@@ -423,15 +423,26 @@ async def _download_parallel_by_ranges(
         progress=_RangeDownloadProgress(0, start_time, start_time),
     )
 
+    is_complete = False
     try:
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _download_range(context, range_start, range_end)
                 for range_start, range_end in ranges
-            )
+            ),
+            return_exceptions=True,
         )
+        failure = next(
+            (outcome for outcome in outcomes if isinstance(outcome, BaseException)),
+            None,
+        )
+        if failure is not None:
+            raise failure
+        is_complete = True
     finally:
         os.close(file_fd)
+        if not is_complete:
+            Path(filepath).unlink(missing_ok=True)
 
 
 def _default_rows_per_insert() -> int:
@@ -506,6 +517,267 @@ async def db_startup(ctx):
     await my_init_db(db)
 
 
+@dataclass(frozen=True)
+class _StreamDownload:
+    client: aiohttp.ClientSession
+    url: str
+    filepath: str
+    max_chunk_size: int
+    size_bytes: int | None
+    accept_ranges: bool
+    request_timeout: aiohttp.ClientTimeout
+    error_context: dict | None
+    logger: object | None
+
+
+async def _prepare_stream_download(
+    client,
+    url,
+    filepath,
+    max_chunk_size,
+    error_context,
+    logger,
+):
+    size_bytes, accept_ranges = await _head_download_info(client, url)
+    request_timeout = await _determine_request_timeout(client, url, max_chunk_size)
+    if size_bytes and size_bytes > LARGE_FILE_TIMEOUT_LOG_THRESHOLD_BYTES:
+        print(
+            "[timeout] "
+            f"computed aiohttp timeout for large file "
+            f"({humanize.naturalsize(size_bytes, binary=True)}): "
+            f"total={request_timeout.total}s "
+            f"connect={request_timeout.connect}s "
+            f"sock_read={request_timeout.sock_read}s"
+        )
+    return _StreamDownload(
+        client=client,
+        url=url,
+        filepath=filepath,
+        max_chunk_size=max_chunk_size,
+        size_bytes=size_bytes,
+        accept_ranges=accept_ranges,
+        request_timeout=request_timeout,
+        error_context=error_context,
+        logger=logger,
+    )
+
+
+async def _stream_response_to_file(
+    download: _StreamDownload,
+    response,
+    mode: str,
+    start_offset: int = 0,
+):
+    stream_total = download.size_bytes
+    response_total = None
+    content_encoding = (
+        response.headers.get("Content-Encoding") or "identity"
+    ).lower()
+    if response.content_length is not None:
+        response_total = response.content_length + start_offset
+    # Prefer response-derived total when HEAD is missing/inaccurate.
+    if response_total and (
+        not stream_total
+        or stream_total <= 0
+        or stream_total < response_total
+        or stream_total < 1024
+    ):
+        stream_total = response_total
+    # With transparent decompression, byte counters are no longer comparable.
+    if content_encoding not in {"", "identity"}:
+        stream_total = None
+    stream_downloaded = start_offset
+    stream_start = time.monotonic()
+    stream_last = stream_start
+    async with async_open(download.filepath, mode) as afp:
+        async for chunk in response.content.iter_chunked(download.max_chunk_size):
+            await afp.write(chunk)
+            stream_downloaded += len(chunk)
+            now = time.monotonic()
+            if now - stream_last >= PROGRESS_INTERVAL_SECONDS:
+                elapsed = max(now - stream_start, 0.001)
+                speed = (stream_downloaded - start_offset) / elapsed
+                _print_progress_line(
+                    stream_downloaded, stream_total, speed, final=False
+                )
+                stream_last = now
+    elapsed = max(time.monotonic() - stream_start, 0.001)
+    speed = (stream_downloaded - start_offset) / elapsed
+    _print_progress_line(stream_downloaded, stream_total, speed, final=True)
+
+
+async def _is_parallel_download_complete(
+    download: _StreamDownload,
+    prefer_stream: bool,
+) -> bool:
+    can_parallel = (
+        bool(download.size_bytes)
+        and download.size_bytes >= PARALLEL_DOWNLOAD_THRESHOLD_BYTES
+        and download.accept_ranges
+        and not PREFER_COMPRESSED_STREAM
+        and not prefer_stream
+    )
+    if not can_parallel:
+        return False
+    print(f"Response size: {download.size_bytes} bytes (parallel download)")
+    try:
+        await _download_parallel_by_ranges(
+            client=download.client,
+            url=download.url,
+            filepath=download.filepath,
+            size_bytes=download.size_bytes,
+            request_timeout=download.request_timeout,
+        )
+        return True
+    except Exception as parallel_err:
+        print(
+            "[warn] parallel download failed, falling back to stream for "
+            f"{download.url}: {parallel_err!r}"
+        )
+        return False
+
+
+async def _resume_stream_if_possible(
+    download: _StreamDownload,
+) -> tuple[bool, bool]:
+    existing_size = (
+        os.path.getsize(download.filepath) if os.path.exists(download.filepath) else 0
+    )
+    can_resume_stream = (
+        bool(existing_size)
+        and bool(download.accept_ranges)
+        and not PREFER_COMPRESSED_STREAM
+    )
+    if (
+        can_resume_stream
+        and download.size_bytes
+        and existing_size < download.size_bytes
+    ):
+        print(
+            f"Resuming stream from {existing_size} / {download.size_bytes} bytes"
+        )
+        resume_headers_by_name = {
+            "Range": f"bytes={existing_size}-",
+            "Accept-Encoding": "identity",
+        }
+        async with download.client.get(
+            download.url,
+            timeout=download.request_timeout,
+            headers=resume_headers_by_name,
+        ) as response:
+            if response.status != 206:
+                print(
+                    f"[warn] resume not supported for {download.url} "
+                    f"(status={response.status}), restarting"
+                )
+                return False, False
+            encoding = response.headers.get("Content-Encoding") or "identity"
+            print(
+                f"Response size: {response.content_length} bytes "
+                f"(stream-resume, encoding={encoding})"
+            )
+            await _stream_response_to_file(
+                download,
+                response,
+                "ab",
+                start_offset=existing_size,
+            )
+            return True, False
+    if (
+        can_resume_stream
+        and download.size_bytes
+        and download.size_bytes >= 1024
+        and existing_size >= download.size_bytes
+    ):
+        print(
+            f"Existing file already complete ({existing_size} bytes), "
+            "skipping download"
+        )
+        return False, True
+    return False, False
+
+
+async def _log_download_error(download: _StreamDownload, message: str) -> None:
+    if download.error_context and download.logger:
+        await log_error(
+            "err",
+            message,
+            download.error_context["issuer_array"],
+            download.url,
+            download.error_context["source"],
+            "network",
+            download.logger,
+        )
+
+
+async def _download_full_stream(download: _StreamDownload) -> None:
+    async with download.client.get(
+        download.url,
+        timeout=download.request_timeout,
+    ) as response:
+        try:
+            encoding = response.headers.get("Content-Encoding") or "identity"
+            print(
+                f"Response size: {response.content_length} bytes "
+                f"(stream, encoding={encoding})"
+            )
+        except aiohttp.ClientResponseError as exc:
+            await _log_download_error(
+                download,
+                f"Error response {exc.status} while requesting "
+                f"{exc.request_info.real_url!r}.",
+            )
+            raise Retry(defer=60)
+        await _stream_response_to_file(download, response, "wb+")
+
+
+async def _raise_download_retry(
+    download: _StreamDownload,
+    console_message: str,
+    log_message: str,
+) -> None:
+    print(console_message)
+    await _log_download_error(download, log_message)
+    raise Retry(defer=60)
+
+
+async def _should_cache_remote_download(
+    download: _StreamDownload,
+    prefer_stream: bool,
+) -> bool:
+    try:
+        if await _is_parallel_download_complete(download, prefer_stream):
+            return False
+        is_resume_complete, is_existing_file_complete = (
+            await _resume_stream_if_possible(download)
+        )
+        if is_existing_file_complete:
+            return False
+        if not is_resume_complete:
+            await _download_full_stream(download)
+        return True
+    except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+        await _raise_download_retry(
+            download,
+            f"[retry] download_it_and_save request failed for {download.url}: {err!r}",
+            f"Network error: {err} while downloading {download.url!r}.",
+        )
+    except Retry:
+        raise
+    except RuntimeError as err:
+        await _raise_download_retry(
+            download,
+            f"[retry] parallel download failed for {download.url}: {err!r}",
+            f"Parallel download error: {err} while downloading {download.url!r}.",
+        )
+    except ssl.SSLCertVerificationError as err:
+        await _raise_download_retry(
+            download,
+            f"[retry] download_it_and_save SSL error for {download.url}: {err!r}",
+            f"SSL Error. {err} URL: {download.url}.",
+        )
+
+
 async def download_it_and_save(
     url,
     filepath,
@@ -524,202 +796,30 @@ async def download_it_and_save(
 
     max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
     cache_dir = _resolve_download_cache_dir(cache_dir)
-    file_with_dir = None
+    cache_path = None
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-        file_with_dir = str(PurePath(str(cache_dir), str(return_checksum([url]))))
-    if cache_dir and file_with_dir and os.path.exists(file_with_dir):
-        await copyfile(file_with_dir, filepath)
-    else:
+        cache_path = str(PurePath(str(cache_dir), str(return_checksum([url]))))
+    if cache_path and os.path.exists(cache_path):
+        await copyfile(cache_path, filepath)
+        return
 
-        async def _stream_response_to_file(response, mode: str, start_offset: int = 0):
-            stream_total = size_bytes
-            response_total = None
-            content_encoding = (
-                response.headers.get("Content-Encoding") or "identity"
-            ).lower()
-            if response.content_length is not None:
-                response_total = response.content_length + start_offset
-            # Prefer response-derived total when HEAD is missing/inaccurate.
-            if response_total and (
-                not stream_total
-                or stream_total <= 0
-                or stream_total < response_total
-                or stream_total < 1024
-            ):
-                stream_total = response_total
-            # With transparent decompression, byte counters are no longer comparable.
-            if content_encoding not in {"", "identity"}:
-                stream_total = None
-            stream_downloaded = start_offset
-            stream_start = time.monotonic()
-            stream_last = stream_start
-            async with async_open(filepath, mode) as afp:
-                async for chunk in response.content.iter_chunked(max_chunk_size):
-                    await afp.write(chunk)
-                    stream_downloaded += len(chunk)
-                    now = time.monotonic()
-                    if now - stream_last >= PROGRESS_INTERVAL_SECONDS:
-                        elapsed = max(now - stream_start, 0.001)
-                        speed = (stream_downloaded - start_offset) / elapsed
-                        _print_progress_line(
-                            stream_downloaded, stream_total, speed, final=False
-                        )
-                        stream_last = now
-            elapsed = max(time.monotonic() - stream_start, 0.001)
-            speed = (stream_downloaded - start_offset) / elapsed
-            _print_progress_line(stream_downloaded, stream_total, speed, final=True)
-
-        client = await get_http_client()
-        async with client:
-            size_bytes, accept_ranges = await _head_download_info(client, url)
-            request_timeout = await _determine_request_timeout(
-                client, url, max_chunk_size
-            )
-            if size_bytes and size_bytes > LARGE_FILE_TIMEOUT_LOG_THRESHOLD_BYTES:
-                print(
-                    "[timeout] "
-                    f"computed aiohttp timeout for large file "
-                    f"({humanize.naturalsize(size_bytes, binary=True)}): "
-                    f"total={request_timeout.total}s "
-                    f"connect={request_timeout.connect}s "
-                    f"sock_read={request_timeout.sock_read}s"
-                )
-            try:
-                can_parallel = (
-                    bool(size_bytes)
-                    and size_bytes >= PARALLEL_DOWNLOAD_THRESHOLD_BYTES
-                    and accept_ranges
-                    and not PREFER_COMPRESSED_STREAM
-                    and not prefer_stream
-                )
-                if can_parallel:
-                    print(f"Response size: {size_bytes} bytes (parallel download)")
-                    try:
-                        await _download_parallel_by_ranges(
-                            client=client,
-                            url=url,
-                            filepath=filepath,
-                            size_bytes=size_bytes,
-                            request_timeout=request_timeout,
-                        )
-                        return
-                    except (
-                        Exception
-                    ) as parallel_err:
-                        print(
-                            f"[warn] parallel download failed, falling back to stream for {url}: {parallel_err!r}"
-                        )
-
-                existing_size = (
-                    os.path.getsize(filepath) if os.path.exists(filepath) else 0
-                )
-                is_resume_complete = False
-                can_resume_stream = (
-                    bool(existing_size)
-                    and bool(accept_ranges)
-                    and not PREFER_COMPRESSED_STREAM
-                )
-                if can_resume_stream and size_bytes and existing_size < size_bytes:
-                    print(f"Resuming stream from {existing_size} / {size_bytes} bytes")
-                    resume_headers_by_name = {
-                        "Range": f"bytes={existing_size}-",
-                        "Accept-Encoding": "identity",
-                    }
-                    async with client.get(
-                        url, timeout=request_timeout, headers=resume_headers_by_name
-                    ) as response:
-                        if response.status == 206:
-                            encoding = (
-                                response.headers.get("Content-Encoding") or "identity"
-                            )
-                            print(
-                                f"Response size: {response.content_length} bytes (stream-resume, encoding={encoding})"
-                            )
-                            await _stream_response_to_file(
-                                response, "ab", start_offset=existing_size
-                            )
-                            is_resume_complete = True
-                        else:
-                            print(
-                                f"[warn] resume not supported for {url} (status={response.status}), restarting"
-                            )
-                elif (
-                    can_resume_stream
-                    and size_bytes
-                    and size_bytes >= 1024
-                    and existing_size >= size_bytes
-                ):
-                    print(
-                        f"Existing file already complete ({existing_size} bytes), skipping download"
-                    )
-                    return
-
-                if not is_resume_complete:
-                    async with client.get(url, timeout=request_timeout) as response:
-                        try:
-                            encoding = (
-                                response.headers.get("Content-Encoding") or "identity"
-                            )
-                            print(
-                                f"Response size: {response.content_length} bytes (stream, encoding={encoding})"
-                            )
-                        except aiohttp.ClientResponseError as exc:
-                            if context and logger:
-                                await log_error(
-                                    "err",
-                                    f"Error response {exc.status} while requesting {exc.request_info.real_url!r}.",
-                                    context["issuer_array"],
-                                    url,
-                                    context["source"],
-                                    "network",
-                                    logger,
-                                )
-                            raise Retry(defer=60)
-                        await _stream_response_to_file(response, "wb+")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                print(f"[retry] download_it_and_save request failed for {url}: {err!r}")
-                if context and logger:
-                    await log_error(
-                        "err",
-                        f"Network error: {err} while downloading {url!r}.",
-                        context["issuer_array"],
-                        url,
-                        context["source"],
-                        "network",
-                        logger,
-                    )
-                raise Retry(defer=60)
-            except Retry:
-                raise
-            except RuntimeError as err:
-                print(f"[retry] parallel download failed for {url}: {err!r}")
-                if context and logger:
-                    await log_error(
-                        "err",
-                        f"Parallel download error: {err} while downloading {url!r}.",
-                        context["issuer_array"],
-                        url,
-                        context["source"],
-                        "network",
-                        logger,
-                    )
-                raise Retry(defer=60)
-            except ssl.SSLCertVerificationError as err:
-                print(f"[retry] download_it_and_save SSL error for {url}: {err!r}")
-                if context and logger:
-                    await log_error(
-                        "err",
-                        f"SSL Error. {err} URL: {url}.",
-                        context["issuer_array"],
-                        url,
-                        context["source"],
-                        "network",
-                        logger,
-                    )
-                raise Retry(defer=60)
-        if cache_dir and file_with_dir:
-            await copyfile(filepath, file_with_dir)
+    client = await get_http_client()
+    async with client:
+        download = await _prepare_stream_download(
+            client,
+            url,
+            filepath,
+            max_chunk_size,
+            context,
+            logger,
+        )
+        should_write_cache = await _should_cache_remote_download(
+            download,
+            prefer_stream,
+        )
+    if should_write_cache and cache_path:
+        await copyfile(filepath, cache_path)
 
 
 def make_class(model_cls, table_suffix, schema_override=None):

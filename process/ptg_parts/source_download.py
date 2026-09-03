@@ -28,6 +28,9 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
+from curl_cffi import CurlECode, CurlHttpVersion, CurlOpt
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 from yarl import URL
 
 from process.ptg_parts.artifact_streams import logical_artifact_identity, stream_logical_artifact
@@ -91,7 +94,12 @@ from process.ptg_parts.frozen_rate_files import (
 )
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
-from process.url_security import UnsafeUrlError, assert_public_ip, assert_safe_url
+from process.url_security import (
+    UnsafeUrlError,
+    assert_public_ip,
+    assert_safe_url,
+    resolve_safe_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +127,8 @@ DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
 _CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
 _ARTIFACT_FILENAME_QUERY_KEYS = frozenset({"file", "filename", "file_name", "name"})
 _HTTP_USER_AGENT = "HealthPorta-MRF/1.0"
+_BROWSER_CONNECT_TIMEOUT_SECONDS = 60
+_BROWSER_READ_TIMEOUT_SECONDS = 600
 
 
 class _PublicResolver(AbstractResolver):
@@ -743,6 +753,26 @@ def _download_retry_error_label(error: Exception) -> str:
     return str(error)
 
 
+async def _wait_before_download_retry(
+    url: str,
+    error: Exception,
+    attempt: int,
+    byte_count: int,
+) -> None:
+    delay = _download_retry_delay_seconds() * (2 ** attempt)
+    message = (
+        f"PTG2_DOWNLOAD_RETRY target={_download_progress_target(url)} "
+        f"bytes={byte_count} "
+        f"attempt={attempt + 1} next_attempt={attempt + 2} "
+        f"delay_seconds={delay:.2f} "
+        f"error={_download_retry_error_label(error)}"
+    )
+    _emit_screen_line(message, stderr=True)
+    logger.debug(message)
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 def _progress_job_index(job: dict[str, Any]) -> int:
     try:
         return max(int(job.get("_ptg_progress_index") or 0), 0)
@@ -1112,6 +1142,12 @@ class _SingleGetDownloadState:
     response_body_started: bool = False
 
 
+@dataclass(frozen=True)
+class _DownloadTransport:
+    user_agent: str | None = None
+    browser_profile: str | None = None
+
+
 class _DownloadSizeLimitError(RuntimeError):
     pass
 
@@ -1367,6 +1403,211 @@ def _single_get_result(state: _SingleGetDownloadState) -> _SingleGetResult:
     )
 
 
+class _BrowserDownloadStatusError(RuntimeError):
+    """HTTP failure from the narrowly selected browser transport."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"browser source download returned HTTP {status}")
+        self.status = status
+
+
+def _curl_resolve_target(hostname: str, port: int, addresses: tuple[str, ...]) -> str:
+    pinned_addresses = ",".join(
+        f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+        for address in addresses
+    )
+    return f"{hostname}:{port}:{pinned_addresses}"
+
+
+def _is_browser_response_url_match(request_url: str, response_url: str) -> bool:
+    requested = urlsplit(request_url)
+    returned = urlsplit(response_url)
+    return returned == requested or (
+        not requested.path and returned == requested._replace(path="/")
+    )
+
+
+def _prepare_browser_response(
+    response: Any,
+    *,
+    state: _SingleGetDownloadState,
+    url: str,
+    pinned_addresses: tuple[str, ...],
+    port: int,
+    max_bytes: int | None,
+) -> None:
+    status = int(response.status_code)
+    state.response_url = str(response.url)
+    state.response_status = status
+    state.content_encoding = response.headers.get("Content-Encoding")
+    state.content_type = response.headers.get("Content-Type")
+    if response.redirect_count or not _is_browser_response_url_match(
+        url, state.response_url
+    ):
+        raise UnsafeUrlError("browser source redirects require separate validation")
+    response_address = ipaddress.ip_address(str(response.primary_ip))
+    if response_address not in {
+        ipaddress.ip_address(address) for address in pinned_addresses
+    }:
+        raise UnsafeUrlError("browser source connected to an unpinned address")
+    if int(response.primary_port) != port:
+        raise UnsafeUrlError("browser source connected to an unpinned port")
+    if int(response.http_version) != int(CurlHttpVersion.V2_0):
+        raise RuntimeError("browser source download did not negotiate HTTP/2")
+    if status != 200:
+        raise _BrowserDownloadStatusError(status)
+    content_length = response.headers.get("Content-Length")
+    state.total_bytes = (
+        int(content_length)
+        if _is_identity_content_encoding(state.content_encoding)
+        and content_length
+        and content_length.isdigit()
+        else None
+    )
+    if max_bytes is not None and state.total_bytes is not None and state.total_bytes > max_bytes:
+        raise _DownloadSizeLimitError(f"PTG2 max-bytes guard exceeded for {url}")
+    returned_etag = response.headers.get("ETag")
+    state.validator = returned_etag if _is_strong_etag(returned_etag) else None
+    state.last_modified = response.headers.get("Last-Modified")
+
+
+async def _stream_browser_response(
+    response: Any,
+    *,
+    state: _SingleGetDownloadState,
+    url: str,
+    max_bytes: int | None,
+    started_at: float,
+) -> None:
+    with state.path.open("wb") as output:
+        async for chunk in response.aiter_content():
+            if not chunk:
+                continue
+            state.response_body_started = True
+            state.byte_count += len(chunk)
+            if max_bytes is not None and state.byte_count > max_bytes:
+                raise _DownloadSizeLimitError(f"PTG2 max-bytes guard exceeded for {url}")
+            state.digest.update(chunk)
+            output.write(chunk)
+            if state.byte_count >= state.next_progress_bytes:
+                _emit_download_progress(
+                    url=url, bytes_read=state.byte_count,
+                    total_bytes=state.total_bytes, started_at=started_at, done=False,
+                )
+                while state.byte_count >= state.next_progress_bytes:
+                    state.next_progress_bytes += _download_progress_interval_bytes()
+
+
+async def _consume_browser_response(
+    response: Any,
+    *,
+    state: _SingleGetDownloadState,
+    url: str,
+    pinned_addresses: tuple[str, ...],
+    port: int,
+    max_bytes: int | None,
+    started_at: float,
+) -> None:
+    try:
+        _prepare_browser_response(
+            response, state=state, url=url, pinned_addresses=pinned_addresses,
+            port=port, max_bytes=max_bytes,
+        )
+        await _stream_browser_response(
+            response, state=state, url=url, max_bytes=max_bytes,
+            started_at=started_at,
+        )
+    except BaseException:
+        if response.quit_now is not None:
+            response.quit_now.set()
+        stream_task = response.astream_task
+        if stream_task is not None:
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
+            response.astream_task = None
+        raise
+
+
+async def _download_raw_artifact_browser_once(
+    *,
+    url: str,
+    path: Path,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+    browser_profile: str,
+) -> _SingleGetResult:
+    """Stream one HTTPS artifact with a DNS-pinned browser fingerprint."""
+    if urlsplit(url).scheme != "https":
+        raise UnsafeUrlError("browser source transport requires HTTPS")
+    hostname, port, addresses = await resolve_safe_url(url)
+    pinned_addresses = tuple(
+        sorted(addresses, key=lambda address: ipaddress.ip_address(address).version)
+    )
+    curl_option_map: dict[Any, Any] = {
+        CurlOpt.RESOLVE: [_curl_resolve_target(hostname, port, pinned_addresses)],
+        CurlOpt.NOPROXY: "*",
+    }
+    if max_bytes is not None:
+        curl_option_map[CurlOpt.MAXFILESIZE_LARGE] = max_bytes
+    _reset_partial_download(path)
+    state = _single_get_download_state(path, head)
+    try:
+        async with AsyncSession(curl_options=curl_option_map) as session:
+            async with session.stream(
+                "GET", url, allow_redirects=False, verify=True,
+                impersonate=browser_profile, quote=False,
+                accept_encoding="identity", http_version=CurlHttpVersion.V2_0,
+                timeout=(_BROWSER_CONNECT_TIMEOUT_SECONDS, _BROWSER_READ_TIMEOUT_SECONDS),
+            ) as response:
+                await _consume_browser_response(
+                    response, state=state, url=url, pinned_addresses=pinned_addresses,
+                    port=port, max_bytes=max_bytes, started_at=started_at,
+                )
+        if state.total_bytes is not None and state.byte_count != state.total_bytes:
+            raise RuntimeError(
+                f"Download for {url} ended at {state.byte_count} bytes, "
+                f"expected {state.total_bytes}"
+            )
+        _raise_for_unexpected_artifact_container(url, path)
+        return _single_get_result(state)
+    except BaseException as exc:
+        _ensure_download_body_marker(exc, state.byte_count)
+        setattr(exc, "_ptg2_downloaded_byte_count", state.byte_count)
+        _reset_partial_download(path)
+        raise
+
+
+async def _download_raw_artifact_browser(
+    *,
+    url: str,
+    path: Path,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+    browser_profile: str,
+) -> _SingleGetResult:
+    retries = _download_retry_count()
+    for attempt in range(retries + 1):
+        try:
+            return await _download_raw_artifact_browser_once(
+                url=url, path=path, head=head, max_bytes=max_bytes,
+                started_at=started_at, browser_profile=browser_profile,
+            )
+        except RequestException as exc:
+            if exc.code == CurlECode.FILESIZE_EXCEEDED:
+                raise _DownloadSizeLimitError(
+                    f"PTG2 max-bytes guard exceeded for {url}"
+                ) from exc
+            if attempt >= retries:
+                raise
+            await _wait_before_download_retry(
+                url, exc, attempt,
+                int(getattr(exc, "_ptg2_downloaded_byte_count", 0)),
+            )
+    raise RuntimeError(f"Browser download retries exhausted for {_download_progress_target(url)}")
+
+
 async def _download_raw_artifact_single_get(
     *,
     url: str,
@@ -1406,19 +1647,7 @@ async def _download_raw_artifact_single_get(
             _prepare_single_get_failure(exc, state, allow_resume=allow_resume)
             if attempt >= retries:
                 raise
-            delay = _download_retry_delay_seconds() * (2 ** attempt)
-            display_target = _download_progress_target(url)
-            message = (
-                f"PTG2_DOWNLOAD_RETRY target={display_target} "
-                f"bytes={state.byte_count} "
-                f"attempt={attempt + 1} next_attempt={attempt + 2} "
-                f"delay_seconds={delay:.2f} "
-                f"error={_download_retry_error_label(exc)}"
-            )
-            _emit_screen_line(message, stderr=True)
-            logger.debug(message)
-            if delay > 0:
-                await asyncio.sleep(delay)
+            await _wait_before_download_retry(url, exc, attempt, state.byte_count)
     raise RuntimeError(
         f"Download retries exhausted for {_download_progress_target(url)}"
     )
@@ -1432,10 +1661,12 @@ async def download_raw_artifact(
     keep_partial_artifacts: bool | None = None,
     exact_get_evidence: bool = False,
     user_agent: str | None = None,
+    browser_profile: str | None = None,
 ) -> PTG2RawArtifact:
     """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
 
     store = store or PTG2ArtifactStore()
+    transport = _DownloadTransport(user_agent, browser_profile)
     try:
         await assert_safe_url(url)
         canonical_url = canonicalize_url(url)
@@ -1449,7 +1680,7 @@ async def download_raw_artifact(
                 max_bytes=max_bytes,
                 keep_partial_artifacts=keep_partial_artifacts,
                 exact_get_evidence=exact_get_evidence,
-                user_agent=user_agent,
+                transport=transport,
             )
     except BaseException as exc:
         _ensure_download_body_marker(exc, 0)
@@ -1724,7 +1955,7 @@ async def _download_raw_to_path(
     max_bytes: int | None,
     started_at: float,
     exact_get_evidence: bool,
-    user_agent: str | None,
+    transport: _DownloadTransport,
     failure_digest: Any,
 ) -> _SingleGetResult:
     is_local = str(url).startswith("file://") or (
@@ -1736,16 +1967,21 @@ async def _download_raw_to_path(
             url, path, head=head, max_bytes=max_bytes,
             started_at=started_at, digest=failure_digest,
         )
+    if transport.browser_profile:
+        return await _download_raw_artifact_browser(
+            url=url, path=path, head=head, max_bytes=max_bytes,
+            started_at=started_at, browser_profile=transport.browser_profile,
+        )
     ranged = await _try_ranged_raw_artifact(
         url, path, head=head, max_bytes=max_bytes, started_at=started_at,
-        exact_get_evidence=exact_get_evidence, user_agent=user_agent,
+        exact_get_evidence=exact_get_evidence, user_agent=transport.user_agent,
     )
     if ranged is not None:
         return ranged
     return await _download_raw_artifact_single_get(
         url=url, path=path, head=head, max_bytes=max_bytes,
         started_at=started_at, allow_resume=not exact_get_evidence,
-        **_user_agent_kwargs(user_agent),
+        **_user_agent_kwargs(transport.user_agent),
     )
 
 
@@ -1942,17 +2178,17 @@ async def _download_raw_artifact_locked(
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
     exact_get_evidence: bool = False,
-    user_agent: str | None = None,
+    transport: _DownloadTransport | None = None,
 ) -> PTG2RawArtifact:
     """Run one raw download after this canonical URL has been serialized."""
 
-    head = await fetch_head_metadata(url, **_user_agent_kwargs(user_agent))
+    transport = transport or _DownloadTransport()
+    head = await fetch_head_metadata(url, **_user_agent_kwargs(transport.user_agent))
     progress_started_at = time.monotonic()
     should_validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
         reused, corrupt_candidate = _try_reuse_raw_artifact(
-            url, store=store, canonical_url=canonical_url,
-            head=head, started_at=progress_started_at,
+            url, store=store, canonical_url=canonical_url, head=head, started_at=progress_started_at,
         )
         if reused is not None:
             return reused
@@ -1970,7 +2206,7 @@ async def _download_raw_artifact_locked(
         download_result = await _download_raw_to_path(
             url, temporary_path, head=head, max_bytes=max_bytes,
             started_at=progress_started_at, exact_get_evidence=exact_get_evidence,
-            user_agent=user_agent, failure_digest=failure_digest,
+            transport=transport, failure_digest=failure_digest,
         )
         failure_digest, downloaded_byte_count = download_result[:2]
         final_path, actual_sha, actual_size = _validate_and_publish_raw_download(

@@ -26,6 +26,7 @@ from process.hospital_price_native import (
     HospitalParserReceipt,
     validate_hospital_parser_summary,
 )
+from process.hospital_price_source_download import download_hospital_source
 from process.ptg_parts.artifacts import PTG2ArtifactStore
 from process.ptg_parts.canonical import canonicalize_url
 from process.ptg_parts.db_tables import _quote_ident
@@ -43,8 +44,8 @@ from process.ptg_parts.source_download import (
 
 REGISTRY_VERSION = 1
 _HOSPITAL_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
 
@@ -252,11 +253,9 @@ async def fetch_locator(
     url, hospitals = locator_group
     locator, observation, raw = locator_id(url), uuid.uuid4().hex, None
     try:
-        raw = await download_raw_artifact(
-            url, store=store, reuse_raw_artifacts=False,
-            max_bytes=MAX_HOSPITAL_HPT_LOCATOR_BYTES,
-            keep_partial_artifacts=False, exact_get_evidence=True,
-            user_agent=_HOSPITAL_USER_AGENT,
+        raw = await download_hospital_source(
+            download_raw_artifact, url, store, MAX_HOSPITAL_HPT_LOCATOR_BYTES,
+            _HOSPITAL_USER_AGENT, exact_get_evidence=True,
         )
         locator_payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
         locator_records = parse_hospital_hpt_locator(locator_payload)
@@ -388,17 +387,13 @@ async def download_source(
     for attempt in attempts:
         attempt.final_source_url = None
         attempt.source_http_status = None
-    request_urls = (
-        (url,)
-        if exact_url_only
-        else tuple(dict.fromkeys((url, *(attempt.source_url for attempt in attempts))))
+    request_urls = (url,) if exact_url_only else tuple(
+        dict.fromkeys((url, *(attempt.source_url for attempt in attempts)))
     )
     for request_url in request_urls:
         try:
-            raw = await download_raw_artifact(
-                request_url, store=store, reuse_raw_artifacts=False,
-                max_bytes=max_bytes, keep_partial_artifacts=False,
-                user_agent=_HOSPITAL_USER_AGENT,
+            raw = await download_hospital_source(
+                download_raw_artifact, request_url, store, max_bytes, _HOSPITAL_USER_AGENT,
             )
         except (ImportCancelledError, asyncio.CancelledError):
             raise
@@ -426,9 +421,8 @@ async def download_source(
     assert last_error is not None
     return DownloadedSource(
         url, None, attempts, *last_error,
-        auth_refresh_required=any(
-            attempt.source_http_status in {401, 403} for attempt in attempts
-        ),
+        auth_refresh_required=any(attempt.source_http_status in {401, 403}
+                                  for attempt in attempts),
     )
 
 

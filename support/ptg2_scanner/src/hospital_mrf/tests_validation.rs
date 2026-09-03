@@ -357,26 +357,6 @@
             .unwrap()
             .contains("\t[Aetna]\t[MADV]\t"));
 
-        let placeholder_headers = records[2]
-            .iter()
-            .map(|header| {
-                header.replace(
-                    "Payer, Inc.|Plan A",
-                    "[PAYER_NAME]|[PLAN_NAME]",
-                )
-            })
-            .collect::<Vec<_>>();
-        let error =
-            parse_wide_columns(
-                &StringRecord::from(placeholder_headers),
-                CmsProfile::V3,
-                1,
-            )
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("must replace payer and plan placeholders"));
-
         let headers = records[2]
             .iter()
             .enumerate()

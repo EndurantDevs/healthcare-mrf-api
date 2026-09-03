@@ -32,6 +32,108 @@ def test_reviewed_locator_compatibility_variants():
 
 
 @pytest.mark.parametrize(
+    "payload",
+    (
+        b"location-name: Hospital\rmrf-url: https://files.example/mrf.csv\r",
+        b"location-name: Hospital\n"
+        b"mrf-url: https://files.example/mrf.csv\n"
+        b".csv\ncontact-name: Price Team\n",
+        b"location-name: Hospital\n"
+        b"mrf-url: mrf-url: https://files.example/mrf.csv\n",
+        b"location-name: Hospital\n"
+        b"source-page-url: https://hospital.example/patients\n"
+        b"  /billing?price-transparency\n"
+        b"mrf-url: https://files.example/mrf.csv\n",
+    ),
+)
+def test_reviewed_locator_syntax_normalizations(payload):
+    assert locator.parse_hospital_hpt_locator(payload) == (
+        _record("Hospital", "https://files.example/mrf.csv"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    (
+        (
+            b"location-name: Hospital\rmrf-url: https://files.example/mrf.csv\n",
+            "control_character",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: https://files.example/mrf.csv\n\n.csv\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: https://files.example/mrf.csv\n.csv \n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: https://files.example/mrf.csv\n.CSV\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: https://files.example/mrf.csv?download=1\n.csv\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: mrf-url: mrf-url: https://files.example/mrf.csv\n",
+            "mrf_url",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: MRF-URL: https://files.example/mrf.csv\n",
+            "mrf_url",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: mrf_url: https://files.example/mrf.csv\n",
+            "mrf_url",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"mrf-url: mrf-url: relative.csv\n",
+            "mrf_url",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"source-page-url: https://hospital.example/patients\n\n"
+            b"/billing\n"
+            b"mrf-url: https://files.example/mrf.csv\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"source-page-url: https://hospital.example/patients\n"
+            b"billing\n"
+            b"mrf-url: https://files.example/mrf.csv\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"source-page-url:\n/billing\n"
+            b"mrf-url: https://files.example/mrf.csv\n",
+            "line",
+        ),
+        (
+            b"location-name: Hospital\n"
+            b"source-page-url: https://hospital.example/patients\n"
+            b"/billing\n/charges\n"
+            b"mrf-url: https://files.example/mrf.csv\n",
+            "line",
+        ),
+    ),
+)
+def test_reviewed_locator_syntax_normalizations_fail_closed(payload, reason):
+    with pytest.raises(locator.HospitalHptLocatorError, match=reason):
+        locator.parse_hospital_hpt_locator(payload)
+
+
+@pytest.mark.parametrize(
     ("payload", "reason"),
     (
         (b"location-name: Hospital\nmrf_url: relative.json\n", "mrf_url"),

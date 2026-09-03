@@ -11,6 +11,7 @@ from process.url_security import (
     assert_safe_url,
     assert_safe_url_sync,
     fetch_max_bytes,
+    resolve_safe_url,
     urlopen_safe,
 )
 
@@ -180,6 +181,24 @@ def test_safe_url_rejects_host_without_dns_answers(monkeypatch):
 
 async def test_async_safe_url_accepts_public_literal():
     await assert_safe_url("https://8.8.8.8/archive.csv")
+
+
+async def test_resolve_safe_url_returns_every_validated_address(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda _host, port, **_options: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port)),
+        ],
+    )
+
+    assert await resolve_safe_url("https://downloads.example/archive.csv") == (
+        "downloads.example",
+        443,
+        ("8.8.8.8", "1.1.1.1"),
+    )
 
 
 def test_redirect_validation_blocks_private_hop_and_accepts_public_hop(monkeypatch):

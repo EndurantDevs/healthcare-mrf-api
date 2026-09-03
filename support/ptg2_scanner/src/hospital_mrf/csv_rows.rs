@@ -166,6 +166,7 @@ fn parse_wide_modifier_payers(
 ) -> io::Result<Vec<ModifierPayerRow>> {
     let mut payers = Vec::new();
     for payer in columns {
+        reject_used_wide_payer_placeholder(record, payer)?;
         let adjustment_columns = [
             payer.standard_charge_dollar,
             payer.standard_charge_percentage,
@@ -315,6 +316,7 @@ fn parse_wide_payers(
 ) -> io::Result<Vec<PayerChargeRow>> {
     let mut payers = Vec::new();
     for payer in columns {
+        reject_used_wide_payer_placeholder(record, payer)?;
         let relevant_columns = [
             Some(payer.standard_charge_dollar),
             Some(payer.standard_charge_percentage),
@@ -409,7 +411,6 @@ fn parse_tall_records<R: Read>(
     let mut modifier_ordinal = 0u64;
     let mut next_modifier_ordinal = 0u64;
     let mut modifier_payer_ordinal = 0u64;
-
     for record in records {
         let record = record.map_err(to_io_error)?;
         if record.iter().all(|value| value.trim().is_empty()) {

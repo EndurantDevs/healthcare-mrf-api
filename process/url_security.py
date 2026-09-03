@@ -68,19 +68,21 @@ def _validate_scheme_and_host(url: str) -> tuple[str, int]:
     return hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
 
 
-def _resolve_and_check(hostname: str, port: int) -> None:
+def _resolve_and_check(hostname: str, port: int) -> tuple[str, ...]:
     try:
         literal = ipaddress.ip_address(hostname)
     except ValueError:
         literal = None
     if literal is not None:
         assert_public_ip(literal)
-        return
+        return (str(literal),)
     infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     if not infos:
         raise UnsafeUrlError("URL host cannot be resolved")
-    for info in infos:
-        assert_public_ip(ipaddress.ip_address(info[4][0]))
+    addresses = tuple(dict.fromkeys(str(info[4][0]) for info in infos))
+    for address in addresses:
+        assert_public_ip(ipaddress.ip_address(address))
+    return addresses
 
 
 def assert_safe_url_sync(url: str) -> None:
@@ -93,6 +95,13 @@ async def assert_safe_url(url: str) -> None:
     """Validate URL scheme, host, and destination asynchronously."""
     hostname, port = _validate_scheme_and_host(url)
     await asyncio.to_thread(_resolve_and_check, hostname, port)
+
+
+async def resolve_safe_url(url: str) -> tuple[str, int, tuple[str, ...]]:
+    """Validate a URL and return its complete public address set."""
+    hostname, port = _validate_scheme_and_host(url)
+    addresses = await asyncio.to_thread(_resolve_and_check, hostname, port)
+    return hostname, port, addresses
 
 
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):

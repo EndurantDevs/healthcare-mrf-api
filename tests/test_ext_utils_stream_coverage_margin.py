@@ -116,31 +116,33 @@ async def test_stream_download_resume_and_complete_paths(tmp_path, monkeypatch):
 async def test_stream_download_parallel_fallback(
     tmp_path,
     monkeypatch,
+    capsys,
 ):
+    destination_path = tmp_path / "fallback.bin"
     monkeypatch.setattr(
         utils,
         "_head_download_info",
-        AsyncMock(return_value=(8, True)),
+        AsyncMock(return_value=(1024, True)),
     )
     monkeypatch.setattr(utils, "_determine_request_timeout", _fixed_download_timeout)
     monkeypatch.setattr(utils, "PARALLEL_DOWNLOAD_THRESHOLD_BYTES", 1)
+    monkeypatch.setattr(utils, "PARALLEL_DOWNLOAD_RANGE_SIZE", 512)
+    monkeypatch.setattr(utils, "PARALLEL_DOWNLOAD_WORKERS", 2)
+    monkeypatch.setattr(utils, "PARALLEL_CHUNK_RETRIES", 1)
+    monkeypatch.setattr(utils, "LARGE_FILE_TIMEOUT_LOG_THRESHOLD_BYTES", 1)
     monkeypatch.setattr(utils, "PREFER_COMPRESSED_STREAM", False)
-    monkeypatch.setattr(
-        utils,
-        "_download_parallel_by_ranges",
-        AsyncMock(side_effect=RuntimeError("range failed")),
-    )
     monkeypatch.setattr(utils, "PROGRESS_INTERVAL_SECONDS", 0.0)
 
-    destination_path = tmp_path / "fallback.bin"
+    fallback_response = _Response(
+        body=b"fallback",
+        headers={"Content-Encoding": "gzip"},
+    )
+    fallback_response.content_length = None
     fallback_client = _Client(
         get_requests=[
-            _Request(
-                _Response(
-                    body=b"fallback",
-                    headers={"Content-Encoding": "gzip"},
-                )
-            )
+            _Request(_Response(status=206, body=b"r" * 512)),
+            _Request(_Response(status=200, body=b"range refused")),
+            _Request(fallback_response),
         ]
     )
     monkeypatch.setattr(
@@ -153,6 +155,10 @@ async def test_stream_download_parallel_fallback(
         str(destination_path),
     )
     assert destination_path.read_bytes() == b"fallback"
+    output = capsys.readouterr().out
+    assert "computed aiohttp timeout for large file" in output
+    assert "parallel download failed, falling back to stream" in output
+    assert len(fallback_client.calls) == 3
 
 
 @pytest.mark.asyncio

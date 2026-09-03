@@ -13,13 +13,18 @@ fn parse_csv<R: Read>(
     let general_headers = next_csv_record(&mut records, "general header row")?;
     let general_values = next_csv_record(&mut records, "general value row")?;
     let data_headers = next_csv_record(&mut records, "data header row")?;
-    let (metadata, contract_provision) =
+    let (metadata, contract_provisions) =
         parse_csv_metadata(&general_headers, &general_values, max_fanout_rows)?;
     let profile = metadata.profile;
     let schema_version = metadata.version.clone();
     metadata.validate(true)?.emit(version_id, outputs)?;
-    if let Some(contract_provision) = contract_provision {
-        emit_contract_provision(outputs, version_id, 0, contract_provision)?;
+    for (provision_ordinal, contract_provision) in contract_provisions.into_iter().enumerate() {
+        emit_contract_provision(
+            outputs,
+            version_id,
+            provision_ordinal as u64,
+            contract_provision,
+        )?;
     }
 
     if wide {
@@ -49,8 +54,9 @@ fn parse_csv_metadata(
     headers: &StringRecord,
     values: &StringRecord,
     max_fanout_rows: usize,
-) -> io::Result<(GeneralMetadata, Option<ContractProvision>)> {
+) -> io::Result<(GeneralMetadata, Vec<ContractProvision>)> {
     let mut fields = BTreeMap::<String, usize>::new();
+    let mut contract_provision_indexes = Vec::new();
     let mut license_state = None;
     let mut license_index = None;
     let mut attestation_index = None;
@@ -58,6 +64,10 @@ fn parse_csv_metadata(
     for (index, header) in headers.iter().enumerate() {
         let parts = header_parts(header);
         let key = match parts.as_slice() {
+            [name] if name == "general_contract_provisions" => {
+                contract_provision_indexes.push(index);
+                None
+            }
             [name]
                 if matches!(
                     name.as_str(),
@@ -70,7 +80,6 @@ fn parse_csv_metadata(
                         | "type_2_npi"
                         | "attester_name"
                         | "financial_aid_policy"
-                        | "general_contract_provisions"
                 ) =>
             {
                 Some(name.clone())
@@ -164,12 +173,23 @@ fn parse_csv_metadata(
     let Some(license_state) = license_state else {
         return Err(invalid("missing license state"));
     };
-    let contract_provision =
-        optional_value("general_contract_provisions").map(|provisions| ContractProvision {
+    let mut contract_provisions = Vec::new();
+    for provisions in contract_provision_indexes
+        .into_iter()
+        .filter_map(|index| values.get(index))
+        .filter_map(optional_text)
+    {
+        if contract_provisions.len() == max_fanout_rows {
+            return Err(invalid(format!(
+                "hospital MRF general_contract_provisions fanout exceeds configured limit {max_fanout_rows}"
+            )));
+        }
+        contract_provisions.push(ContractProvision {
             payer_name: None,
             plan_name: None,
             provisions,
         });
+    }
     Ok((
         GeneralMetadata {
             profile,
@@ -219,7 +239,7 @@ fn parse_csv_metadata(
             },
             financial_aid_policy: optional_value("financial_aid_policy"),
         },
-        contract_provision,
+        contract_provisions,
     ))
 }
 

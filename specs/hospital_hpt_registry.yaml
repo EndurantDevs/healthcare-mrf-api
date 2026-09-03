@@ -720,6 +720,7 @@ hospitals:
 - hospital_id: hospital-000215
   name: Anna Jaques Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://ajh.org/832671600_anna-jaques-hospital_standardcharges.json
 - hospital_id: hospital-000216
   name: Annie Jeffrey Memorial County Health Center
   cms_hpt_url: http://www.ajhc.org/cms-hpt.txt
@@ -1655,18 +1656,21 @@ hospitals:
 - hospital_id: hospital-000494
   name: Avera Dell Rapids
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Dells Area Hospital
 - hospital_id: hospital-000495
   name: Avera Dells Area Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000496
   name: Avera DeSmet
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera De Smet Memorial Hospital
 - hospital_id: hospital-000497
   name: Avera Eureka Health Care Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000498
   name: Avera Flandreau
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Flandreau Hospital
 - hospital_id: hospital-000499
   name: Avera Flandreau Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1676,30 +1680,35 @@ hospitals:
 - hospital_id: hospital-000501
   name: Avera Gregory
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Gregory Hospital
 - hospital_id: hospital-000502
   name: Avera Gregory Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000503
   name: Avera Hand County
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Hand County Memorial Hospital
 - hospital_id: hospital-000504
   name: Avera Hand County Memorial Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000505
   name: Avera Heart
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Heart Hospital of South Dakota
 - hospital_id: hospital-000506
   name: Avera Heart Hospital of South Dakota
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000507
   name: Avera Holy Family
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Holy Family Hospital
 - hospital_id: hospital-000508
   name: Avera Holy Family Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000509
   name: Avera Marshall
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Marshall Regional Medical Center
 - hospital_id: hospital-000510
   name: Avera Marshall Regional Medical Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1709,6 +1718,7 @@ hospitals:
   - hospital-000513
   name: Avera McKennan
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera McKennan Hospital and University Health Center
 - hospital_id: hospital-000514
   alias_of: hospital-000511
   name: Avera McKennan Hospital and University Health Center
@@ -1716,24 +1726,28 @@ hospitals:
 - hospital_id: hospital-000515
   name: Avera Merrill Pioneer
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Merrill Pioneer Hospital
 - hospital_id: hospital-000516
   name: Avera Merrill Pioneer Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000517
   name: Avera Milbank
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Milbank Area Health Care Campus
 - hospital_id: hospital-000518
   name: Avera Missouri River Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000519
   name: Avera Queen of Peace
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Queen of Peace Hospital
 - hospital_id: hospital-000520
   name: Avera Queen of Peace Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000521
   name: Avera Sacred Heart
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Sacred Heart Hospital
 - hospital_id: hospital-000522
   name: Avera Sacred Heart Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1743,6 +1757,7 @@ hospitals:
 - hospital_id: hospital-000524
   name: Avera St. Anthony's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Anthony's Hospital
 - hospital_id: hospital-000525
   name: Avera St. Anthony's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1752,21 +1767,25 @@ hospitals:
 - hospital_id: hospital-000527
   name: Avera St. Benedicts
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Benedict Health Center
 - hospital_id: hospital-000528
   name: Avera St. Luke's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Luke's Hospital
 - hospital_id: hospital-000529
   name: Avera St. Luke's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000530
   name: Avera St. Mary's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Mary's Hospital
 - hospital_id: hospital-000531
   name: Avera St. Mary's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000532
   name: Avera Tyler
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Tyler Hospital
 - hospital_id: hospital-000533
   name: Avera Tyler Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1776,6 +1795,7 @@ hospitals:
 - hospital_id: hospital-000535
   name: Avera Weskota Memorial Med Ctr
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Weskota Memorial Hospital
 - hospital_id: hospital-000536
   name: Avita Health Systems
   cms_hpt_url: https://avitahealth.org/cms-hpt.txt
@@ -2760,9 +2780,11 @@ hospitals:
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
   locator_name: New Orleans Westbank Hospital
 - hospital_id: hospital-000827
+  alias_of: hospital-004573
   name: Beacon Behavioral Hospital Northshore-Lacombe
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-000828
+  alias_of: hospital-003656
   name: Beacon Behavioral Hospital, Lutcher
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-000829
@@ -2918,6 +2940,7 @@ hospitals:
 - hospital_id: hospital-000872
   name: Beth Israel Deaconess Hospital-Milton Inc
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidmilton.org/042103604_beth-israel-deaconess-hospital-milton-inc_standardcharges.json
 - hospital_id: hospital-000873
   alias_of: hospital-000872
   name: Beth Israel Deaconess Hospital–Milton
@@ -2925,12 +2948,15 @@ hospitals:
 - hospital_id: hospital-000874
   name: Beth Israel Deaconess Hospital–Needham
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidneedham.org/043229679_beth-israel-deaconess-hospital---needham_standardcharges.json
 - hospital_id: hospital-000875
   name: Beth Israel Deaconess Hospital–Plymouth
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidplymouth.org/222667354_beth-israel-deaconess-hospital---plymouth_standardcharges.json
 - hospital_id: hospital-000876
   name: Beth Israel Deaconess Medical Center
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidmc.org/042103881_beth-israel-deaconess-medical-center_standardcharges.json
 - hospital_id: hospital-000877
   name: Bethany Children's Health Center
   cms_hpt_url: https://www.bethanychildrens.org/cms-hpt.txt
@@ -3121,6 +3147,7 @@ hospitals:
   name: BON AIR SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-000933
   name: Bon Secours Community Hospital
   cms_hpt_url: https://www.wmchealth.org/cms-hpt.txt
@@ -3202,6 +3229,7 @@ hospitals:
 - hospital_id: hospital-000958
   name: Bowdle Healthcare Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Bowdle Healthcare Center Avera
 - hospital_id: hospital-000959
   name: Bowdle Healthcare Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -3425,6 +3453,7 @@ hospitals:
   name: Bunkie Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-001025
+  alias_of: hospital-001024
   name: Bunkie, Louisiana
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-001026
@@ -4069,6 +4098,7 @@ hospitals:
   name: CHESTER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-001218
   name: Chestnut Hill Mental Health Center, Inc.
   cms_hpt_url: https://havenwoodbehavioral.com/cms-hpt.txt
@@ -5153,6 +5183,7 @@ hospitals:
 - hospital_id: hospital-001545
   name: Community Memorial Hospital - Redfield
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Community Memorial Hospital Avera
 - hospital_id: hospital-001546
   name: Community Memorial Hospital Association
   cms_hpt_url: https://cloquethospital.com/cms-hpt.txt
@@ -5570,6 +5601,7 @@ hospitals:
 - hospital_id: hospital-001668
   name: Creighton
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Creighton Hospital
 - hospital_id: hospital-001669
   name: Crenshaw Community Hospital
   cms_hpt_url: https://crenshawcommunityhospital.com/cms-hpt.txt
@@ -7165,6 +7197,7 @@ hospitals:
 - hospital_id: hospital-002162
   name: Eureka
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Eureka Health Care Center
 - hospital_id: hospital-002163
   name: Evanston Hospital
   cms_hpt_url: https://www.northshore.org/cms-hpt.txt
@@ -7181,6 +7214,7 @@ hospitals:
 - hospital_id: hospital-002167
   name: Exeter Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://exeterhospital.org/222674014_exeter-hospital-standardcharges.json
 - hospital_id: hospital-002168
   alias_of: hospital-002167
   name: Exeter Hospital Inc
@@ -7680,6 +7714,7 @@ hospitals:
 - hospital_id: hospital-002315
   name: Freeman Regional Health Svcs.
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Freeman Regional Health Services
 - hospital_id: hospital-002316
   name: Freestone Medical Center
   cms_hpt_url: https://freestonemc.com/cms-hpt.txt
@@ -8374,6 +8409,7 @@ hospitals:
   name: HANOVER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-002524
   name: Hansford County Hospital District
   cms_hpt_url: https://hchd.net/cms-hpt.txt
@@ -9508,6 +9544,7 @@ hospitals:
 - hospital_id: hospital-002860
   name: Hegg Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Hegg Health Center Avera
 - hospital_id: hospital-002861
   name: Hegg Health Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -10266,6 +10303,7 @@ hospitals:
   name: HULL STREET SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003084
   name: Humboldt County Memorial Hospital
   cms_hpt_url: https://www.humboldthospital.org/cms-hpt.txt
@@ -11380,6 +11418,7 @@ hospitals:
   name: LABURNUM SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003425
   name: Lackey Memorial Hospital
   cms_hpt_url: https://lackeymemorialhospital.com/cms-hpt.txt
@@ -11408,12 +11447,15 @@ hospitals:
 - hospital_id: hospital-003432
   name: Lahey Hospital & Medical Center
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003433
   name: Lahey Hospital & Medical Center, Burlington
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003434
   name: Lahey Medical Center, Peabody
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003435
   name: Lake Behavioral Hospital
   cms_hpt_url: https://lakebehavioralhospital.com/cms-hpt.txt
@@ -11467,6 +11509,7 @@ hospitals:
 - hospital_id: hospital-003451
   name: Lakes Regional
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Lakes Regional Healthcare
 - hospital_id: hospital-003452
   name: Lakes Regional Healthcare
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -11524,6 +11567,7 @@ hospitals:
 - hospital_id: hospital-003469
   name: Landmann-Jungman
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Landmann-Jungman Memorial Hospital Avera
 - hospital_id: hospital-003470
   name: Landmann-Jungman Memorial Hospital Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -12407,6 +12451,7 @@ hospitals:
 - hospital_id: hospital-003738
   name: Marshall County
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Marshall County Healthcare Center Avera
 - hospital_id: hospital-003739
   name: Marshall County Healthcare Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -13805,6 +13850,7 @@ hospitals:
   name: Mesquite Specialty Hospital, LP
   cms_hpt_url: https://msh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004155
+  alias_of: hospital-004156
   name: Metaire IOP
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004156
@@ -14139,6 +14185,7 @@ hospitals:
   name: MIDTOWN SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-004256
   name: Midwest Medical Center
   cms_hpt_url: https://www.midwestmedicalcenter.org/cms-hpt.txt
@@ -14448,6 +14495,7 @@ hospitals:
 - hospital_id: hospital-004348
   name: Mount Auburn Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://mountauburnhospital.org/042103606_mount-auburn-hospital_standardcharges.json
 - hospital_id: hospital-004349
   name: Mount Carmel Behavioral Health
   cms_hpt_url: https://www.mountcarmelbehavioralhealth.com/cms-hpt.txt
@@ -15089,6 +15137,7 @@ hospitals:
 - hospital_id: hospital-004531
   name: New England Baptist Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://nebh.org/042103612_new-england-baptist-hospital_standardcharges.json
 - hospital_id: hospital-004532
   name: New England Rehabilitation Hospital of Portland, a Joint Venture of Maine Medical Center and Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -17113,6 +17162,7 @@ hospitals:
 - hospital_id: hospital-005155
   name: Pikeville Medical Center
   cms_hpt_url: https://www.pikevillehospital.org/cms-hpt.txt
+  fallback_mrf_url: https://HospitalPriceDisclosure.com/download.aspx?ci=djj9uXI2o8BV*_*ZNUwGkb7g*-*
 - hospital_id: hospital-005156
   name: Pinckneyville Community Hospital
   cms_hpt_url: https://pvillehosp.org/cms-hpt.txt
@@ -17189,6 +17239,7 @@ hospitals:
 - hospital_id: hospital-005178
   name: Platte Healthcare
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Platte Health Center Avera
 - hospital_id: hospital-005179
   name: Platte Valley Medical Center
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -17887,6 +17938,7 @@ hospitals:
   name: REYNOLDS SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005392
   name: Rhode Island Hospital
   cms_hpt_url: https://www.brownhealth.org/cms-hpt.txt
@@ -18330,6 +18382,7 @@ hospitals:
   name: SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005527
   name: Saint Agnes Medical Center
   cms_hpt_url: https://www.samc.com/cms-hpt.txt
@@ -19067,6 +19120,7 @@ hospitals:
 - hospital_id: hospital-005748
   name: Sheltering Arms Institute
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005749
   name: Shenandoah Medical Center
   cms_hpt_url: https://smchospital.com/cms-hpt.txt
@@ -19254,6 +19308,7 @@ hospitals:
 - hospital_id: hospital-005803
   name: Sioux Center Health
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Sioux Center Health Avera
 - hospital_id: hospital-005804
   name: Sioux Center Health Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -19302,6 +19357,7 @@ hospitals:
   name: Sleepy Eye Medical Center
   cms_hpt_url: https://semedicalcenter.org/cms-hpt.txt
 - hospital_id: hospital-005819
+  alias_of: hospital-005820
   name: Slidel IOP
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-005820
@@ -20197,6 +20253,7 @@ hospitals:
 - hospital_id: hospital-006082
   name: St Michael's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: St. Michael's Hospital Avera
 - hospital_id: hospital-006083
   name: ST NICHOLAS HOSPITAL
   cms_hpt_url: https://www.hshs.org/cms-hpt.txt
@@ -21496,13 +21553,14 @@ hospitals:
   locator_name: Texas Rehabilitation Hospital of Fort Worth
 - hospital_id: hospital-006475
   name: Texas Scottish Rite for Children Dallas Campus
-  cms_hpt_url: https://tsrh.org/cms-hpt.txt
+  cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
 - hospital_id: hospital-006476
   name: Texas Scottish Rite for Children Frisco Campus
-  cms_hpt_url: https://tsrh.org/cms-hpt.txt
+  cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
 - hospital_id: hospital-006477
   name: TEXAS SCOTTISH RITE HOSPITAL FOR CRIPPLED CHILDREN
   cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
+  alias_of: hospital-006475
   locator_name: Texas Scottish Rite for Children Dallas Campus
 - hospital_id: hospital-006478
   name: Texas Spine & Joint Hospital
@@ -23208,6 +23266,7 @@ hospitals:
 - hospital_id: hospital-007003
   name: Wagner Community Memorial
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Wagner Community Memorial Hospital Avera
 - hospital_id: hospital-007004
   name: Wagner Community Memorial Hospital Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -23656,9 +23715,11 @@ hospitals:
 - hospital_id: hospital-007140
   name: White River Medical Center
   cms_hpt_url: https://whiteriverhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://whiteriverhealth.slicedhealth.io/pricer/71-0411459-1710943881_WhiteRiverHealth_standardcharges.CSV
 - hospital_id: hospital-007141
-  name: WhiteRiverHealth
+  name: Stone County Medical Center
   cms_hpt_url: https://whiteriverhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://whiteriverhealth.slicedhealth.io/pricer/71-0411459-1417913419_WhiteRiverHealth_standardcharges.CSV
 - hospital_id: hospital-007142
   name: Whitfield Regional Hospital
   cms_hpt_url: https://tkn.816.myftpupload.com/cms-hpt.txt
@@ -23787,6 +23848,7 @@ hospitals:
 - hospital_id: hospital-007179
   name: Winchester Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://winchesterhospital.org/042104434_winchester-hospital_standardcharges.json
 - hospital_id: hospital-007180
   name: WINDHAM COMMUNITY MEMORIAL HOSPITAL
   cms_hpt_url: https://windhamhospital.org/cms-hpt.txt

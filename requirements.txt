@@ -11,6 +11,7 @@ asyncpg>=0.31.0
 attrs>=26.1.0
 Brotli
 cryptography>=50.0.1,<51
+curl_cffi==0.16.3
 fastcrc
 frozenlist>=1.8.0
 geopandas

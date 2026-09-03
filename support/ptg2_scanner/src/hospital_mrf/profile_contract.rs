@@ -22,10 +22,12 @@ impl CmsProfile {
 
     fn parse_csv(version: &str) -> io::Result<Self> {
         match version {
-            "2" | "2.0.0" | "2.2.0" | "2.2.1" => Ok(Self::V2),
+            "1" | "1.0.0" | "2" | "2.0.0" | "2.2.0" | "2.2.1" => {
+                Ok(Self::V2)
+            }
             HOSPITAL_MRF_SCHEMA_VERSION => Ok(Self::V3),
             _ => Err(invalid(format!(
-                "unsupported CMS CSV version {version:?}; expected 2, 2.0.0, 2.2.0, 2.2.1, or 3.0.0"
+                "unsupported CMS CSV version {version:?}; expected 1, 1.0.0, 2, 2.0.0, 2.2.0, 2.2.1, or 3.0.0"
             ))),
         }
     }

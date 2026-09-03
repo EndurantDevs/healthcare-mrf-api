@@ -46,6 +46,7 @@ mod tests {
     include!("hospital_mrf/tests_import.rs");
     include!("hospital_mrf/tests_csv_compatibility.rs");
     include!("hospital_mrf/tests_validation.rs");
+    include!("hospital_mrf/tests_csv_tolerances.rs");
     include!("hospital_mrf/tests_profile_compatibility.rs");
     include!("hospital_mrf/tests_charge_free_payers.rs");
     include!("hospital_mrf/tests_limits.rs");
