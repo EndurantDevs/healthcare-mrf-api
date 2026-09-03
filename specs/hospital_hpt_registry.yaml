@@ -17117,6 +17117,7 @@ hospitals:
 - hospital_id: hospital-005155
   name: Pikeville Medical Center
   cms_hpt_url: https://www.pikevillehospital.org/cms-hpt.txt
+  fallback_mrf_url: https://HospitalPriceDisclosure.com/download.aspx?ci=djj9uXI2o8BV*_*ZNUwGkb7g*-*
 - hospital_id: hospital-005156
   name: Pinckneyville Community Hospital
   cms_hpt_url: https://pvillehosp.org/cms-hpt.txt
