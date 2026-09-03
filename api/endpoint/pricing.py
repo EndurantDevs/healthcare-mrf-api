@@ -109,6 +109,7 @@ from api.billing_search_cursor import (
     BillingSearchCursorGenerationExpired,
 )
 from api.billing_search_cursor_keys import BillingSearchCursorKeyringError
+from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
 from api.plan_pricing_state_scan import (
     PlanPricingStateScanBudgetExceeded,
     is_plan_pricing_state_scan,
@@ -12382,6 +12383,16 @@ async def list_providers_by_procedure(request):
     begin_capacity_evidence(request)
     session = _get_session(request)
     args = request.args
+    is_state_scan = is_plan_pricing_state_scan(args)
+    if (
+        is_state_scan
+        and getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH)
+        != BILLING_SEARCH_TRANSPORT_PATH
+    ):
+        raise InvalidUsage(
+            "Release-bound state scans require the canonical "
+            "/api/v1/pricing/providers/search-by-procedure path"
+        )
 
     # Keep pagination explicit so OpenAPI contract tests see both parameters.
     args.get("limit")
@@ -12492,7 +12503,7 @@ async def list_providers_by_procedure(request):
     release_selection = None
     guard_release_selection = None
     release_selection_args_by_name = {}
-    if is_plan_pricing_state_scan(args):
+    if is_state_scan:
         release_selection = await resolve_plan_release_serving(
             session,
             plan_release_id,

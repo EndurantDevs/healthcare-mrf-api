@@ -5766,13 +5766,6 @@ paths:
           in: query
           schema: { type: integer, minimum: 1, maximum: 200, default: 25 }
           description: Maximum provider rows returned on this page.
-        - name: cursor
-          in: query
-          schema:
-            type: string
-            maxLength: 2048
-            pattern: '^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$'
-          description: Opaque continuation for a release-bound NPI-ordered state scan.
         - name: offset
           in: query
           schema: { type: integer, minimum: 0, default: 0 }

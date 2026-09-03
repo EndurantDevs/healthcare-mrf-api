@@ -96,6 +96,9 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
     },
 }
 ROUTE_QUERY_PARAM_REMOVALS = {
-    # Billing search is transport-bound to the canonical path, not aliases.
-    ("get", "/pricing/providers/by-procedure"): {"billing_entity_ref"},
+    # Billing search and state cursors are canonical-path-only at runtime.
+    ("get", "/pricing/providers/by-procedure"): {
+        "billing_entity_ref",
+        "cursor",
+    },
 }

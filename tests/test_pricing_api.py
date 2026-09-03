@@ -4774,6 +4774,25 @@ def _state_scan_response():
 
 
 @pytest.mark.asyncio
+async def test_release_state_scan_rejects_noncanonical_alias():
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": "hprelease_" + "0" * 26,
+            "code_system": "CPT",
+            "code": "27447",
+            "state": "MI",
+            "order_by": "npi",
+            "include_allowed_amounts": "false",
+        },
+    )
+    request.path = "/api/v1/pricing/providers/by-procedure"
+
+    with pytest.raises(pricing_module.InvalidUsage, match="canonical"):
+        await list_providers_by_procedure(request)
+
+
+@pytest.mark.asyncio
 async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch):
     selection = replace(
         _mixed_canonical_release_selection(),
