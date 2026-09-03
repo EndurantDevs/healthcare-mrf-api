@@ -85,7 +85,7 @@ def _is_toc_body_file_location(value: Any) -> bool:
 
 
 def _toc_body_search_text(location: Any, description: Any = None) -> tuple[str, str]:
-    parsed_location = urlsplit(str(location or ""))
+    parsed_location = urlsplit(canonicalize_url(str(location or "")))
     searchable = (
         f"{parsed_location.path} {parsed_location.query} {description or ''}".lower()
         .replace("_", "-")
