@@ -40,6 +40,9 @@ COUNT_INVARIANTS_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
 RATE_TERM_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
     "20260902160000_hospital_price_rate_term.py"
 )
+PRODUCER_CSV_V4_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
+    "20260903100000_hospital_price_producer_csv_4_0_0.py"
+)
 
 
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
@@ -59,6 +62,8 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in model_sql
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
+    assert "template_version = '4.0.0' AND npi_count > 0" in model_sql
+    assert model_sql.count("'4.0.0'") == 1
     assert "template_version IN ('2.0.0', '2.2.0', '2.2.1')" in model_sql
     assert "npi_count = 0 AND attester_name IS NULL" in model_sql
     assert "source_format IN ('csv-tall', 'csv-wide') AND npi_count >= 0" in model_sql
@@ -108,6 +113,18 @@ def test_rate_term_migration_admits_current_contract_and_modifier_metadata() -> 
     assert "ALTER COLUMN plan_name DROP NOT NULL" in rate_term_sql
     assert "DROP CONSTRAINT hospital_price_modifier_payer_shape_check" in rate_term_sql
     assert rate_term.downgrade() is None
+
+
+def test_producer_csv_v4_migration_is_current_parser_only() -> None:
+    migration = _load_migration(PRODUCER_CSV_V4_MIGRATION_PATH)
+    assert migration.revision == "20260903100000_hospital_price_producer_csv_4_0_0"
+    assert migration.down_revision == "20260902160000_hospital_price_rate_term"
+    migration_sql = inspect.getsource(migration.upgrade)
+    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in migration_sql
+    assert "template_version = '4.0.0' AND npi_count > 0" in migration_sql
+    assert "source_format IN ('csv-tall', 'csv-wide')" in migration_sql
+    assert migration_sql.count("'4.0.0'") == 1
+    assert migration.downgrade() is None
 
 
 async def _insert_header(
@@ -231,12 +248,32 @@ async def _assert_forward_metadata_constraints(
         "source_format": "csv-wide",
         "template_version": "2",
     }
+    producer_v4_record = await connection.fetchrow(
+        f"SELECT parser_contract_sha256, source_format, template_version, "
+        f"attester_name, npi_count FROM {quoted}.hospital_price_version "
+        "WHERE version_id=$1",
+        "7" * 64,
+    )
+    assert dict(producer_v4_record) == {
+        "parser_contract_sha256": HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+        "source_format": "csv-tall",
+        "template_version": "4.0.0",
+        "attester_name": "Current Attester",
+        "npi_count": 1,
+    }
     for version_id, invalid_set in (
         ("c" * 64, "attester_name='   '"),
         ("6" * 64, "npi_count=1, attester_name='Unexpected'"),
         ("8" * 64, "npi_count=0"),
         ("4" * 64, "template_version='2'"),
         ("5" * 64, "source_format='json'"),
+        ("7" * 64, "source_format='json'"),
+        ("7" * 64, "npi_count=0"),
+        ("7" * 64, "attester_name=NULL"),
+        (
+            "7" * 64,
+            f"parser_contract_sha256='{HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256}'",
+        ),
         ("c" * 64, "semantic_sha256='not-a-hash'"),
         ("5" * 64, "version_id='not-a-hash'"),
     ):
@@ -333,6 +370,13 @@ async def _prove_current_headers(database_url, quoted: str) -> None:
                 "version_id": "8" * 64,
                 "source_format": "json",
                 "template_version": "3.0.0",
+                "attester_name": "Current Attester",
+                "npi_count": 1,
+            },
+            {
+                "version_id": "7" * 64,
+                "source_format": "csv-tall",
+                "template_version": "4.0.0",
                 "attester_name": "Current Attester",
                 "npi_count": 1,
             },
@@ -441,6 +485,9 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         )
         await _run_migration(
             engine, _load_migration(RATE_TERM_MIGRATION_PATH), "upgrade"
+        )
+        await _run_migration(
+            engine, _load_migration(PRODUCER_CSV_V4_MIGRATION_PATH), "upgrade"
         )
         await _prove_current_headers(database_url, quoted)
     finally:

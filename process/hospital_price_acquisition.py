@@ -286,34 +286,37 @@ async def fetch_locator(
         )
 
 
+def _locator_failure_candidate(
+    locator_result: LocatorResult,
+    hospital: dict[str, str],
+    error_code: str,
+    error_detail: str | None,
+    fallback_url: str | None,
+) -> Candidate:
+    return Candidate(
+        hospital_id=hospital["hospital_id"],
+        hospital_name=hospital["name"],
+        locator_id=locator_result.locator_id,
+        observation_id=locator_result.observation_id,
+        source_url=fallback_url or locator_result.url,
+        locator_name=hospital.get("locator_name") or hospital["name"],
+        locator_url=locator_result.url,
+        initial_error_code=None if fallback_url else error_code,
+        initial_error_detail=None if fallback_url else error_detail,
+    )
+
+
 def _locator_error_candidates(locator_result: LocatorResult) -> tuple[Candidate, ...]:
-    candidates: list[Candidate] = []
-    for hospital in locator_result.hospitals:
-        fallback_url = (
-            hospital.get("fallback_mrf_url")
-            if locator_result.fetch_failed
-            else None
+    return tuple(
+        _locator_failure_candidate(
+            locator_result,
+            hospital,
+            locator_result.error_code or "locator_invalid",
+            locator_result.error_detail,
+            hospital.get("fallback_mrf_url") if locator_result.fetch_failed else None,
         )
-        candidates.append(
-            Candidate(
-                hospital_id=hospital["hospital_id"],
-                hospital_name=hospital["name"],
-                locator_id=locator_result.locator_id,
-                observation_id=locator_result.observation_id,
-                source_url=fallback_url or locator_result.url,
-                locator_name=hospital.get("locator_name") or hospital["name"],
-                locator_url=locator_result.url,
-                initial_error_code=(
-                    None
-                    if fallback_url
-                    else locator_result.error_code or "locator_invalid"
-                ),
-                initial_error_detail=(
-                    None if fallback_url else locator_result.error_detail
-                ),
-            )
-        )
-    return tuple(candidates)
+        for hospital in locator_result.hospitals
+    )
 
 
 def candidates_from_locators(
@@ -355,19 +358,13 @@ def candidates_from_locators(
             (match.unmatched_hospital_ids, "locator_unmatched", "locator has no exact name match"),
         ):
             candidates.extend(
-                Candidate(
-                    hospital_id=hospital_id,
-                    hospital_name=hospital_by_id[hospital_id]["name"],
-                    locator_id=locator_result.locator_id,
-                    observation_id=locator_result.observation_id,
-                    source_url=locator_result.url,
-                    locator_name=(
-                        hospital_by_id[hospital_id].get("locator_name")
-                        or hospital_by_id[hospital_id]["name"]
-                    ),
-                    locator_url=locator_result.url,
-                    initial_error_code=code,
-                    initial_error_detail=detail,
+                _locator_failure_candidate(
+                    locator_result,
+                    hospital_by_id[hospital_id],
+                    code,
+                    detail,
+                    hospital_by_id[hospital_id].get("fallback_mrf_url")
+                    if code == "locator_unmatched" else None,
                 )
                 for hospital_id in ids
             )
