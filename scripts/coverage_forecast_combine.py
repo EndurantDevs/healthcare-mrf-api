@@ -6,7 +6,11 @@ from pathlib import Path
 import subprocess
 import sys
 
-from coverage_forecast_artifacts import CoverageForecastError, verify_shard_artifacts
+from coverage_forecast_artifacts import (
+    CoverageForecastError,
+    SHARD_SPEC_BY_KIND,
+    verify_shard_artifacts,
+)
 
 
 def _run_coverage(root: Path, arguments: list[str]) -> None:
@@ -32,7 +36,7 @@ def _verified_coverage_paths(
     base_sha: str,
     head_sha: str,
 ) -> list[Path]:
-    """Return only the eight valid coverage data files required by healthcare CI."""
+    """Return only the valid coverage data files required by healthcare CI."""
 
     return [
         *verify_shard_artifacts(root, main_artifacts, "main", base_sha, head_sha),
@@ -79,8 +83,9 @@ def combine_python_coverage(
             str(report_path),
         ],
     )
+    main_shard_count = len(SHARD_SPEC_BY_KIND["main"]["shards"])
     return report_path, {
-        "main": [path.name for path in coverage_paths[:4]],
-        "capacity": [coverage_paths[4].name],
-        "postgres": [path.name for path in coverage_paths[5:]],
+        "main": [path.name for path in coverage_paths[:main_shard_count]],
+        "capacity": [coverage_paths[main_shard_count].name],
+        "postgres": [path.name for path in coverage_paths[main_shard_count + 1 :]],
     }

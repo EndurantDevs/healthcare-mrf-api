@@ -18,7 +18,7 @@ sys.modules[SPEC.name] = SHARDER
 SPEC.loader.exec_module(SHARDER)
 
 
-def test_two_shards_are_sorted_disjoint_and_exact_once() -> None:
+def test_five_shards_are_sorted_disjoint_and_exact_once() -> None:
     nodeids = [
         "tests/test_alpha.py::test_one",
         "tests/test_alpha.py::test_two",
@@ -27,13 +27,15 @@ def test_two_shards_are_sorted_disjoint_and_exact_once() -> None:
         "tests/test_gamma.py::test_five",
     ]
 
-    first = SHARDER.select_nodeids(nodeids, shard_count=2, shard_index=0)
-    second = SHARDER.select_nodeids(nodeids, shard_count=2, shard_index=1)
+    shards = [
+        SHARDER.select_nodeids(nodeids, shard_count=5, shard_index=index)
+        for index in range(5)
+    ]
+    selected_nodeids = [nodeid for shard in shards for nodeid in shard]
 
-    assert first == sorted(first)
-    assert second == sorted(second)
-    assert set(first).isdisjoint(second)
-    assert sorted((*first, *second)) == sorted(nodeids)
+    assert all(shard == sorted(shard) for shard in shards)
+    assert len(selected_nodeids) == len(set(selected_nodeids))
+    assert sorted(selected_nodeids) == sorted(nodeids)
 
 
 def test_collection_command_has_the_hard_test_process_limit() -> None:
@@ -243,7 +245,7 @@ def test_plan_pricing_idempotency_postgres_runs_in_core_once() -> None:
     )
 
 
-def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
+def test_workflow_uses_five_unique_main_coverage_artifacts_and_timeouts() -> None:
     """Keep coverage artifacts, lifecycle proofs, and command deadlines closed."""
 
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -253,8 +255,8 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         encoding="utf-8"
     )
 
-    assert "shard-index: [0, 1, 2, 3]" in workflow
-    assert "--shard-count 4" in prepush
+    assert "shard-index: [0, 1, 2, 3, 4]" in workflow
+    assert prepush.count('--shard-count "$shard_count"') == 2
     assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow

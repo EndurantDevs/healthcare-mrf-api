@@ -102,7 +102,7 @@ jobs:
           READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved') }}
         run: scripts/ci/prepush quality
   python-tests:
-    name: python test suite (${{ matrix.shard-index }}/4)
+    name: python test suite (${{ matrix.shard-index }}/5)
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -128,7 +128,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        shard-index: [0, 1, 2, 3]
+        shard-index: [0, 1, 2, 3, 4]
     env:
       COVERAGE_FILE: .coverage.main.${{ matrix.shard-index }}
     steps:
@@ -138,7 +138,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
       - name: Run shared pre-push gate
-        run: scripts/ci/prepush python-main "${{ matrix.shard-index }}"
+        run: scripts/ci/prepush python-main "${{ matrix.shard-index }}" 5
       - name: Upload main-suite coverage data
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -252,7 +252,7 @@ jobs:
           path: coverage-data/postgres
           merge-multiple: true
       - name: Run shared pre-push gate
-        run: scripts/ci/prepush python-coverage
+        run: scripts/ci/prepush python-coverage 5
       - name: Upload Python coverage forecast
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

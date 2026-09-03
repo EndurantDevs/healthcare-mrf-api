@@ -33,9 +33,9 @@ MODE is one of:
   all BASE_SHA
   hygiene
   quality
-  python-main 0|1|2|3
+  python-main 0|1|2|3|4 [4|5]
   capacity
-  python-coverage
+  python-coverage [4|5]
   api-contract
   rust
   container-package
@@ -147,7 +147,12 @@ run_quality() {
 
 run_python_main() {
   local shard=${1:-}
-  case "$shard" in 0|1|2|3) ;; *) usage ;; esac
+  local shard_count=${2:-4}
+  case "$shard_count:$shard" in
+    4:0|4:1|4:2|4:3|5:0|5:1|5:2|5:3|5:4) ;;
+    *) usage ;;
+  esac
+  export HLTHPRT_CI_MAIN_SHARD_COUNT=$shard_count
   if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
     cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml
   else
@@ -173,13 +178,13 @@ run_python_main() {
   done
   local shard_file="${RUNNER_TEMP:-/tmp}/python-test-shard-${shard}.txt"
   python scripts/ci/shard_pytest_nodeids.py \
-    --shard-count 4 \
+    --shard-count "$shard_count" \
     --shard-index "$shard" \
     --output "$shard_file" \
     -- "${collection_args[@]}"
   local envelope_shard_file="${RUNNER_TEMP:-/tmp}/python-envelope-shard-${shard}.txt"
   python scripts/ci/shard_pytest_nodeids.py \
-    --shard-count 4 \
+    --shard-count "$shard_count" \
     --shard-index "$shard" \
     --output "$envelope_shard_file" \
     -- "${envelope_tests[@]}"
@@ -222,6 +227,9 @@ run_capacity() {
 }
 
 run_python_coverage() {
+  local main_shard_count=${1:-4}
+  case "$main_shard_count" in 4|5) ;; *) usage ;; esac
+  export HLTHPRT_CI_MAIN_SHARD_COUNT=$main_shard_count
   install_python_dependencies
   require_base_sha
   timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
@@ -1240,8 +1248,8 @@ EOF
 
       gate hygiene hygiene
       gate quality quality
-      for shard in 0 1 2 3; do
-        gate "python-main-$shard" python-main "$shard"
+      for shard in 0 1 2 3 4; do
+        gate "python-main-$shard" python-main "$shard" 5
         cp "/artifacts/.coverage.main.${shard}" "/artifacts/.coverage-provenance.main.${shard}.json" /artifacts/coverage-data/main/
       done
       gate capacity capacity
@@ -1264,7 +1272,7 @@ EOF
           gate "postgres-$shard" postgres "$shard"
         cp "/artifacts/.coverage.postgres.${shard}" "/artifacts/.coverage-provenance.postgres.${shard}.json" /artifacts/coverage-data/postgres/
       done
-      gate python-coverage python-coverage
+      gate python-coverage python-coverage 5
       gate rust rust
       {
         python --version
@@ -1329,9 +1337,9 @@ case "${1:-}" in
   all) [ "$#" -eq 2 ] || usage; run_all "$2" ;;
   hygiene) [ "$#" -eq 1 ] || usage; run_hygiene ;;
   quality) [ "$#" -eq 1 ] || usage; run_quality ;;
-  python-main) [ "$#" -eq 2 ] || usage; run_python_main "$2" ;;
+  python-main) [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; run_python_main "$2" "${3:-}" ;;
   capacity) [ "$#" -eq 1 ] || usage; run_capacity ;;
-  python-coverage) [ "$#" -eq 1 ] || usage; run_python_coverage ;;
+  python-coverage) [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; run_python_coverage "${2:-}" ;;
   api-contract) [ "$#" -eq 1 ] || usage; run_api_contract ;;
   rust) [ "$#" -eq 1 ] || usage; run_rust ;;
   container-package) [ "$#" -eq 1 ] || usage; run_container_package ;;

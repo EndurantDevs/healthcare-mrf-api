@@ -356,8 +356,8 @@ def test_cli_writes_rust_provenance_with_actual_producer_versions(
     ]
 
 
-def test_python_forecast_combines_only_the_eight_bound_coverage_files(tmp_path: Path) -> None:
-    """The healthcare topology replays all four main, capacity, and PG producers."""
+def test_python_forecast_combines_only_bound_coverage_files(tmp_path: Path) -> None:
+    """The healthcare topology replays all declared main, capacity, and PG producers."""
 
     (tmp_path / artifacts.BASELINE_NAME).write_text(
         json.dumps(_artifact_baseline()), encoding="utf-8"
@@ -384,7 +384,10 @@ def test_python_forecast_combines_only_the_eight_bound_coverage_files(tmp_path: 
 
     assert report_path.is_file()
     assert producer_files == {
-        "main": [f".coverage.main.{index}" for index in range(4)],
+        "main": [
+            f".coverage.main.{index}"
+            for index in range(len(artifacts.SHARD_SPEC_BY_KIND["main"]["shards"]))
+        ],
         "capacity": [".coverage.capacity"],
         "postgres": [
             ".coverage.postgres.core",

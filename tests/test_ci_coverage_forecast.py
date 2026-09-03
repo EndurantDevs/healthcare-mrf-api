@@ -38,13 +38,14 @@ def test_coverage_forecast_requires_one_exact_base_and_head_for_all_producers() 
 
 
 def test_coverage_forecast_binds_every_healthcare_python_producer() -> None:
-    """The aggregation job accepts exactly the four-plus-one-plus-three producers."""
+    """The aggregation job accepts exactly the five-plus-one-plus-three producers."""
 
     workflow = _workflow()
     prepush = _prepush()
 
     assert "--kind main" in prepush
-    assert 'python-main "${{ matrix.shard-index }}"' in workflow
+    assert 'python-main "${{ matrix.shard-index }}" 5' in workflow
+    assert "scripts/ci/prepush python-coverage 5" in workflow
     assert "--kind capacity" in prepush
     assert "--shard capacity" in prepush
     assert "--kind postgres" in prepush

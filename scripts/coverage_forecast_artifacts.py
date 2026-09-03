@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -30,12 +31,16 @@ REPORT_SPEC_BY_NAME = {
 }
 RUST_TOOL_VERSION_FIELDS = ("cargo_llvm_cov", "rust")
 
+_MAIN_SHARD_COUNT = os.environ.get("HLTHPRT_CI_MAIN_SHARD_COUNT", "4")
+if _MAIN_SHARD_COUNT not in {"4", "5"}:
+    raise RuntimeError("HLTHPRT_CI_MAIN_SHARD_COUNT must be 4 or 5")
+
 SHARD_SPEC_BY_KIND = {
     "main": {
         "coverage_prefix": ".coverage.main.",
         "provenance_prefix": ".coverage-provenance.main.",
         "report_name": "python",
-        "shards": ("0", "1", "2", "3"),
+        "shards": tuple(str(index) for index in range(int(_MAIN_SHARD_COUNT))),
     },
     "capacity": {
         "coverage_prefix": ".coverage.capacity",

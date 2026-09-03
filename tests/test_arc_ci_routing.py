@@ -230,12 +230,12 @@ def test_matrices_fail_fast_and_coverage_waits_for_every_root_job() -> None:
     }
 
 
-def test_arc_route_has_exact_14_plus_2_instance_split() -> None:
+def test_arc_route_has_exact_15_plus_2_instance_split() -> None:
     document, _ = _documents()
     jobs = document["jobs"]
 
     assert jobs["python-tests"]["strategy"]["matrix"] == {
-        "shard-index": [0, 1, 2, 3]
+        "shard-index": [0, 1, 2, 3, 4]
     }
     assert jobs["address-canonical-db-tests"]["strategy"]["matrix"] == {
         "shard": ["core", "provider-directory", "provider-profile"]
@@ -247,7 +247,7 @@ def test_arc_route_has_exact_14_plus_2_instance_split() -> None:
         matrix = jobs[name].get("strategy", {}).get("matrix", {})
         return prod(len(values) for values in matrix.values()) if matrix else 1
 
-    assert sum(instances(name) for name in KUBERNETES_JOBS) == 14
+    assert sum(instances(name) for name in KUBERNETES_JOBS) == 15
     assert sum(instances(name) for name in DIND_JOBS) == 2
 
 

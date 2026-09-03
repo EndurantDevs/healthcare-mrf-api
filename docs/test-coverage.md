@@ -75,7 +75,7 @@ The forecast is fail closed. Every coverage producer checks out the same
 base SHA, checked-out head SHA, Coverage.py version, baseline digest, filename,
 and file digest. The aggregation job accepts exactly these Python inputs:
 
-- four main-suite shards: `.coverage.main.0` through `.coverage.main.3`;
+- five main-suite shards: `.coverage.main.0` through `.coverage.main.4`;
 - one capacity shard: `.coverage.capacity`;
 - three PostgreSQL shards: `.coverage.postgres.core`,
   `.coverage.postgres.provider-directory`, and
