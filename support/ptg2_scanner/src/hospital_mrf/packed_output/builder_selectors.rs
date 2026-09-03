@@ -264,7 +264,7 @@ impl PackedOutputBuilder {
             "hospital MRF packed selector page count is missing",
         )?;
         let entry = crate::hospital_price_selector_block::HospitalPriceSelectorEntry {
-            key: key.clone(),
+            key,
             refs: std::mem::take(refs),
         };
         let entry_raw_bytes = crate::hospital_price_selector_block::entry_raw_len(&entry)
