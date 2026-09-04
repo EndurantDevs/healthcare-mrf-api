@@ -76,7 +76,7 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
         "script_location", str(REPOSITORY_ROOT / "alembic")
     )
     assert ScriptDirectory.from_config(alembic_config).get_heads() == [
-        "20260905130000_hospital_price_csv_3_0_1"
+        "20260904223000_provider_directory_michigan_generation_retirement"
     ]
     for table_name in (
         "plan_pricing_em_distance_candidate",

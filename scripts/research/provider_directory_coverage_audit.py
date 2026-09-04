@@ -4390,40 +4390,13 @@ async def _bounded_source_semantic_readiness_summary(
     return summary_by_metric
 
 
-async def _practitioner_role_reimport_gap_summary(
-    conn: asyncpg.Connection,
-    schema: str,
-    *,
-    sample_limit: int,
-) -> dict[str, Any]:
-    """Find sources whose practitioner-role links need reimport or projection."""
-    required_tables = (
-        "provider_directory_source",
-        "provider_directory_practitioner",
-        "provider_directory_location",
-        "provider_directory_practitioner_role",
-    )
-    for table_name in required_tables:
-        if not await _has_relation(conn, schema, table_name):
-            return {"available": False, "missing_table": table_name, "samples": []}
-
-    overlay_source_rows = (
-        f"""
-        SELECT source_id::varchar AS source_id,
-               count(*)::bigint AS overlay_rows
-          FROM {_qt(schema, "provider_directory_address_overlay")}
-         GROUP BY source_id
-        """
-        if await _has_relation(conn, schema, "provider_directory_address_overlay")
-        else "SELECT NULL::varchar AS source_id, 0::bigint AS overlay_rows WHERE false"
-    )
-    cte_sql = f"""
+_PRACTITIONER_ROLE_REIMPORT_GAP_CTE_SQL = """
         WITH practitioner_counts AS (
             SELECT source_id::varchar AS source_id,
                    count(*)::bigint AS practitioner_rows,
                    count(*) FILTER (WHERE npi BETWEEN 1000000000 AND 9999999999)::bigint
                        AS valid_npi_practitioner_rows
-              FROM {_qt(schema, "provider_directory_practitioner")}
+              FROM __PRACTITIONER_TABLE__
              GROUP BY source_id
         ),
         location_counts AS (
@@ -4433,7 +4406,7 @@ async def _practitioner_role_reimport_gap_summary(
                        WHERE NULLIF(BTRIM(first_line), '') IS NOT NULL
                          AND NULLIF(BTRIM(postal_code), '') IS NOT NULL
                    )::bigint AS street_zip_location_rows
-              FROM {_qt(schema, "provider_directory_location")}
+              FROM __LOCATION_TABLE__
              GROUP BY source_id
         ),
         role_counts AS (
@@ -4442,10 +4415,10 @@ async def _practitioner_role_reimport_gap_summary(
                    count(*) FILTER (
                        WHERE jsonb_array_length(COALESCE(location_refs::jsonb, '[]'::jsonb)) > 0
                    )::bigint AS practitioner_role_location_ref_rows
-              FROM {_qt(schema, "provider_directory_practitioner_role")}
+              FROM __PRACTITIONER_ROLE_TABLE__
              GROUP BY source_id
         ),
-        overlay_source_rows AS ({overlay_source_rows}),
+        overlay_source_rows AS (__OVERLAY_SOURCE_ROWS__),
         source_context AS (
             SELECT src.source_id,
                    src.org_name,
@@ -4463,7 +4436,7 @@ async def _practitioner_role_reimport_gap_summary(
                    COALESCE(role_counts.practitioner_role_location_ref_rows, 0)::bigint
                        AS practitioner_role_location_ref_rows,
                    COALESCE(overlay_source_rows.overlay_rows, 0)::bigint AS overlay_rows
-              FROM {_qt(schema, "provider_directory_source")} AS src
+              FROM __SOURCE_TABLE__ AS src
               LEFT JOIN practitioner_counts
                 ON practitioner_counts.source_id = src.source_id
               LEFT JOIN location_counts
@@ -4473,11 +4446,9 @@ async def _practitioner_role_reimport_gap_summary(
               LEFT JOIN overlay_source_rows
                 ON overlay_source_rows.source_id = src.source_id
         )
-    """
-    gap_summary_metrics = await _fetch_mapping(
-        conn,
-        f"""
-        {cte_sql}
+"""
+
+_PRACTITIONER_ROLE_REIMPORT_GAP_METRICS_SQL = """
         SELECT count(*)::bigint AS source_count,
                count(*) FILTER (
                    WHERE NULLIF(BTRIM(endpoint_practitioner_role), '') IS NOT NULL
@@ -4497,11 +4468,9 @@ async def _practitioner_role_reimport_gap_summary(
                      AND overlay_rows = 0
                )::bigint AS practitioner_role_projection_gap_source_count
           FROM source_context
-        """,
-    )
-    samples = await conn.fetch(
-        f"""
-        {cte_sql}
+"""
+
+_PRACTITIONER_ROLE_REIMPORT_GAP_SAMPLES_SQL = """
         SELECT source_id,
                org_name,
                plan_name,
@@ -4527,12 +4496,213 @@ async def _practitioner_role_reimport_gap_summary(
                   lower(coalesce(plan_name, '')),
                   source_id
          LIMIT $1
-        """,
+"""
+
+
+async def _practitioner_role_reimport_gap_cte_sql(
+    conn: asyncpg.Connection,
+    schema: str,
+) -> str:
+    overlay_source_rows = (
+        f"""
+        SELECT source_id::varchar AS source_id,
+               count(*)::bigint AS overlay_rows
+          FROM {_qt(schema, "provider_directory_address_overlay")}
+         GROUP BY source_id
+        """
+        if await _has_relation(conn, schema, "provider_directory_address_overlay")
+        else "SELECT NULL::varchar AS source_id, 0::bigint AS overlay_rows WHERE false"
+    )
+    return _render_sql_template(
+        _PRACTITIONER_ROLE_REIMPORT_GAP_CTE_SQL,
+        {
+            "__PRACTITIONER_TABLE__": _qt(schema, "provider_directory_practitioner"),
+            "__LOCATION_TABLE__": _qt(schema, "provider_directory_location"),
+            "__PRACTITIONER_ROLE_TABLE__": _qt(
+                schema, "provider_directory_practitioner_role"
+            ),
+            "__OVERLAY_SOURCE_ROWS__": overlay_source_rows,
+            "__SOURCE_TABLE__": _qt(schema, "provider_directory_source"),
+        },
+    )
+
+
+async def _practitioner_role_reimport_gap_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+) -> dict[str, Any]:
+    """Find sources whose practitioner-role links need reimport or projection."""
+    required_tables = (
+        "provider_directory_source",
+        "provider_directory_practitioner",
+        "provider_directory_location",
+        "provider_directory_practitioner_role",
+    )
+    for table_name in required_tables:
+        if not await _has_relation(conn, schema, table_name):
+            return {"available": False, "missing_table": table_name, "samples": []}
+
+    cte_sql = await _practitioner_role_reimport_gap_cte_sql(conn, schema)
+    gap_summary_metrics = await _fetch_mapping(
+        conn,
+        cte_sql + _PRACTITIONER_ROLE_REIMPORT_GAP_METRICS_SQL,
+    )
+    samples = await conn.fetch(
+        cte_sql + _PRACTITIONER_ROLE_REIMPORT_GAP_SAMPLES_SQL,
         sample_limit,
     )
     gap_summary_metrics["available"] = True
     gap_summary_metrics["samples"] = [dict(sample_record) for sample_record in samples]
     return gap_summary_metrics
+
+
+async def _fast_ptg_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    view: str,
+    view_kind: str | None,
+    *,
+    skip_corroboration: bool,
+) -> dict[str, Any]:
+    if view_kind == "view":
+        reason = (
+            "corroboration relation is a live view; use "
+            "--force-ptg-live-view-scans for exact aggregate"
+        )
+        return {
+            "ptg_unified_address": _skipped_summary(reason, relation_kind=view_kind),
+            "ptg_corroboration": _skipped_summary(reason, relation_kind=view_kind),
+            "ptg_network_name_overlap": _skipped_summary(
+                "disabled by --fast-serving-readiness", samples=[]
+            ),
+        }
+    estimate = await _table_row_estimate(conn, schema, view) if view_kind else {}
+    estimated_rows = _int(estimate.get("row_count"))
+    summary_by_section = {
+        "ptg_unified_address": {
+            "available": bool(view_kind),
+            "summary_source": "provider_directory_address_corroboration_estimate",
+            "counts_are_estimates": True,
+            "ptg_unified_address_rows": estimated_rows,
+            "ptg_source_count": 0,
+            "ptg_npi_count": 0,
+            "ptg_keyed_address_rows": estimated_rows,
+            "ptg_keyed_address_pct": _pct(estimated_rows, estimated_rows),
+        }
+    }
+    if skip_corroboration:
+        summary_by_section["ptg_corroboration"] = _skipped_summary(
+            "disabled by --skip-ptg-corroboration"
+        )
+    elif not view_kind:
+        summary_by_section["ptg_corroboration"] = {"available": False}
+    else:
+        summary_by_section["ptg_corroboration"] = {
+            "available": True,
+            "summary_source": "pg_stat_user_tables",
+            "counts_are_estimates": True,
+            "relation_kind": view_kind,
+            "corroboration_rows": estimated_rows,
+            "provider_directory_source_count": 0,
+            "active_match_rows": 0,
+            "plan_context_match_rows": 0,
+            "network_context_rows": 0,
+            "resolved_network_name_rows": 0,
+            "resolved_network_match_rows": 0,
+        }
+    summary_by_section["ptg_network_name_overlap"] = _skipped_summary(
+        "disabled by --fast-serving-readiness",
+        samples=[],
+    )
+    return summary_by_section
+
+
+async def _ptg_unified_address_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    ptg_plan_id: str | None,
+) -> dict[str, Any]:
+    if not await _has_relation(conn, schema, "entity_address_unified"):
+        return {"available": False}
+    plan_filter = (
+        "WHERE COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 "
+        "AND ($1::varchar IS NULL OR $1 = ANY(COALESCE(ptg_plan_array, ARRAY[]::varchar[])))"
+    )
+    ptg_summary_metrics = await _fetch_mapping(
+        conn,
+        f"""
+        WITH filtered AS (
+            SELECT *
+              FROM {_qt(schema, "entity_address_unified")}
+              {plan_filter}
+        )
+        SELECT
+            (SELECT count(*)::bigint FROM filtered) AS ptg_unified_address_rows,
+            count(DISTINCT source_key.value)::bigint AS ptg_source_count,
+            count(DISTINCT npi)::bigint AS ptg_npi_count,
+            (
+                SELECT count(*)::bigint
+                  FROM filtered
+                 WHERE address_key IS NOT NULL
+            ) AS ptg_keyed_address_rows
+          FROM filtered
+          LEFT JOIN LATERAL unnest(COALESCE(ptg_source_array, ARRAY[]::varchar[])) AS source_key(value)
+            ON TRUE
+        """,
+        ptg_plan_id,
+    )
+    ptg_summary_metrics["ptg_keyed_address_pct"] = _pct(
+        _int(ptg_summary_metrics.get("ptg_keyed_address_rows")),
+        _int(ptg_summary_metrics.get("ptg_unified_address_rows")),
+    )
+    return {"available": True, **ptg_summary_metrics}
+
+
+async def _ptg_corroboration_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    view: str,
+    view_kind: str | None,
+    *,
+    ptg_plan_id: str | None,
+    skip_corroboration: bool,
+    force_live_view_scans: bool,
+) -> dict[str, Any]:
+    if skip_corroboration:
+        return _skipped_summary("disabled by --skip-ptg-corroboration")
+    if not view_kind:
+        return {"available": False}
+    if view_kind == "view" and not force_live_view_scans:
+        return {
+            **_skipped_summary(
+                "corroboration relation is a live view; use --force-ptg-live-view-scans for exact aggregate"
+            ),
+            "relation_kind": view_kind,
+        }
+    plan_filter = "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1)"
+    ptg_summary_metrics = await _fetch_mapping(
+        conn,
+        f"""
+        SELECT
+            count(*)::bigint AS corroboration_rows,
+            count(DISTINCT provider_directory_source_id)::bigint AS provider_directory_source_count,
+            count(*) FILTER (WHERE provider_directory_active_match IS TRUE)::bigint AS active_match_rows,
+            count(*) FILTER (WHERE provider_directory_plan_context_matched IS TRUE)::bigint AS plan_context_match_rows,
+            count(*) FILTER (WHERE provider_directory_network_context_present IS TRUE)::bigint AS network_context_rows,
+            count(*) FILTER (
+                WHERE cardinality(COALESCE(provider_directory_network_names, ARRAY[]::varchar[])) > 0
+            )::bigint AS resolved_network_name_rows,
+            count(*) FILTER (
+                WHERE jsonb_array_length(COALESCE(provider_directory_network_matches, '[]'::jsonb)) > 0
+            )::bigint AS resolved_network_match_rows
+          FROM {_qt(schema, view)}
+          {plan_filter}
+        """,
+        ptg_plan_id,
+    )
+    return {"available": True, "relation_kind": view_kind, **ptg_summary_metrics}
 
 
 async def _ptg_summary(
@@ -4547,108 +4717,30 @@ async def _ptg_summary(
     fast_probe: bool = False,
 ) -> dict[str, Any]:
     """Measure PTG address corroboration and network-name overlap."""
-    ptg_summary_by_section: dict[str, Any] = {}
     view = "provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
     if fast_probe:
-        estimate = await _table_row_estimate(conn, schema, view) if view_kind else {}
-        estimated_rows = _int(estimate.get("row_count"))
-        ptg_summary_by_section["ptg_unified_address"] = {
-            "available": bool(view_kind),
-            "summary_source": "provider_directory_address_corroboration_estimate",
-            "counts_are_estimates": True,
-            "ptg_unified_address_rows": estimated_rows,
-            "ptg_source_count": 0,
-            "ptg_npi_count": 0,
-            "ptg_keyed_address_rows": estimated_rows,
-            "ptg_keyed_address_pct": _pct(estimated_rows, estimated_rows),
-        }
-        if skip_corroboration:
-            ptg_summary_by_section["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
-        elif not view_kind:
-            ptg_summary_by_section["ptg_corroboration"] = {"available": False}
-        else:
-            ptg_summary_by_section["ptg_corroboration"] = {
-                "available": True,
-                "summary_source": "pg_stat_user_tables",
-                "counts_are_estimates": True,
-                "relation_kind": view_kind,
-                "corroboration_rows": estimated_rows,
-                "provider_directory_source_count": 0,
-                "active_match_rows": 0,
-                "plan_context_match_rows": 0,
-                "network_context_rows": 0,
-                "resolved_network_name_rows": 0,
-                "resolved_network_match_rows": 0,
-            }
-        ptg_summary_by_section["ptg_network_name_overlap"] = _skipped_summary(
-            "disabled by --fast-serving-readiness",
-            samples=[],
-        )
-        return ptg_summary_by_section
-    if await _has_relation(conn, schema, "entity_address_unified"):
-        plan_filter = (
-            "WHERE COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 "
-            "AND ($1::varchar IS NULL OR $1 = ANY(COALESCE(ptg_plan_array, ARRAY[]::varchar[])))"
-        )
-        ptg_summary_metrics = await _fetch_mapping(
+        return await _fast_ptg_summary(
             conn,
-            f"""
-            WITH filtered AS (
-                SELECT *
-                  FROM {_qt(schema, "entity_address_unified")}
-                  {plan_filter}
-            )
-            SELECT
-                count(*)::bigint AS ptg_unified_address_rows,
-                count(DISTINCT source_key.value)::bigint AS ptg_source_count,
-                count(DISTINCT npi)::bigint AS ptg_npi_count,
-                count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS ptg_keyed_address_rows
-              FROM filtered
-              LEFT JOIN LATERAL unnest(COALESCE(ptg_source_array, ARRAY[]::varchar[])) AS source_key(value)
-                ON TRUE
-            """,
-            ptg_plan_id,
+            schema,
+            view,
+            view_kind,
+            skip_corroboration=skip_corroboration,
         )
-        ptg_summary_metrics["ptg_keyed_address_pct"] = _pct(
-            _int(ptg_summary_metrics.get("ptg_keyed_address_rows")),
-            _int(ptg_summary_metrics.get("ptg_unified_address_rows")),
-        )
-        ptg_summary_by_section["ptg_unified_address"] = {"available": True, **ptg_summary_metrics}
-    else:
-        ptg_summary_by_section["ptg_unified_address"] = {"available": False}
-    if skip_corroboration:
-        ptg_summary_by_section["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
-    elif not view_kind:
-        ptg_summary_by_section["ptg_corroboration"] = {"available": False}
-    elif view_kind == "view" and not force_live_view_scans:
-        ptg_summary_by_section["ptg_corroboration"] = _skipped_summary(
-            "corroboration relation is a live view; use --force-ptg-live-view-scans for exact aggregate"
-        )
-        ptg_summary_by_section["ptg_corroboration"]["relation_kind"] = view_kind
-    else:
-        plan_filter = "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1)"
-        ptg_summary_metrics = await _fetch_mapping(
+    ptg_summary_by_section = {
+        "ptg_unified_address": await _ptg_unified_address_summary(
+            conn, schema, ptg_plan_id
+        ),
+        "ptg_corroboration": await _ptg_corroboration_summary(
             conn,
-            f"""
-            SELECT
-                count(*)::bigint AS corroboration_rows,
-                count(DISTINCT provider_directory_source_id)::bigint AS provider_directory_source_count,
-                count(*) FILTER (WHERE provider_directory_active_match IS TRUE)::bigint AS active_match_rows,
-                count(*) FILTER (WHERE provider_directory_plan_context_matched IS TRUE)::bigint AS plan_context_match_rows,
-                count(*) FILTER (WHERE provider_directory_network_context_present IS TRUE)::bigint AS network_context_rows,
-                count(*) FILTER (
-                    WHERE cardinality(COALESCE(provider_directory_network_names, ARRAY[]::varchar[])) > 0
-                )::bigint AS resolved_network_name_rows,
-                count(*) FILTER (
-                    WHERE jsonb_array_length(COALESCE(provider_directory_network_matches, '[]'::jsonb)) > 0
-                )::bigint AS resolved_network_match_rows
-              FROM {_qt(schema, view)}
-              {plan_filter}
-            """,
-            ptg_plan_id,
-        )
-        ptg_summary_by_section["ptg_corroboration"] = {"available": True, "relation_kind": view_kind, **ptg_summary_metrics}
+            schema,
+            view,
+            view_kind,
+            ptg_plan_id=ptg_plan_id,
+            skip_corroboration=skip_corroboration,
+            force_live_view_scans=force_live_view_scans,
+        ),
+    }
     ptg_summary_by_section["ptg_network_name_overlap"] = (
         _skipped_summary("disabled by --skip-ptg-network-overlap", samples=[])
         if skip_network_name_overlap

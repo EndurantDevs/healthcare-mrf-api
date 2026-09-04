@@ -823,6 +823,8 @@ run_provider_directory_postgres() {
       tests/test_tin_npi_connector_postgres.py \
       tests/test_provider_directory_endpoint_dataset_admission_seal_migration.py \
       tests/test_provider_directory_endpoint_dataset_admission_seal_migration_postgres.py \
+      tests/test_provider_directory_source_local_outcomes_postgres.py \
+      tests/test_provider_directory_michigan_generation_retirement_migration.py \
       tests/test_provider_directory_publication_budget_postgres.py \
       tests/test_provider_directory_terminal_publication_compact_guard_migration.py \
       tests/test_provider_directory_terminal_publication_compact_guard_db.py \

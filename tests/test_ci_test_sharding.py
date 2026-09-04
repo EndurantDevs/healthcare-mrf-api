@@ -327,6 +327,8 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         encoding="utf-8"
     )
     lifecycle_tests = (
+        "tests/test_provider_directory_source_local_outcomes_postgres.py",
+        "tests/test_provider_directory_michigan_generation_retirement_migration.py",
         "tests/test_uhc_flex_practitioner_registration_postgres.py",
         "tests/test_provider_directory_uhc_flex_npi_cohort_postgres.py",
         "tests/test_provider_directory_uhc_flex_practitioner_acquisition_postgres.py",
