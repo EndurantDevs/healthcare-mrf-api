@@ -193,7 +193,6 @@
     "long_functions": [
       "long_function:api/control_imports.py:create_import_run",
       "long_function:api/endpoint/coverage.py:coverage_statistics",
-      "long_function:api/endpoint/npi.py:_build_nearby_sql",
       "long_function:api/endpoint/npi.py:_fetch_provider_enrichment_detail",
       "long_function:api/endpoint/npi.py:_match_candidate_query",
       "long_function:api/endpoint/npi.py:_normalize_match_candidate_params",
