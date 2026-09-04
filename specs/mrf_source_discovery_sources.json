@@ -13,6 +13,7 @@
     "healthcarebluebook_mrf",
     "html_mrf_with_healthcarebluebook",
     "hcsc_asomrf_landing",
+    "bcbsnc_aso_employer_search",
     "html_mrf_links",
     "bcbsal_html_mrf_links",
     "blueadvantage_html_mrf_links",
@@ -115,6 +116,16 @@
       "toc_max_bytes": 104857600,
       "max_state_pages": 10,
       "max_targets": 500
+    },
+    "bcbsnc_aso_employer_search": {
+      "type": "bcbsnc_aso_employer_search",
+      "endpoint": "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search",
+      "model": "/conf/aem-global/settings/dam/cfm/models/transparency-in-coverage",
+      "collection_id": "57253",
+      "front_end_id": "57053",
+      "results_per_page": 10,
+      "max_bytes": 1048576,
+      "toc_max_bytes": 104857600
     },
     "point32_azure_mrf_directory": {
       "type": "point32_azure_mrf_directory",
