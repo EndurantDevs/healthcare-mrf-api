@@ -290,12 +290,13 @@ def _malformed_provider_identifier_payload(
         1234567890,
         123456789,
         123456789,
+        "1447744750`",
     ]
     source_document["in_network"][0]["negotiated_rates"].append(
         {
             "provider_groups": [
                 {
-                    "npi": [1234567891, 123456787],
+                    "npi": [1234567891, 123456787, "1447744750`"],
                     "tin": {"type": "ein", "value": "12-3456789"},
                 }
             ],
@@ -305,6 +306,30 @@ def _malformed_provider_identifier_payload(
                     "negotiated_rate": 126,
                     "service_code": ["11"],
                     "billing_class": "professional",
+                }
+            ],
+        }
+    )
+    source_document["in_network"].append(
+        {
+            "billing_code_type": "CPT",
+            "billing_code": "",
+            "negotiation_arrangement": "ffs",
+            "negotiated_rates": [
+                {
+                    "provider_groups": [
+                        {
+                            "npi": [1234567892, "1447744750`"],
+                        }
+                    ],
+                    "negotiated_prices": [
+                        {
+                            "negotiated_type": "negotiated",
+                            "negotiated_rate": 127,
+                            "service_code": ["11"],
+                            "billing_class": "professional",
+                        }
+                    ],
                 }
             ],
         }

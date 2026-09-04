@@ -352,7 +352,7 @@ Publisher-invalid empty `npi` arrays are handled as an explicit compatibility
 case. The scanner retains the TIN-scoped group and its rates, emits no invented
 NPI membership, canonicalizes the empty array like the existing TIN-only zero
 marker, and records the normalization count in authenticated import evidence.
-Other malformed NPI shapes remain fail-closed.
+Bounded noncanonical NPI strings are quarantined; other malformed shapes remain fail-closed.
 
 ## Release gates
 

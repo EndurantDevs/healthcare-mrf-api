@@ -405,6 +405,7 @@ struct ProviderEntry {
     provider_group_hashes: Vec<i64>,
     npi: Vec<i64>,
     quarantined_npi: Vec<i64>,
+    quarantined_npi_text: Vec<String>,
     network_names: Vec<String>,
     source_locator: Option<ProviderSourceLocator>,
 }
@@ -416,6 +417,7 @@ impl PartialEq for ProviderEntry {
             && self.provider_group_hashes == other.provider_group_hashes
             && self.npi == other.npi
             && self.quarantined_npi == other.quarantined_npi
+            && self.quarantined_npi_text == other.quarantined_npi_text
             && self.network_names == other.network_names
     }
 }
@@ -1938,7 +1940,12 @@ fn log_worker_failure(worker_id: usize, failure_type: &str, message: &str) {
     );
 }
 
-fn provider_group_hash(tin: &Value, npi: &[i64], quarantined_npi: &[i64]) -> i64 {
+fn provider_group_hash(
+    tin: &Value,
+    npi: &[i64],
+    quarantined_npi: &[i64],
+    quarantined_npi_text: &[String],
+) -> i64 {
     let mut payload = vec![
         json!("provider_group"),
         json!(normalize_tin_type(tin.get("type"))),
@@ -1952,6 +1959,15 @@ fn provider_group_hash(tin: &Value, npi: &[i64], quarantined_npi: &[i64]) -> i64
         payload.push(json!({
             "quarantined_npi": distinct_quarantined_npi,
             "contract": "provider_group_quarantined_npi_v1",
+        }));
+    }
+    if !quarantined_npi_text.is_empty() {
+        let mut distinct_quarantined_npi_text = quarantined_npi_text.to_vec();
+        distinct_quarantined_npi_text.sort_unstable();
+        distinct_quarantined_npi_text.dedup();
+        payload.push(json!({
+            "quarantined_npi_text": distinct_quarantined_npi_text,
+            "contract": "provider_group_quarantined_npi_text_v1",
         }));
     }
     make_checksum(payload)
@@ -2032,11 +2048,12 @@ fn provider_group_payload_canonical_json(
     tin_value: &str,
     npi: &[i64],
     quarantined_npi: &[i64],
+    quarantined_npi_text: &[String],
 ) -> String {
     let tin_type_json = serde_json::to_string(tin_type).unwrap_or_else(|_| "\"\"".to_string());
     let tin_value_json = serde_json::to_string(tin_value).unwrap_or_else(|_| "\"\"".to_string());
     let npi_json = serde_json::to_string(npi).unwrap_or_else(|_| "[]".to_string());
-    if quarantined_npi.is_empty() {
+    if quarantined_npi.is_empty() && quarantined_npi_text.is_empty() {
         format!(
             "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
         )
@@ -2046,8 +2063,18 @@ fn provider_group_payload_canonical_json(
         distinct_quarantined_npi.dedup();
         let quarantined_json =
             serde_json::to_string(&distinct_quarantined_npi).unwrap_or_else(|_| "[]".to_string());
+        if quarantined_npi_text.is_empty() {
+            return format!(
+                "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"quarantined_npi\":{quarantined_json},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
+            );
+        }
+        let mut distinct_quarantined_npi_text = quarantined_npi_text.to_vec();
+        distinct_quarantined_npi_text.sort_unstable();
+        distinct_quarantined_npi_text.dedup();
+        let quarantined_text_json = serde_json::to_string(&distinct_quarantined_npi_text)
+            .unwrap_or_else(|_| "[]".to_string());
         format!(
-            "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"quarantined_npi\":{quarantined_json},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
+            "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"quarantined_npi\":{quarantined_json},\"quarantined_npi_text\":{quarantined_text_json},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
         )
     }
 }
@@ -2090,6 +2117,7 @@ fn build_provider_entry_audited(
     let mut group_hashes: Vec<i64> = Vec::new();
     let mut provider_npis: Vec<i64> = Vec::new();
     let mut quarantined_npis: Vec<i64> = Vec::new();
+    let mut quarantined_npi_texts: Vec<String> = Vec::new();
     let mut empty_npi_tin_only_normalization_count = 0u64;
     for group in groups {
         let npi_partition = validate_provider_group(group, allow_empty_npi_tin_only)?;
@@ -2106,12 +2134,14 @@ fn build_provider_entry_audited(
         let tin = group.get("tin").unwrap_or(&Value::Null);
         let npi = npi_partition.valid;
         let quarantined_npi = npi_partition.quarantined;
+        let quarantined_npi_text = npi_partition.quarantined_text;
         let tin_type = normalize_tin_type(tin.get("type"));
         let tin_value = normalize_tin_value(tin.get("value"));
-        let group_hash = provider_group_hash(tin, &npi, &quarantined_npi);
+        let group_hash = provider_group_hash(tin, &npi, &quarantined_npi, &quarantined_npi_text);
         group_hashes.push(group_hash);
         provider_npis.extend(npi.iter().copied());
         quarantined_npis.extend(quarantined_npi.iter().copied());
+        quarantined_npi_texts.extend(quarantined_npi_text.iter().cloned());
         if build_provider_set_payload {
             group_payload_jsons.push(provider_group_payload_canonical_json(
                 group_hash,
@@ -2119,6 +2149,7 @@ fn build_provider_entry_audited(
                 &tin_value,
                 &npi,
                 &quarantined_npi,
+                &quarantined_npi_text,
             ));
         }
     }
@@ -2130,6 +2161,8 @@ fn build_provider_entry_audited(
     provider_npis.shrink_to_fit();
     quarantined_npis.sort_unstable();
     quarantined_npis.shrink_to_fit();
+    quarantined_npi_texts.sort_unstable();
+    quarantined_npi_texts.shrink_to_fit();
     let entry_hash = if build_provider_set_payload {
         provider_set_checksum_from_group_payloads(group_payload_jsons)
     } else {
@@ -2142,6 +2175,7 @@ fn build_provider_entry_audited(
             provider_group_hashes: group_hashes,
             npi: provider_npis,
             quarantined_npi: quarantined_npis,
+            quarantined_npi_text: quarantined_npi_texts,
             network_names,
             source_locator: None,
         },
@@ -2192,8 +2226,22 @@ fn provider_identifier_quarantine_payload(
     let mut quarantine = inline_quarantine;
     for entry in provider_map.values() {
         quarantine.record(&entry.quarantined_npi)?;
+        quarantine.record_text(&entry.quarantined_npi_text)?;
     }
     quarantine.payload()
+}
+
+fn record_and_clear_provider_identifier_quarantine(
+    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    for entry in provider_map.values_mut() {
+        let quarantined_npi = std::mem::take(&mut entry.quarantined_npi);
+        let quarantined_npi_text = std::mem::take(&mut entry.quarantined_npi_text);
+        dedupe.record_quarantined_provider_identifiers(&quarantined_npi)?;
+        dedupe.record_quarantined_provider_identifier_texts(&quarantined_npi_text)?;
+    }
+    Ok(())
 }
 
 fn empty_npi_tin_only_normalization_payload(occurrence_count: u64) -> Value {
@@ -2279,6 +2327,7 @@ fn provider_set_from_ref_keys(
     let mut group_hashes: HashSet<i64> = HashSet::new();
     let mut provider_npis: HashSet<i64> = HashSet::new();
     let mut quarantined_npis: Vec<i64> = Vec::new();
+    let mut quarantined_npi_texts: Vec<String> = Vec::new();
     let mut network_names: HashSet<String> = HashSet::new();
     for key in refs {
         let entry = provider_map.get(key).ok_or_else(|| {
@@ -2295,6 +2344,7 @@ fn provider_set_from_ref_keys(
             provider_npis.insert(*npi);
         }
         quarantined_npis.extend(entry.quarantined_npi.iter().copied());
+        quarantined_npi_texts.extend(entry.quarantined_npi_text.iter().cloned());
         network_names.extend(entry.network_names.iter().cloned());
     }
     if entry_hashes.is_empty() {
@@ -2307,6 +2357,7 @@ fn provider_set_from_ref_keys(
     let mut sorted_provider_npis: Vec<i64> = provider_npis.into_iter().collect();
     sorted_provider_npis.sort_unstable();
     quarantined_npis.sort_unstable();
+    quarantined_npi_texts.sort_unstable();
     let mut sorted_network_names: Vec<String> = network_names.into_iter().collect();
     sorted_network_names.sort_unstable();
     let provider_count = i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX);
@@ -2321,6 +2372,7 @@ fn provider_set_from_ref_keys(
         provider_group_hashes: sorted_group_hashes,
         npi: sorted_provider_npis,
         quarantined_npi: quarantined_npis,
+        quarantined_npi_text: quarantined_npi_texts,
         network_names: sorted_network_names,
         source_locator: None,
     }))
@@ -2343,6 +2395,12 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         .chain(second.quarantined_npi)
         .collect();
     quarantined_npis.sort_unstable();
+    let mut quarantined_npi_texts: Vec<String> = first
+        .quarantined_npi_text
+        .into_iter()
+        .chain(second.quarantined_npi_text)
+        .collect();
+    quarantined_npi_texts.sort_unstable();
     let mut network_names: Vec<String> = first
         .network_names
         .into_iter()
@@ -2362,6 +2420,7 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         provider_group_hashes: group_hashes,
         npi: provider_npis,
         quarantined_npi: quarantined_npis,
+        quarantined_npi_text: quarantined_npi_texts,
         network_names,
         source_locator: None,
     }
@@ -5957,8 +6016,12 @@ impl DictionaryCopySinks {
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi_partition = strict_npi_partition(group.get("npi"))?;
-            let group_hash =
-                provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
+            let group_hash = provider_group_hash(
+                tin,
+                &npi_partition.valid,
+                &npi_partition.quarantined,
+                &npi_partition.quarantined_text,
+            );
             let npi = npi_partition.valid;
             let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
@@ -6029,8 +6092,12 @@ impl DictionaryCopySinks {
             } else {
                 strict_npi_partition(group.get("npi"))?
             };
-            let group_hash =
-                provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
+            let group_hash = provider_group_hash(
+                tin,
+                &npi_partition.valid,
+                &npi_partition.quarantined,
+                &npi_partition.quarantined_text,
+            );
             let npi = npi_partition.valid;
             let inserted = if allow_empty_npi_tin_only {
                 dedupe.insert_provider_group_with_tax_identity(group_hash, group.get("tin"))?
@@ -6326,6 +6393,9 @@ fn process_compact_rate_lites<W: Write>(
             dedupe
                 .provider_identifier_quarantine
                 .record(&inline_entry.quarantined_npi)?;
+            dedupe
+                .provider_identifier_quarantine
+                .record_text(&inline_entry.quarantined_npi_text)?;
             if rate.provider_refs.is_empty() {
                 inline_entry
             } else {
@@ -7094,6 +7164,12 @@ fn estimated_v4_inline_provider_transform_bytes(transform: &V4InlineProviderTran
         .iter()
         .map(|value| value.capacity() as u64)
         .sum::<u64>();
+    let quarantined_npi_text_bytes = transform
+        .entry
+        .quarantined_npi_text
+        .iter()
+        .map(|value| value.capacity() as u64)
+        .sum::<u64>();
     (std::mem::size_of::<V4InlineProviderTransform>() as u64)
         .saturating_add(transform.cache_key.len() as u64)
         .saturating_add((transform.provider_groups.len() * std::mem::size_of::<Value>()) as u64)
@@ -7111,6 +7187,11 @@ fn estimated_v4_inline_provider_transform_bytes(transform: &V4InlineProviderTran
         .saturating_add(
             (transform.entry.quarantined_npi.capacity() * std::mem::size_of::<i64>()) as u64,
         )
+        .saturating_add(
+            (transform.entry.quarantined_npi_text.capacity() * std::mem::size_of::<String>())
+                as u64,
+        )
+        .saturating_add(quarantined_npi_text_bytes)
         .saturating_add(
             (transform.entry.network_names.capacity() * std::mem::size_of::<String>()) as u64,
         )
@@ -9104,6 +9185,7 @@ fn provider_entry_view_for_worker_rate<'a>(
     let inline_entry = build_provider_entry_audited(&provider_ref, false)
         .map(|(entry, _normalization_count)| entry)?;
     dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
+    dedupe.record_quarantined_provider_identifier_texts(&inline_entry.quarantined_npi_text)?;
     if rate.provider_refs.is_empty() {
         return Ok(Some(ProviderEntryView::Owned(inline_entry)));
     }
@@ -9154,6 +9236,7 @@ fn resolve_v4_inline_provider_transform_with_key(
     dedupe
         .record_empty_npi_tin_only_normalizations(transform.empty_npi_tin_only_normalization_count);
     dedupe.record_quarantined_provider_identifiers(&transform.entry.quarantined_npi)?;
+    dedupe.record_quarantined_provider_identifier_texts(&transform.entry.quarantined_npi_text)?;
     Ok(transform)
 }
 
@@ -9336,6 +9419,34 @@ fn resolve_worker_provider<'a>(
     }))
 }
 
+fn record_skipped_inline_provider_quarantine(
+    rate: &RateLite,
+    dedupe: &SharedDedupe,
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<()> {
+    let parsed_provider_groups;
+    let provider_groups = if let Some(raw_provider_groups) = rate.provider_groups_raw.as_deref() {
+        parsed_provider_groups =
+            serde_json::from_str::<Vec<Value>>(raw_provider_groups.get()).map_err(to_io_error)?;
+        parsed_provider_groups.as_slice()
+    } else {
+        rate.provider_groups.as_slice()
+    };
+    if provider_groups.is_empty() {
+        return Ok(());
+    }
+    for provider_group in provider_groups {
+        let partition = if allow_empty_npi_tin_only {
+            strict_npi_partition_allow_empty_tin_only(provider_group.get("npi"))?
+        } else {
+            strict_npi_partition(provider_group.get("npi"))?
+        };
+        dedupe.record_quarantined_provider_identifiers(&partition.quarantined)?;
+        dedupe.record_quarantined_provider_identifier_texts(&partition.quarantined_text)?;
+    }
+    Ok(())
+}
+
 fn process_compact_rate_lites_worker<W: Write>(
     state: &mut SharedCompactState<'_, W>,
     rates: &[RateLite],
@@ -9434,6 +9545,13 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     })?;
     let mut source_witness_population = SourceWitnessPopulationDelta::default();
     if !procedure_has_queryable_code(procedure) {
+        for rate in rates {
+            record_skipped_inline_provider_quarantine(
+                rate,
+                dedupe,
+                provider_set_scope_cache.v4_factor_mode(),
+            )?;
+        }
         if let Some(source_inputs) = source_inputs {
             for _source_input in source_inputs {
                 mark_source_rate_unqueryable(&mut source_witness_population)?;
@@ -9508,6 +9626,11 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 .find(|provider_reference| !provider_map.contains_key(*provider_reference))
             {
                 if source_input.is_some() {
+                    record_skipped_inline_provider_quarantine(
+                        rate,
+                        dedupe,
+                        provider_set_scope_cache.v4_factor_mode(),
+                    )?;
                     mark_source_rate_unqueryable(&mut source_witness_population)?;
                     continue;
                 }
@@ -12526,7 +12649,9 @@ fn scan_compact_byte_top_level_parallel(
                     }
                     writer.flush()?;
 
-                    let provider_map = Arc::new(joined_provider_refs.provider_map);
+                    let mut provider_map = joined_provider_refs.provider_map;
+                    record_and_clear_provider_identifier_quarantine(&mut provider_map, &dedupe)?;
+                    let provider_map = Arc::new(provider_map);
                     let mut handles = Vec::with_capacity(worker_count);
                     for worker_id in 0..worker_count {
                         let worker_rx = rx.clone();
@@ -28190,6 +28315,7 @@ mod tests {
             provider_group_hashes: vec![101],
             npi: vec![1234567890],
             quarantined_npi: Vec::new(),
+            quarantined_npi_text: Vec::new(),
             network_names: vec!["Shared".to_string(), "Z network".to_string()],
             source_locator: None,
         });
@@ -28221,6 +28347,7 @@ mod tests {
             provider_group_hashes: vec![202],
             npi: vec![1234567891],
             quarantined_npi: Vec::new(),
+            quarantined_npi_text: Vec::new(),
             network_names: Vec::new(),
             source_locator: None,
         });
@@ -29814,6 +29941,7 @@ mod tests {
                 provider_group_hashes: vec![101],
                 npi: vec![1234567890, 1234567891],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
                 source_locator: None,
             },
@@ -29826,6 +29954,7 @@ mod tests {
                 provider_group_hashes: vec![202],
                 npi: vec![1234567891, 1234567892],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
                 source_locator: None,
             },
@@ -29857,6 +29986,7 @@ mod tests {
                 provider_group_hashes: vec![101],
                 npi: vec![1_000_000_001, 1_000_000_002],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
                 source_locator: None,
             },
@@ -29869,6 +29999,7 @@ mod tests {
                 provider_group_hashes: vec![202],
                 npi: vec![1_000_000_002, 1_000_000_003],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
                 source_locator: None,
             },
@@ -29881,6 +30012,7 @@ mod tests {
                 provider_group_hashes: vec![101, 202],
                 npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
                 source_locator: None,
             },
@@ -30000,6 +30132,7 @@ mod tests {
                 provider_group_hashes: group_hashes,
                 npi: npis,
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
                 source_locator: None,
             },
@@ -30049,6 +30182,7 @@ mod tests {
                 provider_group_hashes: vec![1, 2, 3, 4],
                 npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003, 1_000_000_004],
                 quarantined_npi: Vec::new(),
+                quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
                 source_locator: None,
             },
@@ -30086,6 +30220,7 @@ mod tests {
             provider_group_hashes: vec![101, 202],
             npi: vec![1_000_000_001, 1_000_000_002],
             quarantined_npi: Vec::new(),
+            quarantined_npi_text: Vec::new(),
             network_names: vec!["component-network".to_string()],
             source_locator: None,
         };
@@ -30095,6 +30230,7 @@ mod tests {
             provider_group_hashes: vec![202, 303],
             npi: vec![1_000_000_002, 1_000_000_003],
             quarantined_npi: Vec::new(),
+            quarantined_npi_text: Vec::new(),
             network_names: vec!["inline-network".to_string()],
             source_locator: None,
         };
@@ -30281,7 +30417,7 @@ mod tests {
         vec![
             json!({
                 "tin": {"type": "ein", "value": "123456789"},
-                "npi": [1234567890i64, -7i64],
+                "npi": [1234567890i64, -7i64, "1447744750`"],
             }),
             json!({
                 "tin": {"type": "ein", "value": "987654321"},
@@ -30306,7 +30442,7 @@ mod tests {
             provider_refs: Vec::new(),
             provider_groups: Vec::new(),
             provider_groups_raw: Some(raw_provider_groups(
-                r#"[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,-7]},{"tin":{"type":"ein","value":"987654321"},"npi":[]}]"#,
+                r#"[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,-7,"1447744750`"]},{"tin":{"type":"ein","value":"987654321"},"npi":[]}]"#,
             )),
             network_names: Vec::new(),
             prices: vec![test_price_lite("1")],
@@ -30362,6 +30498,7 @@ mod tests {
                             "provider_group_hashes": transform.entry.provider_group_hashes,
                             "npi": transform.entry.npi,
                             "quarantined_npi": transform.entry.quarantined_npi,
+                            "quarantined_npi_text": transform.entry.quarantined_npi_text,
                             "empty_npi_tin_only_normalization_count": transform.empty_npi_tin_only_normalization_count,
                         }))
                         .unwrap(),
@@ -30419,7 +30556,8 @@ mod tests {
         assert_eq!(uncached_single.dedupe["provider_group_unique"], 2);
         assert_eq!(uncached_single.dedupe["provider_group_duplicate"], 12_498);
         assert_eq!(uncached_single.dedupe["provider_group_member_attempted"], 1);
-        assert_eq!(uncached_single.quarantine["occurrence_count"], 6_250);
+        assert_eq!(uncached_single.quarantine["occurrence_count"], 12_500);
+        assert_eq!(uncached_single.quarantine["distinct_value_count"], 2);
         assert_eq!(uncached_single.empty_npi_normalizations, 6_250);
 
         assert_eq!(cached_single.cache.transforms, 1);
@@ -31283,7 +31421,6 @@ mod tests {
 
         for invalid_npi in [
             json!(1234567890_i64),
-            json!([" 1234567890"]),
             json!([true]),
             json!([{}]),
             json!([[]]),
@@ -31393,6 +31530,47 @@ mod tests {
         assert_eq!(
             payload["sha256"],
             "6b01033baec61d1e9d4738f0f12cf2f48cefbd6a801fd0bd4a9b76d1b570624b"
+        );
+    }
+
+    #[test]
+    fn malformed_string_npi_is_quarantined_without_losing_valid_membership() {
+        let malformed = "1447744750`";
+        let mut mixed = valid_provider_reference();
+        mixed["provider_groups"][0]["npi"] =
+            json!([1234567890_i64, 123456789_i64, malformed, malformed]);
+        let mixed_entry = build_provider_entry(&mixed).unwrap();
+        assert_eq!(mixed_entry.provider_count, 1);
+        assert_eq!(mixed_entry.npi, vec![1234567890]);
+        assert_eq!(mixed_entry.quarantined_npi, vec![123456789]);
+        assert_eq!(
+            mixed_entry.quarantined_npi_text,
+            vec![malformed.to_string(), malformed.to_string()]
+        );
+
+        let valid_entry = build_provider_entry(&valid_provider_reference()).unwrap();
+        assert_ne!(mixed_entry.entry_hash, valid_entry.entry_hash);
+
+        let provider_map = HashMap::from([(ProviderRefKey::from("7"), mixed_entry)]);
+        let payload = provider_identifier_quarantine_payload(
+            &provider_map,
+            ProviderIdentifierQuarantine::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["contract"],
+            "ptg2_provider_identifier_quarantine_v2"
+        );
+        assert_eq!(payload["occurrence_count"], 3);
+        assert_eq!(payload["distinct_value_count"], 2);
+        assert_eq!(payload["entries"][0]["kind"], "integer");
+        assert_eq!(payload["entries"][0]["value"], "123456789");
+        assert_eq!(payload["entries"][1]["kind"], "string");
+        assert_eq!(payload["entries"][1]["byte_length"], 11);
+        assert_eq!(payload["entries"][1]["occurrence_count"], 2);
+        assert_eq!(
+            payload["entries"][1]["value_sha256"],
+            "27e0d2def7d3bfb8c0538e8af4def83d193d1a59bcdf96c2d1e5ea67e7c766a3"
         );
     }
 
@@ -31571,6 +31749,46 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conflicting provider_group_id definition: 7"));
+    }
+
+    #[test]
+    fn provider_quarantine_counts_only_globally_deduped_definitions() {
+        let definition = json!({
+            "provider_group_id": 7,
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "123456789"},
+                "npi": [1234567890_i64, -7_i64, "1447744750`"]
+            }]
+        });
+        let (key, entry) = provider_ref_definition(&definition).unwrap();
+        let mut provider_map = merge_provider_maps_pairwise(vec![
+            (0, HashMap::from([(key.clone(), entry.clone())])),
+            (1, HashMap::from([(key.clone(), entry.clone())])),
+        ])
+        .unwrap();
+        let dedupe = SharedDedupe::new(1);
+
+        record_and_clear_provider_identifier_quarantine(&mut provider_map, &dedupe).unwrap();
+
+        let quarantine = dedupe
+            .provider_identifier_quarantine()
+            .unwrap()
+            .payload()
+            .unwrap();
+        assert_eq!(quarantine["occurrence_count"], 2);
+        assert_eq!(quarantine["distinct_value_count"], 2);
+        assert!(provider_map[&key].quarantined_npi.is_empty());
+        assert!(provider_map[&key].quarantined_npi_text.is_empty());
+
+        let mut conflicting_entry = entry.clone();
+        conflicting_entry
+            .quarantined_npi_text
+            .push("1447744750`".to_string());
+        assert!(merge_provider_maps_pairwise(vec![
+            (0, HashMap::from([(key.clone(), entry)])),
+            (1, HashMap::from([(key, conflicting_entry)])),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -31980,7 +32198,7 @@ mod tests {
         );
         let inline_tin = inline_group.get("tin").unwrap();
         let inline_npis = strict_npi_list(inline_group.get("npi")).unwrap();
-        let inline_group_hash = provider_group_hash(inline_tin, &inline_npis, &[]);
+        let inline_group_hash = provider_group_hash(inline_tin, &inline_npis, &[], &[]);
         let member_rows = std::fs::read_to_string(&member_path).unwrap();
         assert_eq!(member_rows.lines().count(), 2);
         assert!(member_rows
@@ -32008,6 +32226,7 @@ mod tests {
         let referenced_group_id = provider_group_global_id_from_hash(provider_group_hash(
             referenced_group.get("tin").unwrap(),
             &strict_npi_list(referenced_group.get("npi")).unwrap(),
+            &[],
             &[],
         ));
         assert!(provider_forward_entries.iter().any(|entry| {
@@ -32072,7 +32291,7 @@ mod tests {
         assert_eq!(group_hashes.len(), 1);
         assert_eq!(
             group_hashes[0],
-            provider_group_hash(&resolved.inline_provider_groups()[0]["tin"], &[], &[])
+            provider_group_hash(&resolved.inline_provider_groups()[0]["tin"], &[], &[], &[])
         );
         assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 1);
         let dedupe_summary = dedupe_summary_payload(&dedupe, &HashMap::new());
@@ -33258,7 +33477,7 @@ mod tests {
         {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi = strict_npi_list(group.get("npi")).unwrap();
-            let group_hash = provider_group_hash(tin, &npi, &[]);
+            let group_hash = provider_group_hash(tin, &npi, &[], &[]);
             group_payloads.push(json!({
                 "provider_group_hash": group_hash,
                 "tin_type": normalize_tin_type(tin.get("type")),
@@ -39934,12 +40153,14 @@ mod tests {
             "123456789",
             &first_entry.npi,
             &[9, 8, 9],
+            &[],
         );
         let second_group_payload = provider_group_payload_canonical_json(
             second_entry.provider_group_hashes[0],
             "ein",
             "987654321",
             &second_entry.npi,
+            &[],
             &[],
         );
         assert_eq!(

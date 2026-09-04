@@ -100,7 +100,8 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
     }
 
     expected_quarantine = provider_identifier_quarantine_payload(
-        {123456787: 1, 123456789: 2}
+        {123456787: 1, 123456789: 2},
+        text_counts={"1447744750`": 3},
     )
     quarantine_evidence_list = []
     malformed_npis = {123456787, 123456789}

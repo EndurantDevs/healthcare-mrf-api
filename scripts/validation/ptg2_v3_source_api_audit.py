@@ -70,7 +70,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.14.0"
+SCRIPT_VERSION = "2.15.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -95,6 +95,14 @@ PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT = (
 PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN = (
     b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0"
 )
+PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT = (
+    "ptg2_provider_identifier_quarantine_v2"
+)
+PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN = (
+    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0"
+)
+PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_TEXT_V1\0"
+MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES = 1_024
 AUDIT_SAMPLE_DIGEST_DOMAIN = b"PTG2V3AUDITROWS\x02"
 AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS = (
     "code_key",
@@ -201,7 +209,7 @@ CODE_SYSTEM_ALIASES = {
     "SNOMEDCT": "SNOMEDCT_US",
 }
 CANONICALIZATION = {
-    "version": 8,
+    "version": 9,
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
@@ -217,7 +225,8 @@ CANONICALIZATION = {
     "npi": (
         "canonical signed-64 JSON integer or unsigned ASCII integer string within the "
         "signed-64 range; values in 1000000000..9999999999 are NPIs, exact 0 is the "
-        "TIN-only marker, and other representable values are quarantined"
+        "TIN-only marker, other representable values are quarantined, and bounded "
+        "noncanonical strings are excluded and bound by typed digest evidence"
     ),
     "provider_tin": (
         "a provider-group TIN object or nested TIN field marks its enclosing reference or rate; "
@@ -2101,13 +2110,99 @@ def strict_source_npi_value(event: str, value: Any) -> int | None:
     return None
 
 
+def provider_identifier_text_identity(value: str) -> tuple[str, int]:
+    """Return bounded redacted identity for one malformed string identifier."""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) > 128:
+        raise SourceFormatError("provider_identifier_text_exceeds_128_bytes")
+    return (
+        hashlib.sha256(PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN + encoded).hexdigest(),
+        len(encoded),
+    )
+
+
+_QuarantineKey = TypeVar("_QuarantineKey")
+
+
+def _record_quarantined_provider_identifier(
+    counts: collections.Counter[_QuarantineKey],
+    other_distinct_count: int,
+    value: _QuarantineKey,
+) -> None:
+    if (
+        value not in counts
+        and len(counts) + other_distinct_count
+        >= MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES
+    ):
+        raise SourceFormatError(
+            "provider_identifier_quarantine_exceeds_1024_distinct_values"
+        )
+    counts[value] += 1
+
+
 def provider_identifier_quarantine_payload(
     counts: Mapping[int, int],
+    text_counts: Mapping[tuple[str, int], int] | None = None,
 ) -> dict[str, Any]:
-    """Return redacted exact evidence for malformed integer NPI occurrences."""
+    """Return redacted exact evidence for malformed NPI occurrences."""
 
-    if len(counts) > 1_024:
+    text_counts = text_counts or {}
+    if len(counts) + len(text_counts) > MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES:
         raise ValueError("provider identifier quarantine exceeds 1024 distinct values")
+    if text_counts:
+        digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
+        entries: list[dict[str, Any]] = []
+        occurrence_count = 0
+        for value, count in sorted(counts.items()):
+            if value == 0 or 1_000_000_000 <= value <= 9_999_999_999:
+                raise ValueError(
+                    "provider identifier quarantine contains a non-malformed value"
+                )
+            if count <= 0 or count >= 2**64:
+                raise ValueError("provider identifier quarantine count is invalid")
+            occurrence_count += count
+            digest.update(b"integer\0")
+            digest.update(str(value).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(int(count).to_bytes(8, "big"))
+            entries.append(
+                {"kind": "integer", "value": str(value), "occurrence_count": count}
+            )
+        for (value_sha256, byte_length), count in sorted(text_counts.items()):
+            if (
+                len(value_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in value_sha256)
+                or not 0 <= byte_length <= 128
+                or count <= 0
+                or count >= 2**64
+            ):
+                raise ValueError("text provider identifier quarantine entry is invalid")
+            occurrence_count += count
+            digest.update(b"string\0")
+            digest.update(value_sha256.encode("ascii"))
+            digest.update(b"\0")
+            digest.update(int(byte_length).to_bytes(8, "big"))
+            digest.update(int(count).to_bytes(8, "big"))
+            entries.append(
+                {
+                    "kind": "string",
+                    "value_sha256": value_sha256,
+                    "byte_length": byte_length,
+                    "occurrence_count": count,
+                }
+            )
+        if occurrence_count >= 2**64:
+            raise ValueError(
+                "provider identifier quarantine occurrence count overflows uint64"
+            )
+        return {
+            "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
+            "occurrence_count": occurrence_count,
+            "distinct_value_count": len(entries),
+            "entries": entries,
+            "sha256": digest.hexdigest(),
+        }
     digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN)
     entries: list[dict[str, Any]] = []
     occurrence_count = 0
@@ -2745,6 +2840,9 @@ class SourceIndex:
         self.quarantined_provider_identifiers: collections.Counter[int] = (
             collections.Counter()
         )
+        self.quarantined_provider_identifier_texts: collections.Counter[
+            tuple[str, int]
+        ] = collections.Counter()
         self.file_metrics: dict[int, dict[str, Any]] = {}
         self.raw_container_sha256_by_file_id: dict[int, str] = {}
         self._occurrence_sample_prepared = False
@@ -2883,8 +2981,18 @@ class SourceIndex:
                 return
             self.metrics["invalid_provider_npis"] += 1
             if invalid_integer is not None:
-                self.quarantined_provider_identifiers[invalid_integer] += 1
-            if invalid_integer is None:
+                _record_quarantined_provider_identifier(
+                    self.quarantined_provider_identifiers,
+                    len(self.quarantined_provider_identifier_texts),
+                    invalid_integer,
+                )
+            elif event == "string" and type(raw_npi) is str:
+                _record_quarantined_provider_identifier(
+                    self.quarantined_provider_identifier_texts,
+                    len(self.quarantined_provider_identifiers),
+                    provider_identifier_text_identity(raw_npi),
+                )
+            else:
                 self.metrics["invalid_field_types"] += 1
             return
         cursor = self.connection.execute(
@@ -3137,8 +3245,18 @@ class SourceIndex:
                 return
             self.metrics["invalid_inline_npis"] += 1
             if invalid_integer is not None:
-                self.quarantined_provider_identifiers[invalid_integer] += 1
-            if invalid_integer is None:
+                _record_quarantined_provider_identifier(
+                    self.quarantined_provider_identifiers,
+                    len(self.quarantined_provider_identifier_texts),
+                    invalid_integer,
+                )
+            elif event == "string" and type(value) is str:
+                _record_quarantined_provider_identifier(
+                    self.quarantined_provider_identifier_texts,
+                    len(self.quarantined_provider_identifiers),
+                    provider_identifier_text_identity(value),
+                )
+            else:
                 self.metrics["invalid_field_types"] += 1
             return
         cursor = self.connection.execute(
@@ -3970,7 +4088,8 @@ class SourceIndex:
             ).payload,
             "provider_identifier_quarantine": (
                 provider_identifier_quarantine_payload(
-                    self.quarantined_provider_identifiers
+                    self.quarantined_provider_identifiers,
+                    self.quarantined_provider_identifier_texts,
                 )
             ),
             "sqlite_storage_bytes": sqlite_bytes,
