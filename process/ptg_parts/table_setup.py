@@ -136,6 +136,35 @@ PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES = (
     ATTEMPT_IMPORT_JOB_TABLE,
 )
 PTG2_ARTIFACT_BLOB_TABLE = "ptg2_artifact_blob_chunk"
+_RATE_STAGE_COLUMN_TYPES = {
+    "canonical_payload": "json",
+    "plan_id": "varchar(64)",
+    "plan_name": "varchar",
+    "plan_id_type": "varchar(32)",
+    "plan_market_type": "varchar(32)",
+    "issuer_name": "varchar",
+    "plan_sponsor_name": "varchar",
+    "procedure_code": "bigint",
+    "reported_code_system": "varchar(64)",
+    "reported_code": "varchar(64)",
+    "billing_code": "varchar(64)",
+    "billing_code_type": "varchar(64)",
+    "procedure_name": "varchar",
+    "procedure_description": "varchar",
+    "procedure_display_name": "varchar",
+    "rate_pack_hash": "varchar(64)",
+    "provider_set_hash": "varchar(64)",
+    "provider_set_hashes": "varchar[]",
+    "provider_count": "integer",
+    "provider_set_count": "integer",
+    "price_set_hash": "varchar(64)",
+    "source_trace_set_hash": "varchar(64)",
+    "network_names": "varchar[]",
+    "confidence_code": "varchar(64)",
+    "prices": "json",
+    "source_trace": "json",
+    "confidence": "json",
+}
 _RUNTIME_SCHEMA_CAPABILITY_SQL = (
     "WITH missing_tables AS ("
     "SELECT 'table:' || required.table_name AS capability "
@@ -538,11 +567,8 @@ async def _ensure_price_stage_table(db_schema: str) -> None:
 _ensure_ptg2_price_set_stage_table = _ensure_price_stage_table
 
 
-async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
-    """Create and configure the PTG2 staging table for serving-rate rows."""
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
-    await db.status(
-        f"""
+def _serving_rate_stage_create_sql(db_schema: str, storage_mode: str) -> str:
+    return f"""
         CREATE {storage_mode}TABLE IF NOT EXISTS {db_schema}.ptg2_serving_rate_stage (
             snapshot_id varchar(96) NOT NULL,
             serving_rate_id varchar(64) NOT NULL,
@@ -576,43 +602,19 @@ async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
             created_at timestamp
         );
         """
-    )
+
+
+async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
+    """Create and configure the PTG2 staging table for serving-rate rows."""
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    await db.status(_serving_rate_stage_create_sql(db_schema, storage_mode))
     if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
         try:
             async with db.transaction():
                 await db.status(f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage SET UNLOGGED;")
         except Exception as exc:
             logger.debug("Skipping ptg2_serving_rate_stage unlogged ensure: %s", exc)
-    column_types_by_name = {
-        "canonical_payload": "json",
-        "plan_id": "varchar(64)",
-        "plan_name": "varchar",
-        "plan_id_type": "varchar(32)",
-        "plan_market_type": "varchar(32)",
-        "issuer_name": "varchar",
-        "plan_sponsor_name": "varchar",
-        "procedure_code": "bigint",
-        "reported_code_system": "varchar(64)",
-        "reported_code": "varchar(64)",
-        "billing_code": "varchar(64)",
-        "billing_code_type": "varchar(64)",
-        "procedure_name": "varchar",
-        "procedure_description": "varchar",
-        "procedure_display_name": "varchar",
-        "rate_pack_hash": "varchar(64)",
-        "provider_set_hash": "varchar(64)",
-        "provider_set_hashes": "varchar[]",
-        "provider_count": "integer",
-        "provider_set_count": "integer",
-        "price_set_hash": "varchar(64)",
-        "source_trace_set_hash": "varchar(64)",
-        "network_names": "varchar[]",
-        "confidence_code": "varchar(64)",
-        "prices": "json",
-        "source_trace": "json",
-        "confidence": "json",
-    }
-    for column_name, column_type in column_types_by_name.items():
+    for column_name, column_type in _RATE_STAGE_COLUMN_TYPES.items():
         try:
             async with db.transaction():
                 await db.status(

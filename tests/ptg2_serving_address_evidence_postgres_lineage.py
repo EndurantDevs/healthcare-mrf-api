@@ -22,12 +22,14 @@ async def _fetch_provenance(
     admitted_source_ids: list[int],
     *,
     use_stored_only: bool = False,
+    strict_stored_identity: bool = False,
 ):
     return await database.all(
         _schema_sql(serving._ADDRESS_PROVENANCE_SQL, schema),
         location_keys=location_keys,
         admitted_source_ids=admitted_source_ids,
         stored_only=use_stored_only,
+        strict_stored_identity=use_stored_only or strict_stored_identity,
     )
 
 

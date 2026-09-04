@@ -426,6 +426,104 @@ def _validate_file_metadata(
         raise RuntimeError(f"strict V3 {label} entry metadata does not match its file")
 
 
+def _validated_source_run_descriptor(
+    entry: dict[str, Any],
+    identity: SharedPhysicalArtifactIdentity,
+    expected_partition_count: int,
+) -> tuple[int, int, int, dict[str, Any]]:
+    _validate_file_metadata(
+        entry,
+        label="serving-run",
+        expected_format=PTG2_V3_SERVING_RUN_FORMAT,
+        expected_version=PTG2_V3_SERVING_RUN_VERSION,
+    )
+    partition_count = _required_non_negative_integer(
+        entry.get("partition_count"), field_name="serving-run partition_count"
+    )
+    partition = _required_non_negative_integer(
+        entry.get("partition"), field_name="serving-run partition"
+    )
+    if partition_count != expected_partition_count or partition >= expected_partition_count:
+        raise RuntimeError(
+            "strict V3 serving-run partition metadata disagrees with scanner config"
+        )
+    row_count = _required_non_negative_integer(
+        entry.get("row_count"), field_name="serving-run row_count"
+    )
+    byte_count = _required_non_negative_integer(
+        entry.get("bytes"), field_name="serving-run bytes"
+    )
+    if row_count * PTG2_V3_SERVING_RUN_RECORD_BYTES != byte_count:
+        raise RuntimeError(
+            "strict V3 serving-run row and byte counts are inconsistent"
+        )
+    file_sha256 = _required_sha256(
+        entry.get("sha256"), field_name="serving-run sha256"
+    )
+    for field_name, expected_value in identity.as_dict().items():
+        observed_value = entry.setdefault(field_name, expected_value)
+        if observed_value != expected_value:
+            raise RuntimeError(
+                "strict V3 serving-run entry has conflicting physical identity"
+            )
+    entry["source_run_file_sha256"] = file_sha256
+    return partition, row_count, byte_count, {
+        "partition": partition,
+        "row_count": row_count,
+        "bytes": byte_count,
+        "sha256": file_sha256,
+    }
+
+
+def _source_run_contract(
+    identity: SharedPhysicalArtifactIdentity,
+    expected_partition_count: int,
+    partition_rows: list[int],
+    file_descriptors: list[dict[str, Any]],
+    scanner_summary: Mapping[str, Any],
+    total_rows: int,
+    total_bytes: int,
+) -> dict[str, Any]:
+    expected_file_count = _required_non_negative_integer(
+        scanner_summary.get("serving_run_files"),
+        field_name="scanner serving_run_files",
+    )
+    expected_row_count = _required_non_negative_integer(
+        scanner_summary.get("serving_run_rows"),
+        field_name="scanner serving_run_rows",
+    )
+    expected_byte_count = _required_non_negative_integer(
+        scanner_summary.get("serving_run_bytes"),
+        field_name="scanner serving_run_bytes",
+    )
+    if (
+        expected_file_count != len(file_descriptors)
+        or expected_row_count != total_rows
+        or expected_byte_count != total_bytes
+    ):
+        raise RuntimeError(
+            "strict V3 serving-run files do not match the scanner aggregate summary"
+        )
+    file_descriptors.sort(
+        key=lambda value: (
+            int(value["partition"]),
+            str(value["sha256"]),
+            int(value["row_count"]),
+            int(value["bytes"]),
+        )
+    )
+    return {
+        "version": PTG2_V3_SOURCE_RUN_CONTRACT_VERSION,
+        "source_identity": identity.as_dict(),
+        "partition_count": expected_partition_count,
+        "partition_rows": partition_rows,
+        "file_count": expected_file_count,
+        "row_count": expected_row_count,
+        "byte_count": expected_byte_count,
+        "files": file_descriptors,
+    }
+
+
 def attach_v3_source_run_contract(
     entries: Iterable[Mapping[str, Any]],
     *,
@@ -449,96 +547,26 @@ def attach_v3_source_run_contract(
     total_rows = 0
     total_bytes = 0
     for entry in normalized:
-        _validate_file_metadata(
-            entry,
-            label="serving-run",
-            expected_format=PTG2_V3_SERVING_RUN_FORMAT,
-            expected_version=PTG2_V3_SERVING_RUN_VERSION,
-        )
-        partition_count = _required_non_negative_integer(
-            entry.get("partition_count"), field_name="serving-run partition_count"
-        )
-        partition = _required_non_negative_integer(
-            entry.get("partition"), field_name="serving-run partition"
-        )
-        if (
-            partition_count != expected_partition_count
-            or partition >= expected_partition_count
-        ):
-            raise RuntimeError(
-                "strict V3 serving-run partition metadata disagrees with scanner config"
+        partition, row_count, byte_count, file_descriptor = (
+            _validated_source_run_descriptor(
+                entry,
+                identity,
+                expected_partition_count,
             )
-        row_count = _required_non_negative_integer(
-            entry.get("row_count"), field_name="serving-run row_count"
-        )
-        byte_count = _required_non_negative_integer(
-            entry.get("bytes"), field_name="serving-run bytes"
-        )
-        if row_count * PTG2_V3_SERVING_RUN_RECORD_BYTES != byte_count:
-            raise RuntimeError(
-                "strict V3 serving-run row and byte counts are inconsistent"
-            )
-        file_sha256 = _required_sha256(
-            entry.get("sha256"), field_name="serving-run sha256"
         )
         partition_rows[partition] += row_count
         total_rows += row_count
         total_bytes += byte_count
-        for field_name, expected_value in identity.as_dict().items():
-            observed_value = entry.setdefault(field_name, expected_value)
-            if observed_value != expected_value:
-                raise RuntimeError(
-                    "strict V3 serving-run entry has conflicting physical identity"
-                )
-        entry["source_run_file_sha256"] = file_sha256
-        file_descriptors.append(
-            {
-                "partition": partition,
-                "row_count": row_count,
-                "bytes": byte_count,
-                "sha256": file_sha256,
-            }
-        )
-
-    expected_file_count = _required_non_negative_integer(
-        scanner_summary.get("serving_run_files"),
-        field_name="scanner serving_run_files",
+        file_descriptors.append(file_descriptor)
+    source_contract_map = _source_run_contract(
+        identity,
+        expected_partition_count,
+        partition_rows,
+        file_descriptors,
+        scanner_summary,
+        total_rows,
+        total_bytes,
     )
-    expected_row_count = _required_non_negative_integer(
-        scanner_summary.get("serving_run_rows"),
-        field_name="scanner serving_run_rows",
-    )
-    expected_byte_count = _required_non_negative_integer(
-        scanner_summary.get("serving_run_bytes"),
-        field_name="scanner serving_run_bytes",
-    )
-    if (
-        expected_file_count != len(normalized)
-        or expected_row_count != total_rows
-        or expected_byte_count != total_bytes
-    ):
-        raise RuntimeError(
-            "strict V3 serving-run files do not match the scanner aggregate summary"
-        )
-
-    file_descriptors.sort(
-        key=lambda value: (
-            int(value["partition"]),
-            str(value["sha256"]),
-            int(value["row_count"]),
-            int(value["bytes"]),
-        )
-    )
-    source_contract_map = {
-        "version": PTG2_V3_SOURCE_RUN_CONTRACT_VERSION,
-        "source_identity": identity.as_dict(),
-        "partition_count": expected_partition_count,
-        "partition_rows": partition_rows,
-        "file_count": expected_file_count,
-        "row_count": expected_row_count,
-        "byte_count": expected_byte_count,
-        "files": file_descriptors,
-    }
     contract_sha256 = _canonical_json_sha256(source_contract_map)
     for entry in normalized:
         entry["source_run_contract_sha256"] = contract_sha256
@@ -1762,24 +1790,11 @@ def _validated_scratch_durability(
     return scratch_map
 
 
-def validate_v3_finalizer_summary(
-    summary_payload: Mapping[str, Any],
-    *,
-    expected_source_count: int | None = None,
-    expected_resource_configuration: Mapping[str, Any] | None = None,
-    expected_scratch_durability: str | None = None,
-) -> dict[str, Any]:
-    """Validate the strict finalizer contract and return a shallow summary copy."""
-
-    finalizer_summary_map = dict(summary_payload)
-    if finalizer_summary_map.get("format") != PTG2_V3_FINALIZER_FORMAT:
-        raise RuntimeError("strict V3 finalizer returned an incompatible summary")
-    if finalizer_summary_map.get("storage_generation") != PTG2_V3_SHARED_GENERATION:
-        raise RuntimeError("strict V3 finalizer returned another storage generation")
-    if finalizer_summary_map.get("cold_lookup_contract") != PTG2_V3_COLD_LOOKUP_CONTRACT:
-        raise RuntimeError("strict V3 finalizer returned another cold lookup contract")
-    if finalizer_summary_map.get("shared_block_layout") != PTG2_V3_SHARED_BLOCK_LAYOUT:
-        raise RuntimeError("strict V3 finalizer returned another shared block layout")
+def _validate_finalizer_runtime_contracts(
+    finalizer_summary_map: Mapping[str, Any],
+    expected_resource_configuration: Mapping[str, Any] | None,
+    expected_scratch_durability: str | None,
+) -> None:
     observed_resources = finalizer_summary_map.get("resource_configuration")
     normalized_observed_resources = (
         _validated_finalizer_resource_contract(
@@ -1818,14 +1833,9 @@ def validate_v3_finalizer_summary(
             observed_scratch_durability,
             expected_policy=observed_policy,
         )
-    source_count = _required_non_negative_integer(
-        finalizer_summary_map.get("source_count"), field_name="source_count"
-    )
-    if source_count <= 0 or (
-        expected_source_count is not None
-        and source_count != int(expected_source_count)
-    ):
-        raise RuntimeError("strict V3 finalizer returned an incompatible source_count")
+
+
+def _validate_finalizer_blocks(finalizer_summary_map: Mapping[str, Any]) -> None:
     blocks = finalizer_summary_map.get("blocks")
     if not isinstance(blocks, Mapping):
         raise RuntimeError("strict V3 finalizer summary is missing blocks")
@@ -1867,6 +1877,9 @@ def validate_v3_finalizer_summary(
             raise RuntimeError(
                 f"strict V3 finalizer {section_name} object markers are incompatible"
             )
+
+
+def _validate_finalizer_price_keys(finalizer_summary_map: Mapping[str, Any]) -> None:
     dense_keys = finalizer_summary_map.get("dense_keys")
     price_keys = dense_keys.get("price") if isinstance(dense_keys, Mapping) else None
     price_key_map = finalizer_summary_map.get("price_key_map")
@@ -1891,6 +1904,41 @@ def validate_v3_finalizer_summary(
         != "minimum_negotiated_rate_then_global_id_128_v1"
     ):
         raise RuntimeError("strict V3 finalizer returned an incompatible price-key map")
+
+
+def validate_v3_finalizer_summary(
+    summary_payload: Mapping[str, Any],
+    *,
+    expected_source_count: int | None = None,
+    expected_resource_configuration: Mapping[str, Any] | None = None,
+    expected_scratch_durability: str | None = None,
+) -> dict[str, Any]:
+    """Validate the strict finalizer contract and return a shallow summary copy."""
+
+    finalizer_summary_map = dict(summary_payload)
+    if finalizer_summary_map.get("format") != PTG2_V3_FINALIZER_FORMAT:
+        raise RuntimeError("strict V3 finalizer returned an incompatible summary")
+    if finalizer_summary_map.get("storage_generation") != PTG2_V3_SHARED_GENERATION:
+        raise RuntimeError("strict V3 finalizer returned another storage generation")
+    if finalizer_summary_map.get("cold_lookup_contract") != PTG2_V3_COLD_LOOKUP_CONTRACT:
+        raise RuntimeError("strict V3 finalizer returned another cold lookup contract")
+    if finalizer_summary_map.get("shared_block_layout") != PTG2_V3_SHARED_BLOCK_LAYOUT:
+        raise RuntimeError("strict V3 finalizer returned another shared block layout")
+    _validate_finalizer_runtime_contracts(
+        finalizer_summary_map,
+        expected_resource_configuration,
+        expected_scratch_durability,
+    )
+    source_count = _required_non_negative_integer(
+        finalizer_summary_map.get("source_count"), field_name="source_count"
+    )
+    if source_count <= 0 or (
+        expected_source_count is not None
+        and source_count != int(expected_source_count)
+    ):
+        raise RuntimeError("strict V3 finalizer returned an incompatible source_count")
+    _validate_finalizer_blocks(finalizer_summary_map)
+    _validate_finalizer_price_keys(finalizer_summary_map)
     return finalizer_summary_map
 
 
@@ -2136,21 +2184,12 @@ async def _communicate_with_finalizer_progress(
         await _await_cleanup_task(progress_task)
 
 
-async def run_v3_direct_finalizer(
-    *,
+def _validated_v3_finalizer_inputs(
     work_directory: str | Path,
-    serving_run_entries: Iterable[Mapping[str, Any]],
-    code_dictionary_entries: Iterable[Mapping[str, Any]],
-    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
-    expected_source_identities: Iterable[
-        Mapping[str, Any] | SharedPhysicalArtifactIdentity
-    ],
     price_key_map_input: str | Path,
     price_key_map_row_count: int,
-    scratch_durability: str = PTG2_V3_DURABLE_SCRATCH_DURABILITY,
-) -> dict[str, Any]:
-    """Run the bounded Rust external-sort/finalize path without Python row materialization."""
-
+    scratch_durability: str,
+) -> tuple[V3FinalizerResourceConfiguration, Path, Path, Path, Path]:
     if scratch_durability not in {
         PTG2_V3_DURABLE_SCRATCH_DURABILITY,
         PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
@@ -2174,16 +2213,24 @@ async def run_v3_direct_finalizer(
         raise RuntimeError("strict V3 finalization requires a non-empty price-key map")
     if int(price_key_map_row_count) <= 0:
         raise RuntimeError("strict V3 finalization requires a positive price-key map row count")
-    manifest_path = write_v3_finalizer_input_manifest(
-        work_root / "scanner-summary.json",
-        serving_run_entries=serving_run_entries,
-        code_dictionary_entries=code_dictionary_entries,
-        provider_set_metadata_entries=provider_set_metadata_entries,
-        expected_source_identities=expected_source_identities,
-        resource_configuration=resource_configuration,
+    return (
+        resource_configuration,
+        binary,
+        work_root,
+        output_directory,
+        price_key_map_path,
     )
-    manifest_payload = json.loads(manifest_path.read_text(encoding="ascii"))
-    expected_source_count = int(manifest_payload["source_count"])
+
+
+def _v3_finalizer_command_args(
+    binary: Path,
+    output_directory: Path,
+    price_key_map_path: Path,
+    price_key_map_row_count: int,
+    scratch_durability: str,
+    resource_configuration: V3FinalizerResourceConfiguration,
+    manifest_path: Path,
+) -> list[str]:
     command_args = [
         str(binary),
         "--finalize-v3-runs",
@@ -2197,6 +2244,65 @@ async def run_v3_direct_finalizer(
         *resource_configuration.command_arguments(),
     ]
     command_args.append(str(manifest_path))
+    return command_args
+
+
+def _validated_v3_finalizer_result(
+    stdout: bytes,
+    expected_source_count: int,
+    resource_configuration: V3FinalizerResourceConfiguration,
+    scratch_durability: str,
+    output_directory: Path,
+) -> dict[str, Any]:
+    summary = validate_v3_finalizer_summary(
+        parse_v3_finalizer_stdout(stdout),
+        expected_source_count=expected_source_count,
+        expected_resource_configuration=resource_configuration.contract_metadata(),
+        expected_scratch_durability=scratch_durability,
+    )
+    if (
+        Path(str(summary.get("output_directory") or "")).resolve()
+        != output_directory.resolve()
+    ):
+        raise RuntimeError("strict V3 finalizer reported another output directory")
+    summary["resource_validation"] = resource_configuration.validation_metadata()
+    return summary
+
+
+async def _cleanup_failed_finalizer_process(
+    spawn_task: asyncio.Task[asyncio.subprocess.Process] | None,
+    process: asyncio.subprocess.Process | None,
+    manifest_path: Path,
+    output_directory: Path,
+) -> None:
+    if process is None and spawn_task is not None:
+        try:
+            process = await _await_cleanup_task(spawn_task)
+        except BaseException:
+            process = None
+    process_id = int(process.pid) if process is not None else None
+    try:
+        if process is not None:
+            termination_task = asyncio.create_task(
+                _terminate_asyncio_subprocess_group(process)
+            )
+            await _await_cleanup_task(termination_task)
+    finally:
+        _cleanup_unacknowledged_finalizer_attempt(
+            manifest_path=manifest_path,
+            output_directory=output_directory,
+            process_id=process_id,
+        )
+
+
+async def _execute_v3_finalizer(
+    command_args: list[str],
+    output_directory: Path,
+    manifest_path: Path,
+    expected_source_count: int,
+    resource_configuration: V3FinalizerResourceConfiguration,
+    scratch_durability: str,
+) -> dict[str, Any]:
     process: asyncio.subprocess.Process | None = None
     spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
     try:
@@ -2219,43 +2325,77 @@ async def run_v3_direct_finalizer(
                 "strict V3 Rust finalizer failed with exit "
                 f"{process.returncode}: {stderr_text}"
             )
-        summary = validate_v3_finalizer_summary(
-            parse_v3_finalizer_stdout(stdout),
-            expected_source_count=expected_source_count,
-            expected_resource_configuration=(
-                resource_configuration.contract_metadata()
-            ),
-            expected_scratch_durability=(
-                scratch_durability
-            ),
+        return _validated_v3_finalizer_result(
+            stdout,
+            expected_source_count,
+            resource_configuration,
+            scratch_durability,
+            output_directory,
         )
-        if (
-            Path(str(summary.get("output_directory") or "")).resolve()
-            != output_directory.resolve()
-        ):
-            raise RuntimeError("strict V3 finalizer reported another output directory")
-        summary["resource_validation"] = resource_configuration.validation_metadata()
-        return summary
     except BaseException:
-        if process is None and spawn_task is not None:
-            try:
-                process = await _await_cleanup_task(spawn_task)
-            except BaseException:
-                process = None
-        process_id = int(process.pid) if process is not None else None
-        try:
-            if process is not None:
-                termination_task = asyncio.create_task(
-                    _terminate_asyncio_subprocess_group(process)
-                )
-                await _await_cleanup_task(termination_task)
-        finally:
-            _cleanup_unacknowledged_finalizer_attempt(
-                manifest_path=manifest_path,
-                output_directory=output_directory,
-                process_id=process_id,
-            )
+        await _cleanup_failed_finalizer_process(
+            spawn_task,
+            process,
+            manifest_path,
+            output_directory,
+        )
         raise
+
+
+async def run_v3_direct_finalizer(
+    *,
+    work_directory: str | Path,
+    serving_run_entries: Iterable[Mapping[str, Any]],
+    code_dictionary_entries: Iterable[Mapping[str, Any]],
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
+    expected_source_identities: Iterable[
+        Mapping[str, Any] | SharedPhysicalArtifactIdentity
+    ],
+    price_key_map_input: str | Path,
+    price_key_map_row_count: int,
+    scratch_durability: str = PTG2_V3_DURABLE_SCRATCH_DURABILITY,
+) -> dict[str, Any]:
+    """Run the bounded Rust external-sort/finalize path without Python row materialization."""
+
+    (
+        resource_configuration,
+        binary,
+        work_root,
+        output_directory,
+        price_key_map_path,
+    ) = _validated_v3_finalizer_inputs(
+        work_directory,
+        price_key_map_input,
+        price_key_map_row_count,
+        scratch_durability,
+    )
+    manifest_path = write_v3_finalizer_input_manifest(
+        work_root / "scanner-summary.json",
+        serving_run_entries=serving_run_entries,
+        code_dictionary_entries=code_dictionary_entries,
+        provider_set_metadata_entries=provider_set_metadata_entries,
+        expected_source_identities=expected_source_identities,
+        resource_configuration=resource_configuration,
+    )
+    manifest_payload = json.loads(manifest_path.read_text(encoding="ascii"))
+    expected_source_count = int(manifest_payload["source_count"])
+    command_args = _v3_finalizer_command_args(
+        binary,
+        output_directory,
+        price_key_map_path,
+        price_key_map_row_count,
+        scratch_durability,
+        resource_configuration,
+        manifest_path,
+    )
+    return await _execute_v3_finalizer(
+        command_args,
+        output_directory,
+        manifest_path,
+        expected_source_count,
+        resource_configuration,
+        scratch_durability,
+    )
 
 
 __all__ = [

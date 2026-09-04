@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+import pytest
+
 from tests.ptg2_serving_address_evidence_postgres_geo import (
     test_knn_template_executes_precedence_and_empty_probe_shape,
     test_optimized_membership_rejects_npi_wide_cms_anchor,
@@ -35,6 +37,7 @@ from tests.ptg2_serving_address_evidence_postgres_spatial import (
     test_state_city_membership_rejects_evidenced_postal_boxes,
 )
 from tests.ptg2_serving_address_evidence_postgres_lineage import (
+    _fetch_provenance,
     test_admitted_mrf_recovers_specific_lineage_without_fabrication,
     test_admitted_source_never_falls_back_to_generic_materialization,
     test_incomplete_specific_and_source_zero_are_not_public_lineage,
@@ -43,6 +46,7 @@ from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_stored_compact_run_date_is_complete_without_timestamps,
     test_stored_only_lineage_does_not_consult_live_mrf_fallback,
 )
+from tests.ptg2_serving_address_evidence_postgres_support import _temporary_schema
 from tests.ptg2_serving_address_evidence_postgres_ranking import (
     test_optimized_membership_requires_distinct_normalized_mrf_issuers,
     test_optimized_membership_uses_location_key_as_final_tie_breaker,
@@ -60,6 +64,47 @@ def _is_valid_npi_check_digit(npi_text: str) -> bool:
                 digit -= 9
         checksum_total += digit
     return checksum_total % 10 == 0
+
+
+@pytest.mark.asyncio
+async def test_live_fallback_rejects_mismatched_stored_identity_without_live_row():
+    async with _temporary_schema() as (database, schema):
+        await database.status(
+            f"""
+            INSERT INTO {schema}.entity_address_unified (
+                location_key, npi, address_key, premise_key, address_sources
+            ) VALUES (
+                'stale-identity', 1990000015,
+                '00000000-0000-0000-0000-000000000001',
+                '10000000-0000-0000-0000-000000000001',
+                ARRAY['nppes']::varchar[]
+            )
+            """
+        )
+        await database.status(
+            f"""
+            INSERT INTO {schema}.entity_address_evidence (
+                evidence_id, location_key, address_key, premise_key, npi,
+                source_id, source_record_key, source_run_id, observed_at
+            ) VALUES (
+                4, 'stale-identity',
+                '00000000-0000-0000-0000-000000000002',
+                '10000000-0000-0000-0000-000000000002',
+                1990000023, 1, 'nppes:stale', '20260731',
+                '2026-07-31T00:00:00Z'
+            )
+            """
+        )
+
+        provenance_rows = await _fetch_provenance(
+            database,
+            schema,
+            ["stale-identity"],
+            [1],
+            strict_stored_identity=True,
+        )
+
+        assert provenance_rows == []
 
 
 def test_fixture_npis_are_deliberately_checksum_invalid():
