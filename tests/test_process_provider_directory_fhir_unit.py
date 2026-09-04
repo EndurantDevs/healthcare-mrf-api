@@ -2857,7 +2857,7 @@ def test_idaho_medicaid_supports_durable_pagination_checkpoints():
     )
 
 
-def test_michigan_probe_only_source_supports_opaque_cursor_checkpoints():
+def test_michigan_source_supports_opaque_cursor_checkpoints():
     source_lookup = importer._source_row_from_seed(
         {
             "id": "michigan",

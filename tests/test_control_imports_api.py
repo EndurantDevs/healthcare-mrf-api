@@ -4265,21 +4265,21 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (39, 24, 26)
+    ) == (39, 25, 27)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 24
+    assert len(runnable_items) == 25
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
         for entry in runnable_items
     )
-    assert len(nonrunnable_items) == 15
+    assert len(nonrunnable_items) == 14
     probe_items = [
         entry
         for entry in nonrunnable_items
         if entry["classification"] == "probe_only"
     ]
-    assert len(probe_items) == 14
+    assert len(probe_items) == 13
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert probe_by_id["capital-blue-cross"]["resources"] == []
@@ -4296,8 +4296,9 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         runnable_by_id["uhc-provider-files"]["resources"]
         == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     )
-    assert probe_by_id["michigan"]["resources"] == []
-    assert probe_by_id["michigan"]["supported_resources"] == [
+    michigan = runnable_by_id["michigan"]
+    assert michigan["resource_profile"] == "M5"
+    assert michigan["resources"] == michigan["supported_resources"] == [
         "Location", "Organization", "OrganizationAffiliation", "Practitioner",
         "PractitionerRole",
     ]

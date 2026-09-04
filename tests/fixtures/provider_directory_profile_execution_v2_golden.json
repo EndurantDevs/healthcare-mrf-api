@@ -3,7 +3,7 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "3fbb74d8774af411041c610749182a942bca9b6867235007a25a02f327c37bda",
+      "attestation_id": "fb19cda5a6e975de961cee2f3690b0159cd4f76384be36508e0c4635f42a8f03",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
@@ -24,7 +24,7 @@
       "issued_at": "2026-07-30T12:00:01Z",
       "key_id": "capacity-key-2026-07",
       "max_build_deadline": "2026-07-30T12:55:00Z",
-      "nonce": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+      "nonce": "1e37d1bce5308cdb9111450b41be8015107672770c78b4c9ccc67839551083d1",
       "observed_at": "2026-07-30T12:00:00Z",
       "reservation_id": "pd-capacity-reservation-7",
       "runtime_witness": {
@@ -66,11 +66,11 @@
             "generation": 11,
             "materialization_mode": "source_delta",
             "operation": "publish",
-            "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+            "profile_input_digest": "1ecae03dd88923b147d2fc8b82ae10365af63c1a0b18d70f49e5ca51d1da3275",
             "profile_schema_version": 1,
             "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
             "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
-            "selection_proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+            "selection_proof_id": "faad55132125c53feee2eb2440906561d2d391e25684bab91877980961b5f5c7",
             "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
           },
           "quiescence": {
@@ -80,13 +80,13 @@
             "followup_preimage_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
           },
           "quiescence_sha256": "05f35c4d363c20b2e426fb1511e6143d52696db6ebcc89695058e7beaf7aa1ba",
-          "receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+          "receipt_sha256": "abbc85c194621930abd35d703cf39a1e353f3823855e1ff080fb20f5cdf87fa6",
           "request_contract_id": "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v1",
           "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222",
-          "request_sha256": "86d9da554574984b79146a5d41de9bbea76aa020490dd08e49543089756769dd",
+          "request_sha256": "ede8dd281c665ee41b6e57495f0c0b7ae664c6a50d8c6eaeaa9bb0ea865d83c3",
           "storage_observation_sha256": "44d9973fe27ae20acfed91ee82c01b4a8c57dcd8a6291435599f220a3257ef0f"
         },
-        "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+        "control_plane_receipt_sha256": "abbc85c194621930abd35d703cf39a1e353f3823855e1ff080fb20f5cdf87fa6",
         "control_plane_request": {
           "contract_id": "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v1",
           "profile_execution": {
@@ -113,10 +113,10 @@
                   "source_id": "synthetic_profile_source"
                 }
               ],
-              "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+              "profile_input_digest": "1ecae03dd88923b147d2fc8b82ae10365af63c1a0b18d70f49e5ca51d1da3275",
               "profile_schema_version": 1,
               "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
-              "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+              "proof_id": "faad55132125c53feee2eb2440906561d2d391e25684bab91877980961b5f5c7",
               "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
               "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
             },
@@ -230,7 +230,7 @@
             ]
           }
         },
-        "control_plane_request_sha256": "86d9da554574984b79146a5d41de9bbea76aa020490dd08e49543089756769dd",
+        "control_plane_request_sha256": "ede8dd281c665ee41b6e57495f0c0b7ae664c6a50d8c6eaeaa9bb0ea865d83c3",
         "healthcare_preflight_path": "/control/provider-directory/profile-capacity-preflight",
         "healthcare_receipt": {
           "artifact_scope_projection": {
@@ -310,7 +310,7 @@
           },
           "capacity_limits_sha256": "0019cd18a238d6abd97c1b72ef795bb00d6612b92cac06e28a8318885af8980e",
           "contract_id": "healthporta.provider-directory-profile-capacity-preflight.v3",
-          "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+          "control_plane_receipt_sha256": "abbc85c194621930abd35d703cf39a1e353f3823855e1ff080fb20f5cdf87fa6",
           "expires_at": "2026-07-30T13:00:00Z",
           "issued_at": "2026-07-30T12:00:02Z",
           "preflight_receipt_storage": {
@@ -321,11 +321,11 @@
             "generation": 11,
             "materialization_mode": "source_delta",
             "operation": "publish",
-            "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+            "profile_input_digest": "1ecae03dd88923b147d2fc8b82ae10365af63c1a0b18d70f49e5ca51d1da3275",
             "profile_schema_version": 1,
             "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
             "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
-            "selection_proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+            "selection_proof_id": "faad55132125c53feee2eb2440906561d2d391e25684bab91877980961b5f5c7",
             "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
           },
           "quiescence": {
@@ -351,10 +351,10 @@
             "unexpired_capacity_consumption_count": 0
           },
           "quiescence_sha256": "d84740c620131557b964373a3aab900ce8d4220d1289fb703f0dee762e864831",
-          "receipt_sha256": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+          "receipt_sha256": "1e37d1bce5308cdb9111450b41be8015107672770c78b4c9ccc67839551083d1",
           "request_contract_id": "healthporta.provider-directory-profile-capacity-preflight-request.v3",
           "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222",
-          "request_sha256": "8cd692e49d3c0a0262a5ab9546c8f74bf138e187e042d5c9f1559033b71d122f",
+          "request_sha256": "a430ddbf1dc85538bd3ba5b5ca89ccddc851f46d3a9e413389c237f3423c247d",
           "required_reservation_bytes_by_storage_class": {
             "data": 180000000000,
             "temp": 20000000000,
@@ -369,7 +369,7 @@
           },
           "serving_generation_preflight_sha256": "603d042d46aa40c819a1ef4d36b5fd3297d635853425114f5def825bba79a111"
         },
-        "healthcare_receipt_sha256": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+        "healthcare_receipt_sha256": "1e37d1bce5308cdb9111450b41be8015107672770c78b4c9ccc67839551083d1",
         "healthcare_request": {
           "contract_id": "healthporta.provider-directory-profile-capacity-preflight-request.v3",
           "profile_execution": {
@@ -396,10 +396,10 @@
                   "source_id": "synthetic_profile_source"
                 }
               ],
-              "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+              "profile_input_digest": "1ecae03dd88923b147d2fc8b82ae10365af63c1a0b18d70f49e5ca51d1da3275",
               "profile_schema_version": 1,
               "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
-              "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+              "proof_id": "faad55132125c53feee2eb2440906561d2d391e25684bab91877980961b5f5c7",
               "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
               "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
             },
@@ -479,16 +479,16 @@
           },
           "signing_guard": {
             "contract_id": "healthporta.provider-directory-profile-capacity-signing-guard-request.v1",
-            "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+            "control_plane_receipt_sha256": "abbc85c194621930abd35d703cf39a1e353f3823855e1ff080fb20f5cdf87fa6",
             "expires_at": "2026-07-30T13:00:00Z",
             "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222"
           }
         },
-        "healthcare_request_sha256": "8cd692e49d3c0a0262a5ab9546c8f74bf138e187e042d5c9f1559033b71d122f",
+        "healthcare_request_sha256": "a430ddbf1dc85538bd3ba5b5ca89ccddc851f46d3a9e413389c237f3423c247d",
         "held_followup_preimage_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
         "storage_observation_sha256": "44d9973fe27ae20acfed91ee82c01b4a8c57dcd8a6291435599f220a3257ef0f"
       },
-      "signing_preflight_guard_sha256": "936d1324312013cd91c1b0a1a6e5179b152d3a3671c65c204775f7cb4abeb4f6",
+      "signing_preflight_guard_sha256": "57272bff44e0909ec74309c4f5243475a4add19cdbfde838e6741f266469d86b",
       "tablespaces": [
         {
           "tablespace_name": "pg_default",
@@ -527,7 +527,7 @@
         }
       ]
     },
-    "signature": "D66CnjiNbUFKzcOhXkF_BD1cWgU40NTFs8a6hOAIPaab8povgErkdqwf5o0e8uEuw6XRH7azwMV8CCXu3I1_BA"
+    "signature": "tcOktPtWqaJBHOhCFJiExwV3yqIrGhLqFP3NF-3Z8jPNMz9NIqCbTtZM0TAXX-cr8qePAIC0I3ibrehBUNjKDA"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,
@@ -549,10 +549,10 @@
         "source_id": "synthetic_profile_source"
       }
     ],
-    "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+    "profile_input_digest": "1ecae03dd88923b147d2fc8b82ae10365af63c1a0b18d70f49e5ca51d1da3275",
     "profile_schema_version": 1,
     "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
-    "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+    "proof_id": "faad55132125c53feee2eb2440906561d2d391e25684bab91877980961b5f5c7",
     "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
     "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
   },
