@@ -123,6 +123,15 @@ _STALE_WORKER_RECONCILIATION_FIELDS = frozenset(
         "expected_attempt_started_at",
     }
 )
+_TERMINAL_QUEUE_RESIDUE_FIELDS = frozenset(
+    {"expected_importer", "expected_status"}
+)
+_ARQ_EVIDENCE_KEY_PREFIXES = (
+    ("job", job_key_prefix),
+    ("retry", retry_key_prefix),
+    ("in_progress", in_progress_key_prefix),
+    ("result", result_key_prefix),
+)
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
@@ -1774,8 +1783,15 @@ def _stale_worker_receipt(
     }
 
 
+def _arq_evidence_keys(job_id: str) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (field, prefix + job_id) for field, prefix in _ARQ_EVIDENCE_KEY_PREFIXES
+    )
+
+
 async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     _run_id, _importer, queue, job_id = _reconciliation_arq_identity(run)
+    arq_keys_by_field = _arq_evidence_keys(job_id)
     redis_pool = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
@@ -1784,19 +1800,21 @@ async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     try:
         async with redis_pool.pipeline(transaction=True) as pipe:
             pipe.zscore(queue, job_id)
-            pipe.exists(job_key_prefix + job_id)
-            pipe.exists(retry_key_prefix + job_id)
-            pipe.exists(in_progress_key_prefix + job_id)
-            pipe.exists(result_key_prefix + job_id)
-            queue_score, job, retry, in_progress, result = await pipe.execute()
+            for _field, key in arq_keys_by_field:
+                pipe.exists(key)
+            queue_score, *presence_flags = await pipe.execute()
     finally:
         await redis_pool.aclose(close_connection_pool=True)
     return {
         "queue_member": queue_score is not None,
-        "job": bool(job),
-        "retry": bool(retry),
-        "in_progress": bool(in_progress),
-        "result": bool(result),
+        **{
+            field: bool(is_present)
+            for (field, _key), is_present in zip(
+                arq_keys_by_field,
+                presence_flags,
+                strict=True,
+            )
+        },
     }
 
 
@@ -2057,6 +2075,223 @@ async def reconcile_stale_worker_failure(
             exc_info=True,
         )
     return _stale_worker_receipt(public_run_by_field, reconciled=True)
+
+
+def _validated_terminal_queue_residue_request(
+    payload: dict[str, Any],
+) -> dict[str, str]:
+    if type(payload) is not dict or set(payload) != _TERMINAL_QUEUE_RESIDUE_FIELDS:
+        raise ValueError(
+            "request must contain exactly expected_importer and expected_status"
+        )
+    if any(
+        type(payload.get(name)) is not str
+        or not payload[name]
+        or payload[name] != payload[name].strip()
+        for name in _TERMINAL_QUEUE_RESIDUE_FIELDS
+    ):
+        raise ValueError("expected_importer and expected_status must be non-empty strings")
+    return payload
+
+
+def _terminal_queue_residue_identity(
+    run: dict[str, Any],
+    expected: dict[str, str],
+) -> tuple[str, str, str, str]:
+    if run.get("importer") != expected["expected_importer"]:
+        raise StaleWorkerReconciliationConflict(
+            "importer changed during queue residue reconciliation"
+        )
+    if run.get("status") != expected["expected_status"]:
+        raise StaleWorkerReconciliationConflict(
+            "run status changed during queue residue reconciliation"
+        )
+    if run.get("status") not in TERMINAL_STATUSES:
+        raise StaleWorkerReconciliationConflict("run is not terminal")
+    if run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS:
+        raise StaleWorkerReconciliationConflict(
+            "importer does not support deterministic queue residue reconciliation"
+        )
+    run_id, importer, queue, job_id = _reconciliation_arq_identity(run)
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    persisted_queue = str(metrics.get("queue") or "").strip()
+    if persisted_queue and persisted_queue != queue:
+        raise StaleWorkerReconciliationConflict(
+            "persisted worker queue conflicts with importer adapter"
+        )
+    return run_id, importer, queue, job_id
+
+
+def _terminal_queue_residue_receipt(
+    run: dict[str, Any],
+    *,
+    queue: str,
+    job_id: str,
+    evidence_by_field: dict[str, bool],
+    was_removed: bool,
+) -> dict[str, Any]:
+    has_residue = evidence_by_field["queue_member"]
+    return {
+        "run_id": run["run_id"],
+        "importer": run["importer"],
+        "status": run["status"],
+        "queue": queue,
+        "job_id": job_id,
+        "residue_found": has_residue,
+        "removed": was_removed,
+        "already_absent": not has_residue,
+        "evidence": evidence_by_field,
+    }
+
+
+async def _reconcile_terminal_queue_member(
+    pipe: Any,
+    run: dict[str, Any],
+    queue: str,
+    job_id: str,
+    arq_keys_by_field: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    arq_keys = tuple(key for _field, key in arq_keys_by_field)
+    await pipe.watch(queue, *arq_keys)
+    has_queue_member = await pipe.zscore(queue, job_id) is not None
+    arq_key_presence_flags = [bool(await pipe.exists(key)) for key in arq_keys]
+    evidence_by_field = {
+        "queue_member": has_queue_member,
+        **{
+            field: is_present
+            for (field, _key), is_present in zip(
+                arq_keys_by_field,
+                arq_key_presence_flags,
+                strict=True,
+            )
+        },
+    }
+    has_executable_arq_state = any(
+        evidence_by_field[field] for field in ("job", "retry", "in_progress")
+    )
+    if has_executable_arq_state or (
+        has_queue_member and evidence_by_field["result"]
+    ):
+        raise StaleWorkerReconciliationConflict(
+            "ARQ job state is present; refusing queue residue reconciliation"
+        )
+    # A worker that selected the member before this ZREM cannot invoke the
+    # importer without the job payload. It may record a terminal failure result;
+    # with no queue/job/retry/in-progress state, that is safe absent evidence.
+    pipe.multi()
+    if not has_queue_member:
+        pipe.ping()
+        await pipe.execute()
+        return _terminal_queue_residue_receipt(
+            run,
+            queue=queue,
+            job_id=job_id,
+            evidence_by_field=evidence_by_field,
+            was_removed=False,
+        )
+    pipe.zrem(queue, job_id)
+    transaction_results = await pipe.execute()
+    if transaction_results != [1]:
+        raise StaleWorkerReconciliationConflict(
+            "exact queue residue was not removed"
+        )
+    return _terminal_queue_residue_receipt(
+        run,
+        queue=queue,
+        job_id=job_id,
+        evidence_by_field=evidence_by_field,
+        was_removed=True,
+    )
+
+
+async def _reconcile_terminal_queue_member_from_pool(
+    redis_pool: Any,
+    run: dict[str, Any],
+    queue: str,
+    job_id: str,
+    arq_keys_by_field: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    async with redis_pool.pipeline(transaction=True) as pipe:
+        return await _reconcile_terminal_queue_member(
+            pipe,
+            run,
+            queue,
+            job_id,
+            arq_keys_by_field,
+        )
+
+
+async def _remove_terminal_queue_residue(
+    run: dict[str, Any],
+    expected: dict[str, str],
+) -> dict[str, Any]:
+    _run_id, _importer, queue, job_id = _terminal_queue_residue_identity(
+        run, expected
+    )
+    arq_keys_by_field = _arq_evidence_keys(job_id)
+    redis_settings = build_redis_settings()
+    redis_pool = None
+    reconciliation_task = None
+    try:
+        async with asyncio.timeout(redis_settings.conn_timeout):
+            redis_pool = await create_pool(
+                redis_settings,
+                job_serializer=serialize_job,
+                job_deserializer=deserialize_job,
+            )
+            reconciliation_task = asyncio.create_task(
+                _reconcile_terminal_queue_member_from_pool(
+                    redis_pool,
+                    run,
+                    queue,
+                    job_id,
+                    arq_keys_by_field,
+                )
+            )
+            reconciliation_task.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
+            return await asyncio.shield(reconciliation_task)
+    except WatchError as exc:
+        raise StaleWorkerReconciliationConflict(
+            "ARQ state changed during reconciliation"
+        ) from exc
+    except StaleWorkerReconciliationConflict:
+        raise
+    except Exception as exc:
+        raise StaleWorkerReconciliationUnavailable(
+            "queue residue proof is unavailable"
+        ) from exc
+    finally:
+        if reconciliation_task is not None and not reconciliation_task.done():
+            reconciliation_task.cancel()
+        if redis_pool is not None:
+            try:
+                async with asyncio.timeout(redis_settings.conn_timeout):
+                    await redis_pool.aclose(close_connection_pool=True)
+            except Exception:
+                logger.warning("terminal queue residue Redis close failed", exc_info=True)
+
+
+async def reconcile_terminal_queue_residue(
+    run_id: str,
+    request_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Remove one exact terminal run's orphaned ARQ queue member."""
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("run_id is required")
+    expected_by_field = _validated_terminal_queue_residue_request(request_by_field)
+    async with db.acquire() as connection:
+        await acquire_control_run_worker_action_lock(connection, normalized_run_id)
+        run_by_field = await _locked_reconciliation_run(connection, normalized_run_id)
+        if run_by_field is None:
+            return None
+        return await _remove_terminal_queue_residue(
+            run_by_field,
+            expected_by_field,
+        )
 
 
 async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> dict[str, Any] | None:
