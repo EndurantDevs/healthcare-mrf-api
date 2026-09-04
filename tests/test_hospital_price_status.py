@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import sqlite3
 import sys
 import threading
 import types
@@ -60,6 +61,30 @@ def _load_module():
 
 
 status_api = _load_module()
+
+
+@pytest.mark.parametrize(
+    ("attestation_text", "expected_profile"),
+    [
+        (status_api._CMS_V2_ATTESTATION_TEXT, "cms-v2"),
+        (status_api._CMS_V3_ATTESTATION_TEXT, "cms-v3"),
+        (status_api._CMS_V3_ATTESTATION_TEXT + " malformed", None),
+    ],
+)
+def test_detected_schema_profile_sql_requires_exact_attestation(
+    attestation_text, expected_profile
+):
+    connection = sqlite3.connect(":memory:")
+    try:
+        detected_profile = connection.execute(
+            f"SELECT {status_api._DETECTED_SCHEMA_PROFILE_SQL} "
+            "FROM (SELECT ? AS attestation_text) AS version",
+            (attestation_text,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert detected_profile == expected_profile
 
 
 def test_invalid_schema_fails_at_module_load(monkeypatch):

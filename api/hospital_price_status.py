@@ -24,6 +24,32 @@ _ATTEMPT_STATUSES = frozenset(
         "unchanged", "failed", "superseded",
     }
 )
+_CMS_V2_ATTESTATION_TEXT = (
+    "To the best of its knowledge and belief, the hospital has included all "
+    "applicable standard charge information in accordance with the requirements "
+    "of 45 CFR 180.50, and the information encoded is true, accurate, and complete "
+    "as of the date indicated."
+)
+_CMS_V3_ATTESTATION_TEXT = (
+    "To the best of its knowledge and belief, this hospital has included all "
+    "applicable standard charge information in accordance with the requirements "
+    "of 45 CFR 180.50, and the information encoded is true, accurate, and complete "
+    "as of the date in the file. This hospital has included all payer-specific "
+    "negotiated charges in dollars that can be expressed as a dollar amount. For "
+    "payer-specific negotiated charges that cannot be expressed as a dollar amount "
+    "in the machine-readable file or not knowable in advance, the hospital attests "
+    "that the payer-specific negotiated charge is based on a contractual algorithm, "
+    "percentage or formula that precludes the provision of a dollar amount and has "
+    "provided all necessary information available to the hospital for the public to "
+    "be able to derive the dollar amount, including, but not limited to, the specific "
+    "fee schedule or components referenced in such percentage, algorithm or formula."
+)
+_DETECTED_SCHEMA_PROFILE_SQL = f"""
+CASE version.attestation_text
+  WHEN '{_CMS_V2_ATTESTATION_TEXT}' THEN 'cms-v2'
+  WHEN '{_CMS_V3_ATTESTATION_TEXT}' THEN 'cms-v3'
+END
+""".strip()
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _SCHEMA) is None:
     raise RuntimeError("hospital price database schema is invalid")
@@ -45,14 +71,7 @@ SELECT hospital.hospital_id,
        current.tax_identity_count,
        version.template_version,
        version.source_format,
-       CASE
-         WHEN version.attestation_text LIKE
-              'To the best of its knowledge and belief, this hospital has included%'
-           THEN 'cms-v3'
-         WHEN version.attestation_text LIKE
-              'To the best of its knowledge and belief, the hospital has included%'
-           THEN 'cms-v2'
-       END AS detected_schema_profile,
+       {_DETECTED_SCHEMA_PROFILE_SQL} AS detected_schema_profile,
        version.last_updated_on
   FROM {_SCHEMA}.hospital_price_hospital AS hospital
   LEFT JOIN {_SCHEMA}.hospital_price_current AS current
