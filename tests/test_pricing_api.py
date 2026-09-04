@@ -4823,7 +4823,7 @@ async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch
         args=RequestParameters(
             {
                 "plan_release_id": [selection.plan_release_id],
-                "mode": ["standard"],
+                "mode": ["product_search"],
                 "code_system": ["CPT"],
                 "code": ["27447"],
                 "state": ["MI"],
@@ -4844,8 +4844,56 @@ async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch
     assert {
         field_name: state_scan_args[field_name]
         for field_name in ("mode", "code_system", "code")
-    } == {"mode": "standard", "code_system": "CPT", "code": "27447"}
+    } == {"mode": "product_search", "code_system": "CPT", "code": "27447"}
     legacy_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_state_scan_rejects_invalid_mode_before_hydration(
+    monkeypatch,
+):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
+    state_scan = AsyncMock(return_value=_state_scan_response())
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(pricing_module, "search_plan_pricing_state_scan", state_scan)
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "mode": "unsupported",
+            "code_system": "CPT",
+            "code": "27447",
+            "state": "MI",
+            "order_by": "npi",
+            "order": "asc",
+            "view": "full",
+            "include_providers": "true",
+            "include_allowed_amounts": "false",
+        },
+    )
+
+    with pytest.raises(pricing_module.InvalidUsage, match="mode"):
+        await list_providers_by_procedure(request)
+
+    state_scan.assert_not_awaited()
 
 
 @pytest.mark.asyncio

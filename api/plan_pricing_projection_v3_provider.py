@@ -94,12 +94,7 @@ _STAGE_TABLE_SQL = (
                 source_artifact_key bigint NOT NULL,
                 provider_count integer NOT NULL,
                 group_fragment jsonb NOT NULL,
-                occurrence_multiplicity bigint NOT NULL,
-                PRIMARY KEY (
-                    binding_ordinal, provider_set_key, provider_set_ref,
-                    price_key, price_set_ref, rate_pack_ref,
-                    source_artifact_key, group_fragment
-                )
+                occurrence_multiplicity bigint NOT NULL
             ) ON COMMIT DROP
     """,
     """

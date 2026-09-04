@@ -46,6 +46,9 @@ _STORE_OCCURRENCES_SQL = f"""
            price_set_ref, rate_pack_ref, source_artifact_key,
            provider_count, group_fragment, occurrence_multiplicity
       FROM plan_pricing_rate_occurrence_stage
+      JOIN plan_pricing_provider_set_stage membership
+        USING (binding_ordinal, provider_set_key)
+     WHERE membership.membership_count > 0
      ORDER BY binding_ordinal, provider_set_key, provider_set_ref,
               price_key, price_set_ref, rate_pack_ref,
               source_artifact_key, group_fragment::text

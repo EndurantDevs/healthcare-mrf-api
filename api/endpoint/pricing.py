@@ -12503,6 +12503,11 @@ async def list_providers_by_procedure(request):
     release_selection = None
     guard_release_selection = None
     release_selection_args_by_name = {}
+    if mode:
+        try:
+            normalize_ptg2_mode(mode)
+        except ValueError as exc:
+            raise InvalidUsage(str(exc)) from exc
     if is_state_scan:
         state_scan_args_by_name = {key: args.get(key) for key in args.keys()}
         release_selection = await resolve_plan_release_serving(
@@ -12651,11 +12656,6 @@ async def list_providers_by_procedure(request):
         release_selection_args_by_name = _release_selection_args_by_name(
             release_selection
         )
-    if mode:
-        try:
-            normalize_ptg2_mode(mode)
-        except ValueError as exc:
-            raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_order_by = order_by
         if (

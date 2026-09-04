@@ -89,6 +89,13 @@ def test_v4_rate_occurrence_omits_unretained_prices():
     assert list(occurrence.rate_occurrence_rows(_serving(), 0, [_occurrence()], set())) == []
 
 
+def test_v4_rate_occurrence_store_omits_empty_staged_provider_sets():
+    store_sql = " ".join(occurrence._STORE_OCCURRENCES_SQL.split())
+
+    assert "JOIN plan_pricing_provider_set_stage membership" in store_sql
+    assert "WHERE membership.membership_count > 0" in store_sql
+
+
 def _stored_occurrence(*, multiplicity=1):
     row = next(
         iter(
