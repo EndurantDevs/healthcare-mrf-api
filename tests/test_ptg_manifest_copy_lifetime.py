@@ -124,6 +124,7 @@ async def test_manifest_copy_cancellation_drains(is_repeated_cancel, caplog):
         assert stopped_paths == started_paths
         await asyncio.sleep(0)
         assert "exception was never retrieved" not in caplog.text
+        assert "exception in shielded future" not in caplog.text
     finally:
         release_copies.set()
         release_cleanup.set()
