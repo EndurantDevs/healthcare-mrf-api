@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ from api import plan_pricing_projection_contract as projection_contract
 from api import plan_pricing_projection_v3 as projection
 from api import plan_pricing_projection_v3_code as rate_profiles
 from api import plan_pricing_projection_v3_work as work_admission
+from api import plan_pricing_projection_v4_occurrence as rate_occurrences
 from api import ptg2_serving as serving
 from api.plan_pricing_projection_source import BindingProjection
 from api.plan_pricing_projection_v3_types import _BuildState
@@ -29,6 +31,83 @@ from tests.test_plan_pricing_projection_v3_differential_postgres import (
 
 _PROJECTION_ID = "d" * 64
 _PRICE_IDS = ("1" * 32, "2" * 32)
+
+
+def _large_occurrence_fragment() -> str:
+    description = "".join(
+        hashlib.sha256(index.to_bytes(2, "big")).hexdigest()
+        for index in range(90)
+    )
+    fragment = json.dumps(
+        {
+            "plan_id": "synthetic-plan",
+            "reported_code_system": "CPT",
+            "reported_code": "27447",
+            "source_procedure_description": description,
+        },
+        separators=(",", ":"),
+    )
+    assert 4_000 < len(fragment) < 8_192
+    return fragment
+
+
+async def _create_occurrence_target(connection, schema: str) -> None:
+    await connection.execute(
+        text(
+            f"""CREATE TABLE \"{schema}\".plan_pricing_rate_occurrence (
+                projection_id varchar(64) NOT NULL,
+                code_system varchar(16) NOT NULL,
+                code varchar(64) NOT NULL,
+                binding_ordinal integer NOT NULL,
+                occurrence_ordinal bigint NOT NULL,
+                provider_set_key bigint NOT NULL,
+                provider_set_ref varchar(32) NOT NULL,
+                price_key bigint NOT NULL,
+                price_set_ref varchar(32) NOT NULL,
+                rate_pack_ref varchar(32) NOT NULL,
+                source_artifact_key bigint NOT NULL,
+                provider_count integer NOT NULL,
+                group_fragment jsonb NOT NULL,
+                occurrence_multiplicity bigint NOT NULL
+            )"""
+        )
+    )
+
+
+async def _stage_occurrences(connection, group_fragment: str) -> None:
+    await connection.execute(
+        text(
+            """INSERT INTO plan_pricing_provider_set_stage
+               (binding_ordinal, provider_set_key, provider_set_id,
+                membership_count)
+               VALUES (0, 7, :empty_ref, 0), (0, 8, :member_ref, 1)"""
+        ),
+        {"empty_ref": "7" * 32, "member_ref": "8" * 32},
+    )
+    await connection.execute(
+        text(
+            """INSERT INTO plan_pricing_rate_occurrence_stage (
+                binding_ordinal, provider_set_key, provider_set_ref,
+                price_key, price_set_ref, rate_pack_ref, source_artifact_key,
+                provider_count, group_fragment, occurrence_multiplicity
+            ) VALUES (
+                0, :provider_set_key, :provider_set_ref,
+                9, :price_set_ref, :rate_pack_ref, 11,
+                :provider_count, CAST(:group_fragment AS jsonb), 1
+            )"""
+        ),
+        [
+            {
+                "provider_set_key": provider_set_key,
+                "provider_set_ref": str(provider_set_key) * 32,
+                "price_set_ref": "2" * 32,
+                "rate_pack_ref": "3" * 32,
+                "provider_count": membership_count,
+                "group_fragment": group_fragment,
+            }
+            for provider_set_key, membership_count in ((7, 0), (8, 1))
+        ],
+    )
 
 
 def _overflow_binding() -> BindingProjection:
@@ -106,6 +185,61 @@ async def _durable_projection_counts(connection, schema: str):
             )
         )
     return tuple(counts)
+
+
+@pytest.mark.asyncio
+async def test_v4_occurrence_stage_accepts_large_fragments_and_omits_empty_sets(
+    monkeypatch,
+    migrated_v3_database,
+) -> None:
+    """Exercise both occurrence-stage fixes against real PostgreSQL."""
+
+    database = migrated_v3_database
+    group_fragment = _large_occurrence_fragment()
+    state = _BuildState(hashlib.sha256())
+    async with database.engine.begin() as connection:
+        await _create_occurrence_target(connection, database.schema)
+        await projection._create_stage_tables(connection)
+        await _stage_occurrences(connection, group_fragment)
+        configured_target = projection_contract.table(
+            "plan_pricing_rate_occurrence"
+        )
+        test_target = (
+            f'"{database.schema}"."plan_pricing_rate_occurrence"'
+        )
+        monkeypatch.setattr(
+            rate_occurrences,
+            "_STORE_OCCURRENCES_SQL",
+            rate_occurrences._STORE_OCCURRENCES_SQL.replace(
+                configured_target, test_target
+            ),
+        )
+        monkeypatch.setattr(
+            rate_occurrences,
+            "_READ_OCCURRENCES_SQL",
+            rate_occurrences._READ_OCCURRENCES_SQL.replace(
+                configured_target, test_target
+            ),
+        )
+
+        await rate_occurrences.store_rate_occurrences(
+            connection,
+            "f" * 64,
+            ("CPT", "27447"),
+            state,
+        )
+        stored_rows = (
+            await connection.execute(
+                text(
+                    f"SELECT provider_set_key, group_fragment "
+                    f"FROM {test_target}"
+                )
+            )
+        ).mappings().all()
+
+    assert [stored_row["provider_set_key"] for stored_row in stored_rows] == [8]
+    assert stored_rows[0]["group_fragment"] == json.loads(group_fragment)
+    assert state.rate_occurrence_count == 1
 
 
 @pytest.mark.asyncio

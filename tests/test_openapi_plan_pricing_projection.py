@@ -141,7 +141,12 @@ def test_openapi_documents_bounded_v4_state_scan_contract():
     assert operation["responses"]["422"]["content"]["application/json"][
         "schema"
     ] == {
-        "$ref": "#/components/schemas/PlanPricingStateScanBudgetRefusal"
+        "oneOf": [
+            {
+                "$ref": "#/components/schemas/PlanPricingStateScanBudgetRefusal"
+            },
+            {"$ref": "#/components/schemas/PlanPricingScopeRefusal"},
+        ]
     }
     assert operation["responses"]["422"]["headers"]["Cache-Control"] == {
         "$ref": "#/components/headers/BillingSearchCacheControl"
@@ -156,3 +161,35 @@ def test_openapi_documents_bounded_v4_state_scan_contract():
     assert refusal["properties"]["fix_it"]["properties"]["retry_options"][
         "maxItems"
     ] == 0
+
+
+def test_openapi_documents_legacy_scope_refusal_contract():
+    """Expose every structured legacy scope refusal and its sole retry."""
+
+    spec = _openapi_spec()
+    schemas = spec["components"]["schemas"]
+    scope_refusal = schemas["PlanPricingScopeRefusal"]
+    assert scope_refusal["properties"]["code"]["enum"] == [
+        "ptg2_provider_scope_refused",
+        "ptg2_location_scope_too_broad",
+        "ptg2_provider_filter_scope_required",
+    ]
+    assert scope_refusal["properties"]["fix_it"]["properties"][
+        "retry_options"
+    ]["maxItems"] == 1
+    assert schemas["PlanPricingScopeRetryOption"]["required"] == [
+        "order_by",
+        "order",
+        "include_providers",
+        "view",
+        "offset",
+        "start",
+        "page",
+    ]
+    for path in (
+        "/pricing/providers/search-by-procedure",
+        "/pricing/providers/by-procedure",
+    ):
+        parameters = spec["paths"][path]["get"]["parameters"]
+        order_by = next(parameter for parameter in parameters if parameter["name"] == "order_by")
+        assert "distance" in order_by["schema"]["enum"]

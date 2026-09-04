@@ -4911,8 +4911,8 @@ paths:
 
         Group-plan CPT office-visit provider searches that combine a statewide
         location with taxonomy scope fail fast. Add `zip5` and
-        `zip_radius_miles` (or bounded coordinates); the 400 response includes
-        `context.fix_it.retry_options` with the ZIP-radius remediation.
+        `zip_radius_miles` (or bounded coordinates); the 422 response includes
+        `fix_it.retry_options` with the ZIP-radius remediation.
 
         Radius matches fail closed on address evidence: an address must come
         from NPPES, be independently reported by at least two marketplace
@@ -5267,6 +5267,7 @@ paths:
                 total_beneficiaries,
                 matched_service_codes,
                 cost_index,
+                distance,
               ]
         - name: limit
           in: query
@@ -5357,14 +5358,18 @@ paths:
                   code: billing_search_cursor_generation_expired
                   message: Billing search cursor generation is no longer available.
         '422':
-          description: A fixed state-scan page cannot retain every complete rate group.
+          description: |
+            A fixed state-scan page cannot retain every complete rate group, or
+            a legacy provider search exceeds its supported interactive scope.
           headers:
             Cache-Control:
               $ref: '#/components/headers/BillingSearchCacheControl'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PlanPricingStateScanBudgetRefusal'
+                oneOf:
+                  - $ref: '#/components/schemas/PlanPricingStateScanBudgetRefusal'
+                  - $ref: '#/components/schemas/PlanPricingScopeRefusal'
         '503':
           description: |
             Billing-search keys, serving generation, projection, or database
@@ -5409,8 +5414,8 @@ paths:
 
         Group-plan CPT office-visit provider searches that combine a statewide
         location with taxonomy scope fail fast. Add `zip5` and
-        `zip_radius_miles` (or bounded coordinates); the 400 response includes
-        `context.fix_it.retry_options` with the ZIP-radius remediation.
+        `zip_radius_miles` (or bounded coordinates); the 422 response includes
+        `fix_it.retry_options` with the ZIP-radius remediation.
 
         Address-bearing spatial matches require coherent canonical ZIP, state,
         and country identity. Coordinate-bearing addresses must fall inside
@@ -5761,6 +5766,7 @@ paths:
                 total_beneficiaries,
                 matched_service_codes,
                 cost_index,
+                distance,
               ]
         - name: limit
           in: query
@@ -5783,6 +5789,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '422':
+          description: A provider search exceeds its supported interactive scope.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanPricingScopeRefusal'
   /pricing/providers/by-prescription:
     get:
       operationId: getPricingProvidersByPrescription
@@ -7621,6 +7636,60 @@ components:
               maxItems: 0
               items:
                 type: object
+    PlanPricingScopeRefusal:
+      type: object
+      additionalProperties: false
+      required: [status, code, message, fix_it]
+      properties:
+        status:
+          type: integer
+          enum: [422]
+        code:
+          type: string
+          enum:
+            - ptg2_provider_scope_refused
+            - ptg2_location_scope_too_broad
+            - ptg2_provider_filter_scope_required
+        message:
+          type: string
+        fix_it:
+          type: object
+          additionalProperties: false
+          required: [reason, retry_options]
+          properties:
+            reason:
+              type: string
+            retry_options:
+              type: array
+              maxItems: 1
+              items:
+                $ref: '#/components/schemas/PlanPricingScopeRetryOption'
+    PlanPricingScopeRetryOption:
+      type: object
+      additionalProperties: false
+      required: [order_by, order, include_providers, view, offset, start, page]
+      properties:
+        order_by:
+          type: string
+          enum: [distance]
+        order:
+          type: string
+          enum: [asc]
+        include_providers:
+          type: boolean
+          enum: [true]
+        view:
+          type: string
+          enum: [card]
+        offset:
+          type: integer
+          enum: [0]
+        start:
+          type: integer
+          enum: [0]
+        page:
+          type: integer
+          enum: [1]
     PtgNegotiatedPrice:
       type: object
       properties:

@@ -105,6 +105,38 @@ def _normalized_strings(values: Any) -> list[str]:
     )
 
 
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(item, str) and bool(item.strip()) for item in value
+    )
+
+
+def _has_valid_state_address_shape(address: Mapping[str, Any]) -> bool:
+    address_key = address.get("address_key")
+    return bool(
+        _STATE_ADDRESS_FIELDS.issubset(address)
+        and str(address.get("type") or "")
+        in {"practice", "primary", "secondary", "site"}
+        and (
+            address_key is None
+            or isinstance(address_key, str)
+            and bool(address_key.strip())
+        )
+        and str(address.get("location_key") or "")
+        and type(address.get("source_count")) is int
+        and address.get("source_count") > 0
+        and type(address.get("multi_source_confirmed")) is bool
+        and type(address.get("source_mask")) is int
+        and address.get("source_mask") >= 0
+        and type(address.get("address_source_mask")) is int
+        and address.get("address_source_mask") >= 0
+        and type(address.get("location_confidence_id")) is int
+        and address.get("location_confidence_id") >= 0
+        and _is_string_list(address.get("address_sources"))
+        and _is_string_list(address.get("source_record_ids"))
+    )
+
+
 def _state_address_payload(provider_by_field: Mapping[str, Any]) -> dict[str, Any]:
     raw_payload = provider_by_field.get("address_payload")
     try:
@@ -183,7 +215,7 @@ def _validated_state_address(
         else ()
     )
     if (
-        not _STATE_ADDRESS_FIELDS.issubset(address)
+        not _has_valid_state_address_shape(address)
         or type(address.get("npi")) is not int
         or address.get("npi") != npi
         or str(address.get("state") or "") != state
@@ -200,8 +232,6 @@ def _validated_state_address(
             _source_id(entry.get("source_id")) == admitted_source_id
             for entry in complete_provenance
         )
-        or type(address.get("source_mask")) is not int
-        or type(address.get("address_source_mask")) is not int
         or not _has_valid_coordinates(address)
     ):
         raise ValueError("pricing projection provider-state address is inconsistent")

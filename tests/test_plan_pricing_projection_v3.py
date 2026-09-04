@@ -89,6 +89,7 @@ async def test_stage_ddl_uses_one_statement_per_execute() -> None:
     assert "plan_pricing_provider_npi_materialized_stage" in session.calls[2][0]
     assert "plan_pricing_provider_npi_pending_stage" in session.calls[3][0]
     assert "plan_pricing_rate_occurrence_stage" in session.calls[5][0]
+    assert "PRIMARY KEY" not in session.calls[5][0]
     assert "plan_pricing_rate_frequency_stage" in session.calls[7][0]
     assert "plan_pricing_provider_cell_stage" in session.calls[8][0]
     assert "state_fragment bytea NULL" in session.calls[8][0]

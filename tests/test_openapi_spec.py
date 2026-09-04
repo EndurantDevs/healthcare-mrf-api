@@ -246,6 +246,17 @@ def test_openapi_routes_match_code():
         )
 
 
+def test_pricing_procedure_scope_refusals_match_shared_handler():
+    """Document every structured 422 emitted by both procedure-search paths."""
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    scope_ref_by_key = {"$ref": "#/components/schemas/PlanPricingScopeRefusal"}
+    paths = spec["paths"]
+    canonical = paths["/pricing/providers/search-by-procedure"]["get"]["responses"]["422"]
+    alias = paths["/pricing/providers/by-procedure"]["get"]["responses"]["422"]
+    assert scope_ref_by_key in canonical["content"]["application/json"]["schema"]["oneOf"]
+    assert alias["content"]["application/json"]["schema"] == scope_ref_by_key
+
+
 def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
     schemas = spec["components"]["schemas"]

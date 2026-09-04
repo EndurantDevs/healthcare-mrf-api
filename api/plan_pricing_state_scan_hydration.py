@@ -13,6 +13,7 @@ from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailabl
 from api.plan_pricing_projection_v3_provider_cells import (
     MAX_PROVIDER_STATE_FRAGMENT_BYTES,
     PROVIDER_STATE_FRAGMENT_VERSION,
+    _has_valid_state_address_shape,
 )
 from api.plan_pricing_state_scan_contract import (
     STATE_SCAN_PRICE_ATOM_LIMIT,
@@ -42,16 +43,6 @@ _PROVIDER_REQUIRED_FIELDS = frozenset(
         "primary_specialization", "state", "city", "zip5",
         "location_hash", "location_source", "location_confidence_code",
         "address_payload",
-    }
-)
-_ADDRESS_REQUIRED_FIELDS = frozenset(
-    {
-        "npi", "type", "first_line", "second_line", "city", "state",
-        "postal_code", "country_code", "address_key", "location_key",
-        "address_precision", "address_sources", "source_record_ids",
-        "source_count", "multi_source_confirmed", "source_mask",
-        "address_source_mask", "location_confidence_id",
-        "geo_evidence_level", "address_provenance", "lat", "long",
     }
 )
 _EVIDENCE_SOURCE_ID = {
@@ -116,27 +107,6 @@ def _address_provenance(
     return provenance, source_id
 
 
-def _has_valid_address_shape(address: Mapping[str, Any]) -> bool:
-    return bool(
-        _ADDRESS_REQUIRED_FIELDS.issubset(address)
-        and str(address.get("type") or "")
-        in {"practice", "primary", "secondary", "site"}
-        and str(address.get("location_key") or "")
-        and str(address.get("address_key") or "")
-        and type(address.get("source_count")) is int
-        and address.get("source_count") > 0
-        and type(address.get("multi_source_confirmed")) is bool
-        and type(address.get("source_mask")) is int
-        and address.get("source_mask") >= 0
-        and type(address.get("address_source_mask")) is int
-        and address.get("address_source_mask") >= 0
-        and type(address.get("location_confidence_id")) is int
-        and address.get("location_confidence_id") > 0
-        and _is_string_list(address.get("address_sources"))
-        and _is_string_list(address.get("source_record_ids"))
-    )
-
-
 def _validated_coordinates(address: Mapping[str, Any]) -> None:
     latitude = address.get("lat")
     longitude = address.get("long")
@@ -167,7 +137,7 @@ def _validated_address(
     serving: Any,
 ) -> dict[str, Any]:
     address = provider.get("address_payload")
-    if not isinstance(address, dict) or not _has_valid_address_shape(address):
+    if not isinstance(address, dict) or not _has_valid_state_address_shape(address):
         raise PTG2ManifestArtifactError("pricing state scan provider address is incomplete")
     postal_code = "".join(
         character
@@ -200,7 +170,7 @@ def _validated_provider_context(
     raw_fragment: Any,
     expected_npi: int,
     expected_state: str,
-    include_evidence: bool,
+    include_response_evidence: bool,
     serving: Any,
 ) -> dict[str, Any]:
     try:
@@ -238,8 +208,17 @@ def _validated_provider_context(
     address_by_field = _validated_address(
         provider_by_field, expected_npi, expected_state, serving
     )
-    if not include_evidence:
+    for field_name in (
+        "npi",
+        "type",
+        "checksum",
+        "county_fips",
+        "premise_key",
+    ):
+        address_by_field.pop(field_name, None)
+    if not include_response_evidence:
         address_by_field.pop("address_provenance", None)
+        address_by_field.pop("geo_evidence_level", None)
     provider_by_field["address_payload"] = address_by_field
     return provider_by_field
 
@@ -250,13 +229,20 @@ def _validated_providers_by_npi(
     serving: Any,
 ) -> dict[int, dict[str, Any]]:
     expected_state = str(args.get("state") or "").strip().upper()
-    include_evidence = _is_request_flag_enabled(args.get("include_evidence"), default=False)
+    include_response_evidence = any(
+        _is_request_flag_enabled(args.get(flag_name), default=False)
+        for flag_name in ("include_evidence", "include_debug", "include_details")
+    )
     providers_by_npi: dict[int, dict[str, Any]] = {}
     for raw_npi, raw_fragment in sorted(provider_fragments.items()):
         if type(raw_npi) is not int or raw_npi <= 0:
             raise PTG2ManifestArtifactError("pricing state scan provider witness NPI is invalid")
         providers_by_npi[raw_npi] = _validated_provider_context(
-            raw_fragment, raw_npi, expected_state, include_evidence, serving
+            raw_fragment,
+            raw_npi,
+            expected_state,
+            include_response_evidence,
+            serving,
         )
     return providers_by_npi
 
@@ -473,6 +459,7 @@ async def hydrate_selected_groups(
     if not occurrence_npis.issubset(providers_by_npi):
         raise PTG2ManifestArtifactError("pricing state scan provider witness is incomplete")
     binding_ordinals = sorted({int(occurrence_by_field["binding_ordinal"]) for occurrence_by_field in occurrence_rows})
+    is_multi_binding = len(selection.in_network_bindings) > 1
     for binding_ordinal in binding_ordinals:
         scope = _binding_scope(selection, args, occurrence_rows, binding_ordinal)
         binding_items, logical_atom_count = await _hydrate_binding(
@@ -482,10 +469,15 @@ async def hydrate_selected_groups(
             STATE_SCAN_PRICE_ATOM_LIMIT - retained_price_atom_count,
             serving,
         )
+        binding_items = serving._merge_provider_rates_for_request(
+            binding_items, {}
+        )
+        if is_multi_binding and scope.binding.source_key:
+            for binding_item in binding_items:
+                binding_item.setdefault("network", scope.binding.source_key)
         hydrated_items.extend(binding_items)
         retained_price_atom_count += logical_atom_count
-    merged_items = serving._merge_provider_rates_for_request(hydrated_items, {})
-    merged_items.sort(
+    hydrated_items.sort(
         key=lambda merged_item: (
             int(merged_item.get("npi") or 0),
             str(merged_item.get("reported_code_system") or ""),
@@ -493,8 +485,8 @@ async def hydrate_selected_groups(
             str(merged_item.get("source_artifact_key") or ""),
         )
     )
-    serving._hide_source_artifact_key_unless_requested(merged_items, args)
-    return merged_items
+    serving._hide_source_artifact_key_unless_requested(hydrated_items, args)
+    return hydrated_items
 
 
 __all__ = ["eligible_provider_npis", "hydrate_selected_groups"]

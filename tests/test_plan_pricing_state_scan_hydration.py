@@ -279,19 +279,37 @@ async def test_state_scan_hydrates_only_from_frozen_provider_witness(monkeypatch
 async def test_state_scan_strips_frozen_address_provenance_without_evidence(
     monkeypatch,
 ):
-    address = _address("1 Frozen Street", "Ann Arbor", "48104", "frozen-location")
+    frozen_address = _address("1 Frozen Street", "Ann Arbor", "48104", "frozen-location")
+    frozen_address.update(
+        {
+            "checksum": "internal-checksum",
+            "county_fips": "26161",
+            "premise_key": "internal-premise",
+        }
+    )
     _install_price_mocks(monkeypatch)
 
-    items = await scan._hydrate_selected_groups(
+    hydrated_items = await scan._hydrate_selected_groups(
         object(),
         _selection(),
         _args(include_evidence="false"),
         [_occurrence(1000000001)],
-        {1000000001: _provider_fragment(1000000001, address)},
+        {1000000001: _provider_fragment(1000000001, frozen_address)},
     )
 
-    assert "address_provenance" not in items[0]["address"]
-    assert "address_provenance" not in items[0]["address_verification"]
+    assert "address_provenance" not in hydrated_items[0]["address"]
+    assert "address_provenance" not in hydrated_items[0]["address_verification"]
+    assert "geo_evidence_level" not in hydrated_items[0]["address"]
+    assert "geo_evidence_level" not in hydrated_items[0]["address_verification"]
+    assert not {
+        "npi",
+        "type",
+        "checksum",
+        "county_fips",
+        "premise_key",
+    }.intersection(hydrated_items[0]["address"])
+    assert hydrated_items[0]["address"]["address_precision"] == "street"
+    assert hydrated_items[0]["address"]["source_record_ids"] == ["record-1"]
 
 
 def _mutated_fragment(path: tuple[str, ...], value) -> bytes:

@@ -12,6 +12,7 @@ import pytest
 from api import plan_pricing_projection as projection
 from api import plan_pricing_projection_source as projection_source
 from api import plan_pricing_projection_v3_provider_cells as provider_cells
+from api import plan_pricing_state_scan_hydration as hydration
 from api import ptg2_serving as serving
 from api.plan_pricing_projection_v3_types import _BuildState
 
@@ -193,6 +194,40 @@ def test_v4_provider_state_witness_is_single_bounded_and_digest_bound() -> None:
     assert first_state.content_digest.digest() != changed_state.content_digest.digest()
 
 
+@pytest.mark.parametrize(
+    "evidence_flag",
+    ("include_evidence", "include_debug", "include_details"),
+)
+def test_v4_provider_state_witness_round_trips_nullable_address_identity(
+    evidence_flag,
+) -> None:
+    provider = _state_provider("48104", 1)
+    address = orjson.loads(provider["address_payload"])
+    address["address_key"] = None
+    address["location_confidence_id"] = 0
+    provider["address_payload"] = orjson.dumps(address)
+
+    provider_cell_rows = provider_cells._provider_cell_rows(
+        PROJECTION_ID,
+        _BuildState(hashlib.sha256()),
+        [NPI],
+        {NPI: [provider]},
+    )
+    state_fragment = next(
+        row["state_fragment"] for row in provider_cell_rows if row["state_fragment"]
+    )
+    hydrated = hydration._validated_providers_by_npi(
+        {NPI: state_fragment},
+        {"state": "MI", evidence_flag: "true"},
+        serving,
+    )[NPI]
+
+    assert hydrated["address_payload"]["address_key"] is None
+    assert hydrated["address_payload"]["location_confidence_id"] == 0
+    assert hydrated["address_payload"]["geo_evidence_level"] == "nppes_registry_address"
+    assert hydrated["address_payload"]["address_provenance"]
+
+
 def test_v4_provider_state_witness_fails_closed(monkeypatch) -> None:
     incomplete_providers = [_state_provider("48104", 2)]
     with pytest.raises(ValueError, match="witness is incomplete"):
@@ -250,6 +285,9 @@ def test_v4_provider_state_witness_rejects_malformed_fields(
     ("field", "value", "in_provenance"),
     [
         ("source_id", True, True),
+        ("address_sources", [], False),
+        ("source_record_ids", [], False),
+        ("source_count", True, False),
         ("lat", None, False),
         ("lat", True, False),
     ],
