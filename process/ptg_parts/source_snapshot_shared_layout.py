@@ -90,6 +90,7 @@ async def bound_shared_layout_keys(
     snapshot_id: str,
     expected_generation: str,
     expected_snapshot_key: Any,
+    allow_missing_binding: bool = False,
 ) -> tuple[int, ...]:
     """Validate and return the exact physical layout owned by one snapshot."""
 
@@ -106,6 +107,8 @@ async def bound_shared_layout_keys(
         snapshot_id=snapshot_id,
     )
     if not layout_by_field:
+        if allow_missing_binding:
+            return ()
         raise ValueError("snapshot is missing its shared layout binding")
     snapshot_key = int(layout_by_field.get("snapshot_key"))
     layout_generation = str(

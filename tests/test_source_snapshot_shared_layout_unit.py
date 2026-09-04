@@ -61,6 +61,7 @@ async def _bound_keys(
     *,
     generation: str = PTG2_V4_SHARED_GENERATION,
     snapshot_key: Any = 11,
+    allow_missing_binding: bool = False,
 ) -> tuple[int, ...]:
     return await bound_shared_layout_keys(
         session,
@@ -68,6 +69,7 @@ async def _bound_keys(
         snapshot_id="snapshot-a",
         expected_generation=generation,
         expected_snapshot_key=snapshot_key,
+        allow_missing_binding=allow_missing_binding,
     )
 
 
@@ -110,6 +112,14 @@ async def test_rejects_v4_snapshot_without_shared_binding() -> None:
     ):
         await _bound_keys(session)
 
+    assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
+
+
+@pytest.mark.asyncio
+async def test_terminal_snapshot_accepts_missing_shared_binding() -> None:
+    session = _Session([])
+
+    assert await _bound_keys(session, allow_missing_binding=True) == ()
     assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
 
 
