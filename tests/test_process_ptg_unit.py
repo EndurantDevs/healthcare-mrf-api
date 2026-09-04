@@ -1716,6 +1716,15 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
     assert ptg_source_download._request_ssl_kwargs(
         "https://api.midlandschoice.com/api/v1/fileshare/download?filename=synthetic.json.gz"
     ) == {"ssl": False}
+    for host in (
+        "www.alamedahealthsystem.org",
+        "franciscanchildrens.org",
+        "franciscans.childrenshospital.org",
+        "www.hhcsinc.org",
+    ):
+        assert ptg_source_download._request_ssl_kwargs(f"https://{host}/mrf") == {
+            "ssl": False
+        }
     assert (
         ptg_source_download._request_ssl_kwargs(
             "https://example.com/api/v1/fileshare/download?filename=synthetic.json.gz"

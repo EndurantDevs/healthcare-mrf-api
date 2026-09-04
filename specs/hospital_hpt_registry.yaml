@@ -10391,9 +10391,11 @@ hospitals:
 - hospital_id: hospital-003109
   name: Innovations - Mesa Springs
   cms_hpt_url: https://mesasprings.com/cms-hpt.txt
+  locator_name: Mesa Springs
 - hospital_id: hospital-003110
   name: Innovations/Changes Arlington
   cms_hpt_url: https://mesasprings.com/cms-hpt.txt
+  locator_name: Mesa Springs Changes
 - hospital_id: hospital-003111
   name: Inova Alexandria Hospital
   cms_hpt_url: https://www.inova.org/cms-hpt.txt
@@ -22239,6 +22241,7 @@ hospitals:
 - hospital_id: hospital-006677
   name: Ucsf Medical Center
   cms_hpt_url: https://www.ucsfhealth.org/cms-hpt.txt
+  locator_name: UCSF Parnassus
 - hospital_id: hospital-006678
   name: UCSF Medical Center & UCSF Benioff Children's Hospital San Francisco
   cms_hpt_url: https://www.ucsfbenioffchildrens.org/cms-hpt.txt
@@ -22429,6 +22432,7 @@ hospitals:
   name: Uniontown Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-006738
+  alias_of: hospital-006688
   name: United Health Services Hospitals, Inc
   cms_hpt_url: https://www.nyuhs.org/cms-hpt.txt
 - hospital_id: hospital-006739
