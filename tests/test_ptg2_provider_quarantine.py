@@ -82,3 +82,43 @@ def test_v2_quarantine_rejects_noncanonical_text_identity(field, value, error):
     payload["entries"][0][field] = value
     with pytest.raises(ValueError, match=error):
         validate_provider_identifier_quarantine(payload)
+
+
+def test_v2_quarantine_rejects_malformed_text_boundaries():
+    with pytest.raises(ValueError, match="exceeds 128 bytes"):
+        provider_identifier_quarantine_payload({}, text_counts={"x" * 129: 1})
+    with pytest.raises(ValueError, match="is not text"):
+        provider_identifier_quarantine_payload({}, text_counts={1: 1})
+    with pytest.raises(ValueError, match="count is invalid"):
+        provider_identifier_quarantine_payload({}, text_counts={"bad": 0})
+
+    quarantine = provider_identifier_quarantine_payload({}, text_counts={"bad": 1})
+    quarantine["entries"][0]["kind"] = "text"
+    with pytest.raises(ValueError, match="entry is incompatible"):
+        validate_provider_identifier_quarantine(quarantine)
+
+    quarantine = provider_identifier_quarantine_payload({}, text_counts={"bad": 1})
+    quarantine["entries"] = [None]
+    with pytest.raises(ValueError, match="entry is incompatible"):
+        validate_provider_identifier_quarantine(quarantine)
+
+    quarantine = provider_identifier_quarantine_payload(
+        {}, text_counts={"first": 1, "second": 1}
+    )
+    quarantine["entries"].reverse()
+    with pytest.raises(ValueError, match="values are not ordered"):
+        validate_provider_identifier_quarantine(quarantine)
+
+    quarantine = provider_identifier_quarantine_payload(
+        {}, text_counts={"first": 1, "second": 1}
+    )
+    quarantine["entries"][0]["occurrence_count"] = 2**64 - 1
+    with pytest.raises(ValueError, match="occurrence count overflows"):
+        validate_provider_identifier_quarantine(quarantine)
+
+    quarantine = provider_identifier_quarantine_payload(
+        {-2: 1, -1: 1}, text_counts={"bad": 1}
+    )
+    quarantine["entries"][0]["occurrence_count"] = 2**64 - 1
+    with pytest.raises(ValueError, match="occurrence count overflows"):
+        validate_provider_identifier_quarantine(quarantine)
