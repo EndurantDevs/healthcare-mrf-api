@@ -9727,6 +9727,7 @@ hospitals:
 - hospital_id: hospital-002914
   name: Highland Clarksburg Hospital
   cms_hpt_url: https://www.highlandclarksburghospital.com/cms-hpt.txt
+  locator_name: Highland-Clarksburg Hospital, Inc.
 - hospital_id: hospital-002915
   name: Highland District Hospital
   cms_hpt_url: https://hdh.org/cms-hpt.txt
@@ -10836,6 +10837,7 @@ hospitals:
 - hospital_id: hospital-003246
   name: Joe DiMaggio Children's Hospital at Memorial
   cms_hpt_url: https://www.mhs.net/cms-hpt.txt
+  alias_of: hospital-003245
 - hospital_id: hospital-003247
   name: John D Archbold Memorial Hospital INC
   cms_hpt_url: https://archbold.org/cms-hpt.txt
@@ -13217,6 +13219,7 @@ hospitals:
 - hospital_id: hospital-003970
   name: Memorial Regional Hospital South Campus
   cms_hpt_url: https://www.mhs.net/cms-hpt.txt
+  alias_of: hospital-003969
 - hospital_id: hospital-003971
   name: MEMORIAL SATILLA HEALTH
   cms_hpt_url: https://memorialsatillahealth.com/cms-hpt.txt
@@ -21850,6 +21853,7 @@ hospitals:
 - hospital_id: hospital-006564
   name: TIMPANOGOS REGIONAL HOSPITAL
   cms_hpt_url: https://www.mountainstar.com/cms-hpt.txt
+  alias_of: hospital-006565
 - hospital_id: hospital-006565
   name: TIMPANOGOS REGIONAL MEDICAL CENTER
   cms_hpt_url: https://www.mountainstar.com/cms-hpt.txt
@@ -22666,6 +22670,7 @@ hospitals:
 - hospital_id: hospital-006815
   name: University of Kentucky Hospital
   cms_hpt_url: https://ukhealthcare.uky.edu/cms-hpt.txt
+  alias_of: hospital-006692
 - hospital_id: hospital-006816
   name: University of Louisville Hospital
   cms_hpt_url: https://uoflhealth.org/cms-hpt.txt
@@ -22997,6 +23002,7 @@ hospitals:
 - hospital_id: hospital-006918
   name: USMD Hospital at Arlington
   cms_hpt_url: https://usmdarlington.com/cms-hpt.txt
+  locator_name: USMD Hospital at Arlington LLC
 - hospital_id: hospital-006919
   alias_of: hospital-006918
   name: USMD Hospital at Arlington LLC
