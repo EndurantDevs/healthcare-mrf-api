@@ -34,12 +34,12 @@ def pytest_collection_modifyitems(config, items) -> None:
     nodeids = [item.nodeid for item in items]
     if len(nodeids) != len(set(nodeids)):
         raise pytest.UsageError("pytest collection returned duplicate node IDs")
-    selected = set(select_nodeids(nodeids, shard_count=shard_count, shard_index=shard_index))
-    if not selected:
+    selected_ids = set(select_nodeids(nodeids, shard_count=shard_count, shard_index=shard_index))
+    if not selected_ids:
         raise pytest.UsageError("selected shard has no node IDs")
-    config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in selected])
+    config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in selected_ids])
     items[:] = sorted(
-        (item for item in items if item.nodeid in selected), key=lambda item: item.nodeid
+        (item for item in items if item.nodeid in selected_ids), key=lambda item: item.nodeid
     )
 
 

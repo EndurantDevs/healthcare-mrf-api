@@ -65,30 +65,30 @@ def test_xdist_shards_execute_the_legacy_sorted_assignment_once(
     )
     nodeids = [
         "test_sample.py::test_zeta", "test_sample.py::test_alpha",
-        *(f"test_sample.py::test_values[{value}]" for value in range(16, 0, -1)),
+        *(f"test_sample.py::test_values[{sample_number}]" for sample_number in range(16, 0, -1)),
     ]
-    executed = []
+    executed_ids = []
     for shard in range(2):
-        result = _run_pytest(
+        pytest_result = _run_pytest(
             tmp_path, "-n", str(workers), "--dist", distribution,
             "--ci-shard-count", "2", "--ci-shard-index", str(shard),
         )
-        assert result.returncode == 0, result.stdout + result.stderr
+        assert pytest_result.returncode == 0, pytest_result.stdout + pytest_result.stderr
         expected = select_nodeids(nodeids, shard_count=2, shard_index=shard)
         collections = list(tmp_path.glob("collected-*.txt"))
         assert len(collections) == workers
         for path in collections:
             assert path.read_text(encoding="utf-8").splitlines() == expected
             path.unlink()
-        observed = []
+        observed_ids = []
         for path in sorted(tmp_path.glob("observed-*.txt")):
-            observed.extend(path.read_text(encoding="utf-8").splitlines())
+            observed_ids.extend(path.read_text(encoding="utf-8").splitlines())
             path.unlink()
-        assert sorted(observed) == expected
+        assert sorted(observed_ids) == expected
         if workers == 1:
-            assert observed == expected
-        executed.extend(observed)
-    assert sorted(executed) == sorted(nodeids)
+            assert observed_ids == expected
+        executed_ids.extend(observed_ids)
+    assert sorted(executed_ids) == sorted(nodeids)
 
 
 @pytest.mark.parametrize(
