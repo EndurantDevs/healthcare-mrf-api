@@ -361,6 +361,7 @@ quota_probe_manifest() {
     '        allowPrivilegeEscalation: false' \
     '        capabilities: {drop: ["ALL"]}' \
     '        readOnlyRootFilesystem: true' \
+    '        runAsNonRoot: true' \
     '        runAsUser: 65532'
 }
 
