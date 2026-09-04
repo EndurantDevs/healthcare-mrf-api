@@ -4798,22 +4798,20 @@ async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch
     assert hmaa_target.metadata["target_max_bytes"] == 200 * 1024 * 1024
 
 
-@pytest.mark.asyncio
-async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
-    tmp_path, monkeypatch
-):
-    landing_url = (
-        "https://www.bcbsnc.com/policies-best-practices/machine-readable-files"
-    )
-    endpoint = (
-        "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
-    )
-    toc_url = (
-        "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/aso/"
-        "2026-09-01_123456789_example-employer_index.json"
-    )
-    observed = {}
-    response_payload = {
+_BCBSNC_ASO_LANDING_URL = (
+    "https://www.bcbsnc.com/policies-best-practices/machine-readable-files"
+)
+_BCBSNC_ASO_ENDPOINT = (
+    "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
+)
+_BCBSNC_ASO_TOC_URL = (
+    "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/aso/"
+    "2026-09-01_123456789_example-employer_index.json"
+)
+
+
+def _bcbsnc_aso_response_payload():
+    return {
         "totalHits": 1,
         "keyMatches": [],
         "results": [
@@ -4822,20 +4820,14 @@ async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
                 "meta": {
                     "groupname": "Example Employer",
                     "title": "Example Employer 123456789",
-                    "url": toc_url,
+                    "url": _BCBSNC_ASO_TOC_URL,
                 },
             }
         ],
     }
 
-    async def fake_post_text(url, payload, **kwargs):
-        observed.update(url=url, payload=json.loads(payload), kwargs=kwargs)
-        return json.dumps(response_payload)
 
-    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
-    assert discovery.classify_hosting_platform(landing_url) == (
-        "bcbsnc_aso_employer_search"
-    )
+async def _bcbsnc_aso_source_row(tmp_path, monkeypatch):
     private_context_path = tmp_path / "private-context.csv"
     private_context_path.write_text(
         "company_name,ein,medical_carriers,medical_lookup_types\n"
@@ -4845,62 +4837,26 @@ async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
     monkeypatch.setenv(
         discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_context_path)
     )
-    candidates = await discovery._load_candidates(
+    source_candidates = await discovery._load_candidates(
         "master-list", test_mode=True, limit=2000
     )
-    [source_candidate] = [
+    matching_source_candidates = [
         candidate
-        for candidate in candidates
-        if candidate.index_url == landing_url
+        for candidate in source_candidates
+        if candidate.index_url == _BCBSNC_ASO_LANDING_URL
         and candidate.raw_payload.get("private_query_context")
     ]
-    _, source_dict = discovery._candidate_to_rows(
+    [source_candidate] = matching_source_candidates
+    _, source_row = discovery._candidate_to_rows(
         source_candidate, discovery._utc_now()
     )
-    assert source_dict is not None
-    assert await discovery._crawl_targets_for_source(
-        {**source_dict, "metadata_json": {}}, landing_url, None
-    ) == []
-    assert observed == {}
-    for invalid_ein in (
-        "123",
-        "abc123456789",
-        "１２-３４５６７８９",
-        "12-3456789*",
-        "<b>12-3456789</b>",
-        "12-3456789\u2003",
-    ):
-        with pytest.raises(ValueError, match="requires a 9-digit EIN"):
-            await discovery._crawl_targets_for_source(
-                {
-                    **source_dict,
-                    "metadata_json": {"query_context_employer_ein": invalid_ein},
-                },
-                landing_url,
-                None,
-            )
-    assert observed == {}
+    assert source_row is not None
+    return source_row
 
-    with pytest.raises(ValueError, match="invalid BCBSNC ASO employer search endpoint"):
-        await discovery._resolve_bcbsnc_aso_employer_search(
-            source_dict,
-            landing_url,
-            {
-                **discovery._platform_resolver_config(
-                    "bcbsnc_aso_employer_search"
-                ),
-                "endpoint": "https://search.example.test/api",
-            },
-            None,
-        )
-    assert observed == {}
 
-    [crawl_target] = await discovery._crawl_targets_for_source(
-        source_dict, landing_url, None
-    )
-
-    assert observed == {
-        "url": endpoint,
+def _expected_bcbsnc_aso_request():
+    return {
+        "url": _BCBSNC_ASO_ENDPOINT,
         "payload": {
             "text": ["123456789~1"],
             "size": 10,
@@ -4930,14 +4886,42 @@ async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
             "allow_redirects": False,
         },
     }
-    assert crawl_target.url == toc_url
+
+
+async def _assert_bcbsnc_aso_search_error(source_row, message):
+    with pytest.raises(ValueError, match=message):
+        await discovery._crawl_targets_for_source(
+            source_row, _BCBSNC_ASO_LANDING_URL, None
+        )
+
+
+@pytest.mark.asyncio
+async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
+    tmp_path, monkeypatch
+):
+    observed_by_field = {}
+    search_response_payload = _bcbsnc_aso_response_payload()
+
+    async def fake_post_text(url, body, **kwargs):
+        observed_by_field.update(url=url, payload=json.loads(body), kwargs=kwargs)
+        return json.dumps(search_response_payload)
+
+    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
+    source_row = await _bcbsnc_aso_source_row(tmp_path, monkeypatch)
+    assert discovery.classify_hosting_platform(_BCBSNC_ASO_LANDING_URL) == (
+        "bcbsnc_aso_employer_search"
+    )
+    [crawl_target] = await discovery._crawl_targets_for_source(
+        source_row, _BCBSNC_ASO_LANDING_URL, None
+    )
+
+    assert observed_by_field == _expected_bcbsnc_aso_request()
+    assert crawl_target.url == _BCBSNC_ASO_TOC_URL
     assert crawl_target.label == "Example Employer"
-    assert crawl_target.resolved_from_url == landing_url
+    assert crawl_target.resolved_from_url == _BCBSNC_ASO_LANDING_URL
     assert crawl_target.metadata["resolver"] == "bcbsnc_aso_employer_search"
     assert crawl_target.metadata["query_context_match"] is True
-    assert crawl_target.metadata["query_context_match_scope"] == (
-        "employer_identity"
-    )
+    assert crawl_target.metadata["query_context_match_scope"] == "employer_identity"
     assert crawl_target.metadata["plan_info"] == [
         {
             "plan_id": "123456789",
@@ -4949,58 +4933,126 @@ async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
         }
     ]
 
-    response_payload["keyMatches"] = None
-    with pytest.raises(ValueError, match="incomplete BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
-    response_payload["keyMatches"] = []
 
-    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+@pytest.mark.asyncio
+async def test_bcbsnc_aso_search_rejects_invalid_query_context(
+    tmp_path, monkeypatch
+):
+    async def fail_post_text(*_args, **_kwargs):
+        raise AssertionError("invalid query context must not be sent")
+
+    monkeypatch.setattr(discovery, "_post_text", fail_post_text)
+    source_row = await _bcbsnc_aso_source_row(tmp_path, monkeypatch)
+    assert await discovery._crawl_targets_for_source(
+        {**source_row, "metadata_json": {}}, _BCBSNC_ASO_LANDING_URL, None
+    ) == []
+    for invalid_ein in (
+        "123",
+        "abc123456789",
+        "１２-３４５６７８９",
+        "12-3456789*",
+        "<b>12-3456789</b>",
+        "12-3456789\u2003",
+    ):
+        with pytest.raises(ValueError, match="requires a 9-digit EIN"):
+            await discovery._crawl_targets_for_source(
+                {
+                    **source_row,
+                    "metadata_json": {"query_context_employer_ein": invalid_ein},
+                },
+                _BCBSNC_ASO_LANDING_URL,
+                None,
+            )
+
+    with pytest.raises(ValueError, match="invalid BCBSNC ASO employer search endpoint"):
+        await discovery._resolve_bcbsnc_aso_employer_search(
+            source_row,
+            _BCBSNC_ASO_LANDING_URL,
+            {
+                **discovery._platform_resolver_config(
+                    "bcbsnc_aso_employer_search"
+                ),
+                "endpoint": "https://search.example.test/api",
+            },
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_bcbsnc_aso_search_requires_exact_ein_url(tmp_path, monkeypatch):
+    search_response_payload = _bcbsnc_aso_response_payload()
+
+    async def fake_post_text(*_args, **_kwargs):
+        return json.dumps(search_response_payload)
+
+    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
+    source_row = await _bcbsnc_aso_source_row(tmp_path, monkeypatch)
+
+    search_response_payload["results"][0]["meta"]["url"] = _BCBSNC_ASO_TOC_URL.replace(
         "/table-of-contents/aso/", "/table-of-contents/aso/../non-aso/"
     )
-    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "no exact")
 
-    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+    search_response_payload["results"][0]["meta"]["url"] = _BCBSNC_ASO_TOC_URL.replace(
         "123456789_example-employer", "0123456789_other-employer"
     )
-    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "no exact")
 
-    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+    search_response_payload["results"][0]["meta"]["url"] = _BCBSNC_ASO_TOC_URL.replace(
         "123456789_example-employer",
         "123456789_987654321_other-employer",
     )
-    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "no exact")
 
-    response_payload["results"][0]["meta"].update(
+    search_response_payload["results"][0]["meta"].update(
         title="Example Employer 123456789",
-        url=toc_url.replace("mrfmftprod.bcbsnc.com", "files.example.test"),
+        url=_BCBSNC_ASO_TOC_URL.replace(
+            "mrfmftprod.bcbsnc.com", "files.example.test"
+        ),
     )
-    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "no exact")
 
-    response_payload["results"][0]["meta"]["url"] = toc_url
-    response_payload["totalHits"] = 2
-    response_payload["results"].append(
+
+@pytest.mark.asyncio
+async def test_bcbsnc_aso_search_rejects_incomplete_or_ambiguous_results(
+    tmp_path, monkeypatch
+):
+    payload = _bcbsnc_aso_response_payload()
+
+    async def fake_post_text(*_args, **_kwargs):
+        return json.dumps(payload)
+
+    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
+    source_row = await _bcbsnc_aso_source_row(tmp_path, monkeypatch)
+
+    payload["keyMatches"] = None
+    await _assert_bcbsnc_aso_search_error(source_row, "incomplete")
+    payload["keyMatches"] = []
+    payload["totalHits"] = 2
+    payload["results"].append(
         {
             "id": "second-synthetic-result",
             "meta": {
                 "groupname": "Second Example Employer",
                 "title": "Second Example Employer 123456789",
-                "url": toc_url.replace("example-employer", "second-example-employer"),
+                "url": _BCBSNC_ASO_TOC_URL.replace(
+                    "example-employer", "second-example-employer"
+                ),
             },
         }
     )
-    with pytest.raises(ValueError, match="ambiguous BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "ambiguous")
+
+
+@pytest.mark.asyncio
+async def test_bcbsnc_aso_search_rejects_non_object_response(tmp_path, monkeypatch):
+    source_row = await _bcbsnc_aso_source_row(tmp_path, monkeypatch)
 
     async def fake_invalid_response(*_args, **_kwargs):
         return "[]"
 
     monkeypatch.setattr(discovery, "_post_text", fake_invalid_response)
-    with pytest.raises(ValueError, match="invalid BCBSNC ASO employer search"):
-        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    await _assert_bcbsnc_aso_search_error(source_row, "invalid")
 
 
 @pytest.mark.asyncio
