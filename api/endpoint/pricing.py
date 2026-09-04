@@ -23,6 +23,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
                         func, literal, literal_column, or_, select, text)
 
+from api.billing_search_access_contract import BILLING_SEARCH_CACHE_CONTROL
 from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.control_auth import require_control_auth
@@ -103,6 +104,17 @@ from api.plan_pricing_em_distance import (
     em_distance_retry_option,
     is_em_distance_projection_ready,
 )
+from api.billing_search_cursor import (
+    BillingSearchCursorError,
+    BillingSearchCursorGenerationExpired,
+)
+from api.billing_search_cursor_keys import BillingSearchCursorKeyringError
+from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
+from api.plan_pricing_state_scan import (
+    PlanPricingStateScanBudgetExceeded,
+    is_plan_pricing_state_scan,
+    search_plan_pricing_state_scan,
+)
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_demographic_filters import (
@@ -168,10 +180,46 @@ def _ptg_json_response(request: Any, payload: Any, *, status: int = 200):
 
     item_rows = payload.get("items") if isinstance(payload, Mapping) else None
     result_count = len(item_rows) if isinstance(item_rows, list) else None
-    return maybe_attach_capacity_evidence_headers(
+    ptg_response = maybe_attach_capacity_evidence_headers(
         request,
         _json_response(payload, status=status),
         result_count=result_count,
+    )
+    ptg_response.headers["Cache-Control"] = BILLING_SEARCH_CACHE_CONTROL
+    return ptg_response
+
+
+def _state_scan_generation_expired_response(request: Any):
+    """Return the opaque continuation-expiry response."""
+
+    return _ptg_json_response(
+        request,
+        {
+            "error": {
+                "code": "billing_search_cursor_generation_expired",
+                "message": (
+                    "Billing search cursor generation is no longer available."
+                ),
+            }
+        },
+        status=409,
+    )
+
+
+def _state_scan_projection_unavailable_response(
+    request: Any, message: str
+):
+    """Return a first-page projection-readiness failure."""
+
+    return _ptg_json_response(
+        request,
+        {
+            "error": {
+                "code": "pricing_projection_unavailable",
+                "message": message,
+            }
+        },
+        status=503,
     )
 
 
@@ -12335,6 +12383,16 @@ async def list_providers_by_procedure(request):
     begin_capacity_evidence(request)
     session = _get_session(request)
     args = request.args
+    is_state_scan = is_plan_pricing_state_scan(args)
+    if (
+        is_state_scan
+        and getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH)
+        != BILLING_SEARCH_TRANSPORT_PATH
+    ):
+        raise InvalidUsage(
+            "Release-bound state scans require the canonical "
+            "/api/v1/pricing/providers/search-by-procedure path"
+        )
 
     # Keep pagination explicit so OpenAPI contract tests see both parameters.
     args.get("limit")
@@ -12445,6 +12503,68 @@ async def list_providers_by_procedure(request):
     release_selection = None
     guard_release_selection = None
     release_selection_args_by_name = {}
+    if is_state_scan:
+        state_scan_args_by_name = {key: args.get(key) for key in args.keys()}
+        release_selection = await resolve_plan_release_serving(
+            session,
+            plan_release_id,
+        )
+        if release_selection is None:
+            if args.get("cursor") not in (None, "", "null"):
+                return _state_scan_generation_expired_response(request)
+            return _state_scan_projection_unavailable_response(
+                request,
+                "The selected release is not ready for exact state-scan serving.",
+            )
+        try:
+            state_scan_payload = await search_plan_pricing_state_scan(
+                session,
+                release_selection,
+                state_scan_args_by_name,
+                pagination,
+            )
+        except BillingSearchCursorGenerationExpired:
+            return _state_scan_generation_expired_response(request)
+        except (PlanPricingProjectionUnsupported, BillingSearchCursorError) as exc:
+            raise InvalidUsage(str(exc)) from exc
+        except PlanPricingStateScanBudgetExceeded:
+            return _ptg_json_response(
+                request,
+                {
+                    "status": 422,
+                    "code": "ptg2_online_work_budget_exceeded",
+                    "message": (
+                        "This NPI page exceeds the fixed complete-rate-group "
+                        "budget."
+                    ),
+                    "fix_it": {
+                        "reason": (
+                            "No verified interactive retry shape is available "
+                            "for this page."
+                        ),
+                        "retry_options": [],
+                    },
+                },
+                status=422,
+            )
+        except PlanPricingProjectionUnavailable as exc:
+            if args.get("cursor") not in (None, "", "null"):
+                return _state_scan_generation_expired_response(request)
+            return _state_scan_projection_unavailable_response(
+                request, str(exc)
+            )
+        except (BillingSearchCursorKeyringError, PTG2ManifestArtifactError) as exc:
+            logger.warning(
+                "plan pricing state scan could not serve an exact page",
+                extra={
+                    "plan_pricing_state_scan_failure_class": type(exc).__name__
+                },
+            )
+            return _state_scan_projection_unavailable_response(
+                request,
+                "The selected release is not ready for exact state-scan serving.",
+            )
+        return _ptg_json_response(request, state_scan_payload)
     if plan_release_id and _is_broad_office_visit_cpt(
         ptg_code_system,
         code,
@@ -12658,11 +12778,8 @@ async def list_providers_by_procedure(request):
                     )
                 )
             else:
-                retry_option_by_field = {
-                    "order_by": "distance",
-                    "include_providers": True,
-                }
-                is_retry_ready = True
+                retry_option_by_field = None
+                is_retry_ready = False
             return _ptg_json_response(
                 request,
                 {
@@ -12678,7 +12795,7 @@ async def list_providers_by_procedure(request):
                     "fix_it": {
                         "reason": (
                             "Use the bounded ascending-distance provider lane."
-                            if allows_distance_retry
+                            if allows_distance_retry and is_retry_ready
                             else "No verified interactive retry shape is available "
                             "for this request."
                         ),

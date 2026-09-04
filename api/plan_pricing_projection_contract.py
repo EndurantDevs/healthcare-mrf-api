@@ -20,7 +20,11 @@ from api.code_systems import (
 
 
 LEGACY_PROJECTION_CONTRACT = "plan_pricing_card_v2"
-PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
+FACTORIZED_V3_PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
+PROJECTION_CONTRACT = "plan_pricing_factorized_v4"
+FACTORIZED_PROJECTION_CONTRACTS = frozenset(
+    {FACTORIZED_V3_PROJECTION_CONTRACT, PROJECTION_CONTRACT}
+)
 
 
 def _projection_schema() -> str:
@@ -57,6 +61,7 @@ PROVIDER_RELATIONS = (
     "npi_taxonomy",
     "nucc_taxonomy",
     "entity_address_unified",
+    "entity_address_evidence",
     "geo_zip_lookup",
     "entity_address_geo_assurance_state",
 )
@@ -157,6 +162,12 @@ def _provider_signature_sql() -> str:
                 to_regclass(:address_relation)::oid,
                 pg_relation_filenode(to_regclass(:address_relation))
             ),
+            'address_evidence', jsonb_build_array(
+                to_regclass(:evidence_relation)::oid,
+                pg_relation_filenode(to_regclass(:evidence_relation)),
+                to_regclass(:address_relation)::oid,
+                pg_relation_filenode(to_regclass(:address_relation))
+            ),
             'zip', jsonb_build_array(
                 to_regclass(:zip_relation)::oid,
                 pg_relation_filenode(to_regclass(:zip_relation))
@@ -186,14 +197,21 @@ def _validated_provider_signature(signature_text: Any) -> str:
     if not isinstance(signature_by_relation, dict):
         raise ValueError("pricing projection provider relations are incomplete")
     relation_signatures = (
-        signature_by_relation.get(name)
-        for name in ("npi", "taxonomy", "vocabulary", "address", "zip")
+        (signature_by_relation.get(name), expected_length)
+        for name, expected_length in (
+            ("npi", 2),
+            ("taxonomy", 2),
+            ("vocabulary", 2),
+            ("address", 2),
+            ("address_evidence", 4),
+            ("zip", 2),
+        )
     )
     relation_is_incomplete = any(
         not isinstance(relation_signature, list)
-        or len(relation_signature) != 2
+        or len(relation_signature) != expected_length
         or any(component is None for component in relation_signature)
-        for relation_signature in relation_signatures
+        for relation_signature, expected_length in relation_signatures
     )
     if (
         signature_by_relation.get("geo_assurance_ready") is not True
@@ -215,6 +233,7 @@ async def provider_signature(session: Any) -> str:
             "taxonomy_relation": f"{SCHEMA}.npi_taxonomy",
             "vocabulary_relation": f"{SCHEMA}.nucc_taxonomy",
             "address_relation": f"{SCHEMA}.entity_address_unified",
+            "evidence_relation": f"{SCHEMA}.entity_address_evidence",
             "zip_relation": f"{SCHEMA}.geo_zip_lookup",
         },
     )

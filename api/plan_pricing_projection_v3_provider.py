@@ -11,6 +11,9 @@ from api.plan_pricing_projection_contract import table
 from api.plan_pricing_projection_materialize import digest_row
 from api.plan_pricing_projection_source import BindingProjection
 from api.plan_pricing_projection_v3_types import _BuildState, _insert_batches
+from api.plan_pricing_projection_v4_provider import (
+    persist_provider_projection as _persist_provider_projection,
+)
 
 
 PROVIDER_SET_BATCH_SIZE = 32
@@ -81,6 +84,25 @@ _STAGE_TABLE_SQL = (
             ) ON COMMIT DROP
     """,
     """
+            CREATE TEMP TABLE plan_pricing_rate_occurrence_stage (
+                binding_ordinal integer NOT NULL,
+                provider_set_key bigint NOT NULL,
+                provider_set_ref varchar(32) NOT NULL,
+                price_key bigint NOT NULL,
+                price_set_ref varchar(32) NOT NULL,
+                rate_pack_ref varchar(32) NOT NULL,
+                source_artifact_key bigint NOT NULL,
+                provider_count integer NOT NULL,
+                group_fragment jsonb NOT NULL,
+                occurrence_multiplicity bigint NOT NULL,
+                PRIMARY KEY (
+                    binding_ordinal, provider_set_key, provider_set_ref,
+                    price_key, price_set_ref, rate_pack_ref,
+                    source_artifact_key, group_fragment
+                )
+            ) ON COMMIT DROP
+    """,
+    """
             CREATE TEMP TABLE plan_pricing_price_rate_stage (
                 binding_ordinal integer NOT NULL,
                 price_set_id varchar(32) NOT NULL,
@@ -111,6 +133,7 @@ _STAGE_TABLE_SQL = (
                 entity_type_code smallint NULL,
                 taxonomy_codes varchar[] NOT NULL,
                 fragment bytea NOT NULL,
+                state_fragment bytea NULL,
                 PRIMARY KEY (projection_id, npi, geo_cell)
             ) ON COMMIT DROP
     """,
@@ -142,9 +165,7 @@ async def _create_stage_tables(session: Any) -> None:
 
 
 def _binding_ordinal(binding: BindingProjection) -> int:
-    raw_ordinal = binding.binding.get(
-        "ordinal", binding.binding.get("binding_ordinal")
-    )
+    raw_ordinal = binding.binding.get("ordinal", binding.binding.get("binding_ordinal"))
     if isinstance(raw_ordinal, bool):
         raise ValueError("pricing projection binding ordinal is invalid")
     try:
@@ -179,23 +200,15 @@ def _provider_set_ids_by_key(
         try:
             provider_set_key = int(raw_key)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "pricing projection provider-set identity is invalid"
-            ) from exc
+            raise ValueError("pricing projection provider-set identity is invalid") from exc
         if provider_set_key not in provider_set_keys:
             continue
-        provider_set_id = serving._ptg2_manifest_id(
-            serving_row.get("provider_set_global_id_128")
-        )
+        provider_set_id = serving._ptg2_manifest_id(serving_row.get("provider_set_global_id_128"))
         if not provider_set_id:
             raise ValueError("pricing projection provider-set identity is invalid")
-        prior_id = provider_set_ids_by_key.setdefault(
-            provider_set_key, provider_set_id
-        )
+        prior_id = provider_set_ids_by_key.setdefault(provider_set_key, provider_set_id)
         if prior_id != provider_set_id:
-            raise ValueError(
-                "pricing projection provider-set identity is inconsistent"
-            )
+            raise ValueError("pricing projection provider-set identity is inconsistent")
     if set(provider_set_ids_by_key) != provider_set_keys:
         raise ValueError("pricing projection provider-set identity is incomplete")
     return provider_set_ids_by_key
@@ -222,10 +235,7 @@ async def _existing_provider_set_ids(
             "provider_set_keys": list(provider_set_keys),
         },
     )
-    return {
-        int(row["provider_set_key"]): str(row["provider_set_id"])
-        for row in result.mappings()
-    }
+    return {int(row["provider_set_key"]): str(row["provider_set_id"]) for row in result.mappings()}
 
 
 def _validate_provider_set_memberships(
@@ -234,10 +244,7 @@ def _validate_provider_set_memberships(
     npis_by_set: Mapping[str, tuple[int, ...]],
 ) -> None:
     expected_key_by_id = {
-        str(provider_set["provider_set_id"]): int(
-            provider_set["provider_set_key"]
-        )
-        for provider_set in provider_sets
+        str(provider_set["provider_set_id"]): int(provider_set["provider_set_key"]) for provider_set in provider_sets
     }
     if (
         len(expected_key_by_id) != len(provider_sets)
@@ -255,17 +262,13 @@ def _validate_provider_set_memberships(
             or metadata.provider_count < 0
             or len(provider_npis) != metadata.provider_count
         ):
-            raise ValueError(
-                "pricing projection provider membership is incomplete"
-            )
+            raise ValueError("pricing projection provider membership is incomplete")
         if (
             len(provider_npis) > MAX_PROVIDER_NPIS_PER_SET
             or any(type(npi) is not int or npi <= 0 for npi in provider_npis)
             or len(set(provider_npis)) != len(provider_npis)
         ):
-            raise ValueError(
-                "pricing projection provider membership exceeds its bound"
-            )
+            raise ValueError("pricing projection provider membership exceeds its bound")
 
 
 def _staged_membership_rows(
@@ -275,10 +278,7 @@ def _staged_membership_rows(
     state: _BuildState,
 ) -> Iterable[dict[str, int]]:
     key_by_id = {
-        str(provider_set["provider_set_id"]): int(
-            provider_set["provider_set_key"]
-        )
-        for provider_set in provider_sets
+        str(provider_set["provider_set_id"]): int(provider_set["provider_set_key"]) for provider_set in provider_sets
     }
     for provider_set_id in sorted(key_by_id, key=key_by_id.get):
         provider_set_key = key_by_id[provider_set_id]
@@ -307,9 +307,7 @@ async def _stage_provider_set_batch(
 ) -> None:
     """Stage one bounded provider-set membership batch."""
 
-    binding_ordinal, npis_by_set = await _bounded_provider_memberships(
-        session, binding, provider_sets, state
-    )
+    binding_ordinal, npis_by_set = await _bounded_provider_memberships(session, binding, provider_sets, state)
     await _stage_provider_membership_batch(
         session,
         binding_ordinal,
@@ -331,10 +329,7 @@ async def _bounded_provider_memberships(
     from api import ptg2_serving as serving
 
     binding_ordinal = _binding_ordinal(binding)
-    provider_set_ids = tuple(
-        str(provider_set["provider_set_id"])
-        for provider_set in provider_sets
-    )
+    provider_set_ids = tuple(str(provider_set["provider_set_id"]) for provider_set in provider_sets)
     metadata_by_id = await serving._provider_set_metadata_for_ids(
         session,
         binding.serving_tables,
@@ -352,10 +347,7 @@ async def _bounded_provider_memberships(
         npis_by_set,
     )
     membership_count = sum(map(len, npis_by_set.values()))
-    if (
-        state.provider_membership_count + membership_count
-        > MAX_PROJECTION_PROVIDER_MEMBERSHIPS
-    ):
+    if state.provider_membership_count + membership_count > MAX_PROJECTION_PROVIDER_MEMBERSHIPS:
         raise ValueError("pricing projection membership bound exceeded")
     return binding_ordinal, npis_by_set
 
@@ -375,9 +367,7 @@ async def _stage_provider_membership_batch(
             "binding_ordinal": binding_ordinal,
             "provider_set_key": int(provider_set["provider_set_key"]),
             "provider_set_id": str(provider_set["provider_set_id"]),
-            "membership_count": len(
-                npis_by_set[str(provider_set["provider_set_id"])]
-            ),
+            "membership_count": len(npis_by_set[str(provider_set["provider_set_id"])]),
         }
         for provider_set in provider_sets
     ]
@@ -396,10 +386,7 @@ async def _stage_provider_membership_batch(
             state,
         ),
     )
-    provider_set_keys = [
-        int(provider_set["provider_set_key"])
-        for provider_set in provider_sets
-    ]
+    provider_set_keys = [int(provider_set["provider_set_key"]) for provider_set in provider_sets]
     await session.execute(
         text(_PENDING_PROVIDER_NPI_INSERT_SQL),
         {
@@ -422,17 +409,10 @@ async def _stage_code_provider_sets(
     if not provider_set_keys:
         return
     binding_ordinal = _binding_ordinal(binding)
-    provider_set_ids_by_key = _provider_set_ids_by_key(
-        serving_rows, provider_set_keys
-    )
+    provider_set_ids_by_key = _provider_set_ids_by_key(serving_rows, provider_set_keys)
     ordered_keys = tuple(sorted(provider_set_ids_by_key))
-    existing_ids_by_key = await _existing_provider_set_ids(
-        session, binding_ordinal, ordered_keys
-    )
-    if any(
-        existing_ids_by_key[key] != provider_set_ids_by_key[key]
-        for key in existing_ids_by_key
-    ):
+    existing_ids_by_key = await _existing_provider_set_ids(session, binding_ordinal, ordered_keys)
+    if any(existing_ids_by_key[key] != provider_set_ids_by_key[key] for key in existing_ids_by_key):
         raise ValueError("pricing projection provider-set identity is inconsistent")
     new_provider_sets = [
         {
@@ -442,10 +422,7 @@ async def _stage_code_provider_sets(
         for key in ordered_keys
         if key not in existing_ids_by_key
     ]
-    if (
-        state.staged_provider_set_count + len(new_provider_sets)
-        > MAX_PROJECTION_PROVIDER_SETS
-    ):
+    if state.staged_provider_set_count + len(new_provider_sets) > MAX_PROJECTION_PROVIDER_SETS:
         raise ValueError("pricing projection provider-set bound exceeded")
     for start in range(0, len(new_provider_sets), PROVIDER_SET_BATCH_SIZE):
         await stage_provider_set_batch(
@@ -454,40 +431,3 @@ async def _stage_code_provider_sets(
             new_provider_sets[start : start + PROVIDER_SET_BATCH_SIZE],
             state,
         )
-
-
-async def _persist_provider_projection(
-    session: Any,
-    projection_id: str,
-) -> None:
-    """Copy fully admitted provider stages into the immutable projection."""
-
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {table('plan_pricing_provider_membership')} (
-                projection_id, binding_ordinal, provider_set_key, npi
-            )
-            SELECT :projection_id, binding_ordinal, provider_set_key, npi
-              FROM plan_pricing_provider_member_stage
-             ORDER BY binding_ordinal, provider_set_key, npi
-            """
-        ),
-        {"projection_id": projection_id},
-    )
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {table('plan_pricing_provider_cell')} (
-                projection_id, geo_cell, npi, entity_type_code,
-                taxonomy_codes, fragment
-            )
-            SELECT projection_id, geo_cell, npi, entity_type_code,
-                   taxonomy_codes, fragment
-              FROM plan_pricing_provider_cell_stage
-             WHERE projection_id = :projection_id
-             ORDER BY geo_cell, npi
-            """
-        ),
-        {"projection_id": projection_id},
-    )

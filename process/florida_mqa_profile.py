@@ -1942,6 +1942,65 @@ def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) 
     return ":".join(parts)
 
 
+def _fact_value(
+    source_row: Mapping[str, str], value_json: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    if value_json is not None:
+        return dict(value_json)
+    return _without_empty(
+        {
+            key: field_value
+            for key, field_value in source_row.items()
+            if key not in _PROFILE_RAW_ONLY_FIELDS
+        }
+    )
+
+
+def _logical_fact_key(
+    category: str,
+    fact_type: str,
+    fact_key: str,
+    fact_value: Mapping[str, Any],
+) -> str:
+    discriminator: Any = fact_key if fact_key != "default" else fact_value
+    return hashlib.sha256(
+        json.dumps(
+            [category, fact_type, discriminator],
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _fact_effective_date(
+    source_row: Mapping[str, str],
+    explicit_date: str | None,
+    fields: tuple[str, ...],
+    infer_effective_period: bool,
+) -> str | None:
+    return explicit_date or (
+        _first(source_row, *fields) if infer_effective_period else None
+    ) or None
+
+
+def _fact_source(
+    profile_source: FloridaSource,
+    artifact: Mapping[str, Any],
+    record_id: str,
+) -> dict[str, Any]:
+    return {
+        "source_key": FL_MQA_SOURCE_KEY,
+        "dataset": profile_source.key,
+        "agency": FL_MQA_AGENCY,
+        "jurisdiction": "FL",
+        "artifact_id": artifact["artifact_id"],
+        "content_sha256": artifact["content_sha256"],
+        "source_url": artifact["source_url"],
+        "source_record_id": record_id,
+    }
+
+
 def _fact_payload(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -1966,34 +2025,12 @@ def _fact_payload(
     """Build the reviewed public and restricted payloads for one source fact."""
     resolved_category = category or profile_source.category
     resolved_fact_type = fact_type or profile_source.fact_type
-    resolved_value = (
-        dict(value_json)
-        if value_json is not None
-        else _without_empty(
-            {
-                key: field_value
-                for key, field_value in source_row.items()
-                if key not in _PROFILE_RAW_ONLY_FIELDS
-            }
-        )
+    resolved_value = _fact_value(source_row, value_json)
+    logical_fact_key = _logical_fact_key(
+        resolved_category, resolved_fact_type, fact_key, resolved_value
     )
-    logical_discriminator: Any = (
-        fact_key
-        if fact_key != "default"
-        else resolved_value
-    )
-    logical_fact_key = hashlib.sha256(
-        json.dumps(
-            [resolved_category, resolved_fact_type, logical_discriminator],
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
     return {
-        "fact_id": hashlib.sha256(
-            f"{run_id}:{record_id}:{logical_fact_key}".encode()
-        ).hexdigest(),
+        "fact_id": hashlib.sha256(f"{run_id}:{record_id}:{logical_fact_key}".encode()).hexdigest(),
         "run_id": run_id,
         "npi": npi,
         "source_record_id": record_id,
@@ -2005,36 +2042,19 @@ def _fact_payload(
         "availability": "available",
         "assertion_type": assertion_type or profile_source.assertion_type,
         "verification_status": verification_status or profile_source.verification_status,
-        "effective_start": effective_start
-        or (
-            _first(source_row, "effective_date", "action_date", "orig_dte", "issue_date")
-            if infer_effective_period
-            else None
-        )
-        or None,
-        "effective_end": effective_end
-        or (
-            _first(source_row, "expiration_date", "expr_dte", "end_date")
-            if infer_effective_period
-            else None
-        )
-        or None,
-        "source_json": {
-            "source_key": FL_MQA_SOURCE_KEY,
-            "dataset": profile_source.key,
-            "agency": FL_MQA_AGENCY,
-            "jurisdiction": "FL",
-            "artifact_id": artifact["artifact_id"],
-            "content_sha256": artifact["content_sha256"],
-            "source_url": artifact["source_url"],
-            "source_record_id": record_id,
-        },
-        "sensitive": profile_source.sensitive if sensitive is None else sensitive,
-        "public_default": (
-            profile_source.public_default
-            if public_default is None
-            else public_default
+        "effective_start": _fact_effective_date(
+            source_row, effective_start,
+            ("effective_date", "action_date", "orig_dte", "issue_date"),
+            infer_effective_period,
         ),
+        "effective_end": _fact_effective_date(
+            source_row, effective_end,
+            ("expiration_date", "expr_dte", "end_date"),
+            infer_effective_period,
+        ),
+        "source_json": _fact_source(profile_source, artifact, record_id),
+        "sensitive": profile_source.sensitive if sensitive is None else sensitive,
+        "public_default": profile_source.public_default if public_default is None else public_default,
         "published_at": _utcnow() if npi is not None else None,
     }
 
@@ -2123,6 +2143,51 @@ def _mapped_profile_data_fact(
     )
 
 
+_SAFE_PROFILE_INDICATORS = (
+    ("other_health_degree", "health_degree", "Other health degree"),
+    ("graduate_medical_education", "grad_med_edu", "Graduate medical education"),
+    ("professional_postgraduate_training", "prof_post_train", "Professional or postgraduate training"),
+    ("faculty_appointments", "faculty_appoint", "Faculty appointments"),
+    ("staff_privileges", "staff_priv", "Staff privileges"),
+    ("certifications", "certification", "Certifications"),
+)
+_RESTRICTED_PROFILE_INDICATORS = (
+    (
+        "criminal_offense_disclosure", "criminal_offense",
+        "criminal_disclosures", "criminal_offense_disclosure_indicator",
+    ),
+    (
+        "medicaid_program_disclosure", "medicaid_prgrm",
+        "regulatory_actions", "medicaid_program_disclosure_indicator",
+    ),
+)
+
+
+def _restricted_indicator_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    restricted_facts: list[dict[str, Any]] = []
+    for output_field, source_field, category, fact_type in _RESTRICTED_PROFILE_INDICATORS:
+        if not source_row.get(source_field):
+            continue
+        indicator = _indicator_value(source_row[source_field])
+        restricted_facts.append(
+            _fact_payload(
+                profile_source, source_row, run_id=run_id, record_id=record_id,
+                npi=npi, artifact=artifact, category=category, fact_type=fact_type,
+                display=f"Restricted {output_field.replace('_', ' ')}",
+                value_json={output_field: indicator}, fact_key={output_field: indicator},
+                sensitive=True, public_default=False,
+            )
+        )
+    return restricted_facts
+
+
 def _profile_indicator_facts(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -2133,32 +2198,16 @@ def _profile_indicator_facts(
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Build reviewed practitioner-profile indicator facts."""
-    safe_indicators = (
-        ("other_health_degree", "health_degree", "Other health degree"),
-        (
-            "graduate_medical_education",
-            "grad_med_edu",
-            "Graduate medical education",
-        ),
-        (
-            "professional_postgraduate_training",
-            "prof_post_train",
-            "Professional or postgraduate training",
-        ),
-        ("faculty_appointments", "faculty_appoint", "Faculty appointments"),
-        ("staff_privileges", "staff_priv", "Staff privileges"),
-        ("certifications", "certification", "Certifications"),
-    )
     sections_by_key = {
         output_field: _indicator_value(source_row[source_field])
-        for output_field, source_field, _label in safe_indicators
+        for output_field, source_field, _label in _SAFE_PROFILE_INDICATORS
         if source_row.get(source_field)
     }
     facts: list[dict[str, Any]] = []
     if sections_by_key:
         available_labels = [
             label
-            for output_field, _source_field, label in safe_indicators
+            for output_field, _source_field, label in _SAFE_PROFILE_INDICATORS
             if sections_by_key.get(output_field, {}).get("reported") is True
         ]
         display = (
@@ -2181,42 +2230,67 @@ def _profile_indicator_facts(
                 fact_key={"sections": sections_by_key},
             )
         )
-    restricted_indicators = (
-        (
-            "criminal_offense_disclosure",
-            "criminal_offense",
-            "criminal_disclosures",
-            "criminal_offense_disclosure_indicator",
-        ),
-        (
-            "medicaid_program_disclosure",
-            "medicaid_prgrm",
-            "regulatory_actions",
-            "medicaid_program_disclosure_indicator",
-        ),
+    return facts + _restricted_indicator_facts(
+        profile_source, source_row, run_id, record_id, npi, artifact
     )
-    for output_field, source_field, category, fact_type in restricted_indicators:
-        if not source_row.get(source_field):
-            continue
-        indicator = _indicator_value(source_row[source_field])
-        facts.append(
-            _fact_payload(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-                category=category,
-                fact_type=fact_type,
-                display=f"Restricted {output_field.replace('_', ' ')}",
-                value_json={output_field: indicator},
-                fact_key={output_field: indicator},
-                sensitive=True,
-                public_default=False,
-            )
+
+
+def _financial_public_value(source_row: Mapping[str, str]) -> dict[str, Any]:
+    return _without_empty(
+        {
+            "financial_responsibility": source_row.get("financial_resp", ""),
+            "financial_exemption": (
+                _indicator_value(source_row["financial_exempt"])
+                if source_row.get("financial_exempt") else {}
+            ),
+            "insurance": _without_empty(
+                {
+                    "currently_insured": (
+                        _indicator_value(source_row["insured"])
+                        if source_row.get("insured") else {}
+                    ),
+                    "insured_for_ten_years": (
+                        _indicator_value(source_row["insured_10_yr"])
+                        if source_row.get("insured_10_yr") else {}
+                    ),
+                }
+            ),
+        }
+    )
+
+
+def _financial_display_values(source_row: Mapping[str, str]) -> list[str]:
+    return [
+        field_value
+        for field_value in (
+            source_row.get("financial_resp", ""),
+            "exemption reported" if source_row.get("financial_exempt", "").upper()
+            in {"Y", "YES", "TRUE", "1", "X"} else "",
+            "insurance reported" if source_row.get("insured", "").upper()
+            in {"Y", "YES", "TRUE", "1", "X"} else "",
         )
-    return facts
+        if field_value
+    ]
+
+
+def _liability_fact(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    liability_indicator = _indicator_value(source_row["liability_claim"])
+    liability_by_field = {"liability_claim_indicator": liability_indicator}
+    return _fact_payload(
+        profile_source, source_row, run_id=run_id, record_id=record_id,
+        npi=npi, artifact=artifact, category="liability_claims",
+        fact_type="liability_claim_indicator",
+        display="Restricted liability claim indicator",
+        value_json=liability_by_field, fact_key=liability_by_field,
+        sensitive=True, public_default=False,
+    )
 
 
 def _financial_responsibility_facts(
@@ -2229,51 +2303,10 @@ def _financial_responsibility_facts(
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Build reviewed financial-responsibility facts from one source row."""
-    public_value = _without_empty(
-        {
-            "financial_responsibility": source_row.get("financial_resp", ""),
-            "financial_exemption": (
-                _indicator_value(source_row["financial_exempt"])
-                if source_row.get("financial_exempt")
-                else {}
-            ),
-            "insurance": _without_empty(
-                {
-                    "currently_insured": (
-                        _indicator_value(source_row["insured"])
-                        if source_row.get("insured")
-                        else {}
-                    ),
-                    "insured_for_ten_years": (
-                        _indicator_value(source_row["insured_10_yr"])
-                        if source_row.get("insured_10_yr")
-                        else {}
-                    ),
-                }
-            ),
-        }
-    )
+    public_value = _financial_public_value(source_row)
     facts: list[dict[str, Any]] = []
     if public_value:
-        display_values = [
-            field_value
-            for field_value in (
-                source_row.get("financial_resp", ""),
-                (
-                    "exemption reported"
-                    if source_row.get("financial_exempt", "").upper()
-                    in {"Y", "YES", "TRUE", "1", "X"}
-                    else ""
-                ),
-                (
-                    "insurance reported"
-                    if source_row.get("insured", "").upper()
-                    in {"Y", "YES", "TRUE", "1", "X"}
-                    else ""
-                ),
-            )
-            if field_value
-        ]
+        display_values = _financial_display_values(source_row)
         facts.append(
             _fact_payload(
                 profile_source,
@@ -2292,28 +2325,9 @@ def _financial_responsibility_facts(
             )
         )
     if source_row.get("liability_claim"):
-        liability_indicator = _indicator_value(source_row["liability_claim"])
-        facts.append(
-            _fact_payload(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-                category="liability_claims",
-                fact_type="liability_claim_indicator",
-                display="Restricted liability claim indicator",
-                value_json={
-                    "liability_claim_indicator": liability_indicator
-                },
-                fact_key={
-                    "liability_claim_indicator": liability_indicator
-                },
-                sensitive=True,
-                public_default=False,
-            )
-        )
+        facts.append(_liability_fact(
+            profile_source, source_row, run_id, record_id, npi, artifact
+        ))
     return facts
 
 

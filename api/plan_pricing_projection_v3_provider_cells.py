@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, Mapping
 
 import orjson
@@ -17,6 +18,29 @@ PROVIDER_NPI_BATCH_SIZE = 5_000
 MAX_PROVIDER_CELLS_PER_BATCH = 100_000
 MAX_PROJECTION_PROVIDER_CELLS = 8_000_000
 MAX_PROJECTION_PROVIDER_FRAGMENT_BYTES = 16 * 1024 * 1024 * 1024
+MAX_PROVIDER_STATE_FRAGMENT_BYTES = 16 * 1024
+PROVIDER_STATE_FRAGMENT_VERSION = "plan_pricing_provider_state_v1"
+_EVIDENCE_SOURCE_ID = {
+    "nppes_registry_address": 1,
+    "multi_issuer_marketplace_address": 2,
+    "cms_doctors_source_with_nppes_identity_anchor": 3,
+}
+_STATE_ADDRESS_FIELDS = frozenset(
+    {
+        "npi", "type", "first_line", "second_line", "city", "state",
+        "postal_code", "country_code", "address_key", "location_key",
+        "address_precision", "address_sources", "source_record_ids",
+        "source_count", "multi_source_confirmed", "source_mask",
+        "address_source_mask", "location_confidence_id",
+        "geo_evidence_level", "address_provenance", "lat", "long",
+    }
+)
+_PROVENANCE_FIELDS = (
+    "dataset_id",
+    "source_record_id",
+    "record_version_id",
+    "retrieved_at",
+)
 
 
 async def _next_provider_npis(session: Any, after_npi: int) -> list[int]:
@@ -71,6 +95,234 @@ def _provider_fragment(
     )
 
 
+def _normalized_strings(values: Any) -> list[str]:
+    return list(
+        dict.fromkeys(
+            normalized
+            for value in values or ()
+            if (normalized := str(value).strip())
+        )
+    )
+
+
+def _state_address_payload(provider_by_field: Mapping[str, Any]) -> dict[str, Any]:
+    raw_payload = provider_by_field.get("address_payload")
+    try:
+        address_payload = orjson.loads(raw_payload)
+    except (orjson.JSONDecodeError, TypeError) as exc:
+        raise ValueError("pricing projection provider-state address is invalid") from exc
+    if not isinstance(address_payload, dict):
+        raise ValueError("pricing projection provider-state address is invalid")
+    return address_payload
+
+
+def _state_code(value: Any) -> str | None:
+    state = str(value or "").strip().upper()
+    if not state:
+        return None
+    if len(state) != 2 or not state.isascii() or not state.isalpha():
+        raise ValueError("pricing projection provider-state code is invalid")
+    return state
+
+
+def _source_id(value: Any) -> int | None:
+    if type(value) is int and value > 0:
+        return value
+    return None
+
+
+def _is_complete_provenance(entry: Any) -> bool:
+    return (
+        isinstance(entry, Mapping)
+        and _source_id(entry.get("source_id")) is not None
+        and all(entry.get(field_name) not in (None, "", []) for field_name in _PROVENANCE_FIELDS)
+    )
+
+
+def _has_valid_coordinates(address: Mapping[str, Any]) -> bool:
+    latitude = address.get("lat")
+    longitude = address.get("long")
+    if latitude is None or longitude is None:
+        return latitude is None and longitude is None
+    if isinstance(latitude, bool) or isinstance(longitude, bool):
+        return False
+    try:
+        lat_value = float(latitude)
+        long_value = float(longitude)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        math.isfinite(lat_value)
+        and math.isfinite(long_value)
+        and -90 <= lat_value <= 90
+        and -180 <= long_value <= 180
+    )
+
+
+def _validated_state_address(
+    provider_by_field: Mapping[str, Any],
+    address: Mapping[str, Any],
+    npi: int,
+    state: str,
+) -> None:
+    zip5 = str(provider_by_field.get("zip5") or "")
+    postal_code = "".join(
+        character
+        for character in str(address.get("postal_code") or "")
+        if character.isdigit()
+    )[:5]
+    location_key = str(address.get("location_key") or "")
+    evidence_level = str(address.get("geo_evidence_level") or "")
+    admitted_source_id = _EVIDENCE_SOURCE_ID.get(evidence_level)
+    provenance = address.get("address_provenance")
+    complete_provenance = (
+        provenance
+        if isinstance(provenance, list)
+        and provenance
+        and all(_is_complete_provenance(entry) for entry in provenance)
+        else ()
+    )
+    if (
+        not _STATE_ADDRESS_FIELDS.issubset(address)
+        or type(address.get("npi")) is not int
+        or address.get("npi") != npi
+        or str(address.get("state") or "") != state
+        or postal_code != zip5
+        or address.get("city") != provider_by_field.get("city")
+        or not location_key
+        or provider_by_field.get("location_hash")
+        != f"entity_address_unified:{location_key}"
+        or provider_by_field.get("location_source") != "entity_address_unified"
+        or provider_by_field.get("location_confidence_code")
+        != "entity_address_unified"
+        or admitted_source_id is None
+        or not any(
+            _source_id(entry.get("source_id")) == admitted_source_id
+            for entry in complete_provenance
+        )
+        or type(address.get("source_mask")) is not int
+        or type(address.get("address_source_mask")) is not int
+        or not _has_valid_coordinates(address)
+    ):
+        raise ValueError("pricing projection provider-state address is inconsistent")
+
+
+def _provider_state_fragment(
+    provider_by_field: Mapping[str, Any],
+    taxonomy_codes: tuple[str, ...],
+) -> bytes:
+    address_payload = _state_address_payload(provider_by_field)
+    npi = int(provider_by_field["npi"])
+    state = _state_code(provider_by_field.get("state"))
+    if state is None:
+        raise ValueError("pricing projection provider-state code is missing")
+    _validated_state_address(provider_by_field, address_payload, npi, state)
+    fragment = orjson.dumps(
+        {
+            "version": PROVIDER_STATE_FRAGMENT_VERSION,
+            "provider": {
+                "npi": npi,
+                "provider_name": provider_by_field.get("provider_name") or "TiC provider",
+                "entity_type_code": provider_by_field.get("entity_type_code"),
+                "credential": provider_by_field.get("credential"),
+                "provider_sex_code": provider_by_field.get("provider_sex_code"),
+                "taxonomy_codes": list(taxonomy_codes),
+                "specialties": _normalized_strings(provider_by_field.get("specialties")),
+                "primary_specialty": provider_by_field.get("primary_specialty"),
+                "classifications": _normalized_strings(provider_by_field.get("classifications")),
+                "specializations": _normalized_strings(provider_by_field.get("specializations")),
+                "primary_specialization": provider_by_field.get("primary_specialization"),
+                "state": state,
+                "city": provider_by_field.get("city"),
+                "zip5": provider_by_field.get("zip5"),
+                "location_hash": provider_by_field.get("location_hash"),
+                "location_source": provider_by_field.get("location_source"),
+                "location_confidence_code": provider_by_field.get("location_confidence_code"),
+                "address_payload": address_payload,
+            },
+        },
+    )
+    if not 2 <= len(fragment) <= MAX_PROVIDER_STATE_FRAGMENT_BYTES:
+        raise ValueError("pricing projection provider-state fragment bound exceeded")
+    return fragment
+
+
+def _state_fragment(
+    provider_by_field: Mapping[str, Any],
+    taxonomy_codes: tuple[str, ...],
+) -> bytes | None:
+    raw_rank = provider_by_field.get("state_address_rank")
+    if raw_rank is None:
+        return None
+    if type(raw_rank) is not int or raw_rank <= 0:
+        raise ValueError("pricing projection provider-state rank is invalid")
+    return (
+        _provider_state_fragment(provider_by_field, taxonomy_codes)
+        if raw_rank == 1
+        else None
+    )
+
+
+def _materialized_provider_cell(
+    projection_id: str,
+    state: _BuildState,
+    npi: int,
+    provider_by_field: Mapping[str, Any],
+    state_witnesses: set[tuple[int, str]],
+) -> tuple[dict[str, Any], str | None]:
+    state_code = _state_code(provider_by_field.get("state"))
+    taxonomy_codes = _normalized_taxonomy_codes(provider_by_field)
+    fragment = _provider_fragment(provider_by_field, taxonomy_codes)
+    state_fragment = _state_fragment(provider_by_field, taxonomy_codes)
+    geo_cell = str(provider_by_field["zip5"])
+    semantic_fragment = orjson.dumps(
+        (
+            fragment.decode("utf-8"),
+            provider_by_field.get("entity_type_code"),
+            taxonomy_codes,
+        )
+    )
+    fragment_bytes = len(fragment) + len(state_fragment or b"")
+    if (
+        state.provider_cell_count >= MAX_PROJECTION_PROVIDER_CELLS
+        or state.provider_fragment_byte_count + fragment_bytes
+        > MAX_PROJECTION_PROVIDER_FRAGMENT_BYTES
+    ):
+        raise ValueError("pricing projection provider-cell bound exceeded")
+    digest_row(
+        state.content_digest,
+        "provider-cell",
+        (npi, geo_cell),
+        semantic_fragment,
+    )
+    if state_fragment is not None:
+        state_key = (npi, state_code or "")
+        if state_key in state_witnesses:
+            raise ValueError("pricing projection provider-state witness is duplicated")
+        digest_row(
+            state.content_digest,
+            "provider-state",
+            (state_key[1], npi),
+            state_fragment,
+        )
+        state_witnesses.add(state_key)
+        state.provider_state_count += 1
+    state.provider_cell_count += 1
+    state.provider_fragment_byte_count += fragment_bytes
+    return (
+        {
+            "projection_id": projection_id,
+            "geo_cell": geo_cell,
+            "npi": npi,
+            "entity_type_code": provider_by_field.get("entity_type_code"),
+            "taxonomy_codes": list(taxonomy_codes),
+            "fragment": fragment,
+            "state_fragment": state_fragment,
+        },
+        state_code,
+    )
+
+
 def _provider_cell_rows(
     projection_id: str,
     state: _BuildState,
@@ -84,44 +336,22 @@ def _provider_cell_rows(
     ):
         raise ValueError("pricing projection provider-cell bound exceeded")
     provider_cell_rows: list[dict[str, Any]] = []
+    state_witnesses: set[tuple[int, str]] = set()
+    expected_state_witnesses: set[tuple[int, str]] = set()
     for npi in npi_batch:
         for provider_by_field in providers_by_npi.get(npi, ()):
-            taxonomy_codes = _normalized_taxonomy_codes(provider_by_field)
-            fragment = _provider_fragment(provider_by_field, taxonomy_codes)
-            geo_cell = str(provider_by_field["zip5"])
-            semantic_fragment = orjson.dumps(
-                (
-                    fragment.decode("utf-8"),
-                    provider_by_field.get("entity_type_code"),
-                    taxonomy_codes,
-                )
+            provider_cell_row, state_code = _materialized_provider_cell(
+                projection_id,
+                state,
+                npi,
+                provider_by_field,
+                state_witnesses,
             )
-            if (
-                state.provider_cell_count >= MAX_PROJECTION_PROVIDER_CELLS
-                or state.provider_fragment_byte_count + len(fragment)
-                > MAX_PROJECTION_PROVIDER_FRAGMENT_BYTES
-            ):
-                raise ValueError("pricing projection provider-cell bound exceeded")
-            digest_row(
-                state.content_digest,
-                "provider-cell",
-                (npi, geo_cell),
-                semantic_fragment,
-            )
-            provider_cell_rows.append(
-                {
-                    "projection_id": projection_id,
-                    "geo_cell": geo_cell,
-                    "npi": npi,
-                    "entity_type_code": provider_by_field.get(
-                        "entity_type_code"
-                    ),
-                    "taxonomy_codes": list(taxonomy_codes),
-                    "fragment": fragment,
-                }
-            )
-            state.provider_cell_count += 1
-            state.provider_fragment_byte_count += len(fragment)
+            if state_code is not None:
+                expected_state_witnesses.add((npi, state_code))
+            provider_cell_rows.append(provider_cell_row)
+    if state_witnesses != expected_state_witnesses:
+        raise ValueError("pricing projection provider-state witness is incomplete")
     return provider_cell_rows
 
 
@@ -149,10 +379,10 @@ async def _materialize_provider_cells(
             """
             INSERT INTO plan_pricing_provider_cell_stage (
                 projection_id, geo_cell, npi, entity_type_code,
-                taxonomy_codes, fragment
+                taxonomy_codes, fragment, state_fragment
             ) VALUES (
                 :projection_id, :geo_cell, :npi, :entity_type_code,
-                :taxonomy_codes, :fragment
+                :taxonomy_codes, :fragment, :state_fragment
             )
             """,
             cell_rows,

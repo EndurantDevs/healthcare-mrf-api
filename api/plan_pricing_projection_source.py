@@ -138,34 +138,25 @@ def _binding_code_query(
     )
 
 
-def _provider_rows_sql() -> str:
-    from api import ptg2_serving as serving
-
+def _assured_addresses_sql(serving: Any) -> str:
     assurance_sql = serving._ptg2_geo_assured_address_sql("addr")
-    taxonomy_sql = serving._provider_taxonomy_summary_lateral_sql(
-        "source_npis.npi"
-    )
+    evidence_level_sql = serving._ptg2_geo_evidence_level_sql("addr")
     return f"""
         WITH source_npis AS MATERIALIZED (
             SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
-        ), ranked_addresses AS MATERIALIZED (
+        ), assured_addresses AS MATERIALIZED (
             SELECT addr.*,
                    COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5))
                        AS projected_zip5,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY addr.npi, COALESCE(
-                           addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)
-                       )
-                       ORDER BY CASE addr.type
-                                    WHEN 'practice' THEN 0
-                                    WHEN 'primary' THEN 1
-                                    WHEN 'secondary' THEN 2
-                                    WHEN 'site' THEN 3
-                                    ELSE 4
-                                END,
-                                addr.checksum,
-                                addr.location_key
-                   ) AS address_rank
+                   CASE
+                     WHEN UPPER(BTRIM(COALESCE(addr.state_name, '')))
+                          ~ '^[A-Z]{{2}}$'
+                     THEN UPPER(BTRIM(addr.state_name))
+                     WHEN UPPER(BTRIM(COALESCE(addr.state_code, '')))
+                          ~ '^[A-Z]{{2}}$'
+                     THEN UPPER(BTRIM(addr.state_code))
+                   END AS projected_state,
+                   {evidence_level_sql} AS geo_evidence_level
               FROM {table('entity_address_unified')} addr
               JOIN source_npis ON source_npis.npi = addr.npi
              WHERE addr.type IN ('practice', 'primary', 'secondary', 'site')
@@ -174,31 +165,136 @@ def _provider_rows_sql() -> str:
                        addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)
                    ) ~ '^[0-9]{{5}}$'
         )
+    """
+
+
+def _ranked_addresses_sql(serving: Any) -> str:
+    display_rank_sql = serving.address_display_rank_sql("addr")
+    type_rank_sql = """CASE addr.type
+        WHEN 'practice' THEN 0
+        WHEN 'primary' THEN 1
+        WHEN 'secondary' THEN 2
+        WHEN 'site' THEN 3
+        ELSE 4
+    END"""
+    return f"""
+        , ranked_addresses AS MATERIALIZED (
+            SELECT addr.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY addr.npi, addr.projected_zip5
+                       ORDER BY {display_rank_sql},
+                                {type_rank_sql},
+                                addr.checksum,
+                                addr.location_key
+                   ) AS zip_address_rank,
+                   CASE WHEN addr.projected_state IS NOT NULL THEN
+                       ROW_NUMBER() OVER (
+                           PARTITION BY addr.npi, addr.projected_state
+                           ORDER BY {display_rank_sql},
+                                    {type_rank_sql},
+                                    addr.checksum,
+                                    addr.location_key
+                       )
+                   END AS state_address_rank
+              FROM assured_addresses addr
+        )
+    """
+
+
+def _address_payload_sql() -> str:
+    return """jsonb_build_object(
+        'npi', source_npis.npi,
+        'type', addr.type,
+        'checksum', addr.checksum,
+        'first_line', addr.first_line,
+        'second_line', addr.second_line,
+        'city', addr.city_name,
+        'state', addr.projected_state,
+        'postal_code', COALESCE(
+            NULLIF(BTRIM(addr.postal_code), ''), addr.projected_zip5
+        ),
+        'country_code', addr.country_code,
+        'telephone_number', addr.telephone_number,
+        'fax_number', addr.fax_number,
+        'phone_number', addr.phone_number,
+        'phone_extension', addr.phone_extension,
+        'fax_number_digits', addr.fax_number_digits,
+        'fax_extension', addr.fax_extension,
+        'address_key', addr.address_key::text,
+        'address_site_key', addr.premise_key::text,
+        'premise_key', addr.premise_key::text,
+        'location_key', addr.location_key,
+        'address_precision', addr.address_precision,
+        'county_fips', addr.county_fips,
+        'address_sources', addr.address_sources,
+        'source_record_ids', addr.source_record_ids,
+        'source_count', addr.source_count,
+        'multi_source_confirmed', addr.multi_source_confirmed,
+        'source_mask', addr.source_mask,
+        'address_source_mask', addr.address_source_mask,
+        'location_confidence_id', addr.location_confidence_id,
+        'lat', addr.lat,
+        'long', addr.long
+    )::text"""
+
+
+def _provider_selection_sql(serving: Any) -> str:
+    taxonomy_sql = serving._provider_taxonomy_summary_lateral_sql(
+        "source_npis.npi"
+    )
+    address_payload_sql = _address_payload_sql()
+    return f"""
         SELECT source_npis.npi,
                {serving._ptg2_provider_name_sql('n')} AS provider_name,
                n.entity_type_code,
                n.provider_credential_text AS credential,
+               n.provider_sex_code,
                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+               COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
+               COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
                tax.primary_specialty,
+               tax.primary_specialization,
                addr.city_name AS city,
-               addr.state_name AS state,
-               addr.projected_zip5 AS zip5
+               addr.projected_state AS state,
+               addr.projected_zip5 AS zip5,
+               CONCAT('entity_address_unified:', addr.location_key)
+                   AS location_hash,
+               'entity_address_unified'::varchar AS location_source,
+               'entity_address_unified'::varchar AS location_confidence_code,
+               addr.state_address_rank,
+               addr.geo_evidence_level AS _geo_evidence_level,
+               {serving._geo_evidence_source_id_sql('addr.geo_evidence_level')}
+                   AS _geo_evidence_source_id,
+               {address_payload_sql} AS address_payload
          FROM source_npis
           LEFT JOIN {table('npi')} n ON n.npi = source_npis.npi
           JOIN ranked_addresses addr
             ON addr.npi = source_npis.npi
-           AND addr.address_rank = 1
+           AND addr.zip_address_rank = 1
          {taxonomy_sql}
-         ORDER BY source_npis.npi, addr.projected_zip5
+         ORDER BY source_npis.npi, addr.projected_state, addr.projected_zip5
          LIMIT :provider_row_limit
     """
+
+
+def _provider_rows_sql() -> str:
+    from api import ptg2_serving as serving
+
+    return "".join(
+        (
+            _assured_addresses_sql(serving),
+            _ranked_addresses_sql(serving),
+            _provider_selection_sql(serving),
+        )
+    )
 
 
 def _append_provider_rows(
     provider_rows_by_npi: dict[int, list[dict[str, Any]]],
     provider_result: Any,
-) -> None:
+) -> list[dict[str, Any]]:
+    appended_rows: list[dict[str, Any]] = []
     for raw_provider_row in provider_result:
         provider_by_field = row_mapping(raw_provider_row)
         npi = int(provider_by_field["npi"])
@@ -209,7 +305,37 @@ def _append_provider_rows(
         provider_by_field["state"] = (
             str(provider_by_field.get("state") or "").strip().upper() or None
         )
+        state_address_rank = provider_by_field.get("state_address_rank")
+        provider_by_field["state_address_rank"] = (
+            int(state_address_rank) if state_address_rank is not None else None
+        )
         provider_rows_by_npi[npi].append(provider_by_field)
+        appended_rows.append(provider_by_field)
+    return appended_rows
+
+
+async def _hydrate_state_address_provenance(
+    session: Any,
+    provider_rows: list[dict[str, Any]],
+) -> None:
+    from api import ptg2_serving as serving
+
+    witness_rows = [
+        provider_by_field
+        for provider_by_field in provider_rows
+        if provider_by_field.get("state_address_rank") == 1
+    ]
+    if not witness_rows:
+        return
+    expected_count = len(witness_rows)
+    status = await serving._hydrate_address_provenance(
+        session,
+        witness_rows,
+        include_response_evidence=True,
+        use_stored_only=True,
+    )
+    if status != "available" or len(witness_rows) != expected_count:
+        raise ValueError("pricing projection provider-state provenance is incomplete")
 
 
 async def projection_provider_rows_for_npis(
@@ -233,7 +359,8 @@ async def projection_provider_rows_for_npis(
         provider_rows = list(provider_result)
         if len(provider_rows) > MAX_PROVIDER_ROWS_PER_BATCH:
             raise ValueError("pricing projection provider-row bound exceeded")
-        _append_provider_rows(provider_rows_by_npi, provider_rows)
+        appended_rows = _append_provider_rows(provider_rows_by_npi, provider_rows)
+        await _hydrate_state_address_provenance(session, appended_rows)
     return {
         npi: tuple(provider_rows)
         for npi, provider_rows in provider_rows_by_npi.items()

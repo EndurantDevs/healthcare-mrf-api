@@ -289,6 +289,7 @@ def test_exact_billing_result_states_and_error_codes_are_frozen():
         "resource_not_found",
         "billing_search_cursor_generation_expired",
         "billing_search_serving_unavailable",
+        "pricing_projection_unavailable",
     }
     assert specification["components"]["headers"]["BillingSearchCacheControl"][
         "schema"

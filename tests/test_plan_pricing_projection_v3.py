@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import plan_pricing_projection_v3 as projection
+from api import plan_pricing_projection_v3_code as code_stage
 from api import plan_pricing_projection_v3_provider as provider_stage
 from api import plan_pricing_projection_v3_provider_cells as provider_cells
 from api import ptg2_serving as serving
@@ -70,11 +71,7 @@ def test_provider_cell_digest_binds_normalized_full_taxonomy_array() -> None:
         PROJECTION_ID,
         second_state,
         [1000000001],
-        {
-            1000000001: [
-                {**provider_by_field, "taxonomy_codes": ["207X00000X", "207Q00000X"]}
-            ]
-        },
+        {1000000001: [{**provider_by_field, "taxonomy_codes": ["207X00000X", "207Q00000X"]}]},
     )
 
     assert first_rows[0]["taxonomy_codes"] == ["207X00000X", "208D00000X"]
@@ -86,26 +83,22 @@ async def test_stage_ddl_uses_one_statement_per_execute() -> None:
     session = _ExecuteSession()
 
     await projection._create_stage_tables(session)
-    assert len(session.calls) == 10
+    assert len(session.calls) == 11
     assert all(sql.count("CREATE TEMP TABLE") == 1 for sql, _ in session.calls)
     assert "plan_pricing_provider_set_stage" in session.calls[0][0]
     assert "plan_pricing_provider_npi_materialized_stage" in session.calls[2][0]
     assert "plan_pricing_provider_npi_pending_stage" in session.calls[3][0]
-    assert "plan_pricing_rate_frequency_stage" in session.calls[6][0]
-    assert "plan_pricing_provider_cell_stage" in session.calls[7][0]
-    assert "plan_pricing_eligible_member_cell_stage" in session.calls[8][0]
-    assert "plan_pricing_set_cell_stage" in session.calls[9][0]
+    assert "plan_pricing_rate_occurrence_stage" in session.calls[5][0]
+    assert "plan_pricing_rate_frequency_stage" in session.calls[7][0]
+    assert "plan_pricing_provider_cell_stage" in session.calls[8][0]
+    assert "state_fragment bytea NULL" in session.calls[8][0]
+    assert "plan_pricing_eligible_member_cell_stage" in session.calls[9][0]
+    assert "plan_pricing_set_cell_stage" in session.calls[10][0]
 
 
 @pytest.mark.asyncio
 async def test_provider_set_membership_is_exactly_bounded(monkeypatch) -> None:
-    provider_npis = AsyncMock(
-        return_value={
-            "1" * 32: tuple(
-                range(1, projection.MAX_PROVIDER_NPIS_PER_SET + 2)
-            )
-        }
-    )
+    provider_npis = AsyncMock(return_value={"1" * 32: tuple(range(1, projection.MAX_PROVIDER_NPIS_PER_SET + 2))})
     monkeypatch.setattr(serving, "_provider_npis_for_sets", provider_npis)
     monkeypatch.setattr(
         serving,
@@ -129,9 +122,7 @@ async def test_provider_set_membership_is_exactly_bounded(monkeypatch) -> None:
             projection._BuildState(hashlib.sha256()),
         )
 
-    assert provider_npis.await_args.kwargs["limit_per_set"] == (
-        projection.MAX_PROVIDER_NPIS_PER_SET + 1
-    )
+    assert provider_npis.await_args.kwargs["limit_per_set"] == (projection.MAX_PROVIDER_NPIS_PER_SET + 1)
 
 
 @pytest.mark.asyncio
@@ -140,11 +131,16 @@ async def test_provider_projection_persists_only_after_admission() -> None:
 
     await provider_stage._persist_provider_projection(session, PROJECTION_ID)
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 3
     assert "plan_pricing_provider_membership" in session.calls[0][0]
     assert "plan_pricing_provider_member_stage" in session.calls[0][0]
     assert "plan_pricing_provider_cell" in session.calls[1][0]
     assert "plan_pricing_provider_cell_stage" in session.calls[1][0]
+    assert "plan_pricing_provider_state" in session.calls[2][0]
+    assert "provider_fragment" in session.calls[2][0]
+    assert "convert_from(state_fragment, 'UTF8')" in session.calls[2][0]
+    assert "SELECT DISTINCT" not in session.calls[2][0]
+    assert "^[A-Z]{2}$" in session.calls[2][0]
     assert all(parameters == {"projection_id": PROJECTION_ID} for _, parameters in session.calls)
 
 
@@ -159,9 +155,7 @@ async def test_code_provider_sets_stage_only_new_referenced_keys(monkeypatch) ->
 
     class _ExistingSession:
         async def execute(self, *_args, **_kwargs):
-            return _MappingRows(
-                [{"provider_set_key": 7, "provider_set_id": "1" * 32}]
-            )
+            return _MappingRows([{"provider_set_key": 7, "provider_set_id": "1" * 32}])
 
     stage_batch = AsyncMock()
     monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
@@ -186,9 +180,7 @@ async def test_code_provider_sets_stage_only_new_referenced_keys(monkeypatch) ->
     )
 
     assert stage_batch.await_count == 1
-    assert stage_batch.await_args.args[2] == [
-        {"provider_set_key": 8, "provider_set_id": "2" * 32}
-    ]
+    assert stage_batch.await_args.args[2] == [{"provider_set_key": 8, "provider_set_id": "2" * 32}]
 
 
 @pytest.mark.asyncio
@@ -244,9 +236,7 @@ async def test_provider_membership_release_cap_is_inclusive(monkeypatch) -> None
     monkeypatch.setattr(
         serving,
         "_provider_set_metadata_for_ids",
-        AsyncMock(
-            return_value=_provider_metadata((provider_set_id, 7, 2))
-        ),
+        AsyncMock(return_value=_provider_metadata((provider_set_id, 7, 2))),
     )
     monkeypatch.setattr(provider_stage, "MAX_PROJECTION_PROVIDER_MEMBERSHIPS", 2)
 
@@ -312,13 +302,9 @@ async def test_provider_materialization_drains_pending_npis_once() -> None:
         insert_batches=insert_batches,
     )
 
-    assert "plan_pricing_provider_cell_stage" in str(
-        insert_batches.await_args.args[1]
-    )
+    assert "plan_pricing_provider_cell_stage" in str(insert_batches.await_args.args[1])
     assert "provider_npi_materialized_stage" in session.calls[0][0]
-    assert "DELETE FROM plan_pricing_provider_npi_pending_stage" in (
-        session.calls[1][0]
-    )
+    assert "DELETE FROM plan_pricing_provider_npi_pending_stage" in (session.calls[1][0])
     assert session.calls[0][1] == session.calls[1][1] == {"npis": [11]}
 
 
@@ -337,14 +323,17 @@ def test_provider_cell_release_caps_are_inclusive(monkeypatch) -> None:
         fragment_size,
     )
     state = projection._BuildState(hashlib.sha256())
-    assert len(
-        provider_cells._provider_cell_rows(
-            PROJECTION_ID,
-            state,
-            [1000000001],
-            {1000000001: [provider_by_field]},
+    assert (
+        len(
+            provider_cells._provider_cell_rows(
+                PROJECTION_ID,
+                state,
+                [1000000001],
+                {1000000001: [provider_by_field]},
+            )
         )
-    ) == 1
+        == 1
+    )
 
     with pytest.raises(ValueError, match="provider-cell bound exceeded"):
         provider_cells._provider_cell_rows(
@@ -380,9 +369,7 @@ async def test_code_read_fails_before_io_above_declared_bound(monkeypatch) -> No
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
 
     with pytest.raises(ValueError, match="occurrence bound"):
-        await projection._binding_code_rows(
-            object(), _binding(), [{"code_key": 1, "rate_count": 1}]
-        )
+        await projection._binding_code_rows(object(), _binding(), [{"code_key": 1, "rate_count": 1}])
 
     merge_rows.assert_not_awaited()
 
@@ -404,9 +391,7 @@ async def test_code_read_preserves_declared_rows_and_price_identities(
         },
     ]
     merge_rows = AsyncMock(return_value=serving_rows)
-    monkeypatch.setattr(
-        serving, "_declared_geo_rate_count", lambda _code_rows: 2
-    )
+    monkeypatch.setattr(serving, "_declared_geo_rate_count", lambda _code_rows: 2)
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
     selected_rows, price_keys_by_set = await projection._binding_code_rows(
         object(), _binding(), [{"code_key": 1, "rate_count": 2}]
@@ -414,18 +399,14 @@ async def test_code_read_preserves_declared_rows_and_price_identities(
 
     assert selected_rows == serving_rows
     assert price_keys_by_set == {"1" * 32: 9}
-    assert merge_rows.await_args.kwargs["limit"] == (
-        projection.MAX_CODE_OCCURRENCES + 1
-    )
+    assert merge_rows.await_args.kwargs["limit"] == (projection.MAX_CODE_OCCURRENCES + 1)
 
 
 @pytest.mark.asyncio
 async def test_code_read_rejects_declared_count_or_price_identity_drift(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        serving, "_declared_geo_rate_count", lambda _code_rows: 2
-    )
+    monkeypatch.setattr(serving, "_declared_geo_rate_count", lambda _code_rows: 2)
     merge_rows = AsyncMock(return_value=[])
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
 
@@ -450,6 +431,4 @@ async def test_code_read_rejects_declared_count_or_price_identity_drift(
 
 def test_numeric_rate_parity_rejects_silent_atom_loss() -> None:
     with pytest.raises(ValueError, match="non-numeric rate"):
-        projection._exact_numeric_rates(
-            ({"negotiated_rate": "1"}, {"negotiated_rate": "bad"})
-        )
+        projection._exact_numeric_rates(({"negotiated_rate": "1"}, {"negotiated_rate": "bad"}))

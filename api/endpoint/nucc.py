@@ -22,25 +22,9 @@ def _get_session(request):
     return session
 
 
-@blueprint.get('/all')
-async def all_of_nucc(request):
-    """Return the filtered NUCC taxonomy collection."""
-    session = _get_session(request)
-    args = request.args
-    table = NUCCTaxonomy.__table__
-
+def _nucc_filters(args, table):
     query_text = str(args.get("q") or "").strip()
     code = str(args.get("code") or "").strip()
-    order = str(args.get("order") or "asc").strip().lower()
-    if order not in {"asc", "desc"}:
-        order = "asc"
-
-    include_meta = parse_bool_alias(args, "include_meta", "paginate", default=False)
-    has_pagination_args = any(
-        args.get(name) not in (None, "", "null")
-        for name in ("limit", "offset", "page", "start", "page_size")
-    )
-
     filters = []
     applied_filter_by_name = {}
     if code:
@@ -58,6 +42,37 @@ async def all_of_nucc(request):
                 table.c.section.ilike(f"%{query_text}%"),
             )
         )
+    return filters, applied_filter_by_name
+
+
+def _ordered_nucc_query(table, filters, order):
+    statement = select(NUCCTaxonomy)
+    if filters:
+        statement = statement.where(*filters)
+    order_columns = (
+        (table.c.display_name.desc(), table.c.code.desc())
+        if order == "desc"
+        else (table.c.display_name.asc(), table.c.code.asc())
+    )
+    return statement.order_by(*order_columns)
+
+
+@blueprint.get('/all')
+async def all_of_nucc(request):
+    """Return the filtered NUCC taxonomy collection."""
+    session = _get_session(request)
+    args = request.args
+    table = NUCCTaxonomy.__table__
+    order = str(args.get("order") or "asc").strip().lower()
+    if order not in {"asc", "desc"}:
+        order = "asc"
+    include_meta = parse_bool_alias(args, "include_meta", "paginate", default=False)
+    has_pagination_args = any(
+        args.get(name) not in (None, "", "null")
+        for name in ("limit", "offset", "page", "start", "page_size")
+    )
+
+    filters, applied_filter_by_name = _nucc_filters(args, table)
 
     count_stmt = select(func.count()).select_from(table)
     if filters:
@@ -65,13 +80,7 @@ async def all_of_nucc(request):
     total_result = await session.execute(count_stmt)
     total = int(total_result.scalar() or 0)
 
-    stmt = select(NUCCTaxonomy)
-    if filters:
-        stmt = stmt.where(*filters)
-    if order == "desc":
-        stmt = stmt.order_by(table.c.display_name.desc(), table.c.code.desc())
-    else:
-        stmt = stmt.order_by(table.c.display_name.asc(), table.c.code.asc())
+    stmt = _ordered_nucc_query(table, filters, order)
     pagination = None
     if include_meta or has_pagination_args:
         pagination = parse_pagination(

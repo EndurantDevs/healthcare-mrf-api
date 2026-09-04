@@ -74,6 +74,7 @@ def test_openapi_documents_projection_response_shapes():
         "enum": [
             "plan_pricing_card_v2",
             "plan_pricing_factorized_v3",
+            "plan_pricing_factorized_v4",
             "plan_pricing_em_distance_v1",
         ],
     }
@@ -110,3 +111,48 @@ def test_openapi_card_allows_projection_specific_optional_fields():
         "nullable": True,
         "pattern": "^[0-9]{5}$",
     }
+
+
+def test_openapi_documents_bounded_v4_state_scan_contract():
+    spec = _openapi_spec()
+    operation = spec["paths"]["/pricing/providers/search-by-procedure"]["get"]
+    description = " ".join(operation["description"].split())
+    parameters_by_name = {
+        parameter["name"]: parameter for parameter in operation["parameters"]
+    }
+
+    assert "release-bound state scan" in description
+    assert "include_allowed_amounts=false" in description
+    assert "immutable projection" in description
+    assert "shorter complete NPI prefix" in description
+    assert "single indivisible NPI" in description
+    assert "may legitimately return no items" in description
+    assert "256 rate occurrences" in description
+    assert "256 emitted price atoms" in description
+    assert "State alone is not a geographic distance anchor" in description
+    assert parameters_by_name["cursor"]["schema"] == {
+        "type": "string",
+        "maxLength": 2048,
+        "pattern": "^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$",
+    }
+    pagination = spec["components"]["schemas"]["PaginationMeta"]
+    assert pagination["properties"]["scanned_npi_count"]["minimum"] == 0
+    assert pagination["properties"]["next_cursor"]["maxLength"] == 2048
+    assert operation["responses"]["422"]["content"]["application/json"][
+        "schema"
+    ] == {
+        "$ref": "#/components/schemas/PlanPricingStateScanBudgetRefusal"
+    }
+    assert operation["responses"]["422"]["headers"]["Cache-Control"] == {
+        "$ref": "#/components/headers/BillingSearchCacheControl"
+    }
+    refusal = spec["components"]["schemas"][
+        "PlanPricingStateScanBudgetRefusal"
+    ]
+    assert refusal["required"] == ["status", "code", "message", "fix_it"]
+    assert refusal["properties"]["code"]["enum"] == [
+        "ptg2_online_work_budget_exceeded"
+    ]
+    assert refusal["properties"]["fix_it"]["properties"]["retry_options"][
+        "maxItems"
+    ] == 0

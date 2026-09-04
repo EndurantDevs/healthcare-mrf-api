@@ -56,11 +56,22 @@ def _candidate(**updates):
         "aggregate_raw_byte_count": 70,
         "aggregate_stored_byte_count": 60,
         "prewarm_shape_count": 1,
+        "provider_state_count": 2,
+        "rate_occurrence_count": 3,
         "build_seconds": 1.5,
         "state": "ready",
     }
     candidate_by_field.update(updates)
     return candidate_by_field
+
+
+def test_factorized_v3_receipt_omits_v4_counts():
+    built_receipt = projection_build.receipt(
+        _candidate(contract_version=projection_build.FACTORIZED_V3_PROJECTION_CONTRACT)
+    )
+
+    assert "provider_state_count" not in built_receipt
+    assert "rate_occurrence_count" not in built_receipt
 
 
 @pytest.mark.asyncio
@@ -121,7 +132,9 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         session,
         PROJECTION_ID,
         hashlib.sha256(b"content"),
-        projection_build.ProjectionV3Counts(3, 2, 80, 1, 1, 70, 60, 1, 4),
+        projection_build.ProjectionV3Counts(
+            3, 2, 80, 1, 1, 70, 60, 1, 4, 2, 3
+        ),
         1.5,
     )
     assert "INSERT INTO" in session.statements[0][0]
@@ -130,6 +143,8 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
     )
     assert receipt["aggregate_entry_count"] == 1
     assert receipt["rate_profile_count"] == 4
+    assert receipt["provider_state_count"] == 2
+    assert receipt["rate_occurrence_count"] == 3
     assert session.statements[1][1] == {
         "projection_id": PROJECTION_ID,
         "content_digest": hashlib.sha256(b"content").hexdigest(),
@@ -142,6 +157,8 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         "aggregate_raw_byte_count": 70,
         "aggregate_stored_byte_count": 60,
         "prewarm_shape_count": 1,
+        "provider_state_count": 2,
+        "rate_occurrence_count": 3,
         "build_seconds": 1.5,
     }
 
@@ -248,6 +265,14 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_session_builder_reuses_authority_bound_candidate_under_lock(monkeypatch):
+    with pytest.raises(ValueError, match="contract is unsupported"):
+        await projection_build.build_in_session(
+            object(),
+            binding_manifest_digest="b" * 64,
+            bindings=[],
+            projection_contract="unknown",
+        )
+
     with pytest.raises(ValueError, match="digest is invalid"):
         await projection_build.build_in_session(
             object(), binding_manifest_digest="bad", bindings=[]

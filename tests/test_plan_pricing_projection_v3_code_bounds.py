@@ -46,7 +46,11 @@ async def _numeric_alias_code_rows(_session, _binding, rows):
     serving_row_by_field = {
         "_ptg_provider_set_key": 7,
         "provider_set_global_id_128": _ALIAS_PROVIDER_SET_ID,
+        "price_key": 1,
         "price_set_global_id_128": _ALIAS_PRICE_SET_ID,
+        "serving_content_hash_128": "3" * 32,
+        "source_key": 1,
+        "provider_count": 1,
     }
     return [serving_row_by_field, dict(serving_row_by_field)], {
         _ALIAS_PRICE_SET_ID: 1
@@ -59,7 +63,12 @@ async def _two_binding_code_rows(_session, binding, _code_rows):
     return [
         {
             "_ptg_provider_set_key": ordinal + 10,
+            "provider_set_global_id_128": str(ordinal + 3) * 32,
+            "price_key": ordinal + 1,
             "price_set_global_id_128": price_set_id,
+            "serving_content_hash_128": str(ordinal + 5) * 32,
+            "source_key": ordinal + 1,
+            "provider_count": 1,
         }
     ], {price_set_id: ordinal + 1}
 

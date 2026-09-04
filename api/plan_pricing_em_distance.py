@@ -134,6 +134,9 @@ def em_distance_retry_option(
         "order": "asc",
         "include_providers": True,
         "view": "card",
+        "offset": 0,
+        "start": 0,
+        "page": 1,
     }
     if pagination is not None and not _is_bounded_pagination(pagination):
         return None
