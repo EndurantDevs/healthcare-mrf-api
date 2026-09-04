@@ -54,22 +54,6 @@ fn v2_charge_free_payers_are_omitted_and_v3_rejects_them() {
             .is_empty());
     }
 
-    let mut estimated_only_v2_tall =
-        csv_fixture_records(&fixture_v2_csv(InputFormat::TallCsv, "2.0.0"));
-    for header in ["negotiated_percentage", "methodology"] {
-        let index = estimated_only_v2_tall[2]
-            .iter()
-            .position(|candidate| candidate.contains(header))
-            .unwrap();
-        estimated_only_v2_tall[3][index].clear();
-    }
-    assert_import_error(
-        InputFormat::TallCsv,
-        &csv_fixture_bytes(&estimated_only_v2_tall),
-        DEFAULT_MAX_FANOUT_ROWS,
-        "invalid standard charge methodology",
-    );
-
     let mut v3_tall = csv_fixture_records(&fixture_tall_csv());
     let dollar = v3_tall[2]
         .iter()

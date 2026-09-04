@@ -4,7 +4,7 @@ fn validate_payer(
     generic_notes: Option<&str>,
     normalize_case: bool,
 ) -> io::Result<PayerChargeRow> {
-    let payer = validate_payer_common(payer, generic_notes, normalize_case)?;
+    let payer = validate_payer_common(payer, generic_notes, normalize_case, false)?;
     validate_v3_payer(&payer, generic_notes, normalize_case)?;
     Ok(payer)
 }
@@ -15,7 +15,17 @@ fn validate_csv_payer(
     normalize_case: bool,
     profile: CmsProfile,
 ) -> io::Result<PayerChargeRow> {
-    let payer = validate_payer_common(payer, generic_notes, normalize_case)?;
+    let methodology_optional = profile == CmsProfile::V2
+        && payer.estimated_amount.is_some()
+        && payer.standard_charge_dollar.is_none()
+        && payer.standard_charge_percentage.is_none()
+        && payer.standard_charge_algorithm.is_none();
+    let payer = validate_payer_common(
+        payer,
+        generic_notes,
+        normalize_case,
+        methodology_optional,
+    )?;
     match profile {
         CmsProfile::V2 => validate_v2_payer(&payer)?,
         CmsProfile::V3 => validate_v3_payer(&payer, generic_notes, normalize_case)?,
@@ -49,7 +59,7 @@ fn validate_json_payer(
     generic_notes: Option<&str>,
     evidence: &mut JsonProfileEvidence,
 ) -> io::Result<Option<PayerChargeRow>> {
-    let payer = validate_payer_common(payer, generic_notes, false)?;
+    let payer = validate_payer_common(payer, generic_notes, false, false)?;
     if payer.estimated_amount.is_some() {
         evidence.v2("estimated_amount");
     }
@@ -108,6 +118,7 @@ fn validate_payer_common(
     mut payer: PayerChargeRow,
     generic_notes: Option<&str>,
     normalize_case: bool,
+    methodology_optional: bool,
 ) -> io::Result<PayerChargeRow> {
     payer.payer_name = required_text(&payer.payer_name, "payer_name")?.to_owned();
     payer.plan_name = required_text(&payer.plan_name, "plan_name")?.to_owned();
@@ -115,7 +126,11 @@ fn validate_payer_common(
         .negotiated_rate_term
         .as_deref()
         .and_then(optional_text);
-    payer.methodology = canonical_methodology(&payer.methodology, normalize_case)?;
+    payer.methodology = if methodology_optional && payer.methodology.trim().is_empty() {
+        String::new()
+    } else {
+        canonical_methodology(&payer.methodology, normalize_case)?
+    };
     payer.standard_charge_algorithm = payer
         .standard_charge_algorithm
         .as_deref()
