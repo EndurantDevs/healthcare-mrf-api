@@ -324,6 +324,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
+    _await_cleanup_task,
     attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
 )
@@ -2099,8 +2100,8 @@ async def _copy_manifest_paths(
                 progress_callback=progress_callback,
             )
         return
-    await asyncio.gather(
-        *(
+    pending_copies = {
+        asyncio.create_task(
             _copy_one_manifest_path(
                 input_path,
                 target_table=target_table,
@@ -2108,9 +2109,16 @@ async def _copy_manifest_paths(
                 progress_callback=progress_callback,
                 semaphore=semaphore,
             )
-            for input_path in input_paths
         )
-    )
+        for input_path in input_paths
+    }
+    try:
+        await asyncio.shield(asyncio.gather(*pending_copies))
+    except BaseException:
+        await _await_cleanup_task(
+            asyncio.create_task(_cancel_and_wait_tasks(pending_copies))
+        )
+        raise
 
 
 def _completed_manifest_copy_result(
@@ -2222,7 +2230,9 @@ async def _copy_manifest_files_direct_with_progress(
     )
 
 
-def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
+def _cleanup_manifest_copy_paths(
+    copy_files_by_kind: dict[str, list[Path]], *, cleanup_empty_siblings: bool = True,
+) -> None:
     for copy_file_paths in copy_files_by_kind.values():
         for copy_file_path in copy_file_paths:
             base_copy_path = _manifest_copy_base_path(copy_file_path)
@@ -2234,7 +2244,8 @@ def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> N
                     copy_file_path,
                     exc_info=True,
                 )
-            _cleanup_empty_manifest_copy_siblings(base_copy_path)
+            if cleanup_empty_siblings:
+                _cleanup_empty_manifest_copy_siblings(base_copy_path)
 
 
 def _cleanup_manifest_copy_entries(
@@ -2414,6 +2425,21 @@ async def _merge_ptg2_manifest_files(
             _cleanup_manifest_copy_paths(copy_files_by_kind)
 
 
+def _cleanup_copied_manifest_kind(
+    kind: str,
+    copy_files_by_kind: dict[str, list[Path]],
+    copy_kinds: Sequence[str],
+) -> None:
+    """Release exact copied files while retaining every later family's input."""
+    retained_paths = {
+        path.resolve() for remaining_kind in copy_kinds[copy_kinds.index(kind) + 1:]
+        for path in copy_files_by_kind[remaining_kind]
+    }
+    _cleanup_manifest_copy_paths({
+        kind: [path for path in copy_files_by_kind[kind] if path.resolve() not in retained_paths]
+    }, cleanup_empty_siblings=False)
+
+
 async def _copy_strict_v3_price_files(
     copy_kinds: tuple[str, ...],
     copy_files_by_kind: dict[str, list[Path]],
@@ -2467,6 +2493,7 @@ async def _copy_strict_v3_price_files(
                 emitted_rows=emitted_rows_by_kind.get(kind),
             )
         )
+        _cleanup_copied_manifest_kind(kind, copy_files_by_kind, active_kinds)
     copy_report_map["direct_to_copy"] = True
     _emit_screen_line(
         "PTG2_STRICT_V3_PRICE_COPY\t" f"{json.dumps(copy_report_map, sort_keys=True)}"

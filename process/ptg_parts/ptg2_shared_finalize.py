@@ -714,6 +714,269 @@ def attach_v3_dictionary_contract(
     return normalized
 
 
+def _validate_serving_entry(
+    entry: dict[str, Any],
+    source_key_by_identity: Mapping[SharedPhysicalArtifactIdentity, int],
+    partition_count: int | None,
+) -> tuple[int, int, str]:
+    """Validate a run's physical source, partition, size, and content binding."""
+
+    _validate_file_metadata(
+        entry,
+        label="serving-run",
+        expected_format=PTG2_V3_SERVING_RUN_FORMAT,
+        expected_version=PTG2_V3_SERVING_RUN_VERSION,
+    )
+    identity = normalized_physical_artifact_identity(entry)
+    try:
+        source_key = source_key_by_identity[identity]
+    except KeyError as exc:
+        raise RuntimeError(
+            "strict V3 serving-run entry is not part of the complete physical input set"
+        ) from exc
+    observed_partition_count = _required_non_negative_integer(
+        entry.get("partition_count"), field_name="serving-run partition_count"
+    )
+    partition = _required_non_negative_integer(
+        entry.get("partition"), field_name="serving-run partition"
+    )
+    if observed_partition_count <= 0 or partition >= observed_partition_count:
+        raise RuntimeError("strict V3 serving-run partition metadata is invalid")
+    if partition_count is None:
+        partition_count = observed_partition_count
+    elif partition_count != observed_partition_count:
+        raise RuntimeError("strict V3 serving-run partition counts are inconsistent")
+    row_count = _required_non_negative_integer(
+        entry.get("row_count"), field_name="serving-run row_count"
+    )
+    byte_count = _required_non_negative_integer(
+        entry.get("bytes"), field_name="serving-run bytes"
+    )
+    if row_count * PTG2_V3_SERVING_RUN_RECORD_BYTES != byte_count:
+        raise RuntimeError(
+            "strict V3 serving-run row and byte counts are inconsistent"
+        )
+    expected_file_sha256 = _required_sha256(
+        entry.get("source_run_file_sha256"),
+        field_name="source_run_file_sha256",
+    )
+    if (
+        _required_sha256(
+            entry.get("sha256"), field_name="serving-run sha256"
+        )
+        != expected_file_sha256
+    ):
+        raise RuntimeError(
+            "strict V3 serving-run content digest does not match its source contract"
+        )
+    return source_key, partition_count, expected_file_sha256
+
+
+def _prepare_serving_run_entry(
+    entry: dict[str, Any],
+    source_key_by_identity: Mapping[SharedPhysicalArtifactIdentity, int],
+    source_count: int,
+    partition_count: int | None,
+    contract_digest_by_source: dict[int, str],
+    contract_by_source: dict[int, dict[str, Any]],
+) -> tuple[int, int, dict[str, Any]]:
+    """Collect the authenticated contract and replace source identity with its key."""
+
+    source_key, partition_count, expected_file_sha256 = _validate_serving_entry(
+        entry, source_key_by_identity, partition_count
+    )
+    contract_digest = _required_sha256(
+        entry.get("source_run_contract_sha256"),
+        field_name="source_run_contract_sha256",
+    )
+    previous_digest = contract_digest_by_source.setdefault(
+        source_key, contract_digest
+    )
+    if previous_digest != contract_digest:
+        raise RuntimeError(
+            "strict V3 serving-run files disagree on their source contract"
+        )
+    raw_contract = entry.get("source_run_contract")
+    if raw_contract is not None:
+        if not isinstance(raw_contract, Mapping) or source_key in contract_by_source:
+            raise RuntimeError(
+                "strict V3 serving-run source contract must appear exactly once"
+            )
+        source_contract_map = dict(raw_contract)
+        if _canonical_json_sha256(source_contract_map) != contract_digest:
+            raise RuntimeError(
+                "strict V3 serving-run source contract digest is invalid"
+            )
+        contract_by_source[source_key] = source_contract_map
+    for field_name in _PHYSICAL_IDENTITY_FIELDS:
+        entry.pop(field_name, None)
+    entry.pop("source_run_contract", None)
+    entry.pop("source_run_contract_sha256", None)
+    entry.pop("source_run_file_sha256", None)
+    entry["sha256"] = expected_file_sha256
+    entry["source_key"] = source_key
+    entry["source_count"] = source_count
+    return source_key, partition_count, {
+        "partition": entry["partition"],
+        "row_count": entry["row_count"],
+        "bytes": entry["bytes"],
+        "sha256": expected_file_sha256,
+    }
+
+
+def _validate_serving_source_header(
+    source_contract_map: dict[str, Any] | None,
+    identity: SharedPhysicalArtifactIdentity,
+    partition_count: int | None,
+) -> tuple[dict[str, Any], int]:
+    """Require one exact source identity and the complete partition geometry."""
+
+    if source_contract_map is None:
+        raise RuntimeError(
+            "strict V3 finalizer is missing a complete source-run contract"
+        )
+    if set(source_contract_map) != set(_SOURCE_RUN_CONTRACT_FIELDS):
+        raise RuntimeError("strict V3 source-run contract fields are incompatible")
+    if _required_non_negative_integer(
+        source_contract_map.get("version"),
+        field_name="source-run contract version",
+    ) != PTG2_V3_SOURCE_RUN_CONTRACT_VERSION:
+        raise RuntimeError("strict V3 source-run contract version is incompatible")
+    raw_contract_identity = source_contract_map.get("source_identity")
+    if (
+        not isinstance(raw_contract_identity, Mapping)
+        or set(raw_contract_identity) != set(_PHYSICAL_IDENTITY_FIELDS)
+        or dict(raw_contract_identity) != identity.as_dict()
+    ):
+        raise RuntimeError(
+            "strict V3 source-run contract is bound to another physical source"
+        )
+    contract_partition_count = _required_non_negative_integer(
+        source_contract_map.get("partition_count"),
+        field_name="source-run contract partition_count",
+    )
+    if contract_partition_count != partition_count:
+        raise RuntimeError(
+            "strict V3 source-run contract has incomplete partition coverage"
+        )
+    return source_contract_map, contract_partition_count
+
+
+def _validate_serving_source_counts(
+    source_contract_map: Mapping[str, Any],
+    contract_partition_count: int,
+    observed_files: Sequence[Mapping[str, Any]],
+) -> None:
+    """Match every partition and aggregate count against authenticated runs."""
+
+    raw_partition_rows = source_contract_map.get("partition_rows")
+    if not isinstance(raw_partition_rows, list) or len(raw_partition_rows) != int(
+        contract_partition_count
+    ):
+        raise RuntimeError(
+            "strict V3 source-run contract has incomplete partition coverage"
+        )
+    expected_partition_rows = [
+        _required_non_negative_integer(
+            partition_row_count,
+            field_name="source-run contract partition row count",
+        )
+        for partition_row_count in raw_partition_rows
+    ]
+    observed_partition_rows = [0] * int(contract_partition_count)
+    for descriptor in observed_files:
+        observed_partition_rows[int(descriptor["partition"])] += int(
+            descriptor["row_count"]
+        )
+    if observed_partition_rows != expected_partition_rows:
+        raise RuntimeError(
+            "strict V3 serving-run partition rows do not match the complete source contract"
+        )
+
+    expected_file_count = _required_non_negative_integer(
+        source_contract_map.get("file_count"),
+        field_name="source-run contract file_count",
+    )
+    expected_row_count = _required_non_negative_integer(
+        source_contract_map.get("row_count"),
+        field_name="source-run contract row_count",
+    )
+    expected_byte_count = _required_non_negative_integer(
+        source_contract_map.get("byte_count"),
+        field_name="source-run contract byte_count",
+    )
+    if (
+        expected_file_count != len(observed_files)
+        or expected_row_count != sum(
+            int(descriptor["row_count"]) for descriptor in observed_files
+        )
+        or expected_byte_count != sum(
+            int(descriptor["bytes"]) for descriptor in observed_files
+        )
+    ):
+        raise RuntimeError(
+            "strict V3 serving-run aggregates do not match the complete source contract"
+        )
+
+
+def _validate_serving_source_files(
+    source_contract_map: Mapping[str, Any],
+    observed_files: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require the complete canonical multiset of source-run file descriptors."""
+
+    raw_expected_files = source_contract_map.get("files")
+    if not isinstance(raw_expected_files, list):
+        raise RuntimeError("strict V3 source-run contract is missing file digests")
+    expected_files: list[dict[str, Any]] = []
+    for raw_descriptor in raw_expected_files:
+        if not isinstance(raw_descriptor, Mapping):
+            raise RuntimeError("strict V3 source-run contract has an invalid file digest")
+        if set(raw_descriptor) != set(_SOURCE_RUN_FILE_FIELDS):
+            raise RuntimeError(
+                "strict V3 source-run contract file fields are incompatible"
+            )
+        expected_files.append(
+            {
+                "partition": _required_non_negative_integer(
+                    raw_descriptor.get("partition"),
+                    field_name="source-run file partition",
+                ),
+                "row_count": _required_non_negative_integer(
+                    raw_descriptor.get("row_count"),
+                    field_name="source-run file row_count",
+                ),
+                "bytes": _required_non_negative_integer(
+                    raw_descriptor.get("bytes"),
+                    field_name="source-run file bytes",
+                ),
+                "sha256": _required_sha256(
+                    raw_descriptor.get("sha256"),
+                    field_name="source-run file sha256",
+                ),
+            }
+        )
+
+    def descriptor_key(
+        descriptor: Mapping[str, Any],
+    ) -> tuple[int, str, int, int]:
+        """Return the canonical sort key for a source-run file descriptor."""
+
+        return (
+            int(descriptor["partition"]),
+            str(descriptor["sha256"]),
+            int(descriptor["row_count"]),
+            int(descriptor["bytes"]),
+        )
+
+    if sorted(expected_files, key=descriptor_key) != sorted(
+        observed_files, key=descriptor_key
+    ):
+        raise RuntimeError(
+            "strict V3 serving-run file digests do not match the complete source contract"
+        )
+
+
 def _prepare_serving_entries(
     entries: Iterable[Mapping[str, Any]],
     *,
@@ -733,94 +996,16 @@ def _prepare_serving_entries(
     contract_digest_by_source: dict[int, str] = {}
     contract_by_source: dict[int, dict[str, Any]] = {}
     for entry in normalized:
-        _validate_file_metadata(
+        source_key, partition_count, descriptor = _prepare_serving_run_entry(
             entry,
-            label="serving-run",
-            expected_format=PTG2_V3_SERVING_RUN_FORMAT,
-            expected_version=PTG2_V3_SERVING_RUN_VERSION,
+            source_key_by_identity,
+            source_count,
+            partition_count,
+            contract_digest_by_source,
+            contract_by_source,
         )
-        identity = normalized_physical_artifact_identity(entry)
-        try:
-            source_key = source_key_by_identity[identity]
-        except KeyError as exc:
-            raise RuntimeError(
-                "strict V3 serving-run entry is not part of the complete physical input set"
-            ) from exc
         observed_source_keys.add(source_key)
-        observed_partition_count = _required_non_negative_integer(
-            entry.get("partition_count"), field_name="serving-run partition_count"
-        )
-        partition = _required_non_negative_integer(
-            entry.get("partition"), field_name="serving-run partition"
-        )
-        if observed_partition_count <= 0 or partition >= observed_partition_count:
-            raise RuntimeError("strict V3 serving-run partition metadata is invalid")
-        if partition_count is None:
-            partition_count = observed_partition_count
-        elif partition_count != observed_partition_count:
-            raise RuntimeError("strict V3 serving-run partition counts are inconsistent")
-        row_count = _required_non_negative_integer(
-            entry.get("row_count"), field_name="serving-run row_count"
-        )
-        byte_count = _required_non_negative_integer(
-            entry.get("bytes"), field_name="serving-run bytes"
-        )
-        if row_count * PTG2_V3_SERVING_RUN_RECORD_BYTES != byte_count:
-            raise RuntimeError(
-                "strict V3 serving-run row and byte counts are inconsistent"
-            )
-        expected_file_sha256 = _required_sha256(
-            entry.get("source_run_file_sha256"),
-            field_name="source_run_file_sha256",
-        )
-        if (
-            _required_sha256(
-                entry.get("sha256"), field_name="serving-run sha256"
-            )
-            != expected_file_sha256
-        ):
-            raise RuntimeError(
-                "strict V3 serving-run content digest does not match its source contract"
-            )
-        contract_digest = _required_sha256(
-            entry.get("source_run_contract_sha256"),
-            field_name="source_run_contract_sha256",
-        )
-        previous_digest = contract_digest_by_source.setdefault(
-            source_key, contract_digest
-        )
-        if previous_digest != contract_digest:
-            raise RuntimeError(
-                "strict V3 serving-run files disagree on their source contract"
-            )
-        raw_contract = entry.get("source_run_contract")
-        if raw_contract is not None:
-            if not isinstance(raw_contract, Mapping) or source_key in contract_by_source:
-                raise RuntimeError(
-                    "strict V3 serving-run source contract must appear exactly once"
-                )
-            source_contract_map = dict(raw_contract)
-            if _canonical_json_sha256(source_contract_map) != contract_digest:
-                raise RuntimeError(
-                    "strict V3 serving-run source contract digest is invalid"
-                )
-            contract_by_source[source_key] = source_contract_map
-        for field_name in _PHYSICAL_IDENTITY_FIELDS:
-            entry.pop(field_name, None)
-        entry.pop("source_run_contract", None)
-        entry.pop("source_run_contract_sha256", None)
-        entry.pop("source_run_file_sha256", None)
-        entry["sha256"] = expected_file_sha256
-        entry["source_key"] = source_key
-        entry["source_count"] = source_count
-        entries_by_source[source_key].append(
-            {
-                "partition": partition,
-                "row_count": row_count,
-                "bytes": byte_count,
-                "sha256": expected_file_sha256,
-            }
-        )
+        entries_by_source[source_key].append(descriptor)
     if observed_source_keys != set(range(source_count)):
         raise RuntimeError(
             "strict V3 finalizer requires complete dense source keys before finalization"
@@ -829,133 +1014,14 @@ def _prepare_serving_entries(
     prepared_contracts: list[dict[str, Any]] = []
     for source_key, identity in dense:
         source_contract_map = contract_by_source.get(source_key)
-        if source_contract_map is None:
-            raise RuntimeError(
-                "strict V3 finalizer is missing a complete source-run contract"
-            )
-        if set(source_contract_map) != set(_SOURCE_RUN_CONTRACT_FIELDS):
-            raise RuntimeError("strict V3 source-run contract fields are incompatible")
-        if _required_non_negative_integer(
-            source_contract_map.get("version"),
-            field_name="source-run contract version",
-        ) != PTG2_V3_SOURCE_RUN_CONTRACT_VERSION:
-            raise RuntimeError("strict V3 source-run contract version is incompatible")
-        raw_contract_identity = source_contract_map.get("source_identity")
-        if (
-            not isinstance(raw_contract_identity, Mapping)
-            or set(raw_contract_identity) != set(_PHYSICAL_IDENTITY_FIELDS)
-            or dict(raw_contract_identity) != identity.as_dict()
-        ):
-            raise RuntimeError(
-                "strict V3 source-run contract is bound to another physical source"
-            )
-        contract_partition_count = _required_non_negative_integer(
-            source_contract_map.get("partition_count"),
-            field_name="source-run contract partition_count",
+        source_contract_map, contract_partition_count = _validate_serving_source_header(
+            source_contract_map, identity, partition_count
         )
-        if contract_partition_count != partition_count:
-            raise RuntimeError(
-                "strict V3 source-run contract has incomplete partition coverage"
-            )
-        raw_partition_rows = source_contract_map.get("partition_rows")
-        if not isinstance(raw_partition_rows, list) or len(raw_partition_rows) != int(
-            contract_partition_count
-        ):
-            raise RuntimeError(
-                "strict V3 source-run contract has incomplete partition coverage"
-            )
-        expected_partition_rows = [
-            _required_non_negative_integer(
-                partition_row_count,
-                field_name="source-run contract partition row count",
-            )
-            for partition_row_count in raw_partition_rows
-        ]
-        observed_partition_rows = [0] * int(contract_partition_count)
         observed_files = entries_by_source[source_key]
-        for descriptor in observed_files:
-            observed_partition_rows[int(descriptor["partition"])] += int(
-                descriptor["row_count"]
-            )
-        if observed_partition_rows != expected_partition_rows:
-            raise RuntimeError(
-                "strict V3 serving-run partition rows do not match the complete source contract"
-            )
-
-        expected_file_count = _required_non_negative_integer(
-            source_contract_map.get("file_count"),
-            field_name="source-run contract file_count",
+        _validate_serving_source_counts(
+            source_contract_map, contract_partition_count, observed_files
         )
-        expected_row_count = _required_non_negative_integer(
-            source_contract_map.get("row_count"),
-            field_name="source-run contract row_count",
-        )
-        expected_byte_count = _required_non_negative_integer(
-            source_contract_map.get("byte_count"),
-            field_name="source-run contract byte_count",
-        )
-        if (
-            expected_file_count != len(observed_files)
-            or expected_row_count != sum(
-                int(descriptor["row_count"]) for descriptor in observed_files
-            )
-            or expected_byte_count != sum(
-                int(descriptor["bytes"]) for descriptor in observed_files
-            )
-        ):
-            raise RuntimeError(
-                "strict V3 serving-run aggregates do not match the complete source contract"
-            )
-
-        raw_expected_files = source_contract_map.get("files")
-        if not isinstance(raw_expected_files, list):
-            raise RuntimeError("strict V3 source-run contract is missing file digests")
-        expected_files: list[dict[str, Any]] = []
-        for raw_descriptor in raw_expected_files:
-            if not isinstance(raw_descriptor, Mapping):
-                raise RuntimeError("strict V3 source-run contract has an invalid file digest")
-            if set(raw_descriptor) != set(_SOURCE_RUN_FILE_FIELDS):
-                raise RuntimeError(
-                    "strict V3 source-run contract file fields are incompatible"
-                )
-            expected_files.append(
-                {
-                    "partition": _required_non_negative_integer(
-                        raw_descriptor.get("partition"),
-                        field_name="source-run file partition",
-                    ),
-                    "row_count": _required_non_negative_integer(
-                        raw_descriptor.get("row_count"),
-                        field_name="source-run file row_count",
-                    ),
-                    "bytes": _required_non_negative_integer(
-                        raw_descriptor.get("bytes"),
-                        field_name="source-run file bytes",
-                    ),
-                    "sha256": _required_sha256(
-                        raw_descriptor.get("sha256"),
-                        field_name="source-run file sha256",
-                    ),
-                }
-            )
-        def descriptor_key(
-            descriptor: Mapping[str, Any],
-        ) -> tuple[int, str, int, int]:
-            """Return the canonical sort key for a source-run file descriptor."""
-
-            return (
-                int(descriptor["partition"]),
-                str(descriptor["sha256"]),
-                int(descriptor["row_count"]),
-                int(descriptor["bytes"]),
-            )
-
-        if sorted(expected_files, key=descriptor_key) != sorted(
-            observed_files, key=descriptor_key
-        ):
-            raise RuntimeError(
-                "strict V3 serving-run file digests do not match the complete source contract"
-            )
+        _validate_serving_source_files(source_contract_map, observed_files)
         prepared_contracts.append(
             {
                 "source_key": source_key,
