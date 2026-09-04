@@ -446,10 +446,8 @@ async def test_targeted_v4_removal_cascades_sidecars_only_after_last_binding(
 
 
 @pytest.mark.asyncio
-async def test_targeted_v4_removal_rejects_missing_binding_before_delete(
-    monkeypatch,
-) -> None:
-    """Only terminal failed snapshots may be removed without V4 bindings."""
+async def test_targeted_v4_removal_recovers_failed_unbound_layout(monkeypatch) -> None:
+    """Failed removal releases an orphan while preserving strict safety gates."""
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for this test")
     database = Database()
@@ -461,35 +459,39 @@ async def test_targeted_v4_removal_rejects_missing_binding_before_delete(
     monkeypatch.setattr(source_snapshot_control, "db", database)
     try:
         await _create_production_shaped_schema(database, schema_name)
-        await _install_v4_layout_fixture(database, schema_name)
-        await database.status(f"DELETE FROM {schema}.ptg2_v3_snapshot_binding WHERE snapshot_id = 'shared-a'")
+        stored_bytes = await _install_v4_layout_fixture(database, schema_name)
+        initial_sidecar_counts = await _assert_initial_sidecars(database, schema_name)
+        retained = await source_snapshot_control.remove_ptg2_source_snapshot(
+            snapshot_id="shared-b", source_key="source_b"
+        )
+        await _assert_first_removal_preserves_layout(
+            database, schema_name, retained, initial_sidecar_counts
+        )
+        await database.status(
+            f"DELETE FROM {schema}.ptg2_v3_snapshot_binding "
+            "WHERE snapshot_id = 'shared-a'"
+        )
         with pytest.raises(ValueError, match="missing its shared layout binding"):
             await source_snapshot_control.remove_ptg2_source_snapshot(
                 snapshot_id="shared-a",
                 source_key="source_a",
             )
-        assert await _count(database, schema_name, "ptg2_snapshot") == 2
+        assert await _count(database, schema_name, "ptg2_snapshot") == 1
         assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 1
         assert await _count(database, schema_name, "ptg2_v4_snapshot_map_root") == 1
-        assert (await _sidecar_counts(database, schema_name))[
-            "ptg2_provider_group_tax_identity"
-        ] == 4
-        assert await _count(database, schema_name, "ptg2_v3_block") == 2
-        await database.status(f"UPDATE {schema}.ptg2_snapshot SET status = 'failed' WHERE snapshot_id = 'shared-a'")
-        removed = await source_snapshot_control.remove_ptg2_source_snapshot(snapshot_id="shared-a", source_key="source_a")
-        assert [
-            removed["deleted_snapshots"],
-            removed["deleted_v3_snapshot_bindings"],
-            removed["released_shared_layouts"],
-        ] == [1, 0, 0]
-        assert [
-            await _count(database, schema_name, table)
-            for table in (
-                "ptg2_snapshot",
-                "ptg2_v3_snapshot_layout",
-                "ptg2_v3_snapshot_binding",
-            )
-        ] == [1, 1, 1]
+        await database.status(
+            f"UPDATE {schema}.ptg2_snapshot SET status = 'failed' "
+            "WHERE snapshot_id = 'shared-a'"
+        )
+        removed = await source_snapshot_control.remove_ptg2_source_snapshot(
+            snapshot_id="shared-a",
+            source_key="source_a",
+        )
+        assert removed["deleted_snapshots"] == 1
+        assert removed["deleted_v3_snapshot_bindings"] == 0
+        await _assert_second_removal_releases_layout(
+            database, schema_name, removed, stored_bytes
+        )
     finally:
         try:
             await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

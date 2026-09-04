@@ -116,11 +116,21 @@ async def test_rejects_v4_snapshot_without_shared_binding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_terminal_snapshot_accepts_missing_shared_binding() -> None:
-    session = _Session([])
+async def test_terminal_snapshot_recovers_missing_shared_binding() -> None:
+    session = _Session([], [_layout()], [{"state": "complete"}])
+
+    assert await _bound_keys(session, allow_missing_binding=True) == (11,)
+    assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
+    assert session.calls[1][1] == {"snapshot_key": 11}
+    assert session.calls[2][1] == {"snapshot_key": 11}
+
+
+@pytest.mark.asyncio
+async def test_terminal_snapshot_accepts_missing_unallocated_layout() -> None:
+    session = _Session([], [])
 
     assert await _bound_keys(session, allow_missing_binding=True) == ()
-    assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
+    assert session.calls[1][1] == {"snapshot_key": 11}
 
 
 @pytest.mark.asyncio
