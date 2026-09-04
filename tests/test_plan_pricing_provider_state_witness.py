@@ -285,6 +285,8 @@ def test_v4_provider_state_witness_rejects_malformed_fields(
     ("field", "value", "in_provenance"),
     [
         ("source_id", True, True),
+        ("address_sources", [], False),
+        ("source_record_ids", [], False),
         ("source_count", True, False),
         ("lat", None, False),
         ("lat", True, False),

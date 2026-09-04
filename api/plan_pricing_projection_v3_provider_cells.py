@@ -106,7 +106,7 @@ def _normalized_strings(values: Any) -> list[str]:
 
 
 def _is_string_list(value: Any) -> bool:
-    return isinstance(value, list) and all(
+    return isinstance(value, list) and bool(value) and all(
         isinstance(item, str) and bool(item.strip()) for item in value
     )
 
