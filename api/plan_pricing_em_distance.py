@@ -140,9 +140,11 @@ def em_distance_retry_option(
     }
     if pagination is not None and not _is_bounded_pagination(pagination):
         return None
+    retry_args_by_field = {key: args.get(key) for key in args}
+    retry_args_by_field.update(retry_by_field)
     return (
         retry_by_field
-        if _request_code_index({**args, **retry_by_field}) is not None
+        if _request_code_index(retry_args_by_field) is not None
         else None
     )
 
