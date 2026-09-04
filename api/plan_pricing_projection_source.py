@@ -178,7 +178,7 @@ def _ranked_addresses_sql(serving: Any) -> str:
         ELSE 4
     END"""
     return f"""
-        , ranked_addresses AS MATERIALIZED (
+        , zip_ranked_addresses AS MATERIALIZED (
             SELECT addr.*,
                    ROW_NUMBER() OVER (
                        PARTITION BY addr.npi, addr.projected_zip5
@@ -186,7 +186,10 @@ def _ranked_addresses_sql(serving: Any) -> str:
                                 {type_rank_sql},
                                 addr.checksum,
                                 addr.location_key
-                   ) AS zip_address_rank,
+                   ) AS zip_address_rank
+              FROM assured_addresses addr
+        ), ranked_addresses AS MATERIALIZED (
+            SELECT addr.*,
                    CASE WHEN addr.projected_state IS NOT NULL THEN
                        ROW_NUMBER() OVER (
                            PARTITION BY addr.npi, addr.projected_state
@@ -196,7 +199,8 @@ def _ranked_addresses_sql(serving: Any) -> str:
                                     addr.location_key
                        )
                    END AS state_address_rank
-              FROM assured_addresses addr
+              FROM zip_ranked_addresses addr
+             WHERE addr.zip_address_rank = 1
         )
     """
 

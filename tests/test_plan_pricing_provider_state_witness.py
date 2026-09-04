@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import hashlib
-from unittest.mock import AsyncMock
+import sqlite3
+from unittest.mock import AsyncMock, Mock
 
 import orjson
 import pytest
@@ -20,6 +21,33 @@ from .test_plan_pricing_projection import PROJECTION_ID, _Session
 
 
 NPI = 1000000001
+
+
+def test_address_state_witness_rank_follows_zip_deduplication() -> None:
+    serving_stub = Mock()
+    serving_stub.address_display_rank_sql.return_value = "0"
+    ranking_sql = projection_source._ranked_addresses_sql(serving_stub)
+
+    with sqlite3.connect(":memory:") as connection:
+        rows = connection.execute(
+            f"""
+            WITH assured_addresses (
+                npi, projected_zip5, projected_state, type, checksum, location_key
+            ) AS (
+                VALUES
+                    (1, '48104', 'MI', 'practice', 'b', 'mi-loser'),
+                    (1, '48104', 'OH', 'practice', 'a', 'oh-winner'),
+                    (1, '48105', 'MI', 'practice', 'c', 'mi-winner')
+            )
+            {ranking_sql}
+            SELECT projected_state, projected_zip5, state_address_rank
+              FROM ranked_addresses
+             WHERE zip_address_rank = 1
+             ORDER BY projected_state
+            """
+        ).fetchall()
+
+    assert rows == [("MI", "48105", 1), ("OH", "48104", 1)]
 
 
 def _state_address(
@@ -114,7 +142,10 @@ async def test_provider_projection_keeps_each_zip_and_one_state_witness(
         for provider_by_field in providers_by_npi[NPI]
     ] == ["48104", "48105"]
     provider_sql = session.statements[0][0]
+    assert "zip_ranked_addresses AS MATERIALIZED" in provider_sql
     assert "PARTITION BY addr.npi, addr.projected_zip5" in provider_sql
+    assert "FROM zip_ranked_addresses addr" in provider_sql
+    assert provider_sql.count("WHERE addr.zip_address_rank = 1") == 1
     assert "PARTITION BY addr.npi, addr.projected_state" in provider_sql
     assert "addr.state_address_rank" in provider_sql
     assert "address_payload" in provider_sql
