@@ -1697,6 +1697,9 @@ mod tests {
         assert!(dedupe
             .record_quarantined_provider_identifiers(&[-1])
             .is_err());
+        assert!(dedupe
+            .record_quarantined_provider_identifier_texts(&["malformed".to_string()])
+            .is_err());
         assert!(dedupe.provider_identifier_quarantine().is_err());
     }
 
@@ -1715,6 +1718,11 @@ mod tests {
         let mut incoming = ProviderIdentifierQuarantine::default();
         incoming.record(&[-2_000]).unwrap();
         assert!(quarantine.merge(&incoming).is_err());
+        let mut incoming_text = ProviderIdentifierQuarantine::default();
+        incoming_text
+            .record_text(&["malformed".to_string()])
+            .unwrap();
+        assert!(quarantine.merge(&incoming_text).is_err());
     }
 
     #[test]
@@ -1732,6 +1740,47 @@ mod tests {
         payload_overflow.occurrences_by_value.insert(-2, u64::MAX);
         payload_overflow.occurrences_by_value.insert(-1, 1);
         assert!(payload_overflow.payload().is_err());
+
+        let malformed = "malformed".to_string();
+        let mut text_record_overflow = ProviderIdentifierQuarantine::default();
+        text_record_overflow
+            .record_text(std::slice::from_ref(&malformed))
+            .unwrap();
+        *text_record_overflow
+            .occurrences_by_text_digest
+            .values_mut()
+            .next()
+            .unwrap() = u64::MAX;
+        assert!(text_record_overflow.record_text(&[malformed]).is_err());
+
+        let mut incoming_text = ProviderIdentifierQuarantine::default();
+        incoming_text
+            .record_text(&["malformed".to_string()])
+            .unwrap();
+        let mut text_merge_target = ProviderIdentifierQuarantine::default();
+        text_merge_target.merge(&incoming_text).unwrap();
+        *text_merge_target
+            .occurrences_by_text_digest
+            .values_mut()
+            .next()
+            .unwrap() = u64::MAX;
+        assert!(text_merge_target.merge(&incoming_text).is_err());
+
+        let mut v2_integer_overflow = incoming_text.clone();
+        v2_integer_overflow
+            .occurrences_by_value
+            .insert(-2, u64::MAX);
+        v2_integer_overflow.occurrences_by_value.insert(-1, 1);
+        assert!(v2_integer_overflow.payload().is_err());
+
+        let mut v2_text_overflow = ProviderIdentifierQuarantine::default();
+        v2_text_overflow
+            .occurrences_by_text_digest
+            .insert(("a".to_string(), 1), u64::MAX);
+        v2_text_overflow
+            .occurrences_by_text_digest
+            .insert(("b".to_string(), 1), 1);
+        assert!(v2_text_overflow.payload().is_err());
     }
 
     #[test]

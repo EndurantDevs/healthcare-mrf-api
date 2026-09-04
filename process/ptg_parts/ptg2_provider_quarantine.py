@@ -43,20 +43,51 @@ def _text_identity(value: str) -> tuple[str, int]:
 
 
 def _validated_integer_counts(counts: Mapping[int, int]) -> dict[int, int]:
-    validated: dict[int, int] = {}
-    for value, count in counts.items():
-        if type(value) is not int or not (_MIN_I64 <= value <= _MAX_I64):
+    validated_counts_by_identifier: dict[int, int] = {}
+    for identifier, count in counts.items():
+        if type(identifier) is not int or not (
+            _MIN_I64 <= identifier <= _MAX_I64
+        ):
             raise ValueError("quarantined provider identifier is not an int64")
-        if value == 0:
+        if identifier == 0:
             raise ValueError(
                 "TIN-only NPI marker cannot appear in provider identifier quarantine"
             )
-        if 1_000_000_000 <= value <= 9_999_999_999:
+        if 1_000_000_000 <= identifier <= 9_999_999_999:
             raise ValueError("valid NPI cannot appear in provider identifier quarantine")
         if type(count) is not int or count <= 0 or count >= 2**64:
             raise ValueError("quarantined provider identifier count is invalid")
-        validated[value] = count
-    return validated
+        validated_counts_by_identifier[identifier] = count
+    return validated_counts_by_identifier
+
+
+def _v2_text_entry(
+    value_sha256: str,
+    byte_length: int,
+    count: int,
+    digest: Any,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value_sha256, str)
+        or len(value_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in value_sha256)
+        or type(byte_length) is not int
+        or not 0 <= byte_length <= _MAX_TEXT_BYTES
+    ):
+        raise ValueError("quarantined text provider identifier identity is invalid")
+    if type(count) is not int or count <= 0 or count >= 2**64:
+        raise ValueError("quarantined provider identifier count is invalid")
+    digest.update(b"string\0")
+    digest.update(value_sha256.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(int(byte_length).to_bytes(8, "big"))
+    digest.update(int(count).to_bytes(8, "big"))
+    return {
+        "kind": "string",
+        "value_sha256": value_sha256,
+        "byte_length": byte_length,
+        "occurrence_count": count,
+    }
 
 
 def _payload_v2(
@@ -69,47 +100,31 @@ def _payload_v2(
     digest = hashlib.sha256(_V2_HASH_DOMAIN)
     entries: list[dict[str, Any]] = []
     occurrence_count = 0
-    for value, count in sorted(integer_counts.items()):
+    for identifier, count in sorted(integer_counts.items()):
         occurrence_count += count
         if occurrence_count >= 2**64:
             raise ValueError(
                 "provider identifier quarantine occurrence count overflows uint64"
             )
         digest.update(b"integer\0")
-        digest.update(str(value).encode("ascii"))
+        digest.update(str(identifier).encode("ascii"))
         digest.update(b"\0")
         digest.update(int(count).to_bytes(8, "big"))
         entries.append(
-            {"kind": "integer", "value": str(value), "occurrence_count": count}
+            {
+                "kind": "integer",
+                "value": str(identifier),
+                "occurrence_count": count,
+            }
         )
     for (value_sha256, byte_length), count in sorted(text_counts.items()):
-        if (
-            not isinstance(value_sha256, str)
-            or len(value_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in value_sha256)
-            or type(byte_length) is not int
-            or not 0 <= byte_length <= _MAX_TEXT_BYTES
-        ):
-            raise ValueError("quarantined text provider identifier identity is invalid")
-        if type(count) is not int or count <= 0 or count >= 2**64:
-            raise ValueError("quarantined provider identifier count is invalid")
         occurrence_count += count
         if occurrence_count >= 2**64:
             raise ValueError(
                 "provider identifier quarantine occurrence count overflows uint64"
             )
-        digest.update(b"string\0")
-        digest.update(value_sha256.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(int(byte_length).to_bytes(8, "big"))
-        digest.update(int(count).to_bytes(8, "big"))
         entries.append(
-            {
-                "kind": "string",
-                "value_sha256": value_sha256,
-                "byte_length": byte_length,
-                "occurrence_count": count,
-            }
+            _v2_text_entry(value_sha256, byte_length, count, digest)
         )
     return {
         "contract": PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
@@ -157,6 +172,57 @@ def provider_identifier_quarantine_payload(
     }
 
 
+def _validated_integer_entry(
+    entry: Mapping[str, Any],
+    contract: str,
+    previous_identifier: int | None,
+    *,
+    has_seen_text: bool,
+) -> tuple[int, Any]:
+    expected_fields = {"value", "occurrence_count"}
+    if contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT:
+        expected_fields.add("kind")
+    if set(entry) != expected_fields or has_seen_text:
+        raise ValueError("provider identifier quarantine entry is incompatible")
+    value_text = entry.get("value")
+    if not isinstance(value_text, str):
+        raise ValueError("quarantined provider identifier value must be text")
+    try:
+        identifier = int(value_text)
+    except ValueError as exc:
+        raise ValueError("quarantined provider identifier value is invalid") from exc
+    if str(identifier) != value_text:
+        raise ValueError("quarantined provider identifier value is not canonical")
+    if previous_identifier is not None and identifier <= previous_identifier:
+        raise ValueError("quarantined provider identifier values are not ordered")
+    return identifier, entry.get("occurrence_count")
+
+
+def _validated_text_entry(
+    entry: Mapping[str, Any],
+    previous_identity: tuple[str, int] | None,
+) -> tuple[tuple[str, int], Any]:
+    if entry.get("kind") != "string" or set(entry) != {
+            "kind",
+            "value_sha256",
+            "byte_length",
+            "occurrence_count",
+    }:
+        raise ValueError("provider identifier quarantine entry is incompatible")
+    identity = (entry.get("value_sha256"), entry.get("byte_length"))
+    if (
+        not isinstance(identity[0], str)
+        or len(identity[0]) != 64
+        or any(character not in "0123456789abcdef" for character in identity[0])
+        or type(identity[1]) is not int
+        or not 0 <= identity[1] <= _MAX_TEXT_BYTES
+    ):
+        raise ValueError("quarantined text provider identifier identity is invalid")
+    if previous_identity is not None and identity <= previous_identity:
+        raise ValueError("quarantined provider identifier values are not ordered")
+    return identity, entry.get("occurrence_count")
+
+
 def validate_provider_identifier_quarantine(
     quarantine_payload: Any,
 ) -> dict[str, Any]:
@@ -164,13 +230,14 @@ def validate_provider_identifier_quarantine(
 
     if not isinstance(quarantine_payload, Mapping):
         raise ValueError("provider identifier quarantine must be an object")
-    if set(quarantine_payload) != {
+    expected_fields = {
         "contract",
         "occurrence_count",
         "distinct_value_count",
         "entries",
         "sha256",
-    }:
+    }
+    if set(quarantine_payload) != expected_fields:
         raise ValueError("provider identifier quarantine fields are incompatible")
     contract = quarantine_payload.get("contract")
     if contract not in {
@@ -183,59 +250,31 @@ def validate_provider_identifier_quarantine(
         raise ValueError("provider identifier quarantine entries must be an array")
     counts: Counter[int] = Counter()
     text_counts: Counter[tuple[str, int]] = Counter()
-    previous_value: int | None = None
+    previous_identifier: int | None = None
     previous_text_identity: tuple[str, int] | None = None
-    saw_text = False
+    has_seen_text = False
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise ValueError("provider identifier quarantine entry is incompatible")
-        count = entry.get("occurrence_count")
-        kind = (
+        entry_kind = (
             entry.get("kind")
             if contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT
             else "integer"
         )
-        expected_fields = {"value", "occurrence_count"}
-        if contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT:
-            expected_fields.add("kind")
-        if kind == "integer":
-            if set(entry) != expected_fields or saw_text:
-                raise ValueError("provider identifier quarantine entry is incompatible")
-            value_text = entry.get("value")
-            if not isinstance(value_text, str):
-                raise ValueError("quarantined provider identifier value must be text")
-            try:
-                identifier = int(value_text)
-            except ValueError as exc:
-                raise ValueError("quarantined provider identifier value is invalid") from exc
-            if str(identifier) != value_text:
-                raise ValueError("quarantined provider identifier value is not canonical")
-            if previous_value is not None and identifier <= previous_value:
-                raise ValueError("quarantined provider identifier values are not ordered")
-            previous_value = identifier
-            counts[identifier] = count
+        if entry_kind == "integer":
+            previous_identifier, count = _validated_integer_entry(
+                entry,
+                contract,
+                previous_identifier,
+                has_seen_text=has_seen_text,
+            )
+            counts[previous_identifier] = count
             continue
-        if kind != "string" or set(entry) != {
-            "kind",
-            "value_sha256",
-            "byte_length",
-            "occurrence_count",
-        }:
-            raise ValueError("provider identifier quarantine entry is incompatible")
-        saw_text = True
-        identity = (entry.get("value_sha256"), entry.get("byte_length"))
-        if (
-            not isinstance(identity[0], str)
-            or len(identity[0]) != 64
-            or any(character not in "0123456789abcdef" for character in identity[0])
-            or type(identity[1]) is not int
-            or not 0 <= identity[1] <= _MAX_TEXT_BYTES
-        ):
-            raise ValueError("quarantined text provider identifier identity is invalid")
-        if previous_text_identity is not None and identity <= previous_text_identity:
-            raise ValueError("quarantined provider identifier values are not ordered")
-        previous_text_identity = identity
-        text_counts[identity] = count
+        previous_text_identity, count = _validated_text_entry(
+            entry, previous_text_identity
+        )
+        has_seen_text = True
+        text_counts[previous_text_identity] = count
     canonical = (
         provider_identifier_quarantine_payload(counts)
         if contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT
