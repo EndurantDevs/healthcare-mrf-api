@@ -401,6 +401,7 @@ fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
 #[derive(Clone, Debug)]
 struct ProviderEntry {
     entry_hash: i64,
+    provider_group_scope_hash: i64,
     provider_count: i64,
     provider_group_hashes: Vec<i64>,
     npi: Vec<i64>,
@@ -413,6 +414,7 @@ struct ProviderEntry {
 impl PartialEq for ProviderEntry {
     fn eq(&self, other: &Self) -> bool {
         self.entry_hash == other.entry_hash
+            && self.provider_group_scope_hash == other.provider_group_scope_hash
             && self.provider_count == other.provider_count
             && self.provider_group_hashes == other.provider_group_hashes
             && self.npi == other.npi
@@ -2115,6 +2117,7 @@ fn build_provider_entry_audited(
     let build_provider_set_payload = groups.len() > 1;
     let mut group_payload_jsons: Vec<String> = Vec::new();
     let mut group_hashes: Vec<i64> = Vec::new();
+    let mut group_scopes: Vec<(String, String)> = Vec::new();
     let mut provider_npis: Vec<i64> = Vec::new();
     let mut quarantined_npis: Vec<i64> = Vec::new();
     let mut quarantined_npi_texts: Vec<String> = Vec::new();
@@ -2137,6 +2140,7 @@ fn build_provider_entry_audited(
         let quarantined_npi_text = npi_partition.quarantined_text;
         let tin_type = normalize_tin_type(tin.get("type"));
         let tin_value = normalize_tin_value(tin.get("value"));
+        group_scopes.push((tin_type.clone(), tin_value.clone()));
         let group_hash = provider_group_hash(tin, &npi, &quarantined_npi, &quarantined_npi_text);
         group_hashes.push(group_hash);
         provider_npis.extend(npi.iter().copied());
@@ -2163,6 +2167,13 @@ fn build_provider_entry_audited(
     quarantined_npis.shrink_to_fit();
     quarantined_npi_texts.sort_unstable();
     quarantined_npi_texts.shrink_to_fit();
+    group_scopes.sort_unstable();
+    group_scopes.dedup();
+    let provider_group_scope_hash = make_checksum(vec![
+        json!("provider_group_scope"),
+        json!(&network_names),
+        json!(group_scopes),
+    ]);
     let entry_hash = if build_provider_set_payload {
         provider_set_checksum_from_group_payloads(group_payload_jsons)
     } else {
@@ -2171,6 +2182,7 @@ fn build_provider_entry_audited(
     Ok((
         ProviderEntry {
             entry_hash,
+            provider_group_scope_hash,
             provider_count: i64::try_from(provider_npis.len()).unwrap_or(i64::MAX),
             provider_group_hashes: group_hashes,
             npi: provider_npis,
@@ -2291,6 +2303,12 @@ fn insert_provider_definition(
         if existing == entry {
             return Ok(());
         }
+        if existing.provider_group_scope_hash != entry.provider_group_scope_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("conflicting provider_group_id definition: {key}"),
+            ));
+        }
         provider_map.insert(key, combine_provider_entries(existing, entry));
         return Ok(());
     }
@@ -2366,6 +2384,7 @@ fn provider_set_from_ref_keys(
     };
     Ok(Some(ProviderEntry {
         entry_hash,
+        provider_group_scope_hash: 0,
         provider_count,
         provider_group_hashes: sorted_group_hashes,
         npi: sorted_provider_npis,
@@ -2377,6 +2396,17 @@ fn provider_set_from_ref_keys(
 }
 
 fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> ProviderEntry {
+    let mut scope_hashes = vec![
+        first.provider_group_scope_hash,
+        second.provider_group_scope_hash,
+    ];
+    scope_hashes.sort_unstable();
+    scope_hashes.dedup();
+    let provider_group_scope_hash = if scope_hashes.len() == 1 {
+        scope_hashes[0]
+    } else {
+        checksum_i64_list("provider_group_scope_set", &scope_hashes)
+    };
     let mut group_hashes: Vec<i64> = first
         .provider_group_hashes
         .into_iter()
@@ -2421,6 +2451,7 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
     };
     ProviderEntry {
         entry_hash,
+        provider_group_scope_hash,
         provider_count,
         provider_group_hashes: group_hashes,
         npi: provider_npis,
@@ -28319,6 +28350,7 @@ mod tests {
         };
         let provider_entry = ProviderEntryView::Owned(ProviderEntry {
             entry_hash: 17,
+            provider_group_scope_hash: 0,
             provider_count: 1,
             provider_group_hashes: vec![101],
             npi: vec![1234567890],
@@ -28351,6 +28383,7 @@ mod tests {
 
         let colliding_entry = ProviderEntryView::Owned(ProviderEntry {
             entry_hash: 17,
+            provider_group_scope_hash: 0,
             provider_count: 1,
             provider_group_hashes: vec![202],
             npi: vec![1234567891],
@@ -29991,6 +30024,7 @@ mod tests {
             ProviderRefKey::from("first"),
             ProviderEntry {
                 entry_hash: 42,
+                provider_group_scope_hash: 0,
                 provider_count: 2,
                 provider_group_hashes: vec![101],
                 npi: vec![1234567890, 1234567891],
@@ -30004,6 +30038,7 @@ mod tests {
             ProviderRefKey::from("second"),
             ProviderEntry {
                 entry_hash: 42,
+                provider_group_scope_hash: 0,
                 provider_count: 2,
                 provider_group_hashes: vec![202],
                 npi: vec![1234567891, 1234567892],
@@ -30036,6 +30071,7 @@ mod tests {
             ProviderRefKey::from("a"),
             ProviderEntry {
                 entry_hash: 11,
+                provider_group_scope_hash: 0,
                 provider_count: 2,
                 provider_group_hashes: vec![101],
                 npi: vec![1_000_000_001, 1_000_000_002],
@@ -30049,6 +30085,7 @@ mod tests {
             ProviderRefKey::from("b"),
             ProviderEntry {
                 entry_hash: 12,
+                provider_group_scope_hash: 0,
                 provider_count: 2,
                 provider_group_hashes: vec![202],
                 npi: vec![1_000_000_002, 1_000_000_003],
@@ -30062,6 +30099,7 @@ mod tests {
             ProviderRefKey::from("c"),
             ProviderEntry {
                 entry_hash: 13,
+                provider_group_scope_hash: 0,
                 provider_count: 3,
                 provider_group_hashes: vec![101, 202],
                 npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003],
@@ -30182,6 +30220,7 @@ mod tests {
             key.clone(),
             ProviderEntry {
                 entry_hash: 91,
+                provider_group_scope_hash: 0,
                 provider_count: npis.len() as i64,
                 provider_group_hashes: group_hashes,
                 npi: npis,
@@ -30232,6 +30271,7 @@ mod tests {
             ProviderRefKey::from("wide"),
             ProviderEntry {
                 entry_hash: 91,
+                provider_group_scope_hash: 0,
                 provider_count: 4,
                 provider_group_hashes: vec![1, 2, 3, 4],
                 npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003, 1_000_000_004],
@@ -30270,6 +30310,7 @@ mod tests {
         let key = ProviderRefKey::from("component");
         let component = ProviderEntry {
             entry_hash: 71,
+            provider_group_scope_hash: 0,
             provider_count: 2,
             provider_group_hashes: vec![101, 202],
             npi: vec![1_000_000_001, 1_000_000_002],
@@ -30280,6 +30321,7 @@ mod tests {
         };
         let inline = ProviderEntry {
             entry_hash: 72,
+            provider_group_scope_hash: 0,
             provider_count: 2,
             provider_group_hashes: vec![202, 303],
             npi: vec![1_000_000_002, 1_000_000_003],
@@ -31918,6 +31960,16 @@ mod tests {
         assert_eq!(provider_map[&key].provider_count, 2);
         assert_eq!(provider_map[&key].npi, vec![1234567890, 2222222222]);
         assert_eq!(provider_map[&key].source_locators, expected.source_locators);
+
+        let mut conflicting_ref = provider_ref.clone();
+        conflicting_ref["provider_groups"][0]["tin"]["value"] = json!("987654321");
+        let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
+        let error = insert_provider_definition(&mut provider_map, key.clone(), conflicting_entry)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting provider_group_id definition: 7"));
+        assert_eq!(provider_map.get(&key), Some(&expected));
 
         let mut left = HashMap::new();
         left.insert(key.clone(), entry.clone());
