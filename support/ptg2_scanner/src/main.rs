@@ -407,7 +407,7 @@ struct ProviderEntry {
     quarantined_npi: Vec<i64>,
     quarantined_npi_text: Vec<String>,
     network_names: Vec<String>,
-    source_locator: Option<ProviderSourceLocator>,
+    source_locators: Vec<ProviderSourceLocator>,
 }
 
 impl PartialEq for ProviderEntry {
@@ -2177,7 +2177,7 @@ fn build_provider_entry_audited(
             quarantined_npi: quarantined_npis,
             quarantined_npi_text: quarantined_npi_texts,
             network_names,
-            source_locator: None,
+            source_locators: Vec::new(),
         },
         empty_npi_tin_only_normalization_count,
     ))
@@ -2287,14 +2287,12 @@ fn insert_provider_definition(
     key: ProviderRefKey,
     entry: ProviderEntry,
 ) -> io::Result<()> {
-    if let Some(existing) = provider_map.get(&key) {
-        if existing == &entry {
+    if let Some(existing) = provider_map.get(&key).cloned() {
+        if existing == entry {
             return Ok(());
         }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("conflicting provider_group_id definition: {key}"),
-        ));
+        provider_map.insert(key, combine_provider_entries(existing, entry));
+        return Ok(());
     }
     provider_map.insert(key, entry);
     Ok(())
@@ -2374,7 +2372,7 @@ fn provider_set_from_ref_keys(
         quarantined_npi: quarantined_npis,
         quarantined_npi_text: quarantined_npi_texts,
         network_names: sorted_network_names,
-        source_locator: None,
+        source_locators: Vec::new(),
     }))
 }
 
@@ -2408,6 +2406,13 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         .collect();
     network_names.sort_unstable();
     network_names.dedup();
+    let mut source_locators: Vec<ProviderSourceLocator> = first
+        .source_locators
+        .into_iter()
+        .chain(second.source_locators)
+        .collect();
+    source_locators.sort_unstable_by_key(|locator| (locator.shard, locator.offset, locator.length));
+    source_locators.dedup();
     let provider_count = i64::try_from(provider_npis.len()).unwrap_or(i64::MAX);
     let entry_hash = if group_hashes.len() == 1 {
         group_hashes[0]
@@ -2422,7 +2427,7 @@ fn combine_provider_entries(first: ProviderEntry, second: ProviderEntry) -> Prov
         quarantined_npi: quarantined_npis,
         quarantined_npi_text: quarantined_npi_texts,
         network_names,
-        source_locator: None,
+        source_locators,
     }
 }
 
@@ -6795,51 +6800,54 @@ fn linked_provider_source_evidence(
         if provider_entry.npi.binary_search(&selected_npi).is_err() {
             continue;
         }
-        let locator = provider_entry.source_locator.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "queryable source occurrence is missing linked provider evidence",
-            )
-        })?;
-        let raw_provider = context.source_witness.read_provider_source(locator)?;
-        let provider_value = parse_json_value_from_raw_bytes(&raw_provider)?;
-        let provider_group_id = provider_value.get("provider_group_id").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "linked provider evidence is missing provider_group_id",
-            )
-        })?;
-        if provider_ref_key(provider_group_id)? != *provider_reference {
+        if provider_entry.source_locators.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "linked provider evidence has a mismatched provider_group_id",
+                "queryable source occurrence is missing linked provider evidence",
             ));
         }
-        let groups = provider_value
-            .get("provider_groups")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
+        for locator in provider_entry.source_locators.iter().copied() {
+            let raw_provider = context.source_witness.read_provider_source(locator)?;
+            let provider_value = parse_json_value_from_raw_bytes(&raw_provider)?;
+            let provider_group_id = provider_value.get("provider_group_id").ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "linked provider evidence is missing provider_groups",
+                    "linked provider evidence is missing provider_group_id",
                 )
             })?;
-        let (group_ordinal, npi_ordinal) =
-            npi_source_coordinate(groups, selected_npi).ok_or_else(|| {
-                io::Error::new(
+            if provider_ref_key(provider_group_id)? != *provider_reference {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "linked provider evidence does not contain the selected NPI",
-                )
-            })?;
-        return Ok((
-            json!({
-                "source_kind": "provider_reference",
-                "provider_reference_id": provider_reference.to_string(),
-                "provider_group_ordinal": group_ordinal,
-                "npi_ordinal": npi_ordinal,
-            }),
-            Some(locator),
-            Some(Sha256::digest(&raw_provider).into()),
+                    "linked provider evidence has a mismatched provider_group_id",
+                ));
+            }
+            let groups = provider_value
+                .get("provider_groups")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "linked provider evidence is missing provider_groups",
+                    )
+                })?;
+            let Some((group_ordinal, npi_ordinal)) = npi_source_coordinate(groups, selected_npi)
+            else {
+                continue;
+            };
+            return Ok((
+                json!({
+                    "source_kind": "provider_reference",
+                    "provider_reference_id": provider_reference.to_string(),
+                    "provider_group_ordinal": group_ordinal,
+                    "npi_ordinal": npi_ordinal,
+                }),
+                Some(locator),
+                Some(Sha256::digest(&raw_provider).into()),
+            ));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "linked provider evidence does not contain the selected NPI",
         ));
     }
     Err(io::Error::new(
@@ -8281,7 +8289,7 @@ fn process_provider_ref_raw_batch_with_metrics(
         let source_locator = context
             .source_witness
             .store_provider_source(metrics.worker_id, raw_ref)?;
-        entry.source_locator = Some(source_locator);
+        entry.source_locators.push(source_locator);
         if let Some(priority) = witness_priority {
             context.source_witness.commit_provider_reference(
                 priority,
@@ -28317,7 +28325,7 @@ mod tests {
             quarantined_npi: Vec::new(),
             quarantined_npi_text: Vec::new(),
             network_names: vec!["Shared".to_string(), "Z network".to_string()],
-            source_locator: None,
+            source_locators: Vec::new(),
         });
         let expected_network_names =
             rate_network_names(&rate, provider_entry.network_names(), &context);
@@ -28349,7 +28357,7 @@ mod tests {
             quarantined_npi: Vec::new(),
             quarantined_npi_text: Vec::new(),
             network_names: Vec::new(),
-            source_locator: None,
+            source_locators: Vec::new(),
         });
         let colliding_scope = cache.resolve(&colliding_entry, &rate, &context);
         assert_ne!(colliding_scope.provider_set_hash, expected_hash);
@@ -28454,20 +28462,39 @@ mod tests {
     #[test]
     fn v3_emission_captures_every_atomic_price_provider_occurrence() {
         let directory = tempfile::tempdir().unwrap();
-        let raw_provider = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,1234567891]}]}"#;
+        let raw_provider_one = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}]}"#;
+        let raw_provider_two = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567891]}]}"#;
         let raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"service_code":["11"]},{"negotiated_type":"negotiated","negotiated_rate":200,"service_code":["22"]}]}"#;
         let source_witness = Arc::new(SourceWitnessCollector::new(&"ab".repeat(32)).unwrap());
         source_witness.configure_provider_spools(1).unwrap();
         source_witness.configure_rate_spools(1).unwrap();
-        let source_locator = source_witness
-            .store_provider_source(0, raw_provider)
+        let source_locator_one = source_witness
+            .store_provider_source(0, raw_provider_one)
+            .unwrap();
+        let source_locator_two = source_witness
+            .store_provider_source(0, raw_provider_two)
             .unwrap();
         source_witness.seal_provider_sources().unwrap();
 
-        let provider_value: Value = serde_json::from_slice(raw_provider).unwrap();
-        let mut provider_entry = build_provider_entry(&provider_value).unwrap();
-        provider_entry.source_locator = Some(source_locator);
-        let provider_map = HashMap::from([(ProviderRefKey::from("7"), provider_entry)]);
+        let provider_value_one: Value = serde_json::from_slice(raw_provider_one).unwrap();
+        let provider_value_two: Value = serde_json::from_slice(raw_provider_two).unwrap();
+        let mut provider_entry_one = build_provider_entry(&provider_value_one).unwrap();
+        provider_entry_one.source_locators.push(source_locator_one);
+        let mut provider_entry_two = build_provider_entry(&provider_value_two).unwrap();
+        provider_entry_two.source_locators.push(source_locator_two);
+        let mut provider_map = HashMap::new();
+        insert_provider_definition(
+            &mut provider_map,
+            ProviderRefKey::from("7"),
+            provider_entry_one,
+        )
+        .unwrap();
+        insert_provider_definition(
+            &mut provider_map,
+            ProviderRefKey::from("7"),
+            provider_entry_two,
+        )
+        .unwrap();
         let rate = read_rate_lite_bytes(raw_rate).unwrap().unwrap();
         let procedure = json!({
             "billing_code_type": "CPT",
@@ -28581,7 +28608,7 @@ mod tests {
         coordinates.sort_unstable();
         assert_eq!(
             coordinates,
-            vec![(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+            vec![(0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0)]
         );
     }
 
@@ -29970,7 +29997,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         );
         provider_map.insert(
@@ -29983,7 +30010,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         );
 
@@ -30015,7 +30042,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         );
         provider_map.insert(
@@ -30028,7 +30055,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         );
         provider_map.insert(
@@ -30041,7 +30068,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: vec!["shared".to_string()],
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         );
         let context = test_compact_context();
@@ -30161,7 +30188,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         )]);
         let rate = RateLite {
@@ -30211,7 +30238,7 @@ mod tests {
                 quarantined_npi: Vec::new(),
                 quarantined_npi_text: Vec::new(),
                 network_names: Vec::new(),
-                source_locator: None,
+                source_locators: Vec::new(),
             },
         )]);
         let rate = RateLite {
@@ -30249,7 +30276,7 @@ mod tests {
             quarantined_npi: Vec::new(),
             quarantined_npi_text: Vec::new(),
             network_names: vec!["component-network".to_string()],
-            source_locator: None,
+            source_locators: Vec::new(),
         };
         let inline = ProviderEntry {
             entry_hash: 72,
@@ -30259,7 +30286,7 @@ mod tests {
             quarantined_npi: Vec::new(),
             quarantined_npi_text: Vec::new(),
             network_names: vec!["inline-network".to_string()],
-            source_locator: None,
+            source_locators: Vec::new(),
         };
         let provider_map = HashMap::from([(key.clone(), component)]);
         let rate = RateLite {
@@ -31863,26 +31890,34 @@ mod tests {
     }
 
     #[test]
-    fn identical_provider_group_ids_are_idempotent_and_conflicts_fail_closed() {
+    fn repeated_provider_group_ids_union_split_fragments_canonically() {
         let provider_ref = valid_provider_reference();
-        let (key, entry) = provider_ref_definition(&provider_ref).unwrap();
+        let (key, mut entry) = provider_ref_definition(&provider_ref).unwrap();
+        entry.source_locators.push(ProviderSourceLocator {
+            shard: 1,
+            offset: 20,
+            length: 2,
+        });
         let mut provider_map = HashMap::new();
         insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
         insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
         assert_eq!(provider_map.len(), 1);
 
-        let mut conflicting_ref = provider_ref.clone();
-        conflicting_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
-        let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
-        let error =
-            insert_provider_definition(&mut provider_map, key.clone(), conflicting_entry.clone())
-                .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("conflicting provider_group_id definition: 7"));
+        let mut split_ref = provider_ref.clone();
+        split_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let mut split_entry = build_provider_entry(&split_ref).unwrap();
+        split_entry.source_locators.push(ProviderSourceLocator {
+            shard: 0,
+            offset: 10,
+            length: 1,
+        });
+        let expected = combine_provider_entries(entry.clone(), split_entry.clone());
+        insert_provider_definition(&mut provider_map, key.clone(), split_entry.clone()).unwrap();
         assert_eq!(provider_map.len(), 1);
-        assert_eq!(provider_map.get(&key), Some(&entry));
+        assert_eq!(provider_map.get(&key), Some(&expected));
+        assert_eq!(provider_map[&key].provider_count, 2);
+        assert_eq!(provider_map[&key].npi, vec![1234567890, 2222222222]);
+        assert_eq!(provider_map[&key].source_locators, expected.source_locators);
 
         let mut left = HashMap::new();
         left.insert(key.clone(), entry.clone());
@@ -31901,12 +31936,9 @@ mod tests {
         let mut left = HashMap::new();
         left.insert(key.clone(), entry.clone());
         let mut right = HashMap::new();
-        right.insert(key, conflicting_entry);
-        let error = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("conflicting provider_group_id definition: 7"));
+        right.insert(key, split_entry);
+        let merged = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap();
+        assert_eq!(merged.values().next(), Some(&expected));
     }
 
     #[test]
@@ -40274,12 +40306,6 @@ mod tests {
             .unwrap();
         insert_provider_definition(&mut provider_map, first_key.clone(), first_entry.clone())
             .unwrap();
-        assert!(insert_provider_definition(
-            &mut provider_map,
-            first_key.clone(),
-            second_entry.clone(),
-        )
-        .is_err());
         validate_preloaded_provider_definition(&provider_map, &first_key, &first_entry).unwrap();
         assert!(
             validate_preloaded_provider_definition(&provider_map, &first_key, &second_entry)
