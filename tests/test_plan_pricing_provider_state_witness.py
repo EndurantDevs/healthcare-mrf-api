@@ -123,6 +123,7 @@ async def test_provider_projection_keeps_each_zip_and_one_state_witness(
     assert hydrate_provenance.await_args.kwargs == {
         "include_response_evidence": True,
         "use_stored_only": False,
+        "strict_stored_identity": True,
         "backfill_admitted_source_record_ids": True,
     }
     assert session.statements[0][1]["provider_row_limit"] == (

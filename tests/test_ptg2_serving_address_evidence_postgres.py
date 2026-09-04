@@ -38,6 +38,7 @@ from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_admitted_mrf_recovers_specific_lineage_without_fabrication,
     test_admitted_source_never_falls_back_to_generic_materialization,
     test_incomplete_specific_and_source_zero_are_not_public_lineage,
+    test_live_fallback_rejects_mismatched_stored_identity_without_live_row,
     test_live_nppes_and_cms_use_source_specific_versions_as_whole_rows,
     test_specific_evidence_excludes_retired_and_blank_rows,
     test_stored_compact_run_date_is_complete_without_timestamps,

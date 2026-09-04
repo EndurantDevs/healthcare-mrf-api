@@ -97,7 +97,8 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
         "stored.premise_key IS NULL OR stored.premise_key = source.premise_key",
     ):
         assert (
-            "NOT CAST(:stored_only AS boolean) OR " + coordinate_predicate
+            "NOT CAST(:strict_stored_identity AS boolean) OR "
+            + coordinate_predicate
             in normalized_sql
         )
 
@@ -433,6 +434,7 @@ async def test_default_lineage_validation_is_one_bounded_set_query(monkeypatch):
     assert len(query_parameters["location_keys"]) == 64
     assert len(query_parameters["admitted_source_ids"]) == 64
     assert query_parameters["stored_only"] is False
+    assert query_parameters["strict_stored_identity"] is False
     assert len(location_rows) == 64
     assert all(
         location_row[serving._PTG_UNPROVEN_ADDRESS_MARKER] is True

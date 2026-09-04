@@ -11181,20 +11181,20 @@ WITH requested(location_key, admitted_source_id) AS (
     SELECT DISTINCT ON (stored.location_key, stored.source_id) stored.*
       FROM source_members AS source
       JOIN stored_evidence AS stored
-        ON stored.location_key = source.location_key
+       ON stored.location_key = source.location_key
        AND stored.source_id = source.source_id
        AND (
-           NOT CAST(:stored_only AS boolean)
+           NOT CAST(:strict_stored_identity AS boolean)
            OR stored.npi IS NULL
            OR stored.npi = source.npi
        )
        AND (
-           NOT CAST(:stored_only AS boolean)
+           NOT CAST(:strict_stored_identity AS boolean)
            OR stored.address_key IS NULL
            OR stored.address_key = source.address_key
        )
        AND (
-           NOT CAST(:stored_only AS boolean)
+           NOT CAST(:strict_stored_identity AS boolean)
            OR stored.premise_key IS NULL
            OR stored.premise_key = source.premise_key
        )
@@ -11517,6 +11517,7 @@ async def _hydrate_address_provenance(
     *,
     include_response_evidence: bool = True,
     use_stored_only: bool = False,
+    strict_stored_identity: bool = False,
     backfill_admitted_source_record_ids: bool = False,
 ) -> str:
     """Validate selected unified addresses with one set-based lineage query."""
@@ -11537,6 +11538,7 @@ async def _hydrate_address_provenance(
                 "location_keys": [request[0] for request in location_requests],
                 "admitted_source_ids": [request[1] for request in location_requests],
                 "stored_only": use_stored_only,
+                "strict_stored_identity": use_stored_only or strict_stored_identity,
             },
         )
         provenance_by_location_key = _index_address_provenance(provenance_result)

@@ -333,6 +333,7 @@ async def _hydrate_state_address_provenance(
         witness_rows,
         include_response_evidence=True,
         use_stored_only=False,
+        strict_stored_identity=True,
         backfill_admitted_source_record_ids=True,
     )
     if status != "available" or len(witness_rows) != expected_count:
