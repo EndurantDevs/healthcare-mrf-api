@@ -13,6 +13,36 @@ from typing import Sequence
 TEST_PROCESS_TIMEOUT_SECONDS = "295s"
 
 
+def pytest_addoption(parser) -> None:
+    """Allow CI workers to select their shard during the execution collection."""
+
+    parser.addoption("--ci-shard-count", type=int, default=4)
+    parser.addoption("--ci-shard-index", type=int)
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    """Keep the same sorted, exact-once assignment without a collect-only run."""
+
+    import pytest
+
+    shard_index = config.getoption("ci_shard_index")
+    if shard_index is None:
+        return
+    shard_count = config.getoption("ci_shard_count")
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise pytest.UsageError("CI shard index must be in [0, positive shard count)")
+    nodeids = [item.nodeid for item in items]
+    if len(nodeids) != len(set(nodeids)):
+        raise pytest.UsageError("pytest collection returned duplicate node IDs")
+    selected = set(select_nodeids(nodeids, shard_count=shard_count, shard_index=shard_index))
+    if not selected:
+        raise pytest.UsageError("selected shard has no node IDs")
+    config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in selected])
+    items[:] = sorted(
+        (item for item in items if item.nodeid in selected), key=lambda item: item.nodeid
+    )
+
+
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse and validate one deterministic shard request."""
 
@@ -33,7 +63,7 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
     return parsed
 
 
-def pytest_collection_command(pytest_arguments: Sequence[str]) -> list[str]:
+def collection_command(pytest_arguments: Sequence[str]) -> list[str]:
     """Build the bounded pytest collection command."""
 
     return [
@@ -53,7 +83,7 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
     """Collect unique sorted repository test node IDs."""
 
     completed = subprocess.run(
-        pytest_collection_command(pytest_arguments),
+        collection_command(pytest_arguments),
         check=True,
         capture_output=True,
         text=True,
