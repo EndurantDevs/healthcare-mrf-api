@@ -542,6 +542,60 @@ def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path
         ]
 
 
+def test_source_index_quarantines_noncanonical_npi_text_without_membership(tmp_path):
+    malformed = "1447744750`"
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    source_document["provider_references"][0]["provider_groups"][0]["npi"] = [
+        NPIS[0],
+        malformed,
+    ]
+    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][
+        0
+    ]["npi"] = [NPIS[2], malformed]
+    source_path = _write_source_fixture(
+        tmp_path / "mixed-valid-noncanonical-string-npi.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=source_document,
+    )
+
+    with _open_source_index(tmp_path, source_path) as index:
+        assert index.metrics["invalid_provider_npis"] == 1
+        assert index.metrics["invalid_inline_npis"] == 1
+        assert index.metrics.get("invalid_field_types", 0) == 0
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+        assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v2"
+        assert quarantine["occurrence_count"] == 2
+        assert quarantine["entries"] == [
+            {
+                "kind": "string",
+                "value_sha256": "27e0d2def7d3bfb8c0538e8af4def83d193d1a59bcdf96c2d1e5ea67e7c766a3",
+                "byte_length": 11,
+                "occurrence_count": 2,
+            }
+        ]
+
+
+def test_provider_identifier_quarantine_rejects_new_identity_at_capacity():
+    integer_counts = collections.Counter({-value: 1 for value in range(1, 1_024)})
+    text_counts = collections.Counter({("0" * 64, 1): 1})
+
+    with pytest.raises(
+        audit.SourceFormatError,
+        match="provider_identifier_quarantine_exceeds_1024_distinct_values",
+    ):
+        audit._record_quarantined_provider_identifier(
+            integer_counts, len(text_counts), -1_024
+        )
+
+    audit._record_quarantined_provider_identifier(
+        integer_counts, len(text_counts), -1
+    )
+    assert integer_counts[-1] == 2
+
+
 @pytest.mark.parametrize(
     ("raw_npi", "expected"),
     [
