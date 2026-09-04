@@ -565,6 +565,8 @@ def test_source_index_quarantines_noncanonical_npi_text_without_membership(tmp_p
         assert index.metrics.get("invalid_field_types", 0) == 0
         assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
         assert index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
+        assert not index.expected_tuples(audit.QueryKey("CPT", "99213", 1_447_744_750))
+        assert not index.expected_tuples(audit.QueryKey("HCPCS", "A1234", 1_447_744_750))
         quarantine = index.source_report()["provider_identifier_quarantine"]
         assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v2"
         assert quarantine["occurrence_count"] == 2
