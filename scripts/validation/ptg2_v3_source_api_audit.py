@@ -2141,6 +2141,64 @@ def _record_quarantined_provider_identifier(
     counts[value] += 1
 
 
+def _provider_identifier_quarantine_v2_payload(
+    counts: Mapping[int, int],
+    text_counts: Mapping[tuple[str, int], int],
+) -> dict[str, Any]:
+    digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
+    entries: list[dict[str, Any]] = []
+    occurrence_count = 0
+    for identifier, count in sorted(counts.items()):
+        if identifier == 0 or 1_000_000_000 <= identifier <= 9_999_999_999:
+            raise ValueError(
+                "provider identifier quarantine contains a non-malformed value"
+            )
+        if count <= 0 or count >= 2**64:
+            raise ValueError("provider identifier quarantine count is invalid")
+        occurrence_count += count
+        digest.update(b"integer\0")
+        digest.update(str(identifier).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(int(count).to_bytes(8, "big"))
+        entries.append(
+            {"kind": "integer", "value": str(identifier), "occurrence_count": count}
+        )
+    for (value_sha256, byte_length), count in sorted(text_counts.items()):
+        if (
+            len(value_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in value_sha256)
+            or not 0 <= byte_length <= 128
+            or count <= 0
+            or count >= 2**64
+        ):
+            raise ValueError("text provider identifier quarantine entry is invalid")
+        occurrence_count += count
+        digest.update(b"string\0")
+        digest.update(value_sha256.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(int(byte_length).to_bytes(8, "big"))
+        digest.update(int(count).to_bytes(8, "big"))
+        entries.append(
+            {
+                "kind": "string",
+                "value_sha256": value_sha256,
+                "byte_length": byte_length,
+                "occurrence_count": count,
+            }
+        )
+    if occurrence_count >= 2**64:
+        raise ValueError(
+            "provider identifier quarantine occurrence count overflows uint64"
+        )
+    return {
+        "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
+        "occurrence_count": occurrence_count,
+        "distinct_value_count": len(entries),
+        "entries": entries,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def provider_identifier_quarantine_payload(
     counts: Mapping[int, int],
     text_counts: Mapping[tuple[str, int], int] | None = None,
@@ -2151,73 +2209,22 @@ def provider_identifier_quarantine_payload(
     if len(counts) + len(text_counts) > MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES:
         raise ValueError("provider identifier quarantine exceeds 1024 distinct values")
     if text_counts:
-        digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
-        entries: list[dict[str, Any]] = []
-        occurrence_count = 0
-        for value, count in sorted(counts.items()):
-            if value == 0 or 1_000_000_000 <= value <= 9_999_999_999:
-                raise ValueError(
-                    "provider identifier quarantine contains a non-malformed value"
-                )
-            if count <= 0 or count >= 2**64:
-                raise ValueError("provider identifier quarantine count is invalid")
-            occurrence_count += count
-            digest.update(b"integer\0")
-            digest.update(str(value).encode("ascii"))
-            digest.update(b"\0")
-            digest.update(int(count).to_bytes(8, "big"))
-            entries.append(
-                {"kind": "integer", "value": str(value), "occurrence_count": count}
-            )
-        for (value_sha256, byte_length), count in sorted(text_counts.items()):
-            if (
-                len(value_sha256) != 64
-                or any(character not in "0123456789abcdef" for character in value_sha256)
-                or not 0 <= byte_length <= 128
-                or count <= 0
-                or count >= 2**64
-            ):
-                raise ValueError("text provider identifier quarantine entry is invalid")
-            occurrence_count += count
-            digest.update(b"string\0")
-            digest.update(value_sha256.encode("ascii"))
-            digest.update(b"\0")
-            digest.update(int(byte_length).to_bytes(8, "big"))
-            digest.update(int(count).to_bytes(8, "big"))
-            entries.append(
-                {
-                    "kind": "string",
-                    "value_sha256": value_sha256,
-                    "byte_length": byte_length,
-                    "occurrence_count": count,
-                }
-            )
-        if occurrence_count >= 2**64:
-            raise ValueError(
-                "provider identifier quarantine occurrence count overflows uint64"
-            )
-        return {
-            "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
-            "occurrence_count": occurrence_count,
-            "distinct_value_count": len(entries),
-            "entries": entries,
-            "sha256": digest.hexdigest(),
-        }
+        return _provider_identifier_quarantine_v2_payload(counts, text_counts)
     digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN)
     entries: list[dict[str, Any]] = []
     occurrence_count = 0
-    for value, count in sorted(counts.items()):
-        if value == 0 or 1_000_000_000 <= value <= 9_999_999_999:
+    for identifier, count in sorted(counts.items()):
+        if identifier == 0 or 1_000_000_000 <= identifier <= 9_999_999_999:
             raise ValueError("provider identifier quarantine contains a non-malformed value")
         if count <= 0 or count >= 2**64:
             raise ValueError("provider identifier quarantine count is invalid")
         occurrence_count += count
         if occurrence_count >= 2**64:
             raise ValueError("provider identifier quarantine count overflows uint64")
-        digest.update(str(value).encode("ascii"))
+        digest.update(str(identifier).encode("ascii"))
         digest.update(b"\0")
         digest.update(int(count).to_bytes(8, "big"))
-        entries.append({"value": str(value), "occurrence_count": count})
+        entries.append({"value": str(identifier), "occurrence_count": count})
     return {
         "contract": PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT,
         "occurrence_count": occurrence_count,
@@ -3236,11 +3243,11 @@ class SourceIndex:
         self,
         rate_id: int,
         event: str,
-        value: Any,
+        raw_value: Any,
     ) -> None:
-        npi = strict_source_npi(event, value)
+        npi = strict_source_npi(event, raw_value)
         if npi is None:
-            invalid_integer = strict_source_npi_value(event, value)
+            invalid_integer = strict_source_npi_value(event, raw_value)
             if invalid_integer == 0:
                 return
             self.metrics["invalid_inline_npis"] += 1
@@ -3250,11 +3257,11 @@ class SourceIndex:
                     len(self.quarantined_provider_identifier_texts),
                     invalid_integer,
                 )
-            elif event == "string" and type(value) is str:
+            elif event == "string" and type(raw_value) is str:
                 _record_quarantined_provider_identifier(
                     self.quarantined_provider_identifier_texts,
                     len(self.quarantined_provider_identifiers),
-                    provider_identifier_text_identity(value),
+                    provider_identifier_text_identity(raw_value),
                 )
             else:
                 self.metrics["invalid_field_types"] += 1

@@ -31575,6 +31575,55 @@ mod tests {
     }
 
     #[test]
+    fn skipped_inline_provider_quarantine_covers_raw_and_parsed_rates() {
+        let parsed_rate = RateLite {
+            provider_refs: Vec::new(),
+            provider_groups: vec![json!({"npi": [-7, "malformed"]})],
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: None,
+        };
+        let dedupe = SharedDedupe::new(1);
+        record_skipped_inline_provider_quarantine(&parsed_rate, &dedupe, false).unwrap();
+
+        let raw_rate = RateLite {
+            provider_groups: Vec::new(),
+            provider_groups_raw: Some(raw_provider_groups(
+                r#"[{"npi":[]},{"npi":[-8,"also-malformed"]}]"#,
+            )),
+            ..parsed_rate.clone()
+        };
+        record_skipped_inline_provider_quarantine(&raw_rate, &dedupe, true).unwrap();
+
+        let invalid_raw_rate = RateLite {
+            provider_groups_raw: Some(raw_provider_groups("null")),
+            ..raw_rate.clone()
+        };
+        assert!(
+            record_skipped_inline_provider_quarantine(&invalid_raw_rate, &dedupe, true).is_err()
+        );
+
+        let empty_rate = RateLite {
+            provider_groups_raw: None,
+            ..raw_rate
+        };
+        record_skipped_inline_provider_quarantine(&empty_rate, &dedupe, false).unwrap();
+
+        let quarantine = dedupe
+            .provider_identifier_quarantine()
+            .unwrap()
+            .payload()
+            .unwrap();
+        assert_eq!(
+            quarantine["contract"],
+            "ptg2_provider_identifier_quarantine_v2"
+        );
+        assert_eq!(quarantine["occurrence_count"], 4);
+        assert_eq!(quarantine["distinct_value_count"], 4);
+    }
+
+    #[test]
     fn strict_provider_definition_rejects_malformed_tin_and_network_metadata() {
         for invalid_tin in [
             Value::Null,
