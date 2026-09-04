@@ -270,6 +270,9 @@ async def remove_ptg2_source_snapshot(
             snapshot_id=snapshot_id,
             expected_generation=storage_generation,
             expected_snapshot_key=plan.get("shared_snapshot_key"),
+            allow_missing_binding=(
+                str(plan.get("status") or "").strip().lower() == "failed"
+            ),
         )
         artifact_ids = [
             str(artifact_id)
