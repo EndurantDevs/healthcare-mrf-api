@@ -113,6 +113,9 @@ ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
     }
 )
 STALE_WORKER_RECONCILIATION_IMPORTERS = ALL_STATUS_IDEMPOTENCY_IMPORTERS
+TERMINAL_QUEUE_RESIDUE_IMPORTERS = (
+    STALE_WORKER_RECONCILIATION_IMPORTERS | {"ptg"}
+)
 STALE_WORKER_RECONCILIATION_MIN_AGE_SECONDS = 60
 _STALE_WORKER_RECONCILIATION_FIELDS = frozenset(
     {
@@ -404,7 +407,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     },
 }
 
-_PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "arq:PTGLarge", "arq:PTGHuge"})
+_PTG_CONTROL_QUEUE_BY_RESOURCE_CLASS = {
+    "legacy": "arq:PTG",
+    "small": "arq:PTGSmall",
+    "normal": "arq:PTGNormal",
+    "large": "arq:PTGLarge",
+    "huge": "arq:PTGHuge",
+}
+_PTG_CONTROL_QUEUES = frozenset(_PTG_CONTROL_QUEUE_BY_RESOURCE_CLASS.values())
 _PTG_FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _PTG_FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
 _PTG_FULL_REBUILD_MARKER_PARAM = "full_rebuild_requested"
@@ -1890,18 +1900,33 @@ def _reconciliation_arq_identity(
 ) -> tuple[str, str, str, str]:
     run_id = str(run.get("run_id") or "").strip()
     importer = str(run.get("importer") or "").strip()
-    adapter = _adapter_for_import_row(run)
-    if not run_id or not importer or adapter is None:
-        raise StaleWorkerReconciliationConflict("exact ARQ identity is unavailable")
-    queue = str(adapter["queue"])
-    canonical_job_id = _enqueue_job_options(adapter, {"run_id": run_id}).get(
-        "_job_id"
+    metrics_by_name = (
+        run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
     )
+    if importer == "ptg":
+        queue = str(metrics_by_name.get("queue") or "").strip()
+        resource_class = str(metrics_by_name.get("resource_class") or "").strip()
+        expected_queue = _PTG_CONTROL_QUEUE_BY_RESOURCE_CLASS.get(resource_class)
+        if not queue or expected_queue != queue:
+            raise StaleWorkerReconciliationConflict(
+                "persisted PTG queue conflicts with resource class"
+            )
+        adapter_by_name = {**_SINGLE_JOB_ADAPTERS["ptg"], "queue": queue}
+    else:
+        adapter_by_name = _adapter_for_import_row(run)
+    if not run_id or not importer or adapter_by_name is None:
+        raise StaleWorkerReconciliationConflict("exact ARQ identity is unavailable")
+    queue = str(adapter_by_name["queue"])
+    canonical_job_id = _enqueue_job_options(
+        adapter_by_name,
+        {"run_id": run_id},
+    ).get("_job_id")
     if not canonical_job_id:
         raise StaleWorkerReconciliationConflict("exact ARQ job ID is unavailable")
-    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
-    persisted_job_id = str(metrics.get("job_id") or "").strip()
-    if persisted_job_id and persisted_job_id != canonical_job_id:
+    persisted_job_id = str(metrics_by_name.get("job_id") or "").strip()
+    if (importer == "ptg" and not persisted_job_id) or (
+        persisted_job_id and persisted_job_id != canonical_job_id
+    ):
         raise StaleWorkerReconciliationConflict(
             "persisted ARQ job ID conflicts with importer adapter"
         )
@@ -2108,7 +2133,7 @@ def _terminal_queue_residue_identity(
         )
     if run.get("status") not in TERMINAL_STATUSES:
         raise StaleWorkerReconciliationConflict("run is not terminal")
-    if run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS:
+    if run.get("importer") not in TERMINAL_QUEUE_RESIDUE_IMPORTERS:
         raise StaleWorkerReconciliationConflict(
             "importer does not support deterministic queue residue reconciliation"
         )
