@@ -267,6 +267,69 @@ async def startup(ctx):
     await init_db(db, loop)
 
 
+async def _create_additional_indexes(cls, table_model, db_schema: str) -> None:
+    for index in (getattr(cls, "__my_additional_indexes__", None) or ()):
+        index_name = index.get("name", "_".join(index.get("index_elements")))
+        using = f"USING {index['using']} " if index.get("using") else ""
+        unique = " UNIQUE " if index.get("unique") else " "
+        where = f' WHERE {index.get("where")} ' if index.get("where") else ""
+        create_index_sql = (
+            f"CREATE{unique}INDEX IF NOT EXISTS "
+            f"{table_model.__tablename__}_idx_{index_name} "
+            f"ON {db_schema}.{table_model.__tablename__}  {using}"
+            f"({', '.join(index.get('index_elements'))}){where};"
+        )
+        print(create_index_sql)
+        await db.status(create_index_sql)
+
+
+async def _finalize_attribute_stage(cls, table_model, db_schema: str) -> None:
+    table_name = f"{db_schema}.{table_model.__tablename__}"
+    if not await _is_table_available(db_schema, table_model.__tablename__):
+        print(f"Skipping post-processing for missing table {table_name}")
+        return
+    await _create_additional_indexes(cls, table_model, db_schema)
+    print(f"Post-Index VACUUM FULL ANALYZE {table_name};")
+    await db.execute_ddl(f"VACUUM FULL ANALYZE {table_name};")
+
+
+async def _swap_attribute_stage(cls, table_model, db_schema: str) -> None:
+    table_name = f"{db_schema}.{table_model.__tablename__}"
+    if not await _is_table_available(db_schema, table_model.__tablename__):
+        print(f"Skipping swap for missing table {table_name}")
+        return
+    table = table_model.__main_table__
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+    await db.status(
+        f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;"
+    )
+    await db.status(
+        f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} "
+        f"RENAME TO {table};"
+    )
+    await db.status(
+        f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary "
+        f"RENAME TO {table}_idx_primary_old;"
+    )
+    await db.status(
+        f"ALTER INDEX IF EXISTS {db_schema}.{table_model.__tablename__}_idx_primary "
+        f"RENAME TO {table}_idx_primary;"
+    )
+    for index in (
+        getattr(table_model, "__my_additional_indexes__", None) or ()
+    ):
+        index_name = index.get("name", "_".join(index.get("index_elements")))
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_{index_name} "
+            f"RENAME TO {table}_idx_{index_name}_old;"
+        )
+        await db.status(
+            f"ALTER INDEX IF EXISTS "
+            f"{db_schema}.{table_model.__tablename__}_idx_{index_name} "
+            f"RENAME TO {table}_idx_{index_name};"
+        )
+
+
 async def finalize_attribute_tables(ctx):
     """Finalize staged attribute tables after worker shutdown."""
 
@@ -274,103 +337,19 @@ async def finalize_attribute_tables(ctx):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-    tables_by_name = {}
-
-    processing_classes_array = (
+    processing_classes = (
         PlanAttributes,
         PlanPrices,
         PlanRatingAreas,
         PlanBenefits,
     )
-
-    for cls in processing_classes_array:
-        tables_by_name[cls.__main_table__] = make_class(
-            cls, import_date, schema_override=db_schema
-        )
-        table_model = tables_by_name[cls.__main_table__]
-        table_name = f"{db_schema}.{table_model.__tablename__}"
-
-        if not await _is_table_available(db_schema, table_model.__tablename__):
-            print(f"Skipping post-processing for missing table {table_name}")
-            continue
-
-        if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
-            for index in cls.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
-                using = ""
-                if index_method := index.get("using"):
-                    using = f"USING {index_method} "
-
-                unique = ' '
-                if index.get('unique'):
-                    unique = ' UNIQUE '
-                where = ''
-                if index.get('where'):
-                    where = f' WHERE {index.get("where")} '
-                create_index_sql = (
-                    f"CREATE{unique}INDEX IF NOT EXISTS "
-                    f"{table_model.__tablename__}_idx_{index_name} "
-                    f"ON {db_schema}.{table_model.__tablename__}  {using}"
-                    f"({', '.join(index.get('index_elements'))}){where};"
-                )
-                print(create_index_sql)
-                await db.status(create_index_sql)
-
-        print(f"Post-Index VACUUM FULL ANALYZE {table_name};")
-        await db.execute_ddl(f"VACUUM FULL ANALYZE {table_name};")
-
+    for cls in processing_classes:
+        table_model = make_class(cls, import_date, schema_override=db_schema)
+        await _finalize_attribute_stage(cls, table_model, db_schema)
     async with db.transaction():
-        for cls in processing_classes_array:
-            tables_by_name[cls.__main_table__] = make_class(
-                cls, import_date, schema_override=db_schema
-            )
-            table_model = tables_by_name[cls.__main_table__]
-            table_name = f"{db_schema}.{table_model.__tablename__}"
-
-            if not await _is_table_available(db_schema, table_model.__tablename__):
-                print(f"Skipping swap for missing table {table_name}")
-                continue
-
-            table = table_model.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;"
-            )
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} RENAME TO {table};"
-            )
-
-            await db.status(
-                f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{table}_idx_primary RENAME TO "
-                f"{table}_idx_primary_old;"
-            )
-
-            await db.status(
-                f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{table_model.__tablename__}_idx_primary RENAME TO "
-                f"{table}_idx_primary;"
-            )
-
-            if (
-                hasattr(cls, "__my_additional_indexes__")
-                and table_model.__my_additional_indexes__
-            ):
-                for index in table_model.__my_additional_indexes__:
-                    index_name = index.get(
-                        "name", "_".join(index.get("index_elements"))
-                    )
-                    await db.status(
-                        f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{table}_idx_{index_name} RENAME TO "
-                        f"{table}_idx_{index_name}_old;"
-                    )
-                    await db.status(
-                        f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{table_model.__tablename__}_idx_{index_name} RENAME TO "
-                        f"{table}_idx_{index_name};"
-                    )
-
+        for cls in processing_classes:
+            table_model = make_class(cls, import_date, schema_override=db_schema)
+            await _swap_attribute_stage(cls, table_model, db_schema)
     print_time_info(ctx["context"]["start"])
 
 

@@ -4674,6 +4674,99 @@ def _is_generation_newer(
     )
 
 
+def _profile_item(fact: Mapping[str, Any]) -> dict[str, Any]:
+    effective_period_by_key = {
+        field_name: field_value
+        for field_name, field_value in (
+            ("start", fact.get("effective_start")),
+            ("end", fact.get("effective_end")),
+        )
+        if field_value
+    }
+    profile_item_by_key = {
+        "type": fact["fact_type"],
+        "logical_fact_key": str(fact["logical_fact_key"]),
+        "display": fact["display"],
+        "value": fact["value_json"],
+        "assertion_type": fact["assertion_type"],
+        "verification_status": fact["verification_status"],
+        "sensitive": bool(fact["sensitive"]),
+        "public_default": bool(fact["public_default"]),
+        "source_record_id": fact["source_record_id"],
+        "source_record_ids": [fact["source_record_id"]],
+        "source_kinds": ["state_regulator"],
+        "assertions": [
+            {
+                "source_kind": "state_regulator",
+                "assertion_type": fact["assertion_type"],
+                "verification_status": fact["verification_status"],
+            }
+        ],
+        "assertion_count": 1,
+    }
+    if effective_period_by_key:
+        profile_item_by_key["effective_period"] = effective_period_by_key
+    return profile_item_by_key
+
+
+def _merge_profile_item(item: dict[str, Any], fact: Mapping[str, Any]) -> None:
+    source_record_id = fact["source_record_id"]
+    if source_record_id in item["source_record_ids"]:
+        return
+    item["source_record_ids"].append(source_record_id)
+    item["source_record_ids"].sort()
+    item["assertion_count"] = len(item["source_record_ids"])
+    if fact["fact_type"] != "provider_address":
+        return
+    item["value"]["location_types"] = sorted(
+        {
+            *item["value"].get("location_types", []),
+            *fact["value_json"].get("location_types", []),
+        }
+    )
+    item["display"] = _address_display(item["value"])
+
+
+def _group_profile_facts(
+    facts: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, dict[str, Any]]], list[dict[str, Any]]]:
+    grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    evidence_items: list[dict[str, Any]] = []
+    for fact in facts:
+        logical_key = str(fact["logical_fact_key"])
+        category_facts = grouped[fact["category"]]
+        item = category_facts.get(logical_key)
+        if item is None:
+            category_facts[logical_key] = _profile_item(fact)
+        else:
+            _merge_profile_item(item, fact)
+        source_json_by_field = fact["source_json"]
+        if "source_key" not in source_json_by_field:
+            raise KeyError("source_key")
+        evidence_items.append(source_json_by_field)
+    return grouped, evidence_items
+
+
+def _profile_categories(
+    grouped: Mapping[str, Mapping[str, dict[str, Any]]],
+    loaded_categories: set[str],
+) -> dict[str, Any]:
+    categories_by_key: dict[str, Any] = {}
+    for category in STANDARD_CATEGORIES:
+        items = list(grouped.get(category, {}).values())
+        categories_by_key[category] = {
+            "availability": (
+                "available"
+                if items
+                else "not_reported"
+                if category in loaded_categories
+                else "unavailable"
+            ),
+            "items": items,
+        }
+    return categories_by_key
+
+
 def _projection(
     npi: int,
     generation_id: str,
@@ -4681,79 +4774,12 @@ def _projection(
     loaded_categories: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Compose the stable, categorized state-provider projection for one NPI."""
-    grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    evidence_items: list[dict[str, Any]] = []
-    source_keys: set[str] = set()
-    for fact in facts:
-        logical_key = str(fact["logical_fact_key"])
-        category_facts = grouped[fact["category"]]
-        profile_item_by_key = category_facts.get(logical_key)
-        if profile_item_by_key is None:
-            effective_period_by_key = {
-                field_name: field_value
-                for field_name, field_value in (
-                    ("start", fact.get("effective_start")),
-                    ("end", fact.get("effective_end")),
-                )
-                if field_value
-            }
-            profile_item_by_key = {
-                "type": fact["fact_type"],
-                "logical_fact_key": logical_key,
-                "display": fact["display"],
-                "value": fact["value_json"],
-                "assertion_type": fact["assertion_type"],
-                "verification_status": fact["verification_status"],
-                "sensitive": bool(fact["sensitive"]),
-                "public_default": bool(fact["public_default"]),
-                "source_record_id": fact["source_record_id"],
-                "source_record_ids": [fact["source_record_id"]],
-                "source_kinds": ["state_regulator"],
-                "assertions": [
-                    {
-                        "source_kind": "state_regulator",
-                        "assertion_type": fact["assertion_type"],
-                        "verification_status": fact["verification_status"],
-                    }
-                ],
-                "assertion_count": 1,
-            }
-            if effective_period_by_key:
-                profile_item_by_key["effective_period"] = effective_period_by_key
-            category_facts[logical_key] = profile_item_by_key
-        elif fact["source_record_id"] not in profile_item_by_key["source_record_ids"]:
-            profile_item_by_key["source_record_ids"].append(fact["source_record_id"])
-            profile_item_by_key["source_record_ids"].sort()
-            profile_item_by_key["assertion_count"] = len(profile_item_by_key["source_record_ids"])
-            if fact["fact_type"] == "provider_address":
-                merged_location_types = sorted(
-                    {
-                        *profile_item_by_key["value"].get("location_types", []),
-                        *fact["value_json"].get("location_types", []),
-                    }
-                )
-                profile_item_by_key["value"]["location_types"] = merged_location_types
-                profile_item_by_key["display"] = _address_display(profile_item_by_key["value"])
-        source_keys.add(fact["source_json"]["source_key"])
-        evidence_items.append(fact["source_json"])
-    categories_by_key: dict[str, Any] = {}
-    for category in STANDARD_CATEGORIES:
-        profile_items = list(grouped.get(category, {}).values())
-        categories_by_key[category] = {
-            "availability": (
-                "available"
-                if profile_items
-                else "not_reported"
-                if category in loaded_categories
-                else "unavailable"
-            ),
-            "items": profile_items,
-        }
+    grouped, evidence_items = _group_profile_facts(facts)
     profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": npi,
         "generation_id": generation_id,
-        "categories": categories_by_key,
+        "categories": _profile_categories(grouped, loaded_categories),
         "sources": [
             {
                 "source_key": FL_MQA_SOURCE_KEY,
@@ -4768,15 +4794,21 @@ def _projection(
             "Administrative complaints are allegations and are not final disciplinary actions.",
         ],
     }
+    serialized_evidence = sorted(
+        {
+            json.dumps(evidence_by_field, sort_keys=True)
+            for evidence_by_field in evidence_items
+        }
+    )
     evidence_json_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": npi,
         "generation_id": generation_id,
-        "records": sorted(
-            {json.dumps(profile_item_by_key, sort_keys=True) for profile_item_by_key in evidence_items}
-        ),
+        "records": [
+            json.loads(serialized_evidence_by_field)
+            for serialized_evidence_by_field in serialized_evidence
+        ],
     }
-    evidence_json_by_key["records"] = [json.loads(profile_item_by_key) for profile_item_by_key in evidence_json_by_key["records"]]
     return profile_by_key, evidence_json_by_key
 
 
