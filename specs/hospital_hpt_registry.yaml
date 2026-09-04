@@ -119,6 +119,7 @@ hospitals:
 - hospital_id: hospital-000030
   name: STRHS Sewanee
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002931
 - hospital_id: hospital-000031
   name: Trinity Health Byron Center
   cms_hpt_url: https://www.trinityhealthmichigan.org/cms-hpt.txt
@@ -150,6 +151,7 @@ hospitals:
 - hospital_id: hospital-000038
   name: Abbott North Western
   cms_hpt_url: https://www.allinahealth.org/cms-hpt.txt
+  alias_of: hospital-000039
   locator_name: Abbott Northwestern Hospital
 - hospital_id: hospital-000039
   name: Abbott Northwestern Hospital
@@ -157,6 +159,7 @@ hospitals:
 - hospital_id: hospital-000040
   name: ABH PA Children's Services DCBHC
   cms_hpt_url: https://www.devereux.org/cms-hpt.txt
+  alias_of: hospital-001784
   locator_name: Devereux PA Acute Care Psychiatric Hospital
 - hospital_id: hospital-000041
   name: Acadia Saint Landry Hospital
@@ -467,6 +470,7 @@ hospitals:
 - hospital_id: hospital-000137
   name: AHMC Seton Medical Center
   cms_hpt_url: https://www.ahmchealth.com/cms-hpt.txt
+  alias_of: hospital-005726
   locator_mrf_url: https://www.ahmchealth.com/docs/PricingTransparency-Seton_Medical_Center-3332-20260331190057.csv
 - hospital_id: hospital-000138
   name: AHN Brentwood Neighborhood Hospital
@@ -695,6 +699,7 @@ hospitals:
 - hospital_id: hospital-000207
   name: Angleton Danbury Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  alias_of: hospital-006921
 - hospital_id: hospital-000208
   name: Animas Surgical Hospital
   cms_hpt_url: https://www.animassurgical.com/cms-hpt.txt
@@ -2894,6 +2899,7 @@ hospitals:
 - hospital_id: hospital-000859
   name: Bennington ,VT
   cms_hpt_url: https://svmc.org/cms-hpt.txt
+  alias_of: hospital-005937
   locator_name: Southwestern Vermont Medical Center
 - hospital_id: hospital-000860
   name: Benson Family Healthcare Clinic
@@ -3477,6 +3483,7 @@ hospitals:
 - hospital_id: hospital-001032
   name: CAHRMC
   cms_hpt_url: https://ricemedicalcenter.net/cms-hpt.txt
+  alias_of: hospital-001033
   locator_mrf_url: https://ricemedicalcenter.slicedhealth.io/pricer/270565499_cahrmc,-dba-rice-medical-center_standardcharges.csv
 - hospital_id: hospital-001033
   name: CAHRMC, dba Rice Medical Center
@@ -3799,6 +3806,7 @@ hospitals:
 - hospital_id: hospital-001130
   name: Carson Tahoe Health
   cms_hpt_url: https://www.carsontahoe.com/cms-hpt.txt
+  alias_of: hospital-001131
   locator_name: Carson Tahoe Regional Healthcare
 - hospital_id: hospital-001131
   name: Carson Tahoe Regional Healthcare
@@ -4742,6 +4750,7 @@ hospitals:
 - hospital_id: hospital-001415
   name: Clear Lake Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  alias_of: hospital-006922
 - hospital_id: hospital-001416
   name: Clear Vista Health and Wellness
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
@@ -5730,6 +5739,7 @@ hospitals:
 - hospital_id: hospital-001706
   name: CVMC - Santaquin Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
+  alias_of: hospital-005657
 - hospital_id: hospital-001707
   name: Cypress Pointe Surgical Hospital
   cms_hpt_url: https://cypresspointesurgical.com/cms-hpt.txt
@@ -5978,10 +5988,12 @@ hospitals:
 - hospital_id: hospital-001781
   name: Detar Hospital Navarro
   cms_hpt_url: https://www.detar.com/cms-hpt.txt
+  alias_of: hospital-001779
   locator_name: Detar Healthcare System Navarro
 - hospital_id: hospital-001782
   name: Detar Hospital North
   cms_hpt_url: https://www.detar.com/cms-hpt.txt
+  alias_of: hospital-001780
   locator_name: Detar Healthcare System North
 - hospital_id: hospital-001783
   name: Detroit Receiving Hospital - DMC
@@ -7874,6 +7886,7 @@ hospitals:
 - hospital_id: hospital-002363
   name: Gibson Area Hospital
   cms_hpt_url: https://www.gibsonhospital.org/cms-hpt.txt
+  alias_of: hospital-002364
 - hospital_id: hospital-002364
   name: Gibson Area Hospital & Health Services
   cms_hpt_url: https://www.gibsonhospital.org/cms-hpt.txt
@@ -8011,6 +8024,7 @@ hospitals:
 - hospital_id: hospital-002405
   name: Good Shepherd Rehabilitation
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  alias_of: hospital-005086
   locator_name: Good Shepherd Rehabilitation Hospital
 - hospital_id: hospital-002406
   name: Good Shepherd Rehabilitation Hospital
@@ -8358,6 +8372,7 @@ hospitals:
 - hospital_id: hospital-002508
   name: Hamilton County Hospital District
   cms_hpt_url: https://hamiltonhospital.org/cms-hpt.txt
+  alias_of: hospital-002510
   locator_name: Hamilton General Hospital
 - hospital_id: hospital-002509
   name: Hamilton County Public Hospital DBA Van Diest Medical Center
@@ -9566,6 +9581,7 @@ hospitals:
 - hospital_id: hospital-002867
   name: Henderson Health Care Services, Inc.
   cms_hpt_url: https://hendersonhealthcare.org/cms-hpt.txt
+  alias_of: hospital-002865
   locator_name: Henderson Community Hospital
 - hospital_id: hospital-002868
   name: Henderson Hospital
@@ -10391,9 +10407,11 @@ hospitals:
 - hospital_id: hospital-003109
   name: Innovations - Mesa Springs
   cms_hpt_url: https://mesasprings.com/cms-hpt.txt
+  locator_name: Mesa Springs
 - hospital_id: hospital-003110
   name: Innovations/Changes Arlington
   cms_hpt_url: https://mesasprings.com/cms-hpt.txt
+  locator_name: Mesa Springs Changes
 - hospital_id: hospital-003111
   name: Inova Alexandria Hospital
   cms_hpt_url: https://www.inova.org/cms-hpt.txt
@@ -10707,6 +10725,7 @@ hospitals:
 - hospital_id: hospital-003206
   name: JasperHealthServices
   cms_hpt_url: https://jaspermemorialhospital.org/cms-hpt.txt
+  alias_of: hospital-003205
   locator_name: Jasper Memorial Hospital
 - hospital_id: hospital-003207
   name: Javon Bea Hospital - Riverside Avenue
@@ -11449,6 +11468,7 @@ hospitals:
 - hospital_id: hospital-003432
   name: Lahey Hospital & Medical Center
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  alias_of: hospital-003433
   fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003433
   name: Lahey Hospital & Medical Center, Burlington
@@ -11735,6 +11755,7 @@ hospitals:
 - hospital_id: hospital-003517
   name: League City Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  alias_of: hospital-006923
 - hospital_id: hospital-003518
   name: League City Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
@@ -11912,6 +11933,7 @@ hospitals:
 - hospital_id: hospital-003572
   name: Lifeways Inc
   cms_hpt_url: https://www.lifeways.org/cms-hpt.txt
+  alias_of: hospital-003573
   locator_name: Lifeways Inc, Boise, Idaho
 - hospital_id: hospital-003573
   name: Lifeways Inc, Boise, Idaho
@@ -11963,6 +11985,7 @@ hospitals:
 - hospital_id: hospital-003588
   name: LINDSBORG COMMUNITY HOSPITAL ASSOCIATION
   cms_hpt_url: https://srhc.com/cms-hpt.txt
+  alias_of: hospital-003587
 - hospital_id: hospital-003589
   name: Linton Regional Medical Center
   cms_hpt_url: https://lintonhospital.org/cms-hpt.txt
@@ -12152,6 +12175,7 @@ hospitals:
 - hospital_id: hospital-003648
   name: LTACH
   cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
+  alias_of: hospital-005795
   locator_name: Silver Lake Hospital LTACH
 - hospital_id: hospital-003649
   name: Lubbock Heart & Surgical Hospital
@@ -12828,6 +12852,7 @@ hospitals:
 - hospital_id: hospital-003852
   name: Medical Center Health System - Odessa, TX
   cms_hpt_url: https://www.mchodessa.com/cms-hpt.txt
+  alias_of: hospital-003853
   locator_name: Medical Center Hospital
 - hospital_id: hospital-003853
   name: Medical Center Hospital
@@ -14116,6 +14141,7 @@ hospitals:
 - hospital_id: hospital-004233
   name: Miami Beach Main Campus
   cms_hpt_url: https://www.msmc.com/cms-hpt.txt
+  alias_of: hospital-004365
   locator_name: Mount Sinai Medical Center of Florida
 - hospital_id: hospital-004234
   name: Miami Cancer Institute at Plantation Chemo/Infusion
@@ -14540,6 +14566,7 @@ hospitals:
 - hospital_id: hospital-004360
   name: Mount Graham Regional Medical Center
   cms_hpt_url: https://www.mtgraham.org/cms-hpt.txt
+  alias_of: hospital-004418
   locator_name: Mt Graham Regional Medical Center
 - hospital_id: hospital-004361
   alias_of: hospital-005493
@@ -15917,10 +15944,12 @@ hospitals:
 - hospital_id: hospital-004769
   name: Oceans Behavioral Hosptial of Baton Rouge
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
+  alias_of: hospital-004747
   locator_name: Oceans Behavioral Hospital of Baton Rouge South
 - hospital_id: hospital-004770
   name: Oceans Behavioral Hosptial of Lake Charles
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
+  alias_of: hospital-004760
   locator_name: Oceans Behavioral Hospital of Lake Charles
 - hospital_id: hospital-004771
   name: Ochiltree General Hospital
@@ -16084,6 +16113,7 @@ hospitals:
 - hospital_id: hospital-004818
   name: Ohio Valley Medical Center
   cms_hpt_url: https://www.ovsurgical.com/cms-hpt.txt
+  alias_of: hospital-004819
   locator_name: OHIO VALLEY SURGICAL HOSPITAL
 - hospital_id: hospital-004819
   name: OHIO VALLEY SURGICAL HOSPITAL
@@ -18161,6 +18191,7 @@ hospitals:
 - hospital_id: hospital-005457
   name: Riverview Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002930
   locator_name: Highpoint Health - Riverview with Ascension Saint Thomas
 - hospital_id: hospital-005458
   name: Riverview Regional Medical Center
@@ -18910,6 +18941,7 @@ hospitals:
 - hospital_id: hospital-005683
   name: Schneck Medical Center
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
+  alias_of: hospital-005684
 - hospital_id: hospital-005684
   name: Schneck Medical Center Hospital
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
@@ -19055,6 +19087,7 @@ hospitals:
 - hospital_id: hospital-005727
   name: Seton Medical Center Coastside
   cms_hpt_url: https://www.ahmchealth.com/cms-hpt.txt
+  alias_of: hospital-005725
 - hospital_id: hospital-005728
   name: Seven Hills Behavioral Health Hospital
   cms_hpt_url: https://www.sevenhillsbi.com/cms-hpt.txt
@@ -19141,10 +19174,12 @@ hospitals:
 - hospital_id: hospital-005753
   name: Sheppard Pratt Hospital
   cms_hpt_url: https://www.sheppardpratt.org/cms-hpt.txt
+  alias_of: hospital-005751
   locator_name: Sheppard Pratt - Towson Campus
 - hospital_id: hospital-005754
   name: Sheppard Pratt Hospital Baltimore/Washington Campus
   cms_hpt_url: https://www.sheppardpratt.org/cms-hpt.txt
+  alias_of: hospital-005752
   locator_name: Sheppard Pratt Health System - Baltimore/Washington Campus
 - hospital_id: hospital-005755
   name: Sheridan County Hospital
@@ -19371,6 +19406,7 @@ hospitals:
 - hospital_id: hospital-005821
   name: Slidell Memorial Hospital
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt
+  alias_of: hospital-005822
 - hospital_id: hospital-005822
   name: Slidell Memorial Hospital - Main Campus
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt
@@ -19494,6 +19530,7 @@ hospitals:
 - hospital_id: hospital-005859
   name: SOUTH COUNTY HEALTH
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  alias_of: hospital-005860
 - hospital_id: hospital-005860
   name: South County Hospital
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
@@ -20934,6 +20971,7 @@ hospitals:
 - hospital_id: hospital-006286
   name: STAT Emergency Center – Laredo South
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  alias_of: hospital-006291
 - hospital_id: hospital-006287
   name: STAT Specialty Hospital – Del Rio
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
@@ -20943,6 +20981,7 @@ hospitals:
 - hospital_id: hospital-006289
   name: STAT Specialty Hospital – Laredo North
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  alias_of: hospital-006290
 - hospital_id: hospital-006290
   name: Stat Specialty Hospital of Laredo-North
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
@@ -21088,6 +21127,7 @@ hospitals:
 - hospital_id: hospital-006332
   name: STRHS Winchester
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002934
 - hospital_id: hospital-006333
   name: STRONG MEMORIAL HOSPITAL
   cms_hpt_url: https://www.urmc.rochester.edu/cms-hpt.txt
@@ -21159,6 +21199,7 @@ hospitals:
 - hospital_id: hospital-006354
   name: Sumner Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002932
 - hospital_id: hospital-006355
   name: Sunnyside Medical Center
   cms_hpt_url: https://healthy.kaiserpermanente.org/cms-hpt.txt
@@ -21679,6 +21720,7 @@ hospitals:
 - hospital_id: hospital-006510
   name: The Medical Center of Southeast Texas
   cms_hpt_url: https://medicalcentersetexas.org/cms-hpt.txt
+  alias_of: hospital-003856
   locator_name: Medical Center Of Southeast Texas
 - hospital_id: hospital-006511
   name: The Menninger Clinic
@@ -22110,6 +22152,7 @@ hospitals:
 - hospital_id: hospital-006639
   name: Trousdale Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002933
 - hospital_id: hospital-006640
   name: Troy Regional Medical Center
   cms_hpt_url: https://www.troymedicalcenter.com/cms-hpt.txt
@@ -22239,6 +22282,7 @@ hospitals:
 - hospital_id: hospital-006677
   name: Ucsf Medical Center
   cms_hpt_url: https://www.ucsfhealth.org/cms-hpt.txt
+  locator_name: UCSF Parnassus
 - hospital_id: hospital-006678
   name: UCSF Medical Center & UCSF Benioff Children's Hospital San Francisco
   cms_hpt_url: https://www.ucsfbenioffchildrens.org/cms-hpt.txt
@@ -22416,6 +22460,7 @@ hospitals:
 - hospital_id: hospital-006733
   name: Union Hospital Inc
   cms_hpt_url: https://union.health/cms-hpt.txt
+  alias_of: hospital-006735
 - hospital_id: hospital-006734
   name: Union Hospital Regional
   cms_hpt_url: https://union.health/cms-hpt.txt
@@ -22429,6 +22474,7 @@ hospitals:
   name: Uniontown Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-006738
+  alias_of: hospital-006688
   name: United Health Services Hospitals, Inc
   cms_hpt_url: https://www.nyuhs.org/cms-hpt.txt
 - hospital_id: hospital-006739
@@ -22560,6 +22606,7 @@ hospitals:
 - hospital_id: hospital-006780
   name: University Hospital of Brooklyn
   cms_hpt_url: https://www.downstate.edu/cms-hpt.txt
+  alias_of: hospital-006365
   locator_name: SUNY Downstate Health Sciences University
 - hospital_id: hospital-006781
   name: University Hospitals Ahuja Medical Center
@@ -22647,6 +22694,7 @@ hospitals:
 - hospital_id: hospital-006808
   name: University of Illinois Hospital & Clinics
   cms_hpt_url: https://hospital.uillinois.edu/cms-hpt.txt
+  alias_of: hospital-006809
   locator_name: University of Illinois Hospital and Clinics
 - hospital_id: hospital-006809
   name: University of Illinois Hospital and Clinics
@@ -22757,18 +22805,22 @@ hospitals:
 - hospital_id: hospital-006841
   name: University of Virginia Culpeper Medical Center
   cms_hpt_url: https://www.uvahealth.com/cms-hpt.txt
+  alias_of: hospital-006925
   locator_name: UVA Health Culpeper Medical Center
 - hospital_id: hospital-006842
   name: University of Virginia Haymarket Medical Center
   cms_hpt_url: https://www.uvahealth.com/cms-hpt.txt
+  alias_of: hospital-006926
   locator_name: UVA Health Haymarket Medical Center
 - hospital_id: hospital-006843
   name: University of Virginia Medical Center
   cms_hpt_url: https://www.uvahealth.com/cms-hpt.txt
+  alias_of: hospital-006927
   locator_name: UVA Health Medical Center
 - hospital_id: hospital-006844
   name: University of Virginia Prince William Medical Center
   cms_hpt_url: https://www.uvahealth.com/cms-hpt.txt
+  alias_of: hospital-006928
   locator_name: UVA Health Prince William Medical Center
 - hospital_id: hospital-006845
   name: UNM Sandoval Regional Medical Center
@@ -24013,6 +24065,7 @@ hospitals:
 - hospital_id: hospital-007240
   name: York Hospital
   cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+  alias_of: hospital-007064
   locator_name: WellSpan York Hospital
 - hospital_id: hospital-007241
   name: York Hospital
