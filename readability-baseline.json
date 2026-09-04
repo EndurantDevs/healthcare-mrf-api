@@ -13,13 +13,13 @@
     "global_state_usage": 0,
     "inline_suppressions": 1,
     "long_files": 143,
-    "long_functions": 136,
+    "long_functions": 135,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
     "too_many_locals": 66,
-    "too_many_parameters": 31
+    "too_many_parameters": 27
   },
   "issue_ids": {
     "ambiguous_function_names": [],
@@ -400,7 +400,6 @@
       "too_many_locals:scripts/validation/ptg2_v3_capacity_gate.py:evaluate_evidence"
     ],
     "too_many_parameters": [
-      "too_many_parameters:api/endpoint/npi.py:_npi_detail_cache_key",
       "too_many_parameters:api/endpoint/reports.py:_build_market_sql",
       "too_many_parameters:process/control_lifecycle.py:mark_control_run",
       "too_many_parameters:process/entity_address_unified.py:_run_sql_phase",
@@ -409,9 +408,6 @@
       "too_many_parameters:process/florida_mqa_profile.py:_fact_payload",
       "too_many_parameters:process/florida_mqa_profile.py:_retained_source_record",
       "too_many_parameters:process/mrf_source_discovery.py:run_mrf_source_discovery_command",
-      "too_many_parameters:process/openaddresses.py:_load_file",
-      "too_many_parameters:process/openaddresses.py:_load_source_item",
-      "too_many_parameters:process/openaddresses.py:refresh_archive_geocodes_from_openaddresses_sharded",
       "too_many_parameters:process/provider_directory_admission_seal.py:validate_generic_admission_copy",
       "too_many_parameters:process/provider_directory_fhir.py:_fetch_resource_rows",
       "too_many_parameters:process/provider_directory_fhir.py:_import_resources",

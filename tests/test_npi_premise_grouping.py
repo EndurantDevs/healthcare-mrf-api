@@ -343,14 +343,20 @@ def test_detail_cache_key_separates_flat_site_and_premise_windows():
         "lookup_stored_geocode": False,
     }
 
-    flat_key = npi_module._npi_detail_cache_key(**cache_key_option_map)
+    flat_key = npi_module._npi_detail_cache_key(
+        npi_module._NpiDetailCacheIdentity(**cache_key_option_map)
+    )
     site_key = npi_module._npi_detail_cache_key(
-        **cache_key_option_map,
-        address_site_key=SITE_A,
+        npi_module._NpiDetailCacheIdentity(
+            **cache_key_option_map,
+            address_site_key=SITE_A,
+        )
     )
     premise_key = npi_module._npi_detail_cache_key(
-        **cache_key_option_map,
-        address_grouping="premise",
+        npi_module._NpiDetailCacheIdentity(
+            **cache_key_option_map,
+            address_grouping="premise",
+        )
     )
 
     assert len({flat_key, site_key, premise_key}) == 3
