@@ -565,6 +565,91 @@ async def startup(ctx):
     logger.info("LODES startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
+async def _validated_lodes_publish_metrics(
+    db_schema: str,
+    stage_table: str,
+    test_mode: bool,
+    run_id: str,
+) -> tuple[int, int, int, float]:
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
+    distinct_zctas = int(
+        await db.scalar(f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_table};") or 0
+    )
+    if await _table_exists(db_schema, "geo_zip_lookup"):
+        matched_zctas = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(DISTINCT s.zcta_code)
+                  FROM {db_schema}.{stage_table} AS s
+                  JOIN {db_schema}.geo_zip_lookup AS g
+                    ON g.zip_code = s.zcta_code
+                """
+            )
+            or 0
+        )
+    elif test_mode:
+        matched_zctas = 0
+        logger.info("LODES test mode: %s.geo_zip_lookup is missing; skipping geo match validation.", db_schema)
+    else:
+        await _abort_lodes_publish(run_id, f"LODES requires {db_schema}.geo_zip_lookup for publish validation.")
+    geo_match_ratio = (matched_zctas / distinct_zctas) if distinct_zctas else 0.0
+    if test_mode:
+        logger.info(
+            "LODES test mode: staged rows=%d distinct_zctas=%d geo_match_ratio=%.3f",
+            stage_rows,
+            distinct_zctas,
+            geo_match_ratio,
+        )
+    elif stage_rows < DEFAULT_MIN_ROWS:
+        await _abort_lodes_publish(
+            run_id,
+            f"LODES stage row count {stage_rows} is below minimum {DEFAULT_MIN_ROWS}; aborting publish.",
+        )
+    elif distinct_zctas < DEFAULT_MIN_DISTINCT_ZCTAS:
+        await _abort_lodes_publish(
+            run_id,
+            f"LODES distinct ZCTA count {distinct_zctas} is below minimum "
+            f"{DEFAULT_MIN_DISTINCT_ZCTAS}; aborting publish.",
+        )
+    elif geo_match_ratio < DEFAULT_MIN_GEO_MATCH_RATIO:
+        await _abort_lodes_publish(
+            run_id,
+            f"LODES geo match ratio {geo_match_ratio:.3f} below minimum "
+            f"{DEFAULT_MIN_GEO_MATCH_RATIO:.2f}; aborting publish.",
+        )
+    return stage_rows, distinct_zctas, matched_zctas, geo_match_ratio
+
+
+async def _swap_lodes_generation(
+    db_schema: str,
+    stage_table: str,
+    run_id: str,
+) -> None:
+    try:
+        async with db.transaction():
+            live_table = LODESWorkplaceAggregate.__main_table__
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{live_table}_old;")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{live_table} RENAME TO {live_table}_old;"
+            )
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{stage_table} RENAME TO {live_table};"
+            )
+
+            archived = _archived_identifier(f"{live_table}_idx_primary")
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{live_table}_idx_primary RENAME TO {archived};"
+            )
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{stage_table}_idx_primary "
+                f"RENAME TO {live_table}_idx_primary;"
+            )
+    except Exception as exc:
+        await _mark_lodes_publish_failed(run_id, exc)
+        raise
+
+
 async def publish_lodes_generation(ctx):
     """Finalize the LODES run and release worker resources."""
     import_date = ctx.get("import_date")
@@ -579,12 +664,14 @@ async def publish_lodes_generation(ctx):
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(LODESWorkplaceAggregate, import_date)
-    if not await _table_exists(db_schema, stage_cls.__tablename__):
-        if context.get("test_mode"):
+    test_mode = bool(context.get("test_mode"))
+    stage_table = stage_cls.__tablename__
+    if not await _table_exists(db_schema, stage_table):
+        if test_mode:
             logger.info(
                 "LODES test mode: stage table %s.%s is missing; skipping publish.",
                 db_schema,
-                stage_cls.__tablename__,
+                stage_table,
             )
             await mark_control_run(
                 run_id,
@@ -596,78 +683,12 @@ async def publish_lodes_generation(ctx):
             return
         await _abort_lodes_publish(
             run_id,
-            f"LODES stage table {db_schema}.{stage_cls.__tablename__} is missing; aborting publish.",
+            f"LODES stage table {db_schema}.{stage_table} is missing; aborting publish.",
         )
-
-    stage_rows = int(await db.scalar(
-        f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
-    distinct_zctas = int(await db.scalar(
-        f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
-    if await _table_exists(db_schema, "geo_zip_lookup"):
-        matched_zctas = int(await db.scalar(
-            f"""
-            SELECT COUNT(DISTINCT s.zcta_code)
-              FROM {db_schema}.{stage_cls.__tablename__} AS s
-              JOIN {db_schema}.geo_zip_lookup AS g
-                ON g.zip_code = s.zcta_code
-            """
-        ) or 0)
-    elif context.get("test_mode"):
-        matched_zctas = 0
-        logger.info("LODES test mode: %s.geo_zip_lookup is missing; skipping geo match validation.", db_schema)
-    else:
-        await _abort_lodes_publish(run_id, f"LODES requires {db_schema}.geo_zip_lookup for publish validation.")
-    geo_match_ratio = (matched_zctas / distinct_zctas) if distinct_zctas else 0.0
-
-    if context.get("test_mode"):
-        logger.info(
-            "LODES test mode: staged rows=%d distinct_zctas=%d geo_match_ratio=%.3f",
-            stage_rows,
-            distinct_zctas,
-            geo_match_ratio,
-        )
-    elif stage_rows < DEFAULT_MIN_ROWS:
-        await _abort_lodes_publish(
-            run_id,
-            f"LODES stage row count {stage_rows} is below minimum {DEFAULT_MIN_ROWS}; aborting publish."
-        )
-    elif distinct_zctas < DEFAULT_MIN_DISTINCT_ZCTAS:
-        await _abort_lodes_publish(
-            run_id,
-            f"LODES distinct ZCTA count {distinct_zctas} is below minimum "
-            f"{DEFAULT_MIN_DISTINCT_ZCTAS}; aborting publish."
-        )
-    elif geo_match_ratio < DEFAULT_MIN_GEO_MATCH_RATIO:
-        await _abort_lodes_publish(
-            run_id,
-            f"LODES geo match ratio {geo_match_ratio:.3f} below minimum "
-            f"{DEFAULT_MIN_GEO_MATCH_RATIO:.2f}; aborting publish."
-        )
-
-    # Atomic swap: staging → live
-    try:
-        async with db.transaction():
-            table = LODESWorkplaceAggregate.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-            )
-
-            archived = _archived_identifier(f"{table}_idx_primary")
-            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-            await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-            )
-            await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-                f"RENAME TO {table}_idx_primary;"
-            )
-    except Exception as exc:
-        await _mark_lodes_publish_failed(run_id, exc)
-        raise
+    stage_rows, distinct_zctas, matched_zctas, geo_match_ratio = (
+        await _validated_lodes_publish_metrics(db_schema, stage_table, test_mode, run_id)
+    )
+    await _swap_lodes_generation(db_schema, stage_table, run_id)
 
     logger.info(
         "LODES publish complete: rows=%d distinct_zctas=%d geo_match_ratio=%.3f",

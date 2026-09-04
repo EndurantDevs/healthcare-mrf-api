@@ -34,6 +34,34 @@ PRICE_RATE_COLUMNS = (
     plan_prices_table.c.couple_and_two_dependents,
     plan_prices_table.c.couple_and_three_or_more_dependents,
 )
+SUMMARY_INSERT_COLUMNS = (
+    "plan_id",
+    "year",
+    "state",
+    "issuer_id",
+    "marketing_name",
+    "market_coverage",
+    "is_on_exchange",
+    "is_off_exchange",
+    "is_hsa",
+    "is_dental_only",
+    "is_catastrophic",
+    "deductible_inn_individual",
+    "moop_inn_individual",
+    "premium_min",
+    "premium_max",
+    "plan_type",
+    "metal_level",
+    "csr_variation",
+    "has_adult_dental",
+    "has_child_dental",
+    "has_adult_vision",
+    "has_child_vision",
+    "telehealth_supported",
+    "attributes",
+    "plan_benefits",
+    "updated_at",
+)
 MIN_SENTINEL = 10**12
 MAX_SENTINEL = -10**12
 ADULT_DENTAL_KEYWORDS = ("dental", "adult")
@@ -286,6 +314,53 @@ async def _ensure_summary_columns() -> None:
         await db.status(stmt)
 
 
+def _build_plan_summary_select(attr_subq, benefit_subq, price_subq):
+    join_attr = and_(
+        plan_table.c.plan_id == attr_subq.c.plan_id,
+        plan_table.c.year == attr_subq.c.year,
+    )
+    join_benefits = and_(
+        plan_table.c.plan_id == benefit_subq.c.plan_id,
+        plan_table.c.year == benefit_subq.c.year,
+    )
+    join_prices = and_(
+        plan_table.c.plan_id == price_subq.c.plan_id,
+        plan_table.c.year == price_subq.c.year,
+    )
+    return select(
+        plan_table.c.plan_id,
+        plan_table.c.year,
+        plan_table.c.state,
+        plan_table.c.issuer_id,
+        plan_table.c.marketing_name,
+        attr_subq.c.market_coverage,
+        func.coalesce(attr_subq.c.is_on_exchange, False).label("is_on_exchange"),
+        func.coalesce(attr_subq.c.is_off_exchange, False).label("is_off_exchange"),
+        func.coalesce(attr_subq.c.is_hsa, False).label("is_hsa"),
+        func.coalesce(attr_subq.c.is_dental_only, False).label("is_dental_only"),
+        func.coalesce(attr_subq.c.is_catastrophic, False).label("is_catastrophic"),
+        attr_subq.c.deductible_inn_individual,
+        attr_subq.c.moop_inn_individual,
+        price_subq.c.premium_min,
+        price_subq.c.premium_max,
+        attr_subq.c.plan_type,
+        attr_subq.c.metal_level,
+        attr_subq.c.csr_variation,
+        func.coalesce(benefit_subq.c.has_adult_dental, False).label("has_adult_dental"),
+        func.coalesce(benefit_subq.c.has_child_dental, False).label("has_child_dental"),
+        func.coalesce(benefit_subq.c.has_adult_vision, False).label("has_adult_vision"),
+        func.coalesce(benefit_subq.c.has_child_vision, False).label("has_child_vision"),
+        func.coalesce(benefit_subq.c.telehealth_supported, False).label("telehealth_supported"),
+        attr_subq.c.attributes,
+        benefit_subq.c.plan_benefits,
+        func.now().label("updated_at"),
+    ).select_from(
+        plan_table.outerjoin(attr_subq, join_attr)
+        .outerjoin(benefit_subq, join_benefits)
+        .outerjoin(price_subq, join_prices)
+    )
+
+
 async def rebuild_plan_search_summary(test_mode: bool = False) -> int:
     """
     Materialize plan_search_summary with pre-calculated filters so /plan/search can run without large joins.
@@ -313,86 +388,8 @@ async def rebuild_plan_search_summary(test_mode: bool = False) -> int:
         await session.execute(text(f'DROP TABLE IF EXISTS {qualified_temp};'))
 
     await db.create_table(temp_table, checkfirst=False)
-
-    join_attr = and_(
-        plan_table.c.plan_id == attr_subq.c.plan_id,
-        plan_table.c.year == attr_subq.c.year,
-    )
-    join_benefits = and_(
-        plan_table.c.plan_id == benefit_subq.c.plan_id,
-        plan_table.c.year == benefit_subq.c.year,
-    )
-    join_prices = and_(
-        plan_table.c.plan_id == price_subq.c.plan_id,
-        plan_table.c.year == price_subq.c.year,
-    )
-
-    data_stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.state,
-            plan_table.c.issuer_id,
-            plan_table.c.marketing_name,
-            attr_subq.c.market_coverage,
-            func.coalesce(attr_subq.c.is_on_exchange, False).label("is_on_exchange"),
-            func.coalesce(attr_subq.c.is_off_exchange, False).label("is_off_exchange"),
-            func.coalesce(attr_subq.c.is_hsa, False).label("is_hsa"),
-            func.coalesce(attr_subq.c.is_dental_only, False).label("is_dental_only"),
-            func.coalesce(attr_subq.c.is_catastrophic, False).label("is_catastrophic"),
-            attr_subq.c.deductible_inn_individual,
-            attr_subq.c.moop_inn_individual,
-            price_subq.c.premium_min,
-            price_subq.c.premium_max,
-            attr_subq.c.plan_type,
-            attr_subq.c.metal_level,
-            attr_subq.c.csr_variation,
-            func.coalesce(benefit_subq.c.has_adult_dental, False).label("has_adult_dental"),
-            func.coalesce(benefit_subq.c.has_child_dental, False).label("has_child_dental"),
-            func.coalesce(benefit_subq.c.has_adult_vision, False).label("has_adult_vision"),
-            func.coalesce(benefit_subq.c.has_child_vision, False).label("has_child_vision"),
-            func.coalesce(benefit_subq.c.telehealth_supported, False).label("telehealth_supported"),
-            attr_subq.c.attributes,
-            benefit_subq.c.plan_benefits,
-            func.now().label("updated_at"),
-        )
-        .select_from(
-            plan_table.outerjoin(attr_subq, join_attr)
-            .outerjoin(benefit_subq, join_benefits)
-            .outerjoin(price_subq, join_prices)
-        )
-    )
-
-    insert_columns = [
-        "plan_id",
-        "year",
-        "state",
-        "issuer_id",
-        "marketing_name",
-        "market_coverage",
-        "is_on_exchange",
-        "is_off_exchange",
-        "is_hsa",
-        "is_dental_only",
-        "is_catastrophic",
-        "deductible_inn_individual",
-        "moop_inn_individual",
-        "premium_min",
-        "premium_max",
-        "plan_type",
-        "metal_level",
-        "csr_variation",
-        "has_adult_dental",
-        "has_child_dental",
-        "has_adult_vision",
-        "has_child_vision",
-        "telehealth_supported",
-        "attributes",
-        "plan_benefits",
-        "updated_at",
-    ]
-
-    insert_stmt = pg_insert(temp_table).from_select(insert_columns, data_stmt)
+    data_stmt = _build_plan_summary_select(attr_subq, benefit_subq, price_subq)
+    insert_stmt = pg_insert(temp_table).from_select(SUMMARY_INSERT_COLUMNS, data_stmt)
 
     async with db.session() as session:
         await session.execute(insert_stmt)

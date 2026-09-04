@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 import aiohttp
 from aiofile import async_open
@@ -603,6 +603,86 @@ def _missing_svi_zcta_example(svi_csv_fields: dict[str, Any]) -> str:
     return json.dumps(present_zcta_field_by_name, ensure_ascii=True)[:220]
 
 
+QPP_SCORE_KEYS_BY_NAME = (
+    (
+        "quality_score",
+        (
+            "quality_score", "quality score", "quality", "quality_percent",
+            "quality_category_score", "quality category score",
+            "quality_performance_category_score", "quality performance category score",
+        ),
+    ),
+    (
+        "cost_score",
+        (
+            "cost_score", "cost score", "cost", "cost_percent",
+            "cost_category_score", "cost category score",
+            "cost_performance_category_score", "cost performance category score",
+        ),
+    ),
+    (
+        "final_score",
+        (
+            "final_score", "final score", "final", "final_percent",
+            "final_mips_score", "final mips score", "finalscore",
+            "final score performance year",
+        ),
+    ),
+)
+
+
+def _qpp_entry(
+    qpp_csv_fields: dict[str, Any], reporting_year: int
+) -> dict[str, Any] | None:
+    npi = _to_npi(
+        _pick_first_ci(
+            qpp_csv_fields,
+            "npi",
+            "clinician_npi",
+            "clinician npi",
+            "organization_npi",
+            "group_practice_npi",
+        )
+    )
+    if npi is None:
+        return None
+    year = max(
+        _to_int(
+            _pick_first_ci(
+                qpp_csv_fields,
+                "year",
+                "performance_year",
+                "performance year",
+                "reporting_year",
+                "reporting year",
+            )
+        )
+        or reporting_year,
+        2013,
+    )
+    return {
+        "npi": npi,
+        "year": year,
+        **{
+            name: _extract_qpp_score(qpp_csv_fields, *keys)
+            for name, keys in QPP_SCORE_KEYS_BY_NAME
+        },
+        "raw_json_text": json.dumps(qpp_csv_fields, ensure_ascii=True),
+        "updated_at": datetime.datetime.utcnow(),
+    }
+
+
+async def _flush_qpp_entries(qpp_entries: list[dict[str, Any]], qpp_cls: type) -> None:
+    if not qpp_entries:
+        return
+    qpp_entry_by_identity = {
+        (qpp_entry.get("npi"), qpp_entry.get("year")): qpp_entry
+        for qpp_entry in qpp_entries
+    }
+    await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
+    qpp_entries.clear()
+
+
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
     """Load normalized QPP provider rows from one source artifact."""
     qpp_entries: list[dict[str, Any]] = []
@@ -620,93 +700,17 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 _print_row_progress("qpp_provider", row_number, accepted, progress_start)
                 progress_last = now
 
-            npi = _to_npi(
-                _pick_first_ci(
-                    qpp_csv_fields,
-                    "npi",
-                    "clinician_npi",
-                    "clinician npi",
-                    "organization_npi",
-                    "group_practice_npi",
-                )
-            )
-            if npi is None:
+            qpp_entry = _qpp_entry(qpp_csv_fields, reporting_year)
+            if qpp_entry is None:
                 continue
-            year = _to_int(
-                _pick_first_ci(
-                    qpp_csv_fields,
-                    "year",
-                    "performance_year",
-                    "performance year",
-                    "reporting_year",
-                    "reporting year",
-                )
-            )
-            year = max(year or reporting_year, 2013)
-
-            quality_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "quality_score",
-                "quality score",
-                "quality",
-                "quality_percent",
-                "quality_category_score",
-                "quality category score",
-                "quality_performance_category_score",
-                "quality performance category score",
-            )
-            cost_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "cost_score",
-                "cost score",
-                "cost",
-                "cost_percent",
-                "cost_category_score",
-                "cost category score",
-                "cost_performance_category_score",
-                "cost performance category score",
-            )
-            final_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "final_score",
-                "final score",
-                "final",
-                "final_percent",
-                "final_mips_score",
-                "final mips score",
-                "finalscore",
-                "final score performance year",
-            )
-
-            qpp_entries.append(
-                {
-                    "npi": npi,
-                    "year": year,
-                    "quality_score": quality_score,
-                    "cost_score": cost_score,
-                    "final_score": final_score,
-                    "raw_json_text": json.dumps(qpp_csv_fields, ensure_ascii=True),
-                    "updated_at": datetime.datetime.utcnow(),
-                }
-            )
+            qpp_entries.append(qpp_entry)
             accepted += 1
             if len(qpp_entries) >= IMPORT_BATCH_SIZE:
-                qpp_entry_by_identity = {(
-                    qpp_entry.get("npi"),
-                    qpp_entry.get("year"),
-                ): qpp_entry for qpp_entry in qpp_entries}
-                await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
-                qpp_entries.clear()
-
+                await _flush_qpp_entries(qpp_entries, qpp_cls)
             if test_mode and accepted >= PROVIDER_QUALITY_TEST_QPP_ROWS:
                 break
 
-    if qpp_entries:
-        qpp_entry_by_identity = {
-            (qpp_entry.get("npi"), qpp_entry.get("year")): qpp_entry
-            for qpp_entry in qpp_entries
-        }
-        await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
+    await _flush_qpp_entries(qpp_entries, qpp_cls)
     _print_row_progress("qpp_provider", row_number, accepted, progress_start, final=True)
 
 
@@ -1646,6 +1650,127 @@ async def _wait_for_materialize_phase_completion(redis, run_id: str, phase: str)
     await _log_materialize_phase_summary(redis, run_id, phase, total=total, done=done, failed=failed)
 
 
+class _MaterializeRunContext(NamedTuple):
+    classes: dict[str, type]
+    schema: str
+    run_id: str
+    stage_suffix: str
+    test_mode: bool
+    years: tuple[int, ...]
+    sql_context: dict[str, Any]
+
+
+async def _materialize_feature_phases(
+    redis, run: _MaterializeRunContext, phase: str
+) -> str:
+    if phase == MAT_PHASE_1_BUILD_FEATURES:
+        logger.info("provider quality materialize phase start run_id=%s phase=%s", run.run_id, phase)
+        for table_key in (
+            "feature_table", "lsh_table", "peer_target_table",
+            "measure_table", "domain_table", "score_table",
+        ):
+            await db.status(f"TRUNCATE TABLE {run.schema}.{run.sql_context[table_key]};")
+        await db.status(_cohort_sql_phase_1_build_features(run.sql_context))
+        await _ensure_materialize_indexes(run.classes, run.schema, "PricingProviderQualityFeature")
+        if run.sql_context["feature_procedure_bucket_col"]:
+            await _enqueue_materialize_phase_shards(
+                redis,
+                run_id=run.run_id,
+                phase=MAT_PHASE_2_BUILD_LSH_SHARDED,
+                years=run.years,
+                shard_count=PROVIDER_QUALITY_LSH_SHARDS,
+                stage_suffix=run.stage_suffix,
+                schema=run.schema,
+                test_mode=run.test_mode,
+                job_name="provider_quality_materialize_lsh_shard",
+            )
+        else:
+            await _set_materialize_phase(
+                redis, run.run_id, MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET, total=0
+            )
+        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+
+    if phase == MAT_PHASE_2_BUILD_LSH_SHARDED:
+        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run.run_id, phase)
+        await _wait_for_materialize_phase_completion(redis, run.run_id, phase)
+        await _ensure_materialize_indexes(run.classes, run.schema, "PricingProviderQualityProcedureLSH")
+        await _set_materialize_phase(
+            redis, run.run_id, MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET, total=0
+        )
+        phase = MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET
+
+    if phase == MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET:
+        logger.info("provider quality materialize phase start run_id=%s phase=%s", run.run_id, phase)
+        procedure_bucket_sql = _cohort_sql_phase_3_procedure_bucket(run.sql_context)
+        if procedure_bucket_sql:
+            await db.status(procedure_bucket_sql)
+        await db.status(f"ANALYZE {run.schema}.{run.sql_context['feature_table']};")
+        await _set_materialize_phase(redis, run.run_id, MAT_PHASE_4_BUILD_PEER_TARGETS, total=0)
+        phase = MAT_PHASE_4_BUILD_PEER_TARGETS
+    return phase
+
+
+async def _materialize_score_phases(
+    redis, run: _MaterializeRunContext, phase: str
+) -> None:
+    if phase == MAT_PHASE_4_BUILD_PEER_TARGETS:
+        logger.info("provider quality materialize phase start run_id=%s phase=%s", run.run_id, phase)
+        await db.status(_cohort_sql_phase_4_peer_targets(run.sql_context))
+        await _ensure_materialize_indexes(run.classes, run.schema, "PricingProviderQualityPeerTarget")
+        await _enqueue_materialize_phase_shards(
+            redis,
+            run_id=run.run_id,
+            phase=MAT_PHASE_5_BUILD_MEASURE_SHARDED,
+            years=run.years,
+            shard_count=PROVIDER_QUALITY_MEASURE_SHARDS,
+            stage_suffix=run.stage_suffix,
+            schema=run.schema,
+            test_mode=run.test_mode,
+            job_name="provider_quality_materialize_measure_shard",
+        )
+        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+    if phase == MAT_PHASE_5_BUILD_MEASURE_SHARDED:
+        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run.run_id, phase)
+        await _wait_for_materialize_phase_completion(redis, run.run_id, phase)
+        await _ensure_materialize_indexes(run.classes, run.schema, "PricingProviderQualityMeasure")
+        await _enqueue_materialize_phase_shards(
+            redis,
+            run_id=run.run_id,
+            phase=MAT_PHASE_6_BUILD_DOMAIN_SHARDED,
+            years=run.years,
+            shard_count=PROVIDER_QUALITY_DOMAIN_SHARDS,
+            stage_suffix=run.stage_suffix,
+            schema=run.schema,
+            test_mode=run.test_mode,
+            job_name="provider_quality_materialize_domain_shard",
+        )
+        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+    if phase == MAT_PHASE_6_BUILD_DOMAIN_SHARDED:
+        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run.run_id, phase)
+        await _wait_for_materialize_phase_completion(redis, run.run_id, phase)
+        await _ensure_materialize_indexes(run.classes, run.schema, "PricingProviderQualityDomain")
+        await _enqueue_materialize_phase_shards(
+            redis,
+            run_id=run.run_id,
+            phase=MAT_PHASE_7_BUILD_SCORE_SHARDED,
+            years=run.years,
+            shard_count=PROVIDER_QUALITY_SCORE_SHARDS,
+            stage_suffix=run.stage_suffix,
+            schema=run.schema,
+            test_mode=run.test_mode,
+            job_name="provider_quality_materialize_score_shard",
+        )
+        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+
+    if phase == MAT_PHASE_7_BUILD_SCORE_SHARDED:
+        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run.run_id, phase)
+        await _wait_for_materialize_phase_completion(redis, run.run_id, phase)
+        await _set_materialize_phase(redis, run.run_id, MAT_PHASE_DONE, total=0)
+        return
+    if phase != MAT_PHASE_DONE:
+        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+
+
 async def _materialize_quality_rows_sharded(
     redis,
     *,
@@ -1659,122 +1784,17 @@ async def _materialize_quality_rows_sharded(
     """Materialize provider-quality rows through resumable shard phases."""
     years = _materialize_reporting_years(manifest)
     await _ensure_provider_quality_rx_agg_table(classes, schema, years)
-    context = await _build_cohort_materialization_context(classes, schema)
+    sql_context = await _build_cohort_materialization_context(classes, schema)
+    run = _MaterializeRunContext(classes, schema, run_id, stage_suffix, test_mode, years, sql_context)
     phase = await _get_materialize_phase(redis, run_id)
     if phase and phase not in MAT_PHASE_SEQUENCE:
         await _reset_materialize_state(redis, run_id)
         phase = ""
-
     if not phase:
-        await _set_materialize_phase(redis, run_id, MAT_PHASE_1_BUILD_FEATURES, total=0)
         phase = MAT_PHASE_1_BUILD_FEATURES
-
-    if phase == MAT_PHASE_1_BUILD_FEATURES:
-        logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
-        await db.status(f"TRUNCATE TABLE {schema}.{context['feature_table']};")
-        await db.status(f"TRUNCATE TABLE {schema}.{context['lsh_table']};")
-        await db.status(f"TRUNCATE TABLE {schema}.{context['peer_target_table']};")
-        await db.status(f"TRUNCATE TABLE {schema}.{context['measure_table']};")
-        await db.status(f"TRUNCATE TABLE {schema}.{context['domain_table']};")
-        await db.status(f"TRUNCATE TABLE {schema}.{context['score_table']};")
-        await db.status(_cohort_sql_phase_1_build_features(context))
-        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityFeature")
-        if context["feature_procedure_bucket_col"]:
-            await _enqueue_materialize_phase_shards(
-                redis,
-                run_id=run_id,
-                phase=MAT_PHASE_2_BUILD_LSH_SHARDED,
-                years=years,
-                shard_count=PROVIDER_QUALITY_LSH_SHARDS,
-                stage_suffix=stage_suffix,
-                schema=schema,
-                test_mode=test_mode,
-                job_name="provider_quality_materialize_lsh_shard",
-            )
-        else:
-            await _set_materialize_phase(
-                redis,
-                run_id,
-                MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET,
-                total=0,
-            )
-        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-
-    if phase == MAT_PHASE_2_BUILD_LSH_SHARDED:
-        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
-        await _wait_for_materialize_phase_completion(redis, run_id, phase)
-        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityProcedureLSH")
-        await _set_materialize_phase(redis, run_id, MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET, total=0)
-        phase = MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET
-
-    if phase == MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET:
-        logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
-        procedure_bucket_sql = _cohort_sql_phase_3_procedure_bucket(context)
-        if procedure_bucket_sql:
-            await db.status(procedure_bucket_sql)
-        await db.status(f"ANALYZE {schema}.{context['feature_table']};")
-        await _set_materialize_phase(redis, run_id, MAT_PHASE_4_BUILD_PEER_TARGETS, total=0)
-        phase = MAT_PHASE_4_BUILD_PEER_TARGETS
-
-    if phase == MAT_PHASE_4_BUILD_PEER_TARGETS:
-        logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
-        await db.status(_cohort_sql_phase_4_peer_targets(context))
-        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityPeerTarget")
-        await _enqueue_materialize_phase_shards(
-            redis,
-            run_id=run_id,
-            phase=MAT_PHASE_5_BUILD_MEASURE_SHARDED,
-            years=years,
-            shard_count=PROVIDER_QUALITY_MEASURE_SHARDS,
-            stage_suffix=stage_suffix,
-            schema=schema,
-            test_mode=test_mode,
-            job_name="provider_quality_materialize_measure_shard",
-        )
-        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-
-    if phase == MAT_PHASE_5_BUILD_MEASURE_SHARDED:
-        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
-        await _wait_for_materialize_phase_completion(redis, run_id, phase)
-        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityMeasure")
-        await _enqueue_materialize_phase_shards(
-            redis,
-            run_id=run_id,
-            phase=MAT_PHASE_6_BUILD_DOMAIN_SHARDED,
-            years=years,
-            shard_count=PROVIDER_QUALITY_DOMAIN_SHARDS,
-            stage_suffix=stage_suffix,
-            schema=schema,
-            test_mode=test_mode,
-            job_name="provider_quality_materialize_domain_shard",
-        )
-        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-
-    if phase == MAT_PHASE_6_BUILD_DOMAIN_SHARDED:
-        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
-        await _wait_for_materialize_phase_completion(redis, run_id, phase)
-        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityDomain")
-        await _enqueue_materialize_phase_shards(
-            redis,
-            run_id=run_id,
-            phase=MAT_PHASE_7_BUILD_SCORE_SHARDED,
-            years=years,
-            shard_count=PROVIDER_QUALITY_SCORE_SHARDS,
-            stage_suffix=stage_suffix,
-            schema=schema,
-            test_mode=test_mode,
-            job_name="provider_quality_materialize_score_shard",
-        )
-        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-
-    if phase == MAT_PHASE_7_BUILD_SCORE_SHARDED:
-        logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
-        await _wait_for_materialize_phase_completion(redis, run_id, phase)
-        await _set_materialize_phase(redis, run_id, MAT_PHASE_DONE, total=0)
-        return
-
-    if phase != MAT_PHASE_DONE:
-        raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+        await _set_materialize_phase(redis, run_id, phase, total=0)
+    phase = await _materialize_feature_phases(redis, run, phase)
+    await _materialize_score_phases(redis, run, phase)
 
 
 
