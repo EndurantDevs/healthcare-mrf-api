@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from sqlalchemy import text
+
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_candidate_attestation import (
@@ -56,7 +58,7 @@ class _TransactionExecutor:
     async def all(self, statement: Any, **params: Any) -> list[Any]:
         """Execute a statement and return all result rows."""
         result = await self._session.execute(
-            _text(statement) if isinstance(statement, str) else statement,
+            text(statement) if isinstance(statement, str) else statement,
             params,
         )
         return result.all()
@@ -64,7 +66,7 @@ class _TransactionExecutor:
     async def status(self, statement: Any, **params: Any) -> int | None:
         """Execute a statement and return its affected row count."""
         result = await self._session.execute(
-            _text(statement) if isinstance(statement, str) else statement,
+            text(statement) if isinstance(statement, str) else statement,
             params,
         )
         return getattr(result, "rowcount", None)
@@ -270,9 +272,8 @@ async def remove_ptg2_source_snapshot(
             snapshot_id=snapshot_id,
             expected_generation=storage_generation,
             expected_snapshot_key=plan.get("shared_snapshot_key"),
-            allow_missing_binding=(
-                str(plan.get("status") or "").strip().lower() == "failed"
-            ),
+            allow_missing_binding=str(plan.get("status") or "").strip().lower()
+            == "failed",
         )
         artifact_ids = [
             str(artifact_id)
@@ -493,9 +494,3 @@ def _clear_ptg2_snapshot_cache() -> None:
     except Exception:
         return
     _PTG2_SNAPSHOT_RESOLVE_CACHE.clear()
-
-
-def _text(statement: str):
-    from sqlalchemy import text
-
-    return text(statement)

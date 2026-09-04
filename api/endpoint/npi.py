@@ -5288,6 +5288,109 @@ def _nearby_geo_type_clause(address_table_sql: str) -> str:
     return "AND (a.type = 'primary' OR a.type = 'secondary')"
 
 
+_NEARBY_SQL_TEMPLATE = dedent(
+    """
+    WITH sub_s AS (
+        SELECT d.npi AS npi_code,
+               ROUND(
+                   CAST(
+                       ST_Distance(
+                           Geography(
+                               ST_MakePoint(
+                                   (a.long)::double precision,
+                                   (a.lat)::double precision
+                               )
+                           ),
+                           Geography(
+                               ST_MakePoint(
+                                   CAST(:in_long AS double precision),
+                                   CAST(:in_lat AS double precision)
+                               )
+                           )
+                       ) / 1609.34 AS NUMERIC
+                   ),
+                   2
+               ) AS distance,
+               Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ) <-> Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ) AS cursor_distance_meters,
+               a.*,
+               d.*
+          FROM {address_table_sql} AS a
+          JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+         WHERE ST_DWithin(
+                   Geography(
+                       ST_MakePoint(
+                           (a.long)::double precision,
+                           (a.lat)::double precision
+                       )
+                   ),
+                   Geography(
+                       ST_MakePoint(
+                           CAST(:in_long AS double precision),
+                           CAST(:in_lat AS double precision)
+                       )
+                   ),
+                   :radius * 1609.34
+               )
+           AND a.lat IS NOT NULL
+           AND a.long IS NOT NULL
+           AND a.address_key IS NOT NULL
+           {taxonomy_where}
+           {geo_precision_clause}
+           {geo_type_clause}
+           {extra_clause}{ilike_clause}{cursor_clause}
+      ORDER BY Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ) <-> Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ) ASC,
+               a.npi ASC,
+               a.address_key ASC,
+               CASE a.type
+                   WHEN 'primary' THEN 0
+                   WHEN 'practice' THEN 1
+                   WHEN 'site' THEN 2
+                   WHEN 'secondary' THEN 3
+                   ELSE 9
+               END ASC,
+               {row_tiebreaker}
+         LIMIT :limit
+    )
+    SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
+      FROM sub_s
+      LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
+      LEFT JOIN mrf.nucc_taxonomy AS nucc
+        ON nucc.code = t.healthcare_provider_taxonomy_code
+  ORDER BY sub_s.cursor_distance_meters ASC,
+           sub_s.npi_code ASC,
+           sub_s.address_key ASC,
+           CASE sub_s.type
+               WHEN 'primary' THEN 0
+               WHEN 'practice' THEN 1
+               WHEN 'site' THEN 2
+               WHEN 'secondary' THEN 3
+               ELSE 9
+           END ASC,
+           {outer_row_tiebreaker};
+    """
+)
+
+
 def _build_nearby_sql(
     taxonomy_conditions: str,
     extra_clause: str,
@@ -5328,107 +5431,7 @@ def _build_nearby_sql(
         if address_table_sql.endswith(".entity_address_unified")
         else "sub_s.type ASC"
     )
-    return dedent(
-        """
-        WITH sub_s AS (
-            SELECT d.npi AS npi_code,
-                   ROUND(
-                       CAST(
-                           ST_Distance(
-                               Geography(
-                                   ST_MakePoint(
-                                       (a.long)::double precision,
-                                       (a.lat)::double precision
-                                   )
-                               ),
-                               Geography(
-                                   ST_MakePoint(
-                                       CAST(:in_long AS double precision),
-                                       CAST(:in_lat AS double precision)
-                                   )
-                               )
-                           ) / 1609.34 AS NUMERIC
-                       ),
-                       2
-                   ) AS distance,
-                   Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ) <-> Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ) AS cursor_distance_meters,
-                   a.*,
-                   d.*
-              FROM {address_table_sql} AS a
-              JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-             WHERE ST_DWithin(
-                       Geography(
-                           ST_MakePoint(
-                               (a.long)::double precision,
-                               (a.lat)::double precision
-                           )
-                       ),
-                       Geography(
-                           ST_MakePoint(
-                               CAST(:in_long AS double precision),
-                               CAST(:in_lat AS double precision)
-                           )
-                       ),
-                       :radius * 1609.34
-                   )
-               AND a.lat IS NOT NULL
-               AND a.long IS NOT NULL
-               AND a.address_key IS NOT NULL
-               {taxonomy_where}
-               {geo_precision_clause}
-               {geo_type_clause}
-               {extra_clause}{ilike_clause}{cursor_clause}
-          ORDER BY Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ) <-> Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ) ASC,
-                   a.npi ASC,
-                   a.address_key ASC,
-                   CASE a.type
-                       WHEN 'primary' THEN 0
-                       WHEN 'practice' THEN 1
-                       WHEN 'site' THEN 2
-                       WHEN 'secondary' THEN 3
-                       ELSE 9
-                   END ASC,
-                   {row_tiebreaker}
-             LIMIT :limit
-        )
-        SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
-          FROM sub_s
-          LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
-          LEFT JOIN mrf.nucc_taxonomy AS nucc
-            ON nucc.code = t.healthcare_provider_taxonomy_code
-      ORDER BY sub_s.cursor_distance_meters ASC,
-               sub_s.npi_code ASC,
-               sub_s.address_key ASC,
-               CASE sub_s.type
-                   WHEN 'primary' THEN 0
-                   WHEN 'practice' THEN 1
-                   WHEN 'site' THEN 2
-                   WHEN 'secondary' THEN 3
-                   ELSE 9
-               END ASC,
-               {outer_row_tiebreaker};
-        """
-    ).format(
+    return _NEARBY_SQL_TEMPLATE.format(
         taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
         geo_precision_clause=geo_precision_clause,
