@@ -2471,8 +2471,6 @@ def _add_backfill_stats(
 async def refresh_archive_geocodes_from_openaddresses_sharded(
     *,
     schema: str | None = None,
-    archive_table: str | None = None,
-    source_table: str = OPENADDRESSES_TABLE,
     state_code: str | None = None,
     zip_prefix: str | None = None,
     concurrency: int | None = None,
@@ -2483,7 +2481,8 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
 ) -> OpenAddressesBackfillStats:
     """Refresh archive geocodes through bounded concurrent shards."""
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+    archive_table = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+    source_table = OPENADDRESSES_TABLE
     state_code = _normalize_backfill_state_code(
         state_code if state_code is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE")
     )
