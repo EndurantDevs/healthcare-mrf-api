@@ -114,6 +114,20 @@ fn payer_has_charge(payer: &PayerChargeRow) -> bool {
         || payer.estimated_amount.is_some()
 }
 
+fn validate_charge_free_csv_payer(payer: &PayerChargeRow) -> io::Result<()> {
+    let methodology = optional_text(&payer.methodology)
+        .map(|value| canonical_methodology(&value, true))
+        .transpose()?;
+    let has_notes = payer.additional_payer_notes.is_some();
+    if methodology.as_deref() == Some("other") && !has_notes {
+        return Err(invalid("methodology other requires explanatory notes"));
+    }
+    if payer.allowed_count.as_deref() == Some("0") && !has_notes {
+        return Err(invalid("count 0 requires explanatory notes"));
+    }
+    Ok(())
+}
+
 fn validate_payer_common(
     mut payer: PayerChargeRow,
     generic_notes: Option<&str>,

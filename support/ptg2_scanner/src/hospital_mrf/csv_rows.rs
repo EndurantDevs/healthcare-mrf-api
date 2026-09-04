@@ -292,12 +292,8 @@ fn parse_tall_payer(
         methodology: csv_value(record, columns.methodology).to_owned(),
         additional_payer_notes: generic_notes.and_then(optional_text),
     };
-    if columns.profile == CmsProfile::V2
-        && !payer.payer_name.is_empty()
-        && !payer.plan_name.is_empty()
-        && !payer_has_charge(&payer)
-        && payer.methodology.is_empty()
-    {
+    if columns.profile == CmsProfile::V2 && !payer_has_charge(&payer) {
+        validate_charge_free_csv_payer(&payer)?;
         return Ok(None);
     }
     let payer = validate_csv_payer(
@@ -377,16 +373,7 @@ fn parse_wide_payers(
             )),
         };
         if !payer_has_charge(&parsed) {
-            let methodology = optional_text(&parsed.methodology)
-                .map(|value| canonical_methodology(&value, true))
-                .transpose()?;
-            let has_notes = parsed.additional_payer_notes.is_some();
-            if methodology.as_deref() == Some("other") && !has_notes {
-                return Err(invalid("methodology other requires explanatory notes"));
-            }
-            if parsed.allowed_count.as_deref() == Some("0") && !has_notes {
-                return Err(invalid("count 0 requires explanatory notes"));
-            }
+            validate_charge_free_csv_payer(&parsed)?;
             continue;
         }
         payers.push(validate_csv_payer(parsed, None, true, profile)?);

@@ -83,3 +83,42 @@ fn v3_wide_empty_payer_columns_are_ignored() {
         ["payer_charge"]
         .is_empty());
 }
+
+#[test]
+fn v2_tall_charge_free_payer_label_does_not_require_plan_name() {
+    let mut records = csv_fixture_records(&fixture_v2_csv(InputFormat::TallCsv, "1"));
+    for header in [
+        "plan_name",
+        "standard_charge | negotiated_percentage",
+        "estimated_amount",
+    ] {
+        let index = csv_fixture_index(&records[2], header);
+        records[3][index].clear();
+    }
+
+    assert!(run_fixture(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&records),
+        false,
+    )["payer_charge"]
+        .is_empty());
+
+    let methodology = csv_fixture_index(&records[2], "standard_charge | methodology");
+    records[3][methodology] = "unsupported".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&records),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "invalid standard charge methodology",
+    );
+
+    records[3][methodology] = "fee schedule".to_owned();
+    let dollar = csv_fixture_index(&records[2], "standard_charge | negotiated_dollar");
+    records[3][dollar] = "9.125".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&records),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "plan_name must be a non-empty string",
+    );
+}
