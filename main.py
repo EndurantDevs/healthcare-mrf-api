@@ -80,7 +80,9 @@ def start(host, port, workers, debug, accesslog):
         notifications=False,
         plpgsql=False,
         sql_reset=False,
-        sql_close_all=False
+        sql_close_all=False,
+        sql_copy_from_where=False,
+        jit=False,
     )
     if debug:
         os.environ['HLTHPRT_DB_ECHO'] = 'True'
