@@ -1707,15 +1707,8 @@ async def _load_geo_service_rows(
     _print_row_progress("geo_service", row_number, accepted_rows, progress_start, final=True)
 
 
-async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema: str) -> None:
-    """Build procedure code dimensions and observed crosswalk edges."""
-
-    procedure_table = classes["PricingProcedure"].__tablename__
-    code_catalog_table = CodeCatalog.__tablename__
-    code_crosswalk_table = CodeCrosswalk.__tablename__
-
-    await db.status(
-        f"""
+_CODE_AND_CROSSWALK_SQL = (
+    """
         WITH src AS (
             SELECT
                 procedure_code,
@@ -1763,11 +1756,7 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
         """,
-        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
-    )
-
-    await db.status(
-        f"""
+    """
         WITH src AS (
             SELECT
                 procedure_code,
@@ -1810,11 +1799,7 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
         """,
-        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
-    )
-
-    await db.status(
-        f"""
+    """
         WITH src AS (
             SELECT
                 procedure_code,
@@ -1859,11 +1844,7 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
         """,
-        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
-    )
-
-    await db.status(
-        f"""
+    """
         WITH src AS (
             SELECT
                 procedure_code,
@@ -1956,23 +1937,47 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
         """,
+)
+
+
+async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema: str) -> None:
+    """Build procedure code dimensions and observed crosswalk edges."""
+
+    procedure_table = classes["PricingProcedure"].__tablename__
+    code_catalog_table = CodeCatalog.__tablename__
+    code_crosswalk_table = CodeCrosswalk.__tablename__
+
+    sql_identifier_by_name = {
+        "schema": schema,
+        "procedure_table": procedure_table,
+        "code_catalog_table": code_catalog_table,
+        "code_crosswalk_table": code_crosswalk_table,
+        "INTERNAL_CODE_SYSTEM": INTERNAL_CODE_SYSTEM,
+    }
+
+    await db.status(
+        _CODE_AND_CROSSWALK_SQL[0].format(**sql_identifier_by_name),
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
+    )
+
+    await db.status(
+        _CODE_AND_CROSSWALK_SQL[1].format(**sql_identifier_by_name),
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
+    )
+
+    await db.status(
+        _CODE_AND_CROSSWALK_SQL[2].format(**sql_identifier_by_name),
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
+    )
+
+    await db.status(
+        _CODE_AND_CROSSWALK_SQL[3].format(**sql_identifier_by_name),
         source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
     )
 
 
-async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) -> None:
-    """Build provider cost profiles and peer statistics from staged claims."""
-
-    provider_table = classes["PricingProvider"].__tablename__
-    provider_procedure_table = classes["PricingProviderProcedure"].__tablename__
-    provider_cost_profile_table = classes["PricingProviderProcedureCostProfile"].__tablename__
-    procedure_peer_table = classes["PricingProcedurePeerStats"].__tablename__
-
-    await db.status(f"TRUNCATE TABLE {schema}.{provider_cost_profile_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{procedure_peer_table};")
-
-    await db.status(
-        f"""
+_COST_LEVEL_SQL = (
+    """
         WITH base AS (
             SELECT
                 pp.npi,
@@ -2097,12 +2102,8 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
             scoped.geography_value,
             scoped.specialty_key,
             scoped.setting_key;
-        """
-    )
-
-    # Robust peer cutoffs: log-space IQR trimming prevents outlier providers from skewing percentiles.
-    await db.status(
-        f"""
+        """,
+    """
         WITH base AS (
             SELECT
                 c.npi,
@@ -2270,7 +2271,39 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
             p80 = excluded.p80,
             p90 = excluded.p90,
             updated_at = excluded.updated_at;
-        """
+        """,
+)
+
+
+async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) -> None:
+    """Build provider cost profiles and peer statistics from staged claims."""
+
+    provider_table = classes["PricingProvider"].__tablename__
+    provider_procedure_table = classes["PricingProviderProcedure"].__tablename__
+    provider_cost_profile_table = classes["PricingProviderProcedureCostProfile"].__tablename__
+    procedure_peer_table = classes["PricingProcedurePeerStats"].__tablename__
+
+    sql_identifier_by_name = {
+        "schema": schema,
+        "provider_table": provider_table,
+        "provider_procedure_table": provider_procedure_table,
+        "provider_cost_profile_table": provider_cost_profile_table,
+        "procedure_peer_table": procedure_peer_table,
+        "COST_LEVEL_MIN_PEER_CLAIMS": COST_LEVEL_MIN_PEER_CLAIMS,
+        "COST_LEVEL_MIN_PEER_PROVIDERS": COST_LEVEL_MIN_PEER_PROVIDERS,
+        "COST_LEVEL_OUTLIER_IQR_FACTOR": COST_LEVEL_OUTLIER_IQR_FACTOR,
+    }
+
+    await db.status(f"TRUNCATE TABLE {schema}.{provider_cost_profile_table};")
+    await db.status(f"TRUNCATE TABLE {schema}.{procedure_peer_table};")
+
+    await db.status(
+        _COST_LEVEL_SQL[0].format(**sql_identifier_by_name)
+    )
+
+    # Robust peer cutoffs: log-space IQR trimming prevents outlier providers from skewing percentiles.
+    await db.status(
+        _COST_LEVEL_SQL[1].format(**sql_identifier_by_name)
     )
 
 

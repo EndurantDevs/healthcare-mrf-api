@@ -24,6 +24,32 @@ _ATTEMPT_STATUSES = frozenset(
         "unchanged", "failed", "superseded",
     }
 )
+_CMS_V2_ATTESTATION_TEXT = (
+    "To the best of its knowledge and belief, the hospital has included all "
+    "applicable standard charge information in accordance with the requirements "
+    "of 45 CFR 180.50, and the information encoded is true, accurate, and complete "
+    "as of the date indicated."
+)
+_CMS_V3_ATTESTATION_TEXT = (
+    "To the best of its knowledge and belief, this hospital has included all "
+    "applicable standard charge information in accordance with the requirements "
+    "of 45 CFR 180.50, and the information encoded is true, accurate, and complete "
+    "as of the date in the file. This hospital has included all payer-specific "
+    "negotiated charges in dollars that can be expressed as a dollar amount. For "
+    "payer-specific negotiated charges that cannot be expressed as a dollar amount "
+    "in the machine-readable file or not knowable in advance, the hospital attests "
+    "that the payer-specific negotiated charge is based on a contractual algorithm, "
+    "percentage or formula that precludes the provision of a dollar amount and has "
+    "provided all necessary information available to the hospital for the public to "
+    "be able to derive the dollar amount, including, but not limited to, the specific "
+    "fee schedule or components referenced in such percentage, algorithm or formula."
+)
+_DETECTED_SCHEMA_PROFILE_SQL = f"""
+CASE version.attestation_text
+  WHEN '{_CMS_V2_ATTESTATION_TEXT}' THEN 'cms-v2'
+  WHEN '{_CMS_V3_ATTESTATION_TEXT}' THEN 'cms-v3'
+END
+""".strip()
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _SCHEMA) is None:
     raise RuntimeError("hospital price database schema is invalid")
@@ -45,6 +71,7 @@ SELECT hospital.hospital_id,
        current.tax_identity_count,
        version.template_version,
        version.source_format,
+       {_DETECTED_SCHEMA_PROFILE_SQL} AS detected_schema_profile,
        version.last_updated_on
   FROM {_SCHEMA}.hospital_price_hospital AS hospital
   LEFT JOIN {_SCHEMA}.hospital_price_current AS current
@@ -99,6 +126,7 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "version_id": row["version_id"],
         "template_version": row.get("template_version"),
         "source_format": row.get("source_format"),
+        "detected_schema_profile": row.get("detected_schema_profile"),
         "last_updated_on": _timestamp_text(row.get("last_updated_on")),
         "generation": row.get("generation"),
         "last_success_at": _timestamp_text(row.get("last_success_at")),
@@ -175,6 +203,7 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
     }
     count_by_template_version: dict[str, int] = {}
     count_by_source_format: dict[str, int] = {}
+    count_by_detected_schema_profile: dict[str, int] = {}
     for hospital_status in hospital_statuses:
         status = _item_status(hospital_status)
         if status in {"queued", "running", "failed"}:
@@ -191,6 +220,13 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
                 count_by_source_format[source_format] = (
                     count_by_source_format.get(source_format, 0) + 1
                 )
+            detected_profile = hospital_status["publication"].get(
+                "detected_schema_profile"
+            )
+            if isinstance(detected_profile, str) and detected_profile:
+                count_by_detected_schema_profile[detected_profile] = (
+                    count_by_detected_schema_profile.get(detected_profile, 0) + 1
+                )
         else:
             count_by_status["unpublished"] += 1
     return {
@@ -198,6 +234,9 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
         **count_by_status,
         "template_versions": dict(sorted(count_by_template_version.items())),
         "source_formats": dict(sorted(count_by_source_format.items())),
+        "detected_schema_profiles": dict(
+            sorted(count_by_detected_schema_profile.items())
+        ),
     }
 
 

@@ -102,3 +102,26 @@
             "wide CSV payer headers must replace payer and plan placeholders",
         );
     }
+    #[test]
+    fn csv_scans_a_bounded_metadata_preamble() {
+        let payload = fixture_wide_csv();
+        let expected = run_fixture(InputFormat::WideCsv, &payload, false);
+        let mut records = csv_fixture_records(&payload);
+        let mut note = vec![String::new(); records[0].len()];
+        note[0] = "***** END NOTES".to_owned();
+        records.insert(0, note.clone());
+        assert_eq!(
+            expected,
+            run_fixture(InputFormat::WideCsv, &csv_fixture_bytes(&records), false)
+        );
+
+        for _ in 1..CSV_METADATA_HEADER_SCAN_MAX_RECORDS {
+            records.insert(0, note.clone());
+        }
+        assert_import_error(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "metadata header exceeds its scan limit",
+        );
+    }

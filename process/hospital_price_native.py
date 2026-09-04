@@ -41,7 +41,11 @@ HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV = (
 )
 DEFAULT_HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES = 64 * 1024**3
 HOSPITAL_MRF_FORMAT_DETECTION_MAX_BYTES = 64 * 1024**2
+HOSPITAL_MRF_CSV_HEADER_SCAN_MAX_RECORDS = 16
 _CP1252_NBSP_SURROGATE = "\udca0"
+_REQUIRED_CSV_METADATA_HEADERS = frozenset(
+    {"hospital_name", "last_updated_on", "version"}
+)
 
 
 def hospital_price_version_id(content_sha256: str) -> str:
@@ -184,6 +188,27 @@ def _open_payload(path: Path, max_decompressed_bytes: int) -> Iterator[BinaryIO]
             yield bounded
 
 
+def _next_csv_data_headers(structural_rows: Iterator[list[str]]) -> list[str]:
+    try:
+        for _ in range(HOSPITAL_MRF_CSV_HEADER_SCAN_MAX_RECORDS):
+            metadata_headers = next(structural_rows)
+            normalized_headers = {
+                header.replace(_CP1252_NBSP_SURROGATE, " ")
+                .strip()
+                .casefold()
+                for header in metadata_headers
+            }
+            if _REQUIRED_CSV_METADATA_HEADERS <= normalized_headers:
+                next(structural_rows)
+                return [
+                    header.replace(_CP1252_NBSP_SURROGATE, " ").strip()
+                    for header in next(structural_rows)
+                ]
+    except (StopIteration, csv.Error) as exc:
+        raise ValueError("hospital CSV is missing its three header rows") from exc
+    raise ValueError("hospital CSV metadata header exceeds its scan limit")
+
+
 def detect_hospital_mrf_format(
     path: str | Path, max_decompressed_bytes: int | None = None
 ) -> str:
@@ -214,12 +239,7 @@ def detect_hospital_mrf_format(
                 for field in csv_record
             )
         )
-        try:
-            next(structural_rows)
-            next(structural_rows)
-            headers = next(structural_rows)
-        except (StopIteration, csv.Error) as exc:
-            raise ValueError("hospital CSV is missing its three header rows") from exc
+        headers = _next_csv_data_headers(structural_rows)
     normalized_headers = {header.strip().casefold() for header in headers}
     if "payer_name" in normalized_headers:
         return "csv-tall"

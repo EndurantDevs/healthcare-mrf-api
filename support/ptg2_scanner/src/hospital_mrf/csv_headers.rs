@@ -1,3 +1,5 @@
+const CSV_METADATA_HEADER_SCAN_MAX_RECORDS: usize = 16;
+
 fn parse_csv<R: Read>(
     reader: R,
     version_id: &str,
@@ -10,7 +12,7 @@ fn parse_csv<R: Read>(
         .flexible(true)
         .from_reader(reader);
     let mut records = csv_reader.records();
-    let general_headers = next_csv_record(&mut records, "general header row")?;
+    let general_headers = next_csv_metadata_header(&mut records)?;
     let general_values = next_csv_record(&mut records, "general value row")?;
     let data_headers = next_csv_record(&mut records, "data header row")?;
     let (metadata, contract_provisions) =
@@ -35,6 +37,27 @@ fn parse_csv<R: Read>(
         parse_tall_records(records, version_id, &columns, max_fanout_rows, outputs)?;
     }
     Ok(schema_version)
+}
+
+fn next_csv_metadata_header<R: Read>(
+    records: &mut csv::StringRecordsIter<'_, R>,
+) -> io::Result<StringRecord> {
+    for _ in 0..CSV_METADATA_HEADER_SCAN_MAX_RECORDS {
+        let record = next_csv_record(records, "general header row")?;
+        let mut required = [false; 3];
+        for header in record.iter() {
+            match header.trim().to_ascii_lowercase().as_str() {
+                "hospital_name" => required[0] = true,
+                "last_updated_on" => required[1] = true,
+                "version" => required[2] = true,
+                _ => {}
+            }
+        }
+        if required.into_iter().all(|found| found) {
+            return Ok(record);
+        }
+    }
+    Err(invalid("hospital CSV metadata header exceeds its scan limit"))
 }
 
 fn next_csv_record<R: Read>(

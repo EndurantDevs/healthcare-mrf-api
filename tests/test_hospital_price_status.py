@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import sqlite3
 import sys
 import threading
 import types
@@ -60,6 +61,30 @@ def _load_module():
 
 
 status_api = _load_module()
+
+
+@pytest.mark.parametrize(
+    ("attestation_text", "expected_profile"),
+    [
+        (status_api._CMS_V2_ATTESTATION_TEXT, "cms-v2"),
+        (status_api._CMS_V3_ATTESTATION_TEXT, "cms-v3"),
+        (status_api._CMS_V3_ATTESTATION_TEXT + " malformed", None),
+    ],
+)
+def test_detected_schema_profile_sql_requires_exact_attestation(
+    attestation_text, expected_profile
+):
+    connection = sqlite3.connect(":memory:")
+    try:
+        detected_profile = connection.execute(
+            f"SELECT {status_api._DETECTED_SCHEMA_PROFILE_SQL} "
+            "FROM (SELECT ? AS attestation_text) AS version",
+            (attestation_text,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert detected_profile == expected_profile
 
 
 def test_invalid_schema_fails_at_module_load(monkeypatch):
@@ -131,6 +156,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
             "tax_identity_count": 1,
             "template_version": "3.0.0",
             "source_format": "json",
+            "detected_schema_profile": "cms-v3",
             "last_updated_on": dt.date(2026, 8, 23),
         },
         {
@@ -160,6 +186,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
         "unpublished": 2,
         "template_versions": {"3.0.0": 1},
         "source_formats": {"json": 1},
+        "detected_schema_profiles": {"cms-v3": 1},
     }
 
 
@@ -189,6 +216,7 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
             "last_success_at": dt.datetime(2026, 8, 24, tzinfo=dt.UTC),
             "template_version": "2",
             "source_format": "csv-wide",
+            "detected_schema_profile": "cms-v2",
         },
         {
             "hospital_id": "hospital-000002",
@@ -209,8 +237,10 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
     assert page["items"][0]["publication"]["generation"] == 1
     assert page["items"][0]["publication"]["template_version"] == "2"
     assert page["items"][0]["publication"]["source_format"] == "csv-wide"
+    assert page["items"][0]["publication"]["detected_schema_profile"] == "cms-v2"
     assert page["summary"]["template_versions"] == {"2": 1}
     assert page["summary"]["source_formats"] == {"csv-wide": 1}
+    assert page["summary"]["detected_schema_profiles"] == {"cms-v2": 1}
     assert page["summary"]["total"] == 1
 
 

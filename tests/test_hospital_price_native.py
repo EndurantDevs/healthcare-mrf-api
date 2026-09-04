@@ -34,7 +34,7 @@ _acquisition_module = acquisition_module
 
 def _csv(headers):
     return (
-        "hospital_name,version\nExample,3.0.0\n"
+        "hospital_name,last_updated_on,version\nExample,2026-08-25,3.0.0\n"
         + ",".join(headers)
         + "\n"
     ).encode()

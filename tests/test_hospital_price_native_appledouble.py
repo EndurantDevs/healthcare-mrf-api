@@ -10,7 +10,8 @@ from process import hospital_price_native as native
 
 def _tall_csv() -> bytes:
     return (
-        b"hospital_name,version\nExample,3.0.0\n"
+        b"hospital_name,last_updated_on,version\n"
+        b"Example,2026-08-25,3.0.0\n"
         b"description,payer_name\n"
     )
 
