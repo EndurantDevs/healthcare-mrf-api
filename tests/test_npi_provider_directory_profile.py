@@ -207,43 +207,43 @@ def test_npi_cache_key_tracks_profile_generation_and_visibility():
         "lookup_stored_geocode": False,
     }
 
-    first_generation = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    def cache_key(**overrides):
+        return npi_module._npi_detail_cache_key(
+            npi_module._NpiDetailCacheIdentity(
+                **(common_options_by_name | overrides)
+            )
+        )
+
+    first_generation = cache_key(
         include_profile=True,
         profile_generation="generation_1",
     )
-    second_generation = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    second_generation = cache_key(
         include_profile=True,
         profile_generation="generation_2",
     )
-    profile_disabled = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    profile_disabled = cache_key(
         include_profile=False,
         profile_generation=None,
     )
-    first_overlay = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    first_overlay = cache_key(
         include_profile=False,
         profile_generation=None,
         address_overlay_serving_identity="oid:101",
     )
-    second_overlay = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    second_overlay = cache_key(
         include_profile=False,
         profile_generation=None,
         address_overlay_serving_identity="oid:202",
     )
-    fallback_generation = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    fallback_generation = cache_key(
         include_profile=True,
         profile_generation="generation_1",
         profile_serving_identity=(
             "fallback:generation_1:2026-07-13T20:00:00Z:101"
         ),
     )
-    adopted_generation = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
+    adopted_generation = cache_key(
         include_profile=True,
         profile_generation="generation_1",
         profile_serving_identity=(

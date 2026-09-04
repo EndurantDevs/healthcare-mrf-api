@@ -319,8 +319,7 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         return source_entries
 
     async def fake_load_source_item(**kwargs):
-        assert kwargs["test_mode"] is True
-        assert kwargs["test_row_limit"] == 10
+        assert kwargs["settings"].row_limit == 10
         concurrency_by_metric["active"] += 1
         concurrency_by_metric["max_active"] = max(
             concurrency_by_metric["max_active"],

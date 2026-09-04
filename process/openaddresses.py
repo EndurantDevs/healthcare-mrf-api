@@ -99,6 +99,17 @@ class _RecordBatch:
     rejection_counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class _FileLoadSettings:
+    stage_cls: Any
+    batch_size: int
+    recovery_cls: Any = None
+    row_limit: int | None = None
+    restore_shards: int = 1
+    ctx: dict[str, Any] | None = None
+    task: dict[str, Any] | None = None
+
+
 @dataclass
 class _LoadProgress:
     processed_files: int = 0
@@ -1265,19 +1276,13 @@ def _emit_backfill_progress(
 async def _load_file(
     path: Path,
     *,
-    stage_cls,
-    recovery_cls=None,
-    batch_size: int,
+    settings: _FileLoadSettings,
     source_name: str | None = None,
     data_id: int | None = None,
     job_id: int | None = None,
     updated: Any = None,
-    row_limit: int | None = None,
-    restore_shards: int = 1,
-    ctx: dict[str, Any] | None = None,
-    task: dict[str, Any] | None = None,
 ) -> tuple[int, int, int, dict[str, int]]:
-    await _maybe_raise_if_cancelled(ctx, task)
+    await _maybe_raise_if_cancelled(settings.ctx, settings.task)
     accepted = 0
     zip_recovery = 0
     processed = 0
@@ -1285,13 +1290,13 @@ async def _load_file(
     batch_iter = iter(
         _iter_record_batches(
             path,
-            batch_size=batch_size,
+            batch_size=settings.batch_size,
             source_name=source_name,
             data_id=data_id,
             job_id=job_id,
             updated=updated,
-            row_limit=row_limit,
-            restore_shards=restore_shards,
+            row_limit=settings.row_limit,
+            restore_shards=settings.restore_shards,
         )
     )
     while True:
@@ -1299,31 +1304,27 @@ async def _load_file(
         if batch is None:
             break
         processed = batch.processed
-        accepted += await _flush_rows(batch.rows, stage_cls)
-        if recovery_cls is not None:
-            zip_recovery += await _flush_zip_recovery_rows(batch.zip_recovery_rows, recovery_cls)
+        accepted += await _flush_rows(batch.rows, settings.stage_cls)
+        if settings.recovery_cls is not None:
+            zip_recovery += await _flush_zip_recovery_rows(
+                batch.zip_recovery_rows,
+                settings.recovery_cls,
+            )
         for reason, count in batch.rejection_counts.items():
             rejection_counts_by_reason[reason] = (
                 rejection_counts_by_reason.get(reason, 0) + count
             )
-        await _maybe_raise_if_cancelled(ctx, task)
+        await _maybe_raise_if_cancelled(settings.ctx, settings.task)
     return processed, accepted, zip_recovery, rejection_counts_by_reason
 
 
 async def _load_source_item(
     *,
-    ctx: dict[str, Any],
-    task: dict[str, Any],
     client: aiohttp.ClientSession,
     source_item: dict[str, Any],
     tmpdir_path: Path,
     token: str,
-    stage_cls,
-    recovery_cls,
-    batch_size: int,
-    test_mode: bool,
-    test_row_limit: int,
-    restore_shards: int,
+    settings: _FileLoadSettings,
 ) -> tuple[str, int, int, int, dict[str, int]]:
     job_id = int(source_item["job"])
     data_id = int(source_item["id"])
@@ -1331,20 +1332,21 @@ async def _load_source_item(
     url = f"{OPENADDRESSES_API_BASE}/job/{job_id}/output/source.geojson.gz"
     path = tmpdir_path / f"openaddresses-{data_id}-{job_id}.geojson.gz"
     logger.info("Downloading OpenAddresses source=%s job=%s", source_name, job_id)
-    await _download_file(client, url, path, token, ctx=ctx, task=task)
+    await _download_file(
+        client,
+        url,
+        path,
+        token,
+        ctx=settings.ctx,
+        task=settings.task,
+    )
     file_processed, file_accepted, file_zip_recovery, rejection_counts = await _load_file(
         path,
-        stage_cls=stage_cls,
-        recovery_cls=recovery_cls,
-        batch_size=batch_size,
+        settings=settings,
         source_name=source_name,
         data_id=data_id,
         job_id=job_id,
         updated=source_item.get("updated"),
-        row_limit=test_row_limit if test_mode else None,
-        restore_shards=restore_shards,
-        ctx=ctx,
-        task=task,
     )
     path.unlink(missing_ok=True)
     return (
@@ -1394,6 +1396,15 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
     )
     ctx["context"]["zip_restore_concurrency"] = zip_restore_concurrency
     ctx["context"]["zip_restore_shards"] = restore_shards
+    file_load_settings = _FileLoadSettings(
+        stage_cls=stage_cls,
+        recovery_cls=recovery_cls,
+        batch_size=batch_size,
+        row_limit=test_row_limit if test_mode else None,
+        restore_shards=restore_shards,
+        ctx=ctx,
+        task=task,
+    )
 
     load_progress = _LoadProgress()
     progress_run_id = _progress_run_id(ctx, task)
@@ -1428,14 +1439,8 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                         raise FileNotFoundError(f"OpenAddresses local file not found: {path}")
                     file_processed, file_accepted, file_zip_recovery, file_rejection_counts = await _load_file(
                         path,
-                        stage_cls=stage_cls,
-                        recovery_cls=recovery_cls,
-                        batch_size=batch_size,
+                        settings=file_load_settings,
                         source_name="local/openaddresses",
-                        row_limit=test_row_limit if test_mode else None,
-                        restore_shards=restore_shards,
-                        ctx=ctx,
-                        task=task,
                     )
                     async with progress_lock:
                         await _maybe_raise_if_cancelled(ctx, task)
@@ -1572,18 +1577,11 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                             file_zip_recovery,
                             file_rejection_counts,
                         ) = await _load_source_item(
-                            ctx=ctx,
-                            task=task,
                             client=client,
                             source_item=source_item,
                             tmpdir_path=tmpdir_path,
                             token=token,
-                            stage_cls=stage_cls,
-                            recovery_cls=recovery_cls,
-                            batch_size=batch_size,
-                            test_mode=test_mode,
-                            test_row_limit=test_row_limit,
-                            restore_shards=restore_shards,
+                            settings=file_load_settings,
                         )
                         async with progress_lock:
                             await _maybe_raise_if_cancelled(ctx, task)

@@ -1193,45 +1193,47 @@ ADDRESS_GROUPING_PREMISE = "premise"
 ADDRESS_GROUPING_VALUES = {ADDRESS_GROUPING_FLAT, ADDRESS_GROUPING_PREMISE}
 
 
-def _npi_detail_cache_key(
-    npi: int,
-    *,
-    view: str,
-    include_chain: bool,
-    extra_info: bool,
-    sync_geocode: bool,
-    lookup_stored_geocode: bool,
-    include_sources: bool = False,
-    include_evidence: bool = False,
-    include_profile: bool = True,
-    profile_generation: str | None = None,
-    profile_serving_identity: str | None = None,
-    address_overlay_serving_identity: str | None = None,
-    canonical_publication_identity: str | None = None,
-    address_limit: int | None = None,
-    address_offset: int = 0,
-    include_address_total: bool = True,
-    address_key: str | None = None,
-    address_site_key: str | None = None,
-    address_grouping: str = ADDRESS_GROUPING_FLAT,
-) -> str:
+@dataclass(frozen=True)
+class _NpiDetailCacheIdentity:
+    npi: int
+    view: str
+    include_chain: bool
+    extra_info: bool
+    sync_geocode: bool
+    lookup_stored_geocode: bool
+    include_sources: bool = False
+    include_evidence: bool = False
+    include_profile: bool = True
+    profile_generation: str | None = None
+    profile_serving_identity: str | None = None
+    address_overlay_serving_identity: str | None = None
+    canonical_publication_identity: str | None = None
+    address_limit: int | None = None
+    address_offset: int = 0
+    include_address_total: bool = True
+    address_key: str | None = None
+    address_site_key: str | None = None
+    address_grouping: str = ADDRESS_GROUPING_FLAT
+
+
+def _npi_detail_cache_key(identity: _NpiDetailCacheIdentity) -> str:
     schema = _runtime_db_schema()
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
     return (
-        f"{schema}|{address_source}|{int(npi)}|{view}|"
-        f"{'chain' if include_chain else 'default'}|"
-        f"extra:{int(extra_info)}|"
-        f"{'sync_geo' if sync_geocode else 'stored_geo'}|"
-        f"{'archive_geo' if lookup_stored_geocode else 'no_archive_geo'}|"
-        f"sources:{int(include_sources)}|evidence:{int(include_evidence)}|"
-        f"profile:{int(include_profile)}|pgen:{profile_generation or 'none'}|"
-        f"pserve:{profile_serving_identity or 'unknown'}|"
-        f"pdaddr:{address_overlay_serving_identity or 'unknown'}|"
-        f"npipub:{canonical_publication_identity or 'untracked'}|"
-        f"alim:{address_limit if address_limit is not None else 'all'}|"
-        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
-        f"akey:{address_key or 'none'}|"
-        f"askey:{address_site_key or 'none'}|agroup:{address_grouping}"
+        f"{schema}|{address_source}|{int(identity.npi)}|{identity.view}|"
+        f"{'chain' if identity.include_chain else 'default'}|"
+        f"extra:{int(identity.extra_info)}|"
+        f"{'sync_geo' if identity.sync_geocode else 'stored_geo'}|"
+        f"{'archive_geo' if identity.lookup_stored_geocode else 'no_archive_geo'}|"
+        f"sources:{int(identity.include_sources)}|evidence:{int(identity.include_evidence)}|"
+        f"profile:{int(identity.include_profile)}|pgen:{identity.profile_generation or 'none'}|"
+        f"pserve:{identity.profile_serving_identity or 'unknown'}|"
+        f"pdaddr:{identity.address_overlay_serving_identity or 'unknown'}|"
+        f"npipub:{identity.canonical_publication_identity or 'untracked'}|"
+        f"alim:{identity.address_limit if identity.address_limit is not None else 'all'}|"
+        f"aoff:{int(identity.address_offset or 0)}|atotal:{int(identity.include_address_total)}|"
+        f"akey:{identity.address_key or 'none'}|"
+        f"askey:{identity.address_site_key or 'none'}|agroup:{identity.address_grouping}"
     )
 
 
@@ -12512,35 +12514,35 @@ async def get_npi(request, npi):
                 exc,
             )
     cache_key = _npi_detail_cache_key(
-        npi,
-        view=provider_enrichment_view,
-        include_chain=include_chain_enrichment,
-        extra_info=include_extra_info,
-        sync_geocode=should_sync_geocode,
-        lookup_stored_geocode=should_lookup_stored_geocode,
-        include_sources=include_sources,
-        include_evidence=include_evidence,
-        include_profile=include_profile,
-        profile_generation=(
-            str(profile_record["profile"].get("generation_id"))
-            if profile_record and isinstance(profile_record.get("profile"), Mapping)
-            else None
-        ),
-        profile_serving_identity=(
-            str(profile_record.get("_serving_identity"))
-            if profile_record and profile_record.get("_serving_identity")
-            else None
-        ),
-        address_overlay_serving_identity=(
-            address_overlay_serving_identity
-        ),
-        canonical_publication_identity=canonical_publication_identity,
-        address_limit=address_limit,
-        address_offset=address_offset,
-        include_address_total=include_address_total,
-        address_key=address_key,
-        address_site_key=address_site_key,
-        address_grouping=address_grouping,
+        _NpiDetailCacheIdentity(
+            npi=npi,
+            view=provider_enrichment_view,
+            include_chain=include_chain_enrichment,
+            extra_info=include_extra_info,
+            sync_geocode=should_sync_geocode,
+            lookup_stored_geocode=should_lookup_stored_geocode,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            include_profile=include_profile,
+            profile_generation=(
+                str(profile_record["profile"].get("generation_id"))
+                if profile_record and isinstance(profile_record.get("profile"), Mapping)
+                else None
+            ),
+            profile_serving_identity=(
+                str(profile_record.get("_serving_identity"))
+                if profile_record and profile_record.get("_serving_identity")
+                else None
+            ),
+            address_overlay_serving_identity=address_overlay_serving_identity,
+            canonical_publication_identity=canonical_publication_identity,
+            address_limit=address_limit,
+            address_offset=address_offset,
+            include_address_total=include_address_total,
+            address_key=address_key,
+            address_site_key=address_site_key,
+            address_grouping=address_grouping,
+        )
     )
     if is_response_cache_enabled:
         cached_body = _npi_detail_response_cache_get(cache_key)
