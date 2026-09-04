@@ -41,6 +41,7 @@ _PROVENANCE_FIELDS = (
     "record_version_id",
     "retrieved_at",
 )
+_CANONICAL_PROVENANCE_FIELDS = ("source_id", *_PROVENANCE_FIELDS)
 
 
 async def _next_provider_npis(session: Any, after_npi: int) -> list[int]:
@@ -237,6 +238,24 @@ def _validated_state_address(
         raise ValueError("pricing projection provider-state address is inconsistent")
 
 
+def _canonical_state_address(address: Mapping[str, Any]) -> dict[str, Any]:
+    provenance_entries = [
+        {field_name: entry[field_name] for field_name in _CANONICAL_PROVENANCE_FIELDS}
+        for entry in address["address_provenance"]
+    ]
+    admitted_source_id = _EVIDENCE_SOURCE_ID[str(address["geo_evidence_level"])]
+    canonical_address_by_field = dict(address)
+    canonical_address_by_field["address_provenance"] = provenance_entries
+    canonical_address_by_field["source_record_ids"] = sorted(
+        {
+            str(entry["source_record_id"]).strip()
+            for entry in provenance_entries
+            if _source_id(entry["source_id"]) == admitted_source_id
+        }
+    )
+    return canonical_address_by_field
+
+
 def _provider_state_fragment(
     provider_by_field: Mapping[str, Any],
     taxonomy_codes: tuple[str, ...],
@@ -247,6 +266,7 @@ def _provider_state_fragment(
     if state is None:
         raise ValueError("pricing projection provider-state code is missing")
     _validated_state_address(provider_by_field, address_payload, npi, state)
+    address_payload = _canonical_state_address(address_payload)
     fragment = orjson.dumps(
         {
             "version": PROVIDER_STATE_FRAGMENT_VERSION,
