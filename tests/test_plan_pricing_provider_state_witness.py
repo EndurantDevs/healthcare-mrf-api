@@ -122,7 +122,8 @@ async def test_provider_projection_keeps_each_zip_and_one_state_witness(
     assert hydrate_provenance.await_args.args[1] == [provider_rows[0]]
     assert hydrate_provenance.await_args.kwargs == {
         "include_response_evidence": True,
-        "use_stored_only": True,
+        "use_stored_only": False,
+        "backfill_admitted_source_record_ids": True,
     }
     assert session.statements[0][1]["provider_row_limit"] == (
         projection_source.MAX_PROVIDER_ROWS_PER_BATCH + 1
@@ -139,6 +140,18 @@ async def test_provider_state_provenance_hydration_boundaries(monkeypatch) -> No
     )
     hydrate_provenance.assert_not_awaited()
 
+    with pytest.raises(ValueError, match="provenance is incomplete"):
+        await projection_source._hydrate_state_address_provenance(
+            object(), [_state_provider("48104", 1)]
+        )
+
+    async def drop_unproven_rows(_session, rows, **_kwargs):
+        rows.clear()
+        return "available"
+
+    monkeypatch.setattr(
+        serving, "_hydrate_address_provenance", drop_unproven_rows
+    )
     with pytest.raises(ValueError, match="provenance is incomplete"):
         await projection_source._hydrate_state_address_provenance(
             object(), [_state_provider("48104", 1)]
@@ -226,6 +239,65 @@ def test_v4_provider_state_witness_round_trips_nullable_address_identity(
     assert hydrated["address_payload"]["location_confidence_id"] == 0
     assert hydrated["address_payload"]["geo_evidence_level"] == "nppes_registry_address"
     assert hydrated["address_payload"]["address_provenance"]
+
+
+def test_v4_provider_state_witness_backfills_compact_source_record_ids() -> None:
+    provider = _state_provider("48104", 1)
+    address = orjson.loads(provider["address_payload"])
+    address["source_record_ids"] = []
+    provider["address_payload"] = orjson.dumps(address).decode()
+
+    provider["_geo_evidence_level"] = "nppes_registry_address"
+    provider["_geo_evidence_source_id"] = 1
+    serving._apply_address_provenance(
+        [provider],
+        {
+            address["location_key"]: [
+                address["address_provenance"][0],
+                {
+                    **address["address_provenance"][0],
+                    "source_id": 3,
+                    "source_record_id": "cms-record",
+                },
+                {
+                    **address["address_provenance"][0],
+                    "source_record_id": "z-record",
+                },
+                {
+                    **address["address_provenance"][0],
+                    "source_record_id": "z-record",
+                },
+            ]
+        },
+        backfill_admitted_source_record_ids=True,
+    )
+
+    rows = provider_cells._provider_cell_rows(
+        PROJECTION_ID,
+        _BuildState(hashlib.sha256()),
+        [NPI],
+        {NPI: [provider]},
+    )
+
+    state_fragment = next(row["state_fragment"] for row in rows if row["state_fragment"])
+    assert orjson.loads(state_fragment)["provider"]["address_payload"][
+        "source_record_ids"
+    ] == ["record-48104", "z-record"]
+
+    preserved = _state_provider("48104", 1)
+    preserved_address = orjson.loads(preserved["address_payload"])
+    preserved_address["source_record_ids"] = ["frozen-record"]
+    preserved["address_payload"] = orjson.dumps(preserved_address).decode()
+    preserved["_geo_evidence_level"] = "nppes_registry_address"
+    preserved["_geo_evidence_source_id"] = 1
+    serving._apply_address_provenance(
+        [preserved],
+        {address["location_key"]: [address["address_provenance"][0]]},
+        backfill_admitted_source_record_ids=True,
+    )
+    assert orjson.loads(preserved["address_payload"])["source_record_ids"] == [
+        "frozen-record"
+    ]
 
 
 def test_v4_provider_state_witness_fails_closed(monkeypatch) -> None:

@@ -11453,6 +11453,7 @@ def _apply_address_provenance(
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]],
     *,
     include_response_evidence: bool = True,
+    backfill_admitted_source_record_ids: bool = False,
 ) -> None:
     """Validate every address and optionally expose its source lineage."""
 
@@ -11489,6 +11490,18 @@ def _apply_address_provenance(
             _redact_unproven_location_address(location_row)
             retained_location_rows.append(location_row)
             continue
+        if (
+            backfill_admitted_source_record_ids
+            and address_payload.get("source_record_ids") == []
+        ):
+            address_payload["source_record_ids"] = sorted(
+                {
+                    str(entry["source_record_id"]).strip()
+                    for entry in provenance_entries
+                    if _coerce_int_payload(entry.get("source_id"))
+                    == admitted_source_id
+                }
+            )
         if include_response_evidence:
             address_payload["address_provenance"] = provenance_entries
         if evidence_level and include_response_evidence:
@@ -11504,6 +11517,7 @@ async def _hydrate_address_provenance(
     *,
     include_response_evidence: bool = True,
     use_stored_only: bool = False,
+    backfill_admitted_source_record_ids: bool = False,
 ) -> str:
     """Validate selected unified addresses with one set-based lineage query."""
 
@@ -11530,6 +11544,7 @@ async def _hydrate_address_provenance(
         location_rows,
         provenance_by_location_key,
         include_response_evidence=include_response_evidence,
+        backfill_admitted_source_record_ids=backfill_admitted_source_record_ids,
     )
     return "available"
 

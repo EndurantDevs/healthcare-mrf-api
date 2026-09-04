@@ -332,7 +332,8 @@ async def _hydrate_state_address_provenance(
         session,
         witness_rows,
         include_response_evidence=True,
-        use_stored_only=True,
+        use_stored_only=False,
+        backfill_admitted_source_record_ids=True,
     )
     if status != "available" or len(witness_rows) != expected_count:
         raise ValueError("pricing projection provider-state provenance is incomplete")
