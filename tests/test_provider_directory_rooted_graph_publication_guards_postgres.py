@@ -38,6 +38,22 @@ EXACT_GUARD_SCOPE_MIGRATION_PATH = (
 )
 
 
+async def _make_exact_validity_fail(context) -> None:
+    await context.connection.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION
+            {context.schema}.provider_directory_uhc_flex_practitioner_dataset_valid(
+                candidate_dataset_id text
+            )
+        RETURNS boolean LANGUAGE plpgsql AS $function$
+        BEGIN
+            RAISE EXCEPTION 'exact validity called';
+        END;
+        $function$;
+        """
+    )
+
+
 @pytest.mark.parametrize("first_relation", (ROOTED_RELATION, LEGACY_RELATION))
 @pytest.mark.asyncio
 async def test_logical_current_guard_serializes_direct_cross_endpoint_race(
@@ -77,19 +93,7 @@ async def test_logical_current_guard_skips_unrelated_parent_rows(
             "provider_directory_exact_guard_scope_postgres",
         )
         await run_migration(context.engine, migration, "upgrade")
-        await context.connection.execute(
-            f"""
-            CREATE OR REPLACE FUNCTION
-                {context.schema}.provider_directory_uhc_flex_practitioner_dataset_valid(
-                    candidate_dataset_id text
-                )
-            RETURNS boolean LANGUAGE plpgsql AS $function$
-            BEGIN
-                RAISE EXCEPTION 'exact validity called';
-            END;
-            $function$;
-            """
-        )
+        await _make_exact_validity_fail(context)
 
         unrelated_endpoint_id = "f" * 64
         await context.connection.execute(
