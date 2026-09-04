@@ -53,6 +53,33 @@ async def _lock_snapshot_layout(
     return _row_mapping(binding_rows[0])
 
 
+async def _lock_expected_layout(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+) -> dict[str, Any]:
+    """Lock the manifest-selected layout when logical binding never completed."""
+
+    layout_query_result = await session.execute(
+        text(
+            f"""
+            SELECT layout.snapshot_key, layout.generation, layout.state
+              FROM {_quote_ident(schema)}.ptg2_v3_snapshot_layout AS layout
+             WHERE layout.snapshot_key = :snapshot_key
+             FOR UPDATE OF layout
+            """
+        ),
+        {"snapshot_key": snapshot_key},
+    )
+    layout_rows = layout_query_result.all()
+    if not layout_rows:
+        return {}
+    if len(layout_rows) != 1:
+        raise RuntimeError("snapshot manifest resolved multiple shared layouts")
+    return _row_mapping(layout_rows[0])
+
+
 async def _require_complete_v4_root(
     session: Any,
     *,
@@ -107,9 +134,15 @@ async def bound_shared_layout_keys(
         snapshot_id=snapshot_id,
     )
     if not layout_by_field:
-        if allow_missing_binding:
+        if not allow_missing_binding:
+            raise ValueError("snapshot is missing its shared layout binding")
+        layout_by_field = await _lock_expected_layout(
+            session,
+            schema=schema,
+            snapshot_key=expected_layout_key,
+        )
+        if not layout_by_field:
             return ()
-        raise ValueError("snapshot is missing its shared layout binding")
     snapshot_key = int(layout_by_field.get("snapshot_key"))
     layout_generation = str(
         layout_by_field.get("generation") or ""

@@ -225,11 +225,10 @@ async def _release_removed_snapshot_layout(
     *,
     schema: str,
     layout_keys: tuple[int, ...],
-    deleted_binding_count: int,
 ) -> Any | None:
     """Release a shared layout only after its final binding disappears."""
 
-    if deleted_binding_count <= 0 or not layout_keys:
+    if not layout_keys:
         return None
     return await release_unbound_ptg2_shared_layouts(
         schema_name=schema,
@@ -288,9 +287,6 @@ async def remove_ptg2_source_snapshot(
             session,
             schema=schema,
             layout_keys=layout_keys,
-            deleted_binding_count=deletion_counts[
-                "deleted_v3_snapshot_bindings"
-            ],
         )
     return _executed_snapshot_remove_plan(
         plan=plan,
