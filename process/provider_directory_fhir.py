@@ -6392,8 +6392,11 @@ def _michigan_provider_directory_override(
             "provider_directory_supported_resources": supported_resources,
             "provider_directory_expected_nonempty_resources": supported_resources,
             "provider_directory_resource_page_count_caps": {
-                resource_type: 25 if resource_type == "PractitionerRole" else 100
-                for resource_type in supported_resources
+                "Location": 100,
+                "Organization": 100,
+                "OrganizationAffiliation": 100,
+                "Practitioner": 10,
+                "PractitionerRole": 25,
             },
             "provider_directory_fully_enumerable_resources": supported_resources,
             "provider_directory_coverage_mode": "full",
