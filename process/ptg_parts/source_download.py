@@ -123,7 +123,15 @@ _SingleGetResult = tuple[
 _GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES"
 _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
-DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
+DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset(
+    {
+        "api.midlandschoice.com",
+        "franciscanchildrens.org",
+        "franciscans.childrenshospital.org",
+        "www.alamedahealthsystem.org",
+        "www.hhcsinc.org",
+    }
+)
 _CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
 _ARTIFACT_FILENAME_QUERY_KEYS = frozenset({"file", "filename", "file_name", "name"})
 _HTTP_USER_AGENT = "HealthPorta-MRF/1.0"

@@ -142,7 +142,15 @@ MRF_URL_OBSERVATION_NULLABLE_KEYS = (
     "metadata_json",
 )
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
-DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
+DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset(
+    {
+        "api.midlandschoice.com",
+        "franciscanchildrens.org",
+        "franciscans.childrenshospital.org",
+        "www.alamedahealthsystem.org",
+        "www.hhcsinc.org",
+    }
+)
 DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "sapphire",
     "aetna_health1",

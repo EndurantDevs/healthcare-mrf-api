@@ -877,6 +877,13 @@ def test_discovery_tls_override_is_host_scoped(monkeypatch):
     assert discovery._request_ssl_kwargs("https://api.midlandschoice.com/mrf") == {
         "ssl": False
     }
+    for host in (
+        "www.alamedahealthsystem.org",
+        "franciscanchildrens.org",
+        "franciscans.childrenshospital.org",
+        "www.hhcsinc.org",
+    ):
+        assert discovery._request_ssl_kwargs(f"https://{host}/mrf") == {"ssl": False}
     assert discovery._request_ssl_kwargs("https://example.com/mrf") == {}
 
     monkeypatch.setenv(discovery.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, "example.com")
