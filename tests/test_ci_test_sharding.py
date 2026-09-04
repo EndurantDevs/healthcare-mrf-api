@@ -37,7 +37,7 @@ def test_two_shards_are_sorted_disjoint_and_exact_once() -> None:
 
 
 def test_collection_command_has_the_hard_test_process_limit() -> None:
-    command = SHARDER.pytest_collection_command(["--ignore", "tests/capacity.py"])
+    command = SHARDER.collection_command(["--ignore", "tests/capacity.py"])
 
     assert command[:3] == ["timeout", "--foreground", "295s"]
     assert command[3:7] == [sys.executable, "-m", "pytest", "--collect-only"]
@@ -75,18 +75,17 @@ def test_slow_envelope_suites_run_once_across_the_parallel_main_lanes() -> None:
     assert "capacity_test_paths+=$'\\n'\"$envelope_test_paths\"" in prepush
     assert 'collection_args+=(--ignore "$test_path")' in python_main
     assert 'mapfile -t envelope_tests <<< "$envelope_test_paths"' in python_main
-    assert python_main.count("python scripts/ci/shard_pytest_nodeids.py") == 2
+    assert "python scripts/ci/shard_pytest_nodeids.py" not in python_main
+    assert python_main.count(
+        '-p scripts.ci.shard_pytest_nodeids --ci-shard-count 4 --ci-shard-index "$shard"'
+    ) == 2
     assert '"${#envelope_tests[@]}" -eq 4' in python_main
-    assert (
-        'local envelope_shard_file="${RUNNER_TEMP:-/tmp}/'
-        'python-envelope-shard-${shard}.txt"' in python_main
-    )
-    assert '-- "${envelope_tests[@]}"' in python_main
-    assert python_main.count('@"$envelope_shard_file"') == 1
+    assert python_main.count('    "${collection_args[@]}"') == 1
+    assert python_main.count('    "${envelope_tests[@]}"') == 1
     assert python_main.count("--cov-append") == 1
     assert python_main.count("python -m pytest -q -n 4 --dist worksteal") == 1
     assert python_main.count("export COVERAGE_FILE=") == 1
-    assert python_main.index('@"$envelope_shard_file"') < python_main.index(
+    assert python_main.index('    "${envelope_tests[@]}"') < python_main.index(
         "write-shard-provenance"
     )
     assert 'mapfile -t capacity_tests <<< "$base_capacity_test_paths"' in capacity
@@ -254,8 +253,8 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     )
 
     assert "shard-index: [0, 1, 2, 3]" in workflow
-    assert "--shard-count 4" in prepush
-    assert "scripts/ci/shard_pytest_nodeids.py" in prepush
+    assert "--ci-shard-count 4" in prepush
+    assert "scripts.ci.shard_pytest_nodeids" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
     workflow_jobs = yaml.safe_load(workflow)["jobs"]
