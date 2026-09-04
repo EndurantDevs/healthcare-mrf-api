@@ -32041,15 +32041,26 @@ mod tests {
         )
         .is_err());
 
-        let mut conflicting_entry = entry.clone();
-        conflicting_entry
+        let mut split_entry = entry.clone();
+        split_entry
             .quarantined_npi_text
             .push("1447744750`".to_string());
-        assert!(merge_provider_maps_pairwise(vec![
+        let mut split_map = merge_provider_maps_pairwise(vec![
             (0, HashMap::from([(key.clone(), entry)])),
-            (1, HashMap::from([(key, conflicting_entry)])),
+            (1, HashMap::from([(key.clone(), split_entry)])),
         ])
-        .is_err());
+        .unwrap();
+        let split_dedupe = SharedDedupe::new(1);
+        record_and_clear_provider_identifier_quarantine(&mut split_map, &split_dedupe).unwrap();
+        let split_quarantine = split_dedupe
+            .provider_identifier_quarantine()
+            .unwrap()
+            .payload()
+            .unwrap();
+        assert_eq!(split_quarantine["occurrence_count"], 5);
+        assert_eq!(split_quarantine["distinct_value_count"], 2);
+        assert!(split_map[&key].quarantined_npi.is_empty());
+        assert!(split_map[&key].quarantined_npi_text.is_empty());
     }
 
     #[test]
