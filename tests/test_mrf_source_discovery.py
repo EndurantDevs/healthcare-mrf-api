@@ -4799,6 +4799,211 @@ async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
+    tmp_path, monkeypatch
+):
+    landing_url = (
+        "https://www.bcbsnc.com/policies-best-practices/machine-readable-files"
+    )
+    endpoint = (
+        "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
+    )
+    toc_url = (
+        "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/aso/"
+        "2026-09-01_123456789_example-employer_index.json"
+    )
+    observed = {}
+    response_payload = {
+        "totalHits": 1,
+        "keyMatches": [],
+        "results": [
+            {
+                "id": "synthetic-result",
+                "meta": {
+                    "groupname": "Example Employer",
+                    "title": "Example Employer 123456789",
+                    "url": toc_url,
+                },
+            }
+        ],
+    }
+
+    async def fake_post_text(url, payload, **kwargs):
+        observed.update(url=url, payload=json.loads(payload), kwargs=kwargs)
+        return json.dumps(response_payload)
+
+    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
+    assert discovery.classify_hosting_platform(landing_url) == (
+        "bcbsnc_aso_employer_search"
+    )
+    private_context_path = tmp_path / "private-context.csv"
+    private_context_path.write_text(
+        "company_name,ein,medical_carriers,medical_lookup_types\n"
+        "Example Employer,12-3456789,BCBS North Carolina,employer_ein\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_context_path)
+    )
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+    [source_candidate] = [
+        candidate
+        for candidate in candidates
+        if candidate.index_url == landing_url
+        and candidate.raw_payload.get("private_query_context")
+    ]
+    _, source_dict = discovery._candidate_to_rows(
+        source_candidate, discovery._utc_now()
+    )
+    assert source_dict is not None
+    assert await discovery._crawl_targets_for_source(
+        {**source_dict, "metadata_json": {}}, landing_url, None
+    ) == []
+    assert observed == {}
+    for invalid_ein in (
+        "123",
+        "abc123456789",
+        "１２-３４５６７８９",
+        "12-3456789*",
+        "<b>12-3456789</b>",
+        "12-3456789\u2003",
+    ):
+        with pytest.raises(ValueError, match="requires a 9-digit EIN"):
+            await discovery._crawl_targets_for_source(
+                {
+                    **source_dict,
+                    "metadata_json": {"query_context_employer_ein": invalid_ein},
+                },
+                landing_url,
+                None,
+            )
+    assert observed == {}
+
+    with pytest.raises(ValueError, match="invalid BCBSNC ASO employer search endpoint"):
+        await discovery._resolve_bcbsnc_aso_employer_search(
+            source_dict,
+            landing_url,
+            {
+                **discovery._platform_resolver_config(
+                    "bcbsnc_aso_employer_search"
+                ),
+                "endpoint": "https://search.example.test/api",
+            },
+            None,
+        )
+    assert observed == {}
+
+    [crawl_target] = await discovery._crawl_targets_for_source(
+        source_dict, landing_url, None
+    )
+
+    assert observed == {
+        "url": endpoint,
+        "payload": {
+            "text": ["123456789~1"],
+            "size": 10,
+            "from": 0,
+            "shoulds": {},
+            "advancedSearch": {
+                "sort": {"field": "meta.groupname.keyword", "order": "ASC"}
+            },
+            "aggs": True,
+            "frontEnd": "57053",
+            "datasource": "",
+            "datasourceId": "",
+            "datasourceType": "",
+            "minimumShouldMatch": 1,
+            "collections": ["57253"],
+        },
+        "kwargs": {
+            "headers": {
+                "Content-Type": "application/JSON",
+                "model": (
+                    "/conf/aem-global/settings/dam/cfm/models/"
+                    "transparency-in-coverage"
+                ),
+            },
+            "max_bytes": 1048576,
+            "session": None,
+            "allow_redirects": False,
+        },
+    }
+    assert crawl_target.url == toc_url
+    assert crawl_target.label == "Example Employer"
+    assert crawl_target.resolved_from_url == landing_url
+    assert crawl_target.metadata["resolver"] == "bcbsnc_aso_employer_search"
+    assert crawl_target.metadata["query_context_match"] is True
+    assert crawl_target.metadata["query_context_match_scope"] == (
+        "employer_identity"
+    )
+    assert crawl_target.metadata["plan_info"] == [
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_name": "Example Employer",
+            "plan_sponsor_name": "Example Employer",
+            "issuer_name": "BCBS North Carolina",
+        }
+    ]
+
+    response_payload["keyMatches"] = None
+    with pytest.raises(ValueError, match="incomplete BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+    response_payload["keyMatches"] = []
+
+    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+        "/table-of-contents/aso/", "/table-of-contents/aso/../non-aso/"
+    )
+    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+        "123456789_example-employer", "0123456789_other-employer"
+    )
+    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+    response_payload["results"][0]["meta"]["url"] = toc_url.replace(
+        "123456789_example-employer",
+        "123456789_987654321_other-employer",
+    )
+    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+    response_payload["results"][0]["meta"].update(
+        title="Example Employer 123456789",
+        url=toc_url.replace("mrfmftprod.bcbsnc.com", "files.example.test"),
+    )
+    with pytest.raises(ValueError, match="no exact BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+    response_payload["results"][0]["meta"]["url"] = toc_url
+    response_payload["totalHits"] = 2
+    response_payload["results"].append(
+        {
+            "id": "second-synthetic-result",
+            "meta": {
+                "groupname": "Second Example Employer",
+                "title": "Second Example Employer 123456789",
+                "url": toc_url.replace("example-employer", "second-example-employer"),
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="ambiguous BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+    async def fake_invalid_response(*_args, **_kwargs):
+        return "[]"
+
+    monkeypatch.setattr(discovery, "_post_text", fake_invalid_response)
+    with pytest.raises(ValueError, match="invalid BCBSNC ASO employer search"):
+        await discovery._crawl_targets_for_source(source_dict, landing_url, None)
+
+
+@pytest.mark.asyncio
 async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
     pages_dict = {
         "https://caa.ebms.com/": """

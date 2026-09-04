@@ -247,6 +247,44 @@ async def test_post_adapters_preserve_payload_shape_headers_and_compression(
     _, text_kwargs = text_session.post_calls[0]
     assert text_kwargs["data"] == "query=synthetic"
     assert text_kwargs["headers"] == {"X-Contract": "adapter"}
+    assert text_kwargs["allow_redirects"] is True
+
+
+@pytest.mark.parametrize(
+    ("status", "response_url"),
+    (
+        (
+            307,
+            "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search",
+        ),
+        (
+            308,
+            "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search",
+        ),
+        (200, "https://search.example.invalid/api"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_post_text_rejects_redirect_or_changed_response_url(
+    monkeypatch, status, response_url
+):
+    endpoint = (
+        "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
+    )
+    response = _Response(b"{}", status=status)
+    response.url = response_url
+    session = _Session(response)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+
+    with pytest.raises(ValueError, match="redirect response is not allowed"):
+        await discovery._post_text(
+            endpoint,
+            "synthetic-private-context",
+            session=session,
+            allow_redirects=False,
+        )
+
+    assert session.post_calls[0][1]["allow_redirects"] is False
 
 
 @pytest.mark.parametrize(

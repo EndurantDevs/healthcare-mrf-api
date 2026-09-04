@@ -15,6 +15,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import posixpath
 import re
 import socket
 import ssl
@@ -75,6 +76,7 @@ from process.mrf_discovery_checkpoints import (
 from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.healthsparq_source_jobs import healthsparq_plan_engine_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
+from process.tin_npi_connector_security import normalize_ein
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
 PRIVATE_SEED_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_SEED_CONTEXT_PATHS"
@@ -1238,6 +1240,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return None
     if host == "mrfsearch.meritain.com":
         return "meritain_mrf_search"
+    if host in {"www.bcbsnc.com", "bcbsnc.com"} and (
+        "machine-readable-files" in path
+    ):
+        return "bcbsnc_aso_employer_search"
     if host == "mrf.healthcarebluebook.com":
         return "healthcarebluebook_mrf"
     if host == "clm.magnacare.com" and path.startswith("/transparency"):
@@ -2762,6 +2768,7 @@ async def _post_text(
     headers: dict[str, str] | None = None,
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
     session: aiohttp.ClientSession | None = None,
+    allow_redirects: bool = True,
 ) -> str:
     await _assert_fetch_url_allowed(url)
     if session is None:
@@ -2781,14 +2788,19 @@ async def _post_text(
                 headers=headers,
                 max_bytes=max_bytes,
                 session=owned_session,
+                allow_redirects=allow_redirects,
             )
     async with session.post(
         url,
         data=request_payload,
         headers=headers or {},
-        allow_redirects=True,
+        allow_redirects=allow_redirects,
         **_request_ssl_kwargs(url),
     ) as resp:
+        if not allow_redirects and (
+            300 <= resp.status < 400 or str(resp.url) != url
+        ):
+            raise ValueError("POST redirect response is not allowed")
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
         total = 0
@@ -12567,6 +12579,155 @@ async def _resolve_bcbs_global_solutions_mrf(
     return crawl_targets
 
 
+def _bcbsnc_aso_result_matches_ein(
+    search_result: dict[str, Any], ein_digits: str
+) -> bool:
+    meta = search_result.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    toc_url = _clean_text(meta.get("url"))
+    parsed = urlsplit(toc_url)
+    normalized_path = posixpath.normpath(unquote(parsed.path))
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.netloc.lower() == "mrfmftprod.bcbsnc.com"
+        and normalized_path.startswith(
+            "/prod/etl/outbound/table-of-contents/aso/"
+        )
+        and re.findall(
+            r"(?<![0-9])[0-9]{9}(?![0-9])",
+            posixpath.basename(normalized_path),
+        )
+        == [ein_digits]
+    )
+
+
+async def _resolve_bcbsnc_aso_employer_search(
+    source_row: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    employer_ein = _source_query_context_value(
+        source_row, "query_context_employer_ein"
+    )
+    if employer_ein in (None, ""):
+        return []
+    try:
+        ein_digits = normalize_ein(employer_ein)
+    except ValueError:
+        raise ValueError(
+            "BCBSNC ASO employer search requires a 9-digit EIN"
+        ) from None
+
+    endpoint = str(resolver["endpoint"])
+    if endpoint != (
+        "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
+    ):
+        raise ValueError("invalid BCBSNC ASO employer search endpoint")
+    model = str(resolver["model"])
+    page_size = int(resolver["results_per_page"])
+    request_payload = {
+        "text": [f"{ein_digits}~1"],
+        "size": page_size,
+        "from": 0,
+        "shoulds": {},
+        "advancedSearch": {
+            "sort": {"field": "meta.groupname.keyword", "order": "ASC"}
+        },
+        "aggs": True,
+        "frontEnd": str(resolver["front_end_id"]),
+        "datasource": "",
+        "datasourceId": "",
+        "datasourceType": "",
+        "minimumShouldMatch": 1,
+        "collections": [str(resolver["collection_id"])],
+    }
+    response_payload = _loads_mrf_json_value(
+        await _post_text(
+            endpoint,
+            json.dumps(request_payload),
+            headers={"Content-Type": "application/JSON", "model": model},
+            max_bytes=int(resolver["max_bytes"]),
+            session=session,
+            allow_redirects=False,
+        )
+    )
+    if not isinstance(response_payload, dict):
+        raise ValueError("invalid BCBSNC ASO employer search response")
+    results = response_payload.get("results")
+    total_hits = response_payload.get("totalHits")
+    if (
+        not isinstance(results, list)
+        or not isinstance(response_payload.get("keyMatches"), list)
+        or not isinstance(total_hits, int)
+        or isinstance(total_hits, bool)
+        or total_hits > page_size
+        or len(results) != total_hits
+    ):
+        raise ValueError("incomplete BCBSNC ASO employer search response")
+
+    exact_results = [
+        result
+        for result in results
+        if isinstance(result, dict)
+        and _bcbsnc_aso_result_matches_ein(result, ein_digits)
+    ]
+    if len(exact_results) != 1:
+        outcome = "no exact" if not exact_results else "ambiguous"
+        raise ValueError(f"{outcome} BCBSNC ASO employer search result")
+
+    result = exact_results[0]
+    meta = result["meta"]
+    toc_url = _clean_text(meta.get("url"))
+    target = _direct_toc_crawl_target(
+        source_row,
+        toc_url,
+        resolver="bcbsnc_aso_employer_search",
+        target_max_bytes=int(resolver["toc_max_bytes"]),
+    )
+    if target is None:
+        raise ValueError("BCBSNC ASO employer search result is not a direct TOC")
+    context = _source_query_context_metadata(source_row)
+    employer_name = (
+        _clean_text(meta.get("groupname"))
+        or _clean_text(context.get("employer_name"))
+        or _clean_text(_source_target_payer_query(source_row))
+    )
+    plan_info = [
+        {
+            "plan_id": ein_digits,
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_name": employer_name,
+            "plan_sponsor_name": employer_name,
+            "issuer_name": source_row.get("display_name"),
+        }
+    ]
+    return [
+        CrawlTarget(
+            source=source_row,
+            url=target.url,
+            label=employer_name,
+            resolved_from_url=url,
+            metadata={
+                **target.metadata,
+                **context,
+                "resolver": "bcbsnc_aso_employer_search",
+                "query_context_match": True,
+                "query_context_match_scope": "employer_identity",
+                "bcbsnc_search_endpoint": endpoint,
+                "bcbsnc_search_result_id": _clean_text(result.get("id")),
+                "bcbsnc_matched_group_name": employer_name,
+                "company_name": employer_name,
+                "employer_name": employer_name,
+                "ein": ein_digits,
+                "plan_info": plan_info,
+            },
+        )
+    ]
+
+
 def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -14538,6 +14699,7 @@ _ASYNC_CRAWL_RESOLVER_NAMES = {
     "s3_xml_listing": "_resolve_s3_xml_listing",
     "cigna_static_mrf_lookup": "_resolve_cigna_static_mrf_lookup",
     "bcbs_global_solutions_mrf": "_resolve_bcbs_global_solutions_mrf",
+    "bcbsnc_aso_employer_search": "_resolve_bcbsnc_aso_employer_search",
     "bcbs_asomrf_filelist": "_resolve_bcbs_asomrf_filelist",
     "meritain_mrf_search": "_resolve_meritain_mrf_search",
     "healthcarebluebook_mrf": "_resolve_healthcarebluebook_mrf",
