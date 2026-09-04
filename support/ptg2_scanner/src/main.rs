@@ -2072,7 +2072,7 @@ fn provider_group_payload_canonical_json(
         distinct_quarantined_npi_text.sort_unstable();
         distinct_quarantined_npi_text.dedup();
         let quarantined_text_json = serde_json::to_string(&distinct_quarantined_npi_text)
-            .unwrap_or_else(|_| "[]".to_string());
+            .expect("provider identifier strings serialize");
         format!(
             "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"quarantined_npi\":{quarantined_json},\"quarantined_npi_text\":{quarantined_text_json},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
         )
@@ -28527,6 +28527,33 @@ mod tests {
             &source_inputs,
         )
         .unwrap();
+
+        let invalid_inline_rate = RateLite {
+            provider_refs: vec![ProviderRefKey::from("missing")],
+            provider_groups: vec![json!({"npi": ["x".repeat(129)]})],
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: None,
+        };
+        assert!(process_compact_rate_lites_worker(
+            &mut state,
+            std::slice::from_ref(&invalid_inline_rate),
+            &json!({}),
+        )
+        .is_err());
+        let invalid_source_inputs = [SourceRateWitnessInput {
+            coordinate: SourceWitnessCoordinate::new(19, 23),
+            raw_rate: br#"{}"#,
+        }];
+        assert!(process_compact_rate_lites_worker_with_source(
+            &mut state,
+            &[invalid_inline_rate],
+            &procedure,
+            &invalid_source_inputs,
+        )
+        .is_err());
+
         manifest_serving_copy_writer
             .take()
             .unwrap()
@@ -31572,6 +31599,23 @@ mod tests {
             payload["entries"][1]["value_sha256"],
             "27e0d2def7d3bfb8c0538e8af4def83d193d1a59bcdf96c2d1e5ea67e7c766a3"
         );
+
+        let mut oversized_entry = provider_map.values().next().unwrap().clone();
+        oversized_entry.quarantined_npi_text = vec!["x".repeat(129)];
+        assert!(provider_identifier_quarantine_payload(
+            &HashMap::from([(ProviderRefKey::from("oversized"), oversized_entry)]),
+            ProviderIdentifierQuarantine::default(),
+        )
+        .is_err());
+    }
+
+    fn fill_provider_identifier_quarantine(dedupe: &SharedDedupe) {
+        let values = (1..=1024)
+            .map(|value| -i64::from(value))
+            .collect::<Vec<_>>();
+        dedupe
+            .record_quarantined_provider_identifiers(&values)
+            .unwrap();
     }
 
     #[test]
@@ -31609,6 +31653,71 @@ mod tests {
             ..raw_rate
         };
         record_skipped_inline_provider_quarantine(&empty_rate, &dedupe, false).unwrap();
+
+        let oversized_rate = RateLite {
+            provider_groups: vec![json!({"npi": ["x".repeat(129)]})],
+            ..parsed_rate.clone()
+        };
+        assert!(
+            record_skipped_inline_provider_quarantine(&oversized_rate, &dedupe, false).is_err()
+        );
+        assert!(record_skipped_inline_provider_quarantine(&oversized_rate, &dedupe, true).is_err());
+
+        let full_numeric = SharedDedupe::new(1);
+        fill_provider_identifier_quarantine(&full_numeric);
+        let extra_numeric_rate = RateLite {
+            provider_groups: vec![json!({"npi": [-1025]})],
+            ..parsed_rate.clone()
+        };
+        assert!(record_skipped_inline_provider_quarantine(
+            &extra_numeric_rate,
+            &full_numeric,
+            false,
+        )
+        .is_err());
+
+        let full_text = SharedDedupe::new(1);
+        fill_provider_identifier_quarantine(&full_text);
+        let extra_text_rate = RateLite {
+            provider_groups: vec![json!({"npi": ["new-malformed"]})],
+            ..parsed_rate.clone()
+        };
+        assert!(
+            record_skipped_inline_provider_quarantine(&extra_text_rate, &full_text, false,)
+                .is_err()
+        );
+
+        let provider_group = json!({
+            "tin": {"type": "ein", "value": "123456789"},
+            "npi": [1234567890_i64, "new-malformed"],
+        });
+        let capped_rate = RateLite {
+            provider_groups: vec![provider_group],
+            ..parsed_rate.clone()
+        };
+        let capped_dedupe = SharedDedupe::new(1);
+        fill_provider_identifier_quarantine(&capped_dedupe);
+        let mut capped_sinks =
+            DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        assert!(provider_entry_view_for_worker_rate(
+            &HashMap::new(),
+            &capped_rate,
+            &mut capped_sinks,
+            &capped_dedupe,
+        )
+        .is_err());
+
+        let capped_v4_dedupe = v4_test_shared_dedupe(1);
+        fill_provider_identifier_quarantine(&capped_v4_dedupe);
+        let mut capped_v4_sinks =
+            DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        assert!(resolve_v4_inline_provider_transform(
+            &capped_rate,
+            &mut capped_v4_sinks,
+            &capped_v4_dedupe,
+            &V4InlineProviderTransformSharedCache::new(0),
+        )
+        .is_err());
 
         let quarantine = dedupe
             .provider_identifier_quarantine()
@@ -31828,6 +31937,25 @@ mod tests {
         assert_eq!(quarantine["distinct_value_count"], 2);
         assert!(provider_map[&key].quarantined_npi.is_empty());
         assert!(provider_map[&key].quarantined_npi_text.is_empty());
+
+        let mut invalid_numeric_entry = entry.clone();
+        invalid_numeric_entry.quarantined_npi = vec![0];
+        assert!(record_and_clear_provider_identifier_quarantine(
+            &mut HashMap::from([(
+                ProviderRefKey::from("invalid-numeric"),
+                invalid_numeric_entry,
+            )]),
+            &SharedDedupe::new(1),
+        )
+        .is_err());
+
+        let mut invalid_text_entry = entry.clone();
+        invalid_text_entry.quarantined_npi_text = vec!["x".repeat(129)];
+        assert!(record_and_clear_provider_identifier_quarantine(
+            &mut HashMap::from([(ProviderRefKey::from("invalid-text"), invalid_text_entry)]),
+            &SharedDedupe::new(1),
+        )
+        .is_err());
 
         let mut conflicting_entry = entry.clone();
         conflicting_entry
@@ -32354,7 +32482,7 @@ mod tests {
         let provider_ref = json!({
             "provider_groups": [{
                 "tin": {"type": "ein", "value": "123456789"},
-                "npi": [1234567890]
+                "npi": [1234567890, "bad`"]
             }]
         });
         let mut provider_map = HashMap::new();
@@ -32367,7 +32495,7 @@ mod tests {
                 ProviderRefKey::from("valid-ref"),
                 ProviderRefKey::from("dangling-ref"),
             ],
-            provider_groups: Vec::new(),
+            provider_groups: provider_ref["provider_groups"].as_array().unwrap().clone(),
             provider_groups_raw: None,
             network_names: Vec::new(),
             prices: vec![test_price_lite("100.00")],
