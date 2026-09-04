@@ -1295,6 +1295,33 @@ fn compact_cli_reports_provider_reference_worker_failures() {
 }
 
 #[test]
+fn compact_cli_rejects_too_many_distinct_malformed_provider_identifiers() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    let malformed = (0..1025)
+        .map(|value| format!("malformed-{value}`"))
+        .collect::<Vec<_>>();
+    let malformed = serde_json::to_string(&malformed).unwrap();
+    fs::write(
+        &source,
+        format!(
+            r#"{{"provider_references":[{{"provider_group_id":7,"provider_groups":[{{"npi":{malformed}}}]}}],"in_network":[]}}"#
+        ),
+    )
+    .expect("write malformed identifier fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(!completed.status.success());
+    let stderr = String::from_utf8_lossy(&completed.stderr);
+    assert!(
+        stderr.contains("provider identifier quarantine exceeds 1024 distinct values"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn compact_cli_reports_primary_producer_failures() {
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let source = temporary.path().join("rates.json");
@@ -1476,6 +1503,18 @@ fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
         .as_u64()
         .is_some_and(|value| value >= 2));
     assert_eq!(summary["provider_graph_v4_inline_only_rates"], 1);
+    assert_eq!(
+        summary["provider_identifier_quarantine"]["contract"],
+        "ptg2_provider_identifier_quarantine_v2"
+    );
+    assert_eq!(
+        summary["provider_identifier_quarantine"]["occurrence_count"],
+        2
+    );
+    assert_eq!(
+        summary["provider_identifier_quarantine"]["distinct_value_count"],
+        1
+    );
 
     for name in [
         "provider-set-component.ptg2sc",
