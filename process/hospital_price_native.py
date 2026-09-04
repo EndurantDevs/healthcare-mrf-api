@@ -200,7 +200,10 @@ def _next_csv_data_headers(structural_rows: Iterator[list[str]]) -> list[str]:
             }
             if _REQUIRED_CSV_METADATA_HEADERS <= normalized_headers:
                 next(structural_rows)
-                return next(structural_rows)
+                return [
+                    header.replace(_CP1252_NBSP_SURROGATE, " ").strip()
+                    for header in next(structural_rows)
+                ]
     except (StopIteration, csv.Error) as exc:
         raise ValueError("hospital CSV is missing its three header rows") from exc
     raise ValueError("hospital CSV metadata header exceeds its scan limit")

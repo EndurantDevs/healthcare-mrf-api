@@ -20,7 +20,7 @@ def test_format_detection_skips_cp1252_nbsp_structural_record(tmp_path):
     source = tmp_path / "input.csv"
     source.write_bytes(
         b"hospital_name,last_updated_on,version\n\xa0,\xa0,\xa0\n"
-        b"Example,2026-08-25,3.0.0\ndescription,payer_name\n"
+        b"Example,2026-08-25,3.0.0\ndescription,\xa0payer_name\xa0\n"
     )
 
     assert native.detect_hospital_mrf_format(source) == "csv-tall"
