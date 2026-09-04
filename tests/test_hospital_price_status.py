@@ -131,6 +131,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
             "tax_identity_count": 1,
             "template_version": "3.0.0",
             "source_format": "json",
+            "detected_schema_profile": "cms-v3",
             "last_updated_on": dt.date(2026, 8, 23),
         },
         {
@@ -160,6 +161,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
         "unpublished": 2,
         "template_versions": {"3.0.0": 1},
         "source_formats": {"json": 1},
+        "detected_schema_profiles": {"cms-v3": 1},
     }
 
 
@@ -189,6 +191,7 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
             "last_success_at": dt.datetime(2026, 8, 24, tzinfo=dt.UTC),
             "template_version": "2",
             "source_format": "csv-wide",
+            "detected_schema_profile": "cms-v2",
         },
         {
             "hospital_id": "hospital-000002",
@@ -209,8 +212,10 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
     assert page["items"][0]["publication"]["generation"] == 1
     assert page["items"][0]["publication"]["template_version"] == "2"
     assert page["items"][0]["publication"]["source_format"] == "csv-wide"
+    assert page["items"][0]["publication"]["detected_schema_profile"] == "cms-v2"
     assert page["summary"]["template_versions"] == {"2": 1}
     assert page["summary"]["source_formats"] == {"csv-wide": 1}
+    assert page["summary"]["detected_schema_profiles"] == {"cms-v2": 1}
     assert page["summary"]["total"] == 1
 
 

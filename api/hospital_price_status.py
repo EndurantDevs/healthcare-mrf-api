@@ -45,6 +45,14 @@ SELECT hospital.hospital_id,
        current.tax_identity_count,
        version.template_version,
        version.source_format,
+       CASE
+         WHEN version.attestation_text LIKE
+              'To the best of its knowledge and belief, this hospital has included%'
+           THEN 'cms-v3'
+         WHEN version.attestation_text LIKE
+              'To the best of its knowledge and belief, the hospital has included%'
+           THEN 'cms-v2'
+       END AS detected_schema_profile,
        version.last_updated_on
   FROM {_SCHEMA}.hospital_price_hospital AS hospital
   LEFT JOIN {_SCHEMA}.hospital_price_current AS current
@@ -99,6 +107,7 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "version_id": row["version_id"],
         "template_version": row.get("template_version"),
         "source_format": row.get("source_format"),
+        "detected_schema_profile": row.get("detected_schema_profile"),
         "last_updated_on": _timestamp_text(row.get("last_updated_on")),
         "generation": row.get("generation"),
         "last_success_at": _timestamp_text(row.get("last_success_at")),
@@ -175,6 +184,7 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
     }
     count_by_template_version: dict[str, int] = {}
     count_by_source_format: dict[str, int] = {}
+    count_by_detected_schema_profile: dict[str, int] = {}
     for hospital_status in hospital_statuses:
         status = _item_status(hospital_status)
         if status in {"queued", "running", "failed"}:
@@ -191,6 +201,13 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
                 count_by_source_format[source_format] = (
                     count_by_source_format.get(source_format, 0) + 1
                 )
+            detected_profile = hospital_status["publication"].get(
+                "detected_schema_profile"
+            )
+            if isinstance(detected_profile, str) and detected_profile:
+                count_by_detected_schema_profile[detected_profile] = (
+                    count_by_detected_schema_profile.get(detected_profile, 0) + 1
+                )
         else:
             count_by_status["unpublished"] += 1
     return {
@@ -198,6 +215,9 @@ def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
         **count_by_status,
         "template_versions": dict(sorted(count_by_template_version.items())),
         "source_formats": dict(sorted(count_by_source_format.items())),
+        "detected_schema_profiles": dict(
+            sorted(count_by_detected_schema_profile.items())
+        ),
     }
 
 
