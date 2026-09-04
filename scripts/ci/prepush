@@ -917,7 +917,25 @@ run_provider_directory_postgres() {
     tests/test_provider_directory_two_phase_publication.py \
     tests/test_provider_directory_contract_identity_cutover.py \
     tests/test_provider_directory_retry_cleanup.py \
-    tests/test_provider_directory_artifact_cutover_reconciliation.py \
+    tests/test_provider_directory_artifact_cutover_reconciliation.py
+}
+
+run_provider_profile_postgres() {
+  local dsn=$1
+  # Keep the retained/projection tail in a separate serial batch on this lane.
+  local common_env=(
+    "HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN=$dsn"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN=$dsn"
+    "HLTHPRT_UHC_ORGANIZATION_EVIDENCE_POSTGRES_DSN=$dsn"
+    "HLTHPRT_OPENADDRESSES_BATCH_POSTGRES_DSN=$dsn"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
+    "HLTHPRT_PTG2_RUST_SCANNER_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1"
+  )
+  env "${common_env[@]}" timeout --foreground 295s python -m pytest -q \
+    -o asyncio_default_test_loop_scope=session \
+    -o asyncio_default_fixture_loop_scope=session \
+    --durations=20 \
     tests/test_provider_directory_retained_campaign_contract.py \
     tests/test_provider_directory_retained_private_locator_contract.py \
     tests/test_provider_directory_retained_contract_keys.py \
@@ -946,10 +964,7 @@ run_provider_directory_postgres() {
     tests/test_provider_directory_projection_finalizer_postgres.py \
     tests/test_provider_directory_projection_decoded_census_migration_postgres.py \
     tests/test_uhc_organization_evidence_schema.py
-}
 
-run_provider_profile_postgres() {
-  local dsn=$1
   HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN=$dsn \
   HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1 \
     timeout --foreground 295s python -m pytest -q \

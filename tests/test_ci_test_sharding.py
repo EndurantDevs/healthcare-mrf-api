@@ -360,6 +360,66 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         assert test_path in profile_step
 
 
+RETAINED_PROJECTION_TEST_PATHS = (
+    "tests/test_provider_directory_retained_campaign_contract.py",
+    "tests/test_provider_directory_retained_private_locator_contract.py",
+    "tests/test_provider_directory_retained_contract_keys.py",
+    "tests/test_provider_directory_retained_private_key_binding.py",
+    "tests/test_provider_directory_retained_sealed_contract.py",
+    "tests/test_provider_directory_retained_source_neutrality.py",
+    "tests/test_provider_directory_retained_blob_store.py",
+    "tests/test_provider_directory_retained_reader_postgres.py",
+    "tests/test_provider_directory_retained_reader_parallel_postgres.py",
+    "tests/test_provider_directory_retained_reader_close_races_postgres.py",
+    "tests/test_provider_directory_retained_core_postgres.py",
+    "tests/test_provider_directory_retained_producer_store_postgres.py",
+    "tests/test_provider_directory_retained_producer_store_faults_postgres.py",
+    "tests/test_provider_directory_retained_producer_store_boundaries_postgres.py",
+    "tests/test_provider_directory_retained_core_state_guards.py",
+    "tests/test_provider_directory_retained_seal_claim_guards.py",
+    "tests/test_provider_directory_retained_binding_guards.py",
+    "tests/test_provider_directory_retained_root_ledger_guards.py",
+    "tests/test_provider_directory_retained_retry_gc_guards.py",
+    "tests/test_provider_directory_retained_key_fence_status.py",
+    "tests/test_provider_directory_projection_foundation_postgres.py",
+    "tests/test_provider_directory_projection_child_read_postgres.py",
+    "tests/test_provider_directory_projection_child_read_cleanup_postgres.py",
+    "tests/test_provider_directory_projection_materializer_postgres.py",
+    "tests/test_provider_directory_projection_materializer_census_postgres.py",
+    "tests/test_provider_directory_projection_finalizer_postgres.py",
+    "tests/test_provider_directory_projection_decoded_census_migration_postgres.py",
+    "tests/test_uhc_organization_evidence_schema.py",
+)
+
+
+def test_retained_projection_tail_keeps_its_environment_on_profile_lane() -> None:
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    directory_step, profile_step = prepush.split(
+        "run_provider_directory_postgres() {", 1
+    )[1].split("run_provider_profile_postgres() {", 1)
+    profile_step = profile_step.split("run_postgres() {", 1)[0]
+    retained_step, original_profile_step = profile_step.split(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN=$dsn", 1
+    )
+    assert directory_step.split("local common_env=(", 1)[1].split(
+        "\n  )", 1
+    )[0] == retained_step.split("local common_env=(", 1)[1].split("\n  )", 1)[0]
+    assert 'env "${common_env[@]}" timeout --foreground 295s' in retained_step
+    for scope_option in (
+        "asyncio_default_test_loop_scope=session",
+        "asyncio_default_fixture_loop_scope=session",
+    ):
+        assert scope_option in retained_step
+        assert scope_option in original_profile_step
+    assert profile_step.count("timeout --foreground 295s python -m pytest -q") == 2
+    assert "--durations=20" in retained_step
+    assert "-n " not in profile_step
+    for test_path in RETAINED_PROJECTION_TEST_PATHS:
+        _assert_single_lifecycle_test(prepush, retained_step, test_path)
+
+
 def test_container_proves_rooted_graph_operator_is_packaged_and_dormant() -> None:
     prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
