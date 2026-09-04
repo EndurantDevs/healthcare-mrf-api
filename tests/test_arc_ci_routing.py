@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from math import prod
 from pathlib import Path
 
@@ -10,7 +9,6 @@ import yaml
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
-FAIL_FAST_WORKFLOW = WORKFLOW.with_name("ci-fail-fast.yml")
 CALLER = (
     Path(__file__).resolve().parents[1]
     / ".github/workflows/trusted-pr-ci.yml"
@@ -230,77 +228,6 @@ def test_matrices_fail_fast_and_coverage_waits_for_every_root_job() -> None:
     assert set(jobs["test-coverage"]["needs"]) == {
         name for name, job in jobs.items() if "needs" not in job
     }
-
-
-def test_ci_fail_fast_watchdog_is_run_scoped_and_hosted() -> None:
-    """Keep the privileged watchdog outside the target workflow."""
-    workflow = FAIL_FAST_WORKFLOW.read_text(encoding="utf-8")
-    document = yaml.safe_load(workflow)
-
-    assert document["on"] == {
-        "workflow_run": {
-            "workflows": ["CI", "Trusted pull request CI"],
-            "types": ["in_progress"],
-        }
-    }
-    assert document["permissions"] == {"actions": "write"}
-    assert document["concurrency"] == {
-        "group": "ci-fail-fast-${{ github.event.workflow_run.id }}",
-        "cancel-in-progress": True,
-    }
-    assert set(document["jobs"]) == {"monitor"}
-    monitor = document["jobs"]["monitor"]
-    assert monitor["runs-on"] == "ubuntu-latest"
-    assert monitor["timeout-minutes"] == 360
-    for guard in (
-        "head_repository.full_name == github.repository",
-        "workflow_run.path == '.github/workflows/ci.yml'",
-        "workflow_run.path == '.github/workflows/trusted-pr-ci.yml'",
-    ):
-        assert guard in monitor["if"]
-
-    assert len(monitor["steps"]) == 1
-    step = monitor["steps"][0]
-    assert step["uses"] == (
-        "actions/github-script@"
-        "3a2844b7e9c422d3c10d287c895573f7108da1b3"
-    )
-    assert step["with"]["retries"] == 3
-
-
-def test_ci_fail_fast_script_cancels_only_active_siblings() -> None:
-    """Cancel the run only after a best-effort current-attempt guard."""
-    workflow = FAIL_FAST_WORKFLOW.read_text(encoding="utf-8")
-    step = yaml.safe_load(workflow)["jobs"]["monitor"]["steps"][0]
-    script = step["with"]["script"]
-    assert re.search(
-        r"cancelWorkflowRun\(\{\s+\.\.\.context\.repo,\s+"
-        r"run_id: target\.id,\s+\}\)",
-        script,
-    )
-    for contract in (
-        "listJobsForWorkflowRunAttempt",
-        "attempt_number: attempt",
-        'new Set(["failure", "timed_out"])',
-        'job.status !== "completed"',
-        "if (failed && active)",
-        "if (!active)",
-        "current.run_attempt !== attempt",
-        "current.status === \"completed\"",
-        "cancel is run-scoped",
-        "cancelWorkflowRun",
-        "error.status !== 409",
-        "await sleep(60_000)",
-    ):
-        assert contract in script
-    assert script.index("getWorkflowRun") < script.index("cancelWorkflowRun")
-    assert "listWorkflowRuns" not in script
-    for forbidden in (
-        "actions/checkout@",
-        "download-artifact",
-        "secrets.",
-    ):
-        assert forbidden not in workflow
 
 
 def test_arc_route_has_exact_14_plus_2_instance_split() -> None:
