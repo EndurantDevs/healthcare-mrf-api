@@ -11448,6 +11448,22 @@ def _redact_unproven_location_address(location_row: dict[str, Any]) -> None:
     location_row["address_payload"] = json.dumps({})
 
 
+def _backfill_admitted_source_record_ids(
+    address_payload: dict[str, Any],
+    provenance_entries: list[dict[str, Any]],
+    admitted_source_id: int | None,
+) -> None:
+    if address_payload.get("source_record_ids") != []:
+        return
+    address_payload["source_record_ids"] = sorted(
+        {
+            str(entry["source_record_id"]).strip()
+            for entry in provenance_entries
+            if _coerce_int_payload(entry.get("source_id")) == admitted_source_id
+        }
+    )
+
+
 def _apply_address_provenance(
     location_rows: list[dict[str, Any]],
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]],
@@ -11490,17 +11506,9 @@ def _apply_address_provenance(
             _redact_unproven_location_address(location_row)
             retained_location_rows.append(location_row)
             continue
-        if (
-            backfill_admitted_source_record_ids
-            and address_payload.get("source_record_ids") == []
-        ):
-            address_payload["source_record_ids"] = sorted(
-                {
-                    str(entry["source_record_id"]).strip()
-                    for entry in provenance_entries
-                    if _coerce_int_payload(entry.get("source_id"))
-                    == admitted_source_id
-                }
+        if backfill_admitted_source_record_ids:
+            _backfill_admitted_source_record_ids(
+                address_payload, provenance_entries, admitted_source_id
             )
         if include_response_evidence:
             address_payload["address_provenance"] = provenance_entries

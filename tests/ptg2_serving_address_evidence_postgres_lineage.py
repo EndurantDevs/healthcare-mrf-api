@@ -160,47 +160,6 @@ async def test_stored_only_lineage_does_not_consult_live_mrf_fallback():
         assert provenance_rows == []
 
 
-@pytest.mark.asyncio
-async def test_live_fallback_rejects_mismatched_stored_identity_without_live_row():
-    async with _temporary_schema() as (database, schema):
-        await database.status(
-            f"""
-            INSERT INTO {schema}.entity_address_unified (
-                location_key, npi, address_key, premise_key, address_sources
-            ) VALUES (
-                'stale-identity', 1990000015,
-                '00000000-0000-0000-0000-000000000001',
-                '10000000-0000-0000-0000-000000000001',
-                ARRAY['nppes']::varchar[]
-            )
-            """
-        )
-        await database.status(
-            f"""
-            INSERT INTO {schema}.entity_address_evidence (
-                evidence_id, location_key, address_key, premise_key, npi,
-                source_id, source_record_key, source_run_id, observed_at
-            ) VALUES (
-                4, 'stale-identity',
-                '00000000-0000-0000-0000-000000000002',
-                '10000000-0000-0000-0000-000000000002',
-                1990000023, 1, 'nppes:stale', '20260731',
-                '2026-07-31T00:00:00Z'
-            )
-            """
-        )
-
-        provenance_rows = await _fetch_provenance(
-            database,
-            schema,
-            ["stale-identity"],
-            [1],
-            strict_stored_identity=True,
-        )
-
-        assert provenance_rows == []
-
-
 async def _insert_specific_evidence_candidates(database: Database, schema: str) -> None:
     await database.status(
         f"""

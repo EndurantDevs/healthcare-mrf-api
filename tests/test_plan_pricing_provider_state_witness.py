@@ -273,18 +273,24 @@ def test_v4_provider_state_witness_backfills_compact_source_record_ids() -> None
         backfill_admitted_source_record_ids=True,
     )
 
-    rows = provider_cells._provider_cell_rows(
+    provider_cell_rows = provider_cells._provider_cell_rows(
         PROJECTION_ID,
         _BuildState(hashlib.sha256()),
         [NPI],
         {NPI: [provider]},
     )
 
-    state_fragment = next(row["state_fragment"] for row in rows if row["state_fragment"])
+    state_fragment = next(
+        provider_cell["state_fragment"]
+        for provider_cell in provider_cell_rows
+        if provider_cell["state_fragment"]
+    )
     assert orjson.loads(state_fragment)["provider"]["address_payload"][
         "source_record_ids"
     ] == ["record-48104", "z-record"]
 
+
+def test_v4_provider_state_witness_preserves_compact_source_record_ids() -> None:
     preserved = _state_provider("48104", 1)
     preserved_address = orjson.loads(preserved["address_payload"])
     preserved_address["source_record_ids"] = ["frozen-record"]
@@ -293,7 +299,11 @@ def test_v4_provider_state_witness_backfills_compact_source_record_ids() -> None
     preserved["_geo_evidence_source_id"] = 1
     serving._apply_address_provenance(
         [preserved],
-        {address["location_key"]: [address["address_provenance"][0]]},
+        {
+            preserved_address["location_key"]: [
+                preserved_address["address_provenance"][0]
+            ]
+        },
         backfill_admitted_source_record_ids=True,
     )
     assert orjson.loads(preserved["address_payload"])["source_record_ids"] == [
