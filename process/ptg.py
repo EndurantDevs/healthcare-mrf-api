@@ -2113,7 +2113,8 @@ async def _copy_manifest_paths(
         for input_path in input_paths
     }
     try:
-        await asyncio.shield(asyncio.gather(*pending_copies))
+        for completed_copy in asyncio.as_completed(pending_copies):
+            await completed_copy
     except BaseException:
         await _await_cleanup_task(
             asyncio.create_task(_cancel_and_wait_tasks(pending_copies))
