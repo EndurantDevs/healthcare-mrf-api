@@ -104,9 +104,10 @@ def infrastructure_reasons(log: str) -> tuple[str, ...]:
 
 def is_run_retryable(run: Mapping[str, Any], *, attempt: int) -> bool:
     """Reject stale or duplicate events after a retry has already started."""
+    # ponytail: GitHub has no cancel-actor field; ARC/log checks bound retries.
     return (
         run.get("status") == "completed"
-        and run.get("conclusion") == "failure"
+        and run.get("conclusion") in {"failure", "cancelled"}
         and run.get("run_attempt") == attempt == 1
     )
 

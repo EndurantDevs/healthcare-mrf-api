@@ -121,6 +121,10 @@ def test_classifier_rejects_stale_duplicate_or_incomplete_run_events() -> None:
 
     assert is_run_retryable(completed_failure_run_dict, attempt=1) is True
     assert is_run_retryable(
+        {**completed_failure_run_dict, "conclusion": "cancelled"},
+        attempt=1,
+    ) is True
+    assert is_run_retryable(
         {**completed_failure_run_dict, "run_attempt": 2}, attempt=1
     ) is False
     assert (
@@ -205,6 +209,8 @@ def test_public_retry_workflow_excludes_pull_requests_and_untrusted_branches() -
 
     job = workflow["jobs"]["retry-failed-infrastructure"]
     condition = job["if"]
+    assert "workflow_run.conclusion == 'failure'" in condition
+    assert "workflow_run.conclusion == 'cancelled'" in condition
     assert "run_attempt == 1" in condition
     assert "head_branch == github.event.repository.default_branch" in condition
     assert "workflow_run.event == 'push'" in condition
@@ -246,10 +252,13 @@ def test_retry_steps_remain_pinned_and_fail_closed() -> None:
         "FAILED_HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
     }
     assert "completed:failure:1" in rerun["run"]
+    assert "completed:cancelled:1" in rerun["run"]
     assert ".run_attempt | tostring" in rerun["run"]
     assert "commits/${DEFAULT_BRANCH}" in rerun["run"]
     assert '"$current_tip" != "$FAILED_HEAD_SHA"' in rerun["run"]
-    assert rerun["run"].rstrip().endswith("/rerun-failed-jobs\"")
+    assert 'rerun_endpoint="rerun-failed-jobs"' in rerun["run"]
+    assert 'rerun_endpoint="rerun"' in rerun["run"]
+    assert rerun["run"].rstrip().endswith("/${rerun_endpoint}\"")
 
 
 def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() -> None:

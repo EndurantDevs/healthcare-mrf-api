@@ -1,0 +1,93 @@
+name: CI fail-fast watchdog
+
+"on":
+  workflow_run:
+    workflows: [CI, Trusted pull request CI]
+    types: [in_progress]
+
+permissions:
+  actions: write
+
+concurrency:
+  group: ci-fail-fast-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.path == '.github/workflows/ci.yml' ||
+      github.event.workflow_run.path == '.github/workflows/trusted-pr-ci.yml')
+    runs-on: ubuntu-latest
+    # ponytail: GitHub caps hosted jobs at six hours; use a webhook if queues exceed it.
+    timeout-minutes: 360
+    steps:
+      - name: Cancel remaining jobs after the first failure
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          retries: 3
+          script: |
+            const target = context.payload.workflow_run;
+            const attempt = target.run_attempt;
+            const terminalFailures = new Set(["failure", "timed_out"]);
+            const sleep = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+            // ponytail: watched workflows stay below 100 jobs; paginate if that changes.
+            for (;;) {
+              const { data } =
+                await github.rest.actions.listJobsForWorkflowRunAttempt({
+                  ...context.repo,
+                  run_id: target.id,
+                  attempt_number: attempt,
+                  per_page: 100,
+                });
+              const failed = data.jobs.some((job) =>
+                terminalFailures.has(job.conclusion),
+              );
+              const active = data.jobs.some(
+                (job) => job.status !== "completed",
+              );
+
+              if (failed && active) {
+                const { data: current } =
+                  await github.rest.actions.getWorkflowRun({
+                    ...context.repo,
+                    run_id: target.id,
+                  });
+                if (
+                  current.run_attempt !== attempt ||
+                  current.status === "completed"
+                ) {
+                  return;
+                }
+                // ponytail: cancel is run-scoped; use external serialization to eliminate the rerun race.
+                try {
+                  await github.rest.actions.cancelWorkflowRun({
+                    ...context.repo,
+                    run_id: target.id,
+                  });
+                } catch (error) {
+                  if (error.status !== 409) {
+                    throw error;
+                  }
+                }
+                return;
+              }
+
+              if (!active) {
+                const { data: current } =
+                  await github.rest.actions.getWorkflowRun({
+                    ...context.repo,
+                    run_id: target.id,
+                  });
+                if (
+                  current.run_attempt !== attempt ||
+                  current.status === "completed"
+                ) {
+                  return;
+                }
+              }
+              // ponytail: 60s keeps seven concurrent watchers within token limits.
+              await sleep(60_000);
+            }
