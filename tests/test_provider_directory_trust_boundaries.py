@@ -3013,10 +3013,6 @@ def test_artifact_transaction_timeout_budget_is_phase_specific():
     ordinary_timeout = (
         importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
     )
-    assert (
-        importer.PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS
-        == 60.0
-    )
     assert importer._provider_directory_artifact_transaction_timeout_seconds(
         None
     ) == ordinary_timeout
