@@ -4895,6 +4895,11 @@ async def _assert_bcbsnc_aso_search_error(source_row, message):
         )
 
 
+def test_bcbsnc_aso_classifier_does_not_capture_direct_mrf_bodies():
+    direct_body_url = f"{_BCBSNC_ASO_LANDING_URL}/2026_in-network.json.gz"
+    assert discovery.classify_hosting_platform(direct_body_url) == "direct_mrf_body"
+
+
 @pytest.mark.asyncio
 async def test_bcbsnc_aso_search_resolves_synthetic_employer_ein(
     tmp_path, monkeypatch

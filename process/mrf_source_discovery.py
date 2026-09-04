@@ -1241,7 +1241,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host == "mrfsearch.meritain.com":
         return "meritain_mrf_search"
     if host in {"www.bcbsnc.com", "bcbsnc.com"} and (
-        "machine-readable-files" in path
+        path.rstrip("/") == "/policies-best-practices/machine-readable-files"
     ):
         return "bcbsnc_aso_employer_search"
     if host == "mrf.healthcarebluebook.com":
