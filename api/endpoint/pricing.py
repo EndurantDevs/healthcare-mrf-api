@@ -101,6 +101,7 @@ from api.plan_pricing_projection import (
     projection_result_type,
 )
 from api.plan_pricing_em_distance import (
+    _request_code_index as _em_distance_request_code_index,
     em_distance_retry_option,
     is_em_distance_projection_ready,
 )
@@ -12574,10 +12575,24 @@ async def list_providers_by_procedure(request):
         ptg_code_system,
         code,
     ):
-        guard_release_selection = await resolve_plan_release_guard_selection(
-            session,
-            plan_release_id,
-        )
+        if (
+            _em_distance_request_code_index(args) is not None
+            and em_distance_retry_option(args, pagination) is not None
+        ):
+            release_selection = await resolve_plan_release_serving(
+                session,
+                plan_release_id,
+                projection_only=True,
+            )
+            guard_release_selection = release_selection
+            release_selection_args_by_name = _release_selection_args_by_name(
+                release_selection
+            )
+        else:
+            guard_release_selection = await resolve_plan_release_guard_selection(
+                session,
+                plan_release_id,
+            )
         broad_expansion_market_type = _release_market_type_for_guard(
             guard_release_selection
         )
@@ -12641,7 +12656,7 @@ async def list_providers_by_procedure(request):
             },
             status=422,
         )
-    if plan_release_id:
+    if plan_release_id and not release_selection_args_by_name:
         if projected_result_type is not None:
             release_selection = await resolve_plan_release_serving(
                 session,

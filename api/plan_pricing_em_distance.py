@@ -403,12 +403,18 @@ async def _progressive_page_rows(
         has_page_boundary = unique_count > (
             int(pagination.offset) + int(pagination.limit)
         )
-        if is_window_exhausted or has_page_boundary or candidate_limit >= _MAX_LOCATION_WINDOW:
+        if is_window_exhausted or has_page_boundary:
             return (
                 page_rows_by_field,
                 is_window_exhausted,
                 has_page_boundary,
                 unique_count,
+            )
+        if candidate_limit >= _MAX_LOCATION_WINDOW:
+            from api.ptg2_serving import PTG2LocationScopeError
+
+            raise PTG2LocationScopeError(
+                "The E&M location window cannot prove a complete provider page."
             )
         candidate_limit = min(candidate_limit * 2, _MAX_LOCATION_WINDOW)
 
