@@ -208,6 +208,68 @@ def test_v4_provider_state_witness_is_single_bounded_and_digest_bound() -> None:
     assert first_state.content_digest.digest() != changed_state.content_digest.digest()
 
 
+def test_v4_provider_state_witness_compacts_valid_lineage_before_bound() -> None:
+    provider = _state_provider("48104", 1)
+    address = orjson.loads(provider["address_payload"])
+    address["source_record_ids"] = [
+        f"shared-location-record-{index:04d}-{'x' * 64}"
+        for index in range(512)
+    ]
+    provenance = address["address_provenance"][0]
+    provenance.update(
+        record_version_ids=[f"version-{index:04d}" for index in range(512)],
+        issuer_names=[f"Synthetic Issuer {index:04d}" for index in range(512)],
+        source_urls=[
+            f"https://example.invalid/source/{index:04d}/{'x' * 64}"
+            for index in range(512)
+        ],
+    )
+    provider["address_payload"] = orjson.dumps(address)
+    assert len(provider["address_payload"]) > (
+        provider_cells.MAX_PROVIDER_STATE_FRAGMENT_BYTES
+    )
+
+    provider_rows = provider_cells._provider_cell_rows(
+        PROJECTION_ID,
+        _BuildState(hashlib.sha256()),
+        [NPI],
+        {NPI: [provider]},
+    )
+
+    state_fragment = provider_rows[0]["state_fragment"]
+    witness_address = orjson.loads(state_fragment)["provider"]["address_payload"]
+    assert len(state_fragment) <= provider_cells.MAX_PROVIDER_STATE_FRAGMENT_BYTES
+    assert witness_address["source_record_ids"] == ["record-48104"]
+    assert witness_address["address_provenance"] == [
+        {
+            "source_id": 1,
+            "dataset_id": "synthetic",
+            "source_record_id": "record-48104",
+            "record_version_id": "version-1",
+            "retrieved_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+
+
+def test_v4_provider_state_witness_retains_hard_fragment_ceiling() -> None:
+    provider = _state_provider("48104", 1)
+    address = orjson.loads(provider["address_payload"])
+    oversized_record_id = "record-" + (
+        "x" * provider_cells.MAX_PROVIDER_STATE_FRAGMENT_BYTES
+    )
+    address["source_record_ids"] = [oversized_record_id]
+    address["address_provenance"][0]["source_record_id"] = oversized_record_id
+    provider["address_payload"] = orjson.dumps(address)
+
+    with pytest.raises(ValueError, match="fragment bound exceeded"):
+        provider_cells._provider_cell_rows(
+            PROJECTION_ID,
+            _BuildState(hashlib.sha256()),
+            [NPI],
+            {NPI: [provider]},
+        )
+
+
 @pytest.mark.parametrize(
     "evidence_flag",
     ("include_evidence", "include_debug", "include_details"),
