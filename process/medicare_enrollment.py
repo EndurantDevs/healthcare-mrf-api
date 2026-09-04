@@ -292,15 +292,146 @@ async def _publish_stage_table(db_schema: str, model_cls, stage_cls) -> None:
             )
 
 
+def _merge_county_enrollment(
+    enrollment_by_county: dict[tuple[str, int], dict[str, int]],
+    enrollment_row: dict,
+) -> None:
+    """Add one valid annual county record to its deterministic aggregate."""
+
+    county_fips = _normalize_fips(enrollment_row.get("BENE_FIPS_CD"))
+    year = _to_int(enrollment_row.get("YEAR"))
+    total_benes = _to_int(enrollment_row.get("TOT_BENES"))
+    if not county_fips or year <= 0 or total_benes <= 0:
+        return
+    part_d_benes = max(
+        _to_int(enrollment_row.get("PRSCRPTN_DRUG_TOT_BENES")),
+        0,
+    )
+    current = enrollment_by_county.setdefault(
+        (county_fips, year),
+        {"total_beneficiaries": 0, "part_d_beneficiaries": 0},
+    )
+    current["total_beneficiaries"] += total_benes
+    current["part_d_beneficiaries"] += part_d_benes
+
+
+async def _fetch_county_enrollment(
+    client,
+    api_url: str,
+    latest_year: int,
+    *,
+    page_size: int,
+    test_row_limit: int | None,
+) -> dict[tuple[str, int], dict[str, int]]:
+    """Fetch and aggregate annual enrollment pages for one source year."""
+
+    enrollment_by_county: dict[tuple[str, int], dict[str, int]] = {}
+    offset = 0
+    while True:
+        query = urllib.parse.urlencode(
+            {
+                "size": str(page_size),
+                "offset": str(offset),
+                "sort": "-YEAR",
+                "filter[MONTH]": "Year",
+                "filter[BENE_GEO_LVL]": "County",
+                "filter[YEAR]": str(latest_year),
+            }
+        )
+        async with client.get(f"{api_url}?{query}", timeout=60) as response:
+            if response.status != 200:
+                raise ValueError(
+                    "Medicare Monthly Enrollment API returned "
+                    f"HTTP {response.status} at offset {offset}"
+                )
+            enrollment_rows = await response.json(content_type=None)
+        if not enrollment_rows:
+            return enrollment_by_county
+        for enrollment_row in enrollment_rows:
+            _merge_county_enrollment(enrollment_by_county, enrollment_row)
+            if (
+                test_row_limit is not None
+                and len(enrollment_by_county) >= test_row_limit
+            ):
+                return enrollment_by_county
+        offset += len(enrollment_rows)
+
+
+def _county_rows(
+    enrollment_by_county: dict[tuple[str, int], dict[str, int]],
+    updated_at: datetime.datetime,
+) -> list[dict]:
+    """Project the county aggregate into stable staged rows."""
+
+    return [
+        {
+            "county_fips": county_fips,
+            "year": year,
+            "part_d_beneficiaries": int(
+                county_totals.get("part_d_beneficiaries", 0) or 0
+            ),
+            "total_beneficiaries": int(
+                county_totals.get("total_beneficiaries", 0) or 0
+            ),
+            "updated_at": updated_at,
+        }
+        for (county_fips, year), county_totals in sorted(
+            enrollment_by_county.items()
+        )
+    ]
+
+
+def _zip_rows(
+    county_rows: list[dict],
+    county_zip_weights: dict[str, list[tuple[str, int]]],
+    updated_at: datetime.datetime,
+) -> tuple[list[dict], int]:
+    """Allocate county totals into ZIP rows and count missing counties."""
+
+    totals_by_zip: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {"total_beneficiaries": 0, "part_d_beneficiaries": 0}
+    )
+    unmatched_counties = 0
+    for county_row in county_rows:
+        zip_weights = county_zip_weights.get(county_row["county_fips"])
+        if not zip_weights:
+            unmatched_counties += 1
+            continue
+        total_by_zip = _allocate_by_weights(
+            county_row["total_beneficiaries"], zip_weights
+        )
+        part_d_by_zip = _allocate_by_weights(
+            county_row["part_d_beneficiaries"], zip_weights
+        )
+        for zip_code, total_value in total_by_zip.items():
+            totals = totals_by_zip[(zip_code, county_row["year"])]
+            totals["total_beneficiaries"] += total_value
+            totals["part_d_beneficiaries"] += part_d_by_zip.get(zip_code, 0)
+    zip_rows = [
+        {
+            "zcta_code": zip_code,
+            "year": year,
+            "part_d_beneficiaries": int(totals["part_d_beneficiaries"]),
+            "total_beneficiaries": int(totals["total_beneficiaries"]),
+            "updated_at": updated_at,
+        }
+        for (zip_code, year), totals in sorted(totals_by_zip.items())
+    ]
+    return zip_rows, unmatched_counties
+
+
+async def _push_batches(rows: list[dict], batch_size: int, stage_cls) -> None:
+    for start in range(0, len(rows), batch_size):
+        await push_objects(rows[start:start + batch_size], stage_cls)
+
+
 async def process_medicare_enrollment_data(ctx, task=None):
     """Load Medicare enrollment source data into staging."""
     task = task or {}
-    ctx.setdefault("context", {})
-
+    context = ctx.setdefault("context", {})
     if "test_mode" in task:
-        ctx["context"]["test_mode"] = bool(task.get("test_mode"))
-    test_mode = bool(ctx["context"].get("test_mode", False))
-
+        context["test_mode"] = bool(task.get("test_mode"))
+    test_mode = bool(context.get("test_mode", False))
     await ensure_database(test_mode)
 
     import_date = ctx["import_date"]
@@ -308,12 +439,10 @@ async def process_medicare_enrollment_data(ctx, task=None):
     zip_stage_cls = make_class(MedicareEnrollmentStats, import_date)
     batch_size = int(os.getenv("HLTHPRT_MEDICARE_ENROLLMENT_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
     page_size = int(os.getenv("HLTHPRT_MEDICARE_ENROLLMENT_PAGE_SIZE", str(DEFAULT_PAGE_SIZE)))
-    test_row_limit = int(os.getenv("HLTHPRT_MEDICARE_ENROLLMENT_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
+    row_limit = int(os.getenv("HLTHPRT_MEDICARE_ENROLLMENT_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
 
     import aiohttp
     client = aiohttp.ClientSession()
-    latest_year = 0
-    enrollment_by_county: dict[tuple[str, int], dict[str, int]] = {}
     try:
         api_url = await _resolve_enrollment_api_url(client)
         latest_year = await _resolve_latest_annual_year(client, api_url)
@@ -322,115 +451,32 @@ async def process_medicare_enrollment_data(ctx, task=None):
             api_url,
             latest_year,
         )
-
-        offset = 0
-        while True:
-            query_params_by_field = {
-                "size": str(page_size),
-                "offset": str(offset),
-                "sort": "-YEAR",
-                "filter[MONTH]": "Year",
-                "filter[BENE_GEO_LVL]": "County",
-                "filter[YEAR]": str(latest_year),
-            }
-            query = urllib.parse.urlencode(query_params_by_field)
-            async with client.get(f"{api_url}?{query}", timeout=60) as response:
-                if response.status != 200:
-                    raise ValueError(
-                        f"Medicare Monthly Enrollment API returned HTTP {response.status} "
-                        f"at offset {offset}"
-                    )
-                enrollment_rows = await response.json(content_type=None)
-
-            if not enrollment_rows:
-                break
-
-            for enrollment_row in enrollment_rows:
-                county_fips = _normalize_fips(enrollment_row.get("BENE_FIPS_CD"))
-                if not county_fips:
-                    continue
-
-                year = _to_int(enrollment_row.get("YEAR"))
-                total_benes = _to_int(enrollment_row.get("TOT_BENES"))
-                part_d_benes = _to_int(enrollment_row.get("PRSCRPTN_DRUG_TOT_BENES"))
-
-                if year <= 0 or total_benes <= 0:
-                    continue
-
-                key = (county_fips, year)
-                current = enrollment_by_county.get(key)
-                if current is None:
-                    enrollment_by_county[key] = {
-                        "total_beneficiaries": total_benes,
-                        "part_d_beneficiaries": max(part_d_benes, 0),
-                    }
-                else:
-                    current["total_beneficiaries"] += total_benes
-                    current["part_d_beneficiaries"] += max(part_d_benes, 0)
-
-                if test_mode and len(enrollment_by_county) >= test_row_limit:
-                    break
-
-            if test_mode and len(enrollment_by_county) >= test_row_limit:
-                break
-            offset += len(enrollment_rows)
+        enrollment_by_county = await _fetch_county_enrollment(
+            client,
+            api_url,
+            latest_year,
+            page_size=page_size,
+            test_row_limit=row_limit if test_mode else None,
+        )
     finally:
         await client.close()
 
-    now = datetime.datetime.utcnow()
-    county_rows = []
-    for (county_fips, year), county_totals in sorted(enrollment_by_county.items()):
-        county_rows.append(
-            {
-                "county_fips": county_fips,
-                "year": year,
-                "part_d_beneficiaries": int(county_totals.get("part_d_beneficiaries", 0) or 0),
-                "total_beneficiaries": int(county_totals.get("total_beneficiaries", 0) or 0),
-                "updated_at": now,
-            }
-        )
-    for idx in range(0, len(county_rows), batch_size):
-        await push_objects(county_rows[idx: idx + batch_size], county_stage_cls)
-
+    updated_at = datetime.datetime.utcnow()
+    county_rows = _county_rows(enrollment_by_county, updated_at)
+    await _push_batches(county_rows, batch_size, county_stage_cls)
     county_zip_weights = await _load_county_zip_weights(test_mode=test_mode)
-    zip_agg: dict[tuple[str, int], dict[str, int]] = defaultdict(
-        lambda: {"total_beneficiaries": 0, "part_d_beneficiaries": 0}
+    zip_rows, unmatched_counties = _zip_rows(
+        county_rows,
+        county_zip_weights,
+        updated_at,
     )
-    unmatched_counties = 0
-    for county_row in county_rows:
-        county_fips = county_row["county_fips"]
-        year = county_row["year"]
-        zip_weights = county_zip_weights.get(county_fips)
-        if not zip_weights:
-            unmatched_counties += 1
-            continue
+    await _push_batches(zip_rows, batch_size, zip_stage_cls)
 
-        total_alloc = _allocate_by_weights(county_row["total_beneficiaries"], zip_weights)
-        partd_alloc = _allocate_by_weights(county_row["part_d_beneficiaries"], zip_weights)
-        for zip_code, total_value in total_alloc.items():
-            key = (zip_code, year)
-            zip_agg[key]["total_beneficiaries"] += total_value
-            zip_agg[key]["part_d_beneficiaries"] += partd_alloc.get(zip_code, 0)
-
-    zip_rows = []
-    for (zip_code, year), zip_totals in sorted(zip_agg.items()):
-        zip_rows.append(
-            {
-                "zcta_code": zip_code,
-                "year": year,
-                "part_d_beneficiaries": int(zip_totals["part_d_beneficiaries"]),
-                "total_beneficiaries": int(zip_totals["total_beneficiaries"]),
-                "updated_at": now,
-            }
-        )
-    for idx in range(0, len(zip_rows), batch_size):
-        await push_objects(zip_rows[idx: idx + batch_size], zip_stage_cls)
-
-    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-    ctx["context"]["latest_year"] = latest_year
-    ctx["context"]["county_rows"] = len(county_rows)
-    ctx["context"]["zip_rows"] = len(zip_rows)
-    ctx["context"]["unmatched_counties"] = unmatched_counties
+    context["run"] = context.get("run", 0) + 1
+    context["latest_year"] = latest_year
+    context["county_rows"] = len(county_rows)
+    context["zip_rows"] = len(zip_rows)
+    context["unmatched_counties"] = unmatched_counties
     logger.info(
         "Medicare Enrollment import done: county_rows=%d zip_rows=%d unmatched_counties=%d",
         len(county_rows),

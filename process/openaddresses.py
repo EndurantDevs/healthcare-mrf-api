@@ -1907,15 +1907,10 @@ def _emit_zip_restore_progress(
     enqueue_live_progress(**progress_event_by_name)
 
 
-def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recovery_table: str) -> str:
-    """Build the spatial ZIP restoration insert query."""
-    stage = _qtable(schema, stage_table)
-    recovery = _qtable(schema, recovery_table)
-    qschema = _quote_ident(schema)
-    return f"""
+_OPENADDRESSES_ZIP_RESTORE_INSERT_SQL = """
         WITH shard AS (
             SELECT *
-              FROM {recovery}
+              FROM {recovery_table}
              WHERE restore_bucket = :restore_bucket
         ),
         matches AS (
@@ -1926,7 +1921,7 @@ def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recover
               JOIN tiger.zcta5 AS z
                 ON z.the_geom && ST_SetSRID(ST_Point(r.long::double precision, r.lat::double precision), 4269)
                AND ST_Covers(z.the_geom, ST_SetSRID(ST_Point(r.long::double precision, r.lat::double precision), 4269))
-              JOIN {qschema}.geo_zip_lookup AS g
+              JOIN {schema}.geo_zip_lookup AS g
                 ON g.zip_code = z.zcta5ce
                AND g.state = r.state_code
         ),
@@ -1953,7 +1948,7 @@ def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recover
              GROUP BY raw_hash
             HAVING count(DISTINCT restored_zip5) = 1
         )
-        INSERT INTO {stage} (
+        INSERT INTO {stage_table} (
             row_hash,
             address_key,
             identity_key,
@@ -1989,8 +1984,8 @@ def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recover
                 to_char(lat, 'FM999999990.00000000'),
                 to_char(long, 'FM999999990.00000000')
             ), 'UTF8')), 'hex') AS row_hash,
-            {qschema}.addr_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS address_key,
-            {qschema}.addr_identity_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS identity_key,
+            {schema}.addr_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS address_key,
+            {schema}.addr_identity_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS identity_key,
             house_number,
             street_match_key,
             street_name,
@@ -2018,6 +2013,19 @@ def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recover
           FROM winners
         ON CONFLICT (row_hash) DO NOTHING;
     """
+
+
+def _openaddresses_zip_restore_insert_sql(
+    schema: str,
+    stage_table: str,
+    recovery_table: str,
+) -> str:
+    """Build the spatial ZIP restoration insert query."""
+    return _OPENADDRESSES_ZIP_RESTORE_INSERT_SQL.format(
+        schema=_quote_ident(schema),
+        stage_table=_qtable(schema, stage_table),
+        recovery_table=_qtable(schema, recovery_table),
+    )
 
 
 async def _is_zip_restore_ready(schema: str, recovery_table: str) -> bool:
