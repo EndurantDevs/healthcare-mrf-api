@@ -17660,13 +17660,19 @@ def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps
     assert "provider_directory_candidate_status" not in metadata
     assert importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY not in metadata
     assert metadata["provider_directory_resource_page_count_caps"] == {
-        resource_type: 25 if resource_type == "PractitionerRole" else 100
-        for resource_type in sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)
+        "Location": 100,
+        "Organization": 100,
+        "OrganizationAffiliation": 100,
+        "Practitioner": 10,
+        "PractitionerRole": 25,
     }
     assert importer._resource_start_url(source_row, "InsurancePlan", page_count=100) is None
     assert importer._resource_start_url(source_row, "Endpoint", page_count=100) is None
     assert importer._resource_start_url(source_row, "PractitionerRole", page_count=100) == (
         f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=25"
+    )
+    assert importer._resource_start_url(source_row, "Practitioner", page_count=100) == (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=10"
     )
     assert importer._resource_start_url(source_row, "Location", page_count=500) == (
         f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
