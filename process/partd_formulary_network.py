@@ -1010,44 +1010,7 @@ async def _drop_legacy_partd_tables(schema: str) -> None:
     for table_name in LEGACY_PARTD_TABLES:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{table_name} CASCADE;")
 
-async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
-    """Replace one canonical activity snapshot from staged rows."""
-    canonical_table = f"{schema}.{PartDPharmacyActivity.__tablename__}"
-    stage_table = f"{schema}.{PartDPharmacyActivityStage.__tablename__}"
-    await _fill_activity_address_from_npi(schema, PartDPharmacyActivityStage.__tablename__)
-    await _fill_activity_state_from_zip(schema, PartDPharmacyActivityStage.__tablename__)
-    if source_enabled("partd"):
-        address_field_map = {
-            "first_line": "address_line1",
-            "second_line": "address_line2",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        }
-        await stamp_address_keys(
-            PartDPharmacyActivityStage.__tablename__,
-            address_field_map,
-            schema=schema,
-        )
-        stats = await resolve_into_archive(
-            PartDPharmacyActivityStage.__tablename__,
-            address_field_map,
-            source_bit=64,
-            priority=7,
-            schema=schema,
-            strict_source_predicate=(
-                "strict_source.address_observed_in_source IS TRUE"
-            ),
-        )
-        print(f"Part D pharmacy activity canonical address resolve complete: {stats}")
-
-    await db.status(
-        f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
-        snapshot_id=snapshot_id,
-    )
-    await db.status(
-        f"""
+_ACTIVITY_SNAPSHOT_SQL = """
         INSERT INTO {canonical_table} (
             canonical_id,
             snapshot_id,
@@ -1256,7 +1219,50 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             plan_ids,
             address_key
         FROM grouped;
-        """,
+        """
+
+
+async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
+    """Replace one canonical activity snapshot from staged rows."""
+    canonical_table = f"{schema}.{PartDPharmacyActivity.__tablename__}"
+    stage_table = f"{schema}.{PartDPharmacyActivityStage.__tablename__}"
+    await _fill_activity_address_from_npi(schema, PartDPharmacyActivityStage.__tablename__)
+    await _fill_activity_state_from_zip(schema, PartDPharmacyActivityStage.__tablename__)
+    if source_enabled("partd"):
+        address_field_map = {
+            "first_line": "address_line1",
+            "second_line": "address_line2",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "'US'",
+        }
+        await stamp_address_keys(
+            PartDPharmacyActivityStage.__tablename__,
+            address_field_map,
+            schema=schema,
+        )
+        stats = await resolve_into_archive(
+            PartDPharmacyActivityStage.__tablename__,
+            address_field_map,
+            source_bit=64,
+            priority=7,
+            schema=schema,
+            strict_source_predicate=(
+                "strict_source.address_observed_in_source IS TRUE"
+            ),
+        )
+        print(f"Part D pharmacy activity canonical address resolve complete: {stats}")
+
+    await db.status(
+        f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
+        snapshot_id=snapshot_id,
+    )
+    await db.status(
+        _ACTIVITY_SNAPSHOT_SQL.format(
+            canonical_table=canonical_table,
+            stage_table=stage_table,
+        ),
         snapshot_id=snapshot_id,
     )
     await db.status(
@@ -1324,17 +1330,7 @@ async def _fill_activity_state_from_zip(schema: str, table_name: str) -> None:
         """
     )
 
-async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
-    """Replace one canonical pricing snapshot from staged rows."""
-    canonical_table = f"{schema}.{PartDMedicationCost.__tablename__}"
-    stage_table = f"{schema}.{PartDMedicationCostStage.__tablename__}"
-    await db.status(f"ANALYZE {stage_table};")
-    await db.status(
-        f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
-        snapshot_id=snapshot_id,
-    )
-    await db.status(
-        f"""
+_PRICING_SNAPSHOT_SQL = """
         INSERT INTO {canonical_table} (
             canonical_id,
             snapshot_id,
@@ -1438,7 +1434,23 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
             source_type,
             plan_ids
         FROM grouped;
-        """,
+        """
+
+
+async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
+    """Replace one canonical pricing snapshot from staged rows."""
+    canonical_table = f"{schema}.{PartDMedicationCost.__tablename__}"
+    stage_table = f"{schema}.{PartDMedicationCostStage.__tablename__}"
+    await db.status(f"ANALYZE {stage_table};")
+    await db.status(
+        f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
+        snapshot_id=snapshot_id,
+    )
+    await db.status(
+        _PRICING_SNAPSHOT_SQL.format(
+            canonical_table=canonical_table,
+            stage_table=stage_table,
+        ),
         snapshot_id=snapshot_id,
     )
     await db.status(
