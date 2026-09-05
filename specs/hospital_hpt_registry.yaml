@@ -3648,6 +3648,7 @@ hospitals:
 - hospital_id: hospital-001078
   name: Cardiovascular Care of York Hospital
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-001079
   name: CareOne at Hackensack University Medical Center- Pascack Valley
   cms_hpt_url: https://www.care-one.com/cms-hpt.txt
@@ -15123,6 +15124,7 @@ hospitals:
 - hospital_id: hospital-004517
   name: Neurology Associates of York Hospital
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-004518
   name: NeuroPsychiatric Hospital of Indianapolis, LLC
   cms_hpt_url: https://www.neuropsychiatrichospitals.net/cms-hpt.txt
@@ -23463,6 +23465,7 @@ hospitals:
 - hospital_id: hospital-007046
   name: Webhannet Internal Medicine Associates of York Hospital
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007047
   name: Webster Memorial Hospital
   cms_hpt_url: https://davishealthsystem.org/cms-hpt.txt
@@ -24070,33 +24073,43 @@ hospitals:
 - hospital_id: hospital-007242
   name: York Hospital at Long Sands
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007243
   name: York Hospital in Berwick
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007244
   name: York Hospital in Kittery
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007245
   name: York Hospital In Kittery, Route 1
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007246
   name: York Hospital in Sanford
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007247
   name: York Hospital in South Berwick
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007248
   name: York Hospital in Wells
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007249
   name: York Hospital Walk-in Care
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007250
   name: York Hospital-Artin S. Ulan Building
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007251
   name: York Hospital-Henry Warner Jr. Building
   cms_hpt_url: https://www.yorkhospital.com/cms-hpt.txt
+  alias_of: hospital-007241
 - hospital_id: hospital-007252
   name: Yuma Disctrict_ Hospital
   cms_hpt_url: https://yumahospital.org/cms-hpt.txt
