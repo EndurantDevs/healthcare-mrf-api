@@ -1,3 +1,5 @@
+include!("tests_historical_csv.rs");
+
 fn csv_fixture_records(payload: &[u8]) -> Vec<Vec<String>> {
     ReaderBuilder::new()
         .has_headers(false)
