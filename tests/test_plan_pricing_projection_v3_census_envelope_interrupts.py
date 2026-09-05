@@ -25,6 +25,8 @@ source "$1"
 require_command() { :; }
 verify_reviewed_hashes() { :; }
 verify_source_and_target() { :; }
+open_reviewed_arc_descriptor() { :; }
+arc_acquisition() { :; }
 start_lock() { :; }; require_lock_held() { :; }
 create_quota() { :; }; prove_quota_admission() { :; }
 wait_for_arc_idle() { :; }; set_import_drain() { :; }

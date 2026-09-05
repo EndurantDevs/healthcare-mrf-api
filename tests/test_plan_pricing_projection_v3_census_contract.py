@@ -135,6 +135,7 @@ def _successful_envelope(receipt_by_field: dict) -> dict:
             "policy_removed": True,
             "drain_restored": True,
             "quota_removed": True,
+            "arc_capacity_restored": True,
             "lock_released": True,
             "complete": True,
         },

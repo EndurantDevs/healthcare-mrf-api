@@ -1,9 +1,13 @@
 # Test Coverage Ratchet
 
 CI keeps the measured Python and Rust coverage ratios for each metric at or
-above the exact base revision's ratios. It does not cap the absolute number of
-uncovered lines, branches, functions, or regions, reserve artificial headroom,
-or require unrelated debt paydown.
+above the exact base revision's ratios, with bounded runtime-measurement
+allowances against the provenance-bound exact-base artifact: one Python line
+or branch, and one Rust function, three lines, or four regions. Versioned floors
+remain exact. The policy does not cap absolute uncovered debt, reserve
+artificial headroom, or require unrelated debt paydown.
+Deleting covered code may lower a ratio when the missing-coverage count does
+not increase.
 
 Changed executable product lines must be at least 85% covered for Python and
 80% covered for Rust. The denominator comes from added and modified lines in

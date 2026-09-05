@@ -19,6 +19,49 @@ if name == "timeout":
     command_path = args[command_index]
     command = Path(command_path).name
     forwarded = args[command_index + 1:]
+    if (command == "python3" and len(forwarded) >= 5
+            and forwarded[:2] == ["-", "run-reviewed-arc"]
+            and forwarded[2] in {"/dev/fd/8", "/proc/self/fd/8"}
+            and len(forwarded[3]) == 64
+            and forwarded[4] in {"hold", "verify", "identity", "restore"}):
+        phase = forwarded[4]
+        event("arc_" + phase)
+        if phase == "hold":
+            resource_path("arc-held").touch()
+        if phase == "restore" and resource_path("quota").exists():
+            raise SystemExit("ARC capacity restored while quota remained")
+        if phase == "identity" and (
+                resource_path("arc-interrupted").exists()
+                or not resource_path("arc-held").exists()):
+            raise SystemExit(1)
+        if os.environ.get("FAKE_ARC_FAIL") == phase:
+            raise SystemExit(1)
+        if phase == "verify" and os.environ.get("FAKE_ARC_FAIL_AFTER_CHILD") == "1" and "child" in events.read_text().splitlines():
+            raise SystemExit(1)
+        if os.environ.get("FAKE_ARC_WAIT_PHASE") == phase:
+            helper_pid = os.fork()
+            if helper_pid == 0:
+                if phase == "hold":
+                    resource_path("arc-interrupted").touch()
+                if os.environ.get("FAKE_ARC_IGNORE_SIGNAL") == "1":
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                else:
+                    def finish(number, _frame):
+                        event("arc_" + phase + "_signal_" + str(number))
+                        resource_path("arc-interrupted").touch()
+                        raise SystemExit(128 + number)
+                    signal.signal(signal.SIGTERM, finish); signal.signal(signal.SIGINT, finish)
+                resource_path("arc-helper-pid").write_text(str(os.getpid()))
+                event("arc_" + phase + "_ready")
+                while True: signal.pause()
+            _, wait_status = os.waitpid(helper_pid, 0)
+            raise SystemExit(os.waitstatus_to_exitcode(wait_status))
+        if phase == "restore":
+            resource_path("arc-held").unlink(missing_ok=True)
+        raise SystemExit(0)
+    if command == "python3" and forwarded[:2] == ["-", "reviewed-arc-copy"]:
+        os.execvp(command_path, [command_path, *forwarded])
     if command == "python3" and forwarded[:2] == ["-", "reviewed-child-copy"]:
         mode = os.environ.get("FAKE_REPLACE_CHILD_DURING_COPY")
         if mode:
@@ -63,6 +106,8 @@ elif name == "git":
             root.symlink_to(os.environ["FAKE_OUTSIDE_STATE_ROOT"], target_is_directory=True)
             event("state_root_replaced")
         print(os.environ["FAKE_SOURCE_SHA"])
+    elif "show" in args:
+        sys.stdout.buffer.write(Path(os.environ["FAKE_REVIEWED_ARC_HELPER"]).read_bytes())
 elif name == "sleep": time.sleep(min(float(args[0]), 0.01))
 elif name == "systemd-run":
     event("lock_create")
@@ -102,18 +147,28 @@ elif name == "systemctl":
     elif operation == "reset-failed":
         pass
 elif name == "setsid":
+    if os.environ.get("FAKE_ARC_SETSID_DELAY"):
+        event("arc_setsid_waiting")
+        time.sleep(float(os.environ["FAKE_ARC_SETSID_DELAY"]))
     os.setsid()
-    if os.environ.get("FAKE_REPLACE_CHILD_AT_SETSID") == "1":
+    is_census_child = args[0] in {"/dev/fd/9", "/proc/self/fd/9"}
+    if is_census_child and os.environ.get("FAKE_REPLACE_CHILD_AT_SETSID") == "1":
         child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
         replacement = child.with_suffix(".replacement")
         replacement.write_text("#!/bin/sh\nexit 0\n"); replacement.chmod(0o755)
         os.replace(replacement, child)
         event("child_executable_replaced_at_setsid")
-    if os.environ.get("FAKE_MUTATE_CHILD_IN_PLACE_AT_SETSID") == "1":
+    if is_census_child and os.environ.get("FAKE_MUTATE_CHILD_IN_PLACE_AT_SETSID") == "1":
         child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
         child.write_text("#!/bin/sh\nexit 0\n")
         event("child_executable_mutated_in_place_at_setsid")
-    if args[0] in {"/dev/fd/9", "/proc/self/fd/9"}:
+    if is_census_child:
+        try:
+            os.fstat(8)
+        except OSError:
+            pass
+        else:
+            raise SystemExit("ARC helper descriptor leaked to census child")
         os.lseek(9, 0, os.SEEK_SET)
         source = os.fdopen(os.dup(9), encoding="utf-8").read()
         sys.argv = [os.environ["FAKE_CHILD_EXECUTABLE"], *args[1:]]

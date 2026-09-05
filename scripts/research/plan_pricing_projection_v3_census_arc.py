@@ -1,0 +1,650 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Own a temporary native ARC acquisition drain inside the census envelope."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SCHEMA = "healthporta.census.arc-drain.v1"
+OWNER_LABEL = "healthporta.com/task-owner"
+FENCE_RESOURCES = {
+    "policy": "validatingadmissionpolicies",
+    "binding": "validatingadmissionpolicybindings",
+}
+CAPACITY_KEYS = ("minRunners", "maxRunners")
+COUNT_KEYS = ("currentReplicas", "pendingEphemeralRunners", "runningEphemeralRunners")
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+def _capacity(spec: dict, *, defaults: bool = False) -> tuple[int, int]:
+    values = tuple(spec.get(key, 0 if defaults else None) for key in CAPACITY_KEYS)
+    _require(all(type(value) is int and value >= 0 for value in values), "ARC capacity must be explicit nonnegative integers")
+    _require(values[0] <= values[1], "ARC minimum exceeds maximum")
+    return values
+
+def _held_spec(spec: dict) -> dict:
+    return {**spec, "minRunners": 0, "maxRunners": 0}
+
+def _metadata_identity(item: dict) -> tuple:
+    meta = item["metadata"]
+    _require(all(meta.get(key) for key in ("name", "uid", "resourceVersion")), "Kubernetes resource identity is incomplete")
+    return tuple(meta.get(key) for key in ("namespace", "name", "uid", "generation", "resourceVersion"))
+
+def _is_controlled_by(item: dict, kind: str, uid: str) -> bool:
+    return any(ref.get("controller") is True and ref.get("kind") == kind
+               and ref.get("uid") == uid
+               for ref in item["metadata"].get("ownerReferences", []))
+
+def fence_manifests(owner: str, namespace: str) -> dict[str, dict]:
+    """Fence ASR capacity and membership while leaving native status updates allowed."""
+    name = f"hp-pv3-arc-{owner}.healthporta.com"
+    metadata = {"name": name, "labels": {OWNER_LABEL: owner}}
+    policy_spec_by_field = {
+        "failurePolicy": "Fail",
+        "matchConstraints": {
+            "matchPolicy": "Exact", "namespaceSelector": {}, "objectSelector": {},
+            "resourceRules": [{
+                "apiGroups": ["actions.github.com"], "apiVersions": ["v1alpha1"],
+                "operations": ["CREATE", "UPDATE", "DELETE"],
+                "resources": ["autoscalingrunnersets"], "scope": "Namespaced"}],
+        },
+        "matchConditions": [{"name": "exact-arc-namespace",
+                             "expression": f"request.namespace == '{namespace}'"}],
+        "validations": [{
+            "expression": "request.operation == 'UPDATE' && "
+                          "has(object.spec.minRunners) && has(object.spec.maxRunners) && "
+                          "object.spec.minRunners == 0 && object.spec.maxRunners == 0",
+            "message": f"hp-pv3-arc-deny-{owner}", "reason": "Forbidden"}],
+    }
+    binding_spec_by_field = {
+        "policyName": name, "validationActions": ["Deny"],
+        "matchResources": {
+            "matchPolicy": "Exact", "objectSelector": {},
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": namespace}}},
+    }
+    return {role: {"apiVersion": "admissionregistration.k8s.io/v1", "kind": kind,
+                   "metadata": metadata, "spec": spec}
+            for role, kind, spec in (("policy", "ValidatingAdmissionPolicy", policy_spec_by_field),
+                                     ("binding", "ValidatingAdmissionPolicyBinding", binding_spec_by_field))}
+
+
+class ArcDrain:
+    """Durable intent precedes each mutation; uncertain results retain the hold."""
+
+    def __init__(self, state: str | Path, owner: str, namespace: str = "arc-runners",
+                 deadline_seconds: int = 300):
+        _require(re.fullmatch(r"[a-z0-9][a-z0-9-]{6,30}[a-z0-9]", owner) is not None, "owner must be an 8-32 character DNS label")
+        _require(namespace == "arc-runners", "only the census ARC namespace is supported")
+        _require(type(deadline_seconds) is int and 0 < deadline_seconds <= 86400, "deadline must be 1-86400 seconds")
+        self.path, self.owner, self.namespace = Path(state), owner, namespace
+        self.deadline = time.monotonic() + deadline_seconds
+        self.manifests = fence_manifests(owner, namespace)
+        self.data: dict = {}
+        self.inode: tuple[int, int] | None = None
+
+    def _remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        _require(remaining > 0, "ARC acquisition drain deadline elapsed")
+        return remaining
+
+    def pause(self) -> None:
+        """Wait briefly without crossing the operation deadline."""
+        time.sleep(min(1, self._remaining()))
+
+    def kubectl(self, *args: str, payload=None, check: bool = True):
+        """Run one bounded API operation; never interpret an API error as absence."""
+        limit = min(25, self._remaining())
+        command_args = ["k3s", "kubectl", "--kubeconfig=/etc/rancher/k3s/k3s.yaml", f"--request-timeout={limit:.3f}s", *args]
+        result = subprocess.run(command_args, input=None if payload is None else json.dumps(payload),
+                                capture_output=True, text=True, timeout=limit, check=False)
+        if check:
+            _require(result.returncode == 0, f"kubectl failed: {result.stderr.strip()}")
+        return result
+
+    def _get(self, resource: str, name: str = "", *, namespace: str = "", optional=False):
+        args = ["get", resource, *([name] if name else [])]
+        args += ["-n", namespace] if namespace else []
+        args += ["--ignore-not-found"] if optional else []
+        text = self.kubectl(*args, "-o", "json").stdout.strip()
+        _require(bool(text) or optional, "Kubernetes returned no resource")
+        return json.loads(text) if text else None
+
+    def _save(self, *, create: bool = False) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if create:
+            fd, temporary = os.open(self.path, flags, 0o600), None
+        else:
+            observed = self.path.lstat()
+            _require((observed.st_dev, observed.st_ino) == self.inode, "ARC state identity changed")
+            fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w") as target:
+                json.dump(self.data, target, sort_keys=True, separators=(",", ":"))
+                target.write("\n")
+                target.flush()
+                os.fsync(target.fileno())
+            if temporary:
+                os.replace(temporary, self.path)
+            observed = self.path.lstat()
+            self.inode = (observed.st_dev, observed.st_ino)
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _load(self) -> None:
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as source:
+            observed = os.fstat(source.fileno())
+            _require(stat.S_ISREG(observed.st_mode) and observed.st_size <= 1024 * 1024
+                    and stat.S_IMODE(observed.st_mode) == 0o600
+                    and observed.st_uid == os.geteuid(), "ARC state is not a private regular file")
+            self.data = json.load(source)
+            self.inode = (observed.st_dev, observed.st_ino)
+        _require(self.data.get("schema") == SCHEMA and self.data.get("owner") == self.owner
+                and self.data.get("namespace") == self.namespace, "ARC state ownership/schema mismatch")
+        _require(all(type(self.data.get(key)) is bool for key in ("held", "restored")), "ARC state lifecycle flags are invalid")
+        rows = self.data.get("original", [])
+        _require(bool(rows) and len({row["name"] for row in rows}) == len(rows), "ARC original inventory is empty or duplicated")
+        for row in rows:
+            _capacity(row["spec"])
+            _require(row.get("uid") and row.get("resourceVersion")
+                    and type(row.get("generation")) is int, "ARC snapshot identity is incomplete")
+        _require(set(self.data["changes"]) == {row["name"] for row in rows}
+                and set(self.data["fences"]) == set(FENCE_RESOURCES), "ARC state inventory is invalid")
+
+    def _snapshot(self) -> list[dict]:
+        items = self._get("autoscalingrunnersets", namespace=self.namespace)["items"]
+        _require(bool(items), "ARC inventory is empty")
+        rows = []
+        for item in items:
+            _metadata_identity(item)
+            meta = item["metadata"]
+            _require(meta.get("namespace") == self.namespace and not meta.get("deletionTimestamp")
+                    and type(meta.get("generation")) is int, "ARC set is not live")
+            _capacity(item["spec"])
+            rows.append({key: meta[key] for key in ("name", "uid", "resourceVersion", "generation")} | {"spec": item["spec"]})
+        return sorted(rows, key=lambda row: row["name"])
+
+    def _asrs(self) -> dict[str, dict]:
+        items = self._get("autoscalingrunnersets", namespace=self.namespace)["items"]
+        by_name = {item["metadata"]["name"]: item for item in items}
+        _require(len(by_name) == len(items) == len(self.data["original"])
+                and set(by_name) == {row["name"] for row in self.data["original"]},
+                "ARC set inventory changed")
+        for row in self.data["original"]:
+            item = by_name[row["name"]]
+            _metadata_identity(item)
+            _require(item["metadata"]["uid"] == row["uid"]
+                    and item["metadata"].get("namespace") == self.namespace
+                    and not item["metadata"].get("deletionTimestamp")
+                    and type(item["metadata"].get("generation")) is int,
+                    "ARC set identity/liveness changed")
+            _require(_held_spec(item["spec"]) == _held_spec(row["spec"]), "ARC non-capacity specification changed")
+            _capacity(item["spec"])
+        return by_name
+
+    def _check_fence(self, role: str, item: dict, *, deleting: bool = False) -> str:
+        expected, meta = self.manifests[role], item.get("metadata", {})
+        _require(item.get("apiVersion") == expected["apiVersion"] and item.get("kind") == expected["kind"]
+                and meta.get("name") == expected["metadata"]["name"]
+                and meta.get("labels", {}).get(OWNER_LABEL) == self.owner
+                and (deleting or not meta.get("deletionTimestamp")) and bool(meta.get("uid"))
+                and item.get("spec") == expected["spec"], "ARC admission fence identity/spec changed")
+        return meta["uid"]
+
+    def _reconcile_fence_intents(self) -> None:
+        for role in self.data["fences"]:
+            while self.data["fences"][role]["phase"] == "intent":
+                item = self._get(
+                    FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True,
+                )
+                if item is None:
+                    try:
+                        self._create_fence(role)
+                    except RuntimeError:
+                        self.pause()
+                    continue
+                self.data["fences"][role] = {
+                    "phase": "present", "uid": self._check_fence(role, item),
+                }
+                self._save()
+
+    def _reconcile_cleanup_intents(self) -> None:
+        for role, fence_state in self.data["fences"].items():
+            if fence_state["phase"] != "delete_intent":
+                continue
+            fence_resource = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
+            if fence_resource is None:
+                self.data["fences"][role]["phase"] = "deleted"
+                self._save()
+                continue
+            metadata = fence_resource["metadata"]
+            _require(self._check_fence(role, fence_resource, deleting=True) == fence_state.get("uid"),
+                    "ARC admission fence UID changed during deletion")
+            resource_version = metadata.get("resourceVersion")
+            _require(isinstance(fence_state.get("resourceVersion"), str) and fence_state["resourceVersion"],
+                    "ARC deletion intent resource version is invalid")
+            if not metadata.get("deletionTimestamp"):
+                _require(resource_version == fence_state["resourceVersion"],
+                        "ARC admission fence changed after deletion intent")
+                continue
+            _require(resource_version != fence_state["resourceVersion"],
+                    "ARC admission deletion state is ambiguous")
+            while fence_resource is not None:
+                _require(self._check_fence(role, fence_resource, deleting=True) == fence_state["uid"]
+                        and fence_resource["metadata"].get("deletionTimestamp"),
+                        "ARC admission fence changed during deletion")
+                self.pause()
+                fence_resource = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
+            self.data["fences"][role]["phase"] = "deleted"
+            self._save()
+        asrs = self._asrs()
+        for original_asr in self.data["original"]:
+            capacity_change = self.data["changes"][original_asr["name"]]
+            current_asr = asrs[original_asr["name"]]
+            generation = current_asr["metadata"]["generation"]
+            if capacity_change["phase"] != "restore_intent":
+                continue
+            intent_generation = capacity_change.get("generation")
+            _require(type(intent_generation) is int, "ARC restore intent generation is invalid")
+            if current_asr["spec"] == _held_spec(original_asr["spec"]):
+                _require(generation == intent_generation,
+                        "ARC held capacity generation changed after restore intent")
+            elif current_asr["spec"] == original_asr["spec"]:
+                _require(generation == intent_generation + 1,
+                        "ARC restored capacity response is ambiguous")
+                self.data["changes"][original_asr["name"]]["phase"] = "restored"
+                self._save()
+            else:
+                raise RuntimeError("ARC capacity changed after restore intent")
+
+    def _reconcile_drain_intents(self) -> None:
+        asrs = self._asrs()
+        for original_asr in self.data["original"]:
+            name = original_asr["name"]
+            capacity_change = self.data["changes"][name]
+            if capacity_change["phase"] != "intent":
+                continue
+            intent_generation = capacity_change.get("generation")
+            _require(type(intent_generation) is int, "ARC drain intent generation is invalid")
+            current_asr = asrs[name]
+            generation = current_asr["metadata"]["generation"]
+            if (current_asr["spec"] == original_asr["spec"]
+                    and generation == intent_generation):
+                self.data["changes"][name]["phase"] = "restored"
+            elif (current_asr["spec"] == _held_spec(original_asr["spec"])
+                    and generation == intent_generation + 1):
+                self.data["changes"][name] = {
+                    "phase": "confirmed", "resourceVersion": current_asr["metadata"]["resourceVersion"],
+                }
+            else:
+                raise RuntimeError("ARC capacity changed after drain intent")
+            self._save()
+
+    def identity(self, *, restoring: bool = False) -> dict:
+        """Reject uncertain mutations or drift in the captured resource identities."""
+        self._load()
+        self._reconcile_fence_intents()
+        self._reconcile_drain_intents()
+        if restoring:
+            self._reconcile_cleanup_intents()
+        self._asrs()
+        for role, record in self.data["fences"].items():
+            allowed_fence_phases = {"no_attempt", "present", "deleted"}
+            if restoring:
+                allowed_fence_phases.add("delete_intent")
+            _require(record["phase"] in allowed_fence_phases, "ARC admission mutation result is uncertain")
+            item = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
+            if record["phase"] in {"present", "delete_intent"}:
+                _require(item is not None and self._check_fence(role, item) == record["uid"],
+                        "ARC admission fence UID changed or disappeared")
+                if record["phase"] == "delete_intent":
+                    _require(item["metadata"].get("resourceVersion") == record["resourceVersion"],
+                            "ARC admission fence changed after deletion intent")
+            else:
+                _require(item is None, "unexpected ARC admission fence exists")
+        allowed_changes = {"no_attempt", "confirmed", "restored"}
+        if restoring:
+            allowed_changes.add("restore_intent")
+        _require(all(record["phase"] in allowed_changes
+                    for record in self.data["changes"].values()), "ARC capacity mutation result is uncertain")
+        return self.data
+
+    def _create_fence(self, role: str) -> None:
+        self.data["fences"][role] = {"phase": "intent"}
+        self._save()
+        item = json.loads(self.kubectl("create", "-f", "-", "-o", "json", payload=self.manifests[role]).stdout)
+        self.data["fences"][role] = {"phase": "present", "uid": self._check_fence(role, item)}
+        self._save()
+
+    def _patch_capacity(self, item: dict, spec: dict, *, dry_run=False, check=True):
+        meta = item["metadata"]
+        patch_operations = [{"op": "test", "path": f"/metadata/{key}", "value": meta[key]} for key in ("uid", "resourceVersion")]
+        patch_operations += [{"op": "test", "path": "/spec", "value": item["spec"]}]
+        patch_operations += [{"op": "test", "path": f"/spec/{key}", "value": item["spec"][key]}
+                  for key in CAPACITY_KEYS]
+        patch_operations += [{"op": "replace", "path": f"/spec/{key}", "value": spec[key]}
+                  for key in CAPACITY_KEYS]
+        args = ["patch", "autoscalingrunnersets", meta["name"], "-n", self.namespace,
+                "--type=json", "-p", json.dumps(patch_operations), "-o", "json"]
+        args += ["--dry-run=server"] if dry_run else []
+        return self.kubectl(*args, check=check)
+
+    def _prove_admission(self) -> None:
+        marker = f"hp-pv3-arc-deny-{self.owner}"
+        while True:
+            self.identity()
+            item = self._asrs()[self.data["original"][0]["name"]]
+            probe_spec_by_field = {**item["spec"], "minRunners": 0, "maxRunners": 1}
+            result = self._patch_capacity(item, probe_spec_by_field, dry_run=True, check=False)
+            if result.returncode:
+                _require(re.search(rf"(?<![-\w]){re.escape(marker)}(?![-\w])", result.stderr) is not None,
+                        "ARC dry-run did not return the exact owner denial marker")
+                self.identity()
+                return
+            self.pause()
+
+    def _zero(self, row: dict) -> None:
+        item = self._asrs()[row["name"]]
+        _require(item["spec"] == row["spec"], "ARC capacity changed before owned drain")
+        if _capacity(row["spec"]) == (0, 0):
+            return
+        self.data["changes"][row["name"]] = {
+            "phase": "intent", "resourceVersion": item["metadata"]["resourceVersion"],
+            "generation": item["metadata"]["generation"],
+        }
+        self._save()
+        result = json.loads(self._patch_capacity(item, _held_spec(row["spec"])).stdout)
+        _require(result["metadata"]["uid"] == row["uid"] and result["spec"] == _held_spec(row["spec"]),
+                "ARC drain mutation response is ambiguous")
+        self.data["changes"][row["name"]] = {"phase": "confirmed", "resourceVersion": result["metadata"]["resourceVersion"]}
+        self._save()
+
+    def hold(self) -> dict:
+        """Create an owned admission fence and drain the native ARC controllers."""
+        original = self._snapshot()
+        self.data = {"schema": SCHEMA, "owner": self.owner, "namespace": self.namespace,
+                     "original": original, "held": False, "restored": False,
+                     "fences": {role: {"phase": "no_attempt"} for role in FENCE_RESOURCES},
+                     "changes": {row["name"]: {"phase": "no_attempt"} for row in original}}
+        self._save(create=True)
+        self.identity()
+        for role in FENCE_RESOURCES:
+            self._create_fence(role)
+        self._prove_admission()
+        for row in original:
+            self.identity()
+            self._zero(row)
+        self._stable(held=True)
+        self.data["held"] = True
+        self._save()
+        return self.data
+
+    def _linked_topology_resources(self, asrs: dict[str, dict]) -> tuple | None:
+        inventory = json.loads(self.kubectl("get", "autoscalinglisteners,ephemeralrunnersets", "-A", "-o", "json").stdout)["items"]
+        pods = json.loads(self.kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
+        all_listeners = [resource for resource in inventory
+                         if resource["kind"] == "AutoscalingListener"]
+        listeners = [resource for resource in all_listeners
+                     if resource["spec"].get("autoscalingRunnerSetNamespace") == self.namespace]
+        sets = [resource for resource in inventory if resource["kind"] == "EphemeralRunnerSet"
+                and resource["metadata"].get("namespace") == self.namespace]
+        if len(listeners) != len(asrs) or len(sets) != len(asrs):
+            return None
+        seen, selected = set(), []
+        for listener in listeners:
+            name = listener["spec"].get("autoscalingRunnerSetName")
+            if name not in asrs or name in seen:
+                return None
+            seen.add(name)
+            linked = self._listener_graph(listener, asrs[name], sets, pods)
+            if linked is None:
+                return None
+            selected.extend([listener, *linked])
+        return all_listeners, listeners, sets, pods, selected
+
+    def _topology(self, asrs: dict[str, dict], *, held: bool) -> tuple | None:
+        """Return the stable ARC graph identity, or ``None`` while it is unsettled."""
+        linked_resources = self._linked_topology_resources(asrs)
+        if linked_resources is None:
+            return None
+        all_listeners, listeners, sets, pods, selected = linked_resources
+        live_listener_by_uid = {
+            resource["metadata"].get("uid"): resource
+            for resource in all_listeners
+            if not resource["metadata"].get("deletionTimestamp")
+        }
+        if None in live_listener_by_uid or len(live_listener_by_uid) != len(all_listeners):
+            return None
+        for pod in pods:
+            owner_refs = [
+                ref for ref in pod["metadata"].get("ownerReferences", [])
+                if ref.get("controller") is True
+                and ref.get("kind") == "AutoscalingListener"
+            ]
+            if not owner_refs:
+                continue
+            if len(owner_refs) != 1:
+                return None
+            listener = live_listener_by_uid.get(owner_refs[0].get("uid"))
+            labels = pod["metadata"].get("labels", {})
+            if (listener is None
+                    or (pod["metadata"].get("namespace"), pod["metadata"].get("name"))
+                    != (listener["metadata"].get("namespace"), listener["metadata"].get("name"))
+                    or labels.get("app.kubernetes.io/component") != "runner-scale-set-listener"
+                    or labels.get("actions.github.com/scale-set-namespace")
+                    != listener["spec"].get("autoscalingRunnerSetNamespace")):
+                return None
+        target_listener_uids = {resource["metadata"]["uid"] for resource in listeners}
+        listener_pods = [
+            pod for pod in pods
+            if (pod["metadata"].get("labels", {}).get("app.kubernetes.io/component")
+                == "runner-scale-set-listener"
+                and pod["metadata"].get("labels", {}).get("actions.github.com/scale-set-namespace")
+                == self.namespace)
+            or any(ref.get("controller") is True
+                   and ref.get("kind") == "AutoscalingListener"
+                   and ref.get("uid") in target_listener_uids
+                   for ref in pod["metadata"].get("ownerReferences", []))
+        ]
+        expected_pods = {(resource["metadata"]["namespace"], resource["metadata"]["name"]) for resource in listeners}
+        if {(pod["metadata"]["namespace"], pod["metadata"]["name"])
+                for pod in listener_pods} != expected_pods:
+            return None
+        if held:
+            pending = self._get("ephemeralrunners", namespace=self.namespace)["items"]
+            if pending or any(not self._is_healthy_set(resource, zero=True) for resource in sets):
+                return None
+            if any(self._is_active_runner(pod) for pod in pods):
+                return None
+        return tuple(sorted((_metadata_identity(resource) for resource in [*asrs.values(), *sets, *selected]),
+                            key=lambda value: str(value)))
+
+    def _listener_graph(self, listener: dict, asr: dict, sets: list, pods: list) -> list | None:
+        meta, spec = listener["metadata"], listener["spec"]
+        if meta.get("deletionTimestamp") or meta.get("generation") != 1:
+            return None
+        if _capacity(spec, defaults=True) != _capacity(asr["spec"]):
+            return None
+        scale_id = asr["metadata"].get("annotations", {}).get("actions.github.com/runner-scale-set-id")
+        if not scale_id or str(spec.get("runnerScaleSetId")) != str(scale_id):
+            return None
+        live_sets = [runner_set for runner_set in sets if not runner_set["metadata"].get("deletionTimestamp")
+                and _is_controlled_by(runner_set, "AutoscalingRunnerSet", asr["metadata"]["uid"])]
+        if len(live_sets) != 1 or live_sets[0]["metadata"]["name"] != spec.get("ephemeralRunnerSetName"):
+            return None
+        if not self._is_healthy_set(live_sets[0]):
+            return None
+        listener_pods = [pod for pod in pods if pod["metadata"].get("namespace") == meta["namespace"]
+                 and pod["metadata"]["name"] == meta["name"]]
+        if len(listener_pods) != 1:
+            return None
+        pod = listener_pods[0]
+        if pod["metadata"].get("deletionTimestamp") or pod.get("status", {}).get("phase") != "Running":
+            return None
+        if not _is_controlled_by(pod, "AutoscalingListener", meta["uid"]):
+            return None
+        containers = [status for status in pod.get("status", {}).get("containerStatuses", []) if status.get("name") == "listener"]
+        if len(containers) != 1 or containers[0].get("ready") is not True:
+            return None
+        if not isinstance(containers[0].get("state", {}).get("running"), dict):
+            return None
+        return [live_sets[0], pod]
+
+    @staticmethod
+    def _is_healthy_set(item: dict, *, zero=False) -> bool:
+        values = [item.get("spec", {}).get("replicas", 0)]
+        values += [item.get("status", {}).get(key) for key in COUNT_KEYS]
+        return all(type(value) is int and (value == 0 if zero else value >= 0) for value in values)
+
+    def _is_active_runner(self, pod: dict) -> bool:
+        meta = pod["metadata"]
+        is_runner = str(meta.get("labels", {}).get("actions-ephemeral-runner", "")).lower() == "true"
+        is_runner |= any(ref.get("kind") == "EphemeralRunner" for ref in meta.get("ownerReferences", []))
+        return (meta.get("namespace") == self.namespace and is_runner
+                and pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"})
+
+    def _stable(self, *, held: bool) -> None:
+        previous, count = None, 0
+        while True:
+            self.identity()
+            asrs = self._asrs()
+            spec_by_name = {row["name"]: _held_spec(row["spec"]) if held else row["spec"] for row in self.data["original"]}
+            _require(all(asrs[name]["spec"] == spec for name, spec in spec_by_name.items()),
+                    "ARC capacity does not match the owned lifecycle phase")
+            current = self._topology(asrs, held=held)
+            count = count + 1 if current is not None and current == previous else 0
+            if count >= 2:
+                return
+            previous = current
+            self.pause()
+
+    def verify(self) -> dict:
+        """Require three stable samples of the owned zero-capacity acquisition graph."""
+        self.identity()
+        _require(self.data["held"] and not self.data["restored"], "ARC drain is not held")
+        _require(all(record["phase"] == "present" for record in self.data["fences"].values()),
+                "ARC acquisition fence is not active")
+        self._stable(held=True)
+        return self.data
+
+    def _delete_fence(self, role: str) -> None:
+        self.identity(restoring=True)
+        fence_state_by_field = self.data["fences"][role]
+        if fence_state_by_field["phase"] in {"no_attempt", "deleted"}:
+            return
+        name, uid = self.manifests[role]["metadata"]["name"], fence_state_by_field["uid"]
+        resource = FENCE_RESOURCES[role]
+        if fence_state_by_field["phase"] == "present":
+            item = self._get(resource, name)
+            _require(self._check_fence(role, item) == uid,
+                    "ARC admission fence UID changed before deletion")
+            fence_state_by_field = {"phase": "delete_intent", "uid": uid,
+                                    "resourceVersion": item["metadata"]["resourceVersion"]}
+            self.data["fences"][role] = fence_state_by_field
+            self._save()
+        self.kubectl("delete", f"--raw=/apis/admissionregistration.k8s.io/v1/{resource}/{name}",
+                     "-f", "-", payload={"apiVersion": "v1", "kind": "DeleteOptions",
+                                          "preconditions": {"uid": uid,
+                                                            "resourceVersion": fence_state_by_field["resourceVersion"]},
+                                          "propagationPolicy": "Foreground"})
+        while True:
+            item = self._get(resource, name, optional=True)
+            if item is None:
+                break
+            _require(item["metadata"]["uid"] == uid, "ARC fence replaced during deletion")
+            self.pause()
+        self.data["fences"][role]["phase"] = "deleted"
+        self._save()
+
+    def _restore_capacity(self, original_asr: dict) -> None:
+        name = original_asr["name"]
+        while True:
+            current_asr = self._asrs()[name]
+            if current_asr["spec"] == original_asr["spec"]:
+                self.data["changes"][name]["phase"] = "restored"
+                self._save()
+                return
+            _require(self.data["changes"][name]["phase"] in {"confirmed", "restore_intent"}
+                    and current_asr["spec"] == _held_spec(original_asr["spec"]), "ARC capacity is not an owned change")
+            if self.data["changes"][name]["phase"] == "confirmed":
+                self.data["changes"][name] = {
+                    "phase": "restore_intent",
+                    "resourceVersion": current_asr["metadata"]["resourceVersion"],
+                    "generation": current_asr["metadata"]["generation"],
+                }
+                self._save()
+            else:
+                _require(current_asr["metadata"]["generation"]
+                        == self.data["changes"][name]["generation"],
+                        "ARC capacity generation changed after restore intent")
+            patch_result = self._patch_capacity(current_asr, original_asr["spec"], check=False)
+            if patch_result.returncode and re.search(rf"(?<![-\w])hp-pv3-arc-deny-{self.owner}(?![-\w])", patch_result.stderr):
+                self.pause()
+                continue
+            _require(patch_result.returncode == 0, "ARC capacity restoration result is uncertain")
+            restored = json.loads(patch_result.stdout)
+            _require(restored["metadata"]["uid"] == original_asr["uid"] and restored["spec"] == original_asr["spec"],
+                    "ARC capacity restoration response is ambiguous")
+            self.data["changes"][name]["phase"] = "restored"
+            self._save()
+            return
+
+    def restore(self) -> dict:
+        """Restore confirmed changes after the parent proves census and quota absence."""
+        self.identity(restoring=True)
+        asrs = self._asrs()
+        for row in self.data["original"]:
+            spec = asrs[row["name"]]["spec"]
+            has_owned_change = self.data["changes"][row["name"]]["phase"] in {
+                "confirmed", "restore_intent",
+            }
+            _require(spec == row["spec"] or (has_owned_change and spec == _held_spec(row["spec"])),
+                    "ARC capacity drift blocks restoration")
+        for role in ("binding", "policy"):
+            self._delete_fence(role)
+        for row in self.data["original"]:
+            self._restore_capacity(row)
+        self._stable(held=False)
+        self.data.update(restored=True, held=False)
+        self._save()
+        return self.data
+
+
+def main(argv=None) -> int:
+    """Dispatch the bounded lifecycle command and emit its durable outcome."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("hold", "verify", "identity", "restore"))
+    parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--owner", required=True)
+    parser.add_argument("--namespace", default="arc-runners")
+    parser.add_argument("--deadline-seconds", type=int, required=True)
+    args = parser.parse_args(argv)
+    try:
+        drain = ArcDrain(args.state, args.owner, args.namespace, args.deadline_seconds)
+        result = getattr(drain, args.command)()
+        print(json.dumps({key: result[key] for key in ("schema", "owner", "namespace", "held", "restored")}))
+        return 0
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        print(f"ARC acquisition drain failed: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

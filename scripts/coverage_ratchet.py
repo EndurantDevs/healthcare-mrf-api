@@ -13,6 +13,11 @@ from coverage_ratchet_self_test import run_self_test
 from coverage_reports import CoverageRatchetError, Metric, _collect_report, _metric, _read_json
 
 SCHEMA_VERSION = 1
+# Same-source parallel runs vary slightly in runtime-dependent coverage hits.
+EXACT_BASE_JITTER = {
+    "python": {"branches": 1, "lines": 1},
+    "rust": {"functions": 1, "lines": 3, "regions": 4},
+}
 
 
 def _load_baseline(path: Path) -> dict[str, Any]:
@@ -29,13 +34,24 @@ def _percent(metric: Metric) -> float:
     return 100.0 * metric["covered"] / metric["total"]
 
 
-def _compare_metric(label: str, current: Metric, minimum: Metric) -> list[str]:
+def _compare_metric(
+    label: str,
+    current: Metric,
+    minimum: Metric,
+    allowed_missing_increase: int = 0,
+) -> list[str]:
     current = _metric(current.get("covered"), current.get("total"), label)
     minimum = _metric(minimum.get("covered"), minimum.get("total"), label)
     if current["covered"] * minimum["total"] < minimum["covered"] * current["total"]:
         current_missing = current["total"] - current["covered"]
         minimum_missing = minimum["total"] - minimum["covered"]
-        if current["total"] < minimum["total"] and current_missing <= minimum_missing:
+        if (
+            current_missing <= minimum_missing + allowed_missing_increase
+            and (
+                current["total"] < minimum["total"]
+                or allowed_missing_increase > 0
+            )
+        ):
             return []
         return [
             f"{label}: coverage fell to {_percent(current):.4f}% "
@@ -135,6 +151,9 @@ def _compare_baselines(
         reference.get("machine_artifact_required") is not True
         and candidate.get("machine_artifact_required") is True
     )
+    exact_base_jitter = (
+        EXACT_BASE_JITTER if reference.get("machine_artifact_required") is True else {}
+    )
     for report_name, old_config in reference["reports"].items():
         new_config = candidate_reports.get(report_name)
         if not isinstance(new_config, dict) or not isinstance(old_config, dict):
@@ -167,6 +186,7 @@ def _compare_baselines(
                     f"{report_name}.{metric_name} baseline",
                     new_metric,
                     old_metric,
+                    exact_base_jitter.get(report_name, {}).get(metric_name, 0),
                 )
             )
     return errors

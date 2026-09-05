@@ -60,7 +60,7 @@ def test_checkout_never_persists_the_workflow_token() -> None:
         assert workflow.count("persist-credentials: false") >= checkout_count
 
 
-def test_heavy_ci_jobs_wait_for_quality_success() -> None:
+def test_ci_producers_run_independently() -> None:
     jobs = yaml.safe_load(_workflow("ci.yml"))["jobs"]
     quality = jobs["python-quality"]
     assert "needs" not in quality
@@ -70,13 +70,9 @@ def test_heavy_ci_jobs_wait_for_quality_success() -> None:
         assert not step.get("continue-on-error", False)
 
     for name, job in jobs.items():
-        if name in {"python-quality", "public-hygiene"}:
+        if name == "test-coverage":
             continue
-        needs = job.get("needs", [])
-        if isinstance(needs, str):
-            needs = [needs]
-        assert "python-quality" in needs, name
-        assert "if" not in job, f"{name} must not bypass failed dependencies"
+        assert "needs" not in job, name
 
 
 def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:

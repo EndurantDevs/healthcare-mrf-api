@@ -106,9 +106,7 @@ def _arguments(
     ]
 
 
-def _fake_environment(
-    tmp_path: Path, **overrides: str
-) -> tuple[dict[str, str], Path, Path]:
+def _fake_command_directory(tmp_path: Path) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     dispatcher = fake_bin / "fake-command"
@@ -130,6 +128,15 @@ def _fake_environment(
     census_child = fake_bin / "census-child"
     census_child.write_text(_FAKE_COMMAND, encoding="utf-8")
     census_child.chmod(0o755)
+    return fake_bin
+
+
+def _fake_environment(
+    tmp_path: Path, **overrides: str
+) -> tuple[dict[str, str], Path, Path]:
+    """Create the isolated command, state, and checkout roots for an envelope run."""
+    fake_bin = _fake_command_directory(tmp_path)
+    census_child = fake_bin / "census-child"
     fake_state = tmp_path / "fake-state"
     fake_state.mkdir()
     overlay_bytes = (
@@ -141,6 +148,15 @@ def _fake_environment(
     state_root = _state_root(tmp_path)
     checkout = tmp_path / "repo"
     checkout.mkdir()
+    arc_helper = checkout / "scripts/research/plan_pricing_projection_v3_census_arc.py"
+    arc_helper.parent.mkdir(parents=True)
+    arc_helper.write_text("# reviewed ARC helper\n", encoding="utf-8")
+    reviewed_arc_helper = fake_state / "reviewed-arc-helper.py"
+    reviewed_arc_helper.write_bytes(
+        b"# different ARC helper\n"
+        if overrides.get("FAKE_ARC_HELPER_MISMATCH") == "1"
+        else arc_helper.read_bytes()
+    )
     env_by_name = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -150,6 +166,7 @@ def _fake_environment(
         "FAKE_IMPORT_SCHEDULER": "control-scheduler",
         "FAKE_IMPORT_TOKEN_ENV": "TEST_IMPORT_TOKEN",
         "FAKE_OWNER": OWNER,
+        "FAKE_REVIEWED_ARC_HELPER": str(reviewed_arc_helper),
         "FAKE_POLICY": f"hp-pv3-census-{OWNER}.healthporta.com",
         "FAKE_QUOTA": f"hp-pv3-census-{OWNER}",
         "FAKE_SOURCE_SHA": SOURCE_SHA,

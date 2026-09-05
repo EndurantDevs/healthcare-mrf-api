@@ -85,6 +85,51 @@ def _assert_parser_behavior(collect_report: CollectReport) -> None:
         )
 
 
+def _assert_exact_base_jitter_behavior(compare_baselines: CompareBaselines) -> None:
+    """Keep machine-artifact allowances narrow and metric-specific."""
+
+    baseline = build_diff_policy_test_baseline()
+    rust_reference = json.loads(json.dumps(baseline))
+    rust_reference["machine_artifact_required"] = True
+    rust_reference["reports"]["rust"] = rust_reference["reports"].pop("python")
+    rust_reference["reports"]["rust"]["metrics"] = {
+        metric_name: {"covered": 80, "total": 100}
+        for metric_name in ("functions", "lines", "regions")
+    }
+    for metric_name, allowance in (("functions", 1), ("lines", 3), ("regions", 4)):
+        rust_candidate = json.loads(json.dumps(rust_reference))
+        metric = rust_candidate["reports"]["rust"]["metrics"][metric_name]
+        metric["covered"] -= allowance
+        _require(
+            not compare_baselines(rust_candidate, rust_reference),
+            f"bounded Rust {metric_name} exact-base jitter",
+        )
+        metric["covered"] -= 1
+        _require(
+            bool(compare_baselines(rust_candidate, rust_reference)),
+            f"Rust {metric_name} exact-base regression beyond jitter",
+        )
+    machine_python = json.loads(json.dumps(baseline))
+    machine_python["machine_artifact_required"] = True
+    machine_python["reports"]["python"]["metrics"] = {
+        metric_name: {"covered": 80, "total": 100}
+        for metric_name in ("branches", "lines")
+    }
+    for metric_name in ("branches", "lines"):
+        regressed_python = json.loads(json.dumps(machine_python))
+        metric = regressed_python["reports"]["python"]["metrics"][metric_name]
+        metric["covered"] -= 1
+        _require(
+            not compare_baselines(regressed_python, machine_python),
+            f"bounded Python {metric_name} exact-base jitter",
+        )
+        metric["covered"] -= 1
+        _require(
+            bool(compare_baselines(regressed_python, machine_python)),
+            f"Python {metric_name} exact-base regression beyond jitter",
+        )
+
+
 def _assert_reference_behavior(compare_baselines: CompareBaselines) -> None:
     baseline = build_diff_policy_test_baseline()
     _require(not compare_baselines(baseline, baseline), "unchanged baseline")
@@ -102,6 +147,7 @@ def _assert_reference_behavior(compare_baselines: CompareBaselines) -> None:
         "total": 100,
     }
     _require(bool(compare_baselines(regressed, baseline)), "ratio regression")
+    _assert_exact_base_jitter_behavior(compare_baselines)
     larger = json.loads(json.dumps(baseline))
     larger["reports"]["python"]["metrics"]["lines"] = {
         "covered": 160,

@@ -59,6 +59,7 @@ SOURCE_PATHS = tuple(f"api/{module_name}.py" for module_name in """
 HARNESS_PATHS = tuple(f"scripts/research/{file_name}" for file_name in """
         plan_pricing_projection_v3_census.py plan_pricing_projection_v3_census_support.py
         plan_pricing_projection_v3_census_authority.py
+        plan_pricing_projection_v3_census_arc.py
         plan_pricing_projection_v3_census_contract.py
         plan_pricing_projection_v3_census_diagnostics.py
         plan_pricing_projection_v3_census_identity.py
