@@ -156,7 +156,7 @@ def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
                 "EndurantDevs/healthcare-mrf-api/"
                 ".github/workflows/ci.yml@main"
             ),
-            "with": {"activate_arc": True},
+            "with": {"activate_arc": False},
         }
     }
     caller = CALLER.read_text(encoding="utf-8")
@@ -219,15 +219,13 @@ def test_reusable_foundation_preserves_caller_checkout_and_pr_context() -> None:
         assert checkout["with"].get("ref", "${{ github.sha }}") == "${{ github.sha }}"
 
 
-def test_matrices_fail_fast_and_coverage_waits_for_every_root_job() -> None:
+def test_matrices_fail_fast_and_coverage_waits_for_every_ci_job() -> None:
     document, _ = _documents()
     jobs = document["jobs"]
 
     for name in ("python-tests", "address-canonical-db-tests"):
         assert jobs[name]["strategy"]["fail-fast"] is True
-    assert set(jobs["test-coverage"]["needs"]) == {
-        name for name, job in jobs.items() if "needs" not in job
-    }
+    assert set(jobs["test-coverage"]["needs"]) == set(jobs) - {"test-coverage"}
 
 
 def test_arc_route_has_exact_14_plus_2_instance_split() -> None:

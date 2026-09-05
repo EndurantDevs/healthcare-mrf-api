@@ -14,4 +14,4 @@ jobs:
   ci:
     uses: EndurantDevs/healthcare-mrf-api/.github/workflows/ci.yml@main
     with:
-      activate_arc: true
+      activate_arc: false
