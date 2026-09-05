@@ -292,6 +292,9 @@ fn parse_tall_payer(
         methodology: csv_value(record, columns.methodology).to_owned(),
         additional_payer_notes: generic_notes.and_then(optional_text),
     };
+    if columns.profile == CmsProfile::V3 && is_explicitly_uncontracted_csv_payer(&payer) {
+        return Ok(None);
+    }
     if columns.profile == CmsProfile::V2 && !payer_has_charge(&payer) {
         validate_charge_free_csv_payer(&payer)?;
         return Ok(None);
