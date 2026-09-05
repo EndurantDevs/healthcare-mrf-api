@@ -153,6 +153,7 @@ def test_plan_renders_exact_fences_without_external_commands(tmp_path: Path) -> 
     assert "Kubernetes QoS does not reserve or cap off-node PostgreSQL" in result.stdout
     assert 'pods: "0"' in result.stdout
     assert f"name: hp-pv3-census-quota-probe-{envelope.OWNER}" in result.stdout
+    assert "        runAsNonRoot: true\n        runAsUser: 65532" in result.stdout
     assert "failurePolicy: Fail" in result.stdout
     assert f"message: hp-pv3-census-deny-{envelope.OWNER}" in result.stdout
     assert not state_root.exists()
