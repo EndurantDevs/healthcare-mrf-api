@@ -99,7 +99,7 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
             "AND source_format IN ('csv-tall', 'csv-wide') "
             "AND ((template_version IN ('1', '1.0.0') AND npi_count >= 0 "
             "AND (attester_name IS NULL OR btrim(attester_name) <> '')) OR "
-            "(template_version = '4.0.0' AND npi_count > 0 "
+            "(template_version IN ('3.0.1', '4.0.0') AND npi_count > 0 "
             "AND attester_name IS NOT NULL)))) "
             "AND location_count > 0 AND license_count > 0 "
             "AND service_count > 0 AND charge_count > 0 "

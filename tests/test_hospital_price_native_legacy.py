@@ -21,7 +21,9 @@ def test_native_summary_accepts_supported_source_schema_versions(
     summary = _packed_summary(tmp_path)
     summary["schema_version"] = schema_version
 
-    assert _validate_packed_summary(summary, tmp_path).schema_version == schema_version
+    assert (
+        _validate_packed_summary(summary, tmp_path).schema_version == schema_version
+    )
 
 
 @pytest.mark.parametrize("schema_version", ("1", "1.0.0", "2", "2.0.0"))
@@ -39,14 +41,15 @@ def test_native_summary_accepts_csv_v2_versions_without_admitting_json(
         _validate_packed_summary(summary, tmp_path)
 
 
+@pytest.mark.parametrize("schema_version", ("3.0.1", "4.0.0"))
 @pytest.mark.parametrize("source_format", ("csv-tall", "csv-wide"))
-def test_native_summary_accepts_producer_declared_v4_csv_only(
-    tmp_path, source_format
+def test_native_summary_accepts_producer_declared_current_csv_only(
+    tmp_path, source_format, schema_version
 ):
     summary = _packed_summary(tmp_path)
-    summary.update(schema_version="4.0.0", format=source_format)
+    summary.update(schema_version=schema_version, format=source_format)
 
-    assert _validate_packed_summary(summary, tmp_path).schema_version == "4.0.0"
+    assert _validate_packed_summary(summary, tmp_path).schema_version == schema_version
 
     summary["format"] = "json"
     with pytest.raises(ValueError, match="contract"):
@@ -66,9 +69,10 @@ def test_native_summary_allows_legacy_without_npi_but_keeps_v3_strict(tmp_path):
     with pytest.raises(ValueError, match="v3 NPI"):
         _validate_packed_summary(summary, tmp_path)
 
-    summary.update(schema_version="4.0.0", format="csv-tall")
-    with pytest.raises(ValueError, match="v3 NPI"):
-        _validate_packed_summary(summary, tmp_path)
+    for schema_version in ("3.0.1", "4.0.0"):
+        summary.update(schema_version=schema_version, format="csv-tall")
+        with pytest.raises(ValueError, match="v3 NPI"):
+            _validate_packed_summary(summary, tmp_path)
 
     summary.update(schema_version="2.0.0", format="json")
     with pytest.raises(ValueError, match="contract"):

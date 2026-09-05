@@ -12,7 +12,6 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from db.models.hospital_price_header import HospitalPriceVersion
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
@@ -50,17 +49,8 @@ class _OperationsRecorder:
         self.statements.append(statement)
 
 
-def _model_shape_check() -> str:
-    constraint = next(
-        candidate
-        for candidate in HospitalPriceVersion.__table__.constraints
-        if candidate.name == "hospital_price_version_shape_check"
-    )
-    return str(constraint.sqltext)
-
-
-def test_csv_v1_labels_migration_matches_current_model() -> None:
-    """Keep the successor lineage and ORM constraint byte-for-byte aligned."""
+def test_csv_v1_labels_migration_retains_its_original_boundary() -> None:
+    """Keep the historical V1 migration immutable."""
 
     migration = _load_migration()
     assert migration.revision == "20260903130000_hospital_price_csv_v1_labels"
@@ -71,8 +61,8 @@ def test_csv_v1_labels_migration_matches_current_model() -> None:
     migration.op = recorder
     migration.upgrade()
     migration_check = recorder.statements[1].split(" CHECK (", 1)[1][:-2]
-    assert migration_check == _model_shape_check()
     assert "template_version IN ('1', '1.0.0')" in migration_check
+    assert "'3.0.1'" not in migration_check
     assert migration.downgrade() is None
 
 

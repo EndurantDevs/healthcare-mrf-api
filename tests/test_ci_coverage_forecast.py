@@ -98,6 +98,7 @@ def test_coverage_forecast_combines_full_rust_data_and_publishes_a_machine_basel
     assert "Download Rust coverage data" in workflow
     assert "Resolve exact base coverage run" in workflow
     assert "actions: read" in _trusted_caller()
+    assert "packages: read" in _trusted_caller()
     assert "healthcare-mrf-api-coverage-baseline-${{ github.sha }}" in workflow
     assert "retention-days: 90" in workflow
     assert "name: mrf-coverage-forecast" in workflow
