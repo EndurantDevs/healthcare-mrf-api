@@ -1085,6 +1085,8 @@ create_worker_fence() {
     exit_code=$?
     set -e
     remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -le "$((deadline - SECONDS))" ] \
+      || remaining=$((deadline - SECONDS))
     [ "${remaining}" -gt 0 ] || break
     resource_is_absent_with_limit "${remaining}" job "${probe_name}" \
       "${DEV_NAMESPACE}" \
