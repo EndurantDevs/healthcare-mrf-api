@@ -119,6 +119,7 @@ hospitals:
 - hospital_id: hospital-000030
   name: STRHS Sewanee
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002931
 - hospital_id: hospital-000031
   name: Trinity Health Byron Center
   cms_hpt_url: https://www.trinityhealthmichigan.org/cms-hpt.txt
@@ -18163,7 +18164,7 @@ hospitals:
 - hospital_id: hospital-005457
   name: Riverview Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
-  locator_name: Highpoint Health - Riverview with Ascension Saint Thomas
+  alias_of: hospital-002930
 - hospital_id: hospital-005458
   name: Riverview Regional Medical Center
   cms_hpt_url: https://riverviewregional.com/cms-hpt.txt
@@ -21090,6 +21091,7 @@ hospitals:
 - hospital_id: hospital-006332
   name: STRHS Winchester
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002934
 - hospital_id: hospital-006333
   name: STRONG MEMORIAL HOSPITAL
   cms_hpt_url: https://www.urmc.rochester.edu/cms-hpt.txt
@@ -21161,6 +21163,7 @@ hospitals:
 - hospital_id: hospital-006354
   name: Sumner Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002932
 - hospital_id: hospital-006355
   name: Sunnyside Medical Center
   cms_hpt_url: https://healthy.kaiserpermanente.org/cms-hpt.txt
@@ -22112,6 +22115,7 @@ hospitals:
 - hospital_id: hospital-006639
   name: Trousdale Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002933
 - hospital_id: hospital-006640
   name: Troy Regional Medical Center
   cms_hpt_url: https://www.troymedicalcenter.com/cms-hpt.txt
