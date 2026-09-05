@@ -141,6 +141,15 @@ def _fake_environment(
     state_root = _state_root(tmp_path)
     checkout = tmp_path / "repo"
     checkout.mkdir()
+    arc_helper = checkout / "scripts/research/plan_pricing_projection_v3_census_arc.py"
+    arc_helper.parent.mkdir(parents=True)
+    arc_helper.write_text("# reviewed ARC helper\n", encoding="utf-8")
+    reviewed_arc_helper = fake_state / "reviewed-arc-helper.py"
+    reviewed_arc_helper.write_bytes(
+        b"# different ARC helper\n"
+        if overrides.get("FAKE_ARC_HELPER_MISMATCH") == "1"
+        else arc_helper.read_bytes()
+    )
     env_by_name = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -150,6 +159,7 @@ def _fake_environment(
         "FAKE_IMPORT_SCHEDULER": "control-scheduler",
         "FAKE_IMPORT_TOKEN_ENV": "TEST_IMPORT_TOKEN",
         "FAKE_OWNER": OWNER,
+        "FAKE_REVIEWED_ARC_HELPER": str(reviewed_arc_helper),
         "FAKE_POLICY": f"hp-pv3-census-{OWNER}.healthporta.com",
         "FAKE_QUOTA": f"hp-pv3-census-{OWNER}",
         "FAKE_SOURCE_SHA": SOURCE_SHA,

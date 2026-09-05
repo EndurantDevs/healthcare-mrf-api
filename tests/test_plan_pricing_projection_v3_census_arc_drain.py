@@ -1,8 +1,12 @@
 """The envelope owns ARC pause, census fencing, and safe capacity restoration."""
 
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
+
+from scripts.research import plan_pricing_projection_v3_census_support as support
 
 from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 
@@ -51,8 +55,11 @@ def test_failed_capacity_restoration_keeps_lock_and_reports_incomplete(tmp_path:
     assert "quota_delete" in events and "lock_stop" not in events
     assert (tmp_path / "fake-state/arc-held").exists()
     cleanup = envelope._receipt(state_root)["cleanup"]
+    assert cleanup["quota_removed"] is True
     assert cleanup["arc_capacity_restored"] is False
+    assert cleanup["lock_released"] is False
     assert cleanup["complete"] is False
+    assert (tmp_path / "fake-state/lock").exists()
 
 
 def test_post_child_acquisition_failure_invalidates_proof(tmp_path: Path) -> None:
@@ -63,3 +70,108 @@ def test_post_child_acquisition_failure_invalidates_proof(tmp_path: Path) -> Non
     assert receipt["post_child_fence_verified"] is False
     assert receipt["cleanup"]["arc_capacity_restored"] is True
     assert receipt["cleanup"]["complete"] is True
+
+
+def test_unreviewed_arc_helper_is_rejected_before_lock(tmp_path: Path) -> None:
+    result, state_root = envelope._run_envelope(
+        tmp_path, FAKE_ARC_HELPER_MISMATCH="1",
+    )
+
+    assert result.returncode != 0
+    events = tmp_path / "fake-state/events"
+    assert not events.exists() or "lock_create" not in events.read_text().splitlines()
+    cleanup = envelope._receipt(state_root)["cleanup"]
+    assert cleanup["lock_released"] is False
+    assert cleanup["complete"] is True
+
+
+def test_arc_helper_is_in_reviewed_harness_inventory() -> None:
+    assert "scripts/research/plan_pricing_projection_v3_census_arc.py" in support.HARNESS_PATHS
+
+
+@pytest.mark.parametrize("attack", ["none", "checkout", "descriptor", "replace"])
+def test_arc_helper_executes_only_reviewed_source(tmp_path: Path, attack: str) -> None:
+    definitions = tmp_path / "envelope.sh"
+    definitions.write_text(envelope.SCRIPT.read_text().rsplit('main "$@"', 1)[0])
+    checkout = tmp_path / "repo"
+    helper = checkout / "scripts/research/plan_pricing_projection_v3_census_arc.py"
+    helper.parent.mkdir(parents=True)
+    program = 'import os; open(os.environ["ARC_TEST_MARKER"], "a").write("x")\n'
+    helper.write_text(program)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
+         "user.email=test@example.invalid", "commit", "-qm", "reviewed helper"],
+        check=True,
+    )
+    source_sha = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if attack == "checkout":
+        helper.write_text(program + "# unreviewed change\n")
+    elif attack == "replace":
+        helper.write_text(program + "# replacement object\n")
+        subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
+             "user.email=test@example.invalid", "commit", "-qm", "replacement helper"],
+            check=True,
+        )
+        replacement_sha = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(checkout), "replace", source_sha, replacement_sha],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "update-ref", "HEAD", source_sha,
+             replacement_sha],
+            check=True,
+        )
+    marker = tmp_path / "executed"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    setsid = fake_bin / "setsid"
+    setsid.write_text('#!/bin/sh\nexec "$@"\n')
+    setsid.chmod(0o755)
+    replacement = tmp_path / "replacement"
+    if attack == "descriptor":
+        replacement.write_text("raise SystemExit('unreviewed')\n")
+    result = subprocess.run(
+        ["bash", "-c", r'''
+source "$1"
+REPO_DIR=$2
+SOURCE_SHA=$3
+OWNER_TOKEN=test-owner
+STATE_DIR=$4
+START_SECONDS=${SECONDS}
+DEADLINE_SECONDS=900
+if [ -n "${ARC_TEST_REPLACEMENT}" ]; then
+  set -T
+  replace_descriptor_copy() {
+    if [[ "${BASH_COMMAND}" == *'exec 8<'* ]]; then
+      trap - DEBUG
+      mv "${ARC_TEST_REPLACEMENT}" "${STATE_DIR}/reviewed-arc-helper"
+    fi
+  }
+  trap replace_descriptor_copy DEBUG
+fi
+arc_acquisition hold
+arc_acquisition verify
+''', "bash", str(definitions), str(checkout), source_sha, str(state)],
+        env={**os.environ, "ARC_TEST_MARKER": str(marker),
+             "ARC_TEST_REPLACEMENT": str(replacement) if attack == "descriptor" else "",
+             "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    attacked = attack != "none"
+    assert (result.returncode != 0) is attacked, result.stderr
+    assert marker.exists() is not attacked
+    if not attacked:
+        assert marker.read_text() == "xx"

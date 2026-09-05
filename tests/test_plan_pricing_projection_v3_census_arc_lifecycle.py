@@ -100,11 +100,18 @@ class Cluster:
             pods.append({"metadata": {"name": "worker", "namespace": "arc-runners",
                         "labels": {"actions-ephemeral-runner": "true"}},
                          "status": {"phase": "Running"}})
-        if self.bad_graph == "orphan-listener":
+        if self.bad_graph == "orphan-ers":
+            orphan = deepcopy(sets[0])
+            orphan["metadata"].update(name="previous-ers", uid="previous-ers-uid")
+            orphan["metadata"]["ownerReferences"][0]["uid"] = "deleted-asr"
+            sets.append(orphan)
+        if self.bad_graph in {"orphan-listener", "unlabelled-orphan-listener"}:
             orphan = deepcopy(pods[0])
             orphan["metadata"].update(name="previous-listener", uid="previous-listener-pod")
             orphan["metadata"]["ownerReferences"][0].update(
                 name="previous-listener", uid="deleted-listener")
+            if self.bad_graph == "unlabelled-orphan-listener":
+                orphan["metadata"].pop("labels")
             pods.append(orphan)
         return listeners, sets, pods
 
@@ -220,8 +227,11 @@ class Cluster:
         fence_mapping = self.fences.get((resource, name))
         if fence_mapping is None:
             return None
-        if payload["preconditions"]["uid"] != fence_mapping["metadata"]["uid"]:
-            raise ValueError("UID precondition failed")
+        if payload["preconditions"] != {
+            "uid": fence_mapping["metadata"]["uid"],
+            "resourceVersion": fence_mapping["metadata"]["resourceVersion"],
+        }:
+            raise ValueError("delete precondition failed")
         self.events.append(("delete", fence_mapping["kind"]))
         del self.fences[resource, name]
         return {"status": "Success"}
@@ -280,7 +290,8 @@ def test_flux_cannot_restore_positive_capacity_while_held(lifecycle):
 
 @pytest.mark.parametrize("damage", ["missing-ers", "wrong-ers-owner", "old-pod", "pending-ers",
                                     "missing-current", "null-pending", "wrong-scale-id",
-                                    "unready-listener", "worker-pod", "orphan-listener"])
+                                    "unready-listener", "worker-pod", "orphan-listener",
+                                    "orphan-ers", "unlabelled-orphan-listener"])
 def test_stale_graph_or_pending_work_rejects_quiescence(lifecycle, damage):
     drain, cluster = lifecycle
     drain.hold()
@@ -335,7 +346,136 @@ def test_interrupted_restoration_does_not_claim_cleanup(lifecycle):
     cluster.fail_patch = lambda name, item: name == "ci-b" and item["spec"]["maxRunners"] > 0
     with pytest.raises(RuntimeError):
         drain.restore()
+    assert cluster.asrs["ci-a"]["spec"]["maxRunners"] == 3
     assert cluster.asrs["ci-b"]["spec"]["maxRunners"] == 0
+    assert not cluster.fences
+    assert drain.data["restored"] is False
+
+
+@pytest.mark.parametrize("after_delete", [False, True])
+def test_fresh_restore_reconciles_fence_delete_intent(lifecycle, after_delete):
+    drain, cluster = lifecycle
+    drain.hold()
+    data = json.loads(drain.path.read_text())
+    role = "binding"
+    resource = arc.FENCE_RESOURCES[role]
+    name = drain.manifests[role]["metadata"]["name"]
+    fence = cluster.fences[resource, name]
+    data["fences"][role].update(
+        phase="delete_intent",
+        resourceVersion=fence["metadata"]["resourceVersion"],
+    )
+    if after_delete:
+        del cluster.fences[resource, name]
+    drain.path.write_text(json.dumps(data) + "\n")
+
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.restore()
+
+    assert not cluster.fences
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert resumed.data["restored"] is True
+
+
+def test_fresh_restore_waits_for_in_progress_fence_delete(lifecycle):
+    drain, cluster = lifecycle
+    drain.hold()
+    data = json.loads(drain.path.read_text())
+    role = "binding"
+    resource = arc.FENCE_RESOURCES[role]
+    name = drain.manifests[role]["metadata"]["name"]
+    fence = cluster.fences[resource, name]
+    data["fences"][role].update(
+        phase="delete_intent",
+        resourceVersion=fence["metadata"]["resourceVersion"],
+    )
+    fence["metadata"].update(resourceVersion="2", deletionTimestamp="now")
+    drain.path.write_text(json.dumps(data) + "\n")
+
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.pause = lambda: cluster.fences.pop((resource, name), None)
+    resumed.restore()
+
+    assert ("delete", "ValidatingAdmissionPolicyBinding") not in cluster.events
+    assert resumed.data["restored"] is True
+
+
+@pytest.mark.parametrize("after_patch", [False, True])
+def test_fresh_restore_reconciles_capacity_restore_intent(lifecycle, after_patch):
+    drain, cluster = lifecycle
+    drain.hold()
+    data = json.loads(drain.path.read_text())
+    cluster.fences.clear()
+    for record in data["fences"].values():
+        record["phase"] = "deleted"
+    row = next(row for row in data["original"] if row["name"] == "ci-a")
+    current = cluster.asrs["ci-a"]
+    data["changes"]["ci-a"] = {
+        "phase": "restore_intent",
+        "resourceVersion": current["metadata"]["resourceVersion"],
+    }
+    if after_patch:
+        current["spec"] = deepcopy(row["spec"])
+        cluster.revision += 1
+        current["metadata"]["resourceVersion"] = str(cluster.revision)
+        current["metadata"]["generation"] += 1
+    drain.path.write_text(json.dumps(data) + "\n")
+
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.restore()
+
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert cluster.events.count(("patch", "ci-a", 3)) == (0 if after_patch else 1)
+    assert resumed.data["restored"] is True
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["fence-uid", "fence-spec", "fence-rv", "asr-uid", "held-rv",
+     "capacity-drift", "original-same-rv"],
+)
+def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
+    drain, cluster = lifecycle
+    drain.hold()
+    data = json.loads(drain.path.read_text())
+    if damage.startswith("fence-"):
+        role = "binding"
+        resource = arc.FENCE_RESOURCES[role]
+        name = drain.manifests[role]["metadata"]["name"]
+        fence = cluster.fences[resource, name]
+        data["fences"][role].update(
+            phase="delete_intent",
+            resourceVersion=fence["metadata"]["resourceVersion"],
+        )
+        if damage == "fence-uid":
+            fence["metadata"]["uid"] = "replacement"
+        elif damage == "fence-spec":
+            fence["spec"]["validationActions"] = ["Warn"]
+        else:
+            fence["metadata"]["resourceVersion"] = "99"
+    else:
+        cluster.fences.clear()
+        for record in data["fences"].values():
+            record["phase"] = "deleted"
+        row = next(row for row in data["original"] if row["name"] == "ci-a")
+        current = cluster.asrs["ci-a"]
+        data["changes"]["ci-a"] = {
+            "phase": "restore_intent",
+            "resourceVersion": current["metadata"]["resourceVersion"],
+        }
+        if damage == "asr-uid":
+            current["metadata"]["uid"] = "replacement"
+        elif damage == "held-rv":
+            current["metadata"]["resourceVersion"] = "99"
+        elif damage == "capacity-drift":
+            current["spec"]["maxRunners"] = 1
+        else:
+            current["spec"] = deepcopy(row["spec"])
+    drain.path.write_text(json.dumps(data) + "\n")
+
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    with pytest.raises(RuntimeError):
+        resumed.restore()
 
 
 def test_resource_version_race_never_blindly_patches(lifecycle):

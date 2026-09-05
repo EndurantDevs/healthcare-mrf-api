@@ -197,28 +197,88 @@ class ArcDrain:
             _capacity(item["spec"])
         return by_name
 
-    def _check_fence(self, role: str, item: dict) -> str:
+    def _check_fence(self, role: str, item: dict, *, deleting: bool = False) -> str:
         expected, meta = self.manifests[role], item.get("metadata", {})
         _require(item.get("apiVersion") == expected["apiVersion"] and item.get("kind") == expected["kind"]
                 and meta.get("name") == expected["metadata"]["name"]
                 and meta.get("labels", {}).get(OWNER_LABEL) == self.owner
-                and not meta.get("deletionTimestamp") and bool(meta.get("uid"))
+                and (deleting or not meta.get("deletionTimestamp")) and bool(meta.get("uid"))
                 and item.get("spec") == expected["spec"], "ARC admission fence identity/spec changed")
         return meta["uid"]
 
-    def identity(self) -> dict:
+    def _reconcile_cleanup_intents(self) -> None:
+        for role, record in self.data["fences"].items():
+            if record["phase"] != "delete_intent":
+                continue
+            item = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
+            if item is None:
+                self.data["fences"][role]["phase"] = "deleted"
+                self._save()
+                continue
+            metadata = item["metadata"]
+            _require(self._check_fence(role, item, deleting=True) == record.get("uid"),
+                    "ARC admission fence UID changed during deletion")
+            resource_version = metadata.get("resourceVersion")
+            _require(isinstance(record.get("resourceVersion"), str) and record["resourceVersion"],
+                    "ARC deletion intent resource version is invalid")
+            if not metadata.get("deletionTimestamp"):
+                _require(resource_version == record["resourceVersion"],
+                        "ARC admission fence changed after deletion intent")
+                continue
+            _require(resource_version != record["resourceVersion"],
+                    "ARC admission deletion state is ambiguous")
+            while item is not None:
+                _require(self._check_fence(role, item, deleting=True) == record["uid"]
+                        and item["metadata"].get("deletionTimestamp"),
+                        "ARC admission fence changed during deletion")
+                self.pause()
+                item = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
+            self.data["fences"][role]["phase"] = "deleted"
+            self._save()
+        asrs = self._asrs()
+        for row in self.data["original"]:
+            record = self.data["changes"][row["name"]]
+            if record["phase"] != "restore_intent":
+                continue
+            item = asrs[row["name"]]
+            resource_version = item["metadata"].get("resourceVersion")
+            _require(isinstance(record.get("resourceVersion"), str) and record["resourceVersion"],
+                    "ARC restore intent resource version is invalid")
+            if item["spec"] == _held_spec(row["spec"]):
+                _require(resource_version == record["resourceVersion"],
+                        "ARC held capacity changed after restore intent")
+            elif item["spec"] == row["spec"]:
+                _require(resource_version != record["resourceVersion"],
+                        "ARC restored capacity response is ambiguous")
+                self.data["changes"][row["name"]]["phase"] = "restored"
+                self._save()
+            else:
+                raise RuntimeError("ARC capacity changed after restore intent")
+
+    def identity(self, *, restoring: bool = False) -> dict:
         """Reject uncertain mutations or drift in the captured resource identities."""
         self._load()
+        if restoring:
+            self._reconcile_cleanup_intents()
         self._asrs()
         for role, record in self.data["fences"].items():
-            _require(record["phase"] in {"no_attempt", "present", "deleted"}, "ARC admission mutation result is uncertain")
+            allowed = {"no_attempt", "present", "deleted"}
+            if restoring:
+                allowed.add("delete_intent")
+            _require(record["phase"] in allowed, "ARC admission mutation result is uncertain")
             item = self._get(FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True)
-            if record["phase"] == "present":
+            if record["phase"] in {"present", "delete_intent"}:
                 _require(item is not None and self._check_fence(role, item) == record["uid"],
                         "ARC admission fence UID changed or disappeared")
+                if record["phase"] == "delete_intent":
+                    _require(item["metadata"].get("resourceVersion") == record["resourceVersion"],
+                            "ARC admission fence changed after deletion intent")
             else:
                 _require(item is None, "unexpected ARC admission fence exists")
-        _require(all(record["phase"] in {"no_attempt", "confirmed", "restored"}
+        allowed_changes = {"no_attempt", "confirmed", "restored"}
+        if restoring:
+            allowed_changes.add("restore_intent")
+        _require(all(record["phase"] in allowed_changes
                     for record in self.data["changes"].values()), "ARC capacity mutation result is uncertain")
         return self.data
 
@@ -292,11 +352,13 @@ class ArcDrain:
     def _topology(self, asrs: dict[str, dict], *, held: bool) -> tuple | None:
         inventory = json.loads(self.kubectl("get", "autoscalinglisteners,ephemeralrunnersets", "-A", "-o", "json").stdout)["items"]
         pods = json.loads(self.kubectl("get", "pods", "-A", "-o", "json").stdout)["items"]
-        listeners = [resource for resource in inventory if resource["kind"] == "AutoscalingListener"
-                     and resource["spec"].get("autoscalingRunnerSetNamespace") == self.namespace]
+        all_listeners = [resource for resource in inventory
+                         if resource["kind"] == "AutoscalingListener"]
+        listeners = [resource for resource in all_listeners
+                     if resource["spec"].get("autoscalingRunnerSetNamespace") == self.namespace]
         sets = [resource for resource in inventory if resource["kind"] == "EphemeralRunnerSet"
                 and resource["metadata"].get("namespace") == self.namespace]
-        if len(listeners) != len(asrs):
+        if len(listeners) != len(asrs) or len(sets) != len(asrs):
             return None
         seen, selected = set(), []
         for listener in listeners:
@@ -308,11 +370,44 @@ class ArcDrain:
             if linked is None:
                 return None
             selected.extend([listener, *linked])
-        listener_pods = [pod for pod in pods
-                         if pod["metadata"].get("labels", {}).get("app.kubernetes.io/component")
-                         == "runner-scale-set-listener"
-                         and pod["metadata"].get("labels", {}).get("actions.github.com/scale-set-namespace")
-                         == self.namespace]
+        live_listener_by_uid = {
+            resource["metadata"].get("uid"): resource
+            for resource in all_listeners
+            if not resource["metadata"].get("deletionTimestamp")
+        }
+        if None in live_listener_by_uid or len(live_listener_by_uid) != len(all_listeners):
+            return None
+        for pod in pods:
+            owner_refs = [
+                ref for ref in pod["metadata"].get("ownerReferences", [])
+                if ref.get("controller") is True
+                and ref.get("kind") == "AutoscalingListener"
+            ]
+            if not owner_refs:
+                continue
+            if len(owner_refs) != 1:
+                return None
+            listener = live_listener_by_uid.get(owner_refs[0].get("uid"))
+            labels = pod["metadata"].get("labels", {})
+            if (listener is None
+                    or (pod["metadata"].get("namespace"), pod["metadata"].get("name"))
+                    != (listener["metadata"].get("namespace"), listener["metadata"].get("name"))
+                    or labels.get("app.kubernetes.io/component") != "runner-scale-set-listener"
+                    or labels.get("actions.github.com/scale-set-namespace")
+                    != listener["spec"].get("autoscalingRunnerSetNamespace")):
+                return None
+        target_listener_uids = {resource["metadata"]["uid"] for resource in listeners}
+        listener_pods = [
+            pod for pod in pods
+            if (pod["metadata"].get("labels", {}).get("app.kubernetes.io/component")
+                == "runner-scale-set-listener"
+                and pod["metadata"].get("labels", {}).get("actions.github.com/scale-set-namespace")
+                == self.namespace)
+            or any(ref.get("controller") is True
+                   and ref.get("kind") == "AutoscalingListener"
+                   and ref.get("uid") in target_listener_uids
+                   for ref in pod["metadata"].get("ownerReferences", []))
+        ]
         expected_pods = {(resource["metadata"]["namespace"], resource["metadata"]["name"]) for resource in listeners}
         if {(pod["metadata"]["namespace"], pod["metadata"]["name"])
                 for pod in listener_pods} != expected_pods:
@@ -396,17 +491,24 @@ class ArcDrain:
         return self.data
 
     def _delete_fence(self, role: str) -> None:
+        self.identity(restoring=True)
         record = self.data["fences"][role]
         if record["phase"] in {"no_attempt", "deleted"}:
             return
-        self.identity()
         name, uid = self.manifests[role]["metadata"]["name"], record["uid"]
         resource = FENCE_RESOURCES[role]
-        self.data["fences"][role]["phase"] = "delete_intent"
-        self._save()
+        if record["phase"] == "present":
+            item = self._get(resource, name)
+            _require(self._check_fence(role, item) == uid,
+                    "ARC admission fence UID changed before deletion")
+            record = {"phase": "delete_intent", "uid": uid,
+                      "resourceVersion": item["metadata"]["resourceVersion"]}
+            self.data["fences"][role] = record
+            self._save()
         self.kubectl("delete", f"--raw=/apis/admissionregistration.k8s.io/v1/{resource}/{name}",
                      "-f", "-", payload={"apiVersion": "v1", "kind": "DeleteOptions",
-                                          "preconditions": {"uid": uid},
+                                          "preconditions": {"uid": uid,
+                                                            "resourceVersion": record["resourceVersion"]},
                                           "propagationPolicy": "Foreground"})
         while True:
             item = self._get(resource, name, optional=True)
@@ -425,14 +527,20 @@ class ArcDrain:
                 self.data["changes"][name]["phase"] = "restored"
                 self._save()
                 return
-            _require(self.data["changes"][name]["phase"] == "confirmed"
+            _require(self.data["changes"][name]["phase"] in {"confirmed", "restore_intent"}
                     and item["spec"] == _held_spec(row["spec"]), "ARC capacity is not an owned change")
-            self.data["changes"][name]["phase"] = "restore_intent"
-            self._save()
+            if self.data["changes"][name]["phase"] == "confirmed":
+                self.data["changes"][name] = {
+                    "phase": "restore_intent",
+                    "resourceVersion": item["metadata"]["resourceVersion"],
+                }
+                self._save()
+            else:
+                _require(item["metadata"]["resourceVersion"]
+                        == self.data["changes"][name]["resourceVersion"],
+                        "ARC capacity changed after restore intent")
             result = self._patch_capacity(item, row["spec"], check=False)
             if result.returncode and re.search(rf"(?<![-\w])hp-pv3-arc-deny-{self.owner}(?![-\w])", result.stderr):
-                self.data["changes"][name]["phase"] = "confirmed"
-                self._save()
                 self.pause()
                 continue
             _require(result.returncode == 0, "ARC capacity restoration result is uncertain")
@@ -445,11 +553,13 @@ class ArcDrain:
 
     def restore(self) -> dict:
         """Restore confirmed changes after the parent proves census and quota absence."""
-        self.identity()
+        self.identity(restoring=True)
         asrs = self._asrs()
         for row in self.data["original"]:
             spec = asrs[row["name"]]["spec"]
-            has_owned_change = self.data["changes"][row["name"]]["phase"] == "confirmed"
+            has_owned_change = self.data["changes"][row["name"]]["phase"] in {
+                "confirmed", "restore_intent",
+            }
             _require(spec == row["spec"] or (has_owned_change and spec == _held_spec(row["spec"])),
                     "ARC capacity drift blocks restoration")
         for role in ("binding", "policy"):

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+set +m
+export GIT_NO_REPLACE_OBJECTS=1
 
 readonly OPT_IN_ENV=HLTHPRT_PLAN_PRICING_V3_CENSUS_ENVELOPE_RUN
 readonly EXPECTED_HOST=ns1033171
@@ -57,6 +59,10 @@ PRIOR_DRAIN_MODE=
 CHILD_COMMAND_SHA256=
 CHILD_EXECUTABLE_SHA256=
 CHILD_EXECUTABLE_DESCRIPTOR=
+ARC_HELPER_SHA256=
+ARC_HELPER_DESCRIPTOR=
+ARC_ACQUISITION_PID=
+ARC_SIGNAL_FORWARDED=false
 CHILD_CLEANUP_PROOF=
 CENSUS_RECEIPT_SHA256=
 RUNTIME_ATTESTATION_SHA256=
@@ -663,13 +669,102 @@ PY
   else
     CHILD_EXECUTABLE_DESCRIPTOR=/dev/fd/9
   fi
-  read -r observed_executable_sha _ \
-    < <(sha256sum "${CHILD_EXECUTABLE_DESCRIPTOR}") || return 1
+  observed_executable_sha=$(python3 -c '
+import hashlib, os
+size = os.fstat(9).st_size
+payload = b"".join(os.pread(9, min(1024 * 1024, size - offset), offset)
+                   for offset in range(0, size, 1024 * 1024))
+print(hashlib.sha256(payload).hexdigest())
+') || return 1
   if [ "${observed_executable_sha}" != "${EXPECTED_CHILD_EXECUTABLE_SHA256}" ]; then
     exec 9<&-
     return 1
   fi
   CHILD_EXECUTABLE_SHA256=${observed_executable_sha}
+}
+
+open_reviewed_arc_descriptor() {
+  local helper_path="${REPO_DIR}/scripts/research/plan_pricing_projection_v3_census_arc.py"
+  local copy_path="${STATE_DIR}/reviewed-arc-helper"
+  local observed_sha
+  [ ! -e "${copy_path}" ] && [ ! -L "${copy_path}" ] || return 1
+  observed_sha=$(run_bounded python3 - reviewed-arc-copy "${helper_path}" "${REPO_DIR}" \
+    "${SOURCE_SHA}" "${copy_path}" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+_, source_path, repo_path, source_sha, copy_path = sys.argv[1:]
+maximum_bytes = 16 * 1024 * 1024
+source_fd = os.open(source_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+try:
+    source_stat = os.fstat(source_fd)
+    if not stat.S_ISREG(source_stat.st_mode) or not 0 < source_stat.st_size <= maximum_bytes:
+        raise SystemExit("ARC helper is not a bounded regular file")
+    chunks, total = [], 0
+    while chunk := os.read(source_fd, min(1024 * 1024, maximum_bytes + 1 - total)):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise SystemExit("ARC helper exceeds the byte limit")
+finally:
+    os.close(source_fd)
+payload = b"".join(chunks)
+reviewed = subprocess.run(
+    ["git", "-c", f"safe.directory={repo_path}", "-C", repo_path, "show",
+     f"{source_sha}:scripts/research/plan_pricing_projection_v3_census_arc.py"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=20,
+    check=False,
+)
+if reviewed.returncode or len(reviewed.stdout) > maximum_bytes or payload != reviewed.stdout:
+    raise SystemExit("ARC helper differs from the exact reviewed source")
+copy_fd = os.open(copy_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+try:
+    os.fchmod(copy_fd, 0o500)
+    with os.fdopen(copy_fd, "wb", closefd=False) as target:
+        target.write(payload)
+        target.flush()
+        os.fsync(copy_fd)
+finally:
+    os.close(copy_fd)
+print(hashlib.sha256(payload).hexdigest())
+PY
+  ) || { rm -f -- "${copy_path}"; return 1; }
+  [[ "${observed_sha}" =~ ^[0-9a-f]{64}$ ]] \
+    || { rm -f -- "${copy_path}"; return 1; }
+  if ! exec 8<"${copy_path}"; then
+    rm -f -- "${copy_path}"
+    return 1
+  fi
+  if ! rm -f -- "${copy_path}"; then
+    exec 8<&-
+    return 1
+  fi
+  if [ -r /proc/self/fd/8 ]; then
+    ARC_HELPER_DESCRIPTOR=/proc/self/fd/8
+  else
+    ARC_HELPER_DESCRIPTOR=/dev/fd/8
+  fi
+  ARC_HELPER_SHA256=$(python3 -c '
+import hashlib, os
+size = os.fstat(8).st_size
+payload = b"".join(os.pread(8, min(1024 * 1024, size - offset), offset)
+                   for offset in range(0, size, 1024 * 1024))
+print(hashlib.sha256(payload).hexdigest())
+') || {
+    exec 8<&-
+    ARC_HELPER_DESCRIPTOR=
+    return 1
+  }
+  if [ "${ARC_HELPER_SHA256}" != "${observed_sha}" ]; then
+    exec 8<&-
+    ARC_HELPER_DESCRIPTOR=
+    return 1
+  fi
 }
 
 verify_source_and_target() {
@@ -896,16 +991,49 @@ print(sum(
 }
 
 arc_acquisition() {
-  local remaining
+  local initial_interrupt=${INTERRUPT_EXIT} remaining status
+  if [ "${EXIT_TRAP_ACTIVE}" = true ]; then
+    check_interrupted
+  fi
+  if [ -z "${ARC_HELPER_DESCRIPTOR}" ]; then
+    open_reviewed_arc_descriptor || return 1
+    if [ "${EXIT_TRAP_ACTIVE}" = true ]; then
+      check_interrupted
+    fi
+  fi
   remaining=$((DEADLINE_SECONDS - (SECONDS - START_SECONDS)))
   if [ "${EXIT_TRAP_ACTIVE}" = true ]; then
     remaining=$((remaining - CLEANUP_RESERVE_SECONDS))
   fi
   [ "${remaining}" -gt 0 ] || return 124
-  timeout --foreground --signal=TERM --kill-after=2s "${remaining}s" \
-    python3 "${REPO_DIR}/scripts/research/plan_pricing_projection_v3_census_arc.py" \
+  ARC_SIGNAL_FORWARDED=false
+  setsid timeout --foreground --signal=TERM --kill-after=2s "${remaining}s" \
+    python3 - run-reviewed-arc "${ARC_HELPER_DESCRIPTOR}" "${ARC_HELPER_SHA256}" \
     "$1" --state "${STATE_DIR}/arc-drain.json" --owner "${OWNER_TOKEN}" \
-    --namespace "${ARC_HOLD_NAMESPACE}" --deadline-seconds "${remaining}"
+    --namespace "${ARC_HOLD_NAMESPACE}" --deadline-seconds "${remaining}" <<'PY' &
+import hashlib
+import os
+import sys
+
+_, helper, expected_sha256, *arguments = sys.argv[1:]
+size = os.fstat(8).st_size
+payload = b"".join(os.pread(8, min(1024 * 1024, size - offset), offset)
+                   for offset in range(0, size, 1024 * 1024))
+if hashlib.sha256(payload).hexdigest() != expected_sha256:
+    raise SystemExit("reviewed ARC helper descriptor changed")
+os.lseek(8, 0, os.SEEK_SET)
+os.execv(sys.executable, [sys.executable, helper, *arguments])
+PY
+  ARC_ACQUISITION_PID=$!
+  if [ "${INTERRUPT_EXIT}" -ne "${initial_interrupt}" ]; then
+    terminate_arc_acquisition
+  fi
+  if reap_arc_acquisition "${ARC_ACQUISITION_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  return "${status}"
 }
 
 seconds_before_cleanup() {
@@ -1208,6 +1336,46 @@ signal_child_group() {
   kill -s "${number}" -- "-${pid}" >/dev/null 2>&1 \
     || kill -s "${number}" "${pid}" >/dev/null 2>&1 \
     || true
+}
+
+terminate_arc_acquisition() {
+  [ -n "${ARC_ACQUISITION_PID}" ] || return 0
+  if [ "${ARC_SIGNAL_FORWARDED}" = false ]; then
+    # Non-interactive Bash children can inherit SIGINT ignored before setsid.
+    signal_child_group "${ARC_ACQUISITION_PID}" TERM
+    ARC_SIGNAL_FORWARDED=true
+  fi
+}
+
+reap_arc_acquisition() {
+  local pid=$1 wait_exit=0
+  while :; do
+    if wait "${pid}"; then
+      wait_exit=0
+    else
+      wait_exit=$?
+    fi
+    kill -0 "${pid}" >/dev/null 2>&1 || break
+  done
+  if ! child_group_absent "${pid}"; then
+    terminate_arc_acquisition
+    for _ in {1..20}; do
+      child_group_absent "${pid}" && break
+      /bin/sleep 0.1
+    done
+    if ! child_group_absent "${pid}"; then
+      signal_child_group "${pid}" KILL
+      for _ in {1..50}; do
+        child_group_absent "${pid}" && break
+        /bin/sleep 0.1
+      done
+    fi
+    child_group_absent "${pid}" || return 1
+    [ "${wait_exit}" -ne 0 ] || wait_exit=1
+  fi
+  ARC_ACQUISITION_PID=
+  ARC_SIGNAL_FORWARDED=false
+  return "${wait_exit}"
 }
 
 arm_child_shutdown() {
@@ -1768,7 +1936,7 @@ run_child() {
   verify_reviewed_hashes
   open_reviewed_child_descriptor \
     || die "reviewed child executable descriptor changed"
-  setsid "${CHILD_EXECUTABLE_DESCRIPTOR}" "${CHILD_COMMAND[@]:1}" &
+  setsid "${CHILD_EXECUTABLE_DESCRIPTOR}" "${CHILD_COMMAND[@]:1}" 8<&- &
   capture_child_pid "$!"
   exec 9<&-
   CHILD_LAUNCHED=true
@@ -1830,6 +1998,7 @@ on_signal() {
     signal_child_group "${CHILD_PID}" "${number}"
     CHILD_SIGNAL_FORWARDED=true
   fi
+  terminate_arc_acquisition
 }
 
 delete_uid_bound() {
@@ -1946,7 +2115,14 @@ release_lock() {
 cleanup_envelope() {
   set +e
   rm -f -- "${STATE_DIR}/child-jobs.tmp" \
-    "${STATE_DIR}/reviewed-child-executable"
+    "${STATE_DIR}/reviewed-child-executable" \
+    "${STATE_DIR}/reviewed-arc-helper"
+  if [ -n "${ARC_ACQUISITION_PID}" ] \
+      && { kill -0 "${ARC_ACQUISITION_PID}" >/dev/null 2>&1 \
+        || ! child_group_absent "${ARC_ACQUISITION_PID}"; }; then
+    log 'cleanup retained every outer fence because the ARC helper process group remains'
+    return 1
+  fi
   if [ -n "${CHILD_PID}" ] \
       && { kill -0 "${CHILD_PID}" >/dev/null 2>&1 \
         || ! child_group_absent "${CHILD_PID}"; }; then
@@ -2230,11 +2406,15 @@ run_envelope() {
   trap 'on_signal INT 130' INT
   trap 'finish $?' EXIT
 
+  open_reviewed_arc_descriptor \
+    || die "reviewed ARC helper descriptor changed"
+  check_interrupted
   log 'acquiring the DEV build lock'
   start_lock
   require_lock_held || die "build lock was not retained after acquisition"
   check_interrupted
   log 'holding new ARC acquisition and draining native scale sets'
+  check_interrupted
   ARC_DRAIN_STARTED=true
   arc_acquisition hold
   check_interrupted
