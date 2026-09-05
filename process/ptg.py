@@ -181,6 +181,9 @@ from process.ptg_parts.frozen_rate_files import (
     validate_frozen_processed_results,
 )
 from process.ptg_parts.copy_load import (
+    _cancel_and_wait_tasks,
+    _copy_manifest_paths,
+    _copy_one_manifest_path,
     _copy_ignore_ptg2_objects,
     _copy_insert_ptg2_objects,
     _copy_upsert_ptg2_objects,
@@ -324,7 +327,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
-    _await_cleanup_task,
     attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
 )
@@ -2055,73 +2057,6 @@ def _emit_manifest_copy_start(
     )
 
 
-async def _copy_one_manifest_path(
-    input_path: Path,
-    *,
-    target_table: str,
-    copy_func: Any,
-    progress_callback: Callable[[int], None],
-    semaphore: asyncio.Semaphore | None = None,
-) -> None:
-    if semaphore is None:
-        await copy_func(
-            input_path,
-            target_table=target_table,
-            progress_callback=progress_callback,
-        )
-        return
-    async with semaphore:
-        await copy_func(
-            input_path,
-            target_table=target_table,
-            progress_callback=progress_callback,
-        )
-
-
-async def _copy_manifest_paths(
-    input_paths: Sequence[Path],
-    *,
-    target_table: str,
-    copy_func: Any,
-    progress_callback: Callable[[int], None],
-    copy_tasks: int,
-) -> None:
-    semaphore = (
-        asyncio.Semaphore(copy_tasks)
-        if copy_tasks > 1 and len(input_paths) > 1
-        else None
-    )
-    if semaphore is None:
-        for input_path in input_paths:
-            await _copy_one_manifest_path(
-                input_path,
-                target_table=target_table,
-                copy_func=copy_func,
-                progress_callback=progress_callback,
-            )
-        return
-    pending_copies = {
-        asyncio.create_task(
-            _copy_one_manifest_path(
-                input_path,
-                target_table=target_table,
-                copy_func=copy_func,
-                progress_callback=progress_callback,
-                semaphore=semaphore,
-            )
-        )
-        for input_path in input_paths
-    }
-    try:
-        for completed_copy in asyncio.as_completed(pending_copies):
-            await completed_copy
-    except BaseException:
-        await _await_cleanup_task(
-            asyncio.create_task(_cancel_and_wait_tasks(pending_copies))
-        )
-        raise
-
-
 def _completed_manifest_copy_result(
     progress: _ManifestCopyProgress,
     *,
@@ -2308,17 +2243,6 @@ def _cleanup_strict_v3_graph_artifacts(artifacts: Mapping[str, Any]) -> None:
             except OSError:
                 break
             current = current.parent
-
-
-async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
-    """Cancel child work and wait until it can no longer use import inputs."""
-
-    remaining_tasks = tuple(tasks)
-    for task in remaining_tasks:
-        task.cancel()
-    if remaining_tasks:
-        await asyncio.gather(*remaining_tasks, return_exceptions=True)
-    tasks.clear()
 
 
 @asynccontextmanager
@@ -6261,6 +6185,7 @@ def _shared_v3_publisher_sources(
 ) -> tuple[Path, ...]:
     publisher_sources = (
         source_root / "ptg.py",
+        source_root / "ptg_parts" / "copy_load.py",
         source_root / "ptg_parts" / "rust_scanner.py",
         source_root / "ptg_parts" / "ptg2_manifest_publish.py",
         source_root / "ptg_parts" / "ptg2_provider_quarantine.py",

@@ -9341,7 +9341,9 @@ def test_reused_v3_serving_index_rejects_invalid_source_witness(
         )
 
 
+@pytest.mark.parametrize("publisher_source_file", ["ptg2_source_witness.py", "copy_load.py"])
 def test_shared_v3_physical_identity_binds_source_witness_publisher(
+    publisher_source_file,
     tmp_path,
     monkeypatch,
 ):
@@ -9357,7 +9359,7 @@ def test_shared_v3_physical_identity_binds_source_witness_publisher(
 
     def changed_witness_source(path):
         source_bytes = original_read_bytes(path)
-        if path.name == "ptg2_source_witness.py":
+        if path.name == publisher_source_file:
             return source_bytes + b"\n# physical-contract-change\n"
         return source_bytes
 

@@ -5429,6 +5429,7 @@ async def test_explicit_full_false_keeps_legacy_path_without_projection(
     release_resolver.assert_awaited_once_with(
         request.ctx.sa_session,
         selection.plan_release_id,
+        projection_only=False,
     )
     assert strict_search.await_args.args[1]["view"] == "full"
     assert strict_search.await_args.args[1]["include_providers"] == "false"
@@ -5796,6 +5797,7 @@ async def test_canonical_empty_negotiated_result_reuses_release_for_allowed_fall
     release_resolver.assert_awaited_once_with(
         request.ctx.sa_session,
         selection.plan_release_id,
+        projection_only=False,
     )
     assert strict_search.await_args.kwargs["release_selection"] is selection
     assert allowed_search.await_args.kwargs["release_selection"] is selection

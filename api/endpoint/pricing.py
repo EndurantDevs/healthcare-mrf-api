@@ -93,7 +93,10 @@ from api.plan_release_serving import (
     normalize_plan_release_id,
     resolve_plan_release_serving,
 )
-from api.plan_release_serving_resolution import resolve_plan_release_guard_selection
+from api.plan_release_serving_resolution import (
+    _release_market_type_for_guard,
+    resolve_plan_release_guard_selection,
+)
 from api.plan_release_readiness import is_release_binding_serving_scope_exact
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -1390,23 +1393,6 @@ def _reject_broad_group_plan_provider_expansion(
     ):
         return
     _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=has_taxonomy_scope)
-
-
-def _release_market_type_for_guard(
-    selection: PlanReleaseServingSelection | None,
-) -> str:
-    """Derive the guard market only from exact frozen network bindings."""
-
-    market_types = {
-        binding.plan_market_type.strip().lower()
-        for binding in (
-            selection.in_network_bindings if selection is not None else ()
-        )
-        if binding.plan_market_type.strip()
-    }
-    if "group" in market_types:
-        return "group"
-    return next(iter(market_types)) if len(market_types) == 1 else ""
 
 
 def _raise_unresolved_specialty(specialty_filter) -> None:
@@ -12657,17 +12643,11 @@ async def list_providers_by_procedure(request):
             status=422,
         )
     if plan_release_id and not release_selection_args_by_name:
-        if projected_result_type is not None:
-            release_selection = await resolve_plan_release_serving(
-                session,
-                plan_release_id,
-                projection_only=True,
-            )
-        else:
-            release_selection = await resolve_plan_release_serving(
-                session,
-                plan_release_id,
-            )
+        release_selection = await resolve_plan_release_serving(
+            session,
+            plan_release_id,
+            projection_only=projected_result_type is not None,
+        )
         release_selection_args_by_name = _release_selection_args_by_name(
             release_selection
         )

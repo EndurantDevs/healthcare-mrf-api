@@ -124,6 +124,23 @@ async def _load_release_rows(
     return list(result)
 
 
+def _release_market_type_for_guard(
+    selection: PlanReleaseServingSelection | None,
+) -> str:
+    """Derive the guard market only from exact frozen network bindings."""
+
+    market_types = {
+        binding.plan_market_type.strip().lower()
+        for binding in (
+            selection.in_network_bindings if selection is not None else ()
+        )
+        if binding.plan_market_type.strip()
+    }
+    if "group" in market_types:
+        return "group"
+    return next(iter(market_types)) if len(market_types) == 1 else ""
+
+
 async def resolve_plan_release_guard_selection(
     session: Any,
     plan_release_id: Any,
