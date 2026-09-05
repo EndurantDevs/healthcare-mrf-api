@@ -10459,10 +10459,10 @@ hospitals:
   cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
 - hospital_id: hospital-003118
   name: Insight Hospital and Medical Center Coldwater
-  cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
+  cms_hpt_url: https://insightcoldwater.org/cms-hpt.txt
 - hospital_id: hospital-003119
   name: Insight Surgical Hospital
-  cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
+  cms_hpt_url: https://insightsurgicalhospital.com/cms-hpt.txt
 - hospital_id: hospital-003120
   name: Inspira Health Center Bridgeton
   cms_hpt_url: https://www.inspirahealthnetwork.org/cms-hpt.txt
@@ -19423,6 +19423,7 @@ hospitals:
 - hospital_id: hospital-005821
   name: Slidell Memorial Hospital
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt
+  locator_name: Slidell Memorial Hospital - Main Campus
 - hospital_id: hospital-005822
   name: Slidell Memorial Hospital - Main Campus
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt

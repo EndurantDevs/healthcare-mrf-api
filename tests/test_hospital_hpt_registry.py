@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from process import hospital_hpt_registry as registry
+from process.hospital_hpt_locator import HospitalHptLocatorRecord, match_hospital_hpt_locator
 from tests.hospital_hpt_registry_fallbacks import (
     FALLBACK_URL_SHA256_BY_HOSPITAL_ID as _FALLBACK_URL_SHA256_BY_HOSPITAL_ID,
 )
@@ -47,6 +48,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
     "hospital-005086": "Philadelphia Post-Acute Partners LLC",
+    "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
@@ -80,7 +82,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_899
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_702
+    assert sum("locator_name" in entry for entry in hospitals) == 1_703
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 114
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -124,6 +126,7 @@ def test_checked_in_registry_has_reviewed_cms_hpt_urls():
         "hospital-006476", "hospital-006477", "hospital-007140",
         "hospital-007141",
         "hospital-001458", "hospital-003007", "hospital-003587", "hospital-003588",
+        "hospital-003117", "hospital-003118", "hospital-003119",
     )] == [
         "https://www.achsiowa.org/cms-hpt.txt",
         "https://amberwellhealth.org/cms-hpt.txt",
@@ -140,7 +143,34 @@ def test_checked_in_registry_has_reviewed_cms_hpt_urls():
         "https://mhsks.org/cms-hpt.txt",
         "https://lindsborghospital.org/cms-hpt.txt",
         "https://lindsborghospital.org/cms-hpt.txt",
+        "https://estimator.myinsightcare.com/cms-hpt.txt",
+        "https://insightcoldwater.org/cms-hpt.txt",
+        "https://insightsurgicalhospital.com/cms-hpt.txt",
     ]
+
+
+def test_slidell_name_binding_preserves_distinct_campus_sources():
+    """Bind the reviewed Main name without sharing East's source or identity."""
+    hospitals = registry.selected_hospital_hpt_registry({"hospital_ids": [
+        "hospital-005821", "hospital-005822", "hospital-005823",
+    ]})
+    records = (
+        HospitalHptLocatorRecord(
+            "Slidell Memorial Hospital - Main Campus", "https://hospital.example/main.csv"
+        ),
+        HospitalHptLocatorRecord(
+            "Slidell Memorial Hospital- East Campus", "https://hospital.example/east.csv"
+        ),
+    )
+    match = match_hospital_hpt_locator(hospitals, hospitals[0]["cms_hpt_url"], records)
+    assert [(item.hospital_id, item.record_index) for item in match.bindings] == [
+        ("hospital-005821", 0), ("hospital-005822", 0), ("hospital-005823", 1),
+    ]
+    assert match.content_targets == tuple(record.mrf_url for record in records)
+    assert not match.unmatched_hospital_ids and not match.ambiguous_hospital_ids
+    assert all(registry.hospital_hpt_group_ids(item["hospital_id"]) == (
+        item["hospital_id"],
+    ) for item in hospitals)
 
 
 def test_checked_in_registry_has_reviewed_canonical_aliases():
