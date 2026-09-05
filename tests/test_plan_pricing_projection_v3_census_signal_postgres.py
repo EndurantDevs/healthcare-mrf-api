@@ -28,6 +28,9 @@ from tests.test_plan_pricing_projection_postgres import (
     TEST_DATABASE_PATTERN,
     _sqlalchemy_async_dsn,
 )
+from tests.test_plan_pricing_projection_v3_census_postgres import (
+    _install_census_temp_file_limit_guard,
+)
 
 asyncpg = pytest.importorskip("asyncpg")
 _RECEIPT_ENV = "HLTHPRT_TEST_CENSUS_SIGNAL_RECEIPT"
@@ -154,6 +157,7 @@ async def _connect_test_database():
     if TEST_DATABASE_PATTERN.search(str(database_name)) is None:
         await observer.close()
         pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
+    await _install_census_temp_file_limit_guard(observer.execute)
     return dsn, observer
 
 
