@@ -18100,7 +18100,7 @@ hospitals:
 - hospital_id: hospital-005429
   name: Riverside
   cms_hpt_url: https://www.ahmchealth.com/cms-hpt.txt
-  locator_mrf_url: https://www.ahmchealth.com/docs/PricingTransparency-Parkview_Community_Hospital_Medical_Center-3286-20260320142433b.csv
+  alias_of: hospital-001811
 - hospital_id: hospital-005430
   name: RIVERSIDE COMMUNITY HOSPITAL
   cms_hpt_url: https://www.riversidecommunityhospital.com/cms-hpt.txt
