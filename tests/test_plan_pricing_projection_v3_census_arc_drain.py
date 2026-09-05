@@ -94,6 +94,26 @@ def test_unreviewed_arc_helper_is_rejected_before_lock(tmp_path: Path) -> None:
     assert cleanup["complete"] is True
 
 
+def test_trailing_hyphen_owner_token_is_rejected_before_lock(tmp_path: Path) -> None:
+    env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
+    arguments = envelope._arguments(state_root, checkout)
+    arguments[arguments.index("--owner-token") + 1] = "testowner-"
+
+    result = subprocess.run(
+        ["/bin/bash", str(envelope.SCRIPT), "run", *arguments],
+        env=env_by_name,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert "owner token must be 8-32 lowercase DNS-label characters" in result.stderr
+    events = tmp_path / "fake-state/events"
+    assert not events.exists() or "lock_create" not in events.read_text().splitlines()
+
+
 def test_arc_helper_is_in_reviewed_harness_inventory() -> None:
     assert "scripts/research/plan_pricing_projection_v3_census_arc.py" in support.HARNESS_PATHS
 

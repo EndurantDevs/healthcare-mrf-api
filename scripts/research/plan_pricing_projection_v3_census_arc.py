@@ -206,6 +206,23 @@ class ArcDrain:
                 and item.get("spec") == expected["spec"], "ARC admission fence identity/spec changed")
         return meta["uid"]
 
+    def _reconcile_fence_intents(self) -> None:
+        for role in self.data["fences"]:
+            while self.data["fences"][role]["phase"] == "intent":
+                item = self._get(
+                    FENCE_RESOURCES[role], self.manifests[role]["metadata"]["name"], optional=True,
+                )
+                if item is None:
+                    try:
+                        self._create_fence(role)
+                    except RuntimeError:
+                        self.pause()
+                    continue
+                self.data["fences"][role] = {
+                    "phase": "present", "uid": self._check_fence(role, item),
+                }
+                self._save()
+
     def _reconcile_cleanup_intents(self) -> None:
         for role, fence_state in self.data["fences"].items():
             if fence_state["phase"] != "delete_intent":
@@ -282,6 +299,7 @@ class ArcDrain:
     def identity(self, *, restoring: bool = False) -> dict:
         """Reject uncertain mutations or drift in the captured resource identities."""
         self._load()
+        self._reconcile_fence_intents()
         self._reconcile_drain_intents()
         if restoring:
             self._reconcile_cleanup_intents()

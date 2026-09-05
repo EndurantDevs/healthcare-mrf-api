@@ -265,7 +265,7 @@ PY
 
 validate_args() {
   local state_leaf
-  [[ "${OWNER_TOKEN}" =~ ^[a-z0-9][a-z0-9-]{7,31}$ ]] \
+  [[ "${OWNER_TOKEN}" =~ ^[a-z0-9][a-z0-9-]{6,30}[a-z0-9]$ ]] \
     || die "owner token must be 8-32 lowercase DNS-label characters"
   [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
     || die "exact reviewed source SHA is required"

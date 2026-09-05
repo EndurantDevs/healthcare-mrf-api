@@ -35,6 +35,9 @@ class Cluster:
         self.fail_patch = None
         self.fail_after_patch = None
         self.fail_create = None
+        self.fail_after_create = None
+        self.delay_create = None
+        self.pending_create = None
         self.conflict_once = False
         self.pauses = 0
 
@@ -183,11 +186,23 @@ class Cluster:
                     "ValidatingAdmissionPolicyBinding": "validatingadmissionpolicybindings"}[fence_mapping["kind"]]
         if self.fail_create == fence_mapping["kind"]:
             raise ValueError("injected create failure")
+        if self.delay_create == fence_mapping["kind"]:
+            self.delay_create = None
+            fence_mapping["metadata"].update(uid=name + "-uid", resourceVersion="1", generation=1)
+            self.pending_create = (resource, name, fence_mapping)
+            raise ValueError("injected create timeout")
+        if self.pending_create:
+            pending_resource, pending_name, pending_fence = self.pending_create
+            self.fences[pending_resource, pending_name] = pending_fence
+            self.events.append(("create", pending_fence["kind"]))
+            self.pending_create = None
         if (resource, name) in self.fences:
             raise ValueError("AlreadyExists")
         fence_mapping["metadata"].update(uid=name + "-uid", resourceVersion="1", generation=1)
         self.fences[resource, name] = fence_mapping
         self.events.append(("create", fence_mapping["kind"]))
+        if self.fail_after_create == fence_mapping["kind"]:
+            raise ValueError("injected post-create response failure")
         return fence_mapping
 
     def _patch_asr(self, args, is_dry_run):
@@ -343,12 +358,31 @@ def test_partial_hold_failure_reconciles_before_restore(lifecycle):
     assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
 
 
-def test_create_error_preserves_unmodified_capacity(lifecycle):
+@pytest.mark.parametrize("outcome", ["absent", "present", "delayed"])
+def test_fresh_restore_reconciles_ambiguous_fence_create(lifecycle, outcome):
     drain, cluster = lifecycle
-    cluster.fail_create = "ValidatingAdmissionPolicyBinding"
+    failure_by_outcome = {
+        "absent": "fail_create",
+        "present": "fail_after_create",
+        "delayed": "delay_create",
+    }
+    setattr(cluster, failure_by_outcome[outcome], "ValidatingAdmissionPolicyBinding")
     with pytest.raises(RuntimeError):
         drain.hold()
     assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert json.loads(drain.path.read_text())["fences"]["binding"]["phase"] == "intent"
+
+    cluster.fail_create = None
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.restore()
+
+    if cluster.pending_create:
+        resource, name, fence = cluster.pending_create
+        cluster.fences[resource, name] = fence
+        cluster.pending_create = None
+
+    assert not cluster.fences
+    assert resumed.data["restored"] is True
 
 
 def test_fresh_restore_reconciles_ambiguous_initial_capacity_patch(lifecycle):
