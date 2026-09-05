@@ -179,7 +179,7 @@ async def test_postgres_csv_v1_labels_stay_csv_and_current_parser_only(
         await _create_version_table(engine, table)
         await _run_migration(engine, _load_migration(), "upgrade")
         connection = await asyncpg.connect(
-            str(database_url.set(drivername="postgresql"))
+            database_url.set(drivername="postgresql").render_as_string(hide_password=False)
         )
         try:
             await _assert_v1_shape_boundaries(connection, table)

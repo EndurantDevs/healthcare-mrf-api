@@ -5,7 +5,7 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  # Read workflow runs and download the exact-base coverage artifact.
+  # Read workflow runs, the exact-base artifact, and the pinned CI image.
   actions: read
   contents: read
   packages: read

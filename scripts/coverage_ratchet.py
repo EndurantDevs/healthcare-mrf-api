@@ -33,6 +33,10 @@ def _compare_metric(label: str, current: Metric, minimum: Metric) -> list[str]:
     current = _metric(current.get("covered"), current.get("total"), label)
     minimum = _metric(minimum.get("covered"), minimum.get("total"), label)
     if current["covered"] * minimum["total"] < minimum["covered"] * current["total"]:
+        current_missing = current["total"] - current["covered"]
+        minimum_missing = minimum["total"] - minimum["covered"]
+        if current["total"] < minimum["total"] and current_missing <= minimum_missing:
+            return []
         return [
             f"{label}: coverage fell to {_percent(current):.4f}% "
             f"below {_percent(minimum):.4f}%"
@@ -119,7 +123,7 @@ def _compare_baselines(
     reference: dict[str, Any],
     _changed_line_by_report: dict[str, int] | None = None,
 ) -> list[str]:
-    """Compare policy and ratio floors without imposing an uncovered-count cap."""
+    """Compare policy and ratio floors while allowing deletion-only debt parity."""
 
     errors: list[str] = []
     if reference.get("machine_artifact_required") is True and candidate.get(

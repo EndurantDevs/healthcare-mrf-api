@@ -1,8 +1,14 @@
-"""Static contracts for healthcare's CI-equivalent coverage forecast wiring."""
+"""Contracts for healthcare's CI-equivalent coverage forecast wiring."""
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+
+import pytest
+import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +36,91 @@ def _trusted_caller() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _base_coverage_run(**overrides) -> dict:
+    return {
+        "id": 101, "head_sha": "1" * 40, "head_branch": "main",
+        "event": "push", "status": "completed", "conclusion": "success",
+        "run_started_at": "2026-01-01T00:00:00Z", **overrides,
+    }
+
+
+def _run_base_resolution(tmp_path, responses):
+    """Execute the real workflow step with local API replies and a virtual wait."""
+    response_path = tmp_path / "responses"
+    response_path.write_text("\n".join(
+        "API_ERROR" if response is None else json.dumps({
+            "workflow_runs": response if isinstance(response, list) else [response]
+        })
+        for response in responses
+    ) + "\n")
+    call_path = tmp_path / "calls"
+    poll_path = tmp_path / "polls"
+    output_path = tmp_path / "output"
+    call_path.write_text("0")
+    poll_path.write_text("")
+    output_path.write_text("")
+    step = next(
+        entry for entry in yaml.safe_load(_workflow())["jobs"]["test-coverage"]["steps"]
+        if entry.get("name") == "Resolve exact base coverage run"
+    )
+    harness = r'''
+git() { printf '%s\n' '{"machine_artifact_required":true}'; }
+curl() {
+  call_count=$(($(cat "$CALL_PATH") + 1))
+  printf '%s' "$call_count" > "$CALL_PATH"
+  response=$(sed -n "${call_count}p" "$RESPONSE_PATH")
+  if [ "$response" = API_ERROR ]; then echo "synthetic API failure" >&2; return 22; fi
+  printf '%s\n' "$response"
+}
+sleep() { printf '%s\n' "$1" >> "$POLL_PATH"; SECONDS=$((SECONDS + $1)); }
+'''
+    completed = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", harness + step["run"]],
+        env={**os.environ, "BASE_SHA": "1" * 40, "GH_TOKEN": "synthetic-token",
+             "GITHUB_API_URL": "https://api.example.invalid", "GITHUB_REPOSITORY": "example/repo",
+             "GITHUB_OUTPUT": str(output_path), "RESPONSE_PATH": str(response_path),
+             "CALL_PATH": str(call_path), "POLL_PATH": str(poll_path)},
+        capture_output=True, text=True, timeout=5,
+    )
+    return completed, output_path.read_text(), int(call_path.read_text()), poll_path.read_text().splitlines()
+
+
+@pytest.mark.parametrize(("responses", "error", "poll_count"), [
+    ([_base_coverage_run()], None, 0),
+    ([_base_coverage_run(status="queued", conclusion=None), _base_coverage_run()], None, 1),
+    ([_base_coverage_run(status="waiting", conclusion=None), _base_coverage_run()], None, 1),
+    ([_base_coverage_run(head_sha="2" * 40)], "no successful exact-base", 0),
+    ([_base_coverage_run(head_sha="2" * 40, status="in_progress", conclusion=None)],
+     "no successful exact-base", 0),
+    ([[]], "no successful exact-base", 0),
+    ([_base_coverage_run(event="workflow_dispatch")], "no successful exact-base", 0),
+    ([_base_coverage_run(head_branch="feature")], "no successful exact-base", 0),
+    ([_base_coverage_run(conclusion="failure")], "no successful exact-base", 0),
+    ([_base_coverage_run(status="in_progress", conclusion=None),
+      _base_coverage_run(conclusion="cancelled")], "no successful exact-base", 1),
+    ([None], "synthetic API failure", 0),
+    ([_base_coverage_run(status="in_progress", conclusion=None)] * 18,
+     "timed out waiting for exact-base CI run", 18),
+])
+def test_base_coverage_waits_only_for_exact_producer(tmp_path, responses, error, poll_count):
+    completed, output, call_count, polls = _run_base_resolution(tmp_path, responses)
+    if error and error.startswith("timed out"):
+        assert 0 < len(polls) <= poll_count
+        assert call_count == len(polls)
+    else:
+        assert len(polls) == poll_count
+        assert call_count == len(responses)
+    assert all(0 < int(seconds) <= 10 for seconds in polls)
+    if error is None:
+        assert completed.returncode == 0, completed.stderr
+        assert "run_id=101\n" in output
+        assert "reference_baseline=coverage-data/baseline/test-coverage-baseline.json\n" in output
+    else:
+        assert completed.returncode != 0
+        assert error in completed.stderr
+        assert "run_id=" not in output
+
+
 def test_coverage_forecast_requires_one_exact_base_and_head_for_all_producers() -> None:
     """No coverage job may quietly substitute an unrelated target or checkout."""
 
@@ -42,6 +133,7 @@ def test_coverage_forecast_requires_one_exact_base_and_head_for_all_producers() 
     assert workflow.count("ref: ${{ github.sha }}") >= 5
     assert workflow.count('fetch-depth: 0') >= 6
     assert '--data-urlencode "head_sha=$BASE_SHA"' in workflow
+    assert "--data-urlencode status=success" not in workflow
     assert "--data-urlencode per_page=100" in workflow
     assert "sort_by([.run_started_at, .id])" in workflow
     assert 'error("no successful exact-base CI run")' in workflow

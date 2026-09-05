@@ -109,7 +109,7 @@ async def _packed_database(monkeypatch):
 
 
 def _driver_dsn(case) -> str:
-    return str(case.database_url.set(drivername="postgresql"))
+    return case.database_url.set(drivername="postgresql").render_as_string(hide_password=False)
 
 
 async def _connection_proxy(connection) -> ConnectionProxy:
