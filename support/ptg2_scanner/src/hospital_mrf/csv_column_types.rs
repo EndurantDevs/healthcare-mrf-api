@@ -23,6 +23,7 @@ struct CommonCsvColumns {
 #[derive(Clone, Debug)]
 struct TallCsvColumns {
     profile: CmsProfile,
+    requires_estimated_amount: bool,
     common: CommonCsvColumns,
     payer_name: usize,
     plan_name: usize,
@@ -57,6 +58,7 @@ struct WidePayerColumns {
 #[derive(Clone, Debug)]
 struct WideCsvColumns {
     profile: CmsProfile,
+    requires_estimated_amount: bool,
     common: CommonCsvColumns,
     payers: Vec<WidePayerColumns>,
 }
