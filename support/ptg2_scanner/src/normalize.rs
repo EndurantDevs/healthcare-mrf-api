@@ -217,6 +217,7 @@ pub fn strict_npi_integer(value: &Value, field_name: &str) -> io::Result<i64> {
 pub struct StrictNpiList {
     pub valid: Vec<i64>,
     pub quarantined: Vec<i64>,
+    pub quarantined_text: Vec<String>,
     /// A publisher supplied `[]` instead of the TiC TIN-only marker `[0]`.
     /// The semantic NPI membership is still empty, but callers must surface
     /// this normalization in the scanner attestation.
@@ -240,20 +241,28 @@ fn strict_npi_partition_with_policy(
     let Some(Value::Array(items)) = value else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "provider group npi must be an array of JSON integers or canonical unsigned integer strings",
+            "provider group npi must be an array of JSON integers or bounded strings",
         ));
     };
     let empty_array_normalized = items.is_empty();
     if empty_array_normalized && !allow_empty_tin_only {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "provider group npi must contain at least one JSON integer or canonical unsigned integer string",
+            "provider group npi must contain at least one JSON integer or bounded string",
         ));
     }
     let mut valid = Vec::with_capacity(items.len());
     let mut quarantined = Vec::new();
+    let mut quarantined_text = Vec::new();
     for item in items {
-        let npi = strict_npi_integer(item, "provider group npi element")?;
+        let npi = match strict_npi_integer(item, "provider group npi element") {
+            Ok(npi) => npi,
+            Err(_) if matches!(item, Value::String(text) if text.len() <= 128) => {
+                quarantined_text.push(item.as_str().unwrap().to_string());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if npi == 0 {
             // Zero is the TiC TIN-only marker, not an NPI. Some publishers
             // repeat it beside real NPIs; it must not create membership.
@@ -267,9 +276,11 @@ fn strict_npi_partition_with_policy(
     valid.sort_unstable();
     valid.dedup();
     quarantined.sort_unstable();
+    quarantined_text.sort_unstable();
     Ok(StrictNpiList {
         valid,
         quarantined,
+        quarantined_text,
         empty_array_normalized,
     })
 }
@@ -693,6 +704,7 @@ mod tests {
             StrictNpiList {
                 valid: vec![1234567890],
                 quarantined: vec![123456789, 123456789],
+                quarantined_text: Vec::new(),
                 empty_array_normalized: false,
             }
         );
@@ -708,6 +720,7 @@ mod tests {
             StrictNpiList {
                 valid: vec![1234567890],
                 quarantined: vec![111111111, 222222222, 333333333, 444444444],
+                quarantined_text: Vec::new(),
                 empty_array_normalized: false,
             }
         );
@@ -716,6 +729,7 @@ mod tests {
             StrictNpiList {
                 valid: vec![1234567890],
                 quarantined: Vec::new(),
+                quarantined_text: Vec::new(),
                 empty_array_normalized: false,
             }
         );
@@ -745,7 +759,7 @@ mod tests {
         ] {
             assert!(strict_npi_list(Some(&invalid)).is_err());
         }
-        for invalid_text in [
+        for quarantined_text in [
             " 1234567890",
             "1234567890 ",
             "0123456789",
@@ -755,8 +769,17 @@ mod tests {
             "9223372036854775808",
             "１２３４５６７８９０",
         ] {
-            assert!(strict_npi_list(Some(&json!([invalid_text]))).is_err());
+            assert_eq!(
+                strict_npi_partition(Some(&json!([1234567890, quarantined_text]))).unwrap(),
+                StrictNpiList {
+                    valid: vec![1234567890],
+                    quarantined: Vec::new(),
+                    quarantined_text: vec![quarantined_text.to_string()],
+                    empty_array_normalized: false,
+                }
+            );
         }
+        assert!(strict_npi_list(Some(&json!(["x".repeat(129)]))).is_err());
         assert!(strict_npi_list(None).is_err());
     }
 

@@ -45,6 +45,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_audit import (
     publish_shared_audit_sample,
     sealed_audit_sample_metadata,
+    sealed_or_published_audit_metadata,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
     PTG2_V3_DURABLE_SCRATCH_DURABILITY,
@@ -111,6 +112,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
     normalized_full_rebuild_scope_digest,
+    shared_layout_support_digest,
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
@@ -5142,26 +5144,14 @@ def _physical_serving_index(
     return serving_index
 
 
-def _shared_layout_support_digest(
-    *,
-    core_support: Mapping[str, Any],
-    audit_sample: Mapping[str, Any],
-    source_witness: Mapping[str, Any],
-    full_rebuild_scope_digest: str | None = None,
-) -> bytes:
-    """Seal support metadata, optionally isolating one controlled rebuild."""
-
-    support_by_field = {
-        **dict(core_support),
-        "audit_sample": dict(audit_sample),
-        "source_witness": dict(source_witness),
-    }
-    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
-        full_rebuild_scope_digest
+async def _sealed_or_published_audit_metadata(
+    session: Any, **metadata_by_field: Any
+) -> dict[str, Any]:
+    return await sealed_or_published_audit_metadata(
+        session,
+        sealed_metadata_loader=sealed_audit_sample_metadata,
+        **metadata_by_field,
     )
-    if normalized_rebuild_digest is not None:
-        support_by_field["full_rebuild_scope_digest"] = normalized_rebuild_digest
-    return shared_support_digest(support_by_field)
 
 
 async def _publish_prepared_shared_layout(
@@ -5735,7 +5725,7 @@ async def _publish_prepared_shared_layout(
                 published_rows=int(audit_publication.row_count),
             )
         await touch_build()
-        support_digest = _shared_layout_support_digest(
+        support_digest = shared_layout_support_digest(
             core_support=core_support_map,
             audit_sample=audit_publication.metadata,
             source_witness=source_witness_publication.metadata,
@@ -5802,7 +5792,6 @@ async def _publish_prepared_shared_layout(
                     layout_manifest={"serving_index": provisional_serving_index},
                     progress_callback=seal_progress.add,
                 )
-                sealed_audit_metadata_map = dict(audit_publication.metadata)
             else:
                 sealed = await seal_shared_layout(
                     session,
@@ -5813,16 +5802,18 @@ async def _publish_prepared_shared_layout(
                     support_digest=support_digest,
                     layout_manifest={"serving_index": provisional_serving_index},
                 )
-                sealed_audit_metadata_map = (
-                    await sealed_audit_sample_metadata(
-                        session,
-                        schema_name=schema_name,
-                        snapshot_key=int(sealed.snapshot_key),
-                        logical_snapshot_id=str(logical_snapshot_id),
-                    )
-                    if sealed.reused
-                    else dict(audit_publication.metadata)
-                )
+            sealed_audit_metadata_map = await _sealed_or_published_audit_metadata(
+                session,
+                sealed=sealed,
+                schema_name=schema_name,
+                logical_snapshot_id=logical_snapshot_id,
+                expected_generation=(
+                    PTG2_V4_SHARED_GENERATION
+                    if provider_graph_v4
+                    else PTG2_V3_SHARED_GENERATION
+                ),
+                published_metadata=audit_publication.metadata,
+            )
         if seal_progress is not None:
             seal_progress.flush()
         record_stage("seal", stage_started_at)

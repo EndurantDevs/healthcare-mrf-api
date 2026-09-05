@@ -61,6 +61,10 @@ _GRAPH_LAYOUT = {
 }
 
 
+class ReusableLayoutAuditCorruption(RuntimeError):
+    """A sealed reusable layout has invalid persisted audit state."""
+
+
 @dataclass(frozen=True)
 class AuditCandidate:
     code_key: int
@@ -659,17 +663,13 @@ async def _validate_candidate_provider_counts(
         )
 
 
-async def _validate_snapshot_source_dictionary(
+async def _snapshot_source_keys(
     session: Any,
     *,
     schema_name: str,
     logical_snapshot_id: str,
-    source_count: int,
-    required_source_keys: Iterable[int],
-) -> None:
-    normalized_source_count = int(source_count)
-    if normalized_source_count <= 0:
-        raise RuntimeError("strict V3 audit requires a positive source_count")
+    corruption_error: type[RuntimeError] = RuntimeError,
+) -> list[int]:
     schema = _quote_ident(schema_name)
     source_key_result = await session.execute(
         db.text(
@@ -682,20 +682,64 @@ async def _validate_snapshot_source_dictionary(
         ),
         {"snapshot_id": str(logical_snapshot_id)},
     )
-    observed_source_keys = tuple(
-        int(_row_mapping(database_row)["source_key"])
-        for database_row in source_key_result
+    observed_source_keys = []
+    for database_row in source_key_result:
+        try:
+            source_key = _persisted_unsigned_integer(
+                _row_mapping(database_row)["source_key"],
+                "snapshot source_key",
+                2**64 - 1,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise corruption_error(
+                "strict V3 audit snapshot source dictionary contains invalid source keys"
+            ) from exc
+        observed_source_keys.append(source_key)
+    return observed_source_keys
+
+
+async def _validate_snapshot_source_dictionary(
+    session: Any,
+    *,
+    schema_name: str,
+    logical_snapshot_id: str,
+    source_count: int,
+    required_source_keys: Iterable[int],
+    corruption_error: type[RuntimeError] = RuntimeError,
+) -> None:
+    """Require a complete source dictionary covering every audit occurrence."""
+
+    normalized_source_count = int(source_count)
+    if normalized_source_count <= 0:
+        raise corruption_error("strict V3 audit requires a positive source_count")
+    observed_source_keys = await _snapshot_source_keys(
+        session,
+        schema_name=schema_name,
+        logical_snapshot_id=logical_snapshot_id,
+        corruption_error=corruption_error,
     )
-    expected_source_keys = tuple(range(normalized_source_count))
-    if observed_source_keys != expected_source_keys:
-        raise RuntimeError(
+    if len(observed_source_keys) != normalized_source_count or any(
+        source_key != index
+        for index, source_key in enumerate(observed_source_keys)
+    ):
+        raise corruption_error(
             "strict V3 audit snapshot source dictionary is not complete and dense"
         )
-    missing_source_keys = {
-        int(source_key) for source_key in required_source_keys
-    } - set(observed_source_keys)
+    normalized_required_source_keys = set()
+    for source_key in required_source_keys:
+        try:
+            normalized_required_source_keys.add(
+                _persisted_unsigned_integer(
+                    source_key, "audit occurrence source_key", 2**64 - 1
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise corruption_error(
+                "strict V3 audit occurrence source keys are invalid"
+            ) from exc
+    missing_source_keys = normalized_required_source_keys - set(observed_source_keys)
     if missing_source_keys:
-        raise RuntimeError(
+        raise corruption_error(
             "strict V3 audit occurrence source keys are absent from the snapshot source dictionary"
         )
 
@@ -1694,19 +1738,51 @@ async def sealed_audit_sample_metadata(
         len(audit_occurrences) != sample_count
         or _sample_digest(audit_occurrences).hex() != expected_digest
     ):
-        raise RuntimeError(
-            "reused strict V3 layout audit rows disagree with its manifest"
+        raise ReusableLayoutAuditCorruption(
+            "reused shared PTG layout audit rows disagree with its manifest"
         )
+    try:
+        source_count = _persisted_nonnegative_integer(
+            metadata.get("source_count"), "audit source_count"
+        )
+    except ValueError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit source_count"
+        ) from exc
     await _validate_snapshot_source_dictionary(
         session,
         schema_name=schema_name,
         logical_snapshot_id=str(logical_snapshot_id),
-        source_count=_integer(metadata.get("source_count"), "audit source_count"),
+        source_count=source_count,
         required_source_keys=(
             occurrence.source_key for occurrence in audit_occurrences
         ),
+        corruption_error=ReusableLayoutAuditCorruption,
     )
     return metadata
+
+
+async def sealed_or_published_audit_metadata(
+    session: Any,
+    *,
+    sealed: Any,
+    schema_name: str,
+    logical_snapshot_id: str,
+    expected_generation: str,
+    published_metadata: Mapping[str, Any],
+    sealed_metadata_loader: Any = sealed_audit_sample_metadata,
+) -> dict[str, Any]:
+    """Return persisted metadata for reuse or the metadata just published."""
+
+    if not sealed.reused:
+        return dict(published_metadata)
+    return await sealed_metadata_loader(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(sealed.snapshot_key),
+        logical_snapshot_id=str(logical_snapshot_id),
+        expected_generation=expected_generation,
+    )
 
 
 async def _sealed_layout_manifest(
@@ -1737,7 +1813,9 @@ async def _sealed_layout_manifest(
     )
     layout_manifest = layout_result.scalar()
     if not isinstance(layout_manifest, Mapping):
-        raise RuntimeError("reused strict V3 layout is missing its manifest")
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout is missing its manifest"
+        )
     return layout_manifest
 
 
@@ -1751,7 +1829,7 @@ def _audit_metadata_from_layout(
         else None
     )
     if not isinstance(audit_sample, Mapping):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused strict V3 layout is missing its audit sample contract"
         )
     return dict(audit_sample)
@@ -1760,22 +1838,59 @@ def _audit_metadata_from_layout(
 def _validated_sealed_audit_contract(
     metadata: Mapping[str, Any],
 ) -> tuple[int, str]:
+    try:
+        format_version = _persisted_nonnegative_integer(
+            metadata.get("format_version"), "audit sample format version"
+        )
+    except ValueError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an incompatible audit sample contract"
+        ) from exc
     if (
         metadata.get("contract") != PTG2_V3_AUDIT_CONTRACT
-        or _integer(metadata.get("format_version"), "audit sample format version") != 2
+        or format_version != 2
         or metadata.get("method") != PTG2_V3_AUDIT_METHOD
         or metadata.get("serving_multiplicity_semantics")
         != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
+        or (
+            "maximum_rows" in metadata
+            and (
+                type(metadata.get("maximum_rows")) is not int
+                or metadata.get("maximum_rows") != PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
+            )
+        )
+        or (
+            "complete_population" in metadata
+            and metadata.get("complete_population") is not False
+        )
+        or (
+            "occurrence_identity" in metadata
+            and metadata.get("occurrence_identity")
+            != "sha256_candidate_ordinal_source_key_v2"
+        )
     ):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused strict V3 layout has an incompatible audit sample contract"
         )
-    sample_count = _integer(metadata.get("sample_count"), "audit sample count")
+    try:
+        sample_count = _persisted_nonnegative_integer(
+            metadata.get("sample_count"), "audit sample count"
+        )
+    except ValueError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit sample count"
+        ) from exc
     if sample_count > PTG2_V3_AUDIT_MAX_SAMPLE_ROWS:
-        raise RuntimeError("reused strict V3 layout exceeds the audit sample row cap")
-    expected_digest = str(metadata.get("sample_digest") or "").strip().lower()
-    if len(expected_digest) != 64:
-        raise RuntimeError("reused strict V3 layout has an invalid audit sample digest")
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout exceeds the audit sample row cap"
+        )
+    expected_digest = metadata.get("sample_digest")
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_digest
+    ):
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit sample digest"
+        )
     return sample_count, expected_digest
 
 
@@ -1802,22 +1917,58 @@ async def _sealed_audit_occurrences(
             "row_limit": PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + 1,
         },
     )
-    return tuple(
-        _stored_audit_occurrence(_row_mapping(raw_database_row))
-        for raw_database_row in occurrence_result
+    occurrences = []
+    for raw_database_row in occurrence_result:
+        try:
+            occurrence = _stored_audit_occurrence(_row_mapping(raw_database_row))
+        except (KeyError, TypeError, ValueError, OverflowError, struct.error) as exc:
+            raise ReusableLayoutAuditCorruption(
+                "reused shared PTG layout has invalid persisted audit rows"
+            ) from exc
+        occurrences.append(occurrence)
+    return tuple(occurrences)
+
+
+def _persisted_nonnegative_integer(value: Any, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"persisted {field_name} is invalid")
+    return value
+
+
+def _persisted_unsigned_integer(value: Any, field_name: str, maximum: int) -> int:
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise ValueError(f"persisted {field_name} is invalid")
+    return value
+
+
+def _stored_unsigned_integer(
+    database_row: Mapping[str, Any], field_name: str, maximum: int
+) -> int:
+    return _persisted_unsigned_integer(
+        database_row[field_name], f"audit {field_name}", maximum
     )
 
 
 def _stored_audit_occurrence(database_row: Mapping[str, Any]) -> AuditOccurrence:
+    raw_occurrence_id = database_row["occurrence_id"]
+    if not isinstance(raw_occurrence_id, (bytes, bytearray, memoryview)):
+        raise ValueError("persisted audit occurrence_id is invalid")
+    occurrence_id = bytes(raw_occurrence_id)
+    if len(occurrence_id) != 32:
+        raise ValueError("persisted audit occurrence_id is invalid")
     return AuditOccurrence(
-        occurrence_id=bytes(database_row["occurrence_id"]),
-        code_key=int(database_row["code_key"]),
-        provider_set_key=int(database_row["provider_set_key"]),
-        price_key=int(database_row["price_key"]),
-        source_key=int(database_row["source_key"]),
-        npi=int(database_row["npi"]),
-        atom_ordinal=int(database_row["atom_ordinal"]),
-        atom_key=int(database_row["atom_key"]),
+        occurrence_id=occurrence_id,
+        code_key=_stored_unsigned_integer(database_row, "code_key", 2**32 - 1),
+        provider_set_key=_stored_unsigned_integer(
+            database_row, "provider_set_key", 2**32 - 1
+        ),
+        price_key=_stored_unsigned_integer(database_row, "price_key", 2**32 - 1),
+        source_key=_stored_unsigned_integer(database_row, "source_key", 2**64 - 1),
+        npi=_stored_unsigned_integer(database_row, "npi", 2**64 - 1),
+        atom_ordinal=_stored_unsigned_integer(
+            database_row, "atom_ordinal", 2**64 - 1
+        ),
+        atom_key=_stored_unsigned_integer(database_row, "atom_key", 2**64 - 1),
         candidate_ordinal=0,
     )
 
@@ -1825,6 +1976,7 @@ def _stored_audit_occurrence(database_row: Mapping[str, Any]) -> AuditOccurrence
 __all__ = [
     "AuditCandidate",
     "AuditOccurrence",
+    "ReusableLayoutAuditCorruption",
     "SharedAuditPublication",
     "build_audit_occurrences",
     "load_audit_candidates",
@@ -1832,4 +1984,5 @@ __all__ = [
     "persisted_audit_sample_digest",
     "publish_shared_audit_sample",
     "sealed_audit_sample_metadata",
+    "sealed_or_published_audit_metadata",
 ]

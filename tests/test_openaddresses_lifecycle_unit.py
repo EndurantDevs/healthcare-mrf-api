@@ -182,10 +182,12 @@ async def test_openaddresses_load_file_stops_when_control_run_cancelled(tmp_path
     with pytest.raises(ImportCancelledError):
         await openaddresses._load_file(
             path,
-            stage_cls=object,
-            batch_size=5000,
-            ctx={"redis": FakeRedis()},
-            task={"run_id": "run_1"},
+            settings=openaddresses._FileLoadSettings(
+                stage_cls=object,
+                batch_size=5000,
+                ctx={"redis": FakeRedis()},
+                task={"run_id": "run_1"},
+            ),
         )
 
 

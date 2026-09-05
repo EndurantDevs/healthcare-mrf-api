@@ -52,6 +52,9 @@ EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({}
 MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
     {123456789: 1}
 )
+TYPED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
+    {123456789: 1}, text_counts={"1447744750`": 2}
+)
 
 
 def _frozen_candidate_row(
@@ -1168,7 +1171,17 @@ def _install_candidate_attestation_writer(
 def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     """Keep the rollback writer path covered without making it the default."""
     session = _Session()
-    _install_candidate_attestation_writer(monkeypatch, session)
+    _install_candidate_attestation_writer(
+        monkeypatch,
+        session,
+        identity_map=_candidate_attestation_identity(
+            TYPED_PROVIDER_IDENTIFIER_QUARANTINE
+        ),
+    )
+    report = _release_report()
+    report["source"]["provider_identifier_quarantine"] = (
+        TYPED_PROVIDER_IDENTIFIER_QUARANTINE
+    )
 
     attestation_result = asyncio.run(
         ptg2_candidate_attestation.record_candidate_audit_attestation(
@@ -1176,7 +1189,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
             source_key="SOURCE_A",
             plan_id="12-3456789",
             plan_market_type="GROUP",
-            report=_release_report(),
+            report=report,
         )
     )
 
@@ -1194,6 +1207,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     assert params["source_set_digest"] == b"s" * 32
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
     assert params["source_witness_digest"] == b"w" * 32
+    assert "ptg2_provider_identifier_quarantine_v2" in params["report_json"]
     assert (
         params["contract"]
         == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3

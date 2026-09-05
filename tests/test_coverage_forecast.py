@@ -664,6 +664,9 @@ def test_rust_diff_coverage_matches_llvm_cov_default_test_exclusions(
     report_path = tmp_path / "rust.json"
     report_path.write_text(json.dumps({"data": [{"files": []}]}), encoding="utf-8")
     config = _report_config(report_path, "llvm-cov")
+    nested_test_path = "support/ptg2_scanner/src/main_tests/tests/cases.rs"
+    config["scope"]["include"].append("support/ptg2_scanner/src/**/tests/*.rs")
+    assert growth._is_path_in_scope(nested_test_path, config)
 
     result = growth._report_diff_coverage(
         tmp_path,
@@ -671,7 +674,7 @@ def test_rust_diff_coverage_matches_llvm_cov_default_test_exclusions(
         config,
         {
             "support/ptg2_scanner/src/main_tests.rs": {1},
-            "support/ptg2_scanner/src/main_tests/tests/cases.rs": {1},
+            nested_test_path: {1},
         },
     )
 

@@ -697,13 +697,10 @@ def _shared_graph_metric_object(
     return value
 
 
-def _shared_graph_result_from_summary(
-    summary_fields: Any,
-    *,
-    expected_output_directory: Path,
-    expected: _SharedGraphExpected,
-) -> SharedGraphConversionResult:
-    """Validate strict V3 graph outputs and build their conversion result."""
+def _shared_graph_output_paths(
+    summary_fields: Any, expected_output_directory: Path,
+) -> tuple[Path, dict[str, Path]]:
+    """Validate summary identity and its exact filesystem output set."""
     if not isinstance(summary_fields, dict) or frozenset(summary_fields) != (
         _V3_SHARED_GRAPH_SUMMARY_FIELDS
     ):
@@ -735,6 +732,13 @@ def _shared_graph_result_from_summary(
         for field_name, output_name in _V3_SHARED_GRAPH_OUTPUT_NAMES.items()
     }
 
+    return output_directory, output_path_by_name
+
+
+def _shared_graph_summary_counts(
+    summary_fields: Mapping[str, Any], expected: _SharedGraphExpected,
+) -> dict[str, int]:
+    """Validate scalar counts before reading graph metrics."""
     block_count = _shared_graph_strict_int(
         summary_fields.get("block_count"), "block_count"
     )
@@ -759,6 +763,19 @@ def _shared_graph_result_from_summary(
     if stored_block_byte_count != raw_block_byte_count:
         raise RuntimeError("strict V3 shared-graph summary has incompatible block storage")
 
+    return {
+        "block_count": block_count,
+        "owner_count": owner_count,
+        "provider_group_count": provider_group_count,
+        "npi_count": npi_count,
+        "input_byte_count": input_byte_count,
+        "raw_block_byte_count": raw_block_byte_count,
+        "stored_block_byte_count": stored_block_byte_count,
+    }
+
+
+def _shared_graph_support_digest(summary_fields: Mapping[str, Any]) -> bytes:
+    """Decode the canonical support digest after scalar validation."""
     digest_text = summary_fields.get("support_digest")
     if not isinstance(digest_text, str) or digest_text != digest_text.lower():
         raise RuntimeError("strict V3 shared-graph summary has invalid support_digest")
@@ -771,6 +788,73 @@ def _shared_graph_result_from_summary(
     if len(support_digest) != 32:
         raise RuntimeError("strict V3 shared-graph summary has invalid support_digest")
 
+    return support_digest
+
+
+def _shared_graph_direction_entry(
+    raw_metric: Any, seen_directions: set[int], direction_fields: frozenset[str],
+) -> SharedGraphDirectionMetrics:
+    """Validate one direction and retain duplicate-detection order."""
+    metric = _shared_graph_metric_object(
+        raw_metric,
+        field_name="direction metric",
+        expected_fields=direction_fields,
+    )
+    direction = _shared_graph_strict_int(metric.get("direction"), "direction")
+    expected_direction = _V3_SHARED_GRAPH_DIRECTIONS.get(direction)
+    if expected_direction is None or direction in seen_directions:
+        raise RuntimeError(
+            "strict V3 shared-graph summary has invalid graph directions"
+        )
+    seen_directions.add(direction)
+    object_kind, expected_member_width = expected_direction
+    member_width = _shared_graph_strict_int(
+        metric.get("member_width"), "member_width"
+    )
+    if metric.get("object_kind") != object_kind or member_width != (
+        expected_member_width
+    ):
+        raise RuntimeError(
+            "strict V3 shared-graph summary has incompatible graph direction"
+        )
+    metric_owner_count = _shared_graph_strict_int(
+        metric.get("owner_count"), "direction owner_count"
+    )
+    member_count = _shared_graph_strict_int(
+        metric.get("member_count"), "direction member_count"
+    )
+    empty_owner_count = _shared_graph_strict_int(
+        metric.get("empty_owner_count"), "empty_owner_count"
+    )
+    metric_block_count = _shared_graph_strict_int(
+        metric.get("block_count"), "direction block_count"
+    )
+    metric_raw_byte_count = _shared_graph_strict_int(
+        metric.get("raw_byte_count"), "direction raw_byte_count"
+    )
+    if (
+        empty_owner_count > metric_owner_count
+        or member_count * member_width != metric_raw_byte_count
+    ):
+        raise RuntimeError(
+            "strict V3 shared-graph summary has inconsistent direction metrics"
+        )
+    return SharedGraphDirectionMetrics(
+        direction=direction,
+        object_kind=object_kind,
+        member_width=member_width,
+        owner_count=metric_owner_count,
+        member_count=member_count,
+        empty_owner_count=empty_owner_count,
+        block_count=metric_block_count,
+        raw_byte_count=metric_raw_byte_count,
+    )
+
+
+def _shared_graph_direction_metrics(
+    summary_fields: Mapping[str, Any], count_by_name: Mapping[str, int],
+) -> tuple[SharedGraphDirectionMetrics, ...]:
+    """Validate all directions and reconcile their totals."""
     raw_direction_metrics = summary_fields.get("direction_metrics")
     if not isinstance(raw_direction_metrics, list) or len(raw_direction_metrics) != 4:
         raise RuntimeError("strict V3 shared-graph summary has invalid direction_metrics")
@@ -789,74 +873,66 @@ def _shared_graph_result_from_summary(
     direction_metrics: list[SharedGraphDirectionMetrics] = []
     seen_directions: set[int] = set()
     for raw_metric in raw_direction_metrics:
-        metric = _shared_graph_metric_object(
-            raw_metric,
-            field_name="direction metric",
-            expected_fields=direction_fields,
-        )
-        direction = _shared_graph_strict_int(metric.get("direction"), "direction")
-        expected_direction = _V3_SHARED_GRAPH_DIRECTIONS.get(direction)
-        if expected_direction is None or direction in seen_directions:
-            raise RuntimeError(
-                "strict V3 shared-graph summary has invalid graph directions"
-            )
-        seen_directions.add(direction)
-        object_kind, expected_member_width = expected_direction
-        member_width = _shared_graph_strict_int(
-            metric.get("member_width"), "member_width"
-        )
-        if metric.get("object_kind") != object_kind or member_width != (
-            expected_member_width
-        ):
-            raise RuntimeError(
-                "strict V3 shared-graph summary has incompatible graph direction"
-            )
-        metric_owner_count = _shared_graph_strict_int(
-            metric.get("owner_count"), "direction owner_count"
-        )
-        member_count = _shared_graph_strict_int(
-            metric.get("member_count"), "direction member_count"
-        )
-        empty_owner_count = _shared_graph_strict_int(
-            metric.get("empty_owner_count"), "empty_owner_count"
-        )
-        metric_block_count = _shared_graph_strict_int(
-            metric.get("block_count"), "direction block_count"
-        )
-        metric_raw_byte_count = _shared_graph_strict_int(
-            metric.get("raw_byte_count"), "direction raw_byte_count"
-        )
-        if (
-            empty_owner_count > metric_owner_count
-            or member_count * member_width != metric_raw_byte_count
-        ):
-            raise RuntimeError(
-                "strict V3 shared-graph summary has inconsistent direction metrics"
-            )
         direction_metrics.append(
-            SharedGraphDirectionMetrics(
-                direction=direction,
-                object_kind=object_kind,
-                member_width=member_width,
-                owner_count=metric_owner_count,
-                member_count=member_count,
-                empty_owner_count=empty_owner_count,
-                block_count=metric_block_count,
-                raw_byte_count=metric_raw_byte_count,
-            )
+            _shared_graph_direction_entry(raw_metric, seen_directions, direction_fields)
         )
     direction_metrics.sort(key=lambda metric: metric.direction)
     if seen_directions != set(_V3_SHARED_GRAPH_DIRECTIONS):
         raise RuntimeError("strict V3 shared-graph summary omits graph directions")
-    if block_count != sum(metric.block_count for metric in direction_metrics):
+    if count_by_name["block_count"] != sum(metric.block_count for metric in direction_metrics):
         raise RuntimeError("strict V3 shared-graph summary block counts disagree")
-    if owner_count != sum(metric.owner_count for metric in direction_metrics):
+    if count_by_name["owner_count"] != sum(metric.owner_count for metric in direction_metrics):
         raise RuntimeError("strict V3 shared-graph summary owner counts disagree")
-    if raw_block_byte_count != sum(
+    if count_by_name["raw_block_byte_count"] != sum(
         metric.raw_byte_count for metric in direction_metrics
     ):
         raise RuntimeError("strict V3 shared-graph summary block bytes disagree")
 
+    return tuple(direction_metrics)
+
+
+def _shared_graph_edge_entry(
+    raw_metric: Any, expected_edge_count_by_kind: Mapping[str, int],
+    seen_edge_kinds: set[str], edge_fields: frozenset[str],
+) -> SharedGraphEdgeMetrics:
+    """Validate one edge family before reconciling graph integrity."""
+    metric = _shared_graph_metric_object(
+        raw_metric,
+        field_name="edge metric",
+        expected_fields=edge_fields,
+    )
+    edge_kind = metric.get("edge_kind")
+    if not isinstance(edge_kind, str) or edge_kind not in expected_edge_count_by_kind:
+        raise RuntimeError("strict V3 shared-graph summary has invalid edge kind")
+    if edge_kind in seen_edge_kinds:
+        raise RuntimeError("strict V3 shared-graph summary repeats an edge kind")
+    seen_edge_kinds.add(edge_kind)
+    metric_input_count = _shared_graph_strict_int(
+        metric.get("input_edge_count"), "edge input_edge_count"
+    )
+    unique_edge_count = _shared_graph_strict_int(
+        metric.get("unique_edge_count"), "edge unique_edge_count"
+    )
+    duplicate_edge_count = _shared_graph_strict_int(
+        metric.get("duplicate_edge_count"), "edge duplicate_edge_count"
+    )
+    if (
+        metric_input_count != expected_edge_count_by_kind[edge_kind]
+        or metric_input_count != unique_edge_count + duplicate_edge_count
+    ):
+        raise RuntimeError("strict V3 shared-graph summary edge counts disagree")
+    return SharedGraphEdgeMetrics(
+        edge_kind=edge_kind,
+        input_edge_count=metric_input_count,
+        unique_edge_count=unique_edge_count,
+        duplicate_edge_count=duplicate_edge_count,
+    )
+
+
+def _shared_graph_edge_metrics(
+    summary_fields: Mapping[str, Any], expected: _SharedGraphExpected,
+) -> tuple[SharedGraphEdgeMetrics, ...]:
+    """Validate both expected edge families in scanner order."""
     raw_edge_metrics = summary_fields.get("edge_metrics")
     if not isinstance(raw_edge_metrics, list) or len(raw_edge_metrics) != 2:
         raise RuntimeError("strict V3 shared-graph summary has invalid edge_metrics")
@@ -875,43 +951,23 @@ def _shared_graph_result_from_summary(
     edge_metrics: list[SharedGraphEdgeMetrics] = []
     seen_edge_kinds: set[str] = set()
     for raw_metric in raw_edge_metrics:
-        metric = _shared_graph_metric_object(
-            raw_metric,
-            field_name="edge metric",
-            expected_fields=edge_fields,
-        )
-        edge_kind = metric.get("edge_kind")
-        if not isinstance(edge_kind, str) or edge_kind not in expected_edge_count_by_kind:
-            raise RuntimeError("strict V3 shared-graph summary has invalid edge kind")
-        if edge_kind in seen_edge_kinds:
-            raise RuntimeError("strict V3 shared-graph summary repeats an edge kind")
-        seen_edge_kinds.add(edge_kind)
-        metric_input_count = _shared_graph_strict_int(
-            metric.get("input_edge_count"), "edge input_edge_count"
-        )
-        unique_edge_count = _shared_graph_strict_int(
-            metric.get("unique_edge_count"), "edge unique_edge_count"
-        )
-        duplicate_edge_count = _shared_graph_strict_int(
-            metric.get("duplicate_edge_count"), "edge duplicate_edge_count"
-        )
-        if (
-            metric_input_count != expected_edge_count_by_kind[edge_kind]
-            or metric_input_count != unique_edge_count + duplicate_edge_count
-        ):
-            raise RuntimeError("strict V3 shared-graph summary edge counts disagree")
         edge_metrics.append(
-            SharedGraphEdgeMetrics(
-                edge_kind=edge_kind,
-                input_edge_count=metric_input_count,
-                unique_edge_count=unique_edge_count,
-                duplicate_edge_count=duplicate_edge_count,
+            _shared_graph_edge_entry(
+                raw_metric, expected_edge_count_by_kind, seen_edge_kinds, edge_fields
             )
         )
     edge_metrics.sort(key=lambda metric: metric.edge_kind)
     if seen_edge_kinds != set(expected_edge_count_by_kind):
         raise RuntimeError("strict V3 shared-graph summary omits an edge kind")
 
+    return tuple(edge_metrics)
+
+
+def _shared_graph_integrity_counts(
+    summary_fields: Mapping[str, Any], expected: _SharedGraphExpected,
+    edge_metrics: tuple[SharedGraphEdgeMetrics, ...],
+) -> dict[str, int]:
+    """Reconcile scanner integrity against inputs and validated edges."""
     integrity_fields = frozenset(
         {
             "shard_count",
@@ -951,10 +1007,17 @@ def _shared_graph_result_from_summary(
     if integrity_value_by_name != expected_integrity_by_name:
         raise RuntimeError("strict V3 shared-graph summary integrity counts disagree")
 
+    return integrity_value_by_name
+
+
+def _validate_shared_graph_file_sizes(
+    output_path_by_name: Mapping[str, Path], count_by_name: Mapping[str, int],
+) -> None:
+    """Validate output sizes after all summary metrics are accepted."""
     fixed_file_size_by_name = {
-        "owner_spool_path": owner_count * 25,
-        "group_map_path": provider_group_count * 20,
-        "reference_path": block_count * 57,
+        "owner_spool_path": count_by_name["owner_count"] * 25,
+        "group_map_path": count_by_name["provider_group_count"] * 20,
+        "reference_path": count_by_name["block_count"] * 57,
     }
     for field_name, expected_size in fixed_file_size_by_name.items():
         if output_path_by_name[field_name].stat().st_size != expected_size:
@@ -971,8 +1034,28 @@ def _shared_graph_result_from_summary(
             raise RuntimeError(
                 f"strict V3 shared-graph output has invalid {field_name} size"
             )
-    if block_count and output_path_by_name["block_spool_path"].stat().st_size <= 0:
+    if count_by_name["block_count"] and output_path_by_name["block_spool_path"].stat().st_size <= 0:
         raise RuntimeError("strict V3 shared-graph block spool is empty")
+
+
+def _shared_graph_result_from_summary(
+    summary_fields: Any,
+    *,
+    expected_output_directory: Path,
+    expected: _SharedGraphExpected,
+) -> SharedGraphConversionResult:
+    """Validate strict V3 graph outputs and build their conversion result."""
+    output_directory, output_path_by_name = _shared_graph_output_paths(
+        summary_fields, expected_output_directory
+    )
+    count_by_name = _shared_graph_summary_counts(summary_fields, expected)
+    support_digest = _shared_graph_support_digest(summary_fields)
+    direction_metrics = _shared_graph_direction_metrics(summary_fields, count_by_name)
+    edge_metrics = _shared_graph_edge_metrics(summary_fields, expected)
+    integrity_value_by_name = _shared_graph_integrity_counts(
+        summary_fields, expected, edge_metrics
+    )
+    _validate_shared_graph_file_sizes(output_path_by_name, count_by_name)
 
     return SharedGraphConversionResult(
         scratch_directory=output_directory,
@@ -984,16 +1067,16 @@ def _shared_graph_result_from_summary(
         owner_spool_path=output_path_by_name["owner_spool_path"],
         group_map_path=output_path_by_name["group_map_path"],
         reference_path=output_path_by_name["reference_path"],
-        block_count=block_count,
-        owner_count=owner_count,
-        provider_group_count=provider_group_count,
-        npi_count=npi_count,
+        block_count=count_by_name["block_count"],
+        owner_count=count_by_name["owner_count"],
+        provider_group_count=count_by_name["provider_group_count"],
+        npi_count=count_by_name["npi_count"],
         support_digest=support_digest,
-        direction_metrics=tuple(direction_metrics),
-        edge_metrics=tuple(edge_metrics),
-        input_byte_count=input_byte_count,
-        raw_block_byte_count=raw_block_byte_count,
-        stored_block_byte_count=stored_block_byte_count,
+        direction_metrics=direction_metrics,
+        edge_metrics=edge_metrics,
+        input_byte_count=count_by_name["input_byte_count"],
+        raw_block_byte_count=count_by_name["raw_block_byte_count"],
+        stored_block_byte_count=count_by_name["stored_block_byte_count"],
         integrity=SharedGraphIntegrityMetrics(**integrity_value_by_name),
     )
 

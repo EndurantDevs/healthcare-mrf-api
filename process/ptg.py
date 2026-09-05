@@ -181,6 +181,9 @@ from process.ptg_parts.frozen_rate_files import (
     validate_frozen_processed_results,
 )
 from process.ptg_parts.copy_load import (
+    _cancel_and_wait_tasks,
+    _copy_manifest_paths,
+    _copy_one_manifest_path,
     _copy_ignore_ptg2_objects,
     _copy_insert_ptg2_objects,
     _copy_upsert_ptg2_objects,
@@ -2054,65 +2057,6 @@ def _emit_manifest_copy_start(
     )
 
 
-async def _copy_one_manifest_path(
-    input_path: Path,
-    *,
-    target_table: str,
-    copy_func: Any,
-    progress_callback: Callable[[int], None],
-    semaphore: asyncio.Semaphore | None = None,
-) -> None:
-    if semaphore is None:
-        await copy_func(
-            input_path,
-            target_table=target_table,
-            progress_callback=progress_callback,
-        )
-        return
-    async with semaphore:
-        await copy_func(
-            input_path,
-            target_table=target_table,
-            progress_callback=progress_callback,
-        )
-
-
-async def _copy_manifest_paths(
-    input_paths: Sequence[Path],
-    *,
-    target_table: str,
-    copy_func: Any,
-    progress_callback: Callable[[int], None],
-    copy_tasks: int,
-) -> None:
-    semaphore = (
-        asyncio.Semaphore(copy_tasks)
-        if copy_tasks > 1 and len(input_paths) > 1
-        else None
-    )
-    if semaphore is None:
-        for input_path in input_paths:
-            await _copy_one_manifest_path(
-                input_path,
-                target_table=target_table,
-                copy_func=copy_func,
-                progress_callback=progress_callback,
-            )
-        return
-    await asyncio.gather(
-        *(
-            _copy_one_manifest_path(
-                input_path,
-                target_table=target_table,
-                copy_func=copy_func,
-                progress_callback=progress_callback,
-                semaphore=semaphore,
-            )
-            for input_path in input_paths
-        )
-    )
-
-
 def _completed_manifest_copy_result(
     progress: _ManifestCopyProgress,
     *,
@@ -2222,7 +2166,9 @@ async def _copy_manifest_files_direct_with_progress(
     )
 
 
-def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
+def _cleanup_manifest_copy_paths(
+    copy_files_by_kind: dict[str, list[Path]], *, cleanup_empty_siblings: bool = True,
+) -> None:
     for copy_file_paths in copy_files_by_kind.values():
         for copy_file_path in copy_file_paths:
             base_copy_path = _manifest_copy_base_path(copy_file_path)
@@ -2234,7 +2180,8 @@ def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> N
                     copy_file_path,
                     exc_info=True,
                 )
-            _cleanup_empty_manifest_copy_siblings(base_copy_path)
+            if cleanup_empty_siblings:
+                _cleanup_empty_manifest_copy_siblings(base_copy_path)
 
 
 def _cleanup_manifest_copy_entries(
@@ -2296,17 +2243,6 @@ def _cleanup_strict_v3_graph_artifacts(artifacts: Mapping[str, Any]) -> None:
             except OSError:
                 break
             current = current.parent
-
-
-async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
-    """Cancel child work and wait until it can no longer use import inputs."""
-
-    remaining_tasks = tuple(tasks)
-    for task in remaining_tasks:
-        task.cancel()
-    if remaining_tasks:
-        await asyncio.gather(*remaining_tasks, return_exceptions=True)
-    tasks.clear()
 
 
 @asynccontextmanager
@@ -2414,6 +2350,21 @@ async def _merge_ptg2_manifest_files(
             _cleanup_manifest_copy_paths(copy_files_by_kind)
 
 
+def _cleanup_copied_manifest_kind(
+    kind: str,
+    copy_files_by_kind: dict[str, list[Path]],
+    copy_kinds: Sequence[str],
+) -> None:
+    """Release exact copied files while retaining every later family's input."""
+    retained_paths = {
+        path.resolve() for remaining_kind in copy_kinds[copy_kinds.index(kind) + 1:]
+        for path in copy_files_by_kind[remaining_kind]
+    }
+    _cleanup_manifest_copy_paths({
+        kind: [path for path in copy_files_by_kind[kind] if path.resolve() not in retained_paths]
+    }, cleanup_empty_siblings=False)
+
+
 async def _copy_strict_v3_price_files(
     copy_kinds: tuple[str, ...],
     copy_files_by_kind: dict[str, list[Path]],
@@ -2467,6 +2418,7 @@ async def _copy_strict_v3_price_files(
                 emitted_rows=emitted_rows_by_kind.get(kind),
             )
         )
+        _cleanup_copied_manifest_kind(kind, copy_files_by_kind, active_kinds)
     copy_report_map["direct_to_copy"] = True
     _emit_screen_line(
         "PTG2_STRICT_V3_PRICE_COPY\t" f"{json.dumps(copy_report_map, sort_keys=True)}"
@@ -6227,12 +6179,12 @@ class _ReusedSharedV3AllowedContext:
 
 
 def _shared_v3_publisher_sources(
-    source_root: Path,
-    *,
-    include_provider_graph_v4: bool,
+    source_root: Path, *, include_provider_graph_v4: bool
 ) -> tuple[Path, ...]:
+    """Return sources whose bytes define the shared publisher identity."""
     publisher_sources = (
         source_root / "ptg.py",
+        source_root / "ptg_parts" / "copy_load.py",
         source_root / "ptg_parts" / "rust_scanner.py",
         source_root / "ptg_parts" / "ptg2_manifest_publish.py",
         source_root / "ptg_parts" / "ptg2_provider_quarantine.py",
@@ -6247,6 +6199,7 @@ def _shared_v3_publisher_sources(
         source_root / "ptg_parts" / "ptg2_shared_graph.py",
         source_root / "ptg_parts" / "ptg2_shared_price.py",
         source_root / "ptg_parts" / "ptg2_shared_publish.py",
+        source_root / "ptg_parts" / "ptg2_shared_reuse.py",
         source_root / "ptg_parts" / "ptg2_shared_snapshot_publish.py",
         source_root / "ptg_parts" / "ptg2_source_witness.py",
         source_root / "ptg_parts" / "ptg2_source_witness_codec.py",

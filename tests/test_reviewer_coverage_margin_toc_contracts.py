@@ -6,6 +6,7 @@ from process.ptg_parts import toc_entries
 from process.ptg_parts.domain import (
     PTG2_DOMAIN_ALLOWED_AMOUNT,
     PTG2_DOMAIN_DRUG,
+    PTG2_DOMAIN_IN_NETWORK,
 )
 
 
@@ -25,6 +26,18 @@ def test_toc_query_suffix_and_source_fallbacks_are_deterministic() -> None:
         "payer-drug",
         "https://payer.example/opaque-feed",
     ) == ("payer-drug", PTG2_DOMAIN_DRUG)
+    assert toc_entries._toc_body_source_type(
+        "in-network",
+        "https://payer.example/in-network.json.gz?Signature=random-rx-bytes",
+    ) == ("in-network", PTG2_DOMAIN_IN_NETWORK)
+    assert toc_entries._toc_body_source_type(
+        "in-network",
+        "https://payer.example/in-network.json.gz?Signature=random-oon-bytes",
+    ) == ("in-network", PTG2_DOMAIN_IN_NETWORK)
+    assert toc_entries._toc_body_source_type(
+        "in-network",
+        "https://payer.example/download?file=allowed-amounts.json",
+    ) == ("allowed-amounts", PTG2_DOMAIN_ALLOWED_AMOUNT)
 
 
 def test_flat_toc_ignores_invalid_items_and_keeps_valid_files() -> None:

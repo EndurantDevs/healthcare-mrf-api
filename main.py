@@ -22,7 +22,6 @@ import arq.cli
 import click
 import uvloop
 from asyncpg import connection
-from asyncpg.connection import ServerCapabilities
 from arq.logs import default_log_config
 from arq.utils import import_string
 from arq.worker import create_worker
@@ -60,6 +59,33 @@ def _default_api_workers() -> int:
         return 1
 
 
+def _restrict_asyncpg_server_capabilities() -> None:
+    """Disable unsupported backend operations when asyncpg exposes its hook."""
+
+    detect_server_capabilities = getattr(
+        connection, "_detect_server_capabilities", None
+    )
+    if not callable(detect_server_capabilities):
+        return
+
+    def restricted_server_capabilities(*args, **kwargs):
+        """Retain an unfamiliar future capability object unchanged."""
+
+        capabilities = detect_server_capabilities(*args, **kwargs)
+        replace = getattr(capabilities, "_replace", None)
+        if not callable(replace):
+            return capabilities
+        return replace(
+            advisory_locks=False,
+            notifications=False,
+            plpgsql=False,
+            sql_reset=False,
+            sql_close_all=False,
+        )
+
+    connection._detect_server_capabilities = restricted_server_capabilities
+
+
 @click.command(help="Run sanic server")
 @click.option('--host', help='Setup host ip to listen up, default to 0.0.0.0', default='0.0.0.0')
 @click.option('--port', help='Setup port to attach, default to 8080', type=int, default=8080)
@@ -75,13 +101,7 @@ def start(host, port, workers, debug, accesslog):
     """Start the API server with the requested runtime options."""
     if receipt_authority_role() == RECEIPT_AUTHORITY_ROLE_SIGNER:
         require_receipt_authority_worker_count(workers)
-    connection._detect_server_capabilities = lambda *a, **kw: ServerCapabilities(
-        advisory_locks=False,
-        notifications=False,
-        plpgsql=False,
-        sql_reset=False,
-        sql_close_all=False
-    )
+    _restrict_asyncpg_server_capabilities()
     if debug:
         os.environ['HLTHPRT_DB_ECHO'] = 'True'
     with open(api.config['LOG_CFG'], encoding="utf-8") as log_file:

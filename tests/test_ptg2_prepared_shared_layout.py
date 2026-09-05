@@ -218,6 +218,41 @@ async def _publish_prepared_layout(mocks, tmp_path, **overrides):
     return await snapshot_publish._publish_prepared_shared_layout(**arguments_by_name)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reused", (False, True))
+async def test_sealed_audit_metadata_uses_the_authoritative_layout_on_reuse(
+    monkeypatch, reused
+):
+    sealed_audit = AsyncMock(return_value={"contract": "persisted-audit-v1"})
+    monkeypatch.setattr(
+        snapshot_publish, "sealed_audit_sample_metadata", sealed_audit
+    )
+    session = object()
+
+    metadata = await snapshot_publish._sealed_or_published_audit_metadata(
+        session,
+        sealed=SimpleNamespace(reused=reused, snapshot_key=17),
+        schema_name="mrf",
+        logical_snapshot_id="snapshot-id",
+        expected_generation=snapshot_publish.PTG2_V4_SHARED_GENERATION,
+        published_metadata={"contract": "new-audit-v1"},
+    )
+
+    assert metadata["contract"] == (
+        "persisted-audit-v1" if reused else "new-audit-v1"
+    )
+    if reused:
+        sealed_audit.assert_awaited_once_with(
+            session,
+            schema_name="mrf",
+            snapshot_key=17,
+            logical_snapshot_id="snapshot-id",
+            expected_generation=snapshot_publish.PTG2_V4_SHARED_GENERATION,
+        )
+    else:
+        sealed_audit.assert_not_awaited()
+
+
 def _assert_complete_publication(publication, mocks):
     assert publication.snapshot_key == 17
     assert publication.object_kinds == mocks.mapping_summary.object_kinds

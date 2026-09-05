@@ -20,10 +20,14 @@ def test_npi_detail_cache_key_tracks_exact_address_key():
         "lookup_stored_geocode": False,
     }
 
-    unfiltered_key = npi_module._npi_detail_cache_key(**common_options_by_name)
+    unfiltered_key = npi_module._npi_detail_cache_key(
+        npi_module._NpiDetailCacheIdentity(**common_options_by_name)
+    )
     exact_address_key = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
-        address_key="00000000-0000-0000-0000-000000000002",
+        npi_module._NpiDetailCacheIdentity(
+            **common_options_by_name,
+            address_key="00000000-0000-0000-0000-000000000002",
+        )
     )
 
     assert unfiltered_key != exact_address_key

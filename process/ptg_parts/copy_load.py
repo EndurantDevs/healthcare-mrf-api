@@ -3,19 +3,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
 import time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from db.connection import db
 from process.ext.utils import push_objects
 from process.ptg_parts.canonical import normalize_money
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_shared_finalize import _await_cleanup_task
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     guard_attempt_rows,
 )
@@ -430,3 +432,81 @@ async def _copy_compact_serving_rate_source(
             close = getattr(copy_source, "close", None)
             if close is not None:
                 close()
+
+
+async def _copy_one_manifest_path(
+    input_path: Path,
+    *,
+    target_table: str,
+    copy_func: Any,
+    progress_callback: Callable[[int], None],
+    semaphore: asyncio.Semaphore | None = None,
+) -> None:
+    if semaphore is None:
+        await copy_func(
+            input_path,
+            target_table=target_table,
+            progress_callback=progress_callback,
+        )
+        return
+    async with semaphore:
+        await copy_func(
+            input_path,
+            target_table=target_table,
+            progress_callback=progress_callback,
+        )
+
+
+async def _copy_manifest_paths(
+    input_paths: Sequence[Path],
+    *,
+    target_table: str,
+    copy_func: Any,
+    progress_callback: Callable[[int], None],
+    copy_tasks: int,
+) -> None:
+    semaphore = (
+        asyncio.Semaphore(copy_tasks)
+        if copy_tasks > 1 and len(input_paths) > 1
+        else None
+    )
+    if semaphore is None:
+        for input_path in input_paths:
+            await _copy_one_manifest_path(
+                input_path,
+                target_table=target_table,
+                copy_func=copy_func,
+                progress_callback=progress_callback,
+            )
+        return
+    pending_copies = {
+        asyncio.create_task(
+            _copy_one_manifest_path(
+                input_path,
+                target_table=target_table,
+                copy_func=copy_func,
+                progress_callback=progress_callback,
+                semaphore=semaphore,
+            )
+        )
+        for input_path in input_paths
+    }
+    try:
+        for completed_copy in asyncio.as_completed(pending_copies):
+            await completed_copy
+    except BaseException:
+        await _await_cleanup_task(
+            asyncio.create_task(_cancel_and_wait_tasks(pending_copies))
+        )
+        raise
+
+
+async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """Cancel child work and wait until it can no longer use import inputs."""
+
+    remaining_tasks = tuple(tasks)
+    for task in remaining_tasks:
+        task.cancel()
+    if remaining_tasks:
+        await asyncio.gather(*remaining_tasks, return_exceptions=True)
+    tasks.clear()

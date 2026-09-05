@@ -10,9 +10,9 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock, shared_support_digest
+from process.ptg_parts.ptg2_shared_reuse import shared_layout_support_digest
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
     _physical_serving_index,
-    _shared_layout_support_digest,
 )
 
 
@@ -154,24 +154,24 @@ def test_full_rebuild_scope_salts_only_final_layout_support_identity():
         "source_witness": source_witness_by_field,
     }
     digest_by_name = {
-        "legacy": _shared_layout_support_digest(
+        "legacy": shared_layout_support_digest(
             core_support=core_support_by_field,
             audit_sample=audit_sample_by_field,
             source_witness=source_witness_by_field,
         ),
-        "first_scope": _shared_layout_support_digest(
-            core_support=core_support_by_field,
-            audit_sample=audit_sample_by_field,
-            source_witness=source_witness_by_field,
-            full_rebuild_scope_digest="1" * 64,
-        ),
-        "same_scope": _shared_layout_support_digest(
+        "first_scope": shared_layout_support_digest(
             core_support=core_support_by_field,
             audit_sample=audit_sample_by_field,
             source_witness=source_witness_by_field,
             full_rebuild_scope_digest="1" * 64,
         ),
-        "other_scope": _shared_layout_support_digest(
+        "same_scope": shared_layout_support_digest(
+            core_support=core_support_by_field,
+            audit_sample=audit_sample_by_field,
+            source_witness=source_witness_by_field,
+            full_rebuild_scope_digest="1" * 64,
+        ),
+        "other_scope": shared_layout_support_digest(
             core_support=core_support_by_field,
             audit_sample=audit_sample_by_field,
             source_witness=source_witness_by_field,

@@ -33,8 +33,24 @@ def _sealed_metadata():
         "serving_multiplicity_semantics": (
             audit.PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
         ),
+        "maximum_rows": audit.PTG2_V3_AUDIT_MAX_SAMPLE_ROWS,
+        "complete_population": False,
+        "occurrence_identity": "sha256_candidate_ordinal_source_key_v2",
         "sample_count": 1,
         "sample_digest": "a" * 64,
+    }
+
+
+def _stored_occurrence_row():
+    return {
+        "occurrence_id": b"a" * 32,
+        "code_key": 1,
+        "provider_set_key": 2,
+        "price_key": 3,
+        "source_key": 0,
+        "npi": 1_234_567_890,
+        "atom_ordinal": 0,
+        "atom_key": 4,
     }
 
 
@@ -149,6 +165,29 @@ async def test_snapshot_source_dictionary_requires_dense_database_rows():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_source_dictionary_rejects_huge_count_without_range(
+    monkeypatch,
+):
+    session = AsyncMock()
+    session.execute.return_value = ()
+    monkeypatch.setattr(
+        audit,
+        "range",
+        lambda *_args: pytest.fail("source_count must not construct a range"),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="not complete and dense"):
+        await audit._validate_snapshot_source_dictionary(
+            session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot",
+            source_count=10**100,
+            required_source_keys=(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_snapshot_source_dictionary_requires_occurrence_sources():
     session = AsyncMock()
     session.execute.return_value = ({"source_key": 0},)
@@ -161,6 +200,57 @@ async def test_snapshot_source_dictionary_requires_occurrence_sources():
             source_count=1,
             required_source_keys=(1,),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("database_rows", "required_source_keys", "message"),
+    [
+        (({"source_key": "invalid"},), (), "invalid source keys"),
+        (({"source_key": "0"},), (), "invalid source keys"),
+        (({"source_key": 0.5},), (), "invalid source keys"),
+        (({"source_key": 0},), (object(),), "occurrence source keys are invalid"),
+    ],
+)
+async def test_snapshot_source_dictionary_types_persisted_corruption(
+    database_rows,
+    required_source_keys,
+    message,
+):
+    session = AsyncMock()
+    session.execute.return_value = database_rows
+
+    with pytest.raises(audit.ReusableLayoutAuditCorruption, match=message):
+        await audit._validate_snapshot_source_dictionary(
+            session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot",
+            source_count=1,
+            required_source_keys=required_source_keys,
+            corruption_error=audit.ReusableLayoutAuditCorruption,
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_source_dictionary_does_not_wrap_result_iteration_errors():
+    class FailingRows:
+        def __iter__(self):
+            raise ValueError("database iteration failed")
+
+    session = AsyncMock()
+    session.execute.return_value = FailingRows()
+
+    with pytest.raises(ValueError, match="database iteration failed") as error:
+        await audit._validate_snapshot_source_dictionary(
+            session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot",
+            source_count=1,
+            required_source_keys=(),
+            corruption_error=audit.ReusableLayoutAuditCorruption,
+        )
+
+    assert not isinstance(error.value, audit.ReusableLayoutAuditCorruption)
 
 
 def test_candidate_npis_skip_missing_graph_selection():
@@ -272,7 +362,9 @@ async def test_publication_rejects_invalid_digests(
 
 
 def test_layout_requires_audit_metadata():
-    with pytest.raises(RuntimeError, match="audit sample contract"):
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="audit sample contract"
+    ):
         audit._audit_metadata_from_layout({})
 
 
@@ -281,7 +373,9 @@ async def test_sealed_layout_requires_manifest():
     session = AsyncMock()
     session.execute.return_value = SimpleNamespace(scalar=lambda: None)
 
-    with pytest.raises(RuntimeError, match="missing its manifest"):
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="missing its manifest"
+    ):
         await audit._sealed_layout_manifest(
             session,
             schema_name="mrf",
@@ -305,7 +399,9 @@ async def test_sealed_sample_requires_matching_rows(monkeypatch):
         AsyncMock(return_value=()),
     )
 
-    with pytest.raises(RuntimeError, match="rows disagree"):
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="rows disagree"
+    ):
         await audit.sealed_audit_sample_metadata(
             AsyncMock(),
             schema_name="mrf",
@@ -314,17 +410,156 @@ async def test_sealed_sample_requires_matching_rows(monkeypatch):
         )
 
 
+@pytest.mark.asyncio
+async def test_reused_sample_does_not_wrap_source_dictionary_database_error(
+    monkeypatch,
+):
+    occurrence = audit.AuditOccurrence(b"a" * 32, 1, 2, 3, 0, 5, 6, 7, 0)
+    metadata = {
+        **_sealed_metadata(),
+        "source_count": 1,
+        "sample_digest": audit._sample_digest((occurrence,)).hex(),
+    }
+    monkeypatch.setattr(
+        audit,
+        "_sealed_layout_manifest",
+        AsyncMock(return_value={"serving_index": {"audit_sample": metadata}}),
+    )
+    monkeypatch.setattr(
+        audit,
+        "_sealed_audit_occurrences",
+        AsyncMock(return_value=(occurrence,)),
+    )
+    session = AsyncMock()
+    session.execute.side_effect = RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="database unavailable") as error:
+        await audit.sealed_audit_sample_metadata(
+            session,
+            schema_name="mrf",
+            snapshot_key=1,
+            logical_snapshot_id="snapshot",
+        )
+
+    assert not isinstance(error.value, audit.ReusableLayoutAuditCorruption)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_source_count", ("invalid", 1.5, True))
+async def test_reused_sample_classifies_invalid_source_count(
+    monkeypatch, invalid_source_count
+):
+    metadata = {
+        **_sealed_metadata(),
+        "sample_count": 0,
+        "sample_digest": audit._sample_digest(()).hex(),
+        "source_count": invalid_source_count,
+    }
+    monkeypatch.setattr(
+        audit,
+        "_sealed_layout_manifest",
+        AsyncMock(return_value={"serving_index": {"audit_sample": metadata}}),
+    )
+    monkeypatch.setattr(
+        audit,
+        "_sealed_audit_occurrences",
+        AsyncMock(return_value=()),
+    )
+
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="invalid audit source_count"
+    ):
+        await audit.sealed_audit_sample_metadata(
+            AsyncMock(),
+            schema_name="mrf",
+            snapshot_key=1,
+            logical_snapshot_id="snapshot",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("occurrence_id", b"short"),
+        ("code_key", True),
+        ("provider_set_key", 1.5),
+        ("source_key", -1),
+        ("npi", 2**64),
+    ),
+)
+async def test_sealed_occurrences_classify_malformed_persisted_rows(
+    field_name, invalid_value
+):
+    row = _stored_occurrence_row()
+    row[field_name] = invalid_value
+    session = AsyncMock()
+    session.execute.return_value = (row,)
+
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="invalid persisted audit rows"
+    ):
+        await audit._sealed_audit_occurrences(
+            session,
+            schema_name="mrf",
+            snapshot_key=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sealed_occurrences_accept_strict_persisted_rows():
+    row = _stored_occurrence_row()
+    session = AsyncMock()
+    session.execute.return_value = (row,)
+
+    occurrences = await audit._sealed_audit_occurrences(
+        session,
+        schema_name="mrf",
+        snapshot_key=1,
+    )
+
+    assert occurrences == (
+        audit.AuditOccurrence(b"a" * 32, 1, 2, 3, 0, 1_234_567_890, 0, 4, 0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sealed_occurrences_do_not_wrap_database_errors():
+    session = AsyncMock()
+    session.execute.side_effect = RuntimeError("database unavailable")
+
+    with pytest.raises(RuntimeError, match="database unavailable") as error:
+        await audit._sealed_audit_occurrences(
+            session,
+            schema_name="mrf",
+            snapshot_key=1,
+        )
+
+    assert not isinstance(error.value, audit.ReusableLayoutAuditCorruption)
+
+
 @pytest.mark.parametrize(
     "invalid_field_by_name",
     (
         {"contract": "invalid"},
+        {"format_version": "invalid"},
+        {"format_version": 2.5},
+        {"maximum_rows": None},
+        {"complete_population": True},
+        {"occurrence_identity": "sha256_candidate_ordinal_source_key_v1"},
         {"sample_count": audit.PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + 1},
+        {"sample_count": "invalid"},
         {"sample_digest": "invalid"},
+        {"sample_digest": "g" * 64},
+        {"sample_digest": "A" * 64},
+        {"sample_digest": b"a" * 64},
     ),
 )
 def test_sealed_contract_rejects_invalid_metadata(invalid_field_by_name):
     metadata = _sealed_metadata()
     metadata.update(invalid_field_by_name)
 
-    with pytest.raises(RuntimeError, match="reused strict V3 layout"):
+    with pytest.raises(
+        audit.ReusableLayoutAuditCorruption, match="reused strict V3 layout"
+    ):
         audit._validated_sealed_audit_contract(metadata)

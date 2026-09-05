@@ -10,7 +10,7 @@ use crate::tax_identity::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -330,11 +330,18 @@ pub fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId1
 const PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT: &str = "ptg2_provider_identifier_quarantine_v1";
 const PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN: &[u8] =
     b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0";
+const PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT: &str = "ptg2_provider_identifier_quarantine_v2";
+const PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN: &[u8] =
+    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0";
+const PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN: &[u8] = b"PTG2_PROVIDER_IDENTIFIER_TEXT_V1\0";
 const MAX_QUARANTINED_PROVIDER_IDENTIFIERS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS: usize = 4096;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProviderIdentifierQuarantine {
     occurrences_by_value: BTreeMap<i64, u64>,
+    occurrences_by_text_digest: BTreeMap<(String, u64), u64>,
 }
 
 impl ProviderIdentifierQuarantine {
@@ -357,7 +364,8 @@ impl ProviderIdentifierQuarantine {
                 ));
             }
             if !self.occurrences_by_value.contains_key(value)
-                && self.occurrences_by_value.len() >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+                && self.occurrences_by_value.len() + self.occurrences_by_text_digest.len()
+                    >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -375,10 +383,46 @@ impl ProviderIdentifierQuarantine {
         Ok(())
     }
 
+    pub fn record_text(&mut self, values: &[String]) -> io::Result<()> {
+        for value in values {
+            if value.len() > 128 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "text provider identifier quarantine value exceeds 128 bytes",
+                ));
+            }
+            let mut value_digest = Sha256::new();
+            value_digest.update(PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN);
+            value_digest.update(value.as_bytes());
+            let key = (
+                Self::digest_hex(&value_digest.finalize()),
+                u64::try_from(value.len()).expect("string length fits in u64"),
+            );
+            if !self.occurrences_by_text_digest.contains_key(&key)
+                && self.occurrences_by_value.len() + self.occurrences_by_text_digest.len()
+                    >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine exceeds 1024 distinct values",
+                ));
+            }
+            let count = self.occurrences_by_text_digest.entry(key).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: &Self) -> io::Result<()> {
         for (value, count) in &other.occurrences_by_value {
             if !self.occurrences_by_value.contains_key(value)
-                && self.occurrences_by_value.len() >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+                && self.occurrences_by_value.len() + self.occurrences_by_text_digest.len()
+                    >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -393,10 +437,34 @@ impl ProviderIdentifierQuarantine {
                 )
             })?;
         }
+        for (key, count) in &other.occurrences_by_text_digest {
+            if !self.occurrences_by_text_digest.contains_key(key)
+                && self.occurrences_by_value.len() + self.occurrences_by_text_digest.len()
+                    >= MAX_QUARANTINED_PROVIDER_IDENTIFIERS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine exceeds 1024 distinct values",
+                ));
+            }
+            let current = self
+                .occurrences_by_text_digest
+                .entry(key.clone())
+                .or_default();
+            *current = current.checked_add(*count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+        }
         Ok(())
     }
 
     pub fn payload(&self) -> io::Result<Value> {
+        if !self.occurrences_by_text_digest.is_empty() {
+            return self.payload_v2(&[]);
+        }
         let mut digest = Sha256::new();
         digest.update(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN);
         let mut occurrence_count = 0u64;
@@ -424,6 +492,112 @@ impl ProviderIdentifierQuarantine {
             "occurrence_count": occurrence_count,
             "distinct_value_count": entries.len(),
             "entries": entries,
+            "sha256": Self::digest_hex(&digest.finalize()),
+        }))
+    }
+
+    pub fn payload_with_provider_group_conflicts(
+        &self,
+        conflicts: &[(String, BTreeSet<String>)],
+    ) -> io::Result<Value> {
+        if conflicts.is_empty() {
+            return self.payload();
+        }
+        self.payload_v2(conflicts)
+    }
+
+    fn payload_v2(&self, conflicts: &[(String, BTreeSet<String>)]) -> io::Result<Value> {
+        if conflicts.len() > MAX_PROVIDER_GROUP_CONFLICTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 1024 identifiers",
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN);
+        let mut occurrence_count = 0u64;
+        let mut entries = Vec::with_capacity(
+            self.occurrences_by_value.len() + self.occurrences_by_text_digest.len(),
+        );
+        for (value, count) in &self.occurrences_by_value {
+            occurrence_count = occurrence_count.checked_add(*count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+            digest.update(b"integer\0");
+            digest.update(value.to_string().as_bytes());
+            digest.update([0]);
+            digest.update(count.to_be_bytes());
+            entries.push(json!({
+                "kind": "integer",
+                "value": value.to_string(),
+                "occurrence_count": count,
+            }));
+        }
+        for ((value_sha256, byte_length), count) in &self.occurrences_by_text_digest {
+            occurrence_count = occurrence_count.checked_add(*count).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider identifier quarantine occurrence count overflow",
+                )
+            })?;
+            digest.update(b"string\0");
+            digest.update(value_sha256.as_bytes());
+            digest.update([0]);
+            digest.update(byte_length.to_be_bytes());
+            digest.update(count.to_be_bytes());
+            entries.push(json!({
+                "kind": "string",
+                "value_sha256": value_sha256,
+                "byte_length": byte_length,
+                "occurrence_count": count,
+            }));
+        }
+        let mut definition_count = 0usize;
+        let mut conflict_entries = Vec::with_capacity(conflicts.len());
+        for (provider_group_id_sha256, definitions) in conflicts {
+            if definitions.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider group conflict has fewer than two definitions",
+                ));
+            }
+            definition_count = definition_count
+                .checked_add(definitions.len())
+                .filter(|count| *count <= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider group conflicts exceed 4096 definitions",
+                    )
+                })?;
+            digest.update(b"provider_group_definition_conflict\0");
+            digest.update(provider_group_id_sha256.as_bytes());
+            digest.update([0]);
+            digest.update(
+                u64::try_from(definitions.len())
+                    .expect("bounded provider definition count fits in u64")
+                    .to_be_bytes(),
+            );
+            for definition_sha256 in definitions {
+                digest.update(definition_sha256.as_bytes());
+                digest.update([0]);
+            }
+            conflict_entries.push(json!({
+                "provider_group_id_sha256": provider_group_id_sha256,
+                "definition_sha256": definitions,
+            }));
+        }
+        Ok(json!({
+            "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
+            "occurrence_count": occurrence_count,
+            "distinct_value_count": entries.len(),
+            "entries": entries,
+            "provider_group_conflict_count": conflicts.len(),
+            "provider_group_conflicting_definition_count": definition_count,
+            "provider_group_definition_conflicts": conflict_entries,
             "sha256": Self::digest_hex(&digest.finalize()),
         }))
     }
@@ -757,6 +931,16 @@ impl SharedDedupe {
             .record(values)
     }
 
+    pub fn record_quarantined_provider_identifier_texts(
+        &self,
+        values: &[String],
+    ) -> io::Result<()> {
+        self.provider_identifier_quarantine
+            .lock()
+            .map_err(|_| io::Error::other("provider identifier quarantine lock poisoned"))?
+            .record_text(values)
+    }
+
     pub fn provider_identifier_quarantine(&self) -> io::Result<ProviderIdentifierQuarantine> {
         self.provider_identifier_quarantine
             .lock()
@@ -933,7 +1117,7 @@ mod tests {
         TinTokenPolicy,
     };
     use serde_json::{json, Value};
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::io;
     use std::sync::{Arc, Barrier};
 
@@ -1569,6 +1753,9 @@ mod tests {
         assert!(dedupe
             .record_quarantined_provider_identifiers(&[-1])
             .is_err());
+        assert!(dedupe
+            .record_quarantined_provider_identifier_texts(&["malformed".to_string()])
+            .is_err());
         assert!(dedupe.provider_identifier_quarantine().is_err());
     }
 
@@ -1577,14 +1764,47 @@ mod tests {
         let mut quarantine = ProviderIdentifierQuarantine::default();
         assert!(quarantine.record(&[0]).is_err());
         assert!(quarantine.record(&[1_000_000_000]).is_err());
+        assert!(quarantine.record_text(&["x".repeat(129)]).is_err());
         for value in 1..=MAX_QUARANTINED_PROVIDER_IDENTIFIERS {
             quarantine.occurrences_by_value.insert(-(value as i64), 1);
         }
         assert!(quarantine.record(&[-2_000]).is_err());
+        assert!(quarantine.record_text(&["malformed".to_string()]).is_err());
 
         let mut incoming = ProviderIdentifierQuarantine::default();
         incoming.record(&[-2_000]).unwrap();
         assert!(quarantine.merge(&incoming).is_err());
+        let mut incoming_text = ProviderIdentifierQuarantine::default();
+        incoming_text
+            .record_text(&["malformed".to_string()])
+            .unwrap();
+        assert!(quarantine.merge(&incoming_text).is_err());
+    }
+
+    #[test]
+    fn provider_identifier_quarantine_combined_v2_matches_python_contract() {
+        let mut quarantine = ProviderIdentifierQuarantine::default();
+        quarantine.record(&[-1, -1]).unwrap();
+        quarantine
+            .record_text(&["bad".to_string(), "bad".to_string(), "bad".to_string()])
+            .unwrap();
+        let conflicts = vec![(
+            "1".repeat(64),
+            BTreeSet::from(["2".repeat(64), "3".repeat(64)]),
+        )];
+
+        let payload = quarantine
+            .payload_with_provider_group_conflicts(&conflicts)
+            .unwrap();
+
+        assert_eq!(payload["occurrence_count"], 5);
+        assert_eq!(payload["distinct_value_count"], 2);
+        assert_eq!(payload["provider_group_conflict_count"], 1);
+        assert_eq!(payload["provider_group_conflicting_definition_count"], 2);
+        assert_eq!(
+            payload["sha256"],
+            "4648d8c0bd10e0f69cd6c54d8d11a186c9f960847059855fd55fa3b76778a537"
+        );
     }
 
     #[test]
@@ -1602,6 +1822,47 @@ mod tests {
         payload_overflow.occurrences_by_value.insert(-2, u64::MAX);
         payload_overflow.occurrences_by_value.insert(-1, 1);
         assert!(payload_overflow.payload().is_err());
+
+        let malformed = "malformed".to_string();
+        let mut text_record_overflow = ProviderIdentifierQuarantine::default();
+        text_record_overflow
+            .record_text(std::slice::from_ref(&malformed))
+            .unwrap();
+        *text_record_overflow
+            .occurrences_by_text_digest
+            .values_mut()
+            .next()
+            .unwrap() = u64::MAX;
+        assert!(text_record_overflow.record_text(&[malformed]).is_err());
+
+        let mut incoming_text = ProviderIdentifierQuarantine::default();
+        incoming_text
+            .record_text(&["malformed".to_string()])
+            .unwrap();
+        let mut text_merge_target = ProviderIdentifierQuarantine::default();
+        text_merge_target.merge(&incoming_text).unwrap();
+        *text_merge_target
+            .occurrences_by_text_digest
+            .values_mut()
+            .next()
+            .unwrap() = u64::MAX;
+        assert!(text_merge_target.merge(&incoming_text).is_err());
+
+        let mut v2_integer_overflow = incoming_text.clone();
+        v2_integer_overflow
+            .occurrences_by_value
+            .insert(-2, u64::MAX);
+        v2_integer_overflow.occurrences_by_value.insert(-1, 1);
+        assert!(v2_integer_overflow.payload().is_err());
+
+        let mut v2_text_overflow = ProviderIdentifierQuarantine::default();
+        v2_text_overflow
+            .occurrences_by_text_digest
+            .insert(("a".to_string(), 1), u64::MAX);
+        v2_text_overflow
+            .occurrences_by_text_digest
+            .insert(("b".to_string(), 1), 1);
+        assert!(v2_text_overflow.payload().is_err());
     }
 
     #[test]

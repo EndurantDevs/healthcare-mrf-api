@@ -45,11 +45,15 @@ class _Session:
         self.timeout = object()
         self.get_calls = []
         self.post_calls = []
+        self.entered = False
+        self.exited = False
 
     async def __aenter__(self):
+        self.entered = True
         return self
 
     async def __aexit__(self, *_exc):
+        self.exited = True
         return False
 
     def get(self, url, **kwargs):
@@ -68,6 +72,7 @@ _ASYNC_RESOLVER_ROUTES = [
     ("s3_xml_listing", "_resolve_s3_xml_listing"),
     ("cigna_static_mrf_lookup", "_resolve_cigna_static_mrf_lookup"),
     ("bcbs_global_solutions_mrf", "_resolve_bcbs_global_solutions_mrf"),
+    ("bcbsnc_aso_employer_search", "_resolve_bcbsnc_aso_employer_search"),
     ("bcbs_asomrf_filelist", "_resolve_bcbs_asomrf_filelist"),
     ("meritain_mrf_search", "_resolve_meritain_mrf_search"),
     ("healthcarebluebook_mrf", "_resolve_healthcarebluebook_mrf"),
@@ -247,6 +252,86 @@ async def test_post_adapters_preserve_payload_shape_headers_and_compression(
     _, text_kwargs = text_session.post_calls[0]
     assert text_kwargs["data"] == "query=synthetic"
     assert text_kwargs["headers"] == {"X-Contract": "adapter"}
+    assert text_kwargs["allow_redirects"] is True
+
+
+@pytest.mark.parametrize("owned", (False, True))
+@pytest.mark.parametrize("max_bytes", (3, 4))
+@pytest.mark.asyncio
+async def test_post_text_owns_bounded_session(monkeypatch, owned, max_bytes):
+    allowed = AsyncMock()
+    session = _Session(_Response(b"ab", b"cd", content_type="application/soap+xml"))
+    session_factory = Mock(return_value=session)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allowed)
+    monkeypatch.setattr(discovery, "_tcp_connector", lambda **_kwargs: object())
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", session_factory)
+    endpoint = "https://adapter.example.invalid/soap"
+
+    request = discovery._post_text(
+        endpoint,
+        "<synthetic/>",
+        max_bytes=max_bytes,
+        session=None if owned else session,
+    )
+    if max_bytes == 3:
+        with pytest.raises(ValueError, match="exceeds 3 byte"):
+            await request
+    else:
+        assert await request == "abcd"
+
+    allowed.assert_any_await(endpoint)
+    allowed.assert_any_await(str(session.response.url))
+    assert session.entered is owned
+    assert session.exited is owned
+    if owned:
+        session_factory.assert_called_once()
+        assert session_factory.call_args.kwargs["trust_env"] is False
+        assert session_factory.call_args.kwargs["headers"] == {
+            "User-Agent": discovery.USER_AGENT
+        }
+    else:
+        session_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("owned", (False, True))
+@pytest.mark.parametrize(
+    ("status", "response_url"),
+    (
+        (
+            307,
+            "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search",
+        ),
+        (
+            308,
+            "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search",
+        ),
+        (200, "https://search.example.invalid/api"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_post_text_rejects_redirect_or_changed_response_url(
+    monkeypatch, status, response_url, owned
+):
+    endpoint = (
+        "https://apiservices-ext.bcbsnc.com/bcbsnc/prod/es/mssearch/api/v1/search"
+    )
+    response = _Response(b"{}", status=status)
+    response.url = response_url
+    session = _Session(response)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+    monkeypatch.setattr(discovery, "_tcp_connector", lambda **_kwargs: object())
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", lambda **_kwargs: session)
+
+    with pytest.raises(ValueError, match="redirect response is not allowed"):
+        await discovery._post_text(
+            endpoint,
+            "synthetic-private-context",
+            session=None if owned else session,
+            allow_redirects=False,
+        )
+
+    assert session.post_calls[0][1]["allow_redirects"] is False
+    assert session.exited is owned
 
 
 @pytest.mark.parametrize(

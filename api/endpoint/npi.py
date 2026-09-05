@@ -33,6 +33,10 @@ from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
                               INTERNAL_PROCEDURE_CODE_SYSTEM,
                               INTERNAL_RX_CODE_SYSTEM)
 from api.endpoint.pagination import parse_pagination
+from api.npi_detail_cache_identity import (
+    NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
+    npi_detail_cache_key as _format_npi_detail_cache_key,
+)
 from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
@@ -1193,45 +1197,15 @@ ADDRESS_GROUPING_PREMISE = "premise"
 ADDRESS_GROUPING_VALUES = {ADDRESS_GROUPING_FLAT, ADDRESS_GROUPING_PREMISE}
 
 
-def _npi_detail_cache_key(
-    npi: int,
-    *,
-    view: str,
-    include_chain: bool,
-    extra_info: bool,
-    sync_geocode: bool,
-    lookup_stored_geocode: bool,
-    include_sources: bool = False,
-    include_evidence: bool = False,
-    include_profile: bool = True,
-    profile_generation: str | None = None,
-    profile_serving_identity: str | None = None,
-    address_overlay_serving_identity: str | None = None,
-    canonical_publication_identity: str | None = None,
-    address_limit: int | None = None,
-    address_offset: int = 0,
-    include_address_total: bool = True,
-    address_key: str | None = None,
-    address_site_key: str | None = None,
-    address_grouping: str = ADDRESS_GROUPING_FLAT,
-) -> str:
-    schema = _runtime_db_schema()
-    address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
-    return (
-        f"{schema}|{address_source}|{int(npi)}|{view}|"
-        f"{'chain' if include_chain else 'default'}|"
-        f"extra:{int(extra_info)}|"
-        f"{'sync_geo' if sync_geocode else 'stored_geo'}|"
-        f"{'archive_geo' if lookup_stored_geocode else 'no_archive_geo'}|"
-        f"sources:{int(include_sources)}|evidence:{int(include_evidence)}|"
-        f"profile:{int(include_profile)}|pgen:{profile_generation or 'none'}|"
-        f"pserve:{profile_serving_identity or 'unknown'}|"
-        f"pdaddr:{address_overlay_serving_identity or 'unknown'}|"
-        f"npipub:{canonical_publication_identity or 'untracked'}|"
-        f"alim:{address_limit if address_limit is not None else 'all'}|"
-        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
-        f"akey:{address_key or 'none'}|"
-        f"askey:{address_site_key or 'none'}|agroup:{address_grouping}"
+def _npi_detail_cache_key(identity: _NpiDetailCacheIdentity) -> str:
+    address_source = os.getenv(
+        ADDRESS_SERVING_SOURCE_ENV,
+        ADDRESS_SERVING_SOURCE_UNIFIED,
+    ).strip().lower()
+    return _format_npi_detail_cache_key(
+        identity,
+        schema=_runtime_db_schema(),
+        address_source=address_source,
     )
 
 
@@ -5288,6 +5262,109 @@ def _nearby_geo_type_clause(address_table_sql: str) -> str:
     return "AND (a.type = 'primary' OR a.type = 'secondary')"
 
 
+_NEARBY_SQL_TEMPLATE = dedent(
+    """
+    WITH sub_s AS (
+        SELECT d.npi AS npi_code,
+               ROUND(
+                   CAST(
+                       ST_Distance(
+                           Geography(
+                               ST_MakePoint(
+                                   (a.long)::double precision,
+                                   (a.lat)::double precision
+                               )
+                           ),
+                           Geography(
+                               ST_MakePoint(
+                                   CAST(:in_long AS double precision),
+                                   CAST(:in_lat AS double precision)
+                               )
+                           )
+                       ) / 1609.34 AS NUMERIC
+                   ),
+                   2
+               ) AS distance,
+               Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ) <-> Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ) AS cursor_distance_meters,
+               a.*,
+               d.*
+          FROM {address_table_sql} AS a
+          JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+         WHERE ST_DWithin(
+                   Geography(
+                       ST_MakePoint(
+                           (a.long)::double precision,
+                           (a.lat)::double precision
+                       )
+                   ),
+                   Geography(
+                       ST_MakePoint(
+                           CAST(:in_long AS double precision),
+                           CAST(:in_lat AS double precision)
+                       )
+                   ),
+                   :radius * 1609.34
+               )
+           AND a.lat IS NOT NULL
+           AND a.long IS NOT NULL
+           AND a.address_key IS NOT NULL
+           {taxonomy_where}
+           {geo_precision_clause}
+           {geo_type_clause}
+           {extra_clause}{ilike_clause}{cursor_clause}
+      ORDER BY Geography(
+                   ST_MakePoint(
+                       (a.long)::double precision,
+                       (a.lat)::double precision
+                   )
+               ) <-> Geography(
+                   ST_MakePoint(
+                       CAST(:in_long AS double precision),
+                       CAST(:in_lat AS double precision)
+                   )
+               ) ASC,
+               a.npi ASC,
+               a.address_key ASC,
+               CASE a.type
+                   WHEN 'primary' THEN 0
+                   WHEN 'practice' THEN 1
+                   WHEN 'site' THEN 2
+                   WHEN 'secondary' THEN 3
+                   ELSE 9
+               END ASC,
+               {row_tiebreaker}
+         LIMIT :limit
+    )
+    SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
+      FROM sub_s
+      LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
+      LEFT JOIN mrf.nucc_taxonomy AS nucc
+        ON nucc.code = t.healthcare_provider_taxonomy_code
+  ORDER BY sub_s.cursor_distance_meters ASC,
+           sub_s.npi_code ASC,
+           sub_s.address_key ASC,
+           CASE sub_s.type
+               WHEN 'primary' THEN 0
+               WHEN 'practice' THEN 1
+               WHEN 'site' THEN 2
+               WHEN 'secondary' THEN 3
+               ELSE 9
+           END ASC,
+           {outer_row_tiebreaker};
+    """
+)
+
+
 def _build_nearby_sql(
     taxonomy_conditions: str,
     extra_clause: str,
@@ -5328,107 +5405,7 @@ def _build_nearby_sql(
         if address_table_sql.endswith(".entity_address_unified")
         else "sub_s.type ASC"
     )
-    return dedent(
-        """
-        WITH sub_s AS (
-            SELECT d.npi AS npi_code,
-                   ROUND(
-                       CAST(
-                           ST_Distance(
-                               Geography(
-                                   ST_MakePoint(
-                                       (a.long)::double precision,
-                                       (a.lat)::double precision
-                                   )
-                               ),
-                               Geography(
-                                   ST_MakePoint(
-                                       CAST(:in_long AS double precision),
-                                       CAST(:in_lat AS double precision)
-                                   )
-                               )
-                           ) / 1609.34 AS NUMERIC
-                       ),
-                       2
-                   ) AS distance,
-                   Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ) <-> Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ) AS cursor_distance_meters,
-                   a.*,
-                   d.*
-              FROM {address_table_sql} AS a
-              JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-             WHERE ST_DWithin(
-                       Geography(
-                           ST_MakePoint(
-                               (a.long)::double precision,
-                               (a.lat)::double precision
-                           )
-                       ),
-                       Geography(
-                           ST_MakePoint(
-                               CAST(:in_long AS double precision),
-                               CAST(:in_lat AS double precision)
-                           )
-                       ),
-                       :radius * 1609.34
-                   )
-               AND a.lat IS NOT NULL
-               AND a.long IS NOT NULL
-               AND a.address_key IS NOT NULL
-               {taxonomy_where}
-               {geo_precision_clause}
-               {geo_type_clause}
-               {extra_clause}{ilike_clause}{cursor_clause}
-          ORDER BY Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ) <-> Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ) ASC,
-                   a.npi ASC,
-                   a.address_key ASC,
-                   CASE a.type
-                       WHEN 'primary' THEN 0
-                       WHEN 'practice' THEN 1
-                       WHEN 'site' THEN 2
-                       WHEN 'secondary' THEN 3
-                       ELSE 9
-                   END ASC,
-                   {row_tiebreaker}
-             LIMIT :limit
-        )
-        SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
-          FROM sub_s
-          LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
-          LEFT JOIN mrf.nucc_taxonomy AS nucc
-            ON nucc.code = t.healthcare_provider_taxonomy_code
-      ORDER BY sub_s.cursor_distance_meters ASC,
-               sub_s.npi_code ASC,
-               sub_s.address_key ASC,
-               CASE sub_s.type
-                   WHEN 'primary' THEN 0
-                   WHEN 'practice' THEN 1
-                   WHEN 'site' THEN 2
-                   WHEN 'secondary' THEN 3
-                   ELSE 9
-               END ASC,
-               {outer_row_tiebreaker};
-        """
-    ).format(
+    return _NEARBY_SQL_TEMPLATE.format(
         taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
         geo_precision_clause=geo_precision_clause,
@@ -12509,35 +12486,35 @@ async def get_npi(request, npi):
                 exc,
             )
     cache_key = _npi_detail_cache_key(
-        npi,
-        view=provider_enrichment_view,
-        include_chain=include_chain_enrichment,
-        extra_info=include_extra_info,
-        sync_geocode=should_sync_geocode,
-        lookup_stored_geocode=should_lookup_stored_geocode,
-        include_sources=include_sources,
-        include_evidence=include_evidence,
-        include_profile=include_profile,
-        profile_generation=(
-            str(profile_record["profile"].get("generation_id"))
-            if profile_record and isinstance(profile_record.get("profile"), Mapping)
-            else None
-        ),
-        profile_serving_identity=(
-            str(profile_record.get("_serving_identity"))
-            if profile_record and profile_record.get("_serving_identity")
-            else None
-        ),
-        address_overlay_serving_identity=(
-            address_overlay_serving_identity
-        ),
-        canonical_publication_identity=canonical_publication_identity,
-        address_limit=address_limit,
-        address_offset=address_offset,
-        include_address_total=include_address_total,
-        address_key=address_key,
-        address_site_key=address_site_key,
-        address_grouping=address_grouping,
+        _NpiDetailCacheIdentity(
+            npi=npi,
+            view=provider_enrichment_view,
+            include_chain=include_chain_enrichment,
+            extra_info=include_extra_info,
+            sync_geocode=should_sync_geocode,
+            lookup_stored_geocode=should_lookup_stored_geocode,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            include_profile=include_profile,
+            profile_generation=(
+                str(profile_record["profile"].get("generation_id"))
+                if profile_record and isinstance(profile_record.get("profile"), Mapping)
+                else None
+            ),
+            profile_serving_identity=(
+                str(profile_record.get("_serving_identity"))
+                if profile_record and profile_record.get("_serving_identity")
+                else None
+            ),
+            address_overlay_serving_identity=address_overlay_serving_identity,
+            canonical_publication_identity=canonical_publication_identity,
+            address_limit=address_limit,
+            address_offset=address_offset,
+            include_address_total=include_address_total,
+            address_key=address_key,
+            address_site_key=address_site_key,
+            address_grouping=address_grouping,
+        )
     )
     if is_response_cache_enabled:
         cached_body = _npi_detail_response_cache_get(cache_key)

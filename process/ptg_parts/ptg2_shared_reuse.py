@@ -14,6 +14,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
     shared_semantic_fingerprint,
+    shared_support_digest,
 )
 from process.ptg_parts.ptg2_invalid_price_exclusion import (
     INVALID_PRICE_EXCLUSION_POLICY_FIELD,
@@ -370,6 +371,28 @@ def is_same_downloaded_physical_input(
     return _downloaded_artifact_payload(left) == _downloaded_artifact_payload(right)
 
 
+def shared_layout_support_digest(
+    *,
+    core_support: Mapping[str, Any],
+    audit_sample: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
+    full_rebuild_scope_digest: str | None = None,
+) -> bytes:
+    """Seal support metadata, optionally isolating one controlled rebuild."""
+
+    support_by_field = {
+        **dict(core_support),
+        "audit_sample": dict(audit_sample),
+        "source_witness": dict(source_witness),
+    }
+    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
+    if normalized_rebuild_digest is not None:
+        support_by_field["full_rebuild_scope_digest"] = normalized_rebuild_digest
+    return shared_support_digest(support_by_field)
+
+
 __all__ = [
     "PTG2_V3_SOURCE_SET_CONTRACT",
     "SharedInputIdentity",
@@ -383,6 +406,7 @@ __all__ = [
     "is_same_downloaded_physical_input",
     "shared_physical_artifact_identity",
     "shared_logical_artifact_metadata",
+    "shared_layout_support_digest",
     "shared_physical_input_identity",
     "shared_snapshot_source_assignments",
     "shared_source_set_metadata",

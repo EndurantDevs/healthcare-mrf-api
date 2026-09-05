@@ -68,6 +68,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedLogicalPlanScope,
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
+    shared_layout_support_digest,
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_shared_price import _create_v3_price_key_stage
@@ -78,7 +79,6 @@ from process.ptg_parts.ptg2_shared_publish import (
     publish_shared_block_stage,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
-    _shared_layout_support_digest,
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
 )
@@ -620,7 +620,7 @@ async def _publish_rebuild_scope_proof_layout(
             snapshot_key=reservation.snapshot_key,
             build_token=build_token,
             expected_summary=summary,
-            support_digest=_shared_layout_support_digest(
+            support_digest=shared_layout_support_digest(
                 core_support={"fixture": "full-rebuild-scope-proof-v1"},
                 audit_sample={},
                 source_witness={},

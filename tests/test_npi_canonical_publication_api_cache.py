@@ -297,12 +297,16 @@ def test_detail_response_cache_key_changes_with_publication_identity(monkeypatch
         "lookup_stored_geocode": False,
     }
     first_key = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
-        canonical_publication_identity=PUBLICATION_ONE,
+        npi_module._NpiDetailCacheIdentity(
+            **common_options_by_name,
+            canonical_publication_identity=PUBLICATION_ONE,
+        )
     )
     second_key = npi_module._npi_detail_cache_key(
-        **common_options_by_name,
-        canonical_publication_identity=PUBLICATION_TWO,
+        npi_module._NpiDetailCacheIdentity(
+            **common_options_by_name,
+            canonical_publication_identity=PUBLICATION_TWO,
+        )
     )
 
     npi_module._npi_detail_response_cache_set(first_key, b"generation-one")

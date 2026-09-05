@@ -227,7 +227,7 @@ The bounded activation gate requires all of these floors:
 | Resolved-rate fraction | exactly 1.0 |
 | Unresolved provider references | 0 |
 | Invalid prices | 0 |
-| Unattested or mismatched malformed NPI integers | 0 |
+| Unattested or mismatched malformed NPI identifiers | 0 |
 | Invalid field types | 0 |
 
 The source-selected sample is captured at the actual V3 emission point during

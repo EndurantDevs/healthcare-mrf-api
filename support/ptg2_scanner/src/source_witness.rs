@@ -28,6 +28,7 @@ const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW03";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
 const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
+pub const PROVIDER_SOURCE_RECORD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 // Scanner bundles externalize and deduplicate exact source tokens before applying
 // the same 512 MiB safety bound as the persisted logical payload.
@@ -722,6 +723,10 @@ impl SourceWitnessCollector {
         )
     }
 
+    pub fn raw_source_sha256(&self) -> &[u8; 32] {
+        &self.raw_source_sha256
+    }
+
     pub fn configure_rate_spools(&self, shard_count: usize) -> io::Result<()> {
         io_result(
             self.rate_spools.set(RateSourceSpools::new_rate_with_budget(
@@ -837,6 +842,7 @@ impl SourceWitnessCollector {
         shard: usize,
         raw_provider: &[u8],
     ) -> io::Result<ProviderSourceLocator> {
+        validate_provider_source_record_size(raw_provider.len())?;
         io_option(
             self.provider_spools.get(),
             io::ErrorKind::Other,
@@ -855,12 +861,13 @@ impl SourceWitnessCollector {
     }
 
     pub fn read_provider_source(&self, locator: ProviderSourceLocator) -> io::Result<Vec<u8>> {
+        validate_provider_source_record_size(locator.length as usize)?;
         io_option(
             self.provider_spools.get(),
             io::ErrorKind::Other,
             "provider source spools are not configured",
         )?
-        .read_bounded(locator, SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES)
+        .read_bounded(locator, PROVIDER_SOURCE_RECORD_MAX_BYTES)
     }
 
     #[cfg(test)]
@@ -1491,6 +1498,18 @@ fn validate_decoded_evidence_size(label: &str, decoded_bytes: usize) -> io::Resu
     ))
 }
 
+pub fn validate_provider_source_record_size(record_bytes: usize) -> io::Result<()> {
+    if record_bytes <= PROVIDER_SOURCE_RECORD_MAX_BYTES {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "provider source record is {record_bytes} bytes, exceeding the fail-closed {PROVIDER_SOURCE_RECORD_MAX_BYTES}-byte limit"
+        ),
+    ))
+}
+
 fn validate_compressed_record_size(compressed_record_bytes: usize) -> io::Result<()> {
     if compressed_record_bytes <= SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES {
         return Ok(());
@@ -1731,6 +1750,22 @@ mod tests {
         assert_eq!(
             collector.read_provider_source(locator).unwrap(),
             b"provider"
+        );
+        validate_provider_source_record_size(PROVIDER_SOURCE_RECORD_MAX_BYTES).unwrap();
+        let oversized_error = collector
+            .read_provider_source(ProviderSourceLocator {
+                shard: 0,
+                offset: 0,
+                length: (PROVIDER_SOURCE_RECORD_MAX_BYTES + 1) as u32,
+            })
+            .unwrap_err();
+        assert_eq!(
+            oversized_error.to_string(),
+            format!(
+                "provider source record is {} bytes, exceeding the fail-closed {}-byte limit",
+                PROVIDER_SOURCE_RECORD_MAX_BYTES + 1,
+                PROVIDER_SOURCE_RECORD_MAX_BYTES,
+            ),
         );
         collector
             .read_provider_source(ProviderSourceLocator {

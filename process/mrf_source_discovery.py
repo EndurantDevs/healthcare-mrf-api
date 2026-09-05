@@ -65,6 +65,10 @@ from process.import_status_events import (
     flush_terminal_status_event,
 )
 from process.live_progress import enqueue_live_progress
+from process.mrf_discovery_post_resolvers import (
+    _resolve_bcbsnc_aso_employer_search,
+    post_discovery_text,
+)
 from process.mrf_discovery_checkpoints import (
     DatabaseDiscoveryCheckpointStore,
     DiscoverySourceBatchIncomplete,
@@ -1238,6 +1242,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return None
     if host == "mrfsearch.meritain.com":
         return "meritain_mrf_search"
+    if host in {"www.bcbsnc.com", "bcbsnc.com"} and (
+        path.rstrip("/") == "/policies-best-practices/machine-readable-files"
+    ):
+        return "bcbsnc_aso_employer_search"
     if host == "mrf.healthcarebluebook.com":
         return "healthcarebluebook_mrf"
     if host == "clm.magnacare.com" and path.startswith("/transparency"):
@@ -2762,43 +2770,16 @@ async def _post_text(
     headers: dict[str, str] | None = None,
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
     session: aiohttp.ClientSession | None = None,
+    allow_redirects: bool = True,
 ) -> str:
-    await _assert_fetch_url_allowed(url)
-    if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
-        connector = _tcp_connector(limit=0)
-        async with aiohttp.ClientSession(
-            headers={"User-Agent": USER_AGENT},
-            timeout=timeout,
-            connector=connector,
-            trust_env=False,
-        ) as owned_session:
-            return await _post_text(
-                url,
-                request_payload,
-                headers=headers,
-                max_bytes=max_bytes,
-                session=owned_session,
-            )
-    async with session.post(
+    return await post_discovery_text(
         url,
-        data=request_payload,
-        headers=headers or {},
-        allow_redirects=True,
-        **_request_ssl_kwargs(url),
-    ) as resp:
-        await _assert_fetch_url_allowed(str(resp.url))
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.content.iter_chunked(64 * 1024):
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
-            chunks.append(chunk)
-        charset = resp.charset or "utf-8"
-    return _decode_response_body(b"".join(chunks), charset=charset)
+        request_payload,
+        headers=headers,
+        max_bytes=max_bytes,
+        session=session,
+        allow_redirects=allow_redirects,
+    )
 
 
 async def _load_candidates(
@@ -14538,6 +14519,7 @@ _ASYNC_CRAWL_RESOLVER_NAMES = {
     "s3_xml_listing": "_resolve_s3_xml_listing",
     "cigna_static_mrf_lookup": "_resolve_cigna_static_mrf_lookup",
     "bcbs_global_solutions_mrf": "_resolve_bcbs_global_solutions_mrf",
+    "bcbsnc_aso_employer_search": "_resolve_bcbsnc_aso_employer_search",
     "bcbs_asomrf_filelist": "_resolve_bcbs_asomrf_filelist",
     "meritain_mrf_search": "_resolve_meritain_mrf_search",
     "healthcarebluebook_mrf": "_resolve_healthcarebluebook_mrf",

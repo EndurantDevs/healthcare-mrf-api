@@ -4,6 +4,22 @@ import pytest
 
 from process import control_lifecycle
 from process.control_lifecycle import control_single_job_start
+from process.ptg_control_failures import ptg_failure_error
+from process.ptg_parts.ptg2_shared_audit import ReusableLayoutAuditCorruption
+
+
+def test_ptg_control_classifies_verified_reusable_layout_corruption():
+    message = "reused shared PTG layout audit rows disagree with its manifest"
+
+    assert ptg_failure_error(ReusableLayoutAuditCorruption(message)) == {
+        "code": "ptg_reusable_layout_audit_corrupt",
+        "message": message,
+        "retryable": False,
+    }
+    assert ptg_failure_error(RuntimeError(message)) == {
+        "code": "ptg_import_failed",
+        "message": message,
+    }
 
 
 @pytest.mark.asyncio
