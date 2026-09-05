@@ -470,32 +470,32 @@ def test_fresh_restore_waits_for_in_progress_fence_delete(lifecycle):
 def test_fresh_restore_reconciles_capacity_restore_intent(lifecycle, after_patch):
     drain, cluster = lifecycle
     drain.hold()
-    data = json.loads(drain.path.read_text())
+    persisted_state = json.loads(drain.path.read_text())
     cluster.fences.clear()
-    for record in data["fences"].values():
-        record["phase"] = "deleted"
-    row = next(row for row in data["original"] if row["name"] == "ci-a")
-    current = cluster.asrs["ci-a"]
-    data["changes"]["ci-a"] = {
+    for fence_state in persisted_state["fences"].values():
+        fence_state["phase"] = "deleted"
+    original_asr = next(asr for asr in persisted_state["original"] if asr["name"] == "ci-a")
+    current_asr = cluster.asrs["ci-a"]
+    persisted_state["changes"]["ci-a"] = {
         "phase": "restore_intent",
-        "resourceVersion": current["metadata"]["resourceVersion"],
-        "generation": current["metadata"]["generation"],
+        "resourceVersion": current_asr["metadata"]["resourceVersion"],
+        "generation": current_asr["metadata"]["generation"],
     }
     if after_patch:
-        current["spec"] = deepcopy(row["spec"])
+        current_asr["spec"] = deepcopy(original_asr["spec"])
         cluster.revision += 1
-        current["metadata"]["resourceVersion"] = str(cluster.revision)
-        current["metadata"]["generation"] += 1
+        current_asr["metadata"]["resourceVersion"] = str(cluster.revision)
+        current_asr["metadata"]["generation"] += 1
     else:
         cluster.revision += 1
-        current["metadata"]["resourceVersion"] = str(cluster.revision)
-        current["status"] = {"observedGeneration": current["metadata"]["generation"]}
-    drain.path.write_text(json.dumps(data) + "\n")
+        current_asr["metadata"]["resourceVersion"] = str(cluster.revision)
+        current_asr["status"] = {"observedGeneration": current_asr["metadata"]["generation"]}
+    drain.path.write_text(json.dumps(persisted_state) + "\n")
 
     resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
     resumed.restore()
 
-    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert [asr["spec"]["maxRunners"] for asr in cluster.asrs.values()] == [3, 2]
     assert cluster.events.count(("patch", "ci-a", 3)) == (0 if after_patch else 1)
     assert resumed.data["restored"] is True
 
