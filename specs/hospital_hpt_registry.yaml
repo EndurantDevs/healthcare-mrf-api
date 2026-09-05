@@ -7790,7 +7790,8 @@ hospitals:
   cms_hpt_url: https://gardengrovehospital.com/cms-hpt.txt
 - hospital_id: hospital-002332
   name: GARFIELD COUNTY MEMORIAL HOSPITAL DISTRICT
-  cms_hpt_url: https://fmolhs.org/cms-hpt.txt
+  cms_hpt_url: https://www.garfieldcountyhospital.com/cms-hpt.txt
+  locator_name: Garfield County Hospital District
 - hospital_id: hospital-002333
   name: Garfield Medical Center
   cms_hpt_url: https://www.ahmchealth.com/cms-hpt.txt

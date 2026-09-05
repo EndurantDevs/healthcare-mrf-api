@@ -28,6 +28,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002260": "Franciscan Health Orthopedic-Carmel",
+    "hospital-002332": "Garfield County Hospital District",
     "hospital-002421": "Grady Health System",
     "hospital-002914": "Highland-Clarksburg Hospital, Inc.",
     "hospital-003238": "Southern Humboldt Community Hospital",
@@ -74,7 +75,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_901
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_695
+    assert sum("locator_name" in entry for entry in hospitals) == 1_696
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 107
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -91,7 +92,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         for hospital_id in _REVIEWED_LOCATOR_NAMES
     } == _REVIEWED_LOCATOR_NAMES
     assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
-        "hospital-000047", "hospital-000188", "hospital-000600",
+        "hospital-000047", "hospital-000188", "hospital-000600", "hospital-002332",
         "hospital-005162", "hospital-005163", "hospital-006475",
         "hospital-006476", "hospital-006477", "hospital-007140",
         "hospital-007141",
@@ -99,6 +100,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         "https://www.achsiowa.org/cms-hpt.txt",
         "https://amberwellhealth.org/cms-hpt.txt",
         "https://www.baptisthealth.com/cms-hpt.txt",
+        "https://www.garfieldcountyhospital.com/cms-hpt.txt",
         "https://www.pioneermemorial.org/cms-hpt.txt",
         "https://www.pioneermemorial.org/cms-hpt.txt",
         "https://scottishriteforchildren.org/cms-hpt.txt",
