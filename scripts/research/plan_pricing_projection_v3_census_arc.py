@@ -192,7 +192,9 @@ class ArcDrain:
             _metadata_identity(item)
             _require(item["metadata"]["uid"] == row["uid"]
                     and item["metadata"].get("namespace") == self.namespace
-                    and not item["metadata"].get("deletionTimestamp"), "ARC set UID/liveness changed")
+                    and not item["metadata"].get("deletionTimestamp")
+                    and type(item["metadata"].get("generation")) is int,
+                    "ARC set identity/liveness changed")
             _require(_held_spec(item["spec"]) == _held_spec(row["spec"]), "ARC non-capacity specification changed")
             _capacity(item["spec"])
         return by_name
@@ -256,16 +258,16 @@ class ArcDrain:
         for original_asr in self.data["original"]:
             capacity_change = self.data["changes"][original_asr["name"]]
             current_asr = asrs[original_asr["name"]]
-            resource_version = current_asr["metadata"].get("resourceVersion")
+            generation = current_asr["metadata"]["generation"]
             if capacity_change["phase"] != "restore_intent":
                 continue
-            _require(isinstance(capacity_change.get("resourceVersion"), str) and capacity_change["resourceVersion"],
-                    "ARC restore intent resource version is invalid")
+            intent_generation = capacity_change.get("generation")
+            _require(type(intent_generation) is int, "ARC restore intent generation is invalid")
             if current_asr["spec"] == _held_spec(original_asr["spec"]):
-                _require(resource_version == capacity_change["resourceVersion"],
-                        "ARC held capacity changed after restore intent")
+                _require(generation == intent_generation,
+                        "ARC held capacity generation changed after restore intent")
             elif current_asr["spec"] == original_asr["spec"]:
-                _require(resource_version != capacity_change["resourceVersion"],
+                _require(generation == intent_generation + 1,
                         "ARC restored capacity response is ambiguous")
                 self.data["changes"][original_asr["name"]]["phase"] = "restored"
                 self._save()
@@ -279,18 +281,17 @@ class ArcDrain:
             capacity_change = self.data["changes"][name]
             if capacity_change["phase"] != "intent":
                 continue
-            intent_resource_version = capacity_change.get("resourceVersion")
-            _require(isinstance(intent_resource_version, str) and intent_resource_version,
-                    "ARC drain intent resource version is invalid")
+            intent_generation = capacity_change.get("generation")
+            _require(type(intent_generation) is int, "ARC drain intent generation is invalid")
             current_asr = asrs[name]
-            resource_version = current_asr["metadata"].get("resourceVersion")
+            generation = current_asr["metadata"]["generation"]
             if (current_asr["spec"] == original_asr["spec"]
-                    and resource_version == intent_resource_version):
+                    and generation == intent_generation):
                 self.data["changes"][name]["phase"] = "restored"
             elif (current_asr["spec"] == _held_spec(original_asr["spec"])
-                    and resource_version != intent_resource_version):
+                    and generation == intent_generation + 1):
                 self.data["changes"][name] = {
-                    "phase": "confirmed", "resourceVersion": resource_version,
+                    "phase": "confirmed", "resourceVersion": current_asr["metadata"]["resourceVersion"],
                 }
             else:
                 raise RuntimeError("ARC capacity changed after drain intent")
@@ -364,7 +365,10 @@ class ArcDrain:
         _require(item["spec"] == row["spec"], "ARC capacity changed before owned drain")
         if _capacity(row["spec"]) == (0, 0):
             return
-        self.data["changes"][row["name"]] = {"phase": "intent", "resourceVersion": item["metadata"]["resourceVersion"]}
+        self.data["changes"][row["name"]] = {
+            "phase": "intent", "resourceVersion": item["metadata"]["resourceVersion"],
+            "generation": item["metadata"]["generation"],
+        }
         self._save()
         result = json.loads(self._patch_capacity(item, _held_spec(row["spec"])).stdout)
         _require(result["metadata"]["uid"] == row["uid"] and result["spec"] == _held_spec(row["spec"]),
@@ -583,12 +587,13 @@ class ArcDrain:
                 self.data["changes"][name] = {
                     "phase": "restore_intent",
                     "resourceVersion": current_asr["metadata"]["resourceVersion"],
+                    "generation": current_asr["metadata"]["generation"],
                 }
                 self._save()
             else:
-                _require(current_asr["metadata"]["resourceVersion"]
-                        == self.data["changes"][name]["resourceVersion"],
-                        "ARC capacity changed after restore intent")
+                _require(current_asr["metadata"]["generation"]
+                        == self.data["changes"][name]["generation"],
+                        "ARC capacity generation changed after restore intent")
             patch_result = self._patch_capacity(current_asr, original_asr["spec"], check=False)
             if patch_result.returncode and re.search(rf"(?<![-\w])hp-pv3-arc-deny-{self.owner}(?![-\w])", patch_result.stderr):
                 self.pause()

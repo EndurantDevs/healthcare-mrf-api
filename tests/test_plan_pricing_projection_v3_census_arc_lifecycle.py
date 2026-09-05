@@ -479,12 +479,17 @@ def test_fresh_restore_reconciles_capacity_restore_intent(lifecycle, after_patch
     data["changes"]["ci-a"] = {
         "phase": "restore_intent",
         "resourceVersion": current["metadata"]["resourceVersion"],
+        "generation": current["metadata"]["generation"],
     }
     if after_patch:
         current["spec"] = deepcopy(row["spec"])
         cluster.revision += 1
         current["metadata"]["resourceVersion"] = str(cluster.revision)
         current["metadata"]["generation"] += 1
+    else:
+        cluster.revision += 1
+        current["metadata"]["resourceVersion"] = str(cluster.revision)
+        current["status"] = {"observedGeneration": current["metadata"]["generation"]}
     drain.path.write_text(json.dumps(data) + "\n")
 
     resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
@@ -497,8 +502,8 @@ def test_fresh_restore_reconciles_capacity_restore_intent(lifecycle, after_patch
 
 @pytest.mark.parametrize(
     "damage",
-    ["fence-uid", "fence-spec", "fence-rv", "asr-uid", "held-rv",
-     "capacity-drift", "original-same-rv"],
+    ["fence-uid", "fence-spec", "fence-rv", "asr-uid", "held-generation",
+     "capacity-drift", "original-same-generation"],
 )
 def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
     drain, cluster = lifecycle
@@ -531,11 +536,12 @@ def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
         persisted_state["changes"]["ci-a"] = {
             "phase": "restore_intent",
             "resourceVersion": current["metadata"]["resourceVersion"],
+            "generation": current["metadata"]["generation"],
         }
         if damage == "asr-uid":
             current["metadata"]["uid"] = "replacement"
-        elif damage == "held-rv":
-            current["metadata"]["resourceVersion"] = "99"
+        elif damage == "held-generation":
+            current["metadata"]["generation"] = 99
         elif damage == "capacity-drift":
             current["spec"]["maxRunners"] = 1
         else:
@@ -553,3 +559,10 @@ def test_resource_version_race_never_blindly_patches(lifecycle):
     with pytest.raises(RuntimeError):
         drain.hold()
     assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.restore()
+
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert not cluster.fences
+    assert resumed.data["restored"] is True
