@@ -35,6 +35,14 @@ def _assert_metric_behavior(compare_metric: CompareMetric) -> None:
         bool(compare_metric("ratio", {"covered": 79, "total": 100}, floor)),
         "ratio regression",
     )
+    _require(
+        not compare_metric("deletion", {"covered": 79, "total": 99}, floor),
+        "covered deletion with unchanged debt",
+    )
+    _require(
+        bool(compare_metric("debt", {"covered": 78, "total": 99}, floor)),
+        "deletion with increased debt",
+    )
 
 
 def _assert_parser_behavior(collect_report: CollectReport) -> None:
