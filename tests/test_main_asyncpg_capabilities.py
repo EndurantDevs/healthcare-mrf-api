@@ -1,21 +1,37 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """The server CLI capability override matches the installed asyncpg contract."""
 
+from types import SimpleNamespace
+
+import pytest
 from asyncpg import connection
 from asyncpg.connection import ServerCapabilities
+from asyncpg.serverversion import split_server_version_string
 from click.testing import CliRunner
 
 import main
 
 
-def test_server_cli_constructs_real_asyncpg_capabilities(monkeypatch):
+@pytest.mark.parametrize(
+    "version,settings,copy_from_where,jit",
+    [
+        ("18.2", SimpleNamespace(), True, True),
+        ("10.23", SimpleNamespace(), False, False),
+        ("18.2", SimpleNamespace(crdb_version="test"), False, False),
+    ],
+)
+def test_server_cli_preserves_backend_capabilities(
+    monkeypatch, version, settings, copy_from_where, jit
+):
     observed_capabilities = []
     run_options_by_name = {}
 
     def run_server(_app, **options):
         run_options_by_name.update(options)
         observed_capabilities.append(
-            connection._detect_server_capabilities((18, 2), {})
+            connection._detect_server_capabilities(
+                split_server_version_string(version), settings
+            )
         )
 
     monkeypatch.setenv("HLTHPRT_PTG_WAVE_RECEIPT_AUTHORITY_ROLE", "reader")
@@ -46,6 +62,6 @@ def test_server_cli_constructs_real_asyncpg_capabilities(monkeypatch):
         "plpgsql": False,
         "sql_reset": False,
         "sql_close_all": False,
-        "sql_copy_from_where": False,
-        "jit": False,
+        "sql_copy_from_where": copy_from_where,
+        "jit": jit,
     }

@@ -22,7 +22,6 @@ import arq.cli
 import click
 import uvloop
 from asyncpg import connection
-from asyncpg.connection import ServerCapabilities
 from arq.logs import default_log_config
 from arq.utils import import_string
 from arq.worker import create_worker
@@ -75,14 +74,15 @@ def start(host, port, workers, debug, accesslog):
     """Start the API server with the requested runtime options."""
     if receipt_authority_role() == RECEIPT_AUTHORITY_ROLE_SIGNER:
         require_receipt_authority_worker_count(workers)
-    connection._detect_server_capabilities = lambda *a, **kw: ServerCapabilities(
-        advisory_locks=False,
-        notifications=False,
-        plpgsql=False,
-        sql_reset=False,
-        sql_close_all=False,
-        sql_copy_from_where=False,
-        jit=False,
+    detect_server_capabilities = connection._detect_server_capabilities
+    connection._detect_server_capabilities = lambda *a, **kw: (
+        detect_server_capabilities(*a, **kw)._replace(
+            advisory_locks=False,
+            notifications=False,
+            plpgsql=False,
+            sql_reset=False,
+            sql_close_all=False,
+        )
     )
     if debug:
         os.environ['HLTHPRT_DB_ECHO'] = 'True'
