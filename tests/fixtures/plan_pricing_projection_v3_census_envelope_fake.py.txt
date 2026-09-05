@@ -643,6 +643,7 @@ elif name == "k3s":
                         "spec": {
                             "failurePolicy": "Fail",
                             "matchConstraints": {"matchPolicy": "Exact",
+                                "namespaceSelector": {}, "objectSelector": {},
                                 "resourceRules": [{"apiGroups": ["batch"],
                                     "apiVersions": ["v1"], "operations": ["CREATE"],
                                     "resources": ["jobs"], "scope": "Namespaced"}]},
@@ -663,7 +664,8 @@ elif name == "k3s":
                             "validationActions": ["Deny"], "matchResources": {
                                 "matchPolicy": "Exact", "namespaceSelector": {
                                     "matchLabels": {"kubernetes.io/metadata.name":
-                                                    "healthporta-dev"}}}},
+                                                    "healthporta-dev"}},
+                                "objectSelector": {}}},
                     }
                 if (
                     os.environ.get("FAKE_SPEC_DRIFT") == file_kind
@@ -675,7 +677,8 @@ elif name == "k3s":
                     elif file_kind == "policy":
                         payload["spec"]["validations"][0]["expression"] = "true"
                     else:
-                        payload["spec"]["matchResources"]["objectSelector"] = {}
+                        payload["spec"]["matchResources"]["objectSelector"] = {
+                            "matchLabels": {"drift": "true"}}
                 print(json.dumps(payload))
     else:
         raise SystemExit("unexpected kubectl operation: " + operation)
