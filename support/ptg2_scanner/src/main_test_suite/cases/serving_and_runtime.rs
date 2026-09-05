@@ -1820,6 +1820,9 @@ fn deferred_v3_atom_streams_emit_shared_block_staging_copy() {
 }
 #[test]
 fn serving_binary_v3_memberships_enforce_width_and_strict_pairs() {
+    let error = ptg2_serving_binary_v3::read_checkpoint_offset(&[], usize::MAX).unwrap_err();
+    assert!(error.to_string().contains("checkpoint offset overflows"));
+
     let wide_atom = pg_binary_copy_rows(&[vec![pg_i32_field(0), pg_i64_field(1 << 24)]]);
     let mut reader = Cursor::new(wide_atom.clone());
     let mut writer = CountingWriter::new(Vec::new());

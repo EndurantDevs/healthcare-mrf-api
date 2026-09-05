@@ -15618,7 +15618,10 @@ mod ptg2_serving_binary_v3 {
     }
 
     #[cfg(test)]
-    fn read_checkpoint_offset(payload: &[u8], cursor: usize) -> io::Result<(u32, usize)> {
+    pub(super) fn read_checkpoint_offset(
+        payload: &[u8],
+        cursor: usize,
+    ) -> io::Result<(u32, usize)> {
         let checkpoint_end = cursor
             .checked_add(4)
             .ok_or_else(|| invalid_data("PTG2 v3 checkpoint offset overflows"))?;
@@ -27512,4 +27515,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod main_tests;
+mod main_test_suite;

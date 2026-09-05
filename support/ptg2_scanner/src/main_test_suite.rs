@@ -1,4 +1,4 @@
-mod tests {
+mod cases {
     use super::super::*;
     use ptg2_scanner::manifest::GLOBAL_ID_BYTES;
     use std::collections::BTreeSet;
