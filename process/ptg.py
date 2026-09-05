@@ -6179,10 +6179,9 @@ class _ReusedSharedV3AllowedContext:
 
 
 def _shared_v3_publisher_sources(
-    source_root: Path,
-    *,
-    include_provider_graph_v4: bool,
+    source_root: Path, *, include_provider_graph_v4: bool
 ) -> tuple[Path, ...]:
+    """Return sources whose bytes define the shared publisher identity."""
     publisher_sources = (
         source_root / "ptg.py",
         source_root / "ptg_parts" / "copy_load.py",
@@ -6200,6 +6199,7 @@ def _shared_v3_publisher_sources(
         source_root / "ptg_parts" / "ptg2_shared_graph.py",
         source_root / "ptg_parts" / "ptg2_shared_price.py",
         source_root / "ptg_parts" / "ptg2_shared_publish.py",
+        source_root / "ptg_parts" / "ptg2_shared_reuse.py",
         source_root / "ptg_parts" / "ptg2_shared_snapshot_publish.py",
         source_root / "ptg_parts" / "ptg2_source_witness.py",
         source_root / "ptg_parts" / "ptg2_source_witness_codec.py",

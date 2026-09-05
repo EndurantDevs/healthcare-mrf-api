@@ -9341,7 +9341,10 @@ def test_reused_v3_serving_index_rejects_invalid_source_witness(
         )
 
 
-@pytest.mark.parametrize("publisher_source_file", ["ptg2_source_witness.py", "copy_load.py"])
+@pytest.mark.parametrize(
+    "publisher_source_file",
+    ["ptg2_source_witness.py", "copy_load.py", "ptg2_shared_reuse.py"],
+)
 def test_shared_v3_physical_identity_binds_source_witness_publisher(
     publisher_source_file,
     tmp_path,

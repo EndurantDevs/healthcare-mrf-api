@@ -1852,11 +1852,22 @@ def _validated_sealed_audit_contract(
         or metadata.get("method") != PTG2_V3_AUDIT_METHOD
         or metadata.get("serving_multiplicity_semantics")
         != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
-        or type(metadata.get("maximum_rows")) is not int
-        or metadata.get("maximum_rows") != PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
-        or metadata.get("complete_population") is not False
-        or metadata.get("occurrence_identity")
-        != "sha256_candidate_ordinal_source_key_v2"
+        or (
+            "maximum_rows" in metadata
+            and (
+                type(metadata.get("maximum_rows")) is not int
+                or metadata.get("maximum_rows") != PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
+            )
+        )
+        or (
+            "complete_population" in metadata
+            and metadata.get("complete_population") is not False
+        )
+        or (
+            "occurrence_identity" in metadata
+            and metadata.get("occurrence_identity")
+            != "sha256_candidate_ordinal_source_key_v2"
+        )
     ):
         raise ReusableLayoutAuditCorruption(
             "reused strict V3 layout has an incompatible audit sample contract"

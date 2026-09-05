@@ -27512,4 +27512,4 @@ fn main() {
 }
 
 #[cfg(test)]
-include!("main_tests.rs");
+mod main_tests;
