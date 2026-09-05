@@ -11,11 +11,28 @@ from process.provider_directory_admission_seal import (
     ADMISSION_KIND_UHC_CANONICAL,
     ADMISSION_SEAL_VERSION,
 )
+from process.provider_directory_fhir_subset_identity import (
+    CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
+)
 from process.provider_directory_validated_publication_contract import (
     ProviderDirectoryDatasetIdentity,
 )
 
 _ADMISSION_SCHEMA = ProviderDirectoryEndpointDataset.__table__.schema
+
+
+def _source_endpoint_id(source_model, *, current_published_only):
+    """Keep Profile reads on the serving alias while finding new candidates."""
+
+    if current_published_only:
+        return source_model.endpoint_id
+    configured_endpoint_id = func.nullif(
+        cast(source_model.metadata_json, JSONB).op("->>")(
+            CONFIGURED_ENDPOINT_ID_METADATA_FIELD
+        ),
+        "",
+    )
+    return func.coalesce(configured_endpoint_id, source_model.endpoint_id)
 
 
 def _catalog_publication_metadata(dataset_model):
@@ -129,27 +146,28 @@ def _scope_publication_metadata(
 
 
 def _source_scope_dataset_statement(
-    source_ids, current_source_ids, *, current_published_only=False,
-    other_profile_source_ids=(),
+    source_ids, current_source_ids, *, current_published_only=False, other_profile_source_ids=(),
 ):
     """Select one bounded dataset while retaining valid legacy incumbents."""
     dataset_model, source_model = ProviderDirectoryEndpointDataset, ProviderDirectorySource
     publication_metadata = _scope_publication_metadata(
-        dataset_model,
-        source_model,
-        source_ids,
-        other_profile_source_ids,
+        dataset_model, source_model, source_ids, other_profile_source_ids,
         current_published_only=current_published_only,
     )
     catalog_metadata = select(
         publication_metadata.label("publication_metadata")
     ).correlate(dataset_model).lateral("catalog_metadata")
     publication_metadata = catalog_metadata.c.publication_metadata
+    source_endpoint_id = _source_endpoint_id(
+        source_model,
+        current_published_only=current_published_only,
+    )
     bound_endpoint_ids = (
-        select(source_model.endpoint_id)
-        .where(source_model.source_id.in_(source_ids),
-               source_model.endpoint_id.is_not(None))
-        .group_by(source_model.endpoint_id)
+        select(source_endpoint_id)
+        .where(
+            source_model.source_id.in_(source_ids), source_endpoint_id.is_not(None)
+        )
+        .group_by(source_endpoint_id)
         .having(func.count(source_model.source_id) == len(source_ids))
     )
     return (
@@ -196,9 +214,13 @@ def _source_local_dataset_statement(
 ):
     dataset_model = ProviderDirectoryEndpointDataset
     source_model = ProviderDirectorySource
+    source_endpoint_id = _source_endpoint_id(
+        source_model,
+        current_published_only=current_published_only,
+    )
     current_source_ids = (
         select(func.array_agg(source_model.source_id))
-        .where(source_model.endpoint_id == dataset_model.endpoint_id)
+        .where(source_endpoint_id == dataset_model.endpoint_id)
         .correlate(dataset_model)
         .scalar_subquery()
     )

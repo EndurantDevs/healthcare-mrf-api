@@ -1632,6 +1632,48 @@ async def test_provider_directory_coverage_audit_ptg_summary_fast_probe_uses_est
     }
 
 
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_fast_probe_skips_live_view(monkeypatch):
+    row_estimate = AsyncMock()
+    monkeypatch.setattr(audit, "_relation_kind", AsyncMock(return_value="view"))
+    monkeypatch.setattr(audit, "_table_row_estimate", row_estimate)
+
+    summary = await audit._ptg_summary(AsyncMock(), "mrf", sample_limit=5, fast_probe=True)
+
+    reason = (
+        "corroboration relation is a live view; use "
+        "--force-ptg-live-view-scans for exact aggregate"
+    )
+    row_estimate.assert_not_awaited()
+    assert summary["ptg_unified_address"] == {
+        "available": False,
+        "skipped": True,
+        "reason": reason,
+        "relation_kind": "view",
+    }
+    assert summary["ptg_corroboration"] == summary["ptg_unified_address"]
+
+
+@pytest.mark.asyncio
+async def test_ptg_unified_address_summary_counts_rows_before_source_unnest(monkeypatch):
+    fetch_mapping = AsyncMock(
+        return_value={
+            "ptg_unified_address_rows": 1,
+            "ptg_source_count": 2,
+            "ptg_npi_count": 1,
+            "ptg_keyed_address_rows": 1,
+        }
+    )
+    monkeypatch.setattr(audit, "_has_relation", AsyncMock(return_value=True))
+    monkeypatch.setattr(audit, "_fetch_mapping", fetch_mapping)
+
+    await audit._ptg_unified_address_summary(AsyncMock(), "mrf", None)
+
+    sql = " ".join(fetch_mapping.await_args.args[1].split())
+    assert "(SELECT count(*)::bigint FROM filtered) AS ptg_unified_address_rows" in sql
+    assert "FROM filtered WHERE address_key IS NOT NULL" in sql
+
+
 def test_overlap_uses_serving_network_names():
     sql = audit._ptg_network_name_overlap_cte_sql("mrf", ptg_plan_filter="AND plan_ids.plan_id = $1")
 

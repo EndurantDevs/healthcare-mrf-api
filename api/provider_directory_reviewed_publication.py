@@ -8,13 +8,31 @@ from collections.abc import Mapping
 from typing import Any
 
 from api import provider_directory_source_outcomes as outcomes
+from api.provider_directory_sources import RUNNABLE_CLASSIFICATIONS
 from process.provider_directory_fhir_root_policy import (
     LEGACY_VERIFIED_STATUS,
     ReviewedRootPolicy,
 )
 from process.provider_directory_validated_publication_contract import (
+    AUTOMATIC_VALIDATED_PUBLICATION_ROLE,
     ProviderDirectoryDatasetIdentity,
 )
+from process.provider_directory_validated_publication_catalog import (
+    validated_publication_candidate_payload,
+)
+
+
+def _is_automatic_publication_metadata_valid(
+    dataset: outcomes._CurrentPublishedDataset,
+) -> bool:
+    is_twin_root_required = (
+        dataset.publication_metadata.get("requires_twin_root_verification") is True
+    )
+    verification_role = dataset.publication_metadata.get("verification_role")
+    return (
+        is_twin_root_required
+        and verification_role == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
+    ) or (not is_twin_root_required and verification_role is None)
 
 
 def _is_reviewed_policy_authority(canonical_dataset: Any) -> bool:
@@ -118,3 +136,63 @@ def reviewed_publication_context(
     ):
         incumbent_identity = None
     return candidate_dataset, incumbent_identity, reviewed_dataset
+
+
+def _catalog_validated_publication_candidate(
+    catalog_entry: Mapping[str, Any],
+    source_ids: tuple[str, ...] | None,
+    candidate_dataset: outcomes._CurrentPublishedDataset | None,
+    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
+    canonical_dataset_by_source_id: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if (
+        source_ids is None
+        or len(source_ids) != 1
+        or candidate_dataset is None
+        or candidate_dataset.status != "validated"
+        or candidate_dataset.is_current is not False
+    ):
+        return None
+    canonical_dataset = canonical_dataset_by_source_id.get(source_ids[0])
+    if canonical_dataset is None:
+        return None
+    is_runnable_acquisition = bool(
+        catalog_entry.get("runnable") is True
+        and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
+        and canonical_dataset.reviewed_root_policy is None
+        and (
+            canonical_dataset.verification_source_status is None
+            or (
+                candidate_dataset.publication_metadata.get(
+                    "requires_twin_root_verification"
+                )
+                is True
+                and _is_automatic_publication_metadata_valid(candidate_dataset)
+            )
+        )
+    )
+    is_manual_legacy_reviewed = bool(
+        catalog_entry.get("runnable") is False
+        and catalog_entry.get("classification") == "manual_acquisition"
+        and canonical_dataset.reviewed_root_policy is None
+        and canonical_dataset.verification_source_status == LEGACY_VERIFIED_STATUS
+        and canonical_dataset.completion_proof_required_version == 3
+    )
+    is_reviewed_manual = bool(
+        catalog_entry.get("runnable") is False
+        and catalog_entry.get("classification") == "manual_acquisition"
+        and (
+            canonical_dataset.reviewed_root_policy
+            in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
+            or is_manual_legacy_reviewed
+        )
+    )
+    if not (is_runnable_acquisition or is_reviewed_manual):
+        return None
+    return validated_publication_candidate_payload(
+        source_ids[0],
+        candidate_dataset,
+        incumbent_identity,
+        canonical_dataset,
+        manual_legacy_reviewed=is_manual_legacy_reviewed,
+    )

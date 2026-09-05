@@ -115,11 +115,7 @@ async def _connect(args: argparse.Namespace) -> asyncpg.Connection:
     )
 
 
-async def _seed(conn: asyncpg.Connection, schema: str) -> None:
-    """Create and populate the minimal Provider Directory smoke schema."""
-    await conn.execute(f'CREATE SCHEMA "{schema}";')
-    await conn.execute(
-        f"""
+_SMOKE_SCHEMA_SQL = """
         CREATE TABLE "{schema}".entity_address_unified (
             npi bigint,
             inferred_npi bigint,
@@ -207,10 +203,9 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
             location_refs jsonb,
             observed_at timestamp
         );
-        """
-    )
-    await conn.execute(
-        f"""
+"""
+
+_SMOKE_ROWS_SQL = """
         INSERT INTO "{schema}".provider_directory_source VALUES
             ('pdfhir_1', 'Example Payer', 'Example Directory');
         INSERT INTO "{schema}".provider_directory_insurance_plan VALUES
@@ -261,8 +256,14 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
              '["https://fhir.example.test/base/HealthcareService/service-location"]'::jsonb,
              '["https://fhir.example.test/base/Organization/network-c2"]'::jsonb,
              '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, true, now());
-        """
-    )
+"""
+
+
+async def _seed(conn: asyncpg.Connection, schema: str) -> None:
+    """Create and populate the minimal Provider Directory smoke schema."""
+    await conn.execute(f'CREATE SCHEMA "{schema}";')
+    await conn.execute(_SMOKE_SCHEMA_SQL.format(schema=schema))
+    await conn.execute(_SMOKE_ROWS_SQL.format(schema=schema))
 
 
 def _assert_corroboration_rows(

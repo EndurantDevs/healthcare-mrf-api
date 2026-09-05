@@ -121,6 +121,81 @@ async def test_catalog_bootstrap_candidate_rejects_authority_drift(monkeypatch):
     assert "validated_publication_candidate" not in drifted_catalog["items"][0]
 
 
+@pytest.mark.asyncio
+async def test_catalog_bootstrap_candidate_survives_endpoint_rotation(monkeypatch):
+    catalog_map, canonical_dataset, dataset_rows, _, _ = _generic_catalog_fixture(
+        monkeypatch
+    )
+    serving_endpoint_id = "endpoint-serving"
+    configured_endpoint_id = "endpoint-configured"
+    dataset_rows[0]["endpoint_id"] = serving_endpoint_id
+    dataset_rows[1].update(
+        endpoint_id=configured_endpoint_id,
+        previous_dataset_id=None,
+    )
+    canonical_dataset.endpoint_id = configured_endpoint_id
+    canonical_dataset.expected_incumbent_dataset_id = None
+
+    enriched_catalog = await catalog_outcomes.enrich_provider_directory_source_catalog(
+        catalog_map
+    )
+
+    expected_candidate = _generic_candidate_map(first_publication=True)
+    expected_candidate["endpoint_id"] = configured_endpoint_id
+    assert enriched_catalog["items"][0]["validated_publication_candidate"] == (
+        expected_candidate
+    )
+    assert enriched_catalog["items"][0]["current_outcome_summary"][
+        "endpoint_id"
+    ] == serving_endpoint_id
+
+
+@pytest.mark.asyncio
+async def test_catalog_replacement_uses_configured_endpoint_incumbent(monkeypatch):
+    catalog_map, canonical_dataset, dataset_rows, execute, _ = (
+        _generic_catalog_fixture(monkeypatch)
+    )
+    serving_endpoint_id = "endpoint-serving"
+    configured_endpoint_id = "endpoint-configured"
+    configured_incumbent_id = "dataset-configured-current"
+    serving_row, candidate_row = dataset_rows
+    serving_row["endpoint_id"] = serving_endpoint_id
+    candidate_row.update(
+        endpoint_id=configured_endpoint_id,
+        previous_dataset_id=configured_incumbent_id,
+    )
+    canonical_dataset.endpoint_id = configured_endpoint_id
+    canonical_dataset.expected_incumbent_dataset_id = configured_incumbent_id
+    configured_incumbent_row_map = {
+        **serving_row,
+        "endpoint_id": configured_endpoint_id,
+        "dataset_id": configured_incumbent_id,
+    }
+    execute.side_effect = (
+        _MappingResult([candidate_row]),
+        _MappingResult([serving_row]),
+        _MappingResult([configured_incumbent_row_map]),
+    )
+
+    enriched_catalog = await catalog_outcomes.enrich_provider_directory_source_catalog(
+        catalog_map
+    )
+
+    expected_candidate = _generic_candidate_map()
+    expected_candidate["endpoint_id"] = configured_endpoint_id
+    expected_candidate["expected_current"] = {
+        **expected_candidate["expected_current"],
+        "endpoint_id": configured_endpoint_id,
+        "dataset_id": configured_incumbent_id,
+    }
+    assert enriched_catalog["items"][0]["validated_publication_candidate"] == (
+        expected_candidate
+    )
+    assert enriched_catalog["items"][0]["current_outcome_summary"][
+        "endpoint_id"
+    ] == serving_endpoint_id
+
+
 def test_locked_bootstrap_requires_catalog_authority_and_no_current(monkeypatch):
     monkeypatch.setattr(
         importer,

@@ -9,6 +9,8 @@ from typing import Any
 
 from api import provider_directory_source_outcomes as outcomes
 from api.provider_directory_reviewed_publication import (
+    _catalog_validated_publication_candidate,
+    _is_automatic_publication_metadata_valid,
     reviewed_publication_context,
 )
 from api.provider_directory_source_catalog_projection import (
@@ -32,19 +34,11 @@ from db.models import db
 from process.provider_directory_rooted_graph_publication_facade import (
     load_provider_directory_rooted_graph_dataset_readiness,
 )
-from process.provider_directory_validated_publication_contract import (
-    AUTOMATIC_VALIDATED_PUBLICATION_ROLE,
-    ProviderDirectoryDatasetIdentity,
-)
+from process.provider_directory_validated_publication_contract import ProviderDirectoryDatasetIdentity
 from process.provider_directory_fhir_root_policy import (
     LEGACY_VERIFIED_STATUS,
     ReviewedRootPolicy,
 )
-from process.provider_directory_validated_publication_catalog import (
-    validated_publication_candidate_payload,
-)
-
-
 def _profile_current_dataset_from_row(
     dataset_record: Mapping[str, Any],
     expected_source_id_groups: set[tuple[str, ...]],
@@ -199,28 +193,7 @@ def _automatic_publication_source_ids(
                     and dataset is not None
                     and dataset.status == "validated"
                     and dataset.is_current is False
-                    and (
-                        (
-                            dataset.publication_metadata.get(
-                                "requires_twin_root_verification"
-                            )
-                            is True
-                            and dataset.publication_metadata.get(
-                                "verification_role"
-                            )
-                            == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
-                        )
-                        or (
-                            dataset.publication_metadata.get(
-                                "requires_twin_root_verification"
-                            )
-                            is not True
-                            and dataset.publication_metadata.get(
-                                "verification_role"
-                            )
-                            is None
-                        )
-                    )
+                    and _is_automatic_publication_metadata_valid(dataset)
                 )
             )
         ):
@@ -237,15 +210,19 @@ async def _legacy_current_identities_by_source_ids(
     ],
     canonical_dataset_by_source_id: Mapping[str, Any],
 ) -> dict[tuple[str, ...], ProviderDirectoryDatasetIdentity]:
-    """Bind sealed candidates to scalar identities of legacy incumbents."""
+    """Bind sealed candidates to scalar identities of endpoint-local incumbents."""
 
     candidates_by_source_ids = {
         source_ids: dataset
         for source_ids, dataset in dataset_by_source_ids.items()
-        if source_ids not in current_dataset_by_source_ids
-        and len(source_ids) == 1
+        if len(source_ids) == 1
         and source_ids[0] in canonical_dataset_by_source_id
         and dataset.previous_dataset_id is not None
+        and (
+            source_ids not in current_dataset_by_source_ids
+            or current_dataset_by_source_ids[source_ids].endpoint_id
+            != dataset.endpoint_id
+        )
     }
     identities_by_id = await _current_dataset_identities_by_id(
         {
@@ -260,57 +237,6 @@ async def _legacy_current_identities_by_source_ids(
         is not None
         and identity.endpoint_id == dataset.endpoint_id
     }
-
-
-def _catalog_validated_publication_candidate(
-    catalog_entry: Mapping[str, Any],
-    source_ids: tuple[str, ...] | None,
-    candidate_dataset: outcomes._CurrentPublishedDataset | None,
-    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
-    canonical_dataset_by_source_id: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    if (
-        source_ids is None
-        or len(source_ids) != 1
-        or candidate_dataset is None
-        or candidate_dataset.status != "validated"
-        or candidate_dataset.is_current is not False
-    ):
-        return None
-    canonical_dataset = canonical_dataset_by_source_id.get(source_ids[0])
-    if canonical_dataset is None:
-        return None
-    is_runnable_acquisition = bool(
-        catalog_entry.get("runnable") is True
-        and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
-        and canonical_dataset.reviewed_root_policy is None
-    )
-    is_manual_legacy_reviewed = bool(
-        catalog_entry.get("runnable") is False
-        and catalog_entry.get("classification") == "manual_acquisition"
-        and canonical_dataset.reviewed_root_policy is None
-        and canonical_dataset.verification_source_status
-        == LEGACY_VERIFIED_STATUS
-        and canonical_dataset.completion_proof_required_version == 3
-    )
-    is_reviewed_manual = bool(
-        catalog_entry.get("runnable") is False
-        and catalog_entry.get("classification") == "manual_acquisition"
-        and (
-            canonical_dataset.reviewed_root_policy
-            in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
-            or is_manual_legacy_reviewed
-        )
-    )
-    if not (is_runnable_acquisition or is_reviewed_manual):
-        return None
-    return validated_publication_candidate_payload(
-        source_ids[0],
-        candidate_dataset,
-        incumbent_identity,
-        canonical_dataset,
-        manual_legacy_reviewed=is_manual_legacy_reviewed,
-    )
 
 
 async def _rooted_summary_for_catalog(
@@ -359,6 +285,16 @@ def _publication_candidate_context(
             _dataset_identity(current_dataset) or legacy_current_identity,
             None,
         )
+    )
+    candidate_incumbent = next(
+        (
+            identity
+            for identity in (candidate_incumbent, legacy_current_identity)
+            if identity is not None
+            and candidate_dataset is not None
+            and identity.endpoint_id == candidate_dataset.endpoint_id
+        ),
+        None,
     )
     return (
         _catalog_validated_publication_candidate(

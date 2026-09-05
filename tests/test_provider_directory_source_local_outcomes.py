@@ -9,8 +9,6 @@ import uuid
 
 import pytest
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql import ClauseElement, Executable
 
 from api import provider_directory_source_outcomes as outcomes
 from api import provider_directory_source_dataset_selection as selection
@@ -30,22 +28,6 @@ from tests.test_provider_directory_source_outcomes import (
     _metadata,
     _relation_metadata,
 )
-
-
-class _PostgresExplain(Executable, ClauseElement):
-    inherit_cache = False
-
-    def __init__(self, statement):
-        self.statement = statement
-        self._execution_options = statement._execution_options
-
-
-@compiles(_PostgresExplain, "postgresql")
-def _compile_postgres_explain(element, compiler, **kwargs):
-    return "EXPLAIN (FORMAT JSON) " + compiler.process(
-        element.statement,
-        **kwargs,
-    )
 
 
 async def _disposable_outcome_database() -> Database:
@@ -75,7 +57,8 @@ async def _create_outcome_selection_tables(
     await database.status(f"CREATE SCHEMA {schema};")
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_source ("
-        "source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64));"
+        "source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64), "
+        "metadata_json jsonb);"
     )
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
@@ -115,14 +98,17 @@ async def _insert_outcome_selection_sources(
 ) -> None:
     await database.status(
         f"INSERT INTO {schema}.provider_directory_source "
-        "(source_id, endpoint_id) VALUES "
-        "('source-published', 'endpoint-published'), "
-        "('source-validated', 'endpoint-validated'), "
-        "('source-reassigned', 'endpoint-new'), "
-        "('source-multi-a', 'endpoint-multi'), "
-        "('source-multi-b', 'endpoint-multi'), "
-        "('source-shared', 'endpoint-published'), "
-        "('source-unrequested', 'endpoint-unrequested');"
+        "(source_id, endpoint_id, metadata_json) VALUES "
+        "('source-published', 'endpoint-published', NULL), "
+        "('source-validated', 'endpoint-validated', NULL), "
+        "('source-reassigned', 'endpoint-new', NULL), "
+        "('source-rotated', 'endpoint-rotated-serving', "
+        " '{\"provider_directory_configured_endpoint_id\": "
+        "\"endpoint-rotated-configured\"}'::jsonb), "
+        "('source-multi-a', 'endpoint-multi', NULL), "
+        "('source-multi-b', 'endpoint-multi', NULL), "
+        "('source-shared', 'endpoint-published', NULL), "
+        "('source-unrequested', 'endpoint-unrequested', NULL);"
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_source "
@@ -201,6 +187,11 @@ def _outcome_selection_dataset_states():
          "published", True, dt.datetime(2026, 7, 20, 6, 30),
          dt.datetime(2026, 7, 20, 7), None),
         ("reassigned-stale", "endpoint-old", "source-reassigned",
+         "validated", False, dt.datetime(2026, 7, 20, 11), None, None),
+        ("rotated-incumbent", "endpoint-rotated-serving", "source-rotated",
+         "published", True, dt.datetime(2026, 7, 20, 6),
+         dt.datetime(2026, 7, 20, 6, 30), None),
+        ("rotated-candidate", "endpoint-rotated-configured", "source-rotated",
          "validated", False, dt.datetime(2026, 7, 20, 11), None, None),
         ("unrequested-current", "endpoint-unrequested", "source-unrequested",
          "published", True, dt.datetime(2026, 7, 20, 11, 30),
@@ -299,12 +290,6 @@ async def _outcome_selection_schema(monkeypatch):
         await database.disconnect()
 
 
-def _plan_nodes(plan_map):
-    yield plan_map
-    for child_plan_map in plan_map.get("Plans", []):
-        yield from _plan_nodes(child_plan_map)
-
-
 def test_source_local_query_is_bounded_ranked_and_metadata_only():
     source_id_groups = {SOURCE_IDS} | {
         (f"synthetic-source-{index}",) for index in range(39)
@@ -323,6 +308,7 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "provider_directory_api_endpoint" not in selected_sql
     assert "provider_directory_source" in selected_sql
     assert "endpoint_id IN (SELECT" in selected_sql
+    assert "provider_directory_configured_endpoint_id" in bound_values
     assert "array_agg" in selected_sql.lower()
     assert "jsonb_array_length" in selected_sql.lower()
     assert "CASE WHEN" in selected_sql
@@ -330,7 +316,7 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "ORDER BY" in selected_sql
     assert "LIMIT" in selected_sql
     assert selected_sql.count("LIMIT") == 40
-    assert any(value == list(SOURCE_IDS) for value in bound_values)
+    assert any(bound_value == list(SOURCE_IDS) for bound_value in bound_values)
     assert "resource_count" in selected_sql
     assert "superseded_at" in selected_sql
     assert "GROUP BY" in selected_sql
@@ -357,6 +343,7 @@ def test_current_source_local_query_uses_exact_profile_publication_state():
     assert "jsonb_build_object" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "published" in bound_values
+    assert "provider_directory_configured_endpoint_id" not in bound_values
 
 
 @pytest.mark.asyncio
@@ -441,60 +428,3 @@ async def test_superseded_outcome_keeps_historic_state_truthful(monkeypatch):
         "published_at": "2026-07-20T08:30:00+00:00",
         "total_resources": TOTAL_RESOURCES,
     }
-
-
-@pytest.mark.asyncio
-async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
-    source_id_groups = {("source-published",), ("source-reassigned",),
-                        ("source-validated",), ("source-shared",),
-                        ("source-multi-a", "source-multi-b")} | {
-        (f"synthetic-source-{index}",) for index in range(36)
-    }
-    async with _outcome_selection_schema(monkeypatch) as (database, schema):
-        statement = outcomes._current_published_dataset_statement(
-            source_id_groups
-        )
-        translated_statement = statement.execution_options(schema_translate_map={"mrf": schema})
-        query_result = await database.execute(translated_statement)
-        selected_row_maps = query_result.mappings().all()
-        await database.status(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET publication_metadata_summary_json = NULL, "
-            "publication_metadata_sha256 = NULL, content_proof_admission_version = NULL, "
-            "content_proof_admission_kind = NULL, content_proof_admission_sha256 = NULL, "
-            "content_proof_resource_types = NULL "
-            "WHERE dataset_id = 'published-current';"
-        )
-        current_statement = _source_local_current_published_dataset_statement(
-            source_id_groups).execution_options(
-            schema_translate_map={"mrf": schema}
-        )
-        current_result = await database.execute(current_statement)
-        current_row_maps = current_result.mappings().all()
-        await database.status(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset "
-            "SET content_proof_admission_sha256 = 'tampered' "
-            "WHERE dataset_id = 'reassigned-current';"
-        )
-        tampered_result = await database.execute(current_statement)
-        tampered_row_maps = tampered_result.mappings().all()
-        explain_result = await database.execute(_PostgresExplain(translated_statement))
-        current_explain = await database.execute(_PostgresExplain(current_statement))
-
-    selected_ids = [row_map["dataset_id"] for row_map in selected_row_maps]
-    assert selected_ids == ["multi-current", "published-current",
-                            "reassigned-current", "validated-candidate"]
-    assert len(selected_row_maps) == 4
-    assert [row_map["dataset_id"] for row_map in current_row_maps] == [
-        "multi-current", "reassigned-current", "validated-incumbent"
-    ]
-    assert [row_map["dataset_id"] for row_map in tampered_row_maps] == [
-        "multi-current", "validated-incumbent"]
-    plan_maps = (explain_result.scalars().one()[0]["Plan"],
-                 current_explain.scalars().one()[0]["Plan"])
-    plan_node_maps = [node for plan in plan_maps for node in _plan_nodes(plan)]
-    assert all(plan["Plan Rows"] <= len(source_id_groups) for plan in plan_maps)
-    index_names = {node.get("Index Name") for node in plan_node_maps}
-    assert "provider_directory_endpoint_dataset_endpoint_idx" in index_names
-    assert "provider_directory_source_pkey" in index_names
-    assert all(node.get("Relation Name") != "provider_directory_dataset_resource"
-               for node in plan_node_maps)

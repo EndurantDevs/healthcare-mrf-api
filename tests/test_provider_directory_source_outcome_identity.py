@@ -67,15 +67,16 @@ def _identity_proof_by_field(**overrides):
 
 
 def test_sealed_dataset_query_uses_indexable_source_endpoint_association():
-    selected_sql = str(
-        outcomes._current_published_dataset_statement({SOURCE_IDS})
-    )
+    statement = outcomes._current_published_dataset_statement({SOURCE_IDS})
+    selected_sql = str(statement)
+    bound_values = statement.compile().params.values()
 
-    assert "provider_directory_source.source_id" in selected_sql
     assert (
-        "provider_directory_source.endpoint_id = "
-        "mrf.provider_directory_endpoint_dataset.endpoint_id"
-    ) in selected_sql
+        "provider_directory_endpoint_dataset.endpoint_id IN (SELECT coalesce("
+        in selected_sql
+    )
+    assert "provider_directory_source.source_id" in selected_sql
+    assert "provider_directory_configured_endpoint_id" in bound_values
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "GROUP BY" in selected_sql
 
