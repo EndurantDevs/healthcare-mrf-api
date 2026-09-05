@@ -71,6 +71,48 @@ def test_missing_v1_admission_api_fails_before_any_mutation(tmp_path: Path) -> N
     assert not (state_root / "run").exists()
 
 
+def test_worker_fence_waits_for_owner_denial_propagation(tmp_path: Path) -> None:
+    """A newly created policy may allow probes until its cache refreshes."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_PROBE_ALLOWED_ATTEMPTS="2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert events.count("probe_allowed") == 2
+    assert events.index("probe_allowed") < events.index("probe_denied") < events.index("child")
+    receipt = envelope._receipt(state_root)
+    assert receipt["probe_verified"] is True
+    assert receipt["cleanup"]["complete"] is True
+
+
+def test_worker_fence_fails_closed_when_denial_never_propagates(tmp_path: Path) -> None:
+    """An admission cache that never activates must not launch the census."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_PROBE_ALLOWED_ATTEMPTS="999999",
+    )
+
+    assert result.returncode == 1
+    assert "engine-worker denial policy did not propagate" in result.stderr
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "child" not in events
+    assert events[-6:] == [
+        "drain_set_false",
+        "drain_read",
+        "binding_delete",
+        "policy_delete",
+        "quota_delete",
+        "lock_stop",
+    ]
+    receipt = envelope._receipt(state_root)
+    assert receipt["probe_verified"] is False
+    assert receipt["cleanup"]["complete"] is True
+
+
 def test_state_root_replacement_fails_before_any_outer_fence(tmp_path: Path) -> None:
     """A swapped root cannot redirect task state outside the reviewed directory."""
 
