@@ -122,7 +122,8 @@ fn is_explicitly_uncontracted_csv_payer(payer: &PayerChargeRow) -> bool {
         && payer.percentile_10.is_none()
         && payer.percentile_90.is_none()
         && payer.allowed_count.is_none()
-        && payer.methodology.trim().is_empty()
+        && (payer.methodology.trim().is_empty()
+            || payer.methodology.trim().eq_ignore_ascii_case("per diem"))
         && payer.additional_payer_notes.as_deref().is_some_and(|notes| {
             notes.trim() == "NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE"
         })

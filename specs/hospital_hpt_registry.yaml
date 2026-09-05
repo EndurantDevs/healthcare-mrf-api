@@ -9798,6 +9798,7 @@ hospitals:
 - hospital_id: hospital-002928
   name: Highlands Medical Center
   cms_hpt_url: https://highlandsmedcenter.com/cms-hpt.txt
+  fallback_mrf_url: https://apim.services.craneware.com/api-pricing-transparency/api/public/95675211e480b185fd21b68539ba8560/charges/mrf
 - hospital_id: hospital-002929
   name: HIGHLANDS-CASHIERS HOSPITAL
   cms_hpt_url: https://www.missionhealth.org/cms-hpt.txt

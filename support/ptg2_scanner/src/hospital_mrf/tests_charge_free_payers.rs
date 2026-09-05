@@ -109,6 +109,28 @@ fn v3_tall_explicitly_uncontracted_payer_label_is_ignored() {
     assert!(charge.contains("12.34\t10.5\t8.001\t9.999"));
     assert!(charge.contains("NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE"));
 
+    let methodology = csv_fixture_index(&records[2], "standard_charge | methodology");
+    records[3][methodology] = "PER DIEM".to_owned();
+    let rows = run_fixture(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&records),
+        false,
+    );
+    assert!(rows["payer_charge"].is_empty());
+    let charge = String::from_utf8(rows["charge"].clone()).unwrap();
+    assert!(charge.contains("12.34\t10.5\t8.001\t9.999"));
+    assert!(charge.contains("NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE"));
+
+    let dollar = csv_fixture_index(&records[2], "standard_charge | negotiated_dollar");
+    records[3][dollar] = "9.125".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&records),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "plan_name must be a non-empty string",
+    );
+    records[3][dollar].clear();
+
     records[3][notes] =
         "NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE".to_ascii_lowercase();
     assert_import_error(
