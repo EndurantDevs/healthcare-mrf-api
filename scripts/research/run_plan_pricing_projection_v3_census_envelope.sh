@@ -425,11 +425,21 @@ probe_manifest() {
     '        app.kubernetes.io/managed-by: healthporta-worker-launcher' \
     '    spec:' \
     '      serviceAccountName: import-worker' \
+    '      automountServiceAccountToken: false' \
     '      restartPolicy: Never' \
+    '      securityContext:' \
+    '        runAsNonRoot: true' \
+    '        runAsUser: 65534' \
+    '        runAsGroup: 65534' \
+    '        seccompProfile: {type: RuntimeDefault}' \
     '      containers:' \
     '        - name: worker' \
     '          image: ghcr.io/endurantdevs/healthcare-mrf-api-dev:dev-envelope-probe' \
-    '          command: ["true"]'
+    '          imagePullPolicy: IfNotPresent' \
+    '          command: ["true"]' \
+    '          securityContext:' \
+    '            allowPrivilegeEscalation: false' \
+    '            capabilities: {drop: ["ALL"]}'
 }
 
 render_plan() {
