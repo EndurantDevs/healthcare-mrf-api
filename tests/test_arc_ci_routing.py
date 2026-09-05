@@ -156,7 +156,7 @@ def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
                 "EndurantDevs/healthcare-mrf-api/"
                 ".github/workflows/ci.yml@main"
             ),
-            "with": {"activate_arc": False},
+            "with": {"activate_arc": True},
         }
     }
     caller = CALLER.read_text(encoding="utf-8")
