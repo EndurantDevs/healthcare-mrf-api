@@ -291,7 +291,7 @@ async def _assert_forward_metadata_constraints(
 
 async def _seed_historical_headers(database_url, quoted: str) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         for version_id, template_version in (
@@ -316,7 +316,7 @@ async def _seed_historical_headers(database_url, quoted: str) -> None:
 
 async def _seed_packed_v3_headers(database_url, quoted: str) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         await _insert_header(
@@ -345,7 +345,7 @@ async def _seed_packed_v3_headers(database_url, quoted: str) -> None:
 
 async def _prove_current_headers(database_url, quoted: str) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         for fields in (
@@ -440,7 +440,7 @@ async def _assert_modifier_rate_term_storage(
 
 async def _seed_packed_v4_header(database_url, quoted: str) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         await _insert_header(

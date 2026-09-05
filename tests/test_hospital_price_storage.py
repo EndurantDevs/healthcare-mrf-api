@@ -431,7 +431,9 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
     await _prepare_schema(engine, schema)
     try:
         await _run_migration(engine, migration, "upgrade")
-        connection = await asyncpg.connect(str(database_url.set(drivername="postgresql")))
+        connection = await asyncpg.connect(
+            database_url.set(drivername="postgresql").render_as_string(hide_password=False)
+        )
         try:
             content_sha, version_id, quoted = await _seed_version(connection, schema)
             await _seed_full_v3_facts(connection, quoted, version_id)

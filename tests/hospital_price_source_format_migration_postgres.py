@@ -86,7 +86,7 @@ async def _seed_legacy_versions(
     database_url, schema: str, legacy_by_version: dict[str, str]
 ) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         quoted = _quote(schema)
@@ -110,7 +110,7 @@ async def _seed_legacy_versions(
 
 async def _assert_database_state(database_url, schema: str, *args, **kwargs) -> None:
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         await _assert_state(connection, schema, *args, **kwargs)

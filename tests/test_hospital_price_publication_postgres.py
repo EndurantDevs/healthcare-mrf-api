@@ -55,7 +55,7 @@ class _SignalingDatabase:
 
 async def _seed_expired_attempt(database_url, schema: str, quoted: str):
     connection = await asyncpg.connect(
-        str(database_url.set(drivername="postgresql"))
+        database_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
         content_sha, version_id, _quoted = await _seed_version(connection, schema)
