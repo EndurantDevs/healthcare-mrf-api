@@ -1029,7 +1029,7 @@ print(meta.get("uid") or "")
 }
 
 create_worker_fence() {
-  local create_exit=0 observed_uid
+  local create_exit=0 deadline exit_code=0 observed_uid probe_name remaining
   POLICY_ATTEMPTED=true
   POLICY_CREATE_UNCERTAIN=true
   set +e
@@ -1068,16 +1068,36 @@ create_worker_fence() {
   [ "${create_exit}" -eq 0 ] \
     || die "binding appeared after its create command failed"
 
-  if probe_manifest | kctl \
+  probe_name="hp-pv3-census-fence-probe-${OWNER_TOKEN}"
+  deadline=$((SECONDS + OPERATION_TIMEOUT_SECONDS))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    check_interrupted
+    remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -gt 0 ] || break
+    [ "${remaining}" -le "$((deadline - SECONDS))" ] \
+      || remaining=$((deadline - SECONDS))
+    [ "${remaining}" -gt 0 ] || break
+    set +e
+    probe_manifest | kctl_with_limit "${remaining}" \
       --as="system:serviceaccount:${DEV_NAMESPACE}:engine-worker-launcher" \
       -n "${DEV_NAMESPACE}" create --dry-run=server -f - \
-      >"${STATE_DIR}/probe.stdout" 2>"${STATE_DIR}/probe.stderr"; then
-    die "engine-worker dry-run unexpectedly succeeded"
-  fi
-  [[ "$(<"${STATE_DIR}/probe.stderr")" = *"${DENIAL_MARKER}"* ]] \
-    || die "engine-worker dry-run did not prove the owner denial marker"
-  PROBE_VERIFIED=true
-  verify_absent job "hp-pv3-census-fence-probe-${OWNER_TOKEN}" "${DEV_NAMESPACE}"
+      >"${STATE_DIR}/probe.stdout" 2>"${STATE_DIR}/probe.stderr"
+    exit_code=$?
+    set -e
+    remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -gt 0 ] || break
+    resource_is_absent_with_limit "${remaining}" job "${probe_name}" \
+      "${DEV_NAMESPACE}" \
+      || die "engine-worker dry-run Job absence is unreadable"
+    if [ "${exit_code}" -ne 0 ]; then
+      [[ "$(<"${STATE_DIR}/probe.stderr")" = *"${DENIAL_MARKER}"* ]] \
+        || die "engine-worker dry-run did not prove the owner denial marker"
+      PROBE_VERIFIED=true
+      return 0
+    fi
+    sleep 0.25
+  done
+  die "engine-worker denial policy did not propagate"
 }
 
 active_engine_count() {

@@ -246,6 +246,13 @@ elif name == "k3s":
                     print("exceeded quota: " + os.environ["FAKE_QUOTA"], file=sys.stderr)
                     raise SystemExit(1)
             else:
+                attempt_path = resource_path("probe-attempt")
+                attempt = int(attempt_path.read_text()) + 1 if attempt_path.exists() else 1
+                attempt_path.write_text(str(attempt))
+                if attempt <= int(os.environ.get("FAKE_PROBE_ALLOWED_ATTEMPTS", "0")):
+                    event("probe_allowed")
+                    print("job/probe created (server dry run)")
+                    raise SystemExit(0)
                 event("probe_denied")
                 print(os.environ["FAKE_DENIAL_MARKER"], file=sys.stderr)
                 raise SystemExit(1)
