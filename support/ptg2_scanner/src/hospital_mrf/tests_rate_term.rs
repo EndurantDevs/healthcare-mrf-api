@@ -90,6 +90,7 @@ fn malformed_wide_rate_term_headers_fail_closed() {
         assert!(parse_wide_columns(
             &StringRecord::from(headers),
             CmsProfile::V3,
+            true,
             DEFAULT_MAX_FANOUT_ROWS,
         )
         .unwrap_err()
@@ -115,6 +116,7 @@ fn malformed_wide_rate_term_headers_fail_closed() {
         assert!(parse_wide_columns(
             &StringRecord::from(headers),
             CmsProfile::V3,
+            true,
             DEFAULT_MAX_FANOUT_ROWS,
         )
         .unwrap_err()

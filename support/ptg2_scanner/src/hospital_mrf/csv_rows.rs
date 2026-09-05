@@ -226,7 +226,10 @@ fn parse_tall_payer(
         .all(|column| csv_profile_value(record, *column).is_empty())
     {
         let methodology = csv_value(record, columns.methodology).trim();
-        if !methodology.is_empty() {
+        if !(methodology.is_empty()
+            || columns.profile == CmsProfile::V2
+                && methodology.eq_ignore_ascii_case("gross charge"))
+        {
             canonical_methodology(methodology, true)?;
         }
         return Ok(None);
@@ -304,6 +307,7 @@ fn parse_tall_payer(
         generic_notes,
         true,
         columns.profile,
+        columns.requires_estimated_amount,
     )?;
     Ok(payer_has_charge(&payer).then_some(payer))
 }
@@ -312,6 +316,7 @@ fn parse_wide_payers(
     record: &StringRecord,
     columns: &[WidePayerColumns],
     profile: CmsProfile,
+    requires_estimated_amount: bool,
 ) -> io::Result<Vec<PayerChargeRow>> {
     let mut payers = Vec::new();
     for payer in columns {
@@ -379,7 +384,9 @@ fn parse_wide_payers(
             validate_charge_free_csv_payer(&parsed)?;
             continue;
         }
-        payers.push(validate_csv_payer(parsed, None, true, profile)?);
+        payers.push(validate_csv_payer(
+            parsed, None, true, profile, requires_estimated_amount,
+        )?);
     }
     Ok(payers)
 }
@@ -451,7 +458,14 @@ fn parse_tall_records<R: Read>(
             raw_charge.additional_generic_notes = None;
         }
         let payers = payer.into_iter().collect::<Vec<_>>();
-        let charge = validate_charge(raw_charge, &payers, true)?;
+        let historical_tall = columns.profile == CmsProfile::V2 && !columns.requires_estimated_amount;
+        let charge = if historical_tall {
+            // Historical tall files may leave unavailable payer rates blank inside a charge group.
+            // Validate fields now and require an actual charge when that contiguous group is emitted.
+            validate_charge_fields(raw_charge, &payers, true)?
+        } else {
+            validate_charge(raw_charge, &payers, true)?
+        };
 
         let new_service = current_service.as_ref() != Some(&service);
         if new_service {
@@ -464,7 +478,14 @@ fn parse_tall_records<R: Read>(
         }
         if charge_accumulator
             .as_ref()
-            .is_some_and(|current| current.can_merge(&charge, &payers))
+            .is_some_and(|current| {
+                current.can_merge(&charge, &payers)
+                    || historical_tall
+                        && current.charge == charge
+                        && charge.gross_charge.is_none()
+                        && charge.discounted_cash.is_none()
+                        && (current.payers.is_empty() || payers.is_empty())
+            })
         {
             charge_accumulator
                 .as_mut()

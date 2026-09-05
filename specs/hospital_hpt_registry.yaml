@@ -696,6 +696,7 @@ hospitals:
 - hospital_id: hospital-000207
   name: Angleton Danbury Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health Angleton Danbury Hospital
 - hospital_id: hospital-000208
   name: Animas Surgical Hospital
   cms_hpt_url: https://www.animassurgical.com/cms-hpt.txt
@@ -4761,6 +4762,7 @@ hospitals:
 - hospital_id: hospital-001415
   name: Clear Lake Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health Clear Lake Hospital
 - hospital_id: hospital-001416
   name: Clear Vista Health and Wellness
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
@@ -4901,7 +4903,8 @@ hospitals:
   cms_hpt_url: https://www.trihealth.com/cms-hpt.txt
 - hospital_id: hospital-001458
   name: CLOUD COUNTY HEALTH CENTER INC
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://nckmed.com/cms-hpt.txt
+  locator_name: North Central Kansas Medical Center
 - hospital_id: hospital-001459
   name: Clovis Community Medical Center
   cms_hpt_url: https://communitymedical.org/cms-hpt.txt
@@ -5302,6 +5305,7 @@ hospitals:
 - hospital_id: hospital-001577
   name: COPLEY MEMORIAL HOSPITAL INC
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbCMHAURORAIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-001578
   name: Copper Queen Community Hospital
   cms_hpt_url: https://cqch.org/cms-hpt.txt
@@ -6235,9 +6239,11 @@ hospitals:
 - hospital_id: hospital-001853
   name: East Campus Freeman Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-001854
   name: East Campus Freeman Hospital Psych
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-001855
   name: East Cooper Medical Center
   cms_hpt_url: https://www.novanthealth.org/cms-hpt.txt
@@ -7706,9 +7712,11 @@ hospitals:
 - hospital_id: hospital-002305
   name: Freeman Fort Scott Hospital Acute Inpatient Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002306
   name: Freeman Health System - Freeman West
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002307
   name: Freeman Hospital East Campus Acute Rehab
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
@@ -7724,12 +7732,15 @@ hospitals:
 - hospital_id: hospital-002311
   name: Freeman Neosho Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002312
   name: Freeman Neosho Hospital Inpatient Critical Access
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002313
   name: Freeman Neosho Hospital Inpatient Swing Bed
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002314
   name: Freeman Regional Health Services
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -7790,7 +7801,8 @@ hospitals:
   cms_hpt_url: https://gardengrovehospital.com/cms-hpt.txt
 - hospital_id: hospital-002332
   name: GARFIELD COUNTY MEMORIAL HOSPITAL DISTRICT
-  cms_hpt_url: https://fmolhs.org/cms-hpt.txt
+  cms_hpt_url: https://www.garfieldcountyhospital.com/cms-hpt.txt
+  locator_name: Garfield County Hospital District
 - hospital_id: hospital-002333
   name: Garfield Medical Center
   cms_hpt_url: https://www.ahmchealth.com/cms-hpt.txt
@@ -8033,7 +8045,7 @@ hospitals:
 - hospital_id: hospital-002405
   name: Good Shepherd Rehabilitation
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
-  locator_name: Good Shepherd Rehabilitation Hospital
+  alias_of: hospital-005086
 - hospital_id: hospital-002406
   name: Good Shepherd Rehabilitation Hospital
   cms_hpt_url: https://www.goodshepherdrehab.org/cms-hpt.txt
@@ -9798,6 +9810,7 @@ hospitals:
 - hospital_id: hospital-002928
   name: Highlands Medical Center
   cms_hpt_url: https://highlandsmedcenter.com/cms-hpt.txt
+  fallback_mrf_url: https://apim.services.craneware.com/api-pricing-transparency/api/public/95675211e480b185fd21b68539ba8560/charges/mrf
 - hospital_id: hospital-002929
   name: HIGHLANDS-CASHIERS HOSPITAL
   cms_hpt_url: https://www.missionhealth.org/cms-hpt.txt
@@ -10056,7 +10069,8 @@ hospitals:
   locator_name: GIRARD MEDICAL CENTER
 - hospital_id: hospital-003007
   name: HOSPITAL DISTRICT NO 1 OF DICKINSON COUNTY KANSAS
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://mhsks.org/cms-hpt.txt
+  locator_name: Memorial Health System Abilene
 - hospital_id: hospital-003008
   name: HOSPITAL DISTRICT NO 6 OF HARPER COUNTY KANSAS
   cms_hpt_url: https://pattersonhc.org/cms-hpt.txt
@@ -10448,10 +10462,10 @@ hospitals:
   cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
 - hospital_id: hospital-003118
   name: Insight Hospital and Medical Center Coldwater
-  cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
+  cms_hpt_url: https://insightcoldwater.org/cms-hpt.txt
 - hospital_id: hospital-003119
   name: Insight Surgical Hospital
-  cms_hpt_url: https://estimator.myinsightcare.com/cms-hpt.txt
+  cms_hpt_url: https://insightsurgicalhospital.com/cms-hpt.txt
 - hospital_id: hospital-003120
   name: Inspira Health Center Bridgeton
   cms_hpt_url: https://www.inspirahealthnetwork.org/cms-hpt.txt
@@ -11766,6 +11780,7 @@ hospitals:
 - hospital_id: hospital-003517
   name: League City Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health League City Hospital
 - hospital_id: hospital-003518
   name: League City Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
@@ -11991,10 +12006,12 @@ hospitals:
   cms_hpt_url: https://lindnercenterofhope.org/cms-hpt.txt
 - hospital_id: hospital-003587
   name: Lindsborg Community Hospital
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://lindsborghospital.org/cms-hpt.txt
+  locator_name: Lindsborg Community Hospital
 - hospital_id: hospital-003588
   name: LINDSBORG COMMUNITY HOSPITAL ASSOCIATION
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://lindsborghospital.org/cms-hpt.txt
+  locator_name: Lindsborg Community Hospital
 - hospital_id: hospital-003589
   name: Linton Regional Medical Center
   cms_hpt_url: https://lintonhospital.org/cms-hpt.txt
@@ -16979,9 +16996,11 @@ hospitals:
 - hospital_id: hospital-005085
   name: Penn Medicine
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  alias_of: hospital-005086
 - hospital_id: hospital-005086
   name: Penn Medicine Good Shepherd Rehabilitation Specialty Hospital
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  locator_name: Philadelphia Post-Acute Partners LLC
 - hospital_id: hospital-005087
   name: Penn Medicine Princeton Health
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
@@ -18371,9 +18390,11 @@ hospitals:
 - hospital_id: hospital-005511
   name: Rush Copley Medical Center
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbCMHAURORAIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005512
   name: Rush Oak Park Hospital
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbRushOakPark&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005513
   alias_of: hospital-005512
   name: Rush Oak Park Hospital Inc
@@ -18381,6 +18402,7 @@ hospitals:
 - hospital_id: hospital-005514
   name: Rush University Medical Center
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbRUMCCHICAGOIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005515
   name: Rusk Rehabilitation Hospital, an affiliation of Encompass Health and MU Health Care
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -19408,6 +19430,7 @@ hospitals:
 - hospital_id: hospital-005821
   name: Slidell Memorial Hospital
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt
+  locator_name: Slidell Memorial Hospital - Main Campus
 - hospital_id: hospital-005822
   name: Slidell Memorial Hospital - Main Campus
   cms_hpt_url: https://www.slidellmemorial.org/cms-hpt.txt

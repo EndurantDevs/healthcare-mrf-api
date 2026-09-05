@@ -173,6 +173,7 @@ impl ChargeAccumulator {
     }
 
     fn emit(mut self, outputs: &mut CopyOutputs, version_id: &str) -> io::Result<()> {
+        validate_charge_presence(&self.charge, &self.payers)?;
         self.payers.sort_by(|left, right| {
             left.payer_name
                 .cmp(&right.payer_name)

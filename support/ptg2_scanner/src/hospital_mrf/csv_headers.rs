@@ -19,6 +19,11 @@ fn parse_csv<R: Read>(
         parse_csv_metadata(&general_headers, &general_values, max_fanout_rows)?;
     let profile = metadata.profile;
     let schema_version = metadata.version.clone();
+    // July-2024 CSVs predate the January-2025 derived-rate estimate requirement.
+    // A producer version alone cannot establish this historical contract.
+    let requires_estimated_amount = !(profile == CmsProfile::V2
+        && schema_version == "2.0.0"
+        && metadata.last_updated_on.starts_with("2024-"));
     metadata.validate(true)?.emit(version_id, outputs)?;
     for (provision_ordinal, contract_provision) in contract_provisions.into_iter().enumerate() {
         emit_contract_provision(
@@ -30,10 +35,14 @@ fn parse_csv<R: Read>(
     }
 
     if wide {
-        let columns = parse_wide_columns(&data_headers, profile, max_fanout_rows)?;
+        let columns = parse_wide_columns(
+            &data_headers, profile, requires_estimated_amount, max_fanout_rows,
+        )?;
         parse_wide_records(records, version_id, &columns, max_fanout_rows, outputs)?;
     } else {
-        let columns = parse_tall_columns(&data_headers, profile, max_fanout_rows)?;
+        let columns = parse_tall_columns(
+            &data_headers, profile, requires_estimated_amount, max_fanout_rows,
+        )?;
         parse_tall_records(records, version_id, &columns, max_fanout_rows, outputs)?;
     }
     Ok(schema_version)
@@ -282,7 +291,7 @@ fn split_pipe_bounded(value: &str, field: &str, limit: usize) -> io::Result<Vec<
 fn canonical_csv_date(value: &str) -> io::Result<String> {
     let value = required_text(value, "last_updated_on")?;
     let parts = value.split(['-', '/']).collect::<Vec<_>>();
-    if parts.len() != 3 {
+    if parts.len() != 3 || (value.contains('-') && value.contains('/')) {
         return Err(invalid(
             "last_updated_on must be YYYY-MM-DD, M/D/YYYY, or MM/DD/YYYY",
         ));
@@ -292,6 +301,11 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     } else {
         (parts[0], parts[1], parts[2])
     };
+    if [month, day].iter().any(|part| {
+        !(1..=2).contains(&part.len()) || !part.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return Err(invalid("last_updated_on contains an invalid month or day"));
+    }
     if year.len() != 4 || !year.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid("last_updated_on contains an invalid year"));
     }
