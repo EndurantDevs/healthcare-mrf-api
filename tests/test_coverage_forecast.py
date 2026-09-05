@@ -20,7 +20,9 @@ combine = importlib.import_module("coverage_forecast_combine")
 forecast = importlib.import_module("coverage_forecast")
 reporting = importlib.import_module("coverage_forecast_reporting")
 ratchet = importlib.import_module("coverage_ratchet")
-CoverageRatchetError = importlib.import_module("coverage_reports").CoverageRatchetError
+growth = importlib.import_module("coverage_growth")
+reports = importlib.import_module("coverage_reports")
+CoverageRatchetError = reports.CoverageRatchetError
 
 
 BASE_SHA = "a" * 40
@@ -28,7 +30,7 @@ HEAD_SHA = "b" * 40
 
 
 def _report_config(report_path: Path, report_format: str) -> dict:
-    """Build one compact report configuration with the real growth shape."""
+    """Build one compact report configuration with the real policy shape."""
 
     metric_by_name = {"lines": {"covered": 80, "total": 100}}
     if report_format == "coverage.py":
@@ -36,20 +38,26 @@ def _report_config(report_path: Path, report_format: str) -> dict:
     policy_by_field = {"branch": report_format == "coverage.py", "coverage": "7.15.2"}
     if report_format == "llvm-cov":
         policy_by_field.update({"cargo_llvm_cov": "0.8.7", "rust": "1.97.1"})
+    include = ["api/*.py"]
+    files = ["api/sample.py"]
+    threshold = 85
+    if report_format == "llvm-cov":
+        include = ["support/ptg2_scanner/src/*.rs"]
+        files = ["support/ptg2_scanner/src/sample.rs"]
+        threshold = 80
     return {
         "format": report_format,
         "path": str(report_path),
         "scope": {
-            "include": ["api/*.py"],
+            "include": include,
             "exclude": [],
             "policy": policy_by_field,
         },
-        "files": ["api/sample.py"],
+        "files": files,
         "metrics": metric_by_name,
         "growth": {
-            "changed_line_divisor": 10,
-            "debt_reduction_percent": 1,
-            "target_percent_by_metric": {name: 95 for name in metric_by_name},
+            "debt_reduction_percent": 0,
+            "diff_coverage_percent": threshold,
         },
     }
 
@@ -72,6 +80,16 @@ def _artifact_baseline() -> dict:
     return _baseline(Path("test-coverage-python.json"))
 
 
+def test_generated_coverage_docs_reject_reversed_markers() -> None:
+    """The docs writer cannot replace an ambiguous or inverted section."""
+
+    with pytest.raises(CoverageRatchetError, match="out of order"):
+        reports._updated_docs(
+            "<!-- coverage-baseline:end -->\n<!-- coverage-baseline:start -->\n",
+            _artifact_baseline(),
+        )
+
+
 def _write_python_report(root: Path, covered_count: int) -> Path:
     """Write a compact coverage.py report at the real scope path."""
 
@@ -90,9 +108,41 @@ def _write_python_report(root: Path, covered_count: int) -> Path:
                             "covered_branches": covered_count,
                             "num_branches": 100,
                         },
+                        "executed_lines": list(range(1, covered_count + 1)),
+                        "missing_lines": list(range(covered_count + 1, 101)),
                         "missing_branches": [[1, 2]],
                     }
                 }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def _write_rust_report(root: Path, covered_count: int) -> Path:
+    """Write a compact full llvm-cov report at the real Rust scope path."""
+
+    source_path = root / "support" / "ptg2_scanner" / "src" / "sample.rs"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("fn sample() {}\n", encoding="utf-8")
+    report_path = root / "test-coverage-rust.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "files": [
+                            {
+                                "filename": str(source_path),
+                                "segments": [],
+                                "summary": {
+                                    "lines": {"covered": covered_count, "count": 100}
+                                },
+                            }
+                        ]
+                    }
+                ]
             }
         ),
         encoding="utf-8",
@@ -143,7 +193,7 @@ def _staged_gate(
 
     candidate = ratchet._load_baseline(candidate_path)
     reference = ratchet._load_baseline(reference_path)
-    errors = ratchet._compare_baselines(candidate, reference, {"python": 17})
+    errors = ratchet._compare_baselines(candidate, reference)
     errors.extend(
         ratchet._check_current_report(root, "python", candidate["reports"]["python"])
     )
@@ -168,8 +218,20 @@ def _run_python_forecast(
     monkeypatch.setattr(forecast, "_run_ratchet", _staged_gate)
     monkeypatch.setattr(
         reporting,
-        "collect_growth_evidence",
-        lambda *_: ({"python": 17}, []),
+        "collect_diff_coverage",
+        lambda *_: (
+            {
+                "python": {
+                    "changed": 17,
+                    "covered": 17,
+                    "total": 17,
+                    "percent": 100.0,
+                    "threshold": 85,
+                    "uncovered_lines": [],
+                }
+            },
+            [],
+        ),
     )
     exit_code = forecast._forecast_one_report(
         tmp_path,
@@ -182,10 +244,10 @@ def _run_python_forecast(
     return exit_code, json.loads(output_path.read_text(encoding="utf-8"))
 
 
-def test_forecast_stages_report_metrics_and_files_for_the_real_ratchet(
+def test_forecast_stages_report_metrics_and_files_for_the_ratio_ratchet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stale committed baseline does not make an at-cap CI report falsely red."""
+    """A measured ratio above the base remains green without debt headroom."""
 
     exit_code, output = _run_python_forecast(tmp_path, monkeypatch, covered_count=81)
 
@@ -193,50 +255,57 @@ def test_forecast_stages_report_metrics_and_files_for_the_real_ratchet(
     assert output["ratchet_exit_code"] == 0
     assert output["ratchet_errors"] == []
     assert output["reports"]["python"]["metrics"]["branches"] == {
-        "base_missing": 20,
-        "current_missing": 19,
-        "effective_missing_cap": 19,
-        "margin": 0,
-        "required_growth_reduction": 1,
-        "target_percent": 95,
+        "current_covered": 81,
+        "current_total": 100,
+        "current_percent": 81.0,
+        "reference_covered": 80,
+        "reference_total": 100,
+        "reference_percent": 80.0,
     }
 
 
-def test_forecast_keeps_a_true_report_debt_failure_red(
+def test_forecast_keeps_a_true_ratio_regression_red(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Staging live metrics does not weaken the real debt-paydown requirement."""
+    """Staging live metrics does not weaken the base ratio floor."""
 
-    exit_code, output = _run_python_forecast(tmp_path, monkeypatch, covered_count=80)
+    exit_code, output = _run_python_forecast(tmp_path, monkeypatch, covered_count=79)
 
     assert exit_code == 1
     assert output["ratchet_exit_code"] == 1
-    assert any("uncovered debt must fall" in error for error in output["ratchet_errors"])
-    assert output["reports"]["python"]["metrics"]["lines"]["margin"] == -1
+    assert any("coverage fell" in error for error in output["ratchet_errors"])
+    assert output["reports"]["python"]["metrics"]["lines"]["current_percent"] == 79.0
 
 
-def test_policy_projection_preserves_the_floor_reset_marker(tmp_path: Path) -> None:
-    """The healthcare one-time floor-reset contract is never rewritten by forecast."""
+def test_policy_projection_preserves_the_machine_artifact_marker(tmp_path: Path) -> None:
+    """The exact-base artifact requirement remains protected by forecast."""
 
     candidate = _baseline(tmp_path / "test-coverage-python.json")
     reference = json.loads(json.dumps(candidate))
-    floor_reset_by_field = {
-        "maximum_drop_basis_points": 200,
-        "reason": "release reset",
-        "reference_metrics": reference["reports"]["python"]["metrics"],
-    }
-    candidate["reports"]["python"]["one_time_floor_reset"] = floor_reset_by_field
-    reference["reports"]["python"]["one_time_floor_reset"] = floor_reset_by_field
+    candidate["machine_artifact_required"] = True
+    reference["machine_artifact_required"] = True
 
     projected_candidate, projected_reference = forecast._policy_projection(
         candidate, reference, "python"
     )
 
-    assert (
-        projected_candidate["reports"]["python"]["one_time_floor_reset"]
-        == floor_reset_by_field
-    )
+    assert projected_candidate["machine_artifact_required"] is True
     assert ratchet._compare_baselines(projected_candidate, projected_reference) == []
+
+
+def test_machine_artifact_transition_allows_only_the_coverage_tool_upgrade() -> None:
+    """Bootstrap corrects the stale tool pin without opening a lasting bypass."""
+
+    reference = _artifact_baseline()
+    candidate = json.loads(json.dumps(reference))
+    candidate["machine_artifact_required"] = True
+    candidate["reports"]["python"]["scope"]["policy"]["coverage"] = "7.16.0"
+
+    assert ratchet._compare_baselines(candidate, reference) == []
+    reference["machine_artifact_required"] = True
+    assert "python: measurement policy changed coverage" in ratchet._compare_baselines(
+        candidate, reference
+    )
 
 
 def test_forecast_refuses_mutable_or_short_base_identifiers(tmp_path: Path) -> None:
@@ -443,7 +512,23 @@ def test_diagnostics_rejects_a_report_path_other_than_the_staged_ratchet_input(
     baseline = _baseline(report_path)
     staged = forecast._with_report_snapshot(tmp_path, baseline, "python", report_path)
     reference = forecast._with_report_path(baseline, "python", report_path)
-    monkeypatch.setattr(reporting, "collect_growth_evidence", lambda *_: ({"python": 0}, []))
+    monkeypatch.setattr(
+        reporting,
+        "collect_diff_coverage",
+        lambda *_: (
+            {
+                "python": {
+                    "changed": 0,
+                    "covered": 0,
+                    "total": 0,
+                    "percent": 100.0,
+                    "threshold": 85,
+                    "uncovered_lines": [],
+                }
+            },
+            [],
+        ),
+    )
 
     with pytest.raises(CoverageRatchetError, match="differs from the staged"):
         reporting.build_forecast_diagnostics(
@@ -455,3 +540,295 @@ def test_diagnostics_rejects_a_report_path_other_than_the_staged_ratchet_input(
             "python",
             tmp_path / "other.json",
         )
+
+
+def test_python_diff_coverage_counts_only_executable_changed_lines(tmp_path: Path) -> None:
+    """Blank and comment additions stay outside the Coverage.py denominator."""
+
+    report_path = tmp_path / "coverage.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "files": {
+                    "api/sample.py": {
+                        "executed_lines": [2],
+                        "missing_lines": [],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _report_config(report_path, "coverage.py")
+
+    result = growth._report_diff_coverage(
+        tmp_path,
+        "python",
+        config,
+        {"api/sample.py": {1, 2, 3}},
+    )
+
+    assert result == {
+        "changed": 3,
+        "covered": 1,
+        "total": 1,
+        "percent": 100.0,
+        "threshold": 85,
+        "uncovered_lines": [],
+    }
+
+
+def test_diff_coverage_fails_closed_when_a_changed_product_file_is_absent(
+    tmp_path: Path,
+) -> None:
+    """A missing report record cannot turn changed product code into an exemption."""
+
+    report_path = tmp_path / "coverage.json"
+    report_path.write_text(json.dumps({"files": {}}), encoding="utf-8")
+
+    with pytest.raises(CoverageRatchetError, match="absent from coverage"):
+        growth._report_diff_coverage(
+            tmp_path,
+            "python",
+            _report_config(report_path, "coverage.py"),
+            {"api/new_file.py": {1}},
+        )
+
+
+def test_diff_coverage_exempts_only_configured_generated_files(tmp_path: Path) -> None:
+    """Checked-in generated data does not create an untestable diff denominator."""
+
+    report_path = tmp_path / "coverage.json"
+    report_path.write_text(json.dumps({"files": {}}), encoding="utf-8")
+    config = _report_config(report_path, "coverage.py")
+    config["growth"]["diff_exclude"] = ["process/ext/address_pub28.py"]
+
+    result = growth._report_diff_coverage(
+        tmp_path,
+        "python",
+        config,
+        {"process/ext/address_pub28.py": {1, 2}},
+    )
+
+    assert result["changed"] == 0
+    assert result["total"] == 0
+
+
+def test_rust_diff_coverage_uses_full_llvm_segments_at_the_80_percent_boundary(
+    tmp_path: Path,
+) -> None:
+    """LLVM half-open segments produce executable and covered Rust line sets."""
+
+    report_path = tmp_path / "rust.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "files": [
+                            {
+                                "filename": "support/ptg2_scanner/src/sample.rs",
+                                "segments": [
+                                    [1, 1, 1, True, True, False],
+                                    [17, 1, 0, True, True, False],
+                                    [21, 1, 0, False, False, False],
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _report_config(report_path, "llvm-cov")
+
+    result = growth._report_diff_coverage(
+        tmp_path,
+        "rust",
+        config,
+        {"support/ptg2_scanner/src/sample.rs": set(range(1, 21))},
+    )
+
+    assert result["covered"] == 16
+    assert result["total"] == 20
+    assert result["percent"] == 80.0
+    assert growth._diff_coverage_errors("rust", result) == []
+
+
+def test_rust_diff_coverage_rejects_malformed_llvm_segments(tmp_path: Path) -> None:
+    """Summary-only or malformed LLVM JSON cannot silently pass diff coverage."""
+
+    report_path = tmp_path / "rust.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "files": [
+                            {
+                                "filename": "support/ptg2_scanner/src/sample.rs",
+                                "summary": {},
+                            }
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CoverageRatchetError, match="segments must be a list"):
+        growth._report_diff_coverage(
+            tmp_path,
+            "rust",
+            _report_config(report_path, "llvm-cov"),
+            {"support/ptg2_scanner/src/sample.rs": {1}},
+        )
+
+
+def test_diff_coverage_failure_lists_every_uncovered_changed_line() -> None:
+    """A below-threshold result is actionable in the job log."""
+
+    errors = growth._diff_coverage_errors(
+        "rust",
+        {
+            "covered": 3,
+            "total": 5,
+            "percent": 60.0,
+            "threshold": 80,
+            "uncovered_lines": ["src/a.rs:4", "src/a.rs:5"],
+        },
+    )
+
+    assert errors == [
+        "rust: diff coverage 60.00% is below 80% (3/5)",
+        "rust: uncovered changed line src/a.rs:4",
+        "rust: uncovered changed line src/a.rs:5",
+    ]
+
+
+def test_machine_baseline_bootstraps_once_then_requires_the_exact_base_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a legacy tracked base may proceed without its machine artifact."""
+
+    legacy = _artifact_baseline()
+    monkeypatch.setattr(artifacts, "base_baseline", lambda *_: legacy)
+    assert artifacts.reference_baseline(tmp_path, BASE_SHA, None) is legacy
+
+    required = json.loads(json.dumps(legacy))
+    required["machine_artifact_required"] = True
+    monkeypatch.setattr(artifacts, "base_baseline", lambda *_: required)
+    with pytest.raises(artifacts.CoverageForecastError, match="requires its 90-day"):
+        artifacts.reference_baseline(tmp_path, BASE_SHA, None)
+
+    artifact_path = tmp_path / "machine.json"
+    artifact_path.write_text(
+        json.dumps({**required, "source_sha": HEAD_SHA}),
+        encoding="utf-8",
+    )
+    with pytest.raises(artifacts.CoverageForecastError, match="source_sha"):
+        artifacts.reference_baseline(tmp_path, BASE_SHA, artifact_path)
+
+    artifact_path.write_text(
+        json.dumps({**required, "source_sha": BASE_SHA}),
+        encoding="utf-8",
+    )
+    assert artifacts.reference_baseline(tmp_path, BASE_SHA, artifact_path)[
+        "source_sha"
+    ] == BASE_SHA
+
+
+def test_measured_machine_baseline_restores_canonical_report_paths(tmp_path: Path) -> None:
+    """Temporary combine paths never leak into the reusable main artifact."""
+
+    configured = _artifact_baseline()
+    measured = json.loads(json.dumps(configured))
+    measured["reports"]["python"]["path"] = "/tmp/combined-python.json"
+    measured["reports"]["rust"]["path"] = "/tmp/downloaded-rust.json"
+    output_path = tmp_path / "baseline.json"
+
+    forecast._write_measured_baseline(output_path, measured, configured, HEAD_SHA)
+
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    assert output["source_sha"] == HEAD_SHA
+    assert output["machine_artifact_required"] is True
+    assert output["reports"]["python"]["path"] == "test-coverage-python.json"
+    assert output["reports"]["rust"]["path"] == "test-coverage-rust.json"
+
+
+def test_combined_forecast_stages_both_reports_and_writes_one_machine_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final coverage owner ratchets and publishes Python and Rust together."""
+
+    python_report = _write_python_report(tmp_path, 81)
+    rust_report = _write_rust_report(tmp_path, 82)
+    configured = _artifact_baseline()
+    reference = json.loads(json.dumps(configured))
+    observed_candidates: list[dict] = []
+
+    def run_ratchet(
+        _root: Path,
+        candidate_path: Path,
+        _reference_path: Path,
+        _base_sha: str,
+        report_name: str | None,
+    ) -> subprocess.CompletedProcess[str]:
+        assert report_name is None
+        observed_candidates.append(json.loads(candidate_path.read_text(encoding="utf-8")))
+        return subprocess.CompletedProcess(["coverage_ratchet"], 0, "", "")
+
+    monkeypatch.setattr(forecast, "resolve_forecast_base", lambda *_: (BASE_SHA, HEAD_SHA))
+    monkeypatch.setattr(forecast, "_baseline", lambda *_: json.loads(json.dumps(configured)))
+    monkeypatch.setattr(
+        forecast,
+        "load_reference_baseline",
+        lambda *_: json.loads(json.dumps(reference)),
+    )
+    monkeypatch.setattr(
+        forecast,
+        "combine_python_coverage",
+        lambda *_: (python_report, {"main": ["bound"]}),
+    )
+    monkeypatch.setattr(forecast, "verify_report_artifact", lambda *_: rust_report)
+    monkeypatch.setattr(forecast, "_run_ratchet", run_ratchet)
+    monkeypatch.setattr(
+        forecast,
+        "build_combined_forecast_diagnostics",
+        lambda *_: {
+            "schema_version": 1,
+            "base_sha": BASE_SHA,
+            "head_sha": HEAD_SHA,
+            "reports": {},
+            "policy_errors": [],
+        },
+    )
+    monkeypatch.setattr(forecast, "_print_summary", lambda *_: None)
+    baseline_output = tmp_path / "machine-baseline.json"
+
+    exit_code = forecast.forecast_coverage(
+        tmp_path,
+        BASE_SHA,
+        tmp_path / "main",
+        tmp_path / "capacity",
+        tmp_path / "postgres",
+        tmp_path / "rust",
+        tmp_path / "forecast.json",
+        tmp_path / "base-artifact.json",
+        baseline_output,
+    )
+
+    assert exit_code == 0
+    assert observed_candidates[0]["reports"]["python"]["metrics"]["lines"] == {
+        "covered": 81,
+        "total": 100,
+    }
+    assert observed_candidates[0]["reports"]["rust"]["metrics"]["lines"] == {
+        "covered": 82,
+        "total": 100,
+    }
+    machine = json.loads(baseline_output.read_text(encoding="utf-8"))
+    assert machine["source_sha"] == HEAD_SHA
+    assert set(machine["reports"]) == {"python", "rust"}

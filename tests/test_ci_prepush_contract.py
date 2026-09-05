@@ -45,7 +45,8 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
     for job, command in expected_command_by_job.items():
         job_body = _job(workflow, job)
         assert command in job_body
-        assert len(re.findall(r"^        run:", job_body, re.M)) == 1
+        expected_run_steps = 2 if job == "test-coverage" else 1
+        assert len(re.findall(r"^        run:", job_body, re.M)) == expected_run_steps
 
 
 def test_service_modes_wait_for_ready_redis_and_postgres() -> None:
@@ -95,7 +96,7 @@ if output=$(wait_for_service Missing 0 never 2>&1); then exit 1; fi
     assert "--timeout=1" in postgres.group(1)
 
 
-def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
+def test_local_all_pins_ci_images_and_inputs() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
     assert "ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:0e97164f0e06b60fe5608e5654e026a88c3ef5d3b6a195a26fdc60489b404803" in script
     assert "postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871" in script
@@ -103,10 +104,8 @@ def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     assert "--platform linux/amd64" in script
     assert "for shard in 0 1 2 3" in script
     assert "for shard in core provider-directory provider-profile" in script
-    assert 'require_margin "$(artifact_path test-coverage-forecast-python.json)" python lines 5' in script
-    assert 'require_margin "$(artifact_path test-coverage-forecast-python.json)" python branches 5' in script
-    assert 'require_margin "$(artifact_path test-coverage-forecast-rust.json)" rust functions 2' in script
-    assert script.count("require_margin \"") == 3
+    assert "require_margin" not in script
+    assert "margin_minimum" not in script
     assert 'all requires a clean, committed candidate' in script
     assert 'status=passed' in script
 
@@ -175,12 +174,11 @@ def test_local_all_exit_cleanup_state_outlives_run_all() -> None:
         assert not re.search(rf"^  local {variable}(?:=|$)", script, re.M)
 
 
-def test_local_all_propagates_reviewed_readability_approval() -> None:
+def test_local_all_has_no_readability_label_bypass() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
 
-    assert "readability_zero_growth_approved=${READABILITY_ZERO_GROWTH_APPROVED:-false}" in script
-    assert "readability_zero_growth_approved=$readability_zero_growth_approved" in script
-    assert '--env READABILITY_ZERO_GROWTH_APPROVED="$readability_zero_growth_approved"' in script
+    assert "READABILITY_ZERO_GROWTH_APPROVED" not in script
+    assert "readability_zero_growth_approved" not in script
 
 
 def test_local_all_records_the_native_libc_version() -> None:

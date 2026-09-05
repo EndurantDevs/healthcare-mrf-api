@@ -1,93 +1,108 @@
-"""Produce debt diagnostics from the exact report staged for the ratchet."""
+"""Produce compact diagnostics from CI-equivalent coverage inputs."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from coverage_growth import (
-    calculate_required_debt_reduction,
-    collect_growth_evidence,
-    load_growth_policy,
-)
-from coverage_reports import (
-    CoverageRatchetError,
-    _collect_report,
-    _is_path_in_scope,
-    _read_json,
-    _relative_report_path,
-)
+from coverage_forecast_artifacts import CoverageForecastError
+from coverage_growth import collect_diff_coverage
+from coverage_reports import CoverageRatchetError, _collect_report, _metric
 
 
-def _metric_diagnostic(
+def _validated_metric(metric_value: Any, label: str) -> dict[str, int]:
+    if not isinstance(metric_value, dict):
+        raise CoverageForecastError(f"{label}: metric input is malformed")
+    try:
+        return _metric(metric_value.get("covered"), metric_value.get("total"), label)
+    except CoverageRatchetError as exc:
+        raise CoverageForecastError(str(exc)) from exc
+
+
+def _metric_details(
     report_name: str,
-    metric_name: str,
-    current_metric: dict[str, int],
-    reference_metric: dict[str, int],
-    policy: dict[str, Any],
-    changed_line_count: int,
-) -> dict[str, int]:
-    """Return the debt cap and margin that the staged ratchet evaluates."""
-
-    current_missing = current_metric["total"] - current_metric["covered"]
-    reference_missing = reference_metric["total"] - reference_metric["covered"]
-    target_percent = policy["target_percent_by_metric"][metric_name]
-    is_at_target = (
-        current_metric["covered"] * 100 >= target_percent * current_metric["total"]
-    )
-    required_reduction = 0
-    if changed_line_count and not is_at_target:
-        required_reduction = calculate_required_debt_reduction(
-            reference_metric,
-            target_percent,
-            policy["debt_reduction_percent"],
-            changed_line_count,
-            policy["changed_line_divisor"],
+    candidate_config: dict[str, Any],
+    reference_config: dict[str, Any],
+) -> dict[str, dict[str, int | float]]:
+    candidate_metrics = candidate_config.get("metrics")
+    reference_metrics = reference_config.get("metrics")
+    if not isinstance(candidate_metrics, dict) or not isinstance(reference_metrics, dict):
+        raise CoverageForecastError(f"{report_name}: baseline metrics are malformed")
+    details_by_name: dict[str, dict[str, int | float]] = {}
+    for metric_name, candidate_value in candidate_metrics.items():
+        current = _validated_metric(candidate_value, f"{report_name}.{metric_name}")
+        reference = _validated_metric(
+            reference_metrics.get(metric_name),
+            f"{report_name}.{metric_name} reference baseline",
         )
-    cap = reference_missing - required_reduction
-    return {
-        "base_missing": reference_missing,
-        "current_missing": current_missing,
-        "effective_missing_cap": cap,
-        "margin": cap - current_missing,
-        "required_growth_reduction": required_reduction,
-        "target_percent": target_percent,
-    }
+        details_by_name[metric_name] = {
+            "current_covered": current["covered"],
+            "current_total": current["total"],
+            "current_percent": 100.0 * current["covered"] / current["total"],
+            "reference_covered": reference["covered"],
+            "reference_total": reference["total"],
+            "reference_percent": 100.0
+            * reference["covered"]
+            / reference["total"],
+        }
+    return details_by_name
 
 
-def _missing_branch_arcs(
+def _build_diagnostics(
     root: Path,
-    report_path: Path,
-    report_config: dict[str, Any],
-) -> dict[str, list[list[int]]]:
-    """Return sorted in-scope missing arcs for a coverage.py report."""
-
-    report_document = _read_json(report_path)
-    raw_files = report_document.get("files")
-    if not isinstance(raw_files, dict):
-        return {}
-    arcs_by_path: dict[str, list[list[int]]] = {}
-    for raw_path, payload in raw_files.items():
-        if not isinstance(raw_path, str) or not isinstance(payload, dict):
-            continue
-        relative_path = _relative_report_path(root, raw_path)
-        if relative_path is None or not _is_path_in_scope(relative_path, report_config):
-            continue
-        raw_arcs = payload.get("missing_branches")
-        arcs = [arc for arc in raw_arcs if _is_branch_arc(arc)] if isinstance(raw_arcs, list) else []
-        if arcs:
-            arcs_by_path[relative_path] = sorted(arcs)
-    return arcs_by_path
-
-
-def _is_branch_arc(value: object) -> bool:
-    """Accept only the two-integer arc records emitted by coverage.py."""
-
-    return (
-        isinstance(value, list)
-        and len(value) == 2
-        and all(isinstance(line_number, int) for line_number in value)
-    )
+    base_sha: str,
+    head_sha: str,
+    candidate_baseline: dict[str, Any],
+    reference_baseline: dict[str, Any],
+    report_paths: dict[str, Path],
+) -> dict[str, Any]:
+    candidate_reports = candidate_baseline.get("reports")
+    reference_reports = reference_baseline.get("reports")
+    if not isinstance(candidate_reports, dict) or not isinstance(reference_reports, dict):
+        raise CoverageForecastError("coverage baseline reports are malformed")
+    report_names = list(report_paths)
+    try:
+        diff_by_report, diff_errors = collect_diff_coverage(
+            root,
+            base_sha,
+            candidate_baseline,
+            report_names,
+        )
+    except CoverageRatchetError as exc:
+        raise CoverageForecastError(str(exc)) from exc
+    reports_by_name: dict[str, Any] = {}
+    for report_name, report_path in report_paths.items():
+        candidate_config = candidate_reports.get(report_name)
+        reference_config = reference_reports.get(report_name)
+        if not isinstance(candidate_config, dict) or not isinstance(
+            reference_config, dict
+        ):
+            raise CoverageForecastError(f"{report_name}: baseline report mismatch")
+        if Path(str(candidate_config.get("path"))).resolve() != report_path.resolve():
+            raise CoverageRatchetError(
+                "forecast diagnostics report path differs from the staged ratchet input"
+            )
+        snapshot = _collect_report(root, report_name, candidate_config)
+        if snapshot.metric_by_name != candidate_config.get("metrics"):
+            raise CoverageRatchetError(
+                "staged coverage metrics differ from the measured report"
+            )
+        reports_by_name[report_name] = {
+            "diff_coverage": diff_by_report[report_name],
+            "metrics": _metric_details(
+                report_name,
+                candidate_config,
+                reference_config,
+            ),
+            "source_files": sorted(snapshot.files),
+        }
+    return {
+        "schema_version": 1,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "reports": reports_by_name,
+        "policy_errors": diff_errors,
+    }
 
 
 def build_forecast_diagnostics(
@@ -99,53 +114,33 @@ def build_forecast_diagnostics(
     report_name: str,
     report_path: Path,
 ) -> dict[str, Any]:
-    """Summarize the same report snapshot and base policy fed to the gate."""
+    """Build diagnostics for the legacy one-report forecast commands."""
 
-    candidate_config = candidate_baseline["reports"][report_name]
-    reference_config = reference_baseline["reports"][report_name]
-    candidate_path = Path(candidate_config["path"]).resolve()
-    if candidate_path != report_path.resolve():
-        raise CoverageRatchetError(
-            "forecast diagnostics report path differs from the staged ratchet input"
-        )
-    changed_by_report, exclusion_errors = collect_growth_evidence(
+    return _build_diagnostics(
         root,
         base_sha,
+        head_sha,
         candidate_baseline,
-        [report_name],
+        reference_baseline,
+        {report_name: report_path},
     )
-    snapshot = _collect_report(root, report_name, candidate_config)
-    if snapshot.metric_by_name != candidate_config["metrics"]:
-        raise CoverageRatchetError(
-            "staged coverage metrics differ from the measured report"
-        )
-    policy = load_growth_policy(report_name, candidate_config)
-    metric_diagnostics_by_name: dict[str, dict[str, int]] = {}
-    for metric_name, reference_metric in reference_config["metrics"].items():
-        current_metric = snapshot.metric_by_name[metric_name]
-        metric_diagnostics_by_name[metric_name] = _metric_diagnostic(
-            report_name,
-            metric_name,
-            current_metric,
-            reference_metric,
-            policy,
-            changed_by_report[report_name],
-        )
-    report_diagnostics_by_name: dict[str, Any] = {
-        "changed_source_lines": changed_by_report[report_name],
-        "exclusion_errors": exclusion_errors,
-        "metrics": metric_diagnostics_by_name,
-        "source_files": sorted(snapshot.files),
-    }
-    if candidate_config.get("format") == "coverage.py":
-        report_diagnostics_by_name["missing_branch_arcs"] = _missing_branch_arcs(
-            root,
-            report_path,
-            candidate_config,
-        )
-    return {
-        "schema_version": 1,
-        "base_sha": base_sha,
-        "head_sha": head_sha,
-        "reports": {report_name: report_diagnostics_by_name},
-    }
+
+
+def build_combined_forecast_diagnostics(
+    root: Path,
+    base_sha: str,
+    head_sha: str,
+    candidate_baseline: dict[str, Any],
+    reference_baseline: dict[str, Any],
+    report_paths: dict[str, Path],
+) -> dict[str, Any]:
+    """Build one diagnostic covering both canonical language reports."""
+
+    return _build_diagnostics(
+        root,
+        base_sha,
+        head_sha,
+        candidate_baseline,
+        reference_baseline,
+        report_paths,
+    )

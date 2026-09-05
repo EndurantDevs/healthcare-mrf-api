@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure readability debt and enforce local and net-reduction ratchets."""
+"""Report readability debt and block new function-level and architecture debt."""
 
 from __future__ import annotations
 

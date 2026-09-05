@@ -123,7 +123,9 @@ jobs:
           trap 'rm -f "$artifact_ids"' EXIT
           gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[].id' > "$artifact_ids"
+            --jq '.artifacts[] |
+              select(.name | startswith("healthcare-mrf-api-coverage-baseline-") | not) |
+              .id' > "$artifact_ids"
           while IFS= read -r artifact_id; do
             gh api --method DELETE \
               "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
@@ -199,7 +201,11 @@ jobs:
           jq -r \
             --arg cutoff "${cutoff}" \
             '.artifacts[] |
-             select(.expired == false and .created_at < $cutoff) |
+             select(
+               .expired == false and
+               .created_at < $cutoff and
+               (.name | startswith("healthcare-mrf-api-coverage-baseline-") | not)
+             ) |
              .id' > "$artifact_ids"
           while IFS= read -r artifact_id; do
             gh api --method DELETE \

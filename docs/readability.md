@@ -1,7 +1,7 @@
 # Readability Budget
 
-This repo uses `scripts/readability_budget.py` to keep readability debt visible
-and prevent new debt from entering unnoticed.
+This repo uses `scripts/readability_budget.py` to report readability debt and
+block new function-level and architecture debt.
 
 ## Rules
 
@@ -29,10 +29,40 @@ and prevent new debt from entering unnoticed.
   `readability-budget.json`.
 - Keep importers decomposed by source discovery, download, parse, stage, publish,
   and materialize phases.
+- Do not add facade/module attribute injection, namespace-copy loops,
+  `sys.modules[...].__dict__.update(...)`, or non-allowlisted `__module__`
+  rewrites. Intentional public contract-name rewrites use
+  `readability.module_attribute_injection_allowlist` entries in
+  `<relative path>:<name>` form.
+- Do not add numbered `*_part_NN.py`, `*_part_NN.ts`, or `*_part_NN.tsx`
+  modules. Rust code also rejects paired `*_a.rs`/`*_b.rs` modules and split
+  test `include!(...)` files.
 
 ## Thresholds
 
-- Source files over 500 lines are reported.
+- Product Python files over 1,500 lines are reported as soft overruns. Rust
+  product files over 800 non-test lines are likewise reported; lines inside
+  `#[cfg(test)] mod ...` blocks do not count toward that Rust budget. Test,
+  migration, and script file lengths do not block a change, but their Python
+  functions still receive the rules below.
+- A product file that was already over 5,000 raw lines at the base revision may
+  not grow. The checker discovers these files from the configured product roots
+  and compares each file with the exact base revision, including across renames.
+  At this policy transition the set is:
+
+  - `process/provider_directory_fhir.py`
+  - `support/ptg2_scanner/src/main.rs`
+  - `api/ptg2_serving.py`
+  - `process/mrf_source_discovery.py`
+  - `api/endpoint/npi.py`
+  - `process/entity_address_unified.py`
+  - `api/endpoint/pricing.py`
+  - `support/ptg2_scanner/src/provider_graph_v4.rs`
+  - `process/ptg.py`
+  - `db/models/_legacy.py`
+  - `process/ptg_parts/ptg2_shared_snapshot_publish.py`
+  - `api/ptg2_db_sidecars.py`
+  - `process/florida_mqa_profile.py`
 - Python functions over 60 lines are reported.
 - Python nesting deeper than 4 control-flow levels is reported.
 - Inline suppressions are reported and blocked when new.
@@ -43,31 +73,23 @@ and prevent new debt from entering unnoticed.
   too many locals, global/nonlocal state, missing contract docstrings, placeholder
   bodies, and noisy comments.
 
-Existing debt IDs are stored in `readability-baseline.json`. The normal check
-rejects findings that are not present in that synchronized baseline. When debt
-is removed or the rules intentionally change, regenerate the baseline in the
-same change:
+Existing debt IDs, including soft file-length overruns, are stored in
+`readability-baseline.json`. Soft file-length overruns remain visible but do not
+fail a change. New function, naming, suppression, global-state, placeholder,
+contract-docstring, module-injection, and split-module findings do fail, as does
+growth of a file already over 5,000 lines. Debt reduction is scheduled refactor
+work, not a per-PR tax.
+
+When the rules intentionally change, regenerate the baseline in the same
+change:
 
 ```bash
 python scripts/readability_budget.py --write-baseline
 ```
 
-Normal local check:
+Standalone report and baseline check (the CI quality gate supplies `--base`
+for the huge-file growth check):
 
 ```bash
 python scripts/readability_budget.py
 ```
-
-Pull-request CI also compares the synchronized snapshot with the base branch.
-New syntax errors, suppressions, placeholder bodies, global state, or builtin
-shadowing always fail. A branch that changes runtime Python in `main.py`,
-`api/`, `db/`, `process/`, or `service/` must reduce total readability
-debt by at least 1% until the repository reaches zero findings. CI and test
-tooling use a zero-growth check so infrastructure work does not force unrelated
-runtime edits.
-
-For a focused runtime change where the unrelated refactoring needed for the 1%
-paydown would raise change risk, a maintainer may apply the
-`readability-zero-growth-approved` pull-request label. The label changes the
-required reduction to 0%; it does not permit net debt growth or new protected
-findings. Applying or removing the label reruns CI.

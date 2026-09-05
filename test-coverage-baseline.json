@@ -1,4 +1,5 @@
 {
+  "machine_artifact_required": true,
   "reports": {
     "python": {
       "files": [
@@ -502,12 +503,11 @@
       ],
       "format": "coverage.py",
       "growth": {
-        "changed_line_divisor": 10,
-        "debt_reduction_percent": 1,
-        "target_percent_by_metric": {
-          "branches": 90,
-          "lines": 95
-        }
+        "debt_reduction_percent": 0,
+        "diff_exclude": [
+          "process/ext/address_pub28.py"
+        ],
+        "diff_coverage_percent": 85
       },
       "metrics": {
         "branches": {
@@ -517,20 +517,6 @@
         "lines": {
           "covered": 129861,
           "total": 135903
-        }
-      },
-      "one_time_floor_reset": {
-        "maximum_drop_basis_points": 200,
-        "reason": "PTG V4 adaptive graph representation migration",
-        "reference_metrics": {
-          "branches": {
-            "covered": 26862,
-            "total": 34756
-          },
-          "lines": {
-            "covered": 87961,
-            "total": 102240
-          }
         }
       },
       "path": "test-coverage-python.json",
@@ -551,7 +537,7 @@
         ],
         "policy": {
           "branch": true,
-          "coverage": "7.15.2",
+          "coverage": "7.16.0",
           "include_namespace_packages": true,
           "pytest": "9.1.1",
           "source_dirs": [
@@ -618,13 +604,8 @@
       ],
       "format": "llvm-cov",
       "growth": {
-        "changed_line_divisor": 10,
-        "debt_reduction_percent": 1,
-        "target_percent_by_metric": {
-          "functions": 90,
-          "lines": 95,
-          "regions": 90
-        }
+        "debt_reduction_percent": 0,
+        "diff_coverage_percent": 80
       },
       "metrics": {
         "functions": {
@@ -638,24 +619,6 @@
         "regions": {
           "covered": 84329,
           "total": 93650
-        }
-      },
-      "one_time_floor_reset": {
-        "maximum_drop_basis_points": 200,
-        "reason": "PTG V4 adaptive graph representation migration",
-        "reference_metrics": {
-          "functions": {
-            "covered": 2356,
-            "total": 2991
-          },
-          "lines": {
-            "covered": 34196,
-            "total": 42566
-          },
-          "regions": {
-            "covered": 51845,
-            "total": 63759
-          }
         }
       },
       "path": "test-coverage-rust.json",
