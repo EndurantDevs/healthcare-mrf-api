@@ -5305,6 +5305,7 @@ hospitals:
 - hospital_id: hospital-001577
   name: COPLEY MEMORIAL HOSPITAL INC
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbCMHAURORAIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-001578
   name: Copper Queen Community Hospital
   cms_hpt_url: https://cqch.org/cms-hpt.txt
@@ -18389,9 +18390,11 @@ hospitals:
 - hospital_id: hospital-005511
   name: Rush Copley Medical Center
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbCMHAURORAIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005512
   name: Rush Oak Park Hospital
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbRushOakPark&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005513
   alias_of: hospital-005512
   name: Rush Oak Park Hospital Inc
@@ -18399,6 +18402,7 @@ hospitals:
 - hospital_id: hospital-005514
   name: Rush University Medical Center
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbRUMCCHICAGOIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005515
   name: Rusk Rehabilitation Hospital, an affiliation of Encompass Health and MU Health Care
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
