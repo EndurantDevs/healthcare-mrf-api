@@ -6155,6 +6155,7 @@ hospitals:
   name: Driscoll Children’s Hospital
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
   locator_name: Driscoll Children's Hospital - Rio Grande Valley
+  alias_of: hospital-001836
 - hospital_id: hospital-001836
   name: Driscoll Children's Hospital - Rio Grande Valley
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
@@ -6162,6 +6163,7 @@ hospitals:
   name: Driscoll Children's Hospital (Main Campus and Neonatal Care Center)
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
   locator_name: Driscoll Children's Hospital
+  alias_of: hospital-001834
 - hospital_id: hospital-001838
   name: Drs Hospital Emergency Room Saunder
   cms_hpt_url: https://www.doctorshosplaredo.com/cms-hpt.txt
@@ -8696,11 +8698,11 @@ hospitals:
 - hospital_id: hospital-002614
   name: HCA FL PEA RIDGE ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002613
 - hospital_id: hospital-002615
   name: HCA FL PERDIDO BAY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002616
 - hospital_id: hospital-002616
   name: HCA FL PERDIDO BAY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
@@ -8712,7 +8714,7 @@ hospitals:
 - hospital_id: hospital-002618
   name: HCA FL PINE FOREST ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002617
 - hospital_id: hospital-002619
   name: HCA FL PLANT CITY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
@@ -18715,6 +18717,7 @@ hospitals:
   name: SAN JOAQUIN COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
   locator_name: SAN JOAQUIN COMMUNITY HOSPITAL
+  alias_of: hospital-005624
 - hospital_id: hospital-005626
   name: San Joaquin General Hospital
   cms_hpt_url: https://www.sanjoaquingeneral.org/cms-hpt.txt
