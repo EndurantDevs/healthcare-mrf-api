@@ -911,7 +911,10 @@ def test_failure_kubernetes_covers_claimed_post_absence_and_delete_paths():
         wave, {"reason": "redis_release_absent"}, absence
     ) == absence
     absence["pod_count"] = 1
-    with pytest.raises(failure_types.PTGWaveFailureConflict, match="not exact"):
+    with pytest.raises(
+        failure_types.PTGWaveFailureConflict,
+        match="differs from its persisted receipt",
+    ):
         failure_kubernetes._verify_failure_kubernetes(
             wave, {"reason": "redis_release_absent"}, absence
         )
