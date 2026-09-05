@@ -30,9 +30,18 @@ def test_failed_acquisition_prevents_child_and_restores_capacity(tmp_path: Path,
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "child" not in events
     assert "arc_restore" in events and "lock_stop" in events
+    assert (
+        events.index("arc_hold") < events.index("arc_identity")
+        < events.index("arc_restore") < events.index("lock_stop")
+    )
+    assert not (tmp_path / "fake-state/arc-held").exists()
+    assert not (tmp_path / "fake-state/lock").exists()
     if phase == "hold":
         assert "quota_create" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
+    cleanup = envelope._receipt(state_root)["cleanup"]
+    assert cleanup["arc_capacity_restored"] is True
+    assert cleanup["lock_released"] is True
+    assert cleanup["complete"] is True
 
 
 @pytest.mark.parametrize("settings", [{"FAKE_ARC_FAIL": "identity"}, {"FAKE_CHILD_CLEANUP": "false"}])
@@ -95,39 +104,46 @@ def _reviewed_helper_checkout(tmp_path: Path, attack: str) -> tuple[Path, str]:
     helper.parent.mkdir(parents=True)
     program = 'import os; open(os.environ["ARC_TEST_MARKER"], "a").write("x")\n'
     helper.write_text(program)
-    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-    subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True)
+    git_env_by_name = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True, env=git_env_by_name)
+    subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True, env=git_env_by_name)
     subprocess.run(
         ["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
          "user.email=test@example.invalid", "commit", "-qm", "reviewed helper"],
-        check=True,
+        check=True, env=git_env_by_name,
     )
     source_sha = subprocess.run(
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=git_env_by_name,
     ).stdout.strip()
     if attack == "checkout":
         helper.write_text(program + "# unreviewed change\n")
     elif attack == "replace":
         helper.write_text(program + "# replacement object\n")
-        subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "add", str(helper)], check=True, env=git_env_by_name,
+        )
         subprocess.run(
             ["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
              "user.email=test@example.invalid", "commit", "-qm", "replacement helper"],
-            check=True,
+            check=True, env=git_env_by_name,
         )
         replacement_sha = subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, env=git_env_by_name,
         ).stdout.strip()
         subprocess.run(
             ["git", "-C", str(checkout), "replace", source_sha, replacement_sha],
-            check=True,
+            check=True, env=git_env_by_name,
         )
         subprocess.run(
             ["git", "-C", str(checkout), "update-ref", "HEAD", source_sha,
              replacement_sha],
-            check=True,
+            check=True, env=git_env_by_name,
         )
     return checkout, source_sha
 

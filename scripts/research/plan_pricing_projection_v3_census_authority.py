@@ -118,6 +118,7 @@ _EXPECTED_ENVELOPE_CLEANUP_KEYS = frozenset(
         "policy_removed",
         "drain_restored",
         "quota_removed",
+        "arc_capacity_restored",
         "lock_released",
         "complete",
     }

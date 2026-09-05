@@ -33,6 +33,7 @@ class Cluster:
         self.bad_graph = None
         self.runner_objects = []
         self.fail_patch = None
+        self.fail_after_patch = None
         self.fail_create = None
         self.conflict_once = False
         self.pauses = 0
@@ -86,6 +87,10 @@ class Cluster:
                 ers_mapping["status"]["pendingEphemeralRunners"] = 1
             if self.bad_graph == "missing-current":
                 del ers_mapping["status"]["currentReplicas"]
+            if self.bad_graph == "missing-pending":
+                del ers_mapping["status"]["pendingEphemeralRunners"]
+            if self.bad_graph == "missing-running":
+                del ers_mapping["status"]["runningEphemeralRunners"]
             if self.bad_graph == "null-pending":
                 ers_mapping["status"]["pendingEphemeralRunners"] = None
             if self.bad_graph == "wrong-scale-id":
@@ -218,6 +223,8 @@ class Cluster:
         updated_mapping["metadata"]["generation"] += 1
         self.asrs[name] = updated_mapping
         self.events.append(("patch", name, updated_mapping["spec"]["maxRunners"]))
+        if self.fail_after_patch and self.fail_after_patch(name, updated_mapping):
+            raise ValueError("injected post-patch response failure")
         return updated_mapping
 
     def _delete_fence(self, args, payload):
@@ -289,7 +296,8 @@ def test_flux_cannot_restore_positive_capacity_while_held(lifecycle):
 
 
 @pytest.mark.parametrize("damage", ["missing-ers", "wrong-ers-owner", "old-pod", "pending-ers",
-                                    "missing-current", "null-pending", "wrong-scale-id",
+                                    "missing-current", "missing-pending", "missing-running",
+                                    "null-pending", "wrong-scale-id",
                                     "unready-listener", "worker-pod", "orphan-listener",
                                     "orphan-ers", "unlabelled-orphan-listener"])
 def test_stale_graph_or_pending_work_rejects_quiescence(lifecycle, damage):
@@ -321,15 +329,18 @@ def test_identity_or_inventory_drift_preserves_hold(lifecycle, damage):
     assert cluster.fences
 
 
-def test_partial_hold_failure_never_claims_success(lifecycle):
+def test_partial_hold_failure_reconciles_before_restore(lifecycle):
     drain, cluster = lifecycle
     cluster.fail_patch = lambda name, _: name == "ci-b"
     with pytest.raises(RuntimeError):
         drain.hold()
     assert cluster.asrs["ci-a"]["spec"]["maxRunners"] == 0
     assert cluster.asrs["ci-b"]["spec"]["maxRunners"] == 2
-    with pytest.raises(RuntimeError):
-        drain.identity()
+    drain.identity()
+    assert drain.data["changes"]["ci-a"]["phase"] == "confirmed"
+    assert drain.data["changes"]["ci-b"]["phase"] == "restored"
+    drain.restore()
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
 
 
 def test_create_error_preserves_unmodified_capacity(lifecycle):
@@ -338,6 +349,27 @@ def test_create_error_preserves_unmodified_capacity(lifecycle):
     with pytest.raises(RuntimeError):
         drain.hold()
     assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+
+
+def test_fresh_restore_reconciles_ambiguous_initial_capacity_patch(lifecycle):
+    drain, cluster = lifecycle
+    cluster.fail_after_patch = lambda name, item: (
+        name == "ci-a" and item["spec"]["maxRunners"] == 0
+    )
+    with pytest.raises(RuntimeError):
+        drain.hold()
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [0, 2]
+    assert json.loads(drain.path.read_text())["changes"]["ci-a"]["phase"] == "intent"
+
+    cluster.fail_after_patch = None
+    resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
+    resumed.identity()
+    assert resumed.data["changes"]["ci-a"]["phase"] == "confirmed"
+    resumed.restore()
+
+    assert [item["spec"]["maxRunners"] for item in cluster.asrs.values()] == [3, 2]
+    assert not cluster.fences
+    assert resumed.data["restored"] is True
 
 
 def test_interrupted_restoration_does_not_claim_cleanup(lifecycle):

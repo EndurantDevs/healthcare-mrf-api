@@ -238,10 +238,10 @@ class ArcDrain:
         asrs = self._asrs()
         for original_asr in self.data["original"]:
             capacity_change = self.data["changes"][original_asr["name"]]
-            if capacity_change["phase"] != "restore_intent":
-                continue
             current_asr = asrs[original_asr["name"]]
             resource_version = current_asr["metadata"].get("resourceVersion")
+            if capacity_change["phase"] != "restore_intent":
+                continue
             _require(isinstance(capacity_change.get("resourceVersion"), str) and capacity_change["resourceVersion"],
                     "ARC restore intent resource version is invalid")
             if current_asr["spec"] == _held_spec(original_asr["spec"]):
@@ -255,9 +255,34 @@ class ArcDrain:
             else:
                 raise RuntimeError("ARC capacity changed after restore intent")
 
+    def _reconcile_drain_intents(self) -> None:
+        asrs = self._asrs()
+        for original_asr in self.data["original"]:
+            name = original_asr["name"]
+            capacity_change = self.data["changes"][name]
+            if capacity_change["phase"] != "intent":
+                continue
+            intent_resource_version = capacity_change.get("resourceVersion")
+            _require(isinstance(intent_resource_version, str) and intent_resource_version,
+                    "ARC drain intent resource version is invalid")
+            current_asr = asrs[name]
+            resource_version = current_asr["metadata"].get("resourceVersion")
+            if (current_asr["spec"] == original_asr["spec"]
+                    and resource_version == intent_resource_version):
+                self.data["changes"][name]["phase"] = "restored"
+            elif (current_asr["spec"] == _held_spec(original_asr["spec"])
+                    and resource_version != intent_resource_version):
+                self.data["changes"][name] = {
+                    "phase": "confirmed", "resourceVersion": resource_version,
+                }
+            else:
+                raise RuntimeError("ARC capacity changed after drain intent")
+            self._save()
+
     def identity(self, *, restoring: bool = False) -> dict:
         """Reject uncertain mutations or drift in the captured resource identities."""
         self._load()
+        self._reconcile_drain_intents()
         if restoring:
             self._reconcile_cleanup_intents()
         self._asrs()
@@ -463,8 +488,7 @@ class ArcDrain:
     @staticmethod
     def _is_healthy_set(item: dict, *, zero=False) -> bool:
         values = [item.get("spec", {}).get("replicas", 0)]
-        values += [item.get("status", {}).get(key, None if key == "currentReplicas" else 0)
-                   for key in COUNT_KEYS]
+        values += [item.get("status", {}).get(key) for key in COUNT_KEYS]
         return all(type(value) is int and (value == 0 if zero else value >= 0) for value in values)
 
     def _is_active_runner(self, pod: dict) -> bool:

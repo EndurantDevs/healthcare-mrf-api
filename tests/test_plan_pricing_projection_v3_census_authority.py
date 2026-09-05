@@ -30,6 +30,7 @@ from tests.test_plan_pricing_projection_v3_census_contract import (
         lambda envelope: envelope.update(timed_out=True),
         lambda envelope: envelope.update(post_child_fence_verified=False),
         lambda envelope: envelope["cleanup"].update(complete=False),
+        lambda envelope: envelope["cleanup"].update(arc_capacity_restored=False),
         lambda envelope: envelope.update(reviewed_source_sha="d" * 40),
     ],
 )
