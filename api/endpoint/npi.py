@@ -33,6 +33,10 @@ from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
                               INTERNAL_PROCEDURE_CODE_SYSTEM,
                               INTERNAL_RX_CODE_SYSTEM)
 from api.endpoint.pagination import parse_pagination
+from api.npi_detail_cache_identity import (
+    NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
+    npi_detail_cache_key as _format_npi_detail_cache_key,
+)
 from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
@@ -1193,47 +1197,15 @@ ADDRESS_GROUPING_PREMISE = "premise"
 ADDRESS_GROUPING_VALUES = {ADDRESS_GROUPING_FLAT, ADDRESS_GROUPING_PREMISE}
 
 
-@dataclass(frozen=True)
-class _NpiDetailCacheIdentity:
-    npi: int
-    view: str
-    include_chain: bool
-    extra_info: bool
-    sync_geocode: bool
-    lookup_stored_geocode: bool
-    include_sources: bool = False
-    include_evidence: bool = False
-    include_profile: bool = True
-    profile_generation: str | None = None
-    profile_serving_identity: str | None = None
-    address_overlay_serving_identity: str | None = None
-    canonical_publication_identity: str | None = None
-    address_limit: int | None = None
-    address_offset: int = 0
-    include_address_total: bool = True
-    address_key: str | None = None
-    address_site_key: str | None = None
-    address_grouping: str = ADDRESS_GROUPING_FLAT
-
-
 def _npi_detail_cache_key(identity: _NpiDetailCacheIdentity) -> str:
-    schema = _runtime_db_schema()
-    address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
-    return (
-        f"{schema}|{address_source}|{int(identity.npi)}|{identity.view}|"
-        f"{'chain' if identity.include_chain else 'default'}|"
-        f"extra:{int(identity.extra_info)}|"
-        f"{'sync_geo' if identity.sync_geocode else 'stored_geo'}|"
-        f"{'archive_geo' if identity.lookup_stored_geocode else 'no_archive_geo'}|"
-        f"sources:{int(identity.include_sources)}|evidence:{int(identity.include_evidence)}|"
-        f"profile:{int(identity.include_profile)}|pgen:{identity.profile_generation or 'none'}|"
-        f"pserve:{identity.profile_serving_identity or 'unknown'}|"
-        f"pdaddr:{identity.address_overlay_serving_identity or 'unknown'}|"
-        f"npipub:{identity.canonical_publication_identity or 'untracked'}|"
-        f"alim:{identity.address_limit if identity.address_limit is not None else 'all'}|"
-        f"aoff:{int(identity.address_offset or 0)}|atotal:{int(identity.include_address_total)}|"
-        f"akey:{identity.address_key or 'none'}|"
-        f"askey:{identity.address_site_key or 'none'}|agroup:{identity.address_grouping}"
+    address_source = os.getenv(
+        ADDRESS_SERVING_SOURCE_ENV,
+        ADDRESS_SERVING_SOURCE_UNIFIED,
+    ).strip().lower()
+    return _format_npi_detail_cache_key(
+        identity,
+        schema=_runtime_db_schema(),
+        address_source=address_source,
     )
 
 

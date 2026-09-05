@@ -663,18 +663,13 @@ async def _validate_candidate_provider_counts(
         )
 
 
-async def _validate_snapshot_source_dictionary(
+async def _snapshot_source_keys(
     session: Any,
     *,
     schema_name: str,
     logical_snapshot_id: str,
-    source_count: int,
-    required_source_keys: Iterable[int],
     corruption_error: type[RuntimeError] = RuntimeError,
-) -> None:
-    normalized_source_count = int(source_count)
-    if normalized_source_count <= 0:
-        raise corruption_error("strict V3 audit requires a positive source_count")
+) -> list[int]:
     schema = _quote_ident(schema_name)
     source_key_result = await session.execute(
         db.text(
@@ -700,6 +695,29 @@ async def _validate_snapshot_source_dictionary(
                 "strict V3 audit snapshot source dictionary contains invalid source keys"
             ) from exc
         observed_source_keys.append(source_key)
+    return observed_source_keys
+
+
+async def _validate_snapshot_source_dictionary(
+    session: Any,
+    *,
+    schema_name: str,
+    logical_snapshot_id: str,
+    source_count: int,
+    required_source_keys: Iterable[int],
+    corruption_error: type[RuntimeError] = RuntimeError,
+) -> None:
+    """Require a complete source dictionary covering every audit occurrence."""
+
+    normalized_source_count = int(source_count)
+    if normalized_source_count <= 0:
+        raise corruption_error("strict V3 audit requires a positive source_count")
+    observed_source_keys = await _snapshot_source_keys(
+        session,
+        schema_name=schema_name,
+        logical_snapshot_id=logical_snapshot_id,
+        corruption_error=corruption_error,
+    )
     if len(observed_source_keys) != normalized_source_count or any(
         source_key != index
         for index, source_key in enumerate(observed_source_keys)
@@ -1744,6 +1762,29 @@ async def sealed_audit_sample_metadata(
     return metadata
 
 
+async def sealed_or_published_audit_metadata(
+    session: Any,
+    *,
+    sealed: Any,
+    schema_name: str,
+    logical_snapshot_id: str,
+    expected_generation: str,
+    published_metadata: Mapping[str, Any],
+    sealed_metadata_loader: Any = sealed_audit_sample_metadata,
+) -> dict[str, Any]:
+    """Return persisted metadata for reuse or the metadata just published."""
+
+    if not sealed.reused:
+        return dict(published_metadata)
+    return await sealed_metadata_loader(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(sealed.snapshot_key),
+        logical_snapshot_id=str(logical_snapshot_id),
+        expected_generation=expected_generation,
+    )
+
+
 async def _sealed_layout_manifest(
     session: Any,
     *,
@@ -1932,4 +1973,5 @@ __all__ = [
     "persisted_audit_sample_digest",
     "publish_shared_audit_sample",
     "sealed_audit_sample_metadata",
+    "sealed_or_published_audit_metadata",
 ]

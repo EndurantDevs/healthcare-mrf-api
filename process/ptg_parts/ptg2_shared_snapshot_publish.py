@@ -45,6 +45,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_audit import (
     publish_shared_audit_sample,
     sealed_audit_sample_metadata,
+    sealed_or_published_audit_metadata,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
     PTG2_V3_DURABLE_SCRATCH_DURABILITY,
@@ -111,6 +112,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
     normalized_full_rebuild_scope_digest,
+    shared_layout_support_digest,
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
@@ -5142,45 +5144,13 @@ def _physical_serving_index(
     return serving_index
 
 
-def _shared_layout_support_digest(
-    *,
-    core_support: Mapping[str, Any],
-    audit_sample: Mapping[str, Any],
-    source_witness: Mapping[str, Any],
-    full_rebuild_scope_digest: str | None = None,
-) -> bytes:
-    """Seal support metadata, optionally isolating one controlled rebuild."""
-
-    support_by_field = {
-        **dict(core_support),
-        "audit_sample": dict(audit_sample),
-        "source_witness": dict(source_witness),
-    }
-    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
-        full_rebuild_scope_digest
-    )
-    if normalized_rebuild_digest is not None:
-        support_by_field["full_rebuild_scope_digest"] = normalized_rebuild_digest
-    return shared_support_digest(support_by_field)
-
-
 async def _sealed_or_published_audit_metadata(
-    session: Any,
-    *,
-    sealed: Any,
-    schema_name: str,
-    logical_snapshot_id: str,
-    expected_generation: str,
-    published_metadata: Mapping[str, Any],
+    session: Any, **metadata_by_field: Any
 ) -> dict[str, Any]:
-    if not sealed.reused:
-        return dict(published_metadata)
-    return await sealed_audit_sample_metadata(
+    return await sealed_or_published_audit_metadata(
         session,
-        schema_name=schema_name,
-        snapshot_key=int(sealed.snapshot_key),
-        logical_snapshot_id=str(logical_snapshot_id),
-        expected_generation=expected_generation,
+        sealed_metadata_loader=sealed_audit_sample_metadata,
+        **metadata_by_field,
     )
 
 
@@ -5755,7 +5725,7 @@ async def _publish_prepared_shared_layout(
                 published_rows=int(audit_publication.row_count),
             )
         await touch_build()
-        support_digest = _shared_layout_support_digest(
+        support_digest = shared_layout_support_digest(
             core_support=core_support_map,
             audit_sample=audit_publication.metadata,
             source_witness=source_witness_publication.metadata,

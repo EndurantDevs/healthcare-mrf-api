@@ -2182,12 +2182,11 @@ def _record_quarantined_provider_identifier(
     counts[value] += 1
 
 
-def _provider_identifier_quarantine_v2_payload(
+def _quarantined_provider_identifier_entries(
     counts: Mapping[int, int],
     text_counts: Mapping[tuple[str, int], int],
-    provider_group_definition_conflicts: Mapping[str, Collection[str]],
-) -> dict[str, Any]:
-    digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
+    digest: Any,
+) -> tuple[list[dict[str, Any]], int]:
     entries: list[dict[str, Any]] = []
     occurrence_count = 0
     for identifier, count in sorted(counts.items()):
@@ -2232,6 +2231,27 @@ def _provider_identifier_quarantine_v2_payload(
         raise ValueError(
             "provider identifier quarantine occurrence count overflows uint64"
         )
+    return entries, occurrence_count
+
+
+def _update_provider_group_conflict_digest(
+    digest: Any,
+    provider_group_id_sha256: str,
+    definitions: Collection[str],
+) -> None:
+    digest.update(b"provider_group_definition_conflict\0")
+    digest.update(provider_group_id_sha256.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(len(definitions).to_bytes(8, "big"))
+    for definition_sha256 in definitions:
+        digest.update(definition_sha256.encode("ascii"))
+        digest.update(b"\0")
+
+
+def _provider_group_conflict_entries(
+    provider_group_definition_conflicts: Mapping[str, Collection[str]],
+    digest: Any,
+) -> tuple[list[dict[str, Any]], int]:
     canonical_conflicts: list[dict[str, Any]] = []
     conflicting_definition_count = 0
     if len(provider_group_definition_conflicts) > MAX_PROVIDER_GROUP_CONFLICTS:
@@ -2267,19 +2287,39 @@ def _provider_identifier_quarantine_v2_payload(
             > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
         ):
             raise ValueError("provider group conflicts exceed 4096 definitions")
-        digest.update(b"provider_group_definition_conflict\0")
-        digest.update(provider_group_id_sha256.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(len(definitions).to_bytes(8, "big"))
-        for definition_sha256 in definitions:
-            digest.update(definition_sha256.encode("ascii"))
-            digest.update(b"\0")
+        _update_provider_group_conflict_digest(
+            digest,
+            provider_group_id_sha256,
+            definitions,
+        )
         canonical_conflicts.append(
             {
                 "provider_group_id_sha256": provider_group_id_sha256,
                 "definition_sha256": definitions,
             }
         )
+    return canonical_conflicts, conflicting_definition_count
+
+
+def _provider_identifier_quarantine_v2_payload(
+    counts: Mapping[int, int],
+    text_counts: Mapping[tuple[str, int], int],
+    provider_group_definition_conflicts: Mapping[str, Collection[str]],
+) -> dict[str, Any]:
+    """Return canonical V2 evidence for malformed IDs and group conflicts."""
+
+    digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
+    entries, occurrence_count = _quarantined_provider_identifier_entries(
+        counts,
+        text_counts,
+        digest,
+    )
+    canonical_conflicts, conflicting_definition_count = (
+        _provider_group_conflict_entries(
+            provider_group_definition_conflicts,
+            digest,
+        )
+    )
     return {
         "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
         "occurrence_count": occurrence_count,
@@ -3261,7 +3301,26 @@ class SourceIndex:
             state.provider_group_scopes,
         )
 
-    def _record_provider_reference_scope(
+    def _clear_provider_reference_membership(
+        self,
+        spec: SourceSpec,
+        state: ProviderReferenceState,
+    ) -> None:
+        assert state.reference_id is not None
+        for table_name, metric_name in (
+            ("provider_ref_npi", "provider_reference_npis"),
+            ("provider_ref_network_name", "provider_reference_network_names"),
+            ("provider_ref_tin_marker", None),
+        ):
+            cursor = self.connection.execute(
+                f"DELETE FROM {table_name} WHERE file_id = ? AND ref_id = ?",
+                (spec.file_id, state.reference_id),
+            )
+            if metric_name is not None:
+                self.metrics[metric_name] -= max(cursor.rowcount, 0)
+            self._mark_write()
+
+    def _is_provider_reference_scope_usable(
         self,
         spec: SourceSpec,
         state: ProviderReferenceState,
@@ -3318,18 +3377,7 @@ class SourceIndex:
         }
         self._provider_group_conflicting_definition_count += 2
         self.metrics["provider_group_conflicts"] += 1
-        for table_name, metric_name in (
-            ("provider_ref_npi", "provider_reference_npis"),
-            ("provider_ref_network_name", "provider_reference_network_names"),
-            ("provider_ref_tin_marker", None),
-        ):
-            cursor = self.connection.execute(
-                f"DELETE FROM {table_name} WHERE file_id = ? AND ref_id = ?",
-                (spec.file_id, state.reference_id),
-            )
-            if metric_name is not None:
-                self.metrics[metric_name] -= max(cursor.rowcount, 0)
-            self._mark_write()
+        self._clear_provider_reference_membership(spec, state)
         return False
 
     def _persist_provider_reference(
@@ -3341,7 +3389,7 @@ class SourceIndex:
 
         assert state.current_ordinal is not None
         assert state.reference_id is not None
-        if not self._record_provider_reference_scope(spec, state):
+        if not self._is_provider_reference_scope_usable(spec, state):
             return
         has_tin_marker = bool(
             self.connection.execute(
@@ -3413,6 +3461,34 @@ class SourceIndex:
         except (OSError, EOFError, ValueError, ijson.JSONError) as exc:
             raise SourceFormatError(f"provider_reference_parse:{type(exc).__name__}") from exc
 
+    def _is_provider_network_name_event_consumed(
+        self,
+        spec: SourceSpec,
+        state: ProviderReferenceState,
+        *,
+        base_prefix: str,
+        prefix: str,
+        event: str,
+        raw_value: Any,
+    ) -> bool:
+        network_name_prefix = f"{base_prefix}.network_name"
+        if prefix == network_name_prefix:
+            if event in {"start_array", "end_array"}:
+                return True
+            if event == "string":
+                self._capture_provider_reference_network_name(spec, state, raw_value)
+                return True
+            if event in SCALAR_EVENTS or event == "start_map":
+                self.metrics["invalid_field_types"] += 1
+                return True
+        if prefix != f"{network_name_prefix}.item":
+            return False
+        if event == "string":
+            self._capture_provider_reference_network_name(spec, state, raw_value)
+        elif event in SCALAR_EVENTS or event in {"start_map", "start_array"}:
+            self.metrics["invalid_field_types"] += 1
+        return True
+
     def _consume_provider_reference_event(
         self,
         spec: SourceSpec,
@@ -3422,6 +3498,8 @@ class SourceIndex:
         event: str,
         raw_value: Any,
     ) -> None:
+        """Consume one streamed provider-reference event into staged state."""
+
         if prefix == base_prefix and event == "start_map":
             self._start_provider_reference(spec, state)
             return
@@ -3459,25 +3537,14 @@ class SourceIndex:
         ):
             self._capture_provider_reference_npi(spec, state, event, raw_value)
             return
-        network_name_prefix = f"{base_prefix}.network_name"
-        if prefix == network_name_prefix:
-            if event in {"start_array", "end_array"}:
-                return
-            if event == "string":
-                self._capture_provider_reference_network_name(spec, state, raw_value)
-                return
-            if event in SCALAR_EVENTS or event in {"start_map"}:
-                self.metrics["invalid_field_types"] += 1
-                return
-        if prefix == f"{network_name_prefix}.item":
-            if event == "string":
-                self._capture_provider_reference_network_name(
-                    spec,
-                    state,
-                    raw_value,
-                )
-            elif event in SCALAR_EVENTS or event in {"start_map", "start_array"}:
-                self.metrics["invalid_field_types"] += 1
+        if self._is_provider_network_name_event_consumed(
+            spec,
+            state,
+            base_prefix=base_prefix,
+            prefix=prefix,
+            event=event,
+            raw_value=raw_value,
+        ):
             return
         if prefix == base_prefix and event == "end_map":
             self._finish_provider_reference(spec, state)
@@ -4335,7 +4402,7 @@ class SourceIndex:
         return sampler.values()
 
     def _provider_group_definition_conflicts(self) -> dict[str, set[str]]:
-        conflicts: dict[str, set[str]] = {}
+        definition_digests_by_conflict_id: dict[str, set[str]] = {}
         for (file_id, ref_id), definitions in sorted(
             self.provider_group_definition_conflicts.items()
         ):
@@ -4343,8 +4410,10 @@ class SourceIndex:
                 self.raw_container_sha256_by_file_id[file_id],
                 ref_id,
             )
-            conflicts.setdefault(conflict_id, set()).update(definitions)
-        return conflicts
+            definition_digests_by_conflict_id.setdefault(conflict_id, set()).update(
+                definitions
+            )
+        return definition_digests_by_conflict_id
 
     def source_report(self) -> dict[str, Any]:
         """Return redacted source coverage and temporary-index measurements."""

@@ -31,10 +31,9 @@ def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
     return (error,)
 
 
-def ptg_failure_error(error: BaseException) -> dict[str, Any]:
-    """Classify one possibly grouped PTG failure for lifecycle storage."""
-
-    error_leaves = _exception_leaves(error)
+def _integrity_failure_payload(
+    error_leaves: tuple[BaseException, ...],
+) -> dict[str, Any] | None:
     witness_budget_error = next(
         (
             error_leaf
@@ -79,6 +78,16 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
             "message": str(reusable_layout_audit_error),
             "retryable": False,
         }
+    return None
+
+
+def ptg_failure_error(error: BaseException) -> dict[str, Any]:
+    """Classify one possibly grouped PTG failure for lifecycle storage."""
+
+    error_leaves = _exception_leaves(error)
+    integrity_failure = _integrity_failure_payload(error_leaves)
+    if integrity_failure is not None:
+        return integrity_failure
     frozen_failure = frozen_rate_failure_payload(error_leaves)
     if frozen_failure is not None:
         return frozen_failure

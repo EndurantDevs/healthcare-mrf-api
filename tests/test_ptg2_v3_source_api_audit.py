@@ -280,13 +280,37 @@ def test_source_index_strictly_validates_procedure_and_network_metadata_types(
         )
 
 
-def test_source_index_unions_same_scope_provider_reference_fragments(tmp_path):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    tin = {"type": " EIN ", "value": "00-000-0001"}
-    payload["provider_references"][0]["provider_groups"] = [
-        {"npi": [NPIS[0]], "tin": tin}
+def _conflicting_provider_reference_definitions(
+    provider_group_id: int,
+    first_npi: int,
+    first_tin_suffix: int,
+    second_npi: int,
+    second_tin_suffix: int,
+):
+    return [
+        {
+            "provider_group_id": provider_group_id,
+            "provider_groups": [
+                {
+                    "npi": [npi],
+                    "tin": {"type": "ein", "value": f"00000000{tin_suffix}"},
+                }
+            ],
+        }
+        for npi, tin_suffix in (
+            (first_npi, first_tin_suffix),
+            (second_npi, second_tin_suffix),
+        )
     ]
-    payload["provider_references"].append(
+
+
+def test_source_index_unions_same_scope_provider_reference_fragments(tmp_path):
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    tax_identity_by_field = {"type": " EIN ", "value": "00-000-0001"}
+    source_document["provider_references"][0]["provider_groups"] = [
+        {"npi": [NPIS[0]], "tin": tax_identity_by_field}
+    ]
+    source_document["provider_references"].append(
         {
             "provider_group_id": 7,
             "provider_groups": [
@@ -301,7 +325,7 @@ def test_source_index_unions_same_scope_provider_reference_fragments(tmp_path):
         tmp_path / "source.json",
         references_before=True,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
 
     with _open_source_index(tmp_path, source_path) as index:
@@ -317,35 +341,18 @@ def test_source_index_quarantines_unreferenced_cross_scope_provider_id(
     tmp_path,
     reverse,
 ):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    conflicting_definitions = [
-        {
-            "provider_group_id": 99,
-            "provider_groups": [
-                {
-                    "npi": [NPIS[0]],
-                    "tin": {"type": "ein", "value": "00-000-0001"},
-                }
-            ],
-        },
-        {
-            "provider_group_id": 99,
-            "provider_groups": [
-                {
-                    "npi": [NPIS[1]],
-                    "tin": {"type": "ein", "value": "00-000-0002"},
-                }
-            ],
-        },
-    ]
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    conflicting_definitions = _conflicting_provider_reference_definitions(
+        99, NPIS[0], 1, NPIS[1], 2
+    )
     if reverse:
         conflicting_definitions.reverse()
-    payload["provider_references"].extend(conflicting_definitions)
+    source_document["provider_references"].extend(conflicting_definitions)
     source_path = _write_source_fixture(
         tmp_path / "unreferenced-conflict.json",
         references_before=True,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
     specs = audit.source_specs([source_path])
 
@@ -361,7 +368,7 @@ def test_source_index_quarantines_unreferenced_cross_scope_provider_id(
             (specs[0].file_id,),
         ).fetchall()
         assert conflict_npis == []
-        assert [int(row["npi"]) for row in baseline_npis] == list(NPIS[:2])
+        assert [int(database_row["npi"]) for database_row in baseline_npis] == list(NPIS[:2])
         quarantine = index.source_report()["provider_identifier_quarantine"]
         assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v2"
         assert quarantine["occurrence_count"] == 0
@@ -391,14 +398,14 @@ def test_source_index_quarantines_unreferenced_cross_scope_provider_id(
 
 
 def test_source_index_rejects_referenced_cross_scope_provider_id(tmp_path):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"] = [
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    source_document["provider_references"][0]["provider_groups"] = [
         {
             "npi": [NPIS[0]],
             "tin": {"type": "ein", "value": "00-000-0001"},
         }
     ]
-    payload["provider_references"].append(
+    source_document["provider_references"].append(
         {
             "provider_group_id": 7,
             "provider_groups": [
@@ -413,7 +420,7 @@ def test_source_index_rejects_referenced_cross_scope_provider_id(tmp_path):
         tmp_path / "referenced-conflict.json",
         references_before=True,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
 
     specs = audit.source_specs([source_path])
@@ -434,42 +441,19 @@ def test_source_index_rejects_referenced_cross_scope_provider_id(tmp_path):
 def test_source_index_scopes_same_conflicting_id_to_each_raw_source(tmp_path):
     source_paths = []
     for source_index, tin_suffix in enumerate((1, 3)):
-        payload = _source_document(references_before=True, duplicate_price=False)
-        payload["reporting_entity_name"] = f"synthetic source {source_index}"
-        payload["provider_references"].extend(
-            [
-                {
-                    "provider_group_id": 99,
-                    "provider_groups": [
-                        {
-                            "npi": [NPIS[0]],
-                            "tin": {
-                                "type": "ein",
-                                "value": f"00000000{tin_suffix}",
-                            },
-                        }
-                    ],
-                },
-                {
-                    "provider_group_id": 99,
-                    "provider_groups": [
-                        {
-                            "npi": [NPIS[1]],
-                            "tin": {
-                                "type": "ein",
-                                "value": f"00000000{tin_suffix + 1}",
-                            },
-                        }
-                    ],
-                },
-            ]
+        source_document = _source_document(references_before=True, duplicate_price=False)
+        source_document["reporting_entity_name"] = f"synthetic source {source_index}"
+        source_document["provider_references"].extend(
+            _conflicting_provider_reference_definitions(
+                99, NPIS[0], tin_suffix, NPIS[1], tin_suffix + 1
+            )
         )
         source_paths.append(
             _write_source_fixture(
                 tmp_path / f"source-{source_index}.json",
                 references_before=True,
                 gzip_encoded=False,
-                source_document=payload,
+                source_document=source_document,
             )
         )
     specs = audit.source_specs(source_paths)
