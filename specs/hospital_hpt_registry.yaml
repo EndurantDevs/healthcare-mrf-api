@@ -4901,7 +4901,8 @@ hospitals:
   cms_hpt_url: https://www.trihealth.com/cms-hpt.txt
 - hospital_id: hospital-001458
   name: CLOUD COUNTY HEALTH CENTER INC
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://nckmed.com/cms-hpt.txt
+  locator_name: North Central Kansas Medical Center
 - hospital_id: hospital-001459
   name: Clovis Community Medical Center
   cms_hpt_url: https://communitymedical.org/cms-hpt.txt
@@ -6235,9 +6236,11 @@ hospitals:
 - hospital_id: hospital-001853
   name: East Campus Freeman Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-001854
   name: East Campus Freeman Hospital Psych
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-001855
   name: East Cooper Medical Center
   cms_hpt_url: https://www.novanthealth.org/cms-hpt.txt
@@ -7706,9 +7709,11 @@ hospitals:
 - hospital_id: hospital-002305
   name: Freeman Fort Scott Hospital Acute Inpatient Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002306
   name: Freeman Health System - Freeman West
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002307
   name: Freeman Hospital East Campus Acute Rehab
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
@@ -7724,12 +7729,15 @@ hospitals:
 - hospital_id: hospital-002311
   name: Freeman Neosho Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002312
   name: Freeman Neosho Hospital Inpatient Critical Access
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002313
   name: Freeman Neosho Hospital Inpatient Swing Bed
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431240629_freeman-neosho-hospital_standardcharges.json
 - hospital_id: hospital-002314
   name: Freeman Regional Health Services
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -10058,7 +10066,8 @@ hospitals:
   locator_name: GIRARD MEDICAL CENTER
 - hospital_id: hospital-003007
   name: HOSPITAL DISTRICT NO 1 OF DICKINSON COUNTY KANSAS
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://mhsks.org/cms-hpt.txt
+  locator_name: Memorial Health System Abilene
 - hospital_id: hospital-003008
   name: HOSPITAL DISTRICT NO 6 OF HARPER COUNTY KANSAS
   cms_hpt_url: https://pattersonhc.org/cms-hpt.txt
@@ -11993,10 +12002,12 @@ hospitals:
   cms_hpt_url: https://lindnercenterofhope.org/cms-hpt.txt
 - hospital_id: hospital-003587
   name: Lindsborg Community Hospital
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://lindsborghospital.org/cms-hpt.txt
+  locator_name: Lindsborg Community Hospital
 - hospital_id: hospital-003588
   name: LINDSBORG COMMUNITY HOSPITAL ASSOCIATION
-  cms_hpt_url: https://srhc.com/cms-hpt.txt
+  cms_hpt_url: https://lindsborghospital.org/cms-hpt.txt
+  locator_name: Lindsborg Community Hospital
 - hospital_id: hospital-003589
   name: Linton Regional Medical Center
   cms_hpt_url: https://lintonhospital.org/cms-hpt.txt
