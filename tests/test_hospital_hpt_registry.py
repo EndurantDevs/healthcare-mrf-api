@@ -22,7 +22,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-000342": "Ashland Health Center",
     "hospital-000600": "Baptist Health Hardin",
     "hospital-000833": "Beckett Springs",
-    **dict(pair.split(":", 1) for pair in "hospital-000685:39-3714515 BMH Oktibbeha County|hospital-000825:New Orleans Hospital|hospital-000826:New Orleans Westbank Hospital|hospital-002405:Good Shepherd Rehabilitation Hospital".split("|")),
+    **dict(pair.split(":", 1) for pair in "hospital-000685:39-3714515 BMH Oktibbeha County|hospital-000825:New Orleans Hospital|hospital-000826:New Orleans Westbank Hospital".split("|")),
     "hospital-001199": "Cottonwood Springs",
     **dict(pair.split(":", 1) for pair in "hospital-001587:Corewell Health Big Rapids|hospital-001590:Corewell Health Gerber|hospital-001592:Corewell Health Greenville|hospital-001594:Corewell Health Gross Pointe|hospital-001596:Corewell Health Lakeland Niles|hospital-001597:Corewell Health Lakeland St. Joseph|hospital-001602:Corewell Health Ludington|hospital-001604:Corewell Health Reed City|hospital-001607:Corewell Health Taylor|hospital-001609:Corewell Health Trenton|hospital-001611:Corewell Health Troy|hospital-001612:Corewell Health Lakeland Watervliet|hospital-001614:Corewell Health Wayne|hospital-001616:Corewell Health Zeeland".split("|")),
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
@@ -42,6 +42,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-003240": "Jersey Community Hospital",
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
+    "hospital-005086": "Philadelphia Post-Acute Partners LLC",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
@@ -73,9 +74,9 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_901
+    assert len(registry.hospital_hpt_registry_groups()) == 6_899
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_696
+    assert sum("locator_name" in entry for entry in hospitals) == 1_698
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 107
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -135,13 +136,26 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 455
+    assert len(aliases_by_id) == 457
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
     assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
+
+
+def test_philadelphia_branding_aliases_preserve_distinct_good_shepherd_facilities():
+    """Bind one Philadelphia specialty hospital without merging distinct campuses."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
+    group = ("hospital-005086", "hospital-002405", "hospital-005085")
+    for hospital_id in group:
+        assert registry.hospital_hpt_group_ids(hospital_id) == group
+        assert hospital_by_id[hospital_id]["locator_name"] == "Philadelphia Post-Acute Partners LLC"
+    for hospital_id in ("hospital-002406", "hospital-002407"):
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
 def test_primary_childrens_campuses_use_distinct_locator_records():

@@ -8034,7 +8034,7 @@ hospitals:
 - hospital_id: hospital-002405
   name: Good Shepherd Rehabilitation
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
-  locator_name: Good Shepherd Rehabilitation Hospital
+  alias_of: hospital-005086
 - hospital_id: hospital-002406
   name: Good Shepherd Rehabilitation Hospital
   cms_hpt_url: https://www.goodshepherdrehab.org/cms-hpt.txt
@@ -16981,9 +16981,11 @@ hospitals:
 - hospital_id: hospital-005085
   name: Penn Medicine
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  alias_of: hospital-005086
 - hospital_id: hospital-005086
   name: Penn Medicine Good Shepherd Rehabilitation Specialty Hospital
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  locator_name: Philadelphia Post-Acute Partners LLC
 - hospital_id: hospital-005087
   name: Penn Medicine Princeton Health
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
