@@ -96,6 +96,28 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in _REVIEWED_LOCATOR_NAMES
     } == _REVIEWED_LOCATOR_NAMES
+    assert hospital_by_id["hospital-007141"]["name"] == "Stone County Medical Center"
+    assert {
+        hospital_id: hashlib.sha256(
+            hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
+        ).hexdigest()
+        for hospital_id in _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
+    } == _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
+    assert all(
+        {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
+        <= {
+            "alias_of", "fallback_mrf_url", "hospital_id", "name",
+            "cms_hpt_url", "locator_name", "locator_mrf_url",
+        }
+        for entry in hospitals
+    )
+
+
+def test_checked_in_registry_has_reviewed_cms_hpt_urls():
+    """Keep source-proven locator changes separate from catalog shape checks."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
     assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
         "hospital-000047", "hospital-000188", "hospital-000600", "hospital-002332",
         "hospital-005162", "hospital-005163", "hospital-006475",
@@ -119,21 +141,6 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         "https://lindsborghospital.org/cms-hpt.txt",
         "https://lindsborghospital.org/cms-hpt.txt",
     ]
-    assert hospital_by_id["hospital-007141"]["name"] == "Stone County Medical Center"
-    assert {
-        hospital_id: hashlib.sha256(
-            hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
-        ).hexdigest()
-        for hospital_id in _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
-    } == _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
-    assert all(
-        {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
-        <= {
-            "alias_of", "fallback_mrf_url", "hospital_id", "name",
-            "cms_hpt_url", "locator_name", "locator_mrf_url",
-        }
-        for entry in hospitals
-    )
 
 
 def test_checked_in_registry_has_reviewed_canonical_aliases():
