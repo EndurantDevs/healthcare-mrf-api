@@ -19,6 +19,18 @@ if name == "timeout":
     command_path = args[command_index]
     command = Path(command_path).name
     forwarded = args[command_index + 1:]
+    if command == "python3" and forwarded[0].endswith("plan_pricing_projection_v3_census_arc.py"):
+        phase = forwarded[1]
+        event("arc_" + phase)
+        if phase == "hold":
+            resource_path("arc-held").touch()
+        if os.environ.get("FAKE_ARC_FAIL") == phase:
+            raise SystemExit(1)
+        if phase == "verify" and os.environ.get("FAKE_ARC_FAIL_AFTER_CHILD") == "1" and "child" in events.read_text().splitlines():
+            raise SystemExit(1)
+        if phase == "restore":
+            resource_path("arc-held").unlink(missing_ok=True)
+        raise SystemExit(0)
     if command == "python3" and forwarded[:2] == ["-", "reviewed-child-copy"]:
         mode = os.environ.get("FAKE_REPLACE_CHILD_DURING_COPY")
         if mode:

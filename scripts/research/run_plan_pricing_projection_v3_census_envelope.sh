@@ -98,6 +98,8 @@ BINDING_REMOVED=false
 POLICY_REMOVED=false
 DRAIN_RESTORED=false
 QUOTA_REMOVED=false
+ARC_DRAIN_STARTED=false
+ARC_DRAIN_RESTORED=false
 LOCK_RELEASED=false
 CLEANUP_COMPLETE=false
 EXIT_TRAP_ACTIVE=false
@@ -453,13 +455,14 @@ render_plan() {
     'phases:' \
     '  - validate exact DEV/source/resource absence' \
     '  - acquire bounded dev-build flock' \
+    '  - fence ARC acquisition, record prior capacity, and drain native scale sets' \
     '  - create UID-bound ARC pods=0 quota, prove admission, and drain ARC naturally' \
     '  - capture and set the exact import-node drain state' \
     '  - create UID-bound engine-worker deny policy and prove denial marker' \
     '  - require scheduler=0 and three stable zero-work samples' \
     '  - require reviewed host memory, swap, and PostgreSQL tablespace headroom' \
     '  - run foreground census command under remaining deadline' \
-    '  - restore drain, remove binding and policy, remove quota, release flock'
+    '  - restore drain, remove binding and policy, remove quota, restore ARC, release flock'
   printf '%s\n' '--- quota ---'
   quota_manifest
   printf '%s\n' '--- quota server-dry-run probe ---'
@@ -892,6 +895,19 @@ print(sum(
 ' "${ARC_NAMESPACES[@]}"
 }
 
+arc_acquisition() {
+  local remaining
+  remaining=$((DEADLINE_SECONDS - (SECONDS - START_SECONDS)))
+  if [ "${EXIT_TRAP_ACTIVE}" = true ]; then
+    remaining=$((remaining - CLEANUP_RESERVE_SECONDS))
+  fi
+  [ "${remaining}" -gt 0 ] || return 124
+  timeout --foreground --signal=TERM --kill-after=2s "${remaining}s" \
+    python3 "${REPO_DIR}/scripts/research/plan_pricing_projection_v3_census_arc.py" \
+    "$1" --state "${STATE_DIR}/arc-drain.json" --owner "${OWNER_TOKEN}" \
+    --namespace "${ARC_HOLD_NAMESPACE}" --deadline-seconds "${remaining}"
+}
+
 seconds_before_cleanup() {
   printf '%s\n' "$((DEADLINE_SECONDS - (SECONDS - START_SECONDS) - CLEANUP_RESERVE_SECONDS))"
 }
@@ -1169,6 +1185,7 @@ census_inventory_absent() {
 
 verify_child_fences() {
   require_lock_held \
+    && arc_acquisition verify \
     && [ "${QUOTA_PROBE_VERIFIED}" = true ] \
     && [ "$(quota_identity)" = "${QUOTA_UID}" ] \
     && [ "$(policy_identity)" = "${POLICY_UID}" ] \
@@ -1883,6 +1900,9 @@ reconcile_ambiguous_creates() {
 }
 
 outer_fence_identities_match() {
+  if [ "${ARC_DRAIN_STARTED}" = true ]; then
+    arc_acquisition identity || return 1
+  fi
   if [ -n "${LOCK_INVOCATION_ID}" ]; then
     require_lock_held || return 1
   fi
@@ -1989,6 +2009,10 @@ cleanup_envelope() {
       }
     QUOTA_REMOVED=true
   fi
+  if [ "${ARC_DRAIN_STARTED}" = true ]; then
+    arc_acquisition restore || return 1
+    ARC_DRAIN_RESTORED=true
+  fi
   if [ "${LOCK_STARTED}" = true ]; then
     release_lock || return 1
   fi
@@ -2043,6 +2067,7 @@ write_receipt() {
   RECEIPT_POLICY_REMOVED=${POLICY_REMOVED} \
   RECEIPT_DRAIN_RESTORED=${DRAIN_RESTORED} \
   RECEIPT_QUOTA_REMOVED=${QUOTA_REMOVED} \
+  RECEIPT_ARC_DRAIN_RESTORED=${ARC_DRAIN_RESTORED} \
   RECEIPT_LOCK_RELEASED=${LOCK_RELEASED} \
   RECEIPT_CLEANUP_COMPLETE=${CLEANUP_COMPLETE} \
     python3 - "${STATE_DIR}/envelope-receipt.json.tmp" <<'PY' || return 1
@@ -2147,6 +2172,7 @@ receipt = {
         "policy_removed": optional_bool(os.environ["RECEIPT_POLICY_REMOVED"]),
         "drain_restored": optional_bool(os.environ["RECEIPT_DRAIN_RESTORED"]),
         "quota_removed": optional_bool(os.environ["RECEIPT_QUOTA_REMOVED"]),
+        "arc_capacity_restored": optional_bool(os.environ["RECEIPT_ARC_DRAIN_RESTORED"]),
         "lock_released": optional_bool(os.environ["RECEIPT_LOCK_RELEASED"]),
         "complete": optional_bool(os.environ["RECEIPT_CLEANUP_COMPLETE"]),
     },
@@ -2208,9 +2234,14 @@ run_envelope() {
   start_lock
   require_lock_held || die "build lock was not retained after acquisition"
   check_interrupted
+  log 'holding new ARC acquisition and draining native scale sets'
+  ARC_DRAIN_STARTED=true
+  arc_acquisition hold
+  check_interrupted
   log 'holding ARC admission and waiting for natural drain'
   create_quota
   prove_quota_admission
+  arc_acquisition verify
   wait_for_arc_idle
   check_interrupted
   log 'draining the supported import node'

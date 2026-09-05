@@ -100,12 +100,13 @@ def test_worker_fence_fails_closed_when_denial_never_propagates(tmp_path: Path) 
     assert "engine-worker denial policy did not propagate" in result.stderr
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "child" not in events
-    assert events[-6:] == [
+    assert events[-7:] == [
         "drain_set_false",
         "drain_read",
         "binding_delete",
         "policy_delete",
         "quota_delete",
+        "arc_restore",
         "lock_stop",
     ]
     receipt = envelope._receipt(state_root)
@@ -352,12 +353,13 @@ def test_active_engine_work_fails_before_child_and_cleans_fences(
     assert result.returncode == 1
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "child" not in events
-    assert events[-6:] == [
+    assert events[-7:] == [
         "drain_set_false",
         "drain_read",
         "binding_delete",
         "policy_delete",
         "quota_delete",
+        "arc_restore",
         "lock_stop",
     ]
     assert envelope._receipt(state_root)["cleanup"]["complete"] is True

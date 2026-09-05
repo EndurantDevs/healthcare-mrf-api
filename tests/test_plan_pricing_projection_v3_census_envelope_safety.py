@@ -64,19 +64,20 @@ def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) ->
     assert run_result.returncode == 0, run_result.stderr
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     expected_events = (
-        "lock_create quota_create quota_probe_denied drain_read drain_set_true "
-        "drain_read policy_create binding_create probe_denied capacity drain_read "
-        "child drain_read drain_set_false drain_read binding_delete policy_delete "
-        "quota_delete lock_stop"
+        "lock_create arc_hold quota_create quota_probe_denied arc_verify drain_read drain_set_true "
+        "drain_read policy_create binding_create probe_denied capacity arc_verify drain_read "
+        "child arc_verify drain_read arc_identity drain_set_false drain_read binding_delete policy_delete "
+        "quota_delete arc_restore lock_stop"
     ).split()
     assert [event for event in events if event in expected_events] == expected_events
     assert events.count("zero_sample") == 5
     capacity_index = events.index("capacity")
     child_index = events.index("child")
-    assert events[capacity_index + 1 : child_index] == ["drain_read", "zero_sample"]
+    assert events[capacity_index + 1 : child_index] == ["arc_verify", "drain_read", "zero_sample"]
     receipt = envelope._receipt(state_root)
     assert receipt["status"] == "complete"
     assert receipt["cleanup"]["complete"] is True
+    assert receipt["cleanup"]["arc_capacity_restored"] is True
     assert receipt["probe_verified"] is True
     assert receipt["quota_probe_verified"] is True
     assert receipt["pre_child_fence_verified"] is True
@@ -143,6 +144,7 @@ def test_uid_drift_retains_outer_fences(tmp_path: Path) -> None:
     assert "lock_stop" not in events
     receipt = envelope._receipt(state_root)
     assert receipt["cleanup"] == {
+        "arc_capacity_restored": False,
         "binding_removed": True,
         "complete": False,
         "drain_restored": False,
@@ -194,6 +196,7 @@ def test_quota_replacement_reenables_drain_and_retains_lock(tmp_path: Path) -> N
     assert (tmp_path / "fake-state/drain").read_text() == "true"
     receipt = envelope._receipt(state_root)
     assert receipt["cleanup"] == {
+        "arc_capacity_restored": False,
         "binding_removed": True,
         "complete": False,
         "drain_restored": False,
@@ -227,6 +230,7 @@ def test_capacity_below_any_reviewed_minimum_never_starts_child(
     assert receipt["status"] == "failed"
     assert receipt["capacity"]["verified"] is False
     assert receipt["cleanup"]["complete"] is True
+    assert receipt["cleanup"]["arc_capacity_restored"] is True
 
 
 def test_child_executable_change_during_capacity_never_starts_child(
@@ -291,6 +295,7 @@ def test_native_124_is_not_misclassified_as_owned_deadline(tmp_path: Path) -> No
     assert receipt["child_exit_code"] == 124
     assert receipt["timed_out"] is False
     assert receipt["cleanup"]["complete"] is True
+    assert receipt["cleanup"]["arc_capacity_restored"] is True
 
 
 def test_fast_nonzero_child_status_is_preserved(tmp_path: Path) -> None:
@@ -305,6 +310,7 @@ def test_fast_nonzero_child_status_is_preserved(tmp_path: Path) -> None:
     receipt = envelope._receipt(state_root)
     assert receipt["child_exit_code"] == 7
     assert receipt["cleanup"]["complete"] is True
+    assert receipt["cleanup"]["arc_capacity_restored"] is True
 
 
 def test_lingering_child_group_is_terminated_and_fails(tmp_path: Path) -> None:
@@ -319,6 +325,7 @@ def test_lingering_child_group_is_terminated_and_fails(tmp_path: Path) -> None:
     receipt = envelope._receipt(state_root)
     assert receipt["child_exit_code"] == 1
     assert receipt["cleanup"]["complete"] is True
+    assert receipt["cleanup"]["arc_capacity_restored"] is True
 
 
 def test_preexisting_resource_fails_before_any_mutation(tmp_path: Path) -> None:
