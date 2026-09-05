@@ -65,3 +65,28 @@ def test_server_cli_preserves_backend_capabilities(
         "sql_copy_from_where": copy_from_where,
         "jit": jit,
     }
+
+
+@pytest.mark.parametrize("detector", [None, lambda *_args, **_kwargs: SimpleNamespace()])
+def test_server_cli_tolerates_changed_asyncpg_private_capabilities(
+    monkeypatch, detector
+):
+    run_options_by_name = {}
+    monkeypatch.setenv("HLTHPRT_PTG_WAVE_RECEIPT_AUTHORITY_ROLE", "reader")
+    if detector is None:
+        monkeypatch.delattr(connection, "_detect_server_capabilities")
+    else:
+        monkeypatch.setattr(connection, "_detect_server_capabilities", detector)
+    monkeypatch.setattr(
+        type(main.api), "run", lambda _app, **options: run_options_by_name.update(options)
+    )
+    monkeypatch.setattr(main.logging.config, "dictConfig", lambda _config: None)
+    loop = main._new_event_loop()
+    monkeypatch.setattr(main.asyncio, "get_event_loop", lambda: loop)
+    try:
+        command_result = CliRunner().invoke(main.cli, ["server", "start"])
+    finally:
+        loop.close()
+
+    assert command_result.exit_code == 0, repr(command_result.exception)
+    assert run_options_by_name["host"] == "0.0.0.0"
