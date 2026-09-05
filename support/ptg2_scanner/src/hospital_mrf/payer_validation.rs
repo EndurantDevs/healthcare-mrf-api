@@ -114,6 +114,20 @@ fn payer_has_charge(payer: &PayerChargeRow) -> bool {
         || payer.estimated_amount.is_some()
 }
 
+fn is_explicitly_uncontracted_csv_payer(payer: &PayerChargeRow) -> bool {
+    !payer.payer_name.trim().is_empty()
+        && payer.plan_name.trim().is_empty()
+        && !payer_has_charge(payer)
+        && payer.median_amount.is_none()
+        && payer.percentile_10.is_none()
+        && payer.percentile_90.is_none()
+        && payer.allowed_count.is_none()
+        && payer.methodology.trim().is_empty()
+        && payer.additional_payer_notes.as_deref().is_some_and(|notes| {
+            notes.trim() == "NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE"
+        })
+}
+
 fn validate_charge_free_csv_payer(payer: &PayerChargeRow) -> io::Result<()> {
     let methodology = optional_text(&payer.methodology)
         .map(|value| canonical_methodology(&value, true))

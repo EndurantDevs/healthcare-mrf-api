@@ -2069,12 +2069,15 @@ hospitals:
 - hospital_id: hospital-000617
   name: Baptist Health Medical Plaza at Brickell Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000618
   name: Baptist Health Medical Plaza at Coral Gables Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000619
   name: Baptist Health Medical Plaza at Coral Springs Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000620
   name: Baptist Health Medical Plaza at Country Walk Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2082,12 +2085,15 @@ hospitals:
 - hospital_id: hospital-000621
   name: Baptist Health Medical Plaza at Davie Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000622
   name: Baptist Health Medical Plaza at Doral Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000623
   name: Baptist Health Medical Plaza at Miami Lakes Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000624
   name: Baptist Health Medical Plaza at Palmetto Bay Urgent Care (relocating)
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2095,6 +2101,7 @@ hospitals:
 - hospital_id: hospital-000625
   name: Baptist Health Medical Plaza at Pembroke Pines Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000626
   name: Baptist Health Medical Plaza at Tamiami Trail Urgent Care
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2156,6 +2163,7 @@ hospitals:
 - hospital_id: hospital-000642
   name: Baptist Health Urgent Care at Downtown Doral
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000643
   name: Baptist Health Urgent Care at Kendale Lakes
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2163,6 +2171,7 @@ hospitals:
 - hospital_id: hospital-000644
   name: Baptist Health Urgent Care At Miami Beach
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000645
   name: Baptist Health Urgent Care at Pinecrest
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2170,15 +2179,19 @@ hospitals:
 - hospital_id: hospital-000646
   name: Baptist Health Urgent Care at Plantation
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000647
   name: Baptist Health Urgent Care at Sunrise
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000648
   name: Baptist Health Urgent Care at University Centre
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000649
   name: Baptist Health Urgent Care at Weston
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/590872594_south-miami-hospital_standardcharges.zip
 - hospital_id: hospital-000650
   name: Baptist Health Urgent Care Palmetto Bay
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2969,12 +2982,15 @@ hospitals:
 - hospital_id: hospital-000879
   name: Bethesda Center for Pediatric Development
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/592447554_bethesda-hospital_standardcharges.zip
 - hospital_id: hospital-000880
   name: Bethesda Center for Pediatric Development DBA Bethesda Health Outpatient Rehabilitation
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/592447554_bethesda-hospital_standardcharges.zip
 - hospital_id: hospital-000881
   name: Bethesda Health Outpatient Rehabilitation
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/592447554_bethesda-hospital_standardcharges.zip
 - hospital_id: hospital-000882
   name: Bethesda Hospital Butler Co.
   cms_hpt_url: https://www.trihealth.com/cms-hpt.txt
@@ -5435,6 +5451,7 @@ hospitals:
 - hospital_id: hospital-001617
   name: Cornell Institute for Rehabilitation Medicine
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
+  locator_mrf_url: https://baptisthealth.net/-/media/Documents/Patient-Resources/Patient-Pricing/Apr-2026/592447554_bethesda-hospital_standardcharges.zip
 - hospital_id: hospital-001618
   name: Cornerstone Hospital Conroe
   cms_hpt_url: https://cornerstonehospitals.com/cms-hpt.txt
@@ -10005,18 +10022,23 @@ hospitals:
 - hospital_id: hospital-002998
   name: HOS00114-06
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-002999
   name: HOS00114-13
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-003000
   name: HOS00114-29
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-003001
   name: HOS00114-31
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-003002
   name: HOS00114-32
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-003003
   name: Hospital Authority of Ben Hill dba Dorminy Medical Center
   cms_hpt_url: https://dorminymedical.org/cms-hpt.txt
@@ -11356,6 +11378,7 @@ hospitals:
 - hospital_id: hospital-003402
   name: Kingwood Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
+  locator_mrf_url: https://memorialhermann.org/-/media/memorial-hermann/org/files/patients-and-visitors/cms-standard-hospital-charges/741152597_memorial-hermann-northeast-hospital_standardcharges.ashx
 - hospital_id: hospital-003403
   name: Kiowa County Memorial Hospital
   cms_hpt_url: https://kcmh.net/cms-hpt.txt
@@ -11745,6 +11768,7 @@ hospitals:
 - hospital_id: hospital-003518
   name: League City Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
+  locator_mrf_url: https://memorialhermann.org/-/media/memorial-hermann/org/files/patients-and-visitors/cms-standard-hospital-charges/741152597_memorial-hermann-southeast-hospital_standardcharges.ashx
 - hospital_id: hospital-003519
   name: Leahi Hospital
   cms_hpt_url: https://leahi.hhsc.org/cms-hpt.txt
@@ -14120,6 +14144,7 @@ hospitals:
 - hospital_id: hospital-004232
   name: MH 24 HR Emergency Center
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
+  locator_mrf_url: https://memorialhermann.org/-/media/memorial-hermann/org/files/patients-and-visitors/cms-standard-hospital-charges/741152597_memorial-hermann-the-woodlands-medical-center_standardcharges.ashx
 - hospital_id: hospital-004233
   name: Miami Beach Main Campus
   cms_hpt_url: https://www.msmc.com/cms-hpt.txt
@@ -15864,6 +15889,7 @@ hospitals:
 - hospital_id: hospital-004749
   name: Oceans Behavioral Hospital of Broussard
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
+  locator_name: Ochsner Behavioral Health Acadiana - Broussard
 - hospital_id: hospital-004750
   name: Oceans Behavioral Hospital of Corpus Christi
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
@@ -15894,6 +15920,7 @@ hospitals:
 - hospital_id: hospital-004759
   name: Oceans Behavioral Hospital of Kentwood/Hammond
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
+  alias_of: hospital-004756
 - hospital_id: hospital-004760
   name: Oceans Behavioral Hospital of Lake Charles
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
@@ -15924,11 +15951,11 @@ hospitals:
 - hospital_id: hospital-004769
   name: Oceans Behavioral Hosptial of Baton Rouge
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
-  locator_name: Oceans Behavioral Hospital of Baton Rouge South
+  alias_of: hospital-004747
 - hospital_id: hospital-004770
   name: Oceans Behavioral Hosptial of Lake Charles
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
-  locator_name: Oceans Behavioral Hospital of Lake Charles
+  alias_of: hospital-004760
 - hospital_id: hospital-004771
   name: Ochiltree General Hospital
   cms_hpt_url: https://ochiltreehospital.com/cms-hpt.txt
@@ -19502,6 +19529,7 @@ hospitals:
 - hospital_id: hospital-005859
   name: SOUTH COUNTY HEALTH
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
+  locator_mrf_url: https://stdidsouthcountyhealprod.blob.core.windows.net/large-files/050445136_south-county-hospital_standardcharges.csv
 - hospital_id: hospital-005860
   name: South County Hospital
   cms_hpt_url: https://www.southcountyhealth.org/cms-hpt.txt
@@ -19878,6 +19906,7 @@ hospitals:
 - hospital_id: hospital-005968
   name: Spring Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
+  locator_mrf_url: https://memorialhermann.org/-/media/memorial-hermann/org/files/patients-and-visitors/cms-standard-hospital-charges/741152597_memorial-hermann-the-woodlands-medical-center_standardcharges.ashx
 - hospital_id: hospital-005969
   name: Spring Harbor Hospital
   cms_hpt_url: https://mainehealth.org/cms-hpt.txt
@@ -20942,21 +20971,27 @@ hospitals:
 - hospital_id: hospital-006286
   name: STAT Emergency Center – Laredo South
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993756029_HorizonLaredoMHLLC_standardcharges-south.csv
 - hospital_id: hospital-006287
   name: STAT Specialty Hospital – Del Rio
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993730995_HorizonDelRioLLC_standardcharges.csv
 - hospital_id: hospital-006288
   name: STAT Specialty Hospital – Eagle Pass
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993719983_HorizonEaglePassLLC_standardcharges.csv
 - hospital_id: hospital-006289
   name: STAT Specialty Hospital – Laredo North
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993756029_HorizonLaredoMHLLC_standardcharges.csv
 - hospital_id: hospital-006290
   name: Stat Specialty Hospital of Laredo-North
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993756029_HorizonLaredoMHLLC_standardcharges.csv
 - hospital_id: hospital-006291
   name: Stat Specialty Hospital of Laredo-South
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://statspecialtyhospital.com/wp-content/uploads/2026/03/993756029_HorizonLaredoMHLLC_standardcharges-south.csv
 - hospital_id: hospital-006292
   name: Staten Island University Hospital
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
@@ -21141,6 +21176,7 @@ hospitals:
 - hospital_id: hospital-006346
   name: Summer Creek Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
+  locator_mrf_url: https://memorialhermann.org/-/media/memorial-hermann/org/files/patients-and-visitors/cms-standard-hospital-charges/741152597_memorial-hermann-northeast-hospital_standardcharges.ashx
 - hospital_id: hospital-006347
   name: Summerlin Hospital Medical Center
   cms_hpt_url: https://www.summerlinhospital.com/cms-hpt.txt
