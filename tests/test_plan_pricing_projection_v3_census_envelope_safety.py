@@ -158,17 +158,17 @@ def test_plan_renders_exact_fences_without_external_commands(tmp_path: Path) -> 
     assert "failurePolicy: Fail" in result.stdout
     assert f"message: hp-pv3-census-deny-{envelope.OWNER}" in result.stdout
     probe = yaml.safe_load(result.stdout.split("--- server-dry-run probe ---\n", 1)[1])
-    pod = probe["spec"]["template"]["spec"]
-    assert pod["automountServiceAccountToken"] is False
-    assert pod["securityContext"] == {
+    probe_pod_spec = probe["spec"]["template"]["spec"]
+    assert probe_pod_spec["automountServiceAccountToken"] is False
+    assert probe_pod_spec["securityContext"] == {
         "runAsNonRoot": True,
         "runAsUser": 65534,
         "runAsGroup": 65534,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
-    worker = pod["containers"][0]
-    assert worker["imagePullPolicy"] == "IfNotPresent"
-    assert worker["securityContext"] == {
+    probe_worker = probe_pod_spec["containers"][0]
+    assert probe_worker["imagePullPolicy"] == "IfNotPresent"
+    assert probe_worker["securityContext"] == {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
     }
