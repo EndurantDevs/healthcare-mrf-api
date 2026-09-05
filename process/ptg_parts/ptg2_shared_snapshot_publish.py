@@ -5164,6 +5164,26 @@ def _shared_layout_support_digest(
     return shared_support_digest(support_by_field)
 
 
+async def _sealed_or_published_audit_metadata(
+    session: Any,
+    *,
+    sealed: Any,
+    schema_name: str,
+    logical_snapshot_id: str,
+    expected_generation: str,
+    published_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not sealed.reused:
+        return dict(published_metadata)
+    return await sealed_audit_sample_metadata(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(sealed.snapshot_key),
+        logical_snapshot_id=str(logical_snapshot_id),
+        expected_generation=expected_generation,
+    )
+
+
 async def _publish_prepared_shared_layout(
     *,
     schema_name: str,
@@ -5802,7 +5822,6 @@ async def _publish_prepared_shared_layout(
                     layout_manifest={"serving_index": provisional_serving_index},
                     progress_callback=seal_progress.add,
                 )
-                sealed_audit_metadata_map = dict(audit_publication.metadata)
             else:
                 sealed = await seal_shared_layout(
                     session,
@@ -5813,16 +5832,18 @@ async def _publish_prepared_shared_layout(
                     support_digest=support_digest,
                     layout_manifest={"serving_index": provisional_serving_index},
                 )
-                sealed_audit_metadata_map = (
-                    await sealed_audit_sample_metadata(
-                        session,
-                        schema_name=schema_name,
-                        snapshot_key=int(sealed.snapshot_key),
-                        logical_snapshot_id=str(logical_snapshot_id),
-                    )
-                    if sealed.reused
-                    else dict(audit_publication.metadata)
-                )
+            sealed_audit_metadata_map = await _sealed_or_published_audit_metadata(
+                session,
+                sealed=sealed,
+                schema_name=schema_name,
+                logical_snapshot_id=logical_snapshot_id,
+                expected_generation=(
+                    PTG2_V4_SHARED_GENERATION
+                    if provider_graph_v4
+                    else PTG2_V3_SHARED_GENERATION
+                ),
+                published_metadata=audit_publication.metadata,
+            )
         if seal_progress is not None:
             seal_progress.flush()
         record_stage("seal", stage_started_at)

@@ -280,10 +280,22 @@ def test_source_index_strictly_validates_procedure_and_network_metadata_types(
         )
 
 
-def test_source_index_rejects_duplicate_provider_reference_ids(tmp_path):
+def test_source_index_unions_same_scope_provider_reference_fragments(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
+    tin = {"type": " EIN ", "value": "00-000-0001"}
+    payload["provider_references"][0]["provider_groups"] = [
+        {"npi": [NPIS[0]], "tin": tin}
+    ]
     payload["provider_references"].append(
-        json.loads(json.dumps(payload["provider_references"][0]))
+        {
+            "provider_group_id": 7,
+            "provider_groups": [
+                {
+                    "npi": [NPIS[2]],
+                    "tin": {"type": "ein", "value": "000000001"},
+                }
+            ],
+        }
     )
     source_path = _write_source_fixture(
         tmp_path / "source.json",
@@ -292,8 +304,194 @@ def test_source_index_rejects_duplicate_provider_reference_ids(tmp_path):
         source_document=payload,
     )
 
-    with pytest.raises(audit.SourceFormatError, match="provider_reference_id_is_duplicated"):
-        _open_source_index(tmp_path, source_path)
+    with _open_source_index(tmp_path, source_path) as index:
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[2]))
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+        assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v1"
+        assert quarantine["occurrence_count"] == 0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_source_index_quarantines_unreferenced_cross_scope_provider_id(
+    tmp_path,
+    reverse,
+):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    conflicting_definitions = [
+        {
+            "provider_group_id": 99,
+            "provider_groups": [
+                {
+                    "npi": [NPIS[0]],
+                    "tin": {"type": "ein", "value": "00-000-0001"},
+                }
+            ],
+        },
+        {
+            "provider_group_id": 99,
+            "provider_groups": [
+                {
+                    "npi": [NPIS[1]],
+                    "tin": {"type": "ein", "value": "00-000-0002"},
+                }
+            ],
+        },
+    ]
+    if reverse:
+        conflicting_definitions.reverse()
+    payload["provider_references"].extend(conflicting_definitions)
+    source_path = _write_source_fixture(
+        tmp_path / "unreferenced-conflict.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+    specs = audit.source_specs([source_path])
+
+    with _open_source_index(tmp_path, source_path) as index:
+        conflict_npis = index.connection.execute(
+            """SELECT npi FROM provider_ref_npi
+               WHERE file_id = ? AND ref_id = '99' ORDER BY npi""",
+            (specs[0].file_id,),
+        ).fetchall()
+        baseline_npis = index.connection.execute(
+            """SELECT npi FROM provider_ref_npi
+               WHERE file_id = ? AND ref_id = '7' ORDER BY npi""",
+            (specs[0].file_id,),
+        ).fetchall()
+        assert conflict_npis == []
+        assert [int(row["npi"]) for row in baseline_npis] == list(NPIS[:2])
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+        assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v2"
+        assert quarantine["occurrence_count"] == 0
+        assert quarantine["entries"] == []
+        assert quarantine["provider_group_conflict_count"] == 1
+        assert quarantine["provider_group_conflicting_definition_count"] == 2
+        assert quarantine["provider_group_definition_conflicts"] == [
+            {
+                "provider_group_id_sha256": audit.provider_group_conflict_identity(
+                    specs[0].content_sha256,
+                    "99",
+                ),
+                "definition_sha256": sorted(
+                    [
+                        audit.provider_group_scope_definition_identity(
+                            [],
+                            {("ein", "000000001")},
+                        ),
+                        audit.provider_group_scope_definition_identity(
+                            [],
+                            {("ein", "000000002")},
+                        ),
+                    ]
+                ),
+            }
+        ]
+
+
+def test_source_index_rejects_referenced_cross_scope_provider_id(tmp_path):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    payload["provider_references"][0]["provider_groups"] = [
+        {
+            "npi": [NPIS[0]],
+            "tin": {"type": "ein", "value": "00-000-0001"},
+        }
+    ]
+    payload["provider_references"].append(
+        {
+            "provider_group_id": 7,
+            "provider_groups": [
+                {
+                    "npi": [NPIS[1]],
+                    "tin": {"type": "ein", "value": "00-000-0002"},
+                }
+            ],
+        }
+    )
+    source_path = _write_source_fixture(
+        tmp_path / "referenced-conflict.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    specs = audit.source_specs([source_path])
+    with audit.SourceIndex(
+        tmp_path / "source.sqlite3",
+        seed="test-seed",
+        source_occurrence_sample_target=32,
+        sqlite_cache_mb=1,
+    ) as index:
+        with pytest.raises(
+            audit.SourceFormatError,
+            match="referenced conflicting provider_group_id definition: 7",
+        ):
+            index.index(specs)
+        assert index.metrics["negotiated_rates"] == 2
+
+
+def test_source_index_scopes_same_conflicting_id_to_each_raw_source(tmp_path):
+    source_paths = []
+    for source_index, tin_suffix in enumerate((1, 3)):
+        payload = _source_document(references_before=True, duplicate_price=False)
+        payload["reporting_entity_name"] = f"synthetic source {source_index}"
+        payload["provider_references"].extend(
+            [
+                {
+                    "provider_group_id": 99,
+                    "provider_groups": [
+                        {
+                            "npi": [NPIS[0]],
+                            "tin": {
+                                "type": "ein",
+                                "value": f"00000000{tin_suffix}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "provider_group_id": 99,
+                    "provider_groups": [
+                        {
+                            "npi": [NPIS[1]],
+                            "tin": {
+                                "type": "ein",
+                                "value": f"00000000{tin_suffix + 1}",
+                            },
+                        }
+                    ],
+                },
+            ]
+        )
+        source_paths.append(
+            _write_source_fixture(
+                tmp_path / f"source-{source_index}.json",
+                references_before=True,
+                gzip_encoded=False,
+                source_document=payload,
+            )
+        )
+    specs = audit.source_specs(source_paths)
+
+    with audit.SourceIndex(
+        tmp_path / "source.sqlite3",
+        seed="test-seed",
+        source_occurrence_sample_target=32,
+        sqlite_cache_mb=1,
+    ) as index:
+        index.index(specs)
+        quarantine = index.source_report()["provider_identifier_quarantine"]
+
+    assert quarantine["provider_group_conflict_count"] == 2
+    assert quarantine["provider_group_conflicting_definition_count"] == 4
+    assert {
+        conflict["provider_group_id_sha256"]
+        for conflict in quarantine["provider_group_definition_conflicts"]
+    } == {
+        audit.provider_group_conflict_identity(spec.content_sha256, "99")
+        for spec in specs
+    }
 
 
 @pytest.mark.parametrize(
@@ -570,6 +768,8 @@ def test_source_index_quarantines_noncanonical_npi_text_without_membership(tmp_p
         quarantine = index.source_report()["provider_identifier_quarantine"]
         assert quarantine["contract"] == "ptg2_provider_identifier_quarantine_v2"
         assert quarantine["occurrence_count"] == 2
+        assert quarantine["provider_group_conflict_count"] == 0
+        assert quarantine["provider_group_definition_conflicts"] == []
         assert quarantine["entries"] == [
             {
                 "kind": "string",
@@ -578,6 +778,18 @@ def test_source_index_quarantines_noncanonical_npi_text_without_membership(tmp_p
                 "occurrence_count": 2,
             }
         ]
+
+
+def test_source_audit_combined_v2_digest_matches_scanner_contract():
+    payload = audit.provider_identifier_quarantine_payload(
+        {-1: 2},
+        collections.Counter({audit.provider_identifier_text_identity("bad"): 3}),
+        {"1" * 64: {"2" * 64, "3" * 64}},
+    )
+
+    assert payload["sha256"] == (
+        "4648d8c0bd10e0f69cd6c54d8d11a186c9f960847059855fd55fa3b76778a537"
+    )
 
 
 def test_provider_identifier_quarantine_rejects_new_identity_at_capacity():

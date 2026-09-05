@@ -10,7 +10,7 @@ use crate::tax_identity::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -335,6 +335,8 @@ const PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN: &[u8] =
     b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0";
 const PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN: &[u8] = b"PTG2_PROVIDER_IDENTIFIER_TEXT_V1\0";
 const MAX_QUARANTINED_PROVIDER_IDENTIFIERS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS: usize = 4096;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProviderIdentifierQuarantine {
@@ -461,7 +463,7 @@ impl ProviderIdentifierQuarantine {
 
     pub fn payload(&self) -> io::Result<Value> {
         if !self.occurrences_by_text_digest.is_empty() {
-            return self.payload_v2();
+            return self.payload_v2(&[]);
         }
         let mut digest = Sha256::new();
         digest.update(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN);
@@ -494,7 +496,23 @@ impl ProviderIdentifierQuarantine {
         }))
     }
 
-    fn payload_v2(&self) -> io::Result<Value> {
+    pub fn payload_with_provider_group_conflicts(
+        &self,
+        conflicts: &[(String, BTreeSet<String>)],
+    ) -> io::Result<Value> {
+        if conflicts.is_empty() {
+            return self.payload();
+        }
+        self.payload_v2(conflicts)
+    }
+
+    fn payload_v2(&self, conflicts: &[(String, BTreeSet<String>)]) -> io::Result<Value> {
+        if conflicts.len() > MAX_PROVIDER_GROUP_CONFLICTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 1024 identifiers",
+            ));
+        }
         let mut digest = Sha256::new();
         digest.update(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN);
         let mut occurrence_count = 0u64;
@@ -537,11 +555,49 @@ impl ProviderIdentifierQuarantine {
                 "occurrence_count": count,
             }));
         }
+        let mut definition_count = 0usize;
+        let mut conflict_entries = Vec::with_capacity(conflicts.len());
+        for (provider_group_id_sha256, definitions) in conflicts {
+            if definitions.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider group conflict has fewer than two definitions",
+                ));
+            }
+            definition_count = definition_count
+                .checked_add(definitions.len())
+                .filter(|count| *count <= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider group conflicts exceed 4096 definitions",
+                    )
+                })?;
+            digest.update(b"provider_group_definition_conflict\0");
+            digest.update(provider_group_id_sha256.as_bytes());
+            digest.update([0]);
+            digest.update(
+                u64::try_from(definitions.len())
+                    .expect("bounded provider definition count fits in u64")
+                    .to_be_bytes(),
+            );
+            for definition_sha256 in definitions {
+                digest.update(definition_sha256.as_bytes());
+                digest.update([0]);
+            }
+            conflict_entries.push(json!({
+                "provider_group_id_sha256": provider_group_id_sha256,
+                "definition_sha256": definitions,
+            }));
+        }
         Ok(json!({
             "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
             "occurrence_count": occurrence_count,
             "distinct_value_count": entries.len(),
             "entries": entries,
+            "provider_group_conflict_count": conflicts.len(),
+            "provider_group_conflicting_definition_count": definition_count,
+            "provider_group_definition_conflicts": conflict_entries,
             "sha256": Self::digest_hex(&digest.finalize()),
         }))
     }
@@ -1061,7 +1117,7 @@ mod tests {
         TinTokenPolicy,
     };
     use serde_json::{json, Value};
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::io;
     use std::sync::{Arc, Barrier};
 
@@ -1723,6 +1779,32 @@ mod tests {
             .record_text(&["malformed".to_string()])
             .unwrap();
         assert!(quarantine.merge(&incoming_text).is_err());
+    }
+
+    #[test]
+    fn provider_identifier_quarantine_combined_v2_matches_python_contract() {
+        let mut quarantine = ProviderIdentifierQuarantine::default();
+        quarantine.record(&[-1, -1]).unwrap();
+        quarantine
+            .record_text(&["bad".to_string(), "bad".to_string(), "bad".to_string()])
+            .unwrap();
+        let conflicts = vec![(
+            "1".repeat(64),
+            BTreeSet::from(["2".repeat(64), "3".repeat(64)]),
+        )];
+
+        let payload = quarantine
+            .payload_with_provider_group_conflicts(&conflicts)
+            .unwrap();
+
+        assert_eq!(payload["occurrence_count"], 5);
+        assert_eq!(payload["distinct_value_count"], 2);
+        assert_eq!(payload["provider_group_conflict_count"], 1);
+        assert_eq!(payload["provider_group_conflicting_definition_count"], 2);
+        assert_eq!(
+            payload["sha256"],
+            "4648d8c0bd10e0f69cd6c54d8d11a186c9f960847059855fd55fa3b76778a537"
+        );
     }
 
     #[test]

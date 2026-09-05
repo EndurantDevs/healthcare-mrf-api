@@ -583,6 +583,152 @@ fn compact_v4_command(source: &Path, output: &Path) -> Command {
     command
 }
 
+#[test]
+fn compact_cli_quarantines_only_unreferenced_provider_group_conflicts() {
+    let temporary = tempfile::tempdir().expect("temporary conflict fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    let member_base = output.join("provider-group-member.copy");
+    let mut fixture = json!({
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "111111111"},
+                    "npi": [1111111111_i64, -7_i64, "bad-a"]
+                }]
+            },
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "222222222"},
+                    "npi": [2222222222_i64, -8_i64, "bad-b"]
+                }]
+            },
+            {
+                "provider_group_id": 8,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "333333333"},
+                    "npi": [3333333333_i64]
+                }]
+            },
+            {
+                "provider_group_id": 8,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "333333333"},
+                    "npi": [4444444444_i64]
+                }]
+            }
+        ],
+        "in_network": [{
+            "billing_code_type": "CPT",
+            "billing_code": "99213",
+            "negotiation_arrangement": "ffs",
+            "negotiated_rates": [{
+                "provider_references": [8],
+                "negotiated_prices": [{
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 123.45
+                }]
+            }]
+        }]
+    });
+    fs::write(&source, serde_json::to_vec(&fixture).unwrap()).expect("write conflict fixture");
+
+    let completed = compact_v4_command(&source, &output)
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
+            &member_base,
+        )
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "1")
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1")
+        .output()
+        .expect("run conflict scanner");
+    assert!(
+        completed.status.success(),
+        "scanner failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let summaries = framed_json_records_named(&completed.stdout, "scanner_summary");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0]["provider_identifier_quarantine"]["provider_group_conflict_count"],
+        1
+    );
+    assert_eq!(
+        summaries[0]["provider_identifier_quarantine"]["occurrence_count"],
+        4
+    );
+    assert_eq!(
+        summaries[0]["provider_identifier_quarantine"]["distinct_value_count"],
+        4
+    );
+    assert_eq!(
+        summaries[0]["provider_identifier_quarantine"]["entries"][0]["occurrence_count"],
+        1
+    );
+    assert_eq!(
+        summaries[0]["provider_identifier_quarantine"]["entries"][1]["occurrence_count"],
+        1
+    );
+    let mut member_paths = fs::read_dir(&output)
+        .expect("read conflict outputs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("provider-group-member.copy."))
+        })
+        .collect::<Vec<_>>();
+    member_paths.sort_unstable();
+    let membership = member_paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read provider membership shard"))
+        .collect::<String>();
+    assert!(membership.contains("3333333333"));
+    assert!(membership.contains("4444444444"));
+    assert!(!membership.contains("1111111111"));
+    assert!(!membership.contains("2222222222"));
+
+    let group_npi = output.join("provider-group-npi.sidecar");
+    let npi_group = output.join("provider-npi-group.sidecar");
+    let npi_scope = output.join("provider-npi-scope.copy");
+    let membership_output = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .arg("--provider-membership-sidecars")
+        .args([&group_npi, &npi_group, &npi_scope])
+        .args(&member_paths)
+        .output()
+        .expect("build provider membership sidecars");
+    assert!(
+        membership_output.status.success(),
+        "membership finalizer failed: {}",
+        String::from_utf8_lossy(&membership_output.stderr)
+    );
+    let npi_scope = fs::read(npi_scope).expect("read provider NPI scope");
+    assert_eq!(npi_scope.len(), 49);
+    assert_eq!(
+        i64::from_be_bytes(npi_scope[25..33].try_into().unwrap()),
+        3_333_333_333
+    );
+    assert_eq!(
+        i64::from_be_bytes(npi_scope[39..47].try_into().unwrap()),
+        4_444_444_444
+    );
+
+    fixture["in_network"][0]["negotiated_rates"][0]["provider_references"] = json!([7]);
+    fs::write(&source, serde_json::to_vec(&fixture).unwrap())
+        .expect("write referenced conflict fixture");
+    let referenced = compact_v4_command(&source, &temporary.path().join("referenced-output"))
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "2")
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1")
+        .output()
+        .expect("run referenced conflict scanner");
+    assert!(!referenced.status.success());
+    assert!(String::from_utf8_lossy(&referenced.stderr)
+        .contains("referenced conflicting provider_group_id definition: 7"));
+}
+
 fn run_compact_v4(source: &Path, output: &Path) -> Output {
     compact_v4_command(source, output)
         .output()

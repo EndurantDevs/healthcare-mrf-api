@@ -53,7 +53,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -102,7 +102,15 @@ PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN = (
     b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0"
 )
 PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_TEXT_V1\0"
+PROVIDER_GROUP_CONFLICT_HASH_DOMAIN = (
+    b"PTG2_PROVIDER_GROUP_CONFLICT_SOURCE_ID_V1\0"
+)
+SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN = (
+    b"PTG2_SOURCE_API_AUDIT_PROVIDER_GROUP_CONFLICT_DEFINITION_V1\0"
+)
 MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES = 1_024
+MAX_PROVIDER_GROUP_CONFLICTS = 1_024
+MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS = 4_096
 AUDIT_SAMPLE_DIGEST_DOMAIN = b"PTG2V3AUDITROWS\x02"
 AUDIT_SAMPLE_DIGEST_COORDINATE_FIELDS = (
     "code_key",
@@ -230,7 +238,8 @@ CANONICALIZATION = {
     ),
     "provider_tin": (
         "a provider-group TIN object or nested TIN field marks its enclosing reference or rate; "
-        "valid NPIs do not clear the marker, and rates are counted once"
+        "valid NPIs do not clear the marker, rates are counted once, and duplicate provider IDs "
+        "union only within the same normalized network-name and TIN scope"
     ),
     "decimal": "finite base-10 value; expand exponent; remove leading/trailing insignificant zeroes; -0 becomes 0",
     "date": "strict ISO calendar date YYYY-MM-DD, emitted with date.isoformat()",
@@ -2122,6 +2131,38 @@ def provider_identifier_text_identity(value: str) -> tuple[str, int]:
     )
 
 
+def provider_group_conflict_identity(
+    raw_source_sha256: str,
+    provider_group_id: str,
+) -> str:
+    """Return the source-scoped redacted identity for one conflicting ID."""
+
+    return hashlib.sha256(
+        PROVIDER_GROUP_CONFLICT_HASH_DOMAIN
+        + bytes.fromhex(raw_source_sha256)
+        + provider_group_id.encode("ascii")
+    ).hexdigest()
+
+
+def provider_group_scope_definition_identity(
+    network_names: Collection[str],
+    provider_group_scopes: Collection[tuple[str, str]],
+) -> str:
+    """Bind the scope fields that distinguish conflicting definitions."""
+
+    payload = canonical_json(
+        {
+            "network_names": sorted(set(network_names)),
+            "provider_group_scopes": [
+                list(scope) for scope in sorted(set(provider_group_scopes))
+            ],
+        }
+    ).encode("utf-8")
+    return hashlib.sha256(
+        SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN + payload
+    ).hexdigest()
+
+
 _QuarantineKey = TypeVar("_QuarantineKey")
 
 
@@ -2144,6 +2185,7 @@ def _record_quarantined_provider_identifier(
 def _provider_identifier_quarantine_v2_payload(
     counts: Mapping[int, int],
     text_counts: Mapping[tuple[str, int], int],
+    provider_group_definition_conflicts: Mapping[str, Collection[str]],
 ) -> dict[str, Any]:
     digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN)
     entries: list[dict[str, Any]] = []
@@ -2190,11 +2232,62 @@ def _provider_identifier_quarantine_v2_payload(
         raise ValueError(
             "provider identifier quarantine occurrence count overflows uint64"
         )
+    canonical_conflicts: list[dict[str, Any]] = []
+    conflicting_definition_count = 0
+    if len(provider_group_definition_conflicts) > MAX_PROVIDER_GROUP_CONFLICTS:
+        raise ValueError("provider group conflicts exceed 1024 identifiers")
+    if any(
+        not isinstance(provider_group_id_sha256, str)
+        for provider_group_id_sha256 in provider_group_definition_conflicts
+    ):
+        raise ValueError("provider group conflict evidence is invalid")
+    for provider_group_id_sha256, raw_definitions in sorted(
+        provider_group_definition_conflicts.items()
+    ):
+        if any(not isinstance(definition, str) for definition in raw_definitions):
+            raise ValueError("provider group conflict evidence is invalid")
+        definitions = sorted(set(raw_definitions))
+        if (
+            len(provider_group_id_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in provider_group_id_sha256
+            )
+            or len(definitions) < 2
+            or any(
+                len(definition) != 64
+                or any(character not in "0123456789abcdef" for character in definition)
+                for definition in definitions
+            )
+        ):
+            raise ValueError("provider group conflict evidence is invalid")
+        conflicting_definition_count += len(definitions)
+        if (
+            conflicting_definition_count
+            > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
+        ):
+            raise ValueError("provider group conflicts exceed 4096 definitions")
+        digest.update(b"provider_group_definition_conflict\0")
+        digest.update(provider_group_id_sha256.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(len(definitions).to_bytes(8, "big"))
+        for definition_sha256 in definitions:
+            digest.update(definition_sha256.encode("ascii"))
+            digest.update(b"\0")
+        canonical_conflicts.append(
+            {
+                "provider_group_id_sha256": provider_group_id_sha256,
+                "definition_sha256": definitions,
+            }
+        )
     return {
         "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
         "occurrence_count": occurrence_count,
         "distinct_value_count": len(entries),
         "entries": entries,
+        "provider_group_conflict_count": len(canonical_conflicts),
+        "provider_group_conflicting_definition_count": conflicting_definition_count,
+        "provider_group_definition_conflicts": canonical_conflicts,
         "sha256": digest.hexdigest(),
     }
 
@@ -2202,14 +2295,20 @@ def _provider_identifier_quarantine_v2_payload(
 def provider_identifier_quarantine_payload(
     counts: Mapping[int, int],
     text_counts: Mapping[tuple[str, int], int] | None = None,
+    provider_group_definition_conflicts: Mapping[str, Collection[str]] | None = None,
 ) -> dict[str, Any]:
-    """Return redacted exact evidence for malformed NPI occurrences."""
+    """Return redacted exact evidence for malformed IDs and definition conflicts."""
 
     text_counts = text_counts or {}
+    provider_group_definition_conflicts = provider_group_definition_conflicts or {}
     if len(counts) + len(text_counts) > MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES:
         raise ValueError("provider identifier quarantine exceeds 1024 distinct values")
-    if text_counts:
-        return _provider_identifier_quarantine_v2_payload(counts, text_counts)
+    if text_counts or provider_group_definition_conflicts:
+        return _provider_identifier_quarantine_v2_payload(
+            counts,
+            text_counts,
+            provider_group_definition_conflicts,
+        )
     digest = hashlib.sha256(PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN)
     entries: list[dict[str, Any]] = []
     occurrence_count = 0
@@ -2704,6 +2803,7 @@ CREATE TABLE provider_ref_network_name (
 CREATE TABLE provider_ref_identity (
     file_id INTEGER NOT NULL,
     ref_id TEXT NOT NULL,
+    scope_sha256 TEXT NOT NULL,
     PRIMARY KEY (file_id, ref_id)
 ) WITHOUT ROWID;
 CREATE TABLE provider_ref_tin_marker (
@@ -2774,6 +2874,11 @@ class ProviderReferenceState:
     network_name_values_seen: int = 0
     npi_values_seen: int = 0
     has_zero_npi_marker: bool = False
+    provider_group_scopes: set[tuple[str, str]] = dataclasses.field(
+        default_factory=set
+    )
+    current_tin_type: str = ""
+    current_tin_value: str = ""
 
 
 @dataclass
@@ -2850,6 +2955,10 @@ class SourceIndex:
         self.quarantined_provider_identifier_texts: collections.Counter[
             tuple[str, int]
         ] = collections.Counter()
+        self.provider_group_definition_conflicts: dict[
+            tuple[int, str], set[str]
+        ] = {}
+        self._provider_group_conflicting_definition_count = 0
         self.file_metrics: dict[int, dict[str, Any]] = {}
         self.raw_container_sha256_by_file_id: dict[int, str] = {}
         self._occurrence_sample_prepared = False
@@ -2945,8 +3054,22 @@ class SourceIndex:
         for spec in specs:
             self._index_in_network(spec)
             self.connection.commit()
+        self._validate_unreferenced_provider_group_conflicts()
         self.connection.execute("ANALYZE")
         self.connection.commit()
+
+    def _validate_unreferenced_provider_group_conflicts(self) -> None:
+        for file_id, ref_id in sorted(self.provider_group_definition_conflicts):
+            is_referenced = self.connection.execute(
+                """SELECT 1 FROM rate_provider_ref
+                   WHERE file_id = ? AND ref_id = ? LIMIT 1""",
+                (file_id, ref_id),
+            ).fetchone()
+            if is_referenced is not None:
+                raise SourceFormatError(
+                    "referenced conflicting provider_group_id definition: "
+                    f"{ref_id}"
+                )
 
     def _start_provider_reference(
         self,
@@ -2957,6 +3080,9 @@ class SourceIndex:
         state.current_ordinal = state.ordinal
         state.reference_id = None
         state.network_name_values_seen = 0
+        state.provider_group_scopes.clear()
+        state.current_tin_type = ""
+        state.current_tin_value = ""
         self.metrics["provider_reference_records"] += 1
         self.file_metrics[spec.file_id]["provider_reference_records"] += 1
 
@@ -3027,6 +3153,36 @@ class SourceIndex:
             self.metrics["provider_reference_tin_markers"] += 1
             self._mark_write()
 
+    @staticmethod
+    def _normalized_tin_type(event: str, raw_value: Any) -> str:
+        value = canonical_scalar(raw_value) if event in SCALAR_EVENTS else None
+        return (value or "").lower()
+
+    @staticmethod
+    def _normalized_tin_value(event: str, raw_value: Any) -> str:
+        value = canonical_scalar(raw_value) if event in SCALAR_EVENTS else None
+        return "".join(
+            character
+            for character in (value or "")
+            if character.isascii() and character.isalnum()
+        ).upper()
+
+    def _finish_provider_group_scope(
+        self,
+        state: ProviderReferenceState,
+    ) -> None:
+        scope = (state.current_tin_type, state.current_tin_value)
+        if (
+            scope not in state.provider_group_scopes
+            and len(state.provider_group_scopes) >= self.max_list_values
+        ):
+            raise SourceCoverageError(
+                "provider_reference_scopes_exceed_configured_limit"
+            )
+        state.provider_group_scopes.add(scope)
+        state.current_tin_type = ""
+        state.current_tin_value = ""
+
     def _capture_provider_reference_network_name(
         self,
         spec: SourceSpec,
@@ -3090,6 +3246,92 @@ class SourceIndex:
             self._mark_write()
         return inserted_count
 
+    def _pending_provider_scope_sha256(
+        self,
+        spec: SourceSpec,
+        state: ProviderReferenceState,
+    ) -> str:
+        pending_names = self.connection.execute(
+            """SELECT network_name FROM provider_ref_network_name_pending
+               WHERE file_id = ? AND ref_ordinal = ? ORDER BY network_name""",
+            (spec.file_id, state.current_ordinal),
+        )
+        return provider_group_scope_definition_identity(
+            [str(row["network_name"]) for row in pending_names],
+            state.provider_group_scopes,
+        )
+
+    def _record_provider_reference_scope(
+        self,
+        spec: SourceSpec,
+        state: ProviderReferenceState,
+    ) -> bool:
+        """Record one scope and return whether its aggregate remains usable."""
+
+        assert state.reference_id is not None
+        scope_sha256 = self._pending_provider_scope_sha256(spec, state)
+        identity = self.connection.execute(
+            """SELECT scope_sha256 FROM provider_ref_identity
+               WHERE file_id = ? AND ref_id = ?""",
+            (spec.file_id, state.reference_id),
+        ).fetchone()
+        if identity is None:
+            self.connection.execute(
+                """INSERT INTO provider_ref_identity(file_id, ref_id, scope_sha256)
+                   VALUES (?, ?, ?)""",
+                (spec.file_id, state.reference_id, scope_sha256),
+            )
+            self._mark_write()
+            return True
+        conflict_key = (spec.file_id, state.reference_id)
+        definitions = self.provider_group_definition_conflicts.get(conflict_key)
+        if definitions is not None:
+            if scope_sha256 in definitions:
+                return False
+            if (
+                self._provider_group_conflicting_definition_count
+                >= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
+            ):
+                raise SourceFormatError(
+                    "provider_group_conflicts_exceed_4096_definitions"
+                )
+            definitions.add(scope_sha256)
+            self._provider_group_conflicting_definition_count += 1
+            return False
+        first_scope_sha256 = str(identity["scope_sha256"])
+        if scope_sha256 == first_scope_sha256:
+            return True
+        if len(self.provider_group_definition_conflicts) >= MAX_PROVIDER_GROUP_CONFLICTS:
+            raise SourceFormatError(
+                "provider_group_conflicts_exceed_1024_identifiers"
+            )
+        if (
+            self._provider_group_conflicting_definition_count
+            > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS - 2
+        ):
+            raise SourceFormatError(
+                "provider_group_conflicts_exceed_4096_definitions"
+            )
+        self.provider_group_definition_conflicts[conflict_key] = {
+            first_scope_sha256,
+            scope_sha256,
+        }
+        self._provider_group_conflicting_definition_count += 2
+        self.metrics["provider_group_conflicts"] += 1
+        for table_name, metric_name in (
+            ("provider_ref_npi", "provider_reference_npis"),
+            ("provider_ref_network_name", "provider_reference_network_names"),
+            ("provider_ref_tin_marker", None),
+        ):
+            cursor = self.connection.execute(
+                f"DELETE FROM {table_name} WHERE file_id = ? AND ref_id = ?",
+                (spec.file_id, state.reference_id),
+            )
+            if metric_name is not None:
+                self.metrics[metric_name] -= max(cursor.rowcount, 0)
+            self._mark_write()
+        return False
+
     def _persist_provider_reference(
         self,
         spec: SourceSpec,
@@ -3099,14 +3341,8 @@ class SourceIndex:
 
         assert state.current_ordinal is not None
         assert state.reference_id is not None
-        try:
-            self.connection.execute(
-                "INSERT INTO provider_ref_identity(file_id, ref_id) VALUES (?, ?)",
-                (spec.file_id, state.reference_id),
-            )
-        except sqlite3.IntegrityError as exc:
-            raise SourceFormatError("provider_reference_id_is_duplicated") from exc
-        self._mark_write()
+        if not self._record_provider_reference_scope(spec, state):
+            return
         has_tin_marker = bool(
             self.connection.execute(
                 """SELECT 1 FROM provider_ref_tin_pending
@@ -3115,17 +3351,25 @@ class SourceIndex:
             ).fetchone()
         )
         if has_tin_marker:
-            self.connection.execute(
-                """INSERT INTO provider_ref_tin_marker(file_id, ref_id)
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO provider_ref_tin_marker(file_id, ref_id)
                    VALUES (?, ?)""",
                 (spec.file_id, state.reference_id),
             )
-            self._mark_write()
+            if cursor.rowcount:
+                self._mark_write()
         inserted_count = self._insert_pending_provider_npis(spec, state)
         self.metrics["provider_reference_npis"] += inserted_count
         network_name_count = self._insert_pending_provider_network_names(spec, state)
         self.metrics["provider_reference_network_names"] += network_name_count
-        if inserted_count == 0 and not has_tin_marker:
+        has_pending_npi = bool(
+            self.connection.execute(
+                """SELECT 1 FROM provider_ref_pending
+                   WHERE file_id = ? AND ref_ordinal = ? LIMIT 1""",
+                (spec.file_id, state.current_ordinal),
+            ).fetchone()
+        )
+        if not has_pending_npi and not has_tin_marker:
             self.metrics["provider_references_without_valid_npi"] += 1
 
     def _finish_provider_reference(
@@ -3187,6 +3431,13 @@ class SourceIndex:
             self._capture_provider_reference_id(state, event, raw_value)
             return
         provider_group_prefix = f"{base_prefix}.provider_groups.item"
+        if prefix == provider_group_prefix and event == "start_map":
+            state.current_tin_type = ""
+            state.current_tin_value = ""
+            return
+        if prefix == provider_group_prefix and event == "end_map":
+            self._finish_provider_group_scope(state)
+            return
         if self._is_zero_npi_marker_event_consumed(
             state,
             prefix=prefix,
@@ -3197,6 +3448,10 @@ class SourceIndex:
             return
         if self._is_provider_tin_event(prefix, provider_group_prefix, event):
             self._mark_provider_reference_tin(spec, state)
+            if prefix == f"{provider_group_prefix}.tin.type":
+                state.current_tin_type = self._normalized_tin_type(event, raw_value)
+            elif prefix == f"{provider_group_prefix}.tin.value":
+                state.current_tin_value = self._normalized_tin_value(event, raw_value)
             return
         if (
             self._is_provider_npi_prefix(prefix, provider_group_prefix)
@@ -4079,6 +4334,18 @@ class SourceIndex:
             sampler.offer(query.stable_key, query)
         return sampler.values()
 
+    def _provider_group_definition_conflicts(self) -> dict[str, set[str]]:
+        conflicts: dict[str, set[str]] = {}
+        for (file_id, ref_id), definitions in sorted(
+            self.provider_group_definition_conflicts.items()
+        ):
+            conflict_id = provider_group_conflict_identity(
+                self.raw_container_sha256_by_file_id[file_id],
+                ref_id,
+            )
+            conflicts.setdefault(conflict_id, set()).update(definitions)
+        return conflicts
+
     def source_report(self) -> dict[str, Any]:
         """Return redacted source coverage and temporary-index measurements."""
 
@@ -4097,6 +4364,7 @@ class SourceIndex:
                 provider_identifier_quarantine_payload(
                     self.quarantined_provider_identifiers,
                     self.quarantined_provider_identifier_texts,
+                    self._provider_group_definition_conflicts(),
                 )
             ),
             "sqlite_storage_bytes": sqlite_bytes,

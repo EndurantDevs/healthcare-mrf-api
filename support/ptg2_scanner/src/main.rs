@@ -97,12 +97,15 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Map, Value};
 use sha2::{Digest, Sha256};
-use source_witness::{RateOccurrenceWitnessInput, SourceWitnessCollector, SourceWitnessCoordinate};
+use source_witness::{
+    validate_provider_source_record_size, RateOccurrenceWitnessInput, SourceWitnessCollector,
+    SourceWitnessCoordinate, PROVIDER_SOURCE_RECORD_MAX_BYTES,
+};
 use source_witness_spool::ProviderSourceLocator;
 use std::any::Any;
 use std::cell::Cell;
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
 use std::fs::File;
@@ -426,6 +429,12 @@ impl PartialEq for ProviderEntry {
 
 impl Eq for ProviderEntry {}
 
+const PROVIDER_GROUP_CONFLICT_HASH_DOMAIN: &[u8] = b"PTG2_PROVIDER_GROUP_CONFLICT_SOURCE_ID_V1\0";
+const PROVIDER_GROUP_DEFINITION_HASH_DOMAIN: &[u8] =
+    b"PTG2_PROVIDER_GROUP_CONFLICT_DEFINITION_V1\0";
+const MAX_PROVIDER_GROUP_CONFLICTS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS: usize = 4096;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderRefKey {
     Signed(i64),
@@ -471,6 +480,220 @@ impl std::fmt::Display for ProviderRefKey {
             Self::Unsigned(value) => value.fmt(formatter),
             Self::Text(value) => value.fmt(formatter),
         }
+    }
+}
+
+fn domain_sha256_hex(domain: &[u8], payload: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(payload);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn provider_ref_key_sha256(raw_source_sha256: &[u8; 32], key: &ProviderRefKey) -> String {
+    let mut digest = Sha256::new();
+    digest.update(PROVIDER_GROUP_CONFLICT_HASH_DOMAIN);
+    digest.update(raw_source_sha256);
+    digest.update(key.to_string().as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn provider_entry_definition_sha256(entry: &ProviderEntry) -> io::Result<String> {
+    let payload = serde_json::to_vec(&json!({
+        "entry_hash": entry.entry_hash,
+        "network_names": entry.network_names,
+        "npi": entry.npi,
+        "provider_count": entry.provider_count,
+        "provider_group_hashes": entry.provider_group_hashes,
+        "provider_group_scope_hash": entry.provider_group_scope_hash,
+        "quarantined_npi": entry.quarantined_npi,
+        "quarantined_npi_text": entry.quarantined_npi_text,
+    }))
+    .map_err(to_io_error)?;
+    Ok(domain_sha256_hex(
+        PROVIDER_GROUP_DEFINITION_HASH_DOMAIN,
+        &payload,
+    ))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProviderGroupDefinitionConflicts {
+    definitions_by_key: HashMap<ProviderRefKey, BTreeMap<i64, ProviderEntry>>,
+    definition_count: usize,
+}
+
+impl ProviderGroupDefinitionConflicts {
+    fn record_entry(&mut self, key: ProviderRefKey, entry: ProviderEntry) -> io::Result<()> {
+        if !self.definitions_by_key.contains_key(&key)
+            && self.definitions_by_key.len() >= MAX_PROVIDER_GROUP_CONFLICTS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 1024 identifiers",
+            ));
+        }
+        let scope_hash = entry.provider_group_scope_hash;
+        let definitions = self.definitions_by_key.entry(key).or_default();
+        if let Some(existing) = definitions.get(&scope_hash).cloned() {
+            if existing != entry {
+                definitions.insert(scope_hash, combine_provider_entries(existing, entry));
+            }
+            return Ok(());
+        }
+        if self.definition_count >= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 4096 definitions",
+            ));
+        }
+        definitions.insert(scope_hash, entry);
+        self.definition_count += 1;
+        Ok(())
+    }
+
+    fn keys(&self) -> HashSet<ProviderRefKey> {
+        self.definitions_by_key.keys().cloned().collect()
+    }
+
+    fn payload(&self, raw_source_sha256: &[u8; 32]) -> io::Result<Vec<(String, BTreeSet<String>)>> {
+        let mut entries = self
+            .definitions_by_key
+            .iter()
+            .map(|(key, definitions)| -> io::Result<_> {
+                if definitions.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider group conflict has fewer than two definitions",
+                    ));
+                }
+                let definition_sha256 = definitions
+                    .values()
+                    .map(provider_entry_definition_sha256)
+                    .collect::<io::Result<BTreeSet<_>>>()?;
+                if definition_sha256.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider group conflict definitions are not distinct",
+                    ));
+                }
+                Ok((
+                    provider_ref_key_sha256(raw_source_sha256, key),
+                    definition_sha256,
+                ))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        Ok(entries)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProviderDefinitions {
+    definitions_by_key: HashMap<ProviderRefKey, BTreeMap<i64, BTreeMap<String, ProviderEntry>>>,
+    conflict_count: usize,
+    conflicting_definition_count: usize,
+}
+
+impl ProviderDefinitions {
+    fn insert(&mut self, key: ProviderRefKey, mut entry: ProviderEntry) -> io::Result<()> {
+        let definition_sha256 = provider_entry_definition_sha256(&entry)?;
+        let scope_hash = entry.provider_group_scope_hash;
+        let prior_scope_count = self.definitions_by_key.get(&key).map_or(0, BTreeMap::len);
+        let is_new_scope = !self
+            .definitions_by_key
+            .get(&key)
+            .is_some_and(|scopes| scopes.contains_key(&scope_hash));
+        if is_new_scope {
+            let next_conflict_count = self
+                .conflict_count
+                .saturating_add(usize::from(prior_scope_count == 1));
+            let next_definition_count =
+                self.conflicting_definition_count
+                    .saturating_add(match prior_scope_count {
+                        0 => 0,
+                        1 => 2,
+                        _ => 1,
+                    });
+            if next_conflict_count > MAX_PROVIDER_GROUP_CONFLICTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider group conflicts exceed 1024 identifiers",
+                ));
+            }
+            if next_definition_count > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider group conflicts exceed 4096 definitions",
+                ));
+            }
+            self.conflict_count = next_conflict_count;
+            self.conflicting_definition_count = next_definition_count;
+        }
+        let definitions = self
+            .definitions_by_key
+            .entry(key)
+            .or_default()
+            .entry(scope_hash)
+            .or_default();
+        if let Some(existing) = definitions.get_mut(&definition_sha256) {
+            if *existing != entry {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider definition digest collision",
+                ));
+            }
+            existing.source_locators.append(&mut entry.source_locators);
+            existing
+                .source_locators
+                .sort_unstable_by_key(|locator| (locator.shard, locator.offset, locator.length));
+            existing.source_locators.dedup();
+            existing.source_locators.truncate(1);
+            return Ok(());
+        }
+        entry
+            .source_locators
+            .sort_unstable_by_key(|locator| (locator.shard, locator.offset, locator.length));
+        entry.source_locators.dedup();
+        entry.source_locators.truncate(1);
+        definitions.insert(definition_sha256, entry);
+        Ok(())
+    }
+
+    fn into_materialized(
+        self,
+    ) -> io::Result<(
+        HashMap<ProviderRefKey, ProviderEntry>,
+        ProviderGroupDefinitionConflicts,
+    )> {
+        let mut provider_map = HashMap::new();
+        let mut conflicts = ProviderGroupDefinitionConflicts::default();
+        for (key, scopes) in self.definitions_by_key {
+            let is_conflict = scopes.len() > 1;
+            for definitions in scopes.into_values() {
+                let mut entries = definitions.into_values();
+                let first = entries.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider definition scope is empty",
+                    )
+                })?;
+                let entry = entries.fold(first, combine_provider_entries);
+                if is_conflict {
+                    conflicts.record_entry(key.clone(), entry)?;
+                } else {
+                    provider_map.insert(key.clone(), entry);
+                }
+            }
+        }
+        Ok((provider_map, conflicts))
     }
 }
 
@@ -2234,13 +2457,23 @@ fn provider_ref_definition_audited(
 fn provider_identifier_quarantine_payload(
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     inline_quarantine: ProviderIdentifierQuarantine,
+    provider_group_conflicts: &ProviderGroupDefinitionConflicts,
+    raw_source_sha256: &[u8; 32],
 ) -> io::Result<Value> {
     let mut quarantine = inline_quarantine;
     for entry in provider_map.values() {
         quarantine.record(&entry.quarantined_npi)?;
         quarantine.record_text(&entry.quarantined_npi_text)?;
     }
-    quarantine.payload()
+    for definitions in provider_group_conflicts.definitions_by_key.values() {
+        for entry in definitions.values() {
+            quarantine.record(&entry.quarantined_npi)?;
+            quarantine.record_text(&entry.quarantined_npi_text)?;
+        }
+    }
+    quarantine.payload_with_provider_group_conflicts(
+        &provider_group_conflicts.payload(raw_source_sha256)?,
+    )
 }
 
 fn record_and_clear_provider_identifier_quarantine(
@@ -2294,6 +2527,7 @@ fn scanner_summary_with_v4_empty_npi_audit(
     summary
 }
 
+#[cfg(test)]
 fn insert_provider_definition(
     provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     key: ProviderRefKey,
@@ -8253,7 +8487,7 @@ impl CompactWorkerMetrics {
 }
 
 struct ProviderRefWorkerOutput {
-    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
+    provider_definitions: ProviderDefinitions,
     events: Vec<CopyFileEvent>,
     metrics: ProviderRefWorkerMetrics,
 }
@@ -8285,16 +8519,35 @@ impl WorkerJob {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ProviderRefBatchContext<'a> {
     dedupe: &'a SharedDedupe,
     source_witness: &'a SourceWitnessCollector,
     manifest_sidecars: Option<&'a Arc<Mutex<ManifestSidecarCollector>>>,
     allow_empty_npi_tin_only: bool,
+    defer_definition_outputs: bool,
+}
+
+fn write_provider_definition_outputs(
+    value: &Value,
+    entry: &ProviderEntry,
+    dictionary_copy_sinks: &mut DictionaryCopySinks,
+    context: &ProviderRefBatchContext<'_>,
+) -> io::Result<()> {
+    if let Some(sidecars) = context.manifest_sidecars {
+        lock_manifest_sidecars(sidecars)
+            .record_provider_component(entry.entry_hash, &entry.provider_group_hashes)?;
+    }
+    dictionary_copy_sinks.write_provider_group_members_shared(
+        value,
+        context.dedupe,
+        context.allow_empty_npi_tin_only,
+    )
 }
 
 fn process_provider_ref_raw_batch_with_metrics(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
+    provider_definitions: &mut ProviderDefinitions,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     context: ProviderRefBatchContext<'_>,
     metrics: &mut ProviderRefWorkerMetrics,
@@ -8330,23 +8583,19 @@ fn process_provider_ref_raw_batch_with_metrics(
                 &source_provider_witness_expected(&key, &entry),
             )?;
         }
-        if let Some(sidecars) = context.manifest_sidecars {
-            lock_manifest_sidecars(sidecars)
-                .record_provider_component(entry.entry_hash, &entry.provider_group_hashes)?;
+        if context.defer_definition_outputs {
+            provider_definitions.insert(key, entry)?;
+        } else {
+            let write_started_at = Instant::now();
+            write_provider_definition_outputs(&value, &entry, dictionary_copy_sinks, &context)?;
+            metrics.write_micros = metrics
+                .write_micros
+                .saturating_add(write_started_at.elapsed().as_micros());
+            provider_definitions.insert(key, entry)?;
         }
-        insert_provider_definition(provider_map, key, entry)?;
         context
             .dedupe
             .record_empty_npi_tin_only_normalizations(empty_npi_tin_only_normalization_count);
-        let write_started_at = Instant::now();
-        dictionary_copy_sinks.write_provider_group_members_shared(
-            &value,
-            context.dedupe,
-            context.allow_empty_npi_tin_only,
-        )?;
-        metrics.write_micros = metrics
-            .write_micros
-            .saturating_add(write_started_at.elapsed().as_micros());
         metrics.provider_refs = metrics.provider_refs.saturating_add(1);
     }
     Ok(())
@@ -8363,18 +8612,32 @@ fn process_provider_ref_raw_batch(
     let mut metrics = ProviderRefWorkerMetrics::default();
     let source_witness = SourceWitnessCollector::new(&"00".repeat(32))?;
     source_witness.configure_provider_spools(1)?;
-    process_provider_ref_raw_batch_with_metrics(
+    let mut provider_definitions = ProviderDefinitions::default();
+    for (key, entry) in std::mem::take(provider_map) {
+        provider_definitions.insert(key, entry)?;
+    }
+    let result = process_provider_ref_raw_batch_with_metrics(
         raw_refs,
-        provider_map,
+        &mut provider_definitions,
         dictionary_copy_sinks,
         ProviderRefBatchContext {
             dedupe,
             source_witness: &source_witness,
             manifest_sidecars: None,
             allow_empty_npi_tin_only,
+            defer_definition_outputs: false,
         },
         &mut metrics,
-    )?;
+    );
+    result?;
+    let (materialized, conflicts) = provider_definitions.into_materialized()?;
+    *provider_map = materialized;
+    if !conflicts.definitions_by_key.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider group conflict requires a complete rate scan",
+        ));
+    }
     Ok(metrics.provider_refs)
 }
 
@@ -8399,7 +8662,7 @@ fn provider_ref_worker_loop(
     let worker_paths = config.copy_paths.for_worker(worker_id);
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
-    let mut provider_map = HashMap::new();
+    let mut provider_definitions = ProviderDefinitions::default();
     let mut events = Vec::new();
     let mut metrics = ProviderRefWorkerMetrics {
         worker_id,
@@ -8412,13 +8675,14 @@ fn provider_ref_worker_loop(
         metrics.raw_bytes = metrics.raw_bytes.saturating_add(raw_refs.byte_len() as u64);
         process_provider_ref_raw_batch_with_metrics(
             &raw_refs,
-            &mut provider_map,
+            &mut provider_definitions,
             &mut dictionary_copy_sinks,
             ProviderRefBatchContext {
                 dedupe: &config.dedupe,
                 source_witness: &config.source_witness,
                 manifest_sidecars: config.manifest_sidecars.as_ref(),
                 allow_empty_npi_tin_only: config.allow_empty_npi_tin_only,
+                defer_definition_outputs: true,
             },
             &mut metrics,
         )?;
@@ -8440,7 +8704,7 @@ fn provider_ref_worker_loop(
     metrics.elapsed_micros = started_at.elapsed().as_micros();
 
     Ok(ProviderRefWorkerOutput {
-        provider_map,
+        provider_definitions,
         events,
         metrics,
     })
@@ -8965,52 +9229,76 @@ fn validate_compact_rate_object_suffix<R: Read>(reader: R) -> io::Result<()> {
 
 struct JoinedProviderRefs {
     provider_map: HashMap<ProviderRefKey, ProviderEntry>,
+    provider_group_conflicts: ProviderGroupDefinitionConflicts,
     events: Vec<CopyFileEvent>,
     worker_metrics: Vec<ProviderRefWorkerMetrics>,
     worker_join_seconds: f64,
     map_merge_seconds: f64,
 }
 
-fn merge_ordered_provider_map_pair(
-    mut left: HashMap<ProviderRefKey, ProviderEntry>,
-    right: HashMap<ProviderRefKey, ProviderEntry>,
-) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
-    if left.len() >= right.len() {
-        for (key, entry) in right {
-            insert_provider_definition(&mut left, key, entry)?;
+fn merge_provider_definition_pair(
+    mut left: ProviderDefinitions,
+    right: ProviderDefinitions,
+) -> io::Result<ProviderDefinitions> {
+    for (key, scopes) in right.definitions_by_key {
+        for definitions in scopes.into_values() {
+            for entry in definitions.into_values() {
+                left.insert(key.clone(), entry)?;
+            }
         }
-        return Ok(left);
     }
-
-    let mut right = right;
-    for (key, entry) in left {
-        insert_provider_definition(&mut right, key, entry)?;
-    }
-    Ok(right)
+    Ok(left)
 }
 
-fn merge_provider_maps_pairwise(
-    mut provider_maps: Vec<(usize, HashMap<ProviderRefKey, ProviderEntry>)>,
-) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
-    provider_maps.sort_unstable_by_key(|(worker_id, _provider_map)| *worker_id);
-    while provider_maps.len() > 1 {
-        provider_maps = provider_maps
+fn merge_provider_definitions_pairwise(
+    mut provider_definitions: Vec<(usize, ProviderDefinitions)>,
+) -> io::Result<ProviderDefinitions> {
+    provider_definitions.sort_unstable_by_key(|(worker_id, _definitions)| *worker_id);
+    while provider_definitions.len() > 1 {
+        provider_definitions = provider_definitions
             .into_par_iter()
             .chunks(2)
             .map(|chunk| {
                 let mut maps = chunk.into_iter();
                 let left = maps.next().expect("provider map chunk is non-empty");
                 match maps.next() {
-                    Some(right) => merge_ordered_provider_map_pair(left.1, right.1)
-                        .map(|provider_map| (right.0, provider_map)),
+                    Some(right) => merge_provider_definition_pair(left.1, right.1)
+                        .map(|definitions| (right.0, definitions)),
                     None => Ok(left),
                 }
             })
             .collect::<io::Result<Vec<_>>>()?;
     }
-    Ok(provider_maps
+    Ok(provider_definitions
         .pop()
-        .map_or_else(HashMap::new, |(_worker_id, provider_map)| provider_map))
+        .map_or_else(ProviderDefinitions::default, |(_worker_id, definitions)| {
+            definitions
+        }))
+}
+
+#[cfg(test)]
+fn merge_provider_maps_pairwise(
+    provider_maps: Vec<(usize, HashMap<ProviderRefKey, ProviderEntry>)>,
+) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
+    let provider_definitions = provider_maps
+        .into_iter()
+        .map(|(worker_id, provider_map)| -> io::Result<_> {
+            let mut definitions = ProviderDefinitions::default();
+            for (key, entry) in provider_map {
+                definitions.insert(key, entry)?;
+            }
+            Ok((worker_id, definitions))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let merged = merge_provider_definitions_pairwise(provider_definitions)?;
+    let (provider_map, conflicts) = merged.into_materialized()?;
+    if let Some(key) = conflicts.definitions_by_key.keys().next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("conflicting provider_group_id definition: {key}"),
+        ));
+    }
+    Ok(provider_map)
 }
 
 fn join_provider_ref_workers<W: Write>(
@@ -9019,13 +9307,13 @@ fn join_provider_ref_workers<W: Write>(
 ) -> io::Result<JoinedProviderRefs> {
     let worker_join_started_at = Instant::now();
     let mut provider_worker_error: Option<io::Error> = None;
-    let mut provider_maps = Vec::with_capacity(provider_handles.len());
+    let mut provider_definitions = Vec::with_capacity(provider_handles.len());
     let mut copy_file_events = Vec::new();
     let mut worker_metrics = Vec::new();
     for (worker_id, handle) in provider_handles {
         match handle.join() {
             Ok(Ok(output)) => {
-                provider_maps.push((worker_id, output.provider_map));
+                provider_definitions.push((worker_id, output.provider_definitions));
                 copy_file_events.extend(output.events);
                 worker_metrics.push(output.metrics);
             }
@@ -9052,16 +9340,154 @@ fn join_provider_ref_workers<W: Write>(
     }
     let worker_join_seconds = worker_join_started_at.elapsed().as_secs_f64();
     let map_merge_started_at = Instant::now();
-    let provider_map = merge_provider_maps_pairwise(provider_maps)?;
+    let provider_definitions = merge_provider_definitions_pairwise(provider_definitions)?;
+    let (provider_map, provider_group_conflicts) = provider_definitions.into_materialized()?;
     let map_merge_seconds = map_merge_started_at.elapsed().as_secs_f64();
     worker_metrics.sort_unstable_by_key(|metrics| metrics.worker_id);
     Ok(JoinedProviderRefs {
         provider_map,
+        provider_group_conflicts,
         events: copy_file_events,
         worker_metrics,
         worker_join_seconds,
         map_merge_seconds,
     })
+}
+
+struct ProviderDefinitionOutput {
+    worker_id: usize,
+    events: Vec<CopyFileEvent>,
+    elapsed_micros: u128,
+}
+
+fn validate_replayed_provider_definition(
+    expected_key: &ProviderRefKey,
+    expected_entry: &ProviderEntry,
+    context: ProviderRefBatchContext<'_>,
+) -> io::Result<()> {
+    let mut replayed_entry: Option<ProviderEntry> = None;
+    for locator in expected_entry.source_locators.iter().copied() {
+        let raw_provider = context.source_witness.read_provider_source(locator)?;
+        let value = parse_json_value_from_raw_bytes(&raw_provider)?;
+        let (source_key, mut source_entry, _normalization_count) =
+            provider_ref_definition_audited(&value, context.allow_empty_npi_tin_only)?;
+        if source_key != *expected_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained provider definition differs from its source spool",
+            ));
+        }
+        source_entry.source_locators.push(locator);
+        replayed_entry = Some(match replayed_entry {
+            Some(existing) => combine_provider_entries(existing, source_entry),
+            None => source_entry,
+        });
+    }
+    let replayed_entry = replayed_entry.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "retained provider definition is missing its source locator",
+        )
+    })?;
+    if replayed_entry != *expected_entry
+        || replayed_entry.source_locators != expected_entry.source_locators
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "retained provider definition differs from its source spool",
+        ));
+    }
+    Ok(())
+}
+
+fn emit_provider_definition_outputs(
+    provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    worker_count: usize,
+    copy_paths: &CopyPathConfig,
+    rotate_bytes: u64,
+    context: ProviderRefBatchContext<'_>,
+) -> io::Result<Vec<ProviderDefinitionOutput>> {
+    let mut definitions_by_worker = vec![Vec::new(); worker_count];
+    for (key, entry) in provider_map {
+        let first_locator = entry.source_locators.first().copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained provider definition is missing its source locator",
+            )
+        })?;
+        let definitions = definitions_by_worker
+            .get_mut(first_locator.shard as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retained provider definition source shard is out of range",
+                )
+            })?;
+        definitions.push((key, entry));
+    }
+
+    for definitions in &mut definitions_by_worker {
+        definitions.sort_unstable_by_key(|(key, entry)| {
+            let locator = entry
+                .source_locators
+                .first()
+                .expect("retained provider definition locator was validated");
+            (locator.offset, key.to_string())
+        });
+    }
+    definitions_by_worker
+        .par_iter()
+        .try_for_each(|definitions| {
+            definitions.iter().try_for_each(|(key, entry)| {
+                validate_replayed_provider_definition(key, entry, context)
+            })
+        })?;
+
+    definitions_by_worker
+        .into_par_iter()
+        .enumerate()
+        .map(|(worker_id, definitions)| {
+            let started_at = Instant::now();
+            let worker_paths = copy_paths.for_worker(worker_id);
+            let mut dictionary_copy_sinks =
+                DictionaryCopySinks::from_paths(&worker_paths, rotate_bytes)?;
+            let mut events = Vec::new();
+            for (expected_key, expected_entry) in definitions {
+                for locator in expected_entry.source_locators.iter().copied() {
+                    let raw_provider = context.source_witness.read_provider_source(locator)?;
+                    let value = parse_json_value_from_raw_bytes(&raw_provider)?;
+                    let (source_key, mut source_entry, _normalization_count) =
+                        provider_ref_definition_audited(&value, context.allow_empty_npi_tin_only)?;
+                    if source_key != *expected_key {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "retained provider definition differs from its source spool",
+                        ));
+                    }
+                    source_entry.source_locators.push(locator);
+                    write_provider_definition_outputs(
+                        &value,
+                        &source_entry,
+                        &mut dictionary_copy_sinks,
+                        &context,
+                    )?;
+                    events.extend(dictionary_copy_sinks.maybe_rotate_silent()?);
+                }
+                if let Some(sidecars) = context.manifest_sidecars {
+                    lock_manifest_sidecars(sidecars).record_provider_component(
+                        expected_entry.entry_hash,
+                        &expected_entry.provider_group_hashes,
+                    )?;
+                }
+            }
+            events.extend(dictionary_copy_sinks.finish_silent()?);
+            Ok(ProviderDefinitionOutput {
+                worker_id,
+                events,
+                elapsed_micros: started_at.elapsed().as_micros(),
+            })
+        })
+        .collect()
 }
 
 fn spawn_provider_ref_workers(
@@ -9523,6 +9949,23 @@ fn process_compact_rate_lites_worker_with_grouping<W: Write>(
         group_negotiated_rate_chunks,
         None,
     )
+}
+
+fn validate_unreferenced_provider_group_conflicts(
+    rates: &[RateLite],
+    provider_group_conflicts: &HashSet<ProviderRefKey>,
+) -> io::Result<()> {
+    if let Some(referenced_conflict) = rates.iter().find_map(|rate| {
+        rate.provider_refs
+            .iter()
+            .find(|key| provider_group_conflicts.contains(*key))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("referenced conflicting provider_group_id definition: {referenced_conflict}"),
+        ));
+    }
+    Ok(())
 }
 
 fn process_compact_rate_lites_worker_inner<W: Write>(
@@ -11371,6 +11814,7 @@ fn finish_worker_outputs(
 struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
     provider_map: Arc<HashMap<ProviderRefKey, ProviderEntry>>,
+    provider_group_conflicts: Arc<HashSet<ProviderRefKey>>,
     dedupe: Arc<SharedDedupe>,
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -11460,6 +11904,10 @@ fn compact_worker_loop(
                 if let Some(semantic_progress) = semantic_progress.as_ref() {
                     semantic_progress.record_negotiated_rates_parsed(rates.len() as u64);
                 }
+                validate_unreferenced_provider_group_conflicts(
+                    &rates,
+                    &config.provider_group_conflicts,
+                )?;
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -11545,6 +11993,10 @@ fn compact_worker_loop(
                     .parse_micros
                     .saturating_add(parse_started_at.elapsed().as_micros());
                 metrics.rates_parsed = metrics.rates_parsed.saturating_add(rates.len() as u64);
+                validate_unreferenced_provider_group_conflicts(
+                    &rates,
+                    &config.provider_group_conflicts,
+                )?;
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -12162,6 +12614,22 @@ fn start_semantic_progress_reporter(
         .transpose()
 }
 
+fn validate_provider_source_capture_append(
+    buffered_bytes: usize,
+    capture_start: usize,
+) -> io::Result<()> {
+    let captured_bytes = buffered_bytes
+        .checked_sub(capture_start)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider source capture byte count is invalid",
+            )
+        })?;
+    validate_provider_source_record_size(captured_bytes)
+}
+
 fn scan_compact_byte_top_level_parallel(
     path: &Path,
     context: CompactContext,
@@ -12420,13 +12888,14 @@ fn scan_compact_byte_top_level_parallel(
     let mut provider_capture_seconds = 0.0f64;
     let mut provider_worker_join_seconds = 0.0f64;
     let mut provider_map_merge_seconds = 0.0f64;
+    let mut provider_definition_output_seconds = 0.0f64;
     let provider_capture_compressed_bytes: u64;
     let mut in_network_enqueue_seconds = 0.0f64;
     let in_network_compressed_bytes: u64;
     let mut worker_join_seconds = 0.0f64;
     let mut sidecar_finalize_lock_wait_seconds = 0.0f64;
     let mut sidecar_merge_write_seconds = 0.0f64;
-    let provider_worker_metrics: Vec<ProviderRefWorkerMetrics>;
+    let mut provider_worker_metrics: Vec<ProviderRefWorkerMetrics>;
     let mut compact_worker_metrics = Vec::new();
     let mut invalid_price_exclusions = Vec::new();
     let mut invalid_price_emptied_rates = 0u64;
@@ -12451,6 +12920,7 @@ fn scan_compact_byte_top_level_parallel(
             "provider_ref_queue": provider_ref_queue_size,
             "provider_ref_chunk_items": provider_ref_chunk_items,
             "provider_ref_raw_chunk_bytes": provider_ref_raw_chunk_byte_limit,
+            "provider_source_record_max_bytes": PROVIDER_SOURCE_RECORD_MAX_BYTES,
             "top_level_byte_scan": true,
             "top_level_byte_scan_requested": true,
             "top_level_byte_scan_selected": true,
@@ -12518,8 +12988,8 @@ fn scan_compact_byte_top_level_parallel(
         ProviderRefWorkerConfig {
             dedupe: Arc::clone(&dedupe),
             source_witness: Arc::clone(&context.source_witness),
-            manifest_sidecars: manifest_sidecars.as_ref().map(Arc::clone),
-            copy_paths: provider_ref_paths,
+            manifest_sidecars: None,
+            copy_paths: CopyPathConfig::default(),
             rotate_bytes: compact_copy_rotate_bytes,
             queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
             recycle_tx: Some(provider_ref_recycle_tx),
@@ -12573,6 +13043,7 @@ fn scan_compact_byte_top_level_parallel(
         }
         for (idx, &byte) in buffer[..read].iter().enumerate() {
             if capture_depth > 0 {
+                validate_provider_source_capture_append(raw_refs.byte_len(), capture_start)?;
                 raw_refs.bytes.push(byte);
             }
 
@@ -12671,23 +13142,53 @@ fn scan_compact_byte_top_level_parallel(
                     provider_capture_compressed_bytes = compressed_bytes_read
                         .load(Ordering::Relaxed)
                         .saturating_sub(provider_refs_compressed_started_at);
-                    let joined_provider_refs = join_provider_ref_workers(
+                    let mut joined_provider_refs = join_provider_ref_workers(
                         &mut writer,
                         std::mem::take(&mut provider_handles),
                     )?;
                     context.source_witness.seal_provider_sources()?;
+                    let provider_definition_output_started_at = Instant::now();
+                    let provider_definition_outputs = emit_provider_definition_outputs(
+                        &joined_provider_refs.provider_map,
+                        provider_ref_worker_count,
+                        &provider_ref_paths,
+                        compact_copy_rotate_bytes,
+                        ProviderRefBatchContext {
+                            dedupe: &dedupe,
+                            source_witness: &context.source_witness,
+                            manifest_sidecars: manifest_sidecars.as_ref(),
+                            allow_empty_npi_tin_only: factor_mode,
+                            defer_definition_outputs: false,
+                        },
+                    )?;
+                    provider_definition_output_seconds += provider_definition_output_started_at
+                        .elapsed()
+                        .as_secs_f64();
                     provider_worker_join_seconds += joined_provider_refs.worker_join_seconds;
                     provider_map_merge_seconds += joined_provider_refs.map_merge_seconds;
                     provider_refs_seconds += provider_capture_seconds
                         + joined_provider_refs.worker_join_seconds
-                        + joined_provider_refs.map_merge_seconds;
+                        + joined_provider_refs.map_merge_seconds
+                        + provider_definition_output_seconds;
                     provider_worker_metrics = joined_provider_refs.worker_metrics;
+                    for output in provider_definition_outputs {
+                        if let Some(metrics) = provider_worker_metrics
+                            .iter_mut()
+                            .find(|metrics| metrics.worker_id == output.worker_id)
+                        {
+                            metrics.elapsed_micros =
+                                metrics.elapsed_micros.saturating_add(output.elapsed_micros);
+                        }
+                        joined_provider_refs.events.extend(output.events);
+                    }
                     drain_copy_file_events(&event_rx, &mut writer, &mut copy_file_event_gate)?;
                     for event in joined_provider_refs.events {
                         copy_file_event_gate.publish(&mut writer, event)?;
                     }
                     writer.flush()?;
 
+                    let provider_group_conflicts = joined_provider_refs.provider_group_conflicts;
+                    let conflicting_provider_refs = Arc::new(provider_group_conflicts.keys());
                     let mut provider_map = joined_provider_refs.provider_map;
                     record_and_clear_provider_identifier_quarantine(&mut provider_map, &dedupe)?;
                     let provider_map = Arc::new(provider_map);
@@ -12696,6 +13197,8 @@ fn scan_compact_byte_top_level_parallel(
                         let worker_rx = rx.clone();
                         let worker_event_tx = event_tx.clone();
                         let worker_provider_map = Arc::clone(&provider_map);
+                        let worker_provider_group_conflicts =
+                            Arc::clone(&conflicting_provider_refs);
                         let worker_dedupe = Arc::clone(&dedupe);
                         let worker_manifest_sidecars = manifest_sidecars.as_ref().map(Arc::clone);
                         let worker_copy_paths = copy_paths.clone();
@@ -12715,6 +13218,8 @@ fn scan_compact_byte_top_level_parallel(
                                         CompactWorkerConfig {
                                             event_tx: worker_event_tx,
                                             provider_map: worker_provider_map,
+                                            provider_group_conflicts:
+                                                worker_provider_group_conflicts,
                                             dedupe: worker_dedupe,
                                             manifest_sidecars: worker_manifest_sidecars,
                                             queue_bytes: worker_queue_bytes,
@@ -13287,6 +13792,8 @@ fn scan_compact_byte_top_level_parallel(
                                 "provider_identifier_quarantine": provider_identifier_quarantine_payload(
                                     &provider_map,
                                     dedupe.provider_identifier_quarantine()?,
+                                    &provider_group_conflicts,
+                                    context.source_witness.raw_source_sha256(),
                                 )?,
                                 "worker_count": worker_count,
                                 "work_queue": bounded_queue_size,
@@ -13327,6 +13834,7 @@ fn scan_compact_byte_top_level_parallel(
                                 "provider_write_seconds": provider_write_seconds,
                                 "provider_worker_join_seconds": provider_worker_join_seconds,
                                 "provider_map_merge_seconds": provider_map_merge_seconds,
+                                "provider_definition_output_seconds": provider_definition_output_seconds,
                                 "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
                                 "parse_in_workers": parse_in_workers,
                                 "producer_blocked_micros": producer_blocked_micros,
@@ -27819,7 +28327,8 @@ mod tests {
             Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
             None,
         )
-        .unwrap_err();
+        .err()
+        .expect("later source identity drift must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
@@ -31617,6 +32126,8 @@ mod tests {
         let payload = provider_identifier_quarantine_payload(
             &provider_map,
             ProviderIdentifierQuarantine::default(),
+            &ProviderGroupDefinitionConflicts::default(),
+            &[0x11; 32],
         )
         .unwrap();
         assert_eq!(payload["occurrence_count"], 2);
@@ -31651,6 +32162,8 @@ mod tests {
         let payload = provider_identifier_quarantine_payload(
             &provider_map,
             ProviderIdentifierQuarantine::default(),
+            &ProviderGroupDefinitionConflicts::default(),
+            &[0x11; 32],
         )
         .unwrap();
         assert_eq!(
@@ -31659,6 +32172,9 @@ mod tests {
         );
         assert_eq!(payload["occurrence_count"], 3);
         assert_eq!(payload["distinct_value_count"], 2);
+        assert_eq!(payload["provider_group_conflict_count"], 0);
+        assert_eq!(payload["provider_group_conflicting_definition_count"], 0);
+        assert_eq!(payload["provider_group_definition_conflicts"], json!([]));
         assert_eq!(payload["entries"][0]["kind"], "integer");
         assert_eq!(payload["entries"][0]["value"], "123456789");
         assert_eq!(payload["entries"][1]["kind"], "string");
@@ -31674,6 +32190,8 @@ mod tests {
         assert!(provider_identifier_quarantine_payload(
             &HashMap::from([(ProviderRefKey::from("oversized"), oversized_entry)]),
             ProviderIdentifierQuarantine::default(),
+            &ProviderGroupDefinitionConflicts::default(),
+            &[0x11; 32],
         )
         .is_err());
     }
@@ -31991,6 +32509,391 @@ mod tests {
         right.insert(key, split_entry);
         let merged = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap();
         assert_eq!(merged.values().next(), Some(&expected));
+    }
+
+    #[test]
+    fn distinct_scope_conflicts_preserve_same_scope_unions_deterministically() {
+        let provider_ref = valid_provider_reference();
+        let (key, entry) = provider_ref_definition(&provider_ref).unwrap();
+        let mut split_ref = provider_ref.clone();
+        split_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let split_entry = build_provider_entry(&split_ref).unwrap();
+        let expected_scope = combine_provider_entries(entry.clone(), split_entry.clone());
+        let mut conflicting_ref = provider_ref.clone();
+        conflicting_ref["provider_groups"][0]["tin"]["value"] = json!("987654321");
+        let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
+
+        let mut forward = ProviderDefinitions::default();
+        forward.insert(key.clone(), entry.clone()).unwrap();
+        forward.insert(key.clone(), split_entry.clone()).unwrap();
+        forward
+            .insert(key.clone(), conflicting_entry.clone())
+            .unwrap();
+        let (forward_map, forward_conflicts) = forward.clone().into_materialized().unwrap();
+        assert!(!forward_map.contains_key(&key));
+        assert_eq!(forward_conflicts.definition_count, 2);
+        assert_eq!(
+            forward_conflicts.definitions_by_key[&key]
+                .get(&expected_scope.provider_group_scope_hash),
+            Some(&expected_scope)
+        );
+
+        let mut reverse = ProviderDefinitions::default();
+        reverse
+            .insert(key.clone(), conflicting_entry.clone())
+            .unwrap();
+        reverse.insert(key.clone(), split_entry.clone()).unwrap();
+        reverse.insert(key.clone(), entry.clone()).unwrap();
+        let (reverse_map, reverse_conflicts) = reverse.into_materialized().unwrap();
+        assert_eq!(reverse_conflicts, forward_conflicts);
+
+        let forward_payload = provider_identifier_quarantine_payload(
+            &forward_map,
+            ProviderIdentifierQuarantine::default(),
+            &forward_conflicts,
+            &[0x11; 32],
+        )
+        .unwrap();
+        let reverse_payload = provider_identifier_quarantine_payload(
+            &reverse_map,
+            ProviderIdentifierQuarantine::default(),
+            &reverse_conflicts,
+            &[0x11; 32],
+        )
+        .unwrap();
+        assert_eq!(forward_payload, reverse_payload);
+        assert_eq!(
+            forward_payload["contract"],
+            "ptg2_provider_identifier_quarantine_v2"
+        );
+        assert_eq!(forward_payload["provider_group_conflict_count"], 1);
+        assert_eq!(
+            forward_payload["provider_group_conflicting_definition_count"],
+            2
+        );
+
+        let mut left = ProviderDefinitions::default();
+        left.insert(key.clone(), entry).unwrap();
+        let mut right = ProviderDefinitions::default();
+        right.insert(key.clone(), split_entry).unwrap();
+        right.insert(key.clone(), conflicting_entry).unwrap();
+        let merged = merge_provider_definitions_pairwise(vec![(0, left), (1, right)]).unwrap();
+        let (_merged_map, merged_conflicts) = merged.into_materialized().unwrap();
+        assert_eq!(merged_conflicts, forward_conflicts);
+
+        let referenced_rate = RateLite {
+            provider_refs: vec![key.clone()],
+            provider_groups: Vec::new(),
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: None,
+        };
+        assert!(
+            validate_unreferenced_provider_group_conflicts(&[], &forward_conflicts.keys()).is_ok()
+        );
+        let error = validate_unreferenced_provider_group_conflicts(
+            &[referenced_rate],
+            &HashSet::from([key]),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("referenced conflicting provider_group_id definition: 7"));
+    }
+
+    #[test]
+    fn provider_conflict_identity_is_scoped_to_the_raw_source() {
+        let key = ProviderRefKey::from("7");
+
+        assert_eq!(
+            provider_ref_key_sha256(&[0x11; 32], &key),
+            provider_ref_key_sha256(&[0x11; 32], &key),
+        );
+        assert_ne!(
+            provider_ref_key_sha256(&[0x11; 32], &key),
+            provider_ref_key_sha256(&[0x22; 32], &key),
+        );
+    }
+
+    #[test]
+    fn provider_definition_parts_dedupe_before_scope_union_across_orders_and_workers() {
+        let mut once_ref = valid_provider_reference();
+        once_ref["provider_groups"][0]["npi"] = json!([1234567890_i64, -1_i64]);
+        let (key, mut once) = provider_ref_definition(&once_ref).unwrap();
+        let mut duplicate = once.clone();
+        once.source_locators.push(ProviderSourceLocator {
+            shard: 1,
+            offset: 20,
+            length: 2,
+        });
+        duplicate.source_locators.push(ProviderSourceLocator {
+            shard: 0,
+            offset: 30,
+            length: 2,
+        });
+
+        let mut twice_ref = once_ref.clone();
+        twice_ref["provider_groups"][0]["npi"] = json!([1234567890_i64, -1_i64, -1_i64]);
+        let mut twice = build_provider_entry(&twice_ref).unwrap();
+        twice.source_locators.push(ProviderSourceLocator {
+            shard: 0,
+            offset: 40,
+            length: 3,
+        });
+
+        let mut conflicting_ref = once_ref.clone();
+        conflicting_ref["provider_groups"][0]["tin"]["value"] = json!("987654321");
+        conflicting_ref["provider_groups"][0]["npi"] = json!([2222222222_i64, -2_i64, "bad"]);
+        let mut conflicting = build_provider_entry(&conflicting_ref).unwrap();
+        conflicting.source_locators.push(ProviderSourceLocator {
+            shard: 1,
+            offset: 50,
+            length: 4,
+        });
+
+        let mut forward = ProviderDefinitions::default();
+        for entry in [
+            once.clone(),
+            duplicate.clone(),
+            twice.clone(),
+            conflicting.clone(),
+        ] {
+            forward.insert(key.clone(), entry).unwrap();
+        }
+        let (forward_map, forward_conflicts) = forward.into_materialized().unwrap();
+        assert!(forward_map.is_empty());
+        let retained_scope =
+            &forward_conflicts.definitions_by_key[&key][&once.provider_group_scope_hash];
+        assert_eq!(retained_scope.source_locators.len(), 2);
+        let expected_payload = provider_identifier_quarantine_payload(
+            &forward_map,
+            ProviderIdentifierQuarantine::default(),
+            &forward_conflicts,
+            &[0x11; 32],
+        )
+        .unwrap();
+        assert_eq!(expected_payload["occurrence_count"], 5);
+        assert_eq!(expected_payload["distinct_value_count"], 3);
+        assert_eq!(expected_payload["entries"][0]["value"], "-2");
+        assert_eq!(expected_payload["entries"][0]["occurrence_count"], 1);
+        assert_eq!(expected_payload["entries"][1]["value"], "-1");
+        assert_eq!(expected_payload["entries"][1]["occurrence_count"], 3);
+        assert_eq!(expected_payload["entries"][2]["kind"], "string");
+        assert_eq!(expected_payload["entries"][2]["occurrence_count"], 1);
+
+        let mut reverse = ProviderDefinitions::default();
+        for entry in [
+            conflicting.clone(),
+            twice.clone(),
+            duplicate.clone(),
+            once.clone(),
+        ] {
+            reverse.insert(key.clone(), entry).unwrap();
+        }
+        let (reverse_map, reverse_conflicts) = reverse.into_materialized().unwrap();
+        assert_eq!(
+            provider_identifier_quarantine_payload(
+                &reverse_map,
+                ProviderIdentifierQuarantine::default(),
+                &reverse_conflicts,
+                &[0x11; 32],
+            )
+            .unwrap(),
+            expected_payload
+        );
+
+        let mut left = ProviderDefinitions::default();
+        left.insert(key.clone(), once).unwrap();
+        left.insert(key.clone(), twice).unwrap();
+        let mut right = ProviderDefinitions::default();
+        right.insert(key.clone(), duplicate).unwrap();
+        right.insert(key, conflicting).unwrap();
+        let merged = merge_provider_definitions_pairwise(vec![(0, left), (1, right)]).unwrap();
+        let (merged_map, merged_conflicts) = merged.into_materialized().unwrap();
+        assert_eq!(
+            provider_identifier_quarantine_payload(
+                &merged_map,
+                ProviderIdentifierQuarantine::default(),
+                &merged_conflicts,
+                &[0x11; 32],
+            )
+            .unwrap(),
+            expected_payload
+        );
+    }
+
+    #[test]
+    fn retained_provider_definition_replay_verifies_source_identity() {
+        let provider_ref = valid_provider_reference();
+        let raw_provider = serde_json::to_vec(&provider_ref).unwrap();
+        let (key, mut entry) = provider_ref_definition(&provider_ref).unwrap();
+        let source_witness = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        source_witness.configure_provider_spools(1).unwrap();
+        entry.source_locators.push(
+            source_witness
+                .store_provider_source(0, &raw_provider)
+                .unwrap(),
+        );
+        source_witness.seal_provider_sources().unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let context = ProviderRefBatchContext {
+            dedupe: &dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: None,
+            allow_empty_npi_tin_only: false,
+            defer_definition_outputs: false,
+        };
+
+        emit_provider_definition_outputs(
+            &HashMap::from([(key.clone(), entry.clone())]),
+            1,
+            &CopyPathConfig::default(),
+            0,
+            context,
+        )
+        .unwrap();
+
+        let mut drifted_entry = entry;
+        drifted_entry.npi.push(2_222_222_222);
+        drifted_entry.provider_count = 2;
+        let drift_dedupe = SharedDedupe::new(1);
+        let drift_sidecars = Arc::new(Mutex::new(ManifestSidecarCollector::default()));
+        let drift_context = ProviderRefBatchContext {
+            dedupe: &drift_dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: Some(&drift_sidecars),
+            allow_empty_npi_tin_only: false,
+            defer_definition_outputs: false,
+        };
+        let error = emit_provider_definition_outputs(
+            &HashMap::from([(key, drifted_entry)]),
+            1,
+            &CopyPathConfig::default(),
+            0,
+            drift_context,
+        )
+        .err()
+        .expect("source identity drift must fail closed");
+        assert!(error.to_string().contains("differs from its source spool"));
+        assert!(lock_manifest_sidecars(&drift_sidecars)
+            .provider_component_group
+            .is_empty());
+    }
+
+    #[test]
+    fn retained_provider_replay_validates_every_definition_before_any_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_provider = valid_provider_reference();
+        let mut second_provider = valid_provider_reference();
+        second_provider["provider_group_id"] = json!(8);
+        second_provider["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let first_raw = serde_json::to_vec(&first_provider).unwrap();
+        let second_raw = serde_json::to_vec(&second_provider).unwrap();
+        let source_witness = SourceWitnessCollector::new(&"ef".repeat(32)).unwrap();
+        source_witness.configure_provider_spools(1).unwrap();
+        let (first_key, mut first_entry) = provider_ref_definition(&first_provider).unwrap();
+        first_entry
+            .source_locators
+            .push(source_witness.store_provider_source(0, &first_raw).unwrap());
+        let (second_key, mut second_entry) = provider_ref_definition(&second_provider).unwrap();
+        second_entry.source_locators.push(
+            source_witness
+                .store_provider_source(0, &second_raw)
+                .unwrap(),
+        );
+        assert!(first_entry.source_locators[0].offset < second_entry.source_locators[0].offset);
+        source_witness.seal_provider_sources().unwrap();
+        second_entry.npi.push(3_333_333_333);
+        second_entry.provider_count += 1;
+
+        let dedupe = SharedDedupe::new(1);
+        let sidecars = Arc::new(Mutex::new(ManifestSidecarCollector::default()));
+        let context = ProviderRefBatchContext {
+            dedupe: &dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: Some(&sidecars),
+            allow_empty_npi_tin_only: false,
+            defer_definition_outputs: false,
+        };
+        let base_path = directory.path().join("provider-group-member.copy");
+        let copy_paths = CopyPathConfig {
+            manifest_provider_group_member: Some(base_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let worker_path = copy_paths
+            .for_worker(0)
+            .manifest_provider_group_member
+            .unwrap();
+
+        let error = emit_provider_definition_outputs(
+            &HashMap::from([(first_key, first_entry), (second_key, second_entry)]),
+            1,
+            &copy_paths,
+            0,
+            context,
+        )
+        .err()
+        .expect("later source identity drift must fail closed");
+
+        assert!(error.to_string().contains("differs from its source spool"));
+        assert!(!Path::new(&worker_path).exists());
+        assert!(lock_manifest_sidecars(&sidecars)
+            .provider_component_group
+            .is_empty());
+        let summary = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(summary["provider_group_attempted"], 0);
+        assert_eq!(summary["provider_group_member_attempted"], 0);
+    }
+
+    #[test]
+    fn retained_split_provider_replay_records_the_aggregate_component() {
+        let provider_ref = valid_provider_reference();
+        let mut split_ref = provider_ref.clone();
+        split_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let source_witness = SourceWitnessCollector::new(&"cd".repeat(32)).unwrap();
+        source_witness.configure_provider_spools(1).unwrap();
+        let mut definitions = ProviderDefinitions::default();
+        for value in [&provider_ref, &split_ref] {
+            let raw_provider = serde_json::to_vec(value).unwrap();
+            let (key, mut entry) = provider_ref_definition(value).unwrap();
+            entry.source_locators.push(
+                source_witness
+                    .store_provider_source(0, &raw_provider)
+                    .unwrap(),
+            );
+            definitions.insert(key, entry).unwrap();
+        }
+        let (provider_map, conflicts) = definitions.into_materialized().unwrap();
+        assert!(conflicts.definitions_by_key.is_empty());
+        source_witness.seal_provider_sources().unwrap();
+        let expected_entry = provider_map.values().next().unwrap();
+        let expected_component_id =
+            provider_component_global_id_from_hash(expected_entry.entry_hash);
+        let expected_group_ids = expected_entry
+            .provider_group_hashes
+            .iter()
+            .map(|hash| provider_group_global_id_from_hash(*hash))
+            .collect::<Vec<_>>();
+        let dedupe = SharedDedupe::new(1);
+        let sidecars = Arc::new(Mutex::new(ManifestSidecarCollector::default()));
+        let context = ProviderRefBatchContext {
+            dedupe: &dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: Some(&sidecars),
+            allow_empty_npi_tin_only: false,
+            defer_definition_outputs: false,
+        };
+
+        emit_provider_definition_outputs(&provider_map, 1, &CopyPathConfig::default(), 0, context)
+            .unwrap();
+
+        assert_eq!(
+            lock_manifest_sidecars(&sidecars)
+                .provider_component_group
+                .get(&expected_component_id),
+            Some(&expected_group_ids)
+        );
     }
 
     #[test]
@@ -33548,6 +34451,18 @@ mod tests {
             .capture_object_bytes_append(&mut captured)
             .unwrap();
         assert_eq!(captured, first);
+    }
+
+    #[test]
+    fn provider_source_capture_rejects_the_byte_past_the_record_limit() {
+        validate_provider_source_capture_append(PROVIDER_SOURCE_RECORD_MAX_BYTES - 1, 0).unwrap();
+        let error = validate_provider_source_capture_append(PROVIDER_SOURCE_RECORD_MAX_BYTES, 0)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("provider source record is 67108865 bytes"));
+        assert!(validate_provider_source_capture_append(0, 1).is_err());
     }
 
     #[test]
