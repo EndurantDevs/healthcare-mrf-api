@@ -145,7 +145,11 @@ def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
     }
     assert set(document) == {"name", True, "permissions", "jobs"}
     assert document["name"] == "Trusted pull request CI"
-    assert document["permissions"] == {"actions": "read", "contents": "read"}
+    assert document["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "packages": "read",
+    }
     assert document["jobs"] == {
         "ci": {
             "uses": (
