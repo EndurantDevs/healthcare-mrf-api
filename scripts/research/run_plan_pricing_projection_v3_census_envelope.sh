@@ -964,6 +964,8 @@ expected_spec = {
     "failurePolicy": "Fail",
     "matchConstraints": {
         "matchPolicy": "Exact",
+        "namespaceSelector": {},
+        "objectSelector": {},
         "resourceRules": [{
             "apiGroups": ["batch"],
             "apiVersions": ["v1"],
@@ -1005,6 +1007,7 @@ expected_spec = {
         "namespaceSelector": {"matchLabels": {
             "kubernetes.io/metadata.name": sys.argv[4]
         }},
+        "objectSelector": {},
     },
 }
 if (meta.get("name") != sys.argv[1]
