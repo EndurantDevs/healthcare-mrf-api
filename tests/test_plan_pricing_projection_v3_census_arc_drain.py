@@ -89,10 +89,7 @@ def test_arc_helper_is_in_reviewed_harness_inventory() -> None:
     assert "scripts/research/plan_pricing_projection_v3_census_arc.py" in support.HARNESS_PATHS
 
 
-@pytest.mark.parametrize("attack", ["none", "checkout", "descriptor", "replace"])
-def test_arc_helper_executes_only_reviewed_source(tmp_path: Path, attack: str) -> None:
-    definitions = tmp_path / "envelope.sh"
-    definitions.write_text(envelope.SCRIPT.read_text().rsplit('main "$@"', 1)[0])
+def _reviewed_helper_checkout(tmp_path: Path, attack: str) -> tuple[Path, str]:
     checkout = tmp_path / "repo"
     helper = checkout / "scripts/research/plan_pricing_projection_v3_census_arc.py"
     helper.parent.mkdir(parents=True)
@@ -132,6 +129,15 @@ def test_arc_helper_executes_only_reviewed_source(tmp_path: Path, attack: str) -
              replacement_sha],
             check=True,
         )
+    return checkout, source_sha
+
+
+@pytest.mark.parametrize("attack", ["none", "checkout", "descriptor", "replace"])
+def test_arc_helper_executes_only_reviewed_source(tmp_path: Path, attack: str) -> None:
+    """Execute only the committed helper object despite checkout or descriptor attacks."""
+    definitions = tmp_path / "envelope.sh"
+    definitions.write_text(envelope.SCRIPT.read_text().rsplit('main "$@"', 1)[0])
+    checkout, source_sha = _reviewed_helper_checkout(tmp_path, attack)
     marker = tmp_path / "executed"
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -143,7 +149,7 @@ def test_arc_helper_executes_only_reviewed_source(tmp_path: Path, attack: str) -
     replacement = tmp_path / "replacement"
     if attack == "descriptor":
         replacement.write_text("raise SystemExit('unreviewed')\n")
-    result = subprocess.run(
+    completed_process = subprocess.run(
         ["bash", "-c", r'''
 source "$1"
 REPO_DIR=$2
@@ -170,8 +176,8 @@ arc_acquisition verify
              "PATH": f"{fake_bin}:{os.environ['PATH']}"},
         capture_output=True, text=True, timeout=10, check=False,
     )
-    attacked = attack != "none"
-    assert (result.returncode != 0) is attacked, result.stderr
-    assert marker.exists() is not attacked
-    if not attacked:
+    is_attack = attack != "none"
+    assert (completed_process.returncode != 0) is is_attack, completed_process.stderr
+    assert marker.exists() is not is_attack
+    if not is_attack:
         assert marker.read_text() == "xx"

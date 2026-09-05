@@ -12,7 +12,7 @@ from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 from .test_plan_pricing_projection_v3_census_envelope_interrupts import _script_definitions
 
 
-def _pid_exists(pid: int) -> bool:
+def _is_pid_present(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -47,7 +47,7 @@ def test_arc_helper_signal_cleanup(tmp_path: Path, phase: str, number: signal.Si
         except subprocess.TimeoutExpired:
             pytest.fail(f"parent deferred {number.name} while ARC {phase} remained active")
         assert process.returncode == 128 + number, stderr
-        assert not _pid_exists(helper_pid), "ARC helper outlived the parent cleanup"
+        assert not _is_pid_present(helper_pid), "ARC helper outlived the parent cleanup"
         observed = events.read_text().splitlines()
         assert observed.count(f"arc_{phase}_signal_{signal.SIGTERM.value}") == 1
         assert "lock_stop" not in observed
@@ -58,7 +58,7 @@ def test_arc_helper_signal_cleanup(tmp_path: Path, phase: str, number: signal.Si
         assert receipt["cleanup"]["complete"] is False
         assert receipt["cleanup"]["lock_released"] is False
     finally:
-        if helper_pid is not None and _pid_exists(helper_pid):
+        if helper_pid is not None and _is_pid_present(helper_pid):
             os.kill(helper_pid, signal.SIGKILL)
         if process.poll() is None:
             try:
@@ -67,7 +67,7 @@ def test_arc_helper_signal_cleanup(tmp_path: Path, phase: str, number: signal.Si
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate(timeout=5)
         if helper_pid is not None:
-            assert not _pid_exists(helper_pid), "task-created helper was not cleaned up"
+            assert not _is_pid_present(helper_pid), "task-created helper was not cleaned up"
 
 
 def test_arc_helper_group_kills_signal_ignoring_descendant(tmp_path: Path) -> None:
@@ -95,12 +95,12 @@ def test_arc_helper_group_kills_signal_ignoring_descendant(tmp_path: Path) -> No
         process.send_signal(signal.SIGTERM)
         _, stderr = process.communicate(timeout=10)
         assert process.returncode == 143, stderr
-        assert not _pid_exists(helper_pid)
+        assert not _is_pid_present(helper_pid)
         receipt = envelope._receipt(state_root)
         assert receipt["cleanup"]["complete"] is False
         assert receipt["cleanup"]["lock_released"] is False
     finally:
-        if helper_pid is not None and _pid_exists(helper_pid):
+        if helper_pid is not None and _is_pid_present(helper_pid):
             os.kill(helper_pid, signal.SIGKILL)
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)

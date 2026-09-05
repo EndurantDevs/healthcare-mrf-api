@@ -437,13 +437,13 @@ def test_fresh_restore_reconciles_capacity_restore_intent(lifecycle, after_patch
 def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
     drain, cluster = lifecycle
     drain.hold()
-    data = json.loads(drain.path.read_text())
+    persisted_state = json.loads(drain.path.read_text())
     if damage.startswith("fence-"):
         role = "binding"
         resource = arc.FENCE_RESOURCES[role]
         name = drain.manifests[role]["metadata"]["name"]
         fence = cluster.fences[resource, name]
-        data["fences"][role].update(
+        persisted_state["fences"][role].update(
             phase="delete_intent",
             resourceVersion=fence["metadata"]["resourceVersion"],
         )
@@ -455,11 +455,14 @@ def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
             fence["metadata"]["resourceVersion"] = "99"
     else:
         cluster.fences.clear()
-        for record in data["fences"].values():
-            record["phase"] = "deleted"
-        row = next(row for row in data["original"] if row["name"] == "ci-a")
+        for fence_state in persisted_state["fences"].values():
+            fence_state["phase"] = "deleted"
+        original_asr = next(
+            candidate for candidate in persisted_state["original"]
+            if candidate["name"] == "ci-a"
+        )
         current = cluster.asrs["ci-a"]
-        data["changes"]["ci-a"] = {
+        persisted_state["changes"]["ci-a"] = {
             "phase": "restore_intent",
             "resourceVersion": current["metadata"]["resourceVersion"],
         }
@@ -470,8 +473,8 @@ def test_cleanup_intent_reconciliation_rejects_drift(lifecycle, damage):
         elif damage == "capacity-drift":
             current["spec"]["maxRunners"] = 1
         else:
-            current["spec"] = deepcopy(row["spec"])
-    drain.path.write_text(json.dumps(data) + "\n")
+            current["spec"] = deepcopy(original_asr["spec"])
+    drain.path.write_text(json.dumps(persisted_state) + "\n")
 
     resumed = arc.ArcDrain(drain.path, "test-owner", deadline_seconds=30)
     with pytest.raises(RuntimeError):

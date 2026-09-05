@@ -106,9 +106,7 @@ def _arguments(
     ]
 
 
-def _fake_environment(
-    tmp_path: Path, **overrides: str
-) -> tuple[dict[str, str], Path, Path]:
+def _fake_command_directory(tmp_path: Path) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     dispatcher = fake_bin / "fake-command"
@@ -130,6 +128,15 @@ def _fake_environment(
     census_child = fake_bin / "census-child"
     census_child.write_text(_FAKE_COMMAND, encoding="utf-8")
     census_child.chmod(0o755)
+    return fake_bin
+
+
+def _fake_environment(
+    tmp_path: Path, **overrides: str
+) -> tuple[dict[str, str], Path, Path]:
+    """Create the isolated command, state, and checkout roots for an envelope run."""
+    fake_bin = _fake_command_directory(tmp_path)
+    census_child = fake_bin / "census-child"
     fake_state = tmp_path / "fake-state"
     fake_state.mkdir()
     overlay_bytes = (
