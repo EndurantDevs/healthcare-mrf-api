@@ -74,7 +74,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 6_918
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_679
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 654
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 656
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 100
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (

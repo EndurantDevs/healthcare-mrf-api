@@ -2580,6 +2580,7 @@ hospitals:
 - hospital_id: hospital-000763
   name: Baylor Scott & White Emergency Hospital Keller
   cms_hpt_url: https://bsweh.org/cms-hpt.txt
+  locator_mrf_url: https://mrfs.hyvehealthcare.com/Emerus/364755936_EBD-BEMC-Burleson-LLC_standardcharges.csv
 - hospital_id: hospital-000764
   name: Baylor Scott & White Emergency Hospital Mansfield
   cms_hpt_url: https://bsweh.org/cms-hpt.txt
