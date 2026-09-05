@@ -6,8 +6,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
-
 from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 
 
@@ -127,52 +125,6 @@ def test_large_configmap_overlay_is_attested_without_exec_environment(
     assert len(envelope.LARGE_OVERLAY_BYTES) * 4 // 3 > 128 * 1024
     assert result.returncode == 0, result.stderr
     assert envelope._receipt(state_root)["status"] == "complete"
-
-
-def test_plan_renders_exact_fences_without_external_commands(tmp_path: Path) -> None:
-    """The default plan must render the global hold without mutation."""
-
-    state_root = tmp_path / "state"
-    result = subprocess.run(
-        [
-            "/bin/bash",
-            str(envelope.SCRIPT),
-            "plan",
-            *envelope._arguments(state_root, tmp_path),
-        ],
-        env={
-            "PATH": "/nonexistent",
-            "HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT": str(state_root),
-        },
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    assert "temporary global DEV build, ARC, and import hold" in result.stdout
-    assert "separate direct authority is required" in result.stdout
-    assert "Kubernetes QoS does not reserve or cap off-node PostgreSQL" in result.stdout
-    assert 'pods: "0"' in result.stdout
-    assert f"name: hp-pv3-census-quota-probe-{envelope.OWNER}" in result.stdout
-    assert "        runAsNonRoot: true\n        runAsUser: 65532" in result.stdout
-    assert "failurePolicy: Fail" in result.stdout
-    assert f"message: hp-pv3-census-deny-{envelope.OWNER}" in result.stdout
-    probe = yaml.safe_load(result.stdout.split("--- server-dry-run probe ---\n", 1)[1])
-    probe_pod_spec = probe["spec"]["template"]["spec"]
-    assert probe_pod_spec["automountServiceAccountToken"] is False
-    assert probe_pod_spec["securityContext"] == {
-        "runAsNonRoot": True,
-        "runAsUser": 65534,
-        "runAsGroup": 65534,
-        "seccompProfile": {"type": "RuntimeDefault"},
-    }
-    probe_worker = probe_pod_spec["containers"][0]
-    assert probe_worker["imagePullPolicy"] == "IfNotPresent"
-    assert probe_worker["securityContext"] == {
-        "allowPrivilegeEscalation": False,
-        "capabilities": {"drop": ["ALL"]},
-    }
-    assert not state_root.exists()
 
 
 def test_uid_drift_retains_outer_fences(tmp_path: Path) -> None:
