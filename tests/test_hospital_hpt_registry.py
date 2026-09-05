@@ -21,6 +21,7 @@ _REVIEWED_ALIAS_SAMPLES = {
     "hospital-006354": "hospital-002932",
     "hospital-006639": "hospital-002933",
     "hospital-006738": "hospital-006688",
+    "hospital-000767": "hospital-000763",
     "hospital-001835": "hospital-001836",
     "hospital-001837": "hospital-001834",
     "hospital-002614": "hospital-002613",
@@ -84,10 +85,10 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_919
+    assert len(registry.hospital_hpt_registry_groups()) == 6_918
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_678
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 655
+    assert sum("locator_name" in entry for entry in hospitals) == 1_679
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 656
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 98
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
@@ -147,7 +148,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 437
+    assert len(aliases_by_id) == 438
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
@@ -157,6 +158,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         "Advanced Specialty Hospitals of Toledo"
     )
     for alias_id, canonical_id in {
+        "hospital-000767": "hospital-000763",
         "hospital-002614": "hospital-002613",
         "hospital-002615": "hospital-002616",
         "hospital-002618": "hospital-002617",
