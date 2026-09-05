@@ -56,8 +56,14 @@ pub(super) fn assert_worker_job_queue_pressure(
     event_tx.send(empty_copy_file_event()).unwrap();
     let event_observer_rx = event_rx.clone();
     let mut writer = Vec::new();
+    let retry_event_tx = event_tx.clone();
     let receiver = thread::spawn(move || {
         wait_until_event_is_drained(&event_observer_rx, "worker-job queue never reported Full");
+        retry_event_tx.send(empty_copy_file_event()).unwrap();
+        wait_until_event_is_drained(
+            &event_observer_rx,
+            "worker-job queue never reported a second Full",
+        );
         let _ = job_rx
             .recv_timeout(QUEUE_FULL_HANDSHAKE_TIMEOUT)
             .expect("prefilled worker job was not released");
