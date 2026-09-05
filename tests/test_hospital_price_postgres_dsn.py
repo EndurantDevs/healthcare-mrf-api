@@ -9,7 +9,7 @@ from sqlalchemy.engine import URL, make_url
 from tests.hospital_price_packed_storage_postgres import _driver_dsn
 
 
-@pytest.mark.parametrize("password,host", [
+@pytest.mark.parametrize(("password", "host"), [
     ("synthetic-password", "127.0.0.1"), ("synthetic@:/%+", "postgres"),
 ])
 def test_postgres_driver_dsn_preserves_credentials(password, host) -> None:
