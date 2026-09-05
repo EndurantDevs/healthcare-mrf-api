@@ -201,7 +201,6 @@ async def _validated_row_seal(
             evidence_run_id=dataset_row["evidence_run_id"],
             dataset_hash=dataset_row["dataset_hash"],
             resource_count=dataset_row["resource_count"],
-            scratch_directory=temporary_path,
             expected_resource_hashes=(
                 dataset_row["completion_resource_hashes"]
                 if completion_version == 3

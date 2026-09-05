@@ -53,6 +53,83 @@ def _materialize_shard_task_values(task: dict[str, Any] | None) -> tuple[str, st
     return run_id, stage_suffix, schema, test_mode, year, shard_id, shard_count
 
 
+async def _count_materialize_shard_rows(
+    schema: str,
+    target_table: str,
+    *,
+    run_id: str,
+    phase: str,
+    year: int,
+    shard_id: int,
+    shard_count: int,
+    checkpoint: str,
+) -> int | None:
+    try:
+        return await _count_shard_rows(
+            schema,
+            target_table,
+            year=year,
+            shard_id=shard_id,
+            shard_count=shard_count,
+        )
+    except Exception as exc:
+        logger.warning(
+            "provider quality materialize shard %s-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
+            checkpoint,
+            run_id,
+            phase,
+            year,
+            shard_id,
+            shard_count,
+            target_table,
+            exc,
+        )
+        return None
+
+
+async def _materialize_shard_rows(
+    task_values: tuple[str, str, str, bool, int, int, int],
+    *,
+    sql_builder,
+    phase: str,
+    target_table_key: str,
+    include_run_id: bool,
+) -> tuple[int | None, int | None]:
+    run_id, stage_suffix, schema, test_mode, year, shard_id, shard_count = task_values
+    await ensure_database(test_mode)
+    classes = _staging_classes(stage_suffix, schema)
+    cohort_context = await _build_cohort_materialization_context(classes, schema)
+    target_table = str(cohort_context[target_table_key])
+    count_options_by_name = {
+        "run_id": run_id,
+        "phase": phase,
+        "year": year,
+        "shard_id": shard_id,
+        "shard_count": shard_count,
+    }
+    rows_before = await _count_materialize_shard_rows(
+        schema,
+        target_table,
+        **count_options_by_name,
+        checkpoint="pre",
+    )
+    parameter_by_name: dict[str, Any] = {
+        "year": year,
+        "shard_id": shard_id,
+        "shard_count": shard_count,
+    }
+    if include_run_id:
+        parameter_by_name["run_id"] = run_id
+    await _execute_shard_sql(sql_builder(cohort_context), **parameter_by_name)
+    rows_after = await _count_materialize_shard_rows(
+        schema,
+        target_table,
+        **count_options_by_name,
+        checkpoint="post",
+    )
+    return rows_before, rows_after
+
+
 async def _run_materialize_shard_job(
     ctx,
     task: dict[str, Any] | None,
@@ -63,63 +140,18 @@ async def _run_materialize_shard_job(
     include_run_id: bool = False,
 ) -> dict[str, Any]:
     """Run one provider-quality materialization shard."""
-    run_id, stage_suffix, schema, test_mode, year, shard_id, shard_count = _materialize_shard_task_values(task)
+    task_values = _materialize_shard_task_values(task)
+    run_id, _stage_suffix, _schema, _test_mode, year, shard_id, shard_count = task_values
     redis = ctx.get("redis")
     started_at = time.monotonic()
     try:
-        await ensure_database(test_mode)
-        classes = _staging_classes(stage_suffix, schema)
-        cohort_context = await _build_cohort_materialization_context(classes, schema)
-        target_table = str(cohort_context[target_table_key])
-        rows_before: int | None = None
-        try:
-            rows_before = await _count_shard_rows(
-                schema,
-                target_table,
-                year=year,
-                shard_id=shard_id,
-                shard_count=shard_count,
-            )
-        except Exception as exc:
-            logger.warning(
-                "provider quality materialize shard pre-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
-                run_id,
-                phase,
-                year,
-                shard_id,
-                shard_count,
-                target_table,
-                exc,
-            )
-        sql = sql_builder(cohort_context)
-        parameter_by_name: dict[str, Any] = {
-            "year": year,
-            "shard_id": shard_id,
-            "shard_count": shard_count,
-        }
-        if include_run_id:
-            parameter_by_name["run_id"] = run_id
-        await _execute_shard_sql(sql, **parameter_by_name)
-        rows_after: int | None = None
-        try:
-            rows_after = await _count_shard_rows(
-                schema,
-                target_table,
-                year=year,
-                shard_id=shard_id,
-                shard_count=shard_count,
-            )
-        except Exception as exc:
-            logger.warning(
-                "provider quality materialize shard post-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
-                run_id,
-                phase,
-                year,
-                shard_id,
-                shard_count,
-                target_table,
-                exc,
-            )
+        rows_before, rows_after = await _materialize_shard_rows(
+            task_values,
+            sql_builder=sql_builder,
+            phase=phase,
+            target_table_key=target_table_key,
+            include_run_id=include_run_id,
+        )
         duration_sec = max(time.monotonic() - started_at, 0.0)
         rows_deleted = rows_before
         rows_inserted = rows_after

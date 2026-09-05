@@ -36,14 +36,13 @@ from tests.uhc_final_publication_test_support import final_publication_fixture
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
-def _validate_copy(copy_path: Path, scratch_directory: Path, **changes: object):
+def _validate_copy(copy_path: Path, **changes: object):
     expected_by_field = {
         "dataset_id": "dataset_shared",
         "endpoint_id": "endpoint_shared",
         "evidence_run_id": "root-shared",
         "dataset_hash": "e" * 64,
         "resource_count": 2,
-        "scratch_directory": scratch_directory,
     }
     expected_by_field.update(changes)
     return validate_generic_admission_copy(copy_path, **expected_by_field)
@@ -85,7 +84,7 @@ def test_streaming_rejects_malformed_grammar(
     copy_path = tmp_path / "metadata.copy"
     _binary_copy_payload(payload, copy_path)
     with pytest.raises(AdmissionSealError, match=error):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize(
@@ -118,7 +117,7 @@ def test_streaming_rejects_malformed_copy_shape(tmp_path: Path, body: bytes):
     copy_path = tmp_path / "metadata.copy"
     copy_path.write_bytes(_COPY_SIGNATURE + struct.pack("!ii", 0, 0) + body)
     with pytest.raises(AdmissionSealError, match="copy_shape|copy_size"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize(
@@ -140,7 +139,7 @@ def test_streaming_copy_requires_array_root_scopes(
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="lineage"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize("invalid_item", [1, True, None])
@@ -159,7 +158,7 @@ def test_streaming_copy_requires_string_root_scope_items(
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="lineage"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 def test_streaming_copy_rejects_explicit_null_hash_contract(tmp_path: Path):
@@ -169,7 +168,7 @@ def test_streaming_copy_rejects_explicit_null_hash_contract(tmp_path: Path):
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="contract"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize(
@@ -190,7 +189,7 @@ def test_streaming_copy_requires_exact_semantic_root_proof_scope(
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="lineage|resource scope"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 def test_streaming_copy_rejects_non_ascii_proof_value(tmp_path: Path):
@@ -202,7 +201,7 @@ def test_streaming_copy_rejects_non_ascii_proof_value(tmp_path: Path):
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="non_ascii"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize(
@@ -225,7 +224,7 @@ def test_streaming_copy_rejects_noncanonical_root_lineage(
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="lineage"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 def test_receipt_digest_preserves_large_integer_identity():
@@ -253,7 +252,7 @@ def test_streaming_copy_accepts_zero_count_scoped_resource(tmp_path: Path):
     copy_path = tmp_path / "metadata.copy"
     _binary_copy(metadata, copy_path)
 
-    receipt = _validate_copy(copy_path, tmp_path)
+    receipt = _validate_copy(copy_path)
 
     assert receipt.resource_types == ("Location", "Practitioner")
 
@@ -266,7 +265,7 @@ def test_streaming_copy_rejects_unbounded_tiny_item_capture_and_cleans_spool(
     _binary_copy_payload(payload, copy_path)
 
     with pytest.raises(AdmissionSealError, match="capture_unbounded"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
     assert list(tmp_path.iterdir()) == [copy_path]
 
 
@@ -301,7 +300,7 @@ def test_streaming_copy_ignores_legacy_semantic_parent_key_presence(
     copy_path = tmp_path / "metadata.copy"
     _binary_copy(metadata, copy_path)
 
-    receipt = _validate_copy(copy_path, tmp_path)
+    receipt = _validate_copy(copy_path)
 
     assert receipt.admission_kind == "generic"
 
@@ -313,7 +312,7 @@ def test_streaming_copy_binds_optional_parent_root_run_id(tmp_path: Path):
     _binary_copy(metadata, copy_path)
 
     with pytest.raises(AdmissionSealError, match="parent_identity"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 @pytest.mark.parametrize(("flags", "extension_length"), [(1, 0), (0, 1)])
@@ -335,7 +334,7 @@ def test_streaming_copy_requires_exact_private_copy_header(
     )
 
     with pytest.raises(AdmissionSealError, match="copy_header"):
-        _validate_copy(copy_path, tmp_path)
+        _validate_copy(copy_path)
 
 
 def test_streaming_copy_validates_bounded_legacy_canonical_proof(tmp_path: Path):
@@ -350,7 +349,6 @@ def test_streaming_copy_validates_bounded_legacy_canonical_proof(tmp_path: Path)
 
     receipt = _validate_copy(
         copy_path,
-        tmp_path,
         dataset_hash=state["dataset_hash"],
         resource_count=state["resource_count"],
     )
@@ -387,7 +385,6 @@ def test_streaming_copy_rejects_canonical_root_lineage_change(
     with pytest.raises(AdmissionSealError, match="uhc_proof_invalid"):
         _validate_copy(
             copy_path,
-            tmp_path,
             dataset_hash=state["dataset_hash"],
             resource_count=state["resource_count"],
         )

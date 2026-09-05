@@ -585,6 +585,87 @@ def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
     return _to_float(value)
 
 
+_QPP_NPI_FIELDS = (
+    "npi",
+    "clinician_npi",
+    "clinician npi",
+    "organization_npi",
+    "group_practice_npi",
+)
+_QPP_YEAR_FIELDS = (
+    "year",
+    "performance_year",
+    "performance year",
+    "reporting_year",
+    "reporting year",
+)
+_QPP_SCORE_FIELDS = {
+    "quality_score": (
+        "quality_score",
+        "quality score",
+        "quality",
+        "quality_percent",
+        "quality_category_score",
+        "quality category score",
+        "quality_performance_category_score",
+        "quality performance category score",
+    ),
+    "cost_score": (
+        "cost_score",
+        "cost score",
+        "cost",
+        "cost_percent",
+        "cost_category_score",
+        "cost category score",
+        "cost_performance_category_score",
+        "cost performance category score",
+    ),
+    "final_score": (
+        "final_score",
+        "final score",
+        "final",
+        "final_percent",
+        "final_mips_score",
+        "final mips score",
+        "finalscore",
+        "final score performance year",
+    ),
+}
+
+
+def _qpp_entry(
+    qpp_csv_fields: dict[str, Any],
+    reporting_year: int,
+) -> dict[str, Any] | None:
+    npi = _to_npi(_pick_first_ci(qpp_csv_fields, *_QPP_NPI_FIELDS))
+    if npi is None:
+        return None
+    year = _to_int(_pick_first_ci(qpp_csv_fields, *_QPP_YEAR_FIELDS))
+    return {
+        "npi": npi,
+        "year": max(year or reporting_year, 2013),
+        **{
+            score_name: _extract_qpp_score(qpp_csv_fields, *source_fields)
+            for score_name, source_fields in _QPP_SCORE_FIELDS.items()
+        },
+        "raw_json_text": json.dumps(qpp_csv_fields, ensure_ascii=True),
+        "updated_at": datetime.datetime.utcnow(),
+    }
+
+
+async def _flush_qpp_entries(
+    qpp_entries: list[dict[str, Any]],
+    qpp_cls: type,
+) -> None:
+    if not qpp_entries:
+        return
+    entry_by_identity = {
+        (entry.get("npi"), entry.get("year")): entry for entry in qpp_entries
+    }
+    await _push_objects_with_retry(list(entry_by_identity.values()), qpp_cls)
+    qpp_entries.clear()
+
+
 def _missing_svi_zcta_example(svi_csv_fields: dict[str, Any]) -> str:
     zcta_field_by_name = {
         "FIPS": svi_csv_fields.get("FIPS"),
@@ -620,93 +701,18 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 _print_row_progress("qpp_provider", row_number, accepted, progress_start)
                 progress_last = now
 
-            npi = _to_npi(
-                _pick_first_ci(
-                    qpp_csv_fields,
-                    "npi",
-                    "clinician_npi",
-                    "clinician npi",
-                    "organization_npi",
-                    "group_practice_npi",
-                )
-            )
-            if npi is None:
+            qpp_entry = _qpp_entry(qpp_csv_fields, reporting_year)
+            if qpp_entry is None:
                 continue
-            year = _to_int(
-                _pick_first_ci(
-                    qpp_csv_fields,
-                    "year",
-                    "performance_year",
-                    "performance year",
-                    "reporting_year",
-                    "reporting year",
-                )
-            )
-            year = max(year or reporting_year, 2013)
-
-            quality_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "quality_score",
-                "quality score",
-                "quality",
-                "quality_percent",
-                "quality_category_score",
-                "quality category score",
-                "quality_performance_category_score",
-                "quality performance category score",
-            )
-            cost_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "cost_score",
-                "cost score",
-                "cost",
-                "cost_percent",
-                "cost_category_score",
-                "cost category score",
-                "cost_performance_category_score",
-                "cost performance category score",
-            )
-            final_score = _extract_qpp_score(
-                qpp_csv_fields,
-                "final_score",
-                "final score",
-                "final",
-                "final_percent",
-                "final_mips_score",
-                "final mips score",
-                "finalscore",
-                "final score performance year",
-            )
-
-            qpp_entries.append(
-                {
-                    "npi": npi,
-                    "year": year,
-                    "quality_score": quality_score,
-                    "cost_score": cost_score,
-                    "final_score": final_score,
-                    "raw_json_text": json.dumps(qpp_csv_fields, ensure_ascii=True),
-                    "updated_at": datetime.datetime.utcnow(),
-                }
-            )
+            qpp_entries.append(qpp_entry)
             accepted += 1
             if len(qpp_entries) >= IMPORT_BATCH_SIZE:
-                qpp_entry_by_identity = {(
-                    qpp_entry.get("npi"),
-                    qpp_entry.get("year"),
-                ): qpp_entry for qpp_entry in qpp_entries}
-                await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
-                qpp_entries.clear()
+                await _flush_qpp_entries(qpp_entries, qpp_cls)
 
             if test_mode and accepted >= PROVIDER_QUALITY_TEST_QPP_ROWS:
                 break
 
-    if qpp_entries:
-        qpp_entry_by_identity = {
-            (qpp_entry.get("npi"), qpp_entry.get("year")): qpp_entry
-            for qpp_entry in qpp_entries
-        }
-        await _push_objects_with_retry(list(qpp_entry_by_identity.values()), qpp_cls)
+    await _flush_qpp_entries(qpp_entries, qpp_cls)
     _print_row_progress("qpp_provider", row_number, accepted, progress_start, final=True)
 
 
@@ -1571,8 +1577,13 @@ async def _enqueue_materialize_phase_shards(
     stage_suffix: str,
     schema: str,
     test_mode: bool,
-    job_name: str,
 ) -> int:
+    job_name = {
+        MAT_PHASE_2_BUILD_LSH_SHARDED: "provider_quality_materialize_lsh_shard",
+        MAT_PHASE_5_BUILD_MEASURE_SHARDED: "provider_quality_materialize_measure_shard",
+        MAT_PHASE_6_BUILD_DOMAIN_SHARDED: "provider_quality_materialize_domain_shard",
+        MAT_PHASE_7_BUILD_SCORE_SHARDED: "provider_quality_materialize_score_shard",
+    }[phase]
     payloads: list[dict[str, Any]] = []
     for year in years:
         for shard_id in range(shard_count):
@@ -1689,7 +1700,6 @@ async def _materialize_quality_rows_sharded(
                 stage_suffix=stage_suffix,
                 schema=schema,
                 test_mode=test_mode,
-                job_name="provider_quality_materialize_lsh_shard",
             )
         else:
             await _set_materialize_phase(
@@ -1729,7 +1739,6 @@ async def _materialize_quality_rows_sharded(
             stage_suffix=stage_suffix,
             schema=schema,
             test_mode=test_mode,
-            job_name="provider_quality_materialize_measure_shard",
         )
         raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 
@@ -1746,7 +1755,6 @@ async def _materialize_quality_rows_sharded(
             stage_suffix=stage_suffix,
             schema=schema,
             test_mode=test_mode,
-            job_name="provider_quality_materialize_domain_shard",
         )
         raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 
@@ -1763,7 +1771,6 @@ async def _materialize_quality_rows_sharded(
             stage_suffix=stage_suffix,
             schema=schema,
             test_mode=test_mode,
-            job_name="provider_quality_materialize_score_shard",
         )
         raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 

@@ -95,7 +95,6 @@ def test_streaming_copy_rejects_trailer_drift(tmp_path: Path):
         "evidence_run_id": "root-shared",
         "dataset_hash": "e" * 64,
         "resource_count": 1,
-        "scratch_directory": tmp_path,
     }
     for invalid_copy in (valid_copy[:-2] + b"\0\0", valid_copy + b"x"):
         copy_path.write_bytes(invalid_copy)
@@ -163,7 +162,6 @@ def test_streaming_copy_revalidates_complete_generic_proof(tmp_path: Path):
         evidence_run_id="root-shared",
         dataset_hash="e" * 64,
         resource_count=32,
-        scratch_directory=tmp_path,
     )
 
     assert receipt.admission_kind == "generic"
@@ -203,7 +201,6 @@ def test_streaming_copy_preserves_exact_large_integral_numbers(tmp_path: Path):
                 evidence_run_id="root-shared",
                 dataset_hash="e" * 64,
                 resource_count=2,
-                scratch_directory=tmp_path,
             )
         )
 
@@ -226,7 +223,6 @@ def test_streaming_copy_rejects_boolean_parent_resource_count(tmp_path: Path):
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=1,
-            scratch_directory=tmp_path,
         )
 
 
@@ -249,7 +245,6 @@ def test_streaming_copy_rejects_inexact_decimal_and_reserved_key(
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
 
     metadata = _large_metadata_by_field(2)
@@ -264,7 +259,6 @@ def test_streaming_copy_rejects_inexact_decimal_and_reserved_key(
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
     assert sorted(path.name for path in tmp_path.iterdir()) == [
         "inexact.copy",
@@ -299,7 +293,6 @@ def test_streaming_copy_rejects_decimal_proof_integers(
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
 
 
@@ -326,7 +319,6 @@ try:
         evidence_run_id="root-shared",
         dataset_hash="e" * 64,
         resource_count=2,
-        scratch_directory=Path(sys.argv[2]),
     )
 except AdmissionSealError:
     raise SystemExit(0)
@@ -360,7 +352,6 @@ def test_streaming_copy_rejects_unknown_proof_key(tmp_path: Path):
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
     assert list(tmp_path.iterdir()) == [copy_path]
 
@@ -385,7 +376,6 @@ def test_streaming_copy_rejects_resource_type_growth_early(tmp_path: Path):
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=65,
-            scratch_directory=tmp_path,
         )
     assert list(tmp_path.iterdir()) == [type_path]
 
@@ -405,7 +395,6 @@ def test_streaming_copy_rejects_unbounded_root_summary_early(tmp_path: Path):
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
     assert list(tmp_path.iterdir()) == [root_path]
 
@@ -452,7 +441,6 @@ def test_streaming_copy_rejects_resealed_descriptor_aggregate_drift(
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=2,
-            scratch_directory=tmp_path,
         )
 
 
@@ -494,5 +482,4 @@ def test_streaming_copy_rejects_resealed_legacy_resource_scope_drift(
             evidence_run_id="root-shared",
             dataset_hash="e" * 64,
             resource_count=4,
-            scratch_directory=tmp_path,
         )

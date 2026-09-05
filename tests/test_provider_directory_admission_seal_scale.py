@@ -56,7 +56,6 @@ def test_168275_shard_copy_revalidates_below_two_gib(tmp_path: Path):
         evidence_run_id="root-shared",
         dataset_hash="e" * 64,
         resource_count=_SHARD_COUNT,
-        scratch_directory=tmp_path,
     )
 
     assert receipt.proof_sha256 == metadata[
