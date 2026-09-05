@@ -309,6 +309,7 @@ def _report_diff_coverage(
     changed_by_path: dict[str, set[int]],
 ) -> dict[str, Any]:
     threshold = load_diff_threshold(report_name, report_config)
+    report_format = report_config.get("format")
     coverage_by_path = _coverage_files(root, report_config)
     covered_locations: set[str] = set()
     uncovered_locations: set[str] = set()
@@ -316,6 +317,15 @@ def _report_diff_coverage(
     for relative_path, changed_lines in changed_by_path.items():
         if not _is_path_in_scope(relative_path, report_config):
             continue
+        if report_format == "llvm-cov":
+            # cargo-llvm-cov 0.8.7 omits these test paths from its report by default.
+            path = PurePosixPath(relative_path)
+            if (
+                any(part in {"tests", "examples", "benches"} for part in path.parts)
+                or path.name == "tests.rs"
+                or path.name.endswith(("_tests.rs", "-tests.rs"))
+            ):
+                continue
         diff_exclude = report_config["growth"].get("diff_exclude", [])
         if any(PurePosixPath(relative_path).full_match(pattern) for pattern in diff_exclude):
             continue

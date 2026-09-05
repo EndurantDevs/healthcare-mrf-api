@@ -656,6 +656,29 @@ def test_rust_diff_coverage_uses_full_llvm_segments_at_the_80_percent_boundary(
     assert growth._diff_coverage_errors("rust", result) == []
 
 
+def test_rust_diff_coverage_matches_llvm_cov_default_test_exclusions(
+    tmp_path: Path,
+) -> None:
+    """Test-only Rust files omitted by cargo-llvm-cov stay outside the denominator."""
+
+    report_path = tmp_path / "rust.json"
+    report_path.write_text(json.dumps({"data": [{"files": []}]}), encoding="utf-8")
+    config = _report_config(report_path, "llvm-cov")
+
+    result = growth._report_diff_coverage(
+        tmp_path,
+        "rust",
+        config,
+        {
+            "support/ptg2_scanner/src/main_tests.rs": {1},
+            "support/ptg2_scanner/src/main_tests/tests/cases.rs": {1},
+        },
+    )
+
+    assert result["changed"] == 0
+    assert result["total"] == 0
+
+
 def test_rust_diff_coverage_rejects_malformed_llvm_segments(tmp_path: Path) -> None:
     """Summary-only or malformed LLVM JSON cannot silently pass diff coverage."""
 

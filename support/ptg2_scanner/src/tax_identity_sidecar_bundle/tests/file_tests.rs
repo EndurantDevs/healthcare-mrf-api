@@ -1,7 +1,9 @@
 use super::PairFixture;
 use crate::tax_identity_sidecar_bundle::files::{
-    hash_open_file, ARTIFACT_SIZE_MISMATCH, HASH_BUFFER_BYTES, UNAVAILABLE_ARTIFACT,
+    hash_open_file, open_authentic_artifact, reauthenticate_artifact, ARTIFACT_DIGEST_MISMATCH,
+    ARTIFACT_SIZE_MISMATCH, HASH_BUFFER_BYTES, UNAVAILABLE_ARTIFACT,
 };
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Seek;
 
@@ -76,6 +78,34 @@ fn hashing_stops_at_the_declared_boundary_and_rejects_extra_bytes() {
 
     assert_eq!(error.to_string(), ARTIFACT_SIZE_MISMATCH);
     assert_eq!(file.stream_position().unwrap(), 8);
+}
+
+#[test]
+fn hashing_rejects_a_file_shorter_than_the_declared_boundary() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("short.sidecar");
+    fs::write(&path, [0x5a]).unwrap();
+    let mut file = File::open(path).unwrap();
+
+    let error = hash_open_file(&mut file, 2).unwrap_err();
+
+    assert_eq!(error.to_string(), ARTIFACT_SIZE_MISMATCH);
+}
+
+#[test]
+fn reauthentication_rejects_declared_digest_mismatch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("sidecar");
+    let bytes = b"sidecar";
+    fs::write(&path, bytes).unwrap();
+    let expected_digest: [u8; 32] = Sha256::digest(bytes).into();
+    let (mut file, _, identity) =
+        open_authentic_artifact(&path, bytes.len() as u64, expected_digest).unwrap();
+
+    let error = reauthenticate_artifact(&path, &mut file, &identity, bytes.len() as u64, [0; 32])
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), ARTIFACT_DIGEST_MISMATCH);
 }
 
 #[cfg(unix)]

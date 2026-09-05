@@ -153,6 +153,9 @@ fn held_source_fd_is_reauthenticated_after_record_consumption() {
                 file.seek(SeekFrom::Start(0))?;
                 file.write_all(&[0x7f])?;
                 file.flush()?;
+                file.set_times(
+                    fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )?;
                 tampered = true;
             }
             Ok(())
