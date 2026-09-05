@@ -102,6 +102,7 @@ jobs:
         run: scripts/ci/prepush quality
   python-tests:
     name: python test suite (${{ matrix.shard-index }}/4)
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -150,6 +151,7 @@ jobs:
 
   capacity-evidence:
     name: ptg2 capacity evidence
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -325,6 +327,7 @@ jobs:
 
   api-contract:
     name: openapi contract
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -355,6 +358,7 @@ jobs:
         run: scripts/ci/prepush api-contract
   rust-scanner:
     name: rust scanner
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -395,6 +399,7 @@ jobs:
           retention-days: 1
   container-package:
     name: linux container package
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -419,6 +424,7 @@ jobs:
         run: scripts/ci/prepush container-package
   security:
     name: dependency and semgrep security
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -448,6 +454,7 @@ jobs:
         run: scripts/ci/prepush security
   worker-queue-smoke:
     name: redis worker queue smoke
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
@@ -490,6 +497,7 @@ jobs:
         run: scripts/ci/prepush redis
   address-canonical-db-tests:
     name: postgres18 postgis tests (${{ matrix.shard }})
+    needs: python-quality
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
