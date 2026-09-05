@@ -140,12 +140,12 @@ def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
 
     assert trigger_document["on"] == {
         "pull_request": {
-            "types": ["opened", "synchronize", "reopened", "labeled", "unlabeled"]
+            "types": ["opened", "synchronize", "reopened"]
         }
     }
     assert set(document) == {"name", True, "permissions", "jobs"}
     assert document["name"] == "Trusted pull request CI"
-    assert document["permissions"] == {"contents": "read"}
+    assert document["permissions"] == {"actions": "read", "contents": "read"}
     assert document["jobs"] == {
         "ci": {
             "uses": (
@@ -200,13 +200,9 @@ def test_reusable_foundation_preserves_caller_checkout_and_pr_context() -> None:
         "default": "false",
     }
     assert document["env"]["COVERAGE_BASE_SHA"] == COVERAGE_BASE_EXPRESSION
-    assert (
-        document["jobs"]["python-quality"]["steps"][-1]["env"]
-        ["READABILITY_ZERO_GROWTH_APPROVED"]
-        == "${{ github.event_name == 'pull_request' && "
-        "contains(github.event.pull_request.labels.*.name, "
-        "'readability-zero-growth-approved') }}"
-    )
+    assert document["jobs"]["python-quality"]["steps"][-1]["env"] == {
+        "BASE_SHA": COVERAGE_BASE_EXPRESSION
+    }
     for checkout in (
         step
         for job in document["jobs"].values()
@@ -258,7 +254,12 @@ def test_arc_jobs_are_secretless_and_privilege_free() -> None:
         job = document["jobs"][name]
         assert job["container"] == JOB_CONTAINER
         assert job["defaults"] == {"run": {"shell": "bash"}}
-        assert job.get("permissions", document["permissions"]) == {"contents": "read"}
+        expected_permissions = (
+            {"actions": "read", "contents": "read", "packages": "read"}
+            if name == "test-coverage"
+            else {"contents": "read"}
+        )
+        assert job.get("permissions", document["permissions"]) == expected_permissions
         assert "secrets." not in yaml.safe_dump(job)
         assert "environment" not in job
         for key in ("credentials", "volumes", "ports"):

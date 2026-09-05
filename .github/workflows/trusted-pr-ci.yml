@@ -2,9 +2,11 @@ name: Trusted pull request CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
 
 permissions:
+  # Read workflow runs and download the exact-base coverage artifact.
+  actions: read
   contents: read
 
 jobs:

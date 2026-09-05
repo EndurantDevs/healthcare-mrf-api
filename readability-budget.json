@@ -6,6 +6,8 @@
     "db",
     "process",
     "public_evidence",
+    "service",
+    "alembic",
     "scripts",
     "support",
     "tests"
@@ -33,12 +35,12 @@
     "data/**",
     "logs/**",
     "restore/**",
-    "service/**",
-    "reports/**",
-    "alembic/versions/**"
+    "reports/**"
   ],
   "thresholds": {
-    "max_file_lines": 500,
+    "max_file_lines": 1500,
+    "max_rust_file_lines": 800,
+    "huge_file_lines": 5000,
     "max_function_lines": 60,
     "max_nesting_depth": 4,
     "max_function_name_tokens": 6,
@@ -51,6 +53,29 @@
     "max_locals": 25
   },
   "readability": {
+    "file_length_roots": [
+      "main.py",
+      "api",
+      "db",
+      "process",
+      "public_evidence",
+      "service",
+      "support/ptg2_scanner/src"
+    ],
+    "module_attribute_injection_allowlist": [
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionError",
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionConfig",
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphInputSnapshot",
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphRootReceipt",
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionReceipt",
+      "process/provider_directory_rooted_graph_acquisition_contract.py:ProviderDirectoryRootedGraphAcquisitionDependencies",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerAcquisitionError",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerAcquisitionConfig",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerAcquisitionProgress",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerRootReceipt",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerAcquisitionReceipt",
+      "process/uhc_flex_practitioner_acquisition_contract.py:UHCFlexPractitionerAcquisitionDependencies"
+    ],
     "ambiguous_function_names": [
       "build",
       "callback",

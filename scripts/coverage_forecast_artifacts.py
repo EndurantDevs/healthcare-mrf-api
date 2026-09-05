@@ -116,6 +116,70 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
     return document
 
 
+def load_baseline_bytes(raw_document: bytes, label: str) -> dict[str, Any]:
+    """Load the versioned baseline shape from Git or an artifact."""
+
+    try:
+        document = json.loads(raw_document.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CoverageForecastError(f"{label} is not valid JSON") from exc
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise CoverageForecastError(f"{label} has an unsupported schema version")
+    reports_by_name = document.get("reports")
+    if not isinstance(reports_by_name, dict) or not reports_by_name:
+        raise CoverageForecastError(f"{label} has no coverage reports")
+    return document
+
+
+def load_baseline(path: Path) -> dict[str, Any]:
+    """Load one baseline file with a controlled missing-file error."""
+
+    try:
+        raw_document = path.read_bytes()
+    except OSError as exc:
+        raise CoverageForecastError(f"coverage baseline is unavailable: {path}") from exc
+    return load_baseline_bytes(raw_document, str(path))
+
+
+def base_baseline(root: Path, base_sha: str) -> dict[str, Any]:
+    """Read the tracked coverage baseline from the exact target commit."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "show", f"{base_sha}:{BASELINE_NAME}"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise CoverageForecastError(
+            "target base has no readable coverage baseline"
+        ) from exc
+    return load_baseline_bytes(completed.stdout, f"{base_sha}:{BASELINE_NAME}")
+
+
+def reference_baseline(
+    root: Path,
+    base_sha: str,
+    artifact_path: Path | None,
+) -> dict[str, Any]:
+    """Load the exact-base machine artifact, with one legacy bootstrap."""
+
+    tracked = base_baseline(root, base_sha)
+    if tracked.get("machine_artifact_required") is not True:
+        return tracked
+    if artifact_path is None:
+        raise CoverageForecastError(
+            f"base {base_sha} requires its 90-day coverage baseline artifact"
+        )
+    artifact = load_baseline(artifact_path)
+    if artifact.get("source_sha") != base_sha:
+        raise CoverageForecastError(
+            f"coverage baseline artifact source_sha must equal base {base_sha}"
+        )
+    return artifact
+
+
 def _sha256_file(path: Path) -> str:
     """Return a regular-file SHA-256 digest without loading it all at once."""
 
@@ -132,9 +196,7 @@ def _sha256_file(path: Path) -> str:
 def _baseline(root: Path) -> dict[str, Any]:
     """Load and validate the current versioned coverage baseline."""
 
-    baseline = _read_json(root / BASELINE_NAME, "coverage baseline")
-    if baseline.get("schema_version") != 1:
-        raise CoverageForecastError("coverage baseline must use schema version 1")
+    baseline = load_baseline(root / BASELINE_NAME)
     reports = baseline.get("reports")
     if not isinstance(reports, dict):
         raise CoverageForecastError("coverage baseline reports are malformed")

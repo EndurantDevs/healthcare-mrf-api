@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -254,6 +255,9 @@ PARSER_BY_FORMAT: dict[str, Parser] = {
     "llvm-cov": _llvm_snapshot,
 }
 
+_DOCS_START = "<!-- coverage-baseline:start -->"
+_DOCS_END = "<!-- coverage-baseline:end -->"
+
 
 def _collect_report(
     root: Path,
@@ -292,3 +296,93 @@ def _collect_report(
                 + ", ".join(missing_files)
             )
     return snapshot
+
+
+def _baseline_docs(baseline: dict[str, Any]) -> str:
+    """Render the tracked current-baseline tables deterministically."""
+
+    reports_by_name = baseline.get("reports")
+    if not isinstance(reports_by_name, dict) or not reports_by_name:
+        raise CoverageRatchetError("coverage baseline has no reports")
+    lines = [_DOCS_START]
+    for report_name, config in reports_by_name.items():
+        if not isinstance(config, dict):
+            raise CoverageRatchetError(f"{report_name}: baseline report is malformed")
+        metrics_by_name = config.get("metrics")
+        if not isinstance(metrics_by_name, dict) or not metrics_by_name:
+            raise CoverageRatchetError(f"{report_name}: baseline metrics are missing")
+        if len(reports_by_name) > 1:
+            lines.extend((f"### {report_name.replace('_', ' ').title()}", ""))
+        lines.extend(("| Metric | Covered / total | Coverage |", "| --- | ---: | ---: |"))
+        for metric_name, raw_metric in metrics_by_name.items():
+            if not isinstance(raw_metric, dict):
+                raise CoverageRatchetError(
+                    f"{report_name}.{metric_name}: baseline metric is malformed"
+                )
+            metric = _metric(
+                raw_metric.get("covered"),
+                raw_metric.get("total"),
+                f"{report_name}.{metric_name}",
+            )
+            lines.append(
+                f"| {metric_name.replace('_', ' ').title()} | "
+                f"{metric['covered']:,} / {metric['total']:,} | "
+                f"{100 * metric['covered'] / metric['total']:.2f}% |"
+            )
+        lines.append("")
+    lines.append(_DOCS_END)
+    return "\n".join(lines)
+
+
+def _updated_docs(document: str, baseline: dict[str, Any]) -> str:
+    if document.count(_DOCS_START) != 1 or document.count(_DOCS_END) != 1:
+        raise CoverageRatchetError(
+            "coverage docs must contain one generated table marker pair"
+        )
+    if document.index(_DOCS_START) > document.index(_DOCS_END):
+        raise CoverageRatchetError(
+            "coverage docs generated table markers are out of order"
+        )
+    prefix, remainder = document.split(_DOCS_START, 1)
+    _, suffix = remainder.split(_DOCS_END, 1)
+    return prefix + _baseline_docs(baseline) + suffix
+
+
+def check_baseline_docs(path: Path, baseline: dict[str, Any]) -> None:
+    """Fail when the generated documentation tables differ from a baseline."""
+
+    current = path.read_text(encoding="utf-8")
+    if current != _updated_docs(current, baseline):
+        raise CoverageRatchetError(
+            f"{path} current-baseline table is stale; run coverage_reports.py --write-docs"
+        )
+
+
+def _run_docs_cli() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--baseline", type=Path, default=Path("test-coverage-baseline.json")
+    )
+    parser.add_argument("--docs", type=Path, default=Path("docs/test-coverage.md"))
+    parser.add_argument("--write-docs", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    if not args.write_docs and not args.check:
+        parser.error("one of --write-docs or --check is required")
+    try:
+        baseline = _read_json(args.baseline)
+        if args.write_docs:
+            current = args.docs.read_text(encoding="utf-8")
+            args.docs.write_text(_updated_docs(current, baseline), encoding="utf-8")
+            print(f"Wrote the coverage baseline table to {args.docs}.")
+        if args.check:
+            check_baseline_docs(args.docs, baseline)
+            print("Coverage documentation matches the baseline.")
+    except (CoverageRatchetError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_docs_cli())

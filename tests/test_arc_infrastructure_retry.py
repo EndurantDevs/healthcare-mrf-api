@@ -290,6 +290,7 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert 'trap \'rm -f "$artifact_ids"\' EXIT' in delete["run"]
     assert 'done < "$artifact_ids"' in delete["run"]
     assert "/actions/artifacts/${artifact_id}" in delete["run"]
+    assert 'startswith("healthcare-mrf-api-coverage-baseline-") | not' in delete["run"]
 
     closed = workflow["jobs"]["delete-closed-pr-artifacts"]
     assert closed["concurrency"] == serialized_cleanup_by_field
@@ -320,6 +321,9 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert 'done < "$artifact_ids"' in stale["steps"][0]["run"]
     assert ".workflow_run.id" not in stale["steps"][0]["run"]
     assert "/actions/runs/${run_id}" not in stale["steps"][0]["run"]
+    assert 'startswith("healthcare-mrf-api-coverage-baseline-") | not' in (
+        stale["steps"][0]["run"]
+    )
 
 
 def test_closed_pr_cleanup_uses_exact_event_identity() -> None:
@@ -330,7 +334,7 @@ def test_closed_pr_cleanup_uses_exact_event_identity() -> None:
     assert "PR_NUMBER" not in str(closed_env)
 
 
-def test_all_explicit_artifacts_expire_after_one_day() -> None:
+def test_machine_baseline_is_the_only_long_lived_artifact() -> None:
     workflow = yaml.safe_load(CI_WORKFLOW_PATH.read_text(encoding="utf-8"))
     retention_by_name = {
         step["with"]["name"]: step["with"]["retention-days"]
@@ -342,8 +346,8 @@ def test_all_explicit_artifacts_expire_after_one_day() -> None:
     assert retention_by_name == {
         "mrf-python-coverage-main-${{ matrix.shard-index }}": 1,
         "mrf-python-coverage-capacity": 1,
-        "mrf-python-coverage-forecast": 1,
+        "healthcare-mrf-api-coverage-baseline-${{ github.sha }}": 90,
+        "mrf-coverage-forecast": 1,
         "mrf-rust-coverage": 1,
-        "mrf-rust-coverage-forecast": 1,
         "mrf-python-coverage-postgres-${{ matrix.shard }}": 1,
     }

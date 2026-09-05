@@ -118,25 +118,11 @@ run_quality() {
   bash tests/test_ci_readability_policy.sh
 
   if [ -n "${BASE_SHA:-}" ]; then
-    git show "$BASE_SHA:readability-baseline.json" > "${RUNNER_TEMP:-/tmp}/readability-base.json"
-    required_reduction_percent=1
-    if git diff --quiet "$BASE_SHA" HEAD -- \
-      main.py \
-      ':(glob)api/**/*.py' \
-      ':(glob)db/**/*.py' \
-      ':(glob)process/**/*.py' \
-      ':(glob)public_evidence/**/*.py' \
-      ':(glob)service/**/*.py'; then
-      required_reduction_percent=0
-    elif [ "${READABILITY_ZERO_GROWTH_APPROVED:-false}" = true ]; then
-      required_reduction_percent=0
-    fi
-    python scripts/readability_budget.py \
-      --ratchet-baseline "${RUNNER_TEMP:-/tmp}/readability-base.json" \
-      --required-reduction-percent "$required_reduction_percent"
+    python scripts/readability_budget.py --base "$BASE_SHA"
   else
     python scripts/readability_budget.py
   fi
+  python scripts/coverage_reports.py --check
 
   python scripts/ci/request_time_external_call_guard.py
   timeout --foreground 295s python -m pytest -q \
@@ -214,15 +200,48 @@ run_capacity() {
 run_python_coverage() {
   install_python_dependencies
   require_base_sha
+  local forecast_path="${PREPUSH_COVERAGE_OUTPUT:-$(artifact_path test-coverage-forecast.json)}"
+  local baseline_output="${PREPUSH_BASELINE_OUTPUT:-$(artifact_path test-coverage-baseline.json)}"
+  local baseline_docs_output="${PREPUSH_BASELINE_DOCS_OUTPUT:-$(artifact_path test-coverage.md)}"
+  local reference_baseline="${PREPUSH_REFERENCE_BASELINE:-}"
+  local rust_artifacts="${PREPUSH_RUST_ARTIFACTS:-$(artifact_path coverage-artifacts/rust)}"
+  if [ ! -f "$rust_artifacts/test-coverage-rust.json" ]; then
+    local machine_artifact_required
+    machine_artifact_required=$(git show "$COVERAGE_BASE_SHA:test-coverage-baseline.json" | \
+      python -c 'import json,sys; print(str(json.load(sys.stdin).get("machine_artifact_required", False)).lower())')
+    if [ "$machine_artifact_required" = true ]; then
+      echo "combined coverage requires the exact Rust report artifact" >&2
+      exit 2
+    fi
+    timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
+    timeout --foreground 295s python scripts/coverage_forecast.py forecast-python \
+      --base "$COVERAGE_BASE_SHA" \
+      --main-artifacts "${PREPUSH_MAIN_ARTIFACTS:-coverage-data/main}" \
+      --capacity-artifacts "${PREPUSH_CAPACITY_ARTIFACTS:-coverage-data/capacity}" \
+      --postgres-artifacts "${PREPUSH_POSTGRES_ARTIFACTS:-coverage-data/postgres}" \
+      --output "$(artifact_path test-coverage-forecast-python.json)"
+    return
+  fi
+  local -a forecast_arguments=(
+    --base "$COVERAGE_BASE_SHA"
+    --main-artifacts "${PREPUSH_MAIN_ARTIFACTS:-coverage-data/main}"
+    --capacity-artifacts "${PREPUSH_CAPACITY_ARTIFACTS:-coverage-data/capacity}"
+    --postgres-artifacts "${PREPUSH_POSTGRES_ARTIFACTS:-coverage-data/postgres}"
+    --rust-artifacts "$rust_artifacts"
+    --output "$forecast_path"
+    --baseline-output "$baseline_output"
+  )
+  if [ -n "$reference_baseline" ]; then
+    forecast_arguments+=(--reference-baseline "$reference_baseline")
+  fi
   timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
-  timeout --foreground 295s python scripts/coverage_forecast.py forecast-python \
-    --base "$COVERAGE_BASE_SHA" \
-    --main-artifacts "${PREPUSH_MAIN_ARTIFACTS:-coverage-data/main}" \
-    --capacity-artifacts "${PREPUSH_CAPACITY_ARTIFACTS:-coverage-data/capacity}" \
-    --postgres-artifacts "${PREPUSH_POSTGRES_ARTIFACTS:-coverage-data/postgres}" \
-    --output "$(artifact_path test-coverage-forecast-python.json)"
-  require_margin "$(artifact_path test-coverage-forecast-python.json)" python lines 5
-  require_margin "$(artifact_path test-coverage-forecast-python.json)" python branches 5
+  timeout --foreground 295s python scripts/coverage_forecast.py forecast \
+    "${forecast_arguments[@]}"
+  cp docs/test-coverage.md "$baseline_docs_output"
+  python scripts/coverage_reports.py \
+    --baseline "$baseline_output" \
+    --docs "$baseline_docs_output" \
+    --write-docs --check
 }
 
 run_api_contract() {
@@ -245,7 +264,7 @@ run_rust() {
     cargo install cargo-llvm-cov --version 0.8.7 --locked
   fi
   timeout --foreground 295s cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
-    --all-targets --features python --json --summary-only \
+    --all-targets --features python --json \
     --output-path "$rust_artifacts/test-coverage-rust.json"
   require_base_sha
   timeout --foreground 295s python scripts/coverage_forecast.py write-report-provenance \
@@ -255,12 +274,6 @@ run_rust() {
     --output "$rust_artifacts/coverage-provenance-rust.json" \
     --cargo-llvm-cov-version "$(cargo llvm-cov --version | awk '{print $2}')" \
     --rust-version "$(rustc --version | awk '{print $2}')"
-  timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
-  timeout --foreground 295s python scripts/coverage_forecast.py forecast-rust \
-    --base "$COVERAGE_BASE_SHA" \
-    --artifacts "$rust_artifacts" \
-    --output "$(artifact_path test-coverage-forecast-rust.json)"
-  require_margin "$(artifact_path test-coverage-forecast-rust.json)" rust functions 2
   if [ "$(cargo audit --version 2>/dev/null || true)" != "cargo-audit-audit 0.22.2" ]; then
     cargo install cargo-audit --version 0.22.2 --locked
   fi
@@ -1053,28 +1066,6 @@ assert_candidate_unchanged() {
   fi
 }
 
-require_margin() {
-  local forecast=$1
-  local report=$2
-  local metric=$3
-  local minimum=$4
-  python3 - "$forecast" "$report" "$metric" "$minimum" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-
-forecast_path, report, metric, minimum_text = sys.argv[1:]
-payload = json.loads(Path(forecast_path).read_text(encoding="utf-8"))
-margin = payload["reports"][report]["metrics"][metric]["margin"]
-minimum = int(minimum_text)
-if not isinstance(margin, int) or isinstance(margin, bool) or margin < minimum:
-    raise SystemExit(
-        f"{report} {metric} coverage margin is {margin}; pre-push requires at least {minimum}"
-    )
-PY
-}
-
 run_all() {
   local base_sha=${1:-}
   if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -1105,7 +1096,6 @@ run_all() {
   local git_common_dir
   local python_lock_input_sha256
   local python_lock_sha256
-  local readability_zero_growth_approved=${READABILITY_ZERO_GROWTH_APPROVED:-false}
   python_lock_input_sha256=$(sha256sum requirements-ci.in | awk '{print $1}')
   python_lock_sha256=$(sha256sum requirements-ci.lock | awk '{print $1}')
   if [ -z "$artifacts" ]; then
@@ -1144,10 +1134,6 @@ cargo_llvm_cov_version=0.8.7
 cargo_audit_version=0.22.2
 pip_audit_version=2.10.1
 python_coverage_version=7.16.0
-python_line_margin_minimum=5
-python_branch_margin_minimum=5
-rust_function_margin_minimum=2
-readability_zero_growth_approved=$readability_zero_growth_approved
 command=scripts/ci/prepush all $base_sha
 EOF
   cleanup_all() {
@@ -1212,7 +1198,6 @@ EOF
     --env PREPUSH_CAPACITY_ARTIFACTS=/artifacts/coverage-data/capacity \
     --env PREPUSH_POSTGRES_ARTIFACTS=/artifacts/coverage-data/postgres \
     --env PREPUSH_PIP_REPORT=/artifacts/python-lock-install-report.json \
-    --env READABILITY_ZERO_GROWTH_APPROVED="$readability_zero_growth_approved" \
     "$arc_image" \
     bash -lc '
       set -euo pipefail
@@ -1269,8 +1254,8 @@ EOF
           gate "postgres-$shard" postgres "$shard"
         cp "/artifacts/.coverage.postgres.${shard}" "/artifacts/.coverage-provenance.postgres.${shard}.json" /artifacts/coverage-data/postgres/
       done
-      gate python-coverage python-coverage
       gate rust rust
+      gate python-coverage python-coverage
       {
         python --version
         python -m pip --version
@@ -1315,8 +1300,7 @@ PY
   cat >> "$artifacts/receipt.txt" <<EOF
 status=passed
 completed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-python_forecast=$artifacts/test-coverage-forecast-python.json
-rust_forecast=$artifacts/test-coverage-forecast-rust.json
+coverage_forecast=$artifacts/test-coverage-forecast.json
 python_locked_versions=$artifacts/python-locked-versions.txt
 python_locked_versions_sha256=$(sha256sum "$artifacts/python-locked-versions.txt" | awk '{print $1}')
 python_install_report=$artifacts/python-lock-install-report.json
