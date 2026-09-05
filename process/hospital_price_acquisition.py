@@ -313,7 +313,10 @@ def _locator_error_candidates(locator_result: LocatorResult) -> tuple[Candidate,
             hospital,
             locator_result.error_code or "locator_invalid",
             locator_result.error_detail,
-            hospital.get("fallback_mrf_url") if locator_result.fetch_failed else None,
+            hospital.get("fallback_mrf_url")
+            if locator_result.fetch_failed
+            or locator_result.error_code == "hospitalhptlocator"
+            else None,
         )
         for hospital in locator_result.hospitals
     )

@@ -8500,6 +8500,7 @@ hospitals:
 - hospital_id: hospital-002550
   name: Harsha Behavioral Center
   cms_hpt_url: https://www.harshacenter.com/cms-hpt.txt
+  fallback_mrf_url: https://www.harshacenter.com/s/261091197_harsha-behavioral-center_standardcharges.csv
 - hospital_id: hospital-002551
   name: HARTFORD HOSPITAL
   cms_hpt_url: https://hartfordhospital.org/cms-hpt.txt
@@ -23100,6 +23101,7 @@ hospitals:
 - hospital_id: hospital-006944
   name: Valley View Hospital
   cms_hpt_url: https://www.vvh.org/cms-hpt.txt
+  fallback_mrf_url: https://www.vvh.org/documents/840446259_Valley-View-Hospital_standardcharges.1).csv
 - hospital_id: hospital-006945
   name: Valley View Medical Center
   cms_hpt_url: https://www.valleyviewmedicalcenter.net/cms-hpt.txt
