@@ -226,8 +226,8 @@ fn parse_tall_payer(
         .all(|column| csv_profile_value(record, *column).is_empty())
     {
         let methodology = csv_value(record, columns.methodology).trim();
-        if !methodology.is_empty()
-            && !(columns.profile == CmsProfile::V2
+        if !(methodology.is_empty()
+            || columns.profile == CmsProfile::V2
                 && methodology.eq_ignore_ascii_case("gross charge"))
         {
             canonical_methodology(methodology, true)?;
