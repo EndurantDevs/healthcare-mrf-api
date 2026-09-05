@@ -89,12 +89,12 @@ sleep() { printf '%s\n' "$1" >> "$POLL_PATH"; SECONDS=$((SECONDS + $1)); }
     ([_base_coverage_run()], None, 0),
     ([_base_coverage_run(status="queued", conclusion=None), _base_coverage_run()], None, 1),
     ([_base_coverage_run(status="waiting", conclusion=None), _base_coverage_run()], None, 1),
-    ([_base_coverage_run(head_sha="2" * 40)], "no successful exact-base", 0),
-    ([_base_coverage_run(head_sha="2" * 40, status="in_progress", conclusion=None)],
-     "no successful exact-base", 0),
-    ([[]], "no successful exact-base", 0),
-    ([_base_coverage_run(event="workflow_dispatch")], "no successful exact-base", 0),
-    ([_base_coverage_run(head_branch="feature")], "no successful exact-base", 0),
+    ([_base_coverage_run(head_sha="2" * 40), _base_coverage_run()], None, 1),
+    ([_base_coverage_run(head_sha="2" * 40, status="in_progress", conclusion=None),
+      _base_coverage_run()], None, 1),
+    ([[], _base_coverage_run()], None, 1),
+    ([_base_coverage_run(event="workflow_dispatch"), _base_coverage_run()], None, 1),
+    ([_base_coverage_run(head_branch="feature"), _base_coverage_run()], None, 1),
     ([_base_coverage_run(conclusion="failure")], "no successful exact-base", 0),
     ([_base_coverage_run(status="in_progress", conclusion=None),
       _base_coverage_run(conclusion="cancelled")], "no successful exact-base", 1),
@@ -136,6 +136,7 @@ def test_coverage_forecast_requires_one_exact_base_and_head_for_all_producers() 
     assert "--data-urlencode status=success" not in workflow
     assert "--data-urlencode per_page=100" in workflow
     assert "sort_by([.run_started_at, .id])" in workflow
+    assert 'elif length == 0 then "pending"' in workflow
     assert 'error("no successful exact-base CI run")' in workflow
     assert "expected exactly one successful exact-base CI run" not in workflow
     assert 'echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"' in workflow
