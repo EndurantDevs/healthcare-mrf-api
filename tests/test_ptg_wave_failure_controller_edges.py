@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 
+import copy
 import types
 
 
@@ -905,7 +906,7 @@ def test_failure_kubernetes_covers_claimed_post_absence_and_delete_paths():
 
     wave = _wave()
     absence = _absence_evidence(wave)
-    wave.kubernetes_delete_evidence = absence
+    wave.kubernetes_delete_evidence = copy.deepcopy(absence)
     assert failure_kubernetes._verify_failure_kubernetes(
         wave, {"reason": "redis_release_absent"}, absence
     ) == absence

@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
+  # Read workflow runs and download the exact-base coverage artifact.
   actions: read
   contents: read
 

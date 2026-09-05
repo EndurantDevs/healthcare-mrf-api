@@ -80,6 +80,14 @@ def _assert_parser_behavior(collect_report: CollectReport) -> None:
 def _assert_reference_behavior(compare_baselines: CompareBaselines) -> None:
     baseline = build_diff_policy_test_baseline()
     _require(not compare_baselines(baseline, baseline), "unchanged baseline")
+    expanded_exclusions = json.loads(json.dumps(baseline))
+    expanded_exclusions["reports"]["python"]["growth"]["diff_exclude"] = [
+        "generated.py"
+    ]
+    _require(
+        bool(compare_baselines(expanded_exclusions, baseline)),
+        "new diff exclusion",
+    )
     regressed = json.loads(json.dumps(baseline))
     regressed["reports"]["python"]["metrics"]["lines"] = {
         "covered": 79,
@@ -98,6 +106,28 @@ def _assert_reference_behavior(compare_baselines: CompareBaselines) -> None:
     weakened = json.loads(json.dumps(baseline))
     weakened["reports"]["python"]["growth"]["diff_coverage_percent"] = 84
     _require(bool(compare_baselines(weakened, baseline)), "weakened diff policy")
+
+    legacy = json.loads(json.dumps(baseline))
+    legacy["reports"]["python"]["scope"]["policy"]["coverage"] = "7.15.2"
+    transition = json.loads(json.dumps(legacy))
+    transition["machine_artifact_required"] = True
+    transition["reports"]["python"]["scope"]["policy"]["coverage"] = "7.16.0"
+    _require(
+        not compare_baselines(transition, legacy),
+        "machine artifact bootstrap",
+    )
+    marker_removed = json.loads(json.dumps(transition))
+    marker_removed.pop("machine_artifact_required")
+    _require(
+        bool(compare_baselines(marker_removed, transition)),
+        "machine artifact marker removal",
+    )
+    version_changed = json.loads(json.dumps(transition))
+    version_changed["reports"]["python"]["scope"]["policy"]["coverage"] = "7.17.0"
+    _require(
+        bool(compare_baselines(version_changed, transition)),
+        "post-bootstrap coverage version change",
+    )
 
 
 def run_self_test(

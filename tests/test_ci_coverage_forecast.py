@@ -41,6 +41,16 @@ def test_coverage_forecast_requires_one_exact_base_and_head_for_all_producers() 
     assert "HEAD^" not in workflow
     assert workflow.count("ref: ${{ github.sha }}") >= 5
     assert workflow.count('fetch-depth: 0') >= 6
+    assert '--data-urlencode "head_sha=$BASE_SHA"' in workflow
+    assert "--data-urlencode per_page=100" in workflow
+    assert "sort_by([.run_started_at, .id])" in workflow
+    assert 'error("no successful exact-base CI run")' in workflow
+    assert "expected exactly one successful exact-base CI run" not in workflow
+    assert 'echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"' in workflow
+    assert (
+        "healthcare-mrf-api-coverage-baseline-"
+        "${{ steps.base-coverage.outputs.base_sha }}" in workflow
+    )
 
 
 def test_coverage_forecast_binds_every_healthcare_python_producer() -> None:
@@ -91,4 +101,8 @@ def test_coverage_forecast_combines_full_rust_data_and_publishes_a_machine_basel
     assert "healthcare-mrf-api-coverage-baseline-${{ github.sha }}" in workflow
     assert "retention-days: 90" in workflow
     assert "name: mrf-coverage-forecast" in workflow
+    assert 'git show "$COVERAGE_BASE_SHA:test-coverage-baseline.json"' in prepush
+    assert 'if [ "$machine_artifact_required" = true ]; then' in prepush
+    assert "combined coverage requires the exact Rust report artifact" in prepush
+    assert "machine_artifact_required" in workflow
     assert "if: always()" in workflow

@@ -16,5 +16,11 @@ printf '%s\n' "$quality_job" | grep -Fq -- 'run: scripts/ci/prepush quality'
 printf '%s\n' "$quality_job" | grep -Fq -- 'BASE_SHA:'
 printf '%s\n' "$policy_block" | grep -Fq -- 'python scripts/readability_budget.py --base "$BASE_SHA"'
 printf '%s\n' "$policy_block" | grep -Fq -- 'python scripts/coverage_reports.py --check'
-! grep -Fq -- 'READABILITY_ZERO_GROWTH_APPROVED' "$workflow_path" "$prepush_path"
-! grep -Fq -- 'required_reduction_percent' "$prepush_path"
+if grep -Fq -- 'READABILITY_ZERO_GROWTH_APPROVED' "$workflow_path" "$prepush_path"; then
+  echo 'READABILITY_ZERO_GROWTH_APPROVED must remain absent' >&2
+  exit 1
+fi
+if grep -Fq -- 'required_reduction_percent' "$prepush_path"; then
+  echo 'required_reduction_percent must remain absent' >&2
+  exit 1
+fi

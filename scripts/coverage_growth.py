@@ -96,10 +96,8 @@ def compare_diff_policy(
     if current < previous:
         return [f"{report_name}: diff coverage threshold was lowered"]
     candidate_excludes = set(candidate_report_by_field["growth"].get("diff_exclude", []))
-    reference_excludes = previous_policy.get("diff_exclude")
-    if reference_excludes is not None and not candidate_excludes.issubset(
-        set(reference_excludes)
-    ):
+    reference_excludes = set(previous_policy.get("diff_exclude", []))
+    if not candidate_excludes.issubset(reference_excludes):
         return [f"{report_name}: diff coverage exclusions were expanded"]
     return []
 

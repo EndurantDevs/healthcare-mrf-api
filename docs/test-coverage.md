@@ -10,7 +10,10 @@ Changed executable product lines must be at least 85% covered for Python and
 the Git diff intersected with Coverage.py's executable line sets or llvm-cov's
 full JSON coverage segments. Comments, blank lines, tests, scripts, generated
 files, and pure deletions do not count. Failures list every uncovered changed
-`path:line`. New in-scope coverage suppression directives remain forbidden.
+`path:line`. `process/ext/address_pub28.py`, the checked-in generated USPS
+Publication 28 table, is explicitly excluded by the Python baseline's
+`diff_exclude` list. New in-scope coverage suppression directives remain
+forbidden.
 
 ## Current baseline
 

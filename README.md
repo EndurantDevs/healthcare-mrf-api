@@ -53,8 +53,9 @@ This repository resolves and processes data from public source websites, includi
 See the full source catalog in [docs/data-sources.md](./docs/data-sources.md).
 
 Readability and ownership rules live in `docs/architecture.md` and
-`docs/readability.md`. Run `python scripts/readability_budget.py` before commits
-to confirm a change does not add new function-level or architecture debt.
+`docs/readability.md`. Run
+`python scripts/readability_budget.py --base <revision>` before commits to
+confirm a change does not add new function-level or architecture debt.
 File-length debt is reported as a soft budget, while existing files over 5,000
 lines may not grow. Commit message rules live in `docs/commit-messages.md`; run
 `python3 scripts/check_commit_messages.py --last 1` before pushing hand-written
