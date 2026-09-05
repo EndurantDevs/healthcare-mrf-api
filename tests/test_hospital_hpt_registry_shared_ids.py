@@ -78,6 +78,26 @@ hospitals:
     ) == hospitals
 
 
+def test_reviewed_duplicate_aliases_preserve_selector_identity():
+    hospital_by_id = {
+        row["hospital_id"]: row for row in registry.load_hospital_hpt_registry()
+    }
+    for alias, canonical in (
+        ("hospital-002614", "hospital-002613"),
+        ("hospital-002615", "hospital-002616"),
+        ("hospital-002618", "hospital-002617"),
+    ):
+        assert hospital_by_id[alias]["locator_mrf_url"] == hospital_by_id[canonical][
+            "locator_mrf_url"
+        ]
+    keller_mrf_url = (
+        "https://mrfs.hyvehealthcare.com/Emerus/"
+        "364755936_EBD-BEMC-Burleson-LLC_standardcharges.csv"
+    )
+    assert hospital_by_id["hospital-000763"]["locator_mrf_url"] == keller_mrf_url
+    assert hospital_by_id["hospital-000767"]["locator_mrf_url"] == keller_mrf_url
+
+
 def test_avera_shared_locator_closes_every_reviewed_id():
     hospitals = tuple(
         hospital for hospital in registry.load_hospital_hpt_registry()

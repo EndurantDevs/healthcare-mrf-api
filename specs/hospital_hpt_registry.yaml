@@ -119,6 +119,7 @@ hospitals:
 - hospital_id: hospital-000030
   name: STRHS Sewanee
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002931
 - hospital_id: hospital-000031
   name: Trinity Health Byron Center
   cms_hpt_url: https://www.trinityhealthmichigan.org/cms-hpt.txt
@@ -2579,6 +2580,7 @@ hospitals:
 - hospital_id: hospital-000763
   name: Baylor Scott & White Emergency Hospital Keller
   cms_hpt_url: https://bsweh.org/cms-hpt.txt
+  locator_mrf_url: https://mrfs.hyvehealthcare.com/Emerus/364755936_EBD-BEMC-Burleson-LLC_standardcharges.csv
 - hospital_id: hospital-000764
   name: Baylor Scott & White Emergency Hospital Mansfield
   cms_hpt_url: https://bsweh.org/cms-hpt.txt
@@ -2591,7 +2593,7 @@ hospitals:
 - hospital_id: hospital-000767
   name: Baylor Scott & White Emergency Hospital-Keller
   cms_hpt_url: https://bsweh.org/cms-hpt.txt
-  locator_mrf_url: https://mrfs.hyvehealthcare.com/Emerus/364755936_EBD-BEMC-Burleson-LLC_standardcharges.csv
+  alias_of: hospital-000763
 - hospital_id: hospital-000768
   name: BAYLOR SCOTT & WHITE EMERGENCY MEDICAL CENTER - CEDAR PARK
   cms_hpt_url: https://www.bswhealth.com/cms-hpt.txt
@@ -6154,6 +6156,7 @@ hospitals:
   name: Driscoll Children’s Hospital
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
   locator_name: Driscoll Children's Hospital - Rio Grande Valley
+  alias_of: hospital-001836
 - hospital_id: hospital-001836
   name: Driscoll Children's Hospital - Rio Grande Valley
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
@@ -6161,6 +6164,7 @@ hospitals:
   name: Driscoll Children's Hospital (Main Campus and Neonatal Care Center)
   cms_hpt_url: https://driscollchildrens.org/cms-hpt.txt
   locator_name: Driscoll Children's Hospital
+  alias_of: hospital-001834
 - hospital_id: hospital-001838
   name: Drs Hospital Emergency Room Saunder
   cms_hpt_url: https://www.doctorshosplaredo.com/cms-hpt.txt
@@ -8496,6 +8500,7 @@ hospitals:
 - hospital_id: hospital-002550
   name: Harsha Behavioral Center
   cms_hpt_url: https://www.harshacenter.com/cms-hpt.txt
+  fallback_mrf_url: https://www.harshacenter.com/s/261091197_harsha-behavioral-center_standardcharges.csv
 - hospital_id: hospital-002551
   name: HARTFORD HOSPITAL
   cms_hpt_url: https://hartfordhospital.org/cms-hpt.txt
@@ -8695,11 +8700,11 @@ hospitals:
 - hospital_id: hospital-002614
   name: HCA FL PEA RIDGE ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002613
 - hospital_id: hospital-002615
   name: HCA FL PERDIDO BAY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002616
 - hospital_id: hospital-002616
   name: HCA FL PERDIDO BAY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
@@ -8711,7 +8716,7 @@ hospitals:
 - hospital_id: hospital-002618
   name: HCA FL PINE FOREST ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/80-0935610_HCA-FLORIDA-PASADENA-HOSPITAL_standardcharges.json
+  alias_of: hospital-002617
 - hospital_id: hospital-002619
   name: HCA FL PLANT CITY ER
   cms_hpt_url: https://www.hcafloridahealthcare.com/cms-hpt.txt
@@ -18163,7 +18168,7 @@ hospitals:
 - hospital_id: hospital-005457
   name: Riverview Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
-  locator_name: Highpoint Health - Riverview with Ascension Saint Thomas
+  alias_of: hospital-002930
 - hospital_id: hospital-005458
   name: Riverview Regional Medical Center
   cms_hpt_url: https://riverviewregional.com/cms-hpt.txt
@@ -18714,6 +18719,7 @@ hospitals:
   name: SAN JOAQUIN COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
   locator_name: SAN JOAQUIN COMMUNITY HOSPITAL
+  alias_of: hospital-005624
 - hospital_id: hospital-005626
   name: San Joaquin General Hospital
   cms_hpt_url: https://www.sanjoaquingeneral.org/cms-hpt.txt
@@ -21090,6 +21096,7 @@ hospitals:
 - hospital_id: hospital-006332
   name: STRHS Winchester
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002934
 - hospital_id: hospital-006333
   name: STRONG MEMORIAL HOSPITAL
   cms_hpt_url: https://www.urmc.rochester.edu/cms-hpt.txt
@@ -21161,6 +21168,7 @@ hospitals:
 - hospital_id: hospital-006354
   name: Sumner Regional Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002932
 - hospital_id: hospital-006355
   name: Sunnyside Medical Center
   cms_hpt_url: https://healthy.kaiserpermanente.org/cms-hpt.txt
@@ -22112,6 +22120,7 @@ hospitals:
 - hospital_id: hospital-006639
   name: Trousdale Medical Center
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
+  alias_of: hospital-002933
 - hospital_id: hospital-006640
   name: Troy Regional Medical Center
   cms_hpt_url: https://www.troymedicalcenter.com/cms-hpt.txt
@@ -23092,6 +23101,7 @@ hospitals:
 - hospital_id: hospital-006944
   name: Valley View Hospital
   cms_hpt_url: https://www.vvh.org/cms-hpt.txt
+  fallback_mrf_url: https://www.vvh.org/documents/840446259_Valley-View-Hospital_standardcharges.1).csv
 - hospital_id: hospital-006945
   name: Valley View Medical Center
   cms_hpt_url: https://www.valleyviewmedicalcenter.net/cms-hpt.txt

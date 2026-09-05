@@ -94,7 +94,7 @@ def test_locator_uses_explicit_reviewed_fallback_source(locator_record_names):
     )
 
 
-def test_fetch_failure_uses_only_an_explicit_reviewed_fallback():
+def test_locator_failure_uses_only_an_explicit_reviewed_fallback():
     acquisition = _acquisition_module()
     hospital_by_field = {
         "hospital_id": "a",
@@ -110,14 +110,22 @@ def test_fetch_failure_uses_only_an_explicit_reviewed_fallback():
         (hospital_by_field,), None, "hospitalhptlocator", "invalid",
         fetch_failed=False,
     )
+    invalid_without_fallback = acquisition.LocatorResult(
+        "https://b/cms-hpt.txt", "locator-b", "parse-observation-b",
+        ({"hospital_id": "b", "name": "Hospital B"},),
+        None, "hospitalhptlocator", "invalid", fetch_failed=False,
+    )
 
     fallback = acquisition.candidates_from_locators((failed_fetch,))[0]
-    rejected = acquisition.candidates_from_locators((invalid_body,))[0]
+    parsed_fallback = acquisition.candidates_from_locators((invalid_body,))[0]
+    rejected = acquisition.candidates_from_locators((invalid_without_fallback,))[0]
 
     assert fallback.source_url == hospital_by_field["fallback_mrf_url"]
     assert fallback.initial_error_code is None
     assert fallback.observation_id == "fetch-observation"
-    assert rejected.source_url == invalid_body.url
+    assert parsed_fallback.source_url == hospital_by_field["fallback_mrf_url"]
+    assert parsed_fallback.initial_error_code is None
+    assert rejected.source_url == invalid_without_fallback.url
     assert rejected.initial_error_code == "hospitalhptlocator"
 
 

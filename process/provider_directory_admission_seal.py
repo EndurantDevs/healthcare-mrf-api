@@ -426,7 +426,6 @@ def validate_generic_admission_copy(
     evidence_run_id: str,
     dataset_hash: str,
     resource_count: int,
-    scratch_directory: Path,
     expected_resource_hashes: Mapping[str, Any] | None = None,
     expected_resource_counts: Mapping[str, Any] | None = None,
 ) -> ProviderDirectoryAdmissionSeal:
@@ -443,7 +442,7 @@ def validate_generic_admission_copy(
         evidence_run_id=evidence_run_id,
         dataset_hash=dataset_hash,
         resource_count=resource_count,
-        scratch_directory=scratch_directory,
+        scratch_directory=copy_path.parent,
         completion_summaries={
             "expected_resource_hashes": expected_resource_hashes,
             "expected_resource_counts": expected_resource_counts,

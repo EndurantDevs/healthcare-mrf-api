@@ -20,7 +20,6 @@ async def test_enqueue_materialize_phase_shards_sets_progress_and_jobs(monkeypat
         stage_suffix="stage_1",
         schema="mrf",
         test_mode=True,
-        job_name="provider_quality_materialize_lsh_shard",
     )
 
     assert queued == 4
