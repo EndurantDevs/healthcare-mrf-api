@@ -696,6 +696,7 @@ hospitals:
 - hospital_id: hospital-000207
   name: Angleton Danbury Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health Angleton Danbury Hospital
 - hospital_id: hospital-000208
   name: Animas Surgical Hospital
   cms_hpt_url: https://www.animassurgical.com/cms-hpt.txt
@@ -4761,6 +4762,7 @@ hospitals:
 - hospital_id: hospital-001415
   name: Clear Lake Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health Clear Lake Hospital
 - hospital_id: hospital-001416
   name: Clear Vista Health and Wellness
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
@@ -11777,6 +11779,7 @@ hospitals:
 - hospital_id: hospital-003517
   name: League City Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  locator_name: UTMB Health League City Hospital
 - hospital_id: hospital-003518
   name: League City Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
