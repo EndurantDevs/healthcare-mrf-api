@@ -1,5 +1,7 @@
 const CSV_METADATA_HEADER_SCAN_MAX_RECORDS: usize = 16;
 
+include!("csv_metadata_address.rs");
+
 fn parse_csv<R: Read>(
     reader: R,
     version_id: &str,
@@ -10,7 +12,7 @@ fn parse_csv<R: Read>(
     let mut csv_reader = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
-        .from_reader(reader);
+        .from_reader(csv_metadata_address_reader(reader, max_fanout_rows)?);
     let mut records = csv_reader.records();
     let general_headers = next_csv_metadata_header(&mut records)?;
     let general_values = next_csv_record(&mut records, "general value row")?;
@@ -87,6 +89,8 @@ fn parse_csv_metadata(
     values: &StringRecord,
     max_fanout_rows: usize,
 ) -> io::Result<(GeneralMetadata, Vec<ContractProvision>)> {
+    let aligned_values = align_csv_hospital_name(headers, values);
+    let values = aligned_values.as_ref().unwrap_or(values);
     let mut fields = BTreeMap::<String, usize>::new();
     let mut contract_provision_indexes = Vec::new();
     let mut license_state = None;
@@ -273,6 +277,37 @@ fn parse_csv_metadata(
         },
         contract_provisions,
     ))
+}
+
+fn align_csv_hospital_name(headers: &StringRecord, values: &StringRecord) -> Option<StringRecord> {
+    // Recover only one unquoted comma in the leading name. Date/version anchors
+    // must identify the shift; all metadata and row validation still follows.
+    if values.len() != headers.len() + 1
+        || !["hospital_name", "last_updated_on", "version"]
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| {
+                headers
+                    .get(index)
+                    .is_some_and(|header| header.trim().eq_ignore_ascii_case(expected))
+            })
+    {
+        return None;
+    }
+    let first = values.get(0)?;
+    let second = values.get(1)?;
+    if first.trim().is_empty()
+        || second.trim().is_empty()
+        || canonical_csv_date(second).is_ok()
+        || canonical_csv_date(values.get(2)?).is_err()
+        || CmsProfile::parse_csv(values.get(3)?.trim()).is_err()
+    {
+        return None;
+    }
+    let mut aligned = StringRecord::new();
+    aligned.push_field(&format!("{first},{second}"));
+    aligned.extend(values.iter().skip(2));
+    Some(aligned)
 }
 
 fn split_pipe_bounded(value: &str, field: &str, limit: usize) -> io::Result<Vec<String>> {
