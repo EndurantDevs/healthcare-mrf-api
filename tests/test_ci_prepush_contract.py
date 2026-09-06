@@ -282,7 +282,7 @@ def test_every_python_mode_uses_the_exact_lock() -> None:
             for step in job["steps"]
         )
     }
-    assert setup_python_jobs == {"security"}
+    assert setup_python_jobs == {"security", "readability-preflight"}
     assert "actions/setup-python@" not in _job(workflow, "container-package")
 
 
