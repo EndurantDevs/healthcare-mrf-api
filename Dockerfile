@@ -125,6 +125,19 @@ COPY process/ /opt/process/
 COPY public_evidence/ /opt/public_evidence/
 COPY scripts/provider_directory_support_contract.py /opt/scripts/provider_directory_support_contract.py
 COPY scripts/validation/ptg2_v3_source_api_audit.py /opt/scripts/validation/ptg2_v3_source_api_audit.py
+# Explicit, default-off importer commands documented for image users.
+COPY scripts/smoke/formulary_fhir_reviewed_operator.py /opt/scripts/smoke/formulary_fhir_reviewed_operator.py
+COPY scripts/smoke/formulary_fhir_synthetic_canary.py /opt/scripts/smoke/formulary_fhir_synthetic_canary.py
+COPY scripts/smoke/formulary_fhir_synthetic_seed_publisher.py /opt/scripts/smoke/formulary_fhir_synthetic_seed_publisher.py
+COPY scripts/smoke/provider_directory_fhir_reviewed_subset_state.py /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py
+COPY scripts/smoke/provider_directory_rooted_graph_operator.py /opt/scripts/smoke/provider_directory_rooted_graph_operator.py
+COPY scripts/smoke/provider_directory_terminal_root_retirement.py /opt/scripts/smoke/provider_directory_terminal_root_retirement.py
+COPY scripts/smoke/uhc_flex_practitioner_operator.py /opt/scripts/smoke/uhc_flex_practitioner_operator.py
+COPY scripts/smoke/uhc_formulary_operator.py /opt/scripts/smoke/uhc_formulary_operator.py
+COPY scripts/smoke/fixtures/formulary_fhir/canary_expected_v1.json /opt/scripts/smoke/fixtures/formulary_fhir/canary_expected_v1.json
+COPY scripts/smoke/fixtures/formulary_fhir/coverage_plan.json /opt/scripts/smoke/fixtures/formulary_fhir/coverage_plan.json
+COPY scripts/smoke/fixtures/formulary_fhir/medication_a.json /opt/scripts/smoke/fixtures/formulary_fhir/medication_a.json
+COPY scripts/smoke/fixtures/formulary_fhir/medication_b.json /opt/scripts/smoke/fixtures/formulary_fhir/medication_b.json
 COPY support/hospital_price_native_validation.py /opt/support/hospital_price_native_validation.py
 COPY support/zip/ /opt/support/zip/
 COPY --from=ptg2-scanner-builder \
