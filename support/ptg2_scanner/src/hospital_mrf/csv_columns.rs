@@ -33,6 +33,7 @@ fn find_optional_header(headers: &StringRecord, parts: &[&str]) -> io::Result<Op
 
 fn parse_common_columns(
     headers: &StringRecord,
+    profile: CmsProfile,
     max_fanout_rows: usize,
 ) -> io::Result<CommonCsvColumns> {
     let mut code_columns = BTreeMap::<usize, (Option<usize>, Option<usize>)>::new();
@@ -91,14 +92,23 @@ fn parse_common_columns(
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let drug_unit = find_optional_header(headers, &["drug_unit_of_measurement"])?;
+    let drug_type = find_optional_header(headers, &["drug_type_of_measurement"])?;
+    // Historical non-drug CSVs may omit both columns; every service still validates.
+    if drug_unit.is_none() && (profile != CmsProfile::V2 || drug_type.is_some()) {
+        return Err(invalid("missing CSV header drug_unit_of_measurement"));
+    }
+    if drug_type.is_none() && drug_unit.is_some() {
+        return Err(invalid("missing CSV header drug_type_of_measurement"));
+    }
     Ok(CommonCsvColumns {
         description: find_header(headers, &["description"])?,
         codes,
         modifiers: find_header(headers, &["modifiers"])?,
         setting: find_header(headers, &["setting"])?,
         billing_class: find_optional_header(headers, &["billing_class"])?,
-        drug_unit: find_header(headers, &["drug_unit_of_measurement"])?,
-        drug_type: find_header(headers, &["drug_type_of_measurement"])?,
+        drug_unit,
+        drug_type,
         gross_charge: find_header(headers, &["standard_charge", "gross"])?,
         discounted_cash: find_header(headers, &["standard_charge", "discounted_cash"])?,
         minimum: find_header(headers, &["standard_charge", "min"])?,
@@ -161,7 +171,7 @@ fn parse_tall_columns(
     Ok(TallCsvColumns {
         profile,
         requires_estimated_amount,
-        common: parse_common_columns(headers, max_fanout_rows)?,
+        common: parse_common_columns(headers, profile, max_fanout_rows)?,
         payer_name: find_header(headers, &["payer_name"])?,
         plan_name: find_header(headers, &["plan_name"])?,
         standard_charge_dollar: find_header(headers, &["standard_charge", "negotiated_dollar"])?,
@@ -458,7 +468,7 @@ fn parse_wide_columns(
     Ok(WideCsvColumns {
         profile,
         requires_estimated_amount,
-        common: parse_common_columns(headers, max_fanout_rows)?,
+        common: parse_common_columns(headers, profile, max_fanout_rows)?,
         payers,
     })
 }

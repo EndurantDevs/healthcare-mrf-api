@@ -478,3 +478,233 @@
             assert_eq!(mrf[4], ATTESTATION_TEXT);
         }
     }
+
+    fn omit_csv_drug_headers(records: &mut [Vec<String>], omitted: &[&str]) {
+        let mut indexes = omitted
+            .iter()
+            .map(|name| csv_fixture_index(&records[2], name))
+            .collect::<Vec<_>>();
+        indexes.sort_unstable_by(|left, right| right.cmp(left));
+        for record in records.iter_mut().skip(2) {
+            for &index in &indexes {
+                record.remove(index);
+                // Keep metadata untouched and the fixture writer's record width stable.
+                record.push(String::new());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_optional_drug_headers_preserve_non_drug_artifacts() {
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            for version in ["2.0.0", "2.2.1"] {
+                let mut records = csv_fixture_records(&fixture_v2_csv(format, version));
+                let code = if format == InputFormat::TallCsv {
+                    "code | 1"
+                } else {
+                    "code|1"
+                };
+                let code_index = csv_fixture_index(&records[2], code);
+                records[3][code_index] = "00070551".to_owned();
+                let original = csv_fixture_bytes(&records);
+                let expected = run_fixture(format, &original, false);
+                omit_csv_drug_headers(
+                    &mut records,
+                    &["drug_unit_of_measurement", "drug_type_of_measurement"],
+                );
+                let missing = csv_fixture_bytes(&records);
+                assert_eq!(expected, run_fixture(format, &missing, false));
+                let (_original_directory, original_summary) =
+                    import_packed(format, &original, TEST_MAX_OUTPUT_BYTES);
+                let (_missing_directory, missing_summary) =
+                    import_packed(format, &missing, TEST_MAX_OUTPUT_BYTES);
+                assert_eq!(
+                    original_summary.schema_version,
+                    missing_summary.schema_version
+                );
+                assert_eq!(
+                    serde_json::to_value(&original_summary.root).unwrap(),
+                    serde_json::to_value(&missing_summary.root).unwrap(),
+                );
+                assert_eq!(
+                    original_summary
+                        .artifacts
+                        .iter()
+                        .map(|artifact| (
+                            artifact.kind,
+                            artifact.rows,
+                            artifact.bytes,
+                            &artifact.sha256
+                        ))
+                        .collect::<Vec<_>>(),
+                    missing_summary
+                        .artifacts
+                        .iter()
+                        .map(|artifact| (
+                            artifact.kind,
+                            artifact.rows,
+                            artifact.bytes,
+                            &artifact.sha256
+                        ))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_drug_headers_keep_one_missing_duplicates_and_v3_strict() {
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            let original = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));
+            for header in ["drug_unit_of_measurement", "drug_type_of_measurement"] {
+                let mut missing = original.clone();
+                omit_csv_drug_headers(&mut missing, &[header]);
+                assert_import_error(
+                    format,
+                    &csv_fixture_bytes(&missing),
+                    DEFAULT_MAX_FANOUT_ROWS,
+                    &format!("missing CSV header {header}"),
+                );
+                let mut duplicate = original.clone();
+                for record in &mut duplicate {
+                    record.push(String::new());
+                }
+                *duplicate[2].last_mut().unwrap() = header.to_owned();
+                assert_import_error(
+                    format,
+                    &csv_fixture_bytes(&duplicate),
+                    DEFAULT_MAX_FANOUT_ROWS,
+                    &format!("duplicate CSV header {header}"),
+                );
+            }
+            for declared_version in ["3.0.0", "2.0.0"] {
+                let payload = if format == InputFormat::TallCsv {
+                    fixture_tall_csv()
+                } else {
+                    fixture_wide_csv()
+                };
+                let mut modern = csv_fixture_records(&payload);
+                let version = csv_fixture_index(&modern[0], "version");
+                modern[1][version] = declared_version.to_owned();
+                omit_csv_drug_headers(
+                    &mut modern,
+                    &["drug_unit_of_measurement", "drug_type_of_measurement"],
+                );
+                assert_import_error(
+                    format,
+                    &csv_fixture_bytes(&modern),
+                    DEFAULT_MAX_FANOUT_ROWS,
+                    "missing CSV header drug_unit_of_measurement",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_drug_headers_preserve_present_measurement_validation() {
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));
+            let code = if format == InputFormat::TallCsv {
+                "code | 1"
+            } else {
+                "code|1"
+            };
+            let code_index = csv_fixture_index(&records[2], code);
+            let unit = csv_fixture_index(&records[2], "drug_unit_of_measurement");
+            let kind = csv_fixture_index(&records[2], "drug_type_of_measurement");
+            records[3][code_index] = "00001234567".to_owned();
+            records[3][code_index + 1] = "ndc".to_owned();
+            records[3][unit] = "1.00".to_owned();
+            records[3][kind] = "ml".to_owned();
+            let valid = run_fixture(format, &csv_fixture_bytes(&records), false);
+            assert!(String::from_utf8(valid["code"].clone())
+                .unwrap()
+                .contains("\tNDC\t00001234567\n"));
+            assert!(String::from_utf8(valid["service"].clone())
+                .unwrap()
+                .contains("\t1\tML\n"));
+            for (unit_value, type_value, code_type, error) in [
+                ("0", "ML", "NDC", "drug unit must be greater than zero"),
+                (
+                    "NA",
+                    "ML",
+                    "NDC",
+                    "drug unit must be an exact decimal number",
+                ),
+                ("1", "NA", "NDC", "invalid drug type"),
+                (
+                    "",
+                    "ML",
+                    "CPT",
+                    "drug unit and drug type must be supplied together",
+                ),
+                (
+                    "1",
+                    "",
+                    "CPT",
+                    "drug unit and drug type must be supplied together",
+                ),
+                (
+                    "",
+                    "",
+                    "NDC",
+                    "NDC services require drug unit and drug type",
+                ),
+            ] {
+                records[3][unit] = unit_value.to_owned();
+                records[3][kind] = type_value.to_owned();
+                records[3][code_index + 1] = code_type.to_owned();
+                assert_import_error(
+                    format,
+                    &csv_fixture_bytes(&records),
+                    DEFAULT_MAX_FANOUT_ROWS,
+                    error,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_drug_headers_reject_late_second_code_ndc_and_clear_outputs() {
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));
+            omit_csv_drug_headers(
+                &mut records,
+                &["drug_unit_of_measurement", "drug_type_of_measurement"],
+            );
+            let second_code = records[2].len();
+            for record in &mut records {
+                record.extend([String::new(), String::new()]);
+            }
+            records[2][second_code] = "code|2".to_owned();
+            records[2][second_code + 1] = "code|2|type".to_owned();
+            let mut late = records[3].clone();
+            late[0] = "Later drug service".to_owned();
+            late[second_code] = "00001234567".to_owned();
+            late[second_code + 1] = "ndc".to_owned();
+            records.push(late);
+            let payload = csv_fixture_bytes(&records);
+            let expected = "NDC services require drug unit and drug type";
+            assert_import_error(format, &payload, DEFAULT_MAX_FANOUT_ROWS, expected);
+            let directory = tempfile::tempdir().unwrap();
+            let input = directory.path().join("source.csv");
+            let output = directory.path().join("output");
+            fs::write(&input, &payload).unwrap();
+            fs::create_dir(&output).unwrap();
+            let error = import_hospital_mrf_with_output_mode(
+                format,
+                VERSION_ID,
+                &input,
+                &output,
+                HospitalMrfLimits::new(
+                    DEFAULT_MAX_FANOUT_ROWS,
+                    TEST_MAX_DECOMPRESSED_BYTES,
+                    TEST_MAX_OUTPUT_BYTES,
+                ),
+                HospitalMrfOutputMode::Packed,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected));
+            assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
+        }
+    }
