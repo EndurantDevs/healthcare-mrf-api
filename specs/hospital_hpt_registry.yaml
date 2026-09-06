@@ -7720,15 +7720,19 @@ hospitals:
 - hospital_id: hospital-002307
   name: Freeman Hospital East Campus Acute Rehab
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002308
   name: Freeman Hospital East Campus Inpatient Geri Psych
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002309
   name: Freeman Hospital East Campus Inpatient Psych
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002310
   name: Freeman Hospital West Campus Acute Inpatient Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cleverleypteusstatic.blob.core.windows.net/readable/431704371_freeman-health-system---freeman-west_standardcharges.json
 - hospital_id: hospital-002311
   name: Freeman Neosho Hospital
   cms_hpt_url: https://www.freemanhealth.com/cms-hpt.txt

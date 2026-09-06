@@ -87,7 +87,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_707
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 682
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 119
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 123
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -234,7 +234,7 @@ def test_shared_sources_preserve_lindsborg_identities_and_freeman_campuses():
         entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
     }
     for suffix in ("003587", "003588", "001853", "001854", "002305", "002306",
-                   "002311", "002312", "002313"):
+                   "002307", "002308", "002309", "002310", "002311", "002312", "002313"):
         hospital_id = f"hospital-{suffix}"
         assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
     assert [hospital_by_id[f"hospital-{suffix}"]["name"] for suffix in ("003587", "003588")] == [
@@ -244,7 +244,18 @@ def test_shared_sources_preserve_lindsborg_identities_and_freeman_campuses():
         hospital_by_id["hospital-002311"]["fallback_mrf_url"]
     )
     for suffix in ("002307", "002308", "002309", "002310"):
-        assert "fallback_mrf_url" not in hospital_by_id[f"hospital-{suffix}"]
+        assert hospital_by_id[f"hospital-{suffix}"]["fallback_mrf_url"] == (
+            hospital_by_id["hospital-002306"]["fallback_mrf_url"]
+        )
+    assert {
+        entry["hospital_id"] for entry in hospital_by_id.values()
+        if entry["cms_hpt_url"] == hospital_by_id["hospital-002306"]["cms_hpt_url"]
+    } == {
+        f"hospital-{suffix}" for suffix in (
+            "001853", "001854", "002305", "002306", "002307", "002308", "002309",
+            "002310", "002311", "002312", "002313",
+        )
+    }
 
 
 def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():
