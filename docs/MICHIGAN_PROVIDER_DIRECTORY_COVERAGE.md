@@ -25,9 +25,40 @@ Bounded checks from a US host on 2026-09-06 established:
   fail or are ignored for other collections. No complete partition scheme was
   established.
 
-Only exact advertised opaque next links are valid continuation evidence.
-Synthesized offsets, larger page sizes, guessed IDs, or reference expansion do
-not prove that the unobserved remainder is empty.
+Those observations do not rule out an alternative paging contract. They do show
+that ordinary cursor exhaustion, larger page sizes, guessed IDs, or reference
+expansion cannot prove that the unobserved remainder is empty.
+
+## Offset-mode investigation
+
+Further bounded checks found a route beyond the published window on all five
+collections: `_count=1&_getpagesoffset=N&_offset=0` returns ten resources, with
+exact five-ID overlap between windows starting at N and N+5. Successful later
+windows start at 100 for Practitioner, 250 for PractitionerRole, and 1,000 for
+Location, Organization, and OrganizationAffiliation. A repeated Practitioner
+window returned the same ordered IDs.
+
+The endpoint advertises HAPI FHIR 7.6.1. Its
+[version-pinned response builder](https://github.com/hapifhir/hapi-fhir/blob/63b2df5750203ed940233c03f2ccdd56edc72822/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/method/ResponseBundleBuilder.java#L98)
+uses a different path when `_offset` is present, including zero: it assumes the
+resource provider has already applied database paging and does not slice the
+returned list again. The live results are consistent with Michigan applying
+`_getpagesoffset` in its provider, then HAPI applying it a second time when
+`_offset` is absent. Michigan's internal implementation is not public evidence.
+
+Generated next links retain `_getpagesoffset=N` and increment `_offset`, not the
+backend window. They are not a verified continuation for this mode. A proposed
+adapter must keep `_offset=0`, advance the backend offset by actual returned
+resources, and reject duplicate, malformed, or drifting pages. The response may
+contain ten times `_count`; byte limits must remain enforced. Old completed
+cursor checkpoints must not be reused for a new strategy.
+
+This route is not yet an exhaustive acquisition contract. Deeper unfiltered
+requests at offset 10,000 returned HTTP 504 after about 29 seconds for tested
+Practitioner, PractitionerRole, Organization, and Location collections. All five
+collections returned 504 at offset 1,000,000. A valid empty filtered Organization
+search is possible, but an unfiltered terminal boundary remains unverified.
+Gateway failures are errors, never evidence that the remainder is empty.
 
 ## Containment
 
@@ -45,11 +76,11 @@ rebuild the global evidence layer.
 
 ## Required upstream resolution
 
-A complete import requires either corrected, exhaustive server-issued pagination
-or a supported full directory extract with per-resource counts and a stable
-snapshot identity. Any proposed search partitions must also account for missing
-values and overflowing partitions; ordinary successful subset searches are not
-sufficient.
+A complete import still requires verified exhaustive traversal and a trustworthy
+terminal condition, or a supported full directory extract with per-resource
+counts and a stable snapshot identity. Any proposed search partitions must also
+account for missing values and overflowing partitions; ordinary successful
+subset searches are not sufficient.
 
 The [MiHIN developer guide](https://mihin.org/wp-content/uploads/2022/08/InterOp-Station-Third-Party-Developer-Portal-User-Guide-v1-8-18-22.pdf)
 identifies the MDHHS tenant and original public FHIR endpoints, but supplies no
