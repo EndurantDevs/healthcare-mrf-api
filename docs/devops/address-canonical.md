@@ -533,34 +533,6 @@ cargo test --manifest-path support/ptg2_scanner/Cargo.toml
 cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
 ```
 
-Dev-server NPI shutdown optimization verification from 2026-06-13
-(`ubuntu@dev-host.example`, PostgreSQL 18.4, 24 cores):
-
-- Python 3.14.6 was provisioned with `uv`; focused parallel verification
-  passed with 24 workers:
-  `python -m pytest tests/test_address_canonical_unit.py tests/test_process_npi_unit.py tests/test_process_mrf_unit.py -n auto`
-  -> `93 passed in 3.27s`.
-- Published dev NPI address table had 19,707,579 rows, with 19,694,747
-  populated `address_key` values and 12,832 null keys. The NPI shutdown path
-  now skips full SQL restamp when load-time keys are present; for small missing
-  sets it stamps one shard and bypasses the global
-  `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS` override to avoid repeated full scans.
-  A temp-table run over the 12,832 null-key rows completed the canonical stamp
-  computation in 2.922s and changed no rows, confirming those rows are
-  ineligible for canonical keys rather than stale prekeys.
-- `do_business_as` enrichment now avoids the unconditional 9.6M-row reset,
-  updates only changed source NPIs, and clears only stale non-empty values.
-  On published dev data, changed-row checks returned 0 update / 0 clear in
-  2.282s and 0.374s. `do_business_as_text` is now non-null by default so fresh
-  staging tables do not need a blanket reset before search indexes are built.
-- NPI taxonomy arrays are now stamped onto primary and mailing addresses during
-  row parsing from the in-memory NUCC code map. Shutdown keeps a deterministic
-  changed-only SQL fallback for secondary/old rows. Published dev address
-  counts were 9,260,504 primary, 9,260,501 mail, and 1,186,574 secondary; the
-  old published data still has deterministic-array drift on 1,286,921 primary,
-  1,286,921 mail, and 486,362 secondary rows, but fresh imports should avoid
-  the primary/mail post-load rewrite.
-
 For a disposable database on local Postgres:
 
 ```bash
@@ -568,7 +540,7 @@ env HLTHPRT_DB_HOST=127.0.0.1 \
     HLTHPRT_DB_PORT=5440 \
     HLTHPRT_DB_DATABASE=mrf_address_canon_test \
     HLTHPRT_DB_SCHEMA=mrf \
-    HLTHPRT_DB_USER=nick \
+    HLTHPRT_DB_USER=healthcare \
     HLTHPRT_DB_PASSWORD= \
     HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true \
     ./venv314/bin/python -m pytest -q tests/test_address_canonical_db.py
@@ -651,66 +623,6 @@ Local verification snapshot from 2026-06-11:
   `npi/id/1154324382`, pharmacy license detail for `1518379605`, Part D
   activity for `135672782`, and control node health, with no `address_key`
   string in checked payloads.
-- Python 3.14 dev-server rebuild follow-up began on 2026-06-12 with
-  `HLTHPRT_ADDRESS_CANON_SOURCES=all`,
-  `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS=24`,
-  `HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY=16`,
-  `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true`,
-  `HLTHPRT_MAX_MRF_JOBS=16`, `HLTHPRT_MRF_QUEUE_READ_LIMIT=512`,
-  `HLTHPRT_DB_DEADLOCK_RETRIES=20`, and
-  `HLTHPRT_PARALLEL_DOWNLOAD_WORKERS=16`.
-  CMS-doctors address stamping over 3,271,389 rows was the observed bottleneck
-  when shards ran serially; SQL shard fan-out keyed 100% of rows and the helper
-  now has explicit concurrency coverage.
-- Rust materializer follow-up on image
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260612214227`
-  fixed an actual NPI parity edge (`2ND FLOOR-PULMANARY`) and passed actual-data
-  scratch resolves: 1M NPI rows in 9.752s wall time with 0 key mismatches and 0
-  source-bit misses; multi-source checks also passed for NPI, marketplace MRF,
-  CMS doctors, and facility anchors. Pharmacy-license was empty in the dev DB
-  during this smoke.
-- Dev deploy was advanced through
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260613020811`
-  and finally to
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260613050521`
-  after the full MRF/NPPES timing work. The newer deployment tags add
-  `HLTHPRT_MAX_NPI_JOBS`, `HLTHPRT_NPI_QUEUE_READ_LIMIT`,
-  `HLTHPRT_MAX_NPI_FINISH_JOBS`, conflict-safe formulary aggregate upserts,
-  `HLTHPRT_MRF_QUEUE_READ_LIMIT` support, DB-pool sizing for parallel address
-  stamping, BigInteger ORM coverage for MRF provider NPI/network-checksum
-  staging plus NPPES NPI identifiers, and Rust parity fixes for actual NPI
-  `2ND FLOOR-PULMANARY` and `STE T .` addresses. The high-parallel MRF
-  follow-up found that a single very wide ARQ process can exhaust the
-  per-process DB pool; use multiple normal `process.MRF --burst` processes with
-  a larger queue read window instead.
-- The controlled Python 3.14 MRF run for import
-  `addrcanon_mrf_20260612215839` published successfully on 2026-06-13 after
-  patched recovery/finish work. Final finish job
-  `hp-mrf-finish-patched-20260613020811` completed in 3208.32s; total import
-  delta was 5:51:04.280138. Published counts: 735 issuers, 15,500 plans,
-  34,811 transparency rows, 29,507,745 drug rows, 6,929 plan drug stats,
-  39,241 plan drug tier stats, 25,672,487 plan NPI rows, 10,583 network tiers,
-  16,302,076 MRF address rows, 85,859,271 MRF address evidence rows, and
-  15,500 plan search summary rows. `address_archive_v2` held 6,056,982 rows,
-  with 1,322,413 carrying the MRF source bit. Only two published MRF address
-  rows had null `address_key`; both came from malformed source ZIP values
-  (`postal_code='.'`) in the Intermountain provider feed.
-- The controlled Python 3.14 NPPES run for import
-  `addrcanon_npi_20260613040046` loaded full June 2026 NPPES data in
-  1369.91s. Its initial shutdown exposed two address-canonical parity bugs:
-  Python-prekeyed rows skipped SQL repair, and Rust treated `STE T .` as unit
-  `stet` while Python/SQL treat it as street text. After the source fixes,
-  patched shutdown job `hp-npi-shutdown-patched-20260613050521` completed in
-  26m12s. `canonical_address_resolve` took 780.512s, published 19,707,579
-  `npi_address` rows, 9,606,683 `npi` rows, 12,019,685 taxonomy rows, and
-  154,583 phone-staffing rows, with 5,351,601 NPPES keys represented in
-  `address_archive_v2`. Runtime API smoke passed healthcheck, `npi/id`, and
-  import summary, and Redis `arq:queue`, `arq:queue:NPI`, and
-  `arq:queue:NPI_finish` were all 0. The remaining shutdown hotspots were SQL
-  restamping (~13 minutes), `do_business_as` enrichment (225.619s),
-  taxonomy-array enrichment (242.907s), and `npi_address` vacuum/analyze
-  (146.505s).
-
 ## Rollback
 
 1. Disable canonical writes by unsetting `HLTHPRT_ADDRESS_CANON_SOURCES`.

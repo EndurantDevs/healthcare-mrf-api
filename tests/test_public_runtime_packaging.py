@@ -83,6 +83,14 @@ def test_documented_container_commands_are_packaged():
 
 
 def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path):
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert (
+        "python:3.14.6-slim-trixie@sha256:"
+        "b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967"
+    ) in dockerfile
+    assert "--require-hashes" in dockerfile
+    assert "--only-binary=:all:" in dockerfile
+    assert "python -m pip check" in dockerfile
     validate(ROOT)
     for name in {*LOCK_INPUTS, *(name for inputs in LOCK_INPUTS.values() for name in inputs)}:
         (tmp_path / name).write_bytes((ROOT / name).read_bytes())

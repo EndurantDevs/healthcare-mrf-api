@@ -33,7 +33,7 @@ def test_ensure_worker_without_run_id_does_not_fabricate_run_identity(
 def _configure_kubernetes_worker_environment(monkeypatch) -> None:
     """Configure the complete Kubernetes worker-job environment contract."""
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "mrf-api-config")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "mrf-api-secret")
     monkeypatch.setenv(
@@ -54,7 +54,7 @@ def _assert_kubernetes_worker_job(job: dict[str, object]) -> None:
     """Verify the generated job preserves secret and volume contracts."""
     assert job["kind"] == "Job"
     container = job["spec"]["template"]["spec"]["containers"][0]
-    assert container["image"] == "ghcr.io/endurantdevs/healthcare-mrf-api:dev"
+    assert container["image"] == "ghcr.io/example/healthcare-mrf-api:test"
     assert {"name": "HLTHPRT_CONTROL_RUN_ID", "value": "run_123"} in container["env"]
     assert {
         "name": "EXAMPLE_STATUS_TOKEN",
