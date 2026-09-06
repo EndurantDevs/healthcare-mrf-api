@@ -284,7 +284,7 @@ def parse_hospital_hpt_locator(
             if key == "location-name" and key in fields_by_key:
                 locator_records.append(_record(fields_by_key))
                 fields_by_key = {}
-            if key in fields_by_key:
+            if key in fields_by_key and key != "contact-name":
                 if replaces_empty_mrf_url and key == "mrf-url":
                     fields_by_key[key] = field_value
                     continue
