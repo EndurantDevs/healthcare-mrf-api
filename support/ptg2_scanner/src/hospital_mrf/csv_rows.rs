@@ -26,8 +26,8 @@ fn parse_csv_service(
             code: code.to_owned(),
         });
     }
-    let drug_unit = optional_decimal(csv_value(record, columns.drug_unit), "drug unit")?;
-    let drug_type = optional_text(csv_value(record, columns.drug_type));
+    let drug_unit = optional_decimal(csv_profile_value(record, columns.drug_unit), "drug unit")?;
+    let drug_type = optional_text(csv_profile_value(record, columns.drug_type));
     let service = validate_service(
         ServiceRow {
             description: csv_value(record, columns.description).to_owned(),
