@@ -3496,7 +3496,7 @@ hospitals:
 - hospital_id: hospital-001032
   name: CAHRMC
   cms_hpt_url: https://ricemedicalcenter.net/cms-hpt.txt
-  locator_mrf_url: https://ricemedicalcenter.slicedhealth.io/pricer/270565499_cahrmc,-dba-rice-medical-center_standardcharges.csv
+  alias_of: hospital-001033
 - hospital_id: hospital-001033
   name: CAHRMC, dba Rice Medical Center
   cms_hpt_url: https://ricemedicalcenter.net/cms-hpt.txt

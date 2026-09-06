@@ -98,6 +98,34 @@ def test_reviewed_duplicate_aliases_preserve_selector_identity():
     assert hospital_by_id["hospital-000767"]["locator_mrf_url"] == keller_mrf_url
 
 
+def test_rice_legal_name_alias_preserves_ids_and_locator_closure():
+    """Resolve Rice's legal-name alias without merging neighboring facilities."""
+    group = ("hospital-001033", "hospital-001032")
+    locator_url = "https://ricemedicalcenter.net/cms-hpt.txt"
+    records = (locator.HospitalHptLocatorRecord(
+        "CAHRMC, dba Rice Medical Center", "https://hospital.example/rice.csv"
+    ),)
+    hospitals = registry.load_hospital_hpt_registry()
+    cohort_hospitals = tuple(row for row in hospitals if row["cms_hpt_url"] == locator_url)
+    assert {row["hospital_id"] for row in cohort_hospitals} == set(group)
+    assert {row.get("alias_of", row["hospital_id"]) for row in cohort_hospitals} == {group[0]}
+    assert [row["name"] for row in cohort_hospitals] == ["CAHRMC", "CAHRMC, dba Rice Medical Center"]
+    assert all("locator_mrf_url" not in row for row in cohort_hospitals)
+    for hospital_id in group:
+        assert registry.hospital_hpt_group_ids(hospital_id) == group
+        selected = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+        assert selected == cohort_hospitals
+        match = locator.match_hospital_hpt_locator(selected, locator_url, records)
+        assert [(item.hospital_id, item.record_index) for item in match.bindings] == [
+            ("hospital-001032", 0), ("hospital-001033", 0),
+        ]
+        assert match.content_targets == (records[0].mrf_url,)
+        assert not match.unmatched_hospital_ids and not match.ambiguous_hospital_ids
+        assert not match.unmatched_record_indexes and not match.ambiguous_record_indexes
+    for hospital_id in ("hospital-001031", "hospital-001034"):
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+
+
 def test_avera_shared_locator_closes_every_reviewed_id():
     hospitals = tuple(
         hospital for hospital in registry.load_hospital_hpt_registry()

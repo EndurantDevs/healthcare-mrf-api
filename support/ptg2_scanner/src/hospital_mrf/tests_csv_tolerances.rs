@@ -125,3 +125,170 @@
             "metadata header exceeds its scan limit",
         );
     }
+include!("tests_metadata_address.rs");
+
+    fn unquote_fixture_hospital_name(payload: &[u8]) -> Vec<u8> {
+        let payload = std::str::from_utf8(payload).unwrap();
+        assert!(payload.contains("\"North, Hospital\""));
+        payload
+            .replacen("\"North, Hospital\"", "North, Hospital", 1)
+            .into_bytes()
+    }
+
+    #[test]
+    fn csv_name_alignment_preserves_quoted_semantics_and_literal_confirmation() {
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            let fixture = match format {
+                InputFormat::TallCsv => fixture_tall_csv(),
+                InputFormat::WideCsv => fixture_wide_csv(),
+                InputFormat::Json => unreachable!(),
+            };
+            for (version, date, canonical_date) in [
+                ("2.0.0", "2026-02-19", "2026-02-19"),
+                ("3.0.0", "2026-02-19", "2026-02-19"),
+                ("3.0.1", "2024-02-29", "2024-02-29"),
+                ("4.0.0", "2/19/2026", "2026-02-19"),
+            ] {
+                let version_fixture = if version == "2.0.0" {
+                    fixture_v2_csv(format, version)
+                } else {
+                    fixture.clone()
+                };
+                for confirmation in ["true", "false"] {
+                    let mut records = csv_fixture_records(&version_fixture);
+                    records[1][1] = date.to_owned();
+                    records[1][2] = version.to_owned();
+                    records[1][7] = confirmation.to_owned();
+                    let quoted = csv_fixture_bytes(&records);
+                    let unquoted = unquote_fixture_hospital_name(&quoted);
+                    let expected = run_fixture(format, &quoted, false);
+                    let actual = run_fixture(format, &unquoted, false);
+                    assert_eq!(actual, expected);
+                    let mrf = std::str::from_utf8(&actual["mrf"]).unwrap();
+                    let fields = mrf.trim_end().split('\t').collect::<Vec<_>>();
+                    assert_eq!(fields[1], "North, Hospital");
+                    assert_eq!(fields[2], canonical_date);
+                    assert_eq!(fields[3], version);
+                    assert_eq!(
+                        fields[4],
+                        if version == "2.0.0" {
+                            AFFIRMATION_TEXT
+                        } else {
+                            ATTESTATION_TEXT
+                        }
+                    );
+                    assert_eq!(fields[5], confirmation);
+                    assert_eq!(
+                        fields[6],
+                        if version == "2.0.0" { "\\N" } else { "Alex Attester" }
+                    );
+
+                    let (_quoted_dir, quoted_summary) =
+                        import_packed(format, &quoted, TEST_MAX_OUTPUT_BYTES);
+                    let (_unquoted_dir, unquoted_summary) =
+                        import_packed(format, &unquoted, TEST_MAX_OUTPUT_BYTES);
+                    assert_eq!(
+                        quoted_summary.artifacts.iter()
+                            .map(|artifact| (artifact.kind, artifact.rows, &artifact.sha256))
+                            .collect::<Vec<_>>(),
+                        unquoted_summary.artifacts.iter()
+                            .map(|artifact| (artifact.kind, artifact.rows, &artifact.sha256))
+                            .collect::<Vec<_>>()
+                    );
+                    let root = unquoted_summary.root.unwrap();
+                    assert_eq!(
+                        (root.service_count, root.charge_count, root.fact_count),
+                        (1, 1, 1)
+                    );
+                }
+            }
+            let unquoted = unquote_fixture_hospital_name(&fixture);
+            let expected = run_fixture(format, &fixture, false);
+            assert_eq!(run_fixture(format, &unquoted, true), expected);
+            assert_eq!(
+                run_zip_fixture(format, &unquoted, CompressionMethod::Deflated),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn csv_name_alignment_leaves_ambiguous_records_unchanged() {
+        let (headers, mut values) = general_rows(11);
+        values[0] = "North".to_owned();
+        values.insert(1, " Hospital".to_owned());
+        let mut cases = Vec::new();
+        for (index, value) in [
+            (0, ""),
+            (1, " "),
+            (1, "2026-01-01"),
+            (2, "2026-02-30"),
+            (2, "2025-02-29"),
+            (2, "2/19/26"),
+            (2, "2026-02/19"),
+            (3, "5.0.0"),
+            (3, ""),
+        ] {
+            let mut invalid_values = values.clone();
+            invalid_values[index] = value.to_owned();
+            cases.push((headers.clone(), invalid_values));
+        }
+        let mut extra = values.clone();
+        extra.insert(1, " General".to_owned());
+        cases.push((headers.clone(), extra));
+        let mut missing = values.clone();
+        missing.pop();
+        cases.push((headers.clone(), missing));
+        let mut reordered = headers.clone();
+        reordered.swap(0, 1);
+        cases.push((reordered, values));
+        for (headers, values) in cases {
+            let headers = StringRecord::from(headers);
+            let values = StringRecord::from(values);
+            assert!(align_csv_hospital_name(&headers, &values).is_none());
+            assert!(parse_csv_metadata(&headers, &values, DEFAULT_MAX_FANOUT_ROWS).is_err());
+        }
+        let (headers, values) = general_rows(11);
+        assert!(align_csv_hospital_name(
+            &StringRecord::from(headers),
+            &StringRecord::from(values)
+        ).is_none());
+    }
+
+    #[test]
+    fn csv_name_alignment_keeps_metadata_body_and_resource_validation() {
+        let fixture = fixture_tall_csv();
+        for (field, value, expected) in [
+            ("type_2_npi", "", "type_2_npi"),
+            (ATTESTATION_TEXT, "1", "attestation value must be true or false"),
+            (ATTESTATION_TEXT, "", "attestation value must be true or false"),
+            ("attester_name", "", "attester_name"),
+        ] {
+            let mut records = csv_fixture_records(&fixture);
+            let index = csv_fixture_index(&records[0], field);
+            records[1][index] = value.to_owned();
+            // A true value elsewhere must never replace the actual confirmation.
+            records[1][9] = "true".to_owned();
+            assert_import_error(
+                InputFormat::TallCsv,
+                &unquote_fixture_hospital_name(&csv_fixture_bytes(&records)),
+                DEFAULT_MAX_FANOUT_ROWS,
+                expected,
+            );
+        }
+        let mut records = csv_fixture_records(&fixture);
+        let index = csv_fixture_index(&records[2], "standard_charge | negotiated_dollar");
+        records[3][index] = "-1".to_owned();
+        assert_import_error(
+            InputFormat::TallCsv,
+            &unquote_fixture_hospital_name(&csv_fixture_bytes(&records)),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "must be greater than zero",
+        );
+        assert_payload_limit_error(
+            InputFormat::TallCsv,
+            &unquote_fixture_hospital_name(&fixture),
+            128,
+            "CSV record exceeds configured limit",
+        );
+    }
