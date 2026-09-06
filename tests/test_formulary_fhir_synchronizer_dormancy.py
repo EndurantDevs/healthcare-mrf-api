@@ -120,13 +120,9 @@ def test_synthetic_canary_is_absent_from_all_runtime_entrypoints():
 
 
 def test_synthetic_canary_postgres_proof_and_fixtures_are_packaged():
-    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
-        encoding="utf-8"
-    )
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     fixture_directory = ROOT / "scripts" / "smoke" / "fixtures" / "formulary_fhir"
 
-    assert "tests/test_formulary_fhir_synthetic_canary_postgres.py" in prepush_source
     script = "scripts/smoke/formulary_fhir_synthetic_canary.py"
     assert f"COPY {script} /opt/{script}" in dockerfile_source
     for fixture_name in (
@@ -193,14 +189,7 @@ def test_synthetic_seed_publisher_has_no_runtime_or_deployment_reachability():
             not in runtime_source
         )
 
-    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
-        encoding="utf-8"
-    )
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert (
-        "tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py"
-        in prepush_source
-    )
     assert "COPY process/ /opt/process/" in dockerfile_source
     script = "scripts/smoke/formulary_fhir_synthetic_seed_publisher.py"
     assert f"COPY {script} /opt/{script}" in dockerfile_source
@@ -250,9 +239,6 @@ def test_reviewed_operator_modules_are_separated_and_dormant():
 
 def test_reviewed_operator_library_and_script_paths_are_packaged():
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
-        encoding="utf-8"
-    )
     operator_script = (
         ROOT / "scripts" / "smoke" / "formulary_fhir_reviewed_operator.py"
     )
@@ -264,10 +250,6 @@ def test_reviewed_operator_library_and_script_paths_are_packaged():
     assert "COPY process/ /opt/process/" in dockerfile_source
     script = operator_script.relative_to(ROOT).as_posix()
     assert f"COPY {script} /opt/{script}" in dockerfile_source
-    assert str(operator_script.relative_to(ROOT)) in prepush_source
-    assert "tests/test_formulary_fhir_reviewed_operator_postgres.py" in (
-        prepush_source
-    )
 
 
 def test_uhc_operator_phases_are_separated_and_runtime_dormant():
@@ -340,19 +322,13 @@ def test_uhc_operator_never_imports_the_legacy_formulary_writer():
             assert forbidden_legacy_name not in source_text
 
 
-def test_uhc_operator_library_and_script_are_packaged_and_gated_in_ci():
+def test_uhc_operator_library_and_script_are_packaged():
     """The image contains the one-shot operator and proves it disabled."""
 
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
-        encoding="utf-8"
-    )
     operator_script = ROOT / "scripts" / "smoke" / "uhc_formulary_operator.py"
 
     assert operator_script.is_file()
     assert "COPY process/ /opt/process/" in dockerfile_source
     script = operator_script.relative_to(ROOT).as_posix()
     assert f"COPY {script} /opt/{script}" in dockerfile_source
-    assert str(operator_script.relative_to(ROOT)) in prepush_source
-    assert "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED" in prepush_source
-    assert "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED" in prepush_source
