@@ -428,6 +428,28 @@ def test_mrf_selector_rejects_control_characters():
     ) is None
 
 
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://[::1/mrf.csv",
+        "https://files.example:invalid/mrf.csv",
+        "https://files.example:65536/mrf.csv",
+    ),
+)
+def test_mrf_selector_rejects_malformed_authority(url):
+    assert locator.hospital_mrf_selector(url, allow_credentials=True) is None
+
+
+@pytest.mark.parametrize("query_field_count", (64, 65))
+def test_mrf_selector_bounds_credential_query_fields(query_field_count):
+    url = "https://files.example/mrf.csv"
+    query = "&".join(["sig=synthetic"] * query_field_count)
+
+    assert locator.hospital_mrf_selector(
+        f"{url}?{query}", allow_credentials=True
+    ) == (url if query_field_count == 64 else None)
+
+
 def test_selector_binds_unique_content_without_inventing_a_location():
     shared_locator = "https://hospital.example/cms-hpt.txt"
     selected = "https://files.example/Case/File.csv"
