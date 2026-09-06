@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,30 @@ from tests.test_plan_pricing_projection_v3_differential_postgres import (
 )
 
 _RUN_TOKEN = "a" * 12
+
+
+def test_census_temp_file_limit_uses_deployed_guard() -> None:
+    source = Path(transaction.__file__).read_text(encoding="utf-8")
+    assert "SET LOCAL temp_file_limit" not in source
+    assert (
+        "SELECT healthporta_guardrails.set_census_temp_file_limit_256mb()"
+        in source
+    )
+
+
+async def _install_census_temp_file_limit_guard(execute) -> None:
+    await execute("CREATE SCHEMA IF NOT EXISTS healthporta_guardrails")
+    await execute("""
+        CREATE OR REPLACE FUNCTION
+          healthporta_guardrails.set_census_temp_file_limit_256mb()
+        RETURNS text
+        LANGUAGE sql
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $function$
+          SELECT pg_catalog.set_config('temp_file_limit', '256MB', true)
+        $function$
+        """)
 
 
 async def _run_blocked_statement(session, backend_pids, query_started) -> None:
@@ -59,6 +84,7 @@ async def _configure_census_database(
     projection_id: str,
 ) -> None:
     async with database.engine.begin() as connection:
+        await _install_census_temp_file_limit_guard(connection.exec_driver_sql)
         await _insert_candidate(connection, database.schema, projection_id)
     session_factory = async_sessionmaker(
         database.engine,

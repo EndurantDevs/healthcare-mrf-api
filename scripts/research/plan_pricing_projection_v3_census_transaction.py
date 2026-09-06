@@ -145,7 +145,6 @@ async def _configure_census_database_session(
         "SET LOCAL work_mem = '4MB'",
         "SET LOCAL hash_mem_multiplier = 1",
         "SET LOCAL plan_cache_mode = force_custom_plan",
-        "SET LOCAL temp_file_limit = '256MB'",
         "SET LOCAL lock_timeout = '5s'",
         "SET LOCAL statement_timeout = '20min'",
     )
@@ -370,6 +369,9 @@ async def _rollback_only(
             expected_settings = expected_census_database_settings(run_token)
             await _configure_census_database_session(session, expected_settings)
             await lock_provider_generation(session)
+            await session.execute(
+                text("SELECT healthporta_guardrails.set_census_temp_file_limit_256mb()")
+            )
             settings_by_field, backend_pid = await _attested_census_database_settings(
                 session,
                 expected_settings,
