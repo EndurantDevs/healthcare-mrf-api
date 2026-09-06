@@ -99,26 +99,26 @@ def test_michigan_new_publication_is_blocked_but_current_slice_is_retained():
     (MICHIGAN_PROVIDER_DIRECTORY_BASE, "https://directory.example.test/fhir"),
 ])
 def test_michigan_canonical_alias_cannot_bypass_acquisition_or_promotion(api_base, canonical_base):
-    source_record = {
+    source_record_by_field = {
         "source_id": "synthetic-canonical-alias", "api_base": api_base,
         "canonical_api_base": canonical_base,
         "metadata_json": {"provider_directory_coverage_mode": "full"},
     }
-    start_url = importer._resource_start_url(source_record, "Organization", page_count=1)
+    start_url = importer._resource_start_url(source_record_by_field, "Organization", page_count=1)
     assert start_url.startswith(canonical_base.rstrip("/") + "/Organization?")
     with pytest.raises(RuntimeError, match="upstream_search_window_incomplete"):
-        importer._assert_resource_acquisition_allowed(source_record, ["Organization"])
+        importer._assert_resource_acquisition_allowed(source_record_by_field, ["Organization"])
     for promote in (False, True):
         row = _dataset_row(promote=promote)
-        row.update(source_id=source_record["source_id"], source_record_json=source_record)
+        row.update(source_id=source_record_by_field["source_id"], source_record_json=source_record_by_field)
         if promote:
             with pytest.raises(RuntimeError, match="artifact_coverage_blocked"):
                 importer._validate_provider_directory_artifact_datasets(
-                    [row], [source_record["source_id"]], should_select_validated_candidates=True,
+                    [row], [source_record_by_field["source_id"]], should_select_validated_candidates=True,
                 )
         else:
             fence = importer._validate_provider_directory_artifact_datasets(
-                [row], [source_record["source_id"]],
+                [row], [source_record_by_field["source_id"]],
             )
             assert fence.datasets[0].is_current is True
             assert fence.datasets[0].promote_on_cutover is False
