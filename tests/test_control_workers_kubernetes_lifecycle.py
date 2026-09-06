@@ -13,7 +13,7 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
         return {"items": []}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setenv(
         "HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON",
         '{"process.PTGSmall":{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"4","memory":"8Gi"}}}',
@@ -123,7 +123,7 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
         return {"items": []}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
@@ -160,7 +160,7 @@ def test_kubernetes_start_worker_replicas_do_not_apply_to_finish(monkeypatch):
         return {"items": []}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
@@ -208,7 +208,7 @@ def test_kubernetes_completed_start_job_promotes_running_import_to_finish(monkey
         return {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
@@ -240,7 +240,7 @@ def test_kubernetes_completed_worker_job_is_recreated(monkeypatch):
         return {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
@@ -271,7 +271,7 @@ def test_kubernetes_completed_worker_jobs_are_all_removed_before_recreate(monkey
         return {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)

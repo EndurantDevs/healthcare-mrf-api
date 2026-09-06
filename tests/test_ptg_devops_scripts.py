@@ -2,15 +2,10 @@
 
 import importlib.util
 import asyncio
-import os
 from pathlib import Path
-import subprocess
-
-import yaml
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "devops"
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_script(module_name: str):
@@ -29,106 +24,6 @@ def test_ptg_devops_scripts_import_without_database_connection():
         "ptg2_strict_v3_cutover_ready",
     ):
         assert _load_script(module_name).__name__ == module_name
-
-
-def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
-    workflow = (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
-
-    assert 'workflows: ["CI"]' in workflow
-    assert "github.event.workflow_run.conclusion == 'success'" in workflow
-    assert "Authorize exact tested source SHA" in workflow
-    assert "context.ref !== 'refs/heads/main'" in workflow
-    assert "workflow_id: 'ci.yml'" in workflow
-    assert "head_sha: deploySha" in workflow
-    assert "run.head_sha === deploySha" in workflow
-    assert "run.event === 'push'" in workflow
-    assert "run.head_repository?.full_name === expectedRepository" in workflow
-    assert "deploySha !== mainSha" in workflow
-    assert "Reader promotion requires the exact staged deploy_sha" in workflow
-    assert "!['auto', 'reader', 'recovery-writer'].includes(phase)" in workflow
-    assert "${phase} deployment requires current main ${mainSha}" in workflow
-    assert workflow.count("phase = 'auto'") == 1
-    assert "workflow_dispatch:" in workflow
-    assert "- recovery-writer" in workflow
-    assert "--detach" not in workflow
-    assert "timeout-minutes: 90" in workflow
-    assert workflow.count("-o ServerAliveInterval=30") == 1
-    assert workflow.count("-o ServerAliveCountMax=3") == 1
-    assert "run.conclusion === 'success'" in workflow
-
-
-def test_dev_deploy_workflow_requires_one_terminal_source_bound_receipt():
-    workflow = (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
-
-    assert "set -o pipefail" in workflow
-    assert '2>&1 | tee "${receipt_log}"' in workflow
-    assert "receipt_count=$(grep -Ec" in workflow
-    assert 'tail -n 1 "${receipt_log}"' in workflow
-    for field in (
-        "healthporta_deploy_receipt_v1 service=healthcare-mrf-api",
-        "source_sha=${DEPLOY_SHA}",
-        "deploy_sha=[0-9a-f]{40}",
-        "image=[^[:space:]]+",
-        "manifest_digest=sha256:[0-9a-f]{64}",
-        "config_digest=sha256:[0-9a-f]{64}",
-    ):
-        assert field in workflow
-
-
-def test_dev_deploy_workflow_executes_receipt_failure_paths(tmp_path):
-    workflow = yaml.safe_load(
-        (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
-    )
-    deploy_script = next(
-        step["run"]
-        for step in workflow["jobs"]["queue"]["steps"]
-        if step.get("name") == "Deploy on dev node"
-    )
-    ssh_stub = tmp_path / "ssh"
-    ssh_stub.write_text(
-        '#!/bin/sh\nprintf \'%s\\n\' "${SSH_OUTPUT}"\nexit "${SSH_STATUS}"\n'
-    )
-    ssh_stub.chmod(0o755)
-
-    source_sha = "a" * 40
-    receipt = (
-        "healthporta_deploy_receipt_v1 service=healthcare-mrf-api "
-        f"source_sha={source_sha} deploy_sha={'b' * 40} image=registry/image@sha256:digest "
-        f"manifest_digest=sha256:{'c' * 64} config_digest=sha256:{'d' * 64}"
-    )
-    environment_by_name = {
-        **os.environ,
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "RUNNER_TEMP": str(tmp_path),
-        "DEV_DEPLOY_HOST": "localhost",
-        "DEPLOY_SHA": source_sha,
-        "DEPLOY_BRANCH": "main",
-        "PTG_V3_PHASE": "auto",
-    }
-    cases = (
-        ("valid", f"progress\n{receipt}", 0, True),
-        ("duplicate", f"{receipt}\n{receipt}", 0, False),
-        ("non-terminal", f"{receipt}\ntrailing output", 0, False),
-        ("ssh failure", receipt, 42, False),
-    )
-
-    for label, output, ssh_status, should_succeed in cases:
-        completed = subprocess.run(
-            ["bash", "-c", deploy_script],
-            env={
-                **environment_by_name,
-                "SSH_OUTPUT": output,
-                "SSH_STATUS": str(ssh_status),
-            },
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert (completed.returncode == 0) is should_succeed, (
-            label,
-            completed.stdout,
-            completed.stderr,
-        )
 
 
 def test_cutover_requires_idle_valid_pointers():

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from db.models import PTG2Snapshot
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     _load_attempt_migration,
@@ -63,58 +61,3 @@ def test_snapshot_model_declares_the_attempt_run_index() -> None:
         "index_elements": ("import_run_id",),
         "name": "ptg2_snapshot_attempt_run_idx",
     } in PTG2Snapshot.__my_additional_indexes__
-
-
-def test_ci_runs_attempt_and_legacy_guard_postgres_tests() -> None:
-    prepush_text = (
-        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "prepush"
-    ).read_text()
-    packed_v4_gate = prepush_text.split(
-        "HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1",
-        maxsplit=1,
-    )[1].split(
-        "HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1",
-        maxsplit=1,
-    )[0]
-    assert "tests/test_ptg2_v4_attempt_stage_regression_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_terminal_stage_atomicity_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_stale_metadata_json_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_stale_metadata_fence_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_attempt_migration_adoption_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_attempt_migration_downgrade_postgres.py" in (
-        packed_v4_gate
-    )
-    assert "tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py" in (
-        packed_v4_gate
-    )
-    for legacy_guard_test in (
-        "tests/test_ptg2_legacy_v3_metadata_reconcile_postgres.py",
-        "tests/test_ptg2_legacy_v3_migration_postgres.py",
-        "tests/test_ptg2_legacy_v3_v4_compat_postgres.py",
-        "tests/test_ptg_source_attempt_action_postgres.py",
-    ):
-        assert legacy_guard_test in packed_v4_gate
-
-
-def test_ci_runs_split_shared_gc_postgres_tests() -> None:
-    prepush_text = (
-        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "prepush"
-    ).read_text()
-    shared_gc_gate = prepush_text.split(
-        "HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1",
-        maxsplit=1,
-    )[1].split(
-        "HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST=1",
-        maxsplit=1,
-    )[0]
-    assert "tests/test_ptg2_shared_gc_postgres.py" in shared_gc_gate

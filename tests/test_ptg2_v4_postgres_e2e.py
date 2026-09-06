@@ -89,7 +89,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     reserve_v4_shared_layout,
     seal_v4_shared_layout,
 )
-from scripts.ptg_v4_dev_canary_storage import relation_size_rows
+from scripts.validation.ptg_relation_storage import relation_size_rows
 from tests.ptg2_layout_build_schema_support import (
     layout_build_candidate_and_pin_ddl,
 )

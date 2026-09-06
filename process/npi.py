@@ -1191,8 +1191,6 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
             )
         with tempfile.TemporaryDirectory(dir=scratch_root) as tmpdirname:
             print(f"Found: {archive_filename}")
-            # await unzip('/users/nick/downloads/NPPES_Data_Dissemination_November_2022.zip', tmpdirname, __debug=True)
-
             if prepared_archive is not None:
                 legacy_layout = await materialize_prepared_nppes_archive(
                     prepared_archive,

@@ -88,54 +88,6 @@
 - Facility anchors were rerun on the dev DB after the source-coordinate archive
   refresh was added; `address_archive_v2` now has 500 facility-source rows with
   `lat`/`long` and `geocode_source='facility_anchor'`.
-- Dev-server Rust materializer verification on image
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260612214227`
-  passed on actual data after fixing Rust unit parsing parity for
-  `2ND FLOOR-PULMANARY`. A 1M-row NPI scratch resolve inserted 487,574
-  canonical rows with 0 key mismatches and 0 source-bit misses in 9.752s wall
-  time; Rust transformed 45.3 MB of COPY input to 143.8 MB in 3.106s. A
-  multi-source actual-data smoke also passed with 0 key mismatches, 0
-  source-bit misses, and no gate violations for NPI 250k rows, marketplace MRF
-  500k rows, CMS doctors 250k rows, and all keyed facility-anchor rows. Live
-  dev API/control smoke returned expected statuses for healthcheck, `npi/all`,
-  `npi/id`, NPI full taxonomy, coverage, pharmacy-license, Part D, and control
-  registry endpoints, with no `address_key` in checked public NPI payloads.
-- Dev deploy was later advanced through
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260613020811`
-  and finally to
-  `ghcr.io/endurantdevs/healthcare-mrf-api:dev-address-canon-rust-20260613050521`
-  for the NPPES timing follow-up and MRF recovery work. The newer images add
-  configurable NPI worker concurrency, conflict-safe MRF formulary aggregate
-  upserts, `HLTHPRT_MRF_QUEUE_READ_LIMIT`, DB-pool sizing for parallel address
-  stamping, BigInteger ORM coverage for MRF provider NPI/network-checksum
-  staging plus NPPES NPI identifiers, and Rust parity fixes for actual NPI
-  `2ND FLOOR-PULMANARY` and `STE T .` addresses. The MRF parallelism follow-up
-  showed that multiple normal `process.MRF --burst` processes with a larger
-  read window are safer than one very wide ARQ process, which can exhaust the
-  per-process DB pool. The current dev profile pins
-  `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS=24`,
-  `HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY=16`, and
-  `HLTHPRT_DB_POOL_MAX_SIZE=32` for canonical address stamping on the 24-core
-  dev host.
-- The controlled Python 3.14 MRF run for `addrcanon_mrf_20260612215839`
-  published successfully on 2026-06-13. Patched finish
-  `hp-mrf-finish-patched-20260613020811` took 3208.32s; total import delta was
-  5:51:04.280138. Published counts included 15,500 plans, 25,672,487 plan NPI
-  rows, 16,302,076 MRF address rows, 85,859,271 MRF address evidence rows, and
-  15,500 plan search summary rows. `address_archive_v2` had 1,322,413 rows with
-  the MRF source bit. The only two null MRF `address_key` rows were malformed
-  Intermountain source rows with `postal_code='.'`.
-- Full NPPES evidence for `addrcanon_npi_20260613040046`: the actual June 2026
-  data load completed in 1369.91s, then patched shutdown
-  `hp-npi-shutdown-patched-20260613050521` published the staged import in
-  26m12s. `canonical_address_resolve` took 780.512s and represented 5,351,601
-  NPPES source-bit keys in `address_archive_v2`. Published counts were
-  9,606,683 NPI rows, 12,019,685 taxonomy rows, 19,707,579 NPI address rows,
-  and 154,583 phone-staffing rows. Healthcheck, `npi/id/1154324382`, and import
-  API smoke passed, with NPI queues empty afterward. Remaining NPI shutdown
-  hotspots are SQL restamping, `do_business_as`, taxonomy-array enrichment, and
-  `npi_address` vacuum/analyze.
-
 ## The idea in one paragraph
 
 Today, six different imports (NPPES, CMS doctors, marketplace MRF, enrollment,

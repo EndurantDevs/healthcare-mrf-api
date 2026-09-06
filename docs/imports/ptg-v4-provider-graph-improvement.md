@@ -496,36 +496,6 @@ generic promotion or route/release reconciliation paths.
    representation byte totals unchanged, while a changed incidence shape may
    select another layout.
 
-The dev canary order covers three frozen source/evidence baselines without
-preselecting their layouts. Each canary is independently accepted; a failure
-stops the sequence and triggers rollback to the retained V3 snapshot.
-
-During this isolated window, generic planned-import dispatch is fenced while
-candidate-audit dispatch remains active. An exact reimport is first created
-under a node-independent deterministic identity; node selection happens only
-inside the atomic dispatch reservation, so concurrent requests cannot start
-two attempts. Rollback is a separate authenticated operation that accepts only
-the exact pinned predecessor and reverses source, plan, same-source global, and
-declared allowed-amount pointers in one lifecycle-locked transaction. It
-validates the retained snapshot's sealed scope and activated audit attestation
-before changing any pointer, and an exact retry performs no writes.
-
-When a retained source wrapper no longer resolves but its active stored direct
-projection is revalidated from fresh bytes, exact-period planning may consume
-an immutable future-only attestation. The proof binds the exact source-file and
-content version, direct-dispatch CAS, semantic month, current source and plan
-lineage, HTTP validators, byte count and hashes, and the validating code image.
-It is idempotent by proof digest, consumed at most once, and can be revoked
-without rewriting history. It does not repair historical provenance, authorize
-catalog refresh, or change an import, snapshot, release, route, or V3 artifact.
-
-The V3 oracle is pinned to its reviewed image. Reference capture first attests
-the singular ready Deployment and Pod, immutable image digest, V3-only
-ConfigMaps, and exact Service target. In the current dev topology that same
-Deployment also serves candidate-audit traffic, so it remains at one replica
-through both canary passes. It may become scale-to-zero only after those roles
-are separated in source control and the canary attests the dedicated oracle.
-
 ## Metadata-only stale-build reconciliation
 
 An interrupted V4 attempt can leave only its internal import-run row and an
