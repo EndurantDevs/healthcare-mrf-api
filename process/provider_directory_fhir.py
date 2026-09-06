@@ -86,6 +86,13 @@ from process.control_lifecycle import (
     suppress_control_run_heartbeat_persistence,
 )
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
+from process.provider_directory_source_coverage import (
+    INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+    MICHIGAN_PROVIDER_DIRECTORY_BASE,
+    MICHIGAN_SUPPORTED_RESOURCES,
+    acquisition_coverage_blocked_reason,
+    michigan_provider_directory_metadata,
+)
 from process.ext import address_alias_sql, address_fast
 from process.ext.address_canon import resolve_into_archive
 from process.ext.address_format import (
@@ -1328,17 +1335,6 @@ REST_PAGE_PREFETCH_DETERMINISTIC_API_BASES = frozenset(
     | {
         SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
         SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
-    }
-)
-INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
-MICHIGAN_PROVIDER_DIRECTORY_BASE = "https://mi.fhir.mhbapp.com/pd/api/v1"
-MICHIGAN_SUPPORTED_RESOURCES = frozenset(
-    {
-        "Location",
-        "Organization",
-        "OrganizationAffiliation",
-        "Practitioner",
-        "PractitionerRole",
     }
 )
 WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
@@ -4016,20 +4012,26 @@ def _has_partition_configs_for_resources(
 
 
 def _resource_acquisition_blocked_reason(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     requested_resource_types: list[str] | tuple[str, ...] | None = None,
 ) -> str | None:
     """Return the catalog safety reason that forbids generic resource import."""
-    validation_status = (_clean_text(source.get("last_validated_status")) or "").lower()
+    coverage_issue = acquisition_coverage_blocked_reason(
+        _clean_text(source_record.get("source_id")),
+        _canonical_base(source_record.get("api_base")),
+    )
+    if coverage_issue is not None:
+        return coverage_issue
+    validation_status = (_clean_text(source_record.get("last_validated_status")) or "").lower()
     if validation_status == "shared_backend_unverified":
         return "shared_backend_unverified"
     has_partition_opt_in = _has_partition_configs_for_resources(
-        source,
+        source_record,
         requested_resource_types,
     )
-    if _source_coverage_mode(source) == "probe_only" and not has_partition_opt_in:
+    if _source_coverage_mode(source_record) == "probe_only" and not has_partition_opt_in:
         return "coverage_mode_probe_only"
-    fully_enumerable_resources = _source_metadata(source).get(
+    fully_enumerable_resources = _source_metadata(source_record).get(
         "provider_directory_fully_enumerable_resources"
     )
     if (
@@ -4037,7 +4039,7 @@ def _resource_acquisition_blocked_reason(
         and not fully_enumerable_resources
         and not has_partition_opt_in
         and not (
-            (contract := current_version_census_contract(source)) is not None
+            (contract := current_version_census_contract(source_record)) is not None
             and contract.is_server_issued_subset_v3
         )
     ):
@@ -5548,6 +5550,7 @@ def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
         "source_import_skipped_blocked_source_shared_backend_unverified": 0,
         "source_import_skipped_blocked_source_coverage_mode_probe_only": 0,
         "source_import_skipped_blocked_source_fully_enumerable_resources_empty": 0,
+        "source_import_skipped_blocked_source_upstream_search_window_incomplete": 0,
         "source_import_skipped_missing_api_base": 0,
         "source_import_skipped_probe_not_valid": 0,
         "source_import_skipped_open_only": 0,
@@ -6365,7 +6368,6 @@ def _michigan_provider_directory_override(
         MICHIGAN_PROVIDER_DIRECTORY_BASE,
     }:
         return None
-    supported_resources = sorted(MICHIGAN_SUPPORTED_RESOURCES)
     return {
         "api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
@@ -6374,34 +6376,7 @@ def _michigan_provider_directory_override(
         "auth_type": "none",
         "last_validated_status": "valid",
         "endpoints": _source_override_endpoint_fields(MICHIGAN_PROVIDER_DIRECTORY_BASE),
-        "metadata": {
-            "provider_directory_override": "michigan_mhbapp_public_provider_directory",
-            "provider_directory_override_reason": (
-                "InteropStation relays Michigan's directory, but the public MHB FHIR "
-                "upstream is the canonical endpoint for metadata and resource probes. "
-                "Candidate acquisition follows its advertised opaque cursor with durable "
-                "checkpoints; one complete acquisition is sufficient for review."
-            ),
-            "provider_directory_previous_api_base": _clean_text(
-                source_row.get("api_base")
-            ),
-            "provider_directory_confirmed_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
-            "provider_directory_confirmed_metadata_url": (
-                f"{MICHIGAN_PROVIDER_DIRECTORY_BASE}/metadata"
-            ),
-            "provider_directory_supported_resources": supported_resources,
-            "provider_directory_expected_nonempty_resources": supported_resources,
-            "provider_directory_resource_page_count_caps": {
-                "Location": 100,
-                "Organization": 100,
-                "OrganizationAffiliation": 100,
-                "Practitioner": 10,
-                "PractitionerRole": 25,
-            },
-            "provider_directory_fully_enumerable_resources": supported_resources,
-            "provider_directory_coverage_mode": "full",
-            "provider_directory_acquisition_enabled": True,
-        },
+        "metadata": michigan_provider_directory_metadata(_clean_text(source_row.get("api_base"))),
     }
 
 
@@ -18687,6 +18662,15 @@ def _provider_directory_artifact_dataset_from_row(
         value_by_name["endpoint_id"] or "",
     )
     source_record = _json_object(dataset_row_map.get("source_record_json"))
+    if selection_state["promote_on_cutover"] and (
+        coverage_issue := acquisition_coverage_blocked_reason(
+            value_by_name["source_id"],
+            _canonical_base(source_record.get("api_base")),
+        )
+    ):
+        raise RuntimeError(
+            f"provider_directory_artifact_coverage_blocked:{dataset_id}:{coverage_issue}"
+        )
     publication_metadata = _json_object(
         dataset_row_map.get("publication_metadata_json")
     )
