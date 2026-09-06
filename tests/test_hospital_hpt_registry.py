@@ -61,6 +61,12 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-006677": "UCSF Parnassus",
     "hospital-006918": "USMD Hospital at Arlington LLC",
 }
+_NORTHSHORE_ALIAS_GROUPS = (
+    ("hospital-002062", "hospital-002163", "Evanston Hospital"),
+    ("hospital-002063", "hospital-002375", "Glenbrook Hospital"),
+    ("hospital-002064", "hospital-002922", "Highland Park Hospital"),
+    ("hospital-002067", "hospital-005814", "Skokie Hospital"),
+)
 
 def _load(tmp_path: Path, text: str) -> tuple[dict[str, str], ...]:
     path = tmp_path / "registry.yaml"
@@ -83,9 +89,9 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_906
+    assert len(registry.hospital_hpt_registry_groups()) == 6_902
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_707
+    assert sum("locator_name" in entry for entry in hospitals) == 1_711
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 126
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -185,13 +191,75 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 459
+    assert len(aliases_by_id) == 463
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
     assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
+
+
+def test_northshore_aliases_preserve_four_facilities():
+    """Preserve old names and IDs without merging neighboring physical sites."""
+    hospitals = registry.load_hospital_hpt_registry()
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+    locator_url = "https://www.endeavorhealth.org/cms-hpt.txt"
+    canonical_ids = {"hospital-001877"} | {f"hospital-{number:06d}" for number in range(2060, 2069)}
+    alias_ids = {alias for _canonical, alias, _name in _NORTHSHORE_ALIAS_GROUPS}
+    assert len(hospitals) == len(hospital_by_id) == 7_365
+    assert {row["hospital_id"] for row in hospitals if row["cms_hpt_url"] == locator_url} == canonical_ids | alias_ids
+    for canonical, alias, name in _NORTHSHORE_ALIAS_GROUPS:
+        assert hospital_by_id[alias] == {
+            "hospital_id": alias, "name": name, "cms_hpt_url": locator_url,
+            "alias_of": canonical, "locator_name": "Endeavor Health " + name,
+        }
+        assert hospital_by_id[canonical] == {
+            "hospital_id": canonical, "name": "Endeavor Health " + name,
+            "cms_hpt_url": locator_url,
+        }
+        for hospital_id in (canonical, alias):
+            assert registry.hospital_hpt_group_ids(hospital_id) == (canonical, alias)
+            assert registry.selected_hospital_hpt_registry({"hospital_id": hospital_id}) == (
+                hospital_by_id[canonical], hospital_by_id[alias],
+            )
+    for hospital_id in canonical_ids - {group[0] for group in _NORTHSHORE_ALIAS_GROUPS}:
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+    assert hospital_by_id["hospital-001877"]["locator_mrf_url"] == (
+        "https://www.endeavorhealth.org/363297173_1427069632_edward-hospital_standardcharges.json"
+    )
+
+
+@pytest.mark.parametrize("record_case", ("bound", "missing", "ambiguous"))
+def test_northshore_aliases_require_exact_locator_records(record_case):
+    """Share content across sites, never their facility or locator identity."""
+    locator_url = "https://www.endeavorhealth.org/cms-hpt.txt"
+    hospitals = tuple(dict(row) for row in registry.load_hospital_hpt_registry() if row["cms_hpt_url"] == locator_url)
+    shared_ids = {"hospital-002062", "hospital-002063", "hospital-002067"}
+    records = tuple(HospitalHptLocatorRecord(
+        row["name"], "https://files.example/shared.json" if row["hospital_id"] in shared_ids
+        else f"https://files.example/{row['hospital_id']}.json",
+    ) for row in hospitals if "alias_of" not in row)
+    next(row for row in hospitals if row["hospital_id"] == "hospital-001877")["locator_mrf_url"] = records[0].mrf_url
+    affected_ids = {"hospital-002062", "hospital-002163"}
+    if record_case == "missing":
+        records = tuple(record for record in records if record.location_name != "Endeavor Health Evanston Hospital")
+    elif record_case == "ambiguous":
+        records += (HospitalHptLocatorRecord("Endeavor Health Evanston Hospital", "https://files.example/conflict.json"),)
+    match = match_hospital_hpt_locator(hospitals, locator_url, records)
+    binding_by_id = {binding.hospital_id: binding for binding in match.bindings}
+    if record_case == "bound":
+        assert len(binding_by_id) == 14 and len(match.content_targets) == 8
+        for canonical, alias, _name in _NORTHSHORE_ALIAS_GROUPS:
+            assert binding_by_id[canonical].record_index == binding_by_id[alias].record_index
+        assert len({binding_by_id[hospital_id].record_index for hospital_id in shared_ids}) == 3
+        assert {binding_by_id[hospital_id].mrf_url for hospital_id in shared_ids} == {"https://files.example/shared.json"}
+        assert not match.unmatched_hospital_ids and not match.ambiguous_hospital_ids
+        assert not match.unmatched_record_indexes and not match.ambiguous_record_indexes
+    else:
+        assert len(binding_by_id) == 12 and not affected_ids & binding_by_id.keys()
+        assert set(match.unmatched_hospital_ids) == (affected_ids if record_case == "missing" else set())
+        assert set(match.ambiguous_hospital_ids) == (affected_ids if record_case == "ambiguous" else set())
 
 
 def test_philadelphia_branding_aliases_preserve_distinct_good_shepherd_facilities():
