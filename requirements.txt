@@ -41,7 +41,6 @@ rapidgzip==0.16.0
 redis[hiredis]>=5.3.1,<6
 ruamel.ext.msgpack
 sanic>=25.12.1
-sanic_ext>=25.12.0
 shapely>=2.1.2
 socksio
 SQLAlchemy>=2.0.52
