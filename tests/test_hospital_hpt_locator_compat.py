@@ -197,3 +197,67 @@ def test_reserved_field_like_lines_never_become_headings(
 def test_inter_record_headings_require_one_complete_boundary(payload):
     with pytest.raises(locator.HospitalHptLocatorError, match="line"):
         locator.parse_hospital_hpt_locator(payload)
+
+
+@pytest.mark.parametrize("position", ("before", "after", "inline"))
+@pytest.mark.parametrize(
+    "contacts",
+    (
+        b"contact-name: Price Team\ncontact-name: Price Team\n",
+        b"contact-name: Price Team\ncontact-name: billing@example.com\n",
+        b"contact-name: Price Team\n CONTACT-NAME : Another Team\n",
+    ),
+)
+def test_repeated_contact_names_preserve_the_binding(position, contacts):
+    mrf = b"mrf-url: https://files.example/mrf.csv\n"
+    if position == "before":
+        fields = contacts + mrf
+    elif position == "after":
+        fields = mrf + contacts
+    else:
+        fields = mrf.rstrip(b"\n") + b" contact-name: Inline Team\n" + contacts
+
+    assert locator.parse_hospital_hpt_locator(b"location-name: Hospital\n" + fields) == (
+        _record("Hospital", "https://files.example/mrf.csv"),
+    )
+
+
+def test_repeated_contact_names_preserve_record_order():
+    payload = (
+        b"location-name: Hospital One\nmrf-url: https://files.example/one.csv\n"
+        b"contact-name: First Team\ncontact-name: Other Team\n\n"
+        b"location-name: Hospital Two\ncontact-name: First Team\n"
+        b"contact-name: Other Team\nmrf-url: https://files.example/two.csv"
+    )
+    assert locator.parse_hospital_hpt_locator(payload) == (
+        _record("Hospital One", "https://files.example/one.csv"),
+        _record("Hospital Two", "https://files.example/two.csv"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    (
+        (b"mrf-url: https://files.example/mrf.csv\nMRF-URL: https://files.example/mrf.csv\n", "duplicate_field"),
+        (b"mrf-url: https://files.example/mrf.csv\nmrf_url: https://files.example/other.csv\n", "duplicate_field"),
+        (b"source-page-url: https://hospital.example/prices\nsource-page_url: https://hospital.example/other\n", "duplicate_field"),
+        (b"contact-email: one@example.com\ncontact-email: two@example.com\n", "duplicate_field"),
+        (b"unknown-field: one\nunknown-field: two\n", "duplicate_field"),
+        (b"mrf-url: https://user:password@files.example/mrf.csv\n", "mrf_url"),
+        (b"mrf-url: https://files.example/mrf.csv#fragment\n", "mrf_url"),
+        (b"contact-name: Invalid\x00Team\n", "control_character"),
+        (b"", "mrf_url"),
+    ),
+)
+def test_repeated_contacts_do_not_relax_other_validation(fields, reason):
+    payload = b"location-name: Hospital\ncontact-name: One\ncontact-name: Two\n" + fields
+    with pytest.raises(locator.HospitalHptLocatorError, match=reason):
+        locator.parse_hospital_hpt_locator(payload)
+
+
+def test_contact_names_still_require_a_location_first():
+    with pytest.raises(locator.HospitalHptLocatorError, match="location_name"):
+        locator.parse_hospital_hpt_locator(
+            b"contact-name: One\ncontact-name: Two\n"
+            b"location-name: Hospital\nmrf-url: https://files.example/mrf.csv\n"
+        )
