@@ -156,6 +156,23 @@ async def _await_cleanup_task(
     return result
 
 
+async def _await_price_tasks(
+    first_task: asyncio.Task[Any], second_task: asyncio.Task[Any]
+) -> tuple[Any, Any]:
+    """Join both price lanes before their caller can clean shared tables."""
+
+    tasks = (first_task, second_task)
+    try:
+        for completed_task in asyncio.as_completed(tasks):
+            await completed_task
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await _await_cleanup_task(asyncio.gather(*tasks, return_exceptions=True))
+        raise
+    return first_task.result(), second_task.result()
+
+
 def _qualified(schema_name: str, table_name: str) -> str:
     return f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
 
@@ -1223,22 +1240,9 @@ async def prepare_shared_price_artifacts(
 
         price_map_task = asyncio.create_task(prepare_price_key_stage())
         atom_stages_task = asyncio.create_task(prepare_atom_stages())
-        try:
-            price_map_stats, atom_stage_result = await asyncio.gather(
-                price_map_task,
-                atom_stages_task,
-            )
-        except BaseException:
-            for task in (price_map_task, atom_stages_task):
-                task.cancel()
-            await _await_cleanup_task(
-                asyncio.gather(
-                    price_map_task,
-                    atom_stages_task,
-                    return_exceptions=True,
-                )
-            )
-            raise
+        price_map_stats, atom_stage_result = await _await_price_tasks(
+            price_map_task, atom_stages_task
+        )
         lean_manifest, atom_map_stats, atom_map_started_at = atom_stage_result
         parallel_finished_at = time.monotonic()
         stage_metrics_map["dense_key_build_seconds"] = (
@@ -1336,22 +1340,22 @@ async def _stage_shared_price_blocks(
         qualified_atom_key_map=_qualified(schema_name, prepared.atom_key_map),
         constant_key_by_column=constant_key_by_column,
     )
-    membership_summary, atom_summary = await asyncio.gather(
-        _stream_shared_price_copy(
-            kind=_PRICE_MEMBERSHIP_ARTIFACT_KIND,
-            sql=membership_sql,
-            schema_name=schema_name,
-            target_table=block_stage,
-            atom_key_bits=prepared.atom_key_bits,
-        ),
-        _stream_shared_price_copy(
-            kind=_PRICE_ATOM_ARTIFACT_KIND,
-            sql=atom_sql,
-            schema_name=schema_name,
-            target_table=block_stage,
-            atom_key_bits=prepared.atom_key_bits,
-        ),
-    )
+    stream_tasks = [
+        asyncio.create_task(
+            _stream_shared_price_copy(
+                kind=kind,
+                sql=sql,
+                schema_name=schema_name,
+                target_table=block_stage,
+                atom_key_bits=prepared.atom_key_bits,
+            )
+        )
+        for kind, sql in (
+            (_PRICE_MEMBERSHIP_ARTIFACT_KIND, membership_sql),
+            (_PRICE_ATOM_ARTIFACT_KIND, atom_sql),
+        )
+    ]
+    membership_summary, atom_summary = await _await_price_tasks(*stream_tasks)
     _v3_membership_stats_from_summary(
         membership_summary,
         price_set_count=prepared.price_set_count,
