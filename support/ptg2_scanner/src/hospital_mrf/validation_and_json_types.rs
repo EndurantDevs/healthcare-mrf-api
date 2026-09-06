@@ -24,6 +24,25 @@ fn validate_service(mut service: ServiceRow, normalize_case: bool) -> io::Result
 }
 
 fn validate_charge(
+    charge: ChargeRow,
+    payers: &[PayerChargeRow],
+    normalize_case: bool,
+) -> io::Result<ChargeRow> {
+    let charge = validate_charge_fields(charge, payers, normalize_case)?;
+    validate_charge_presence(&charge, payers)?;
+    Ok(charge)
+}
+
+fn validate_charge_presence(charge: &ChargeRow, payers: &[PayerChargeRow]) -> io::Result<()> {
+    if charge.gross_charge.is_none() && charge.discounted_cash.is_none() && payers.is_empty() {
+        return Err(invalid(
+            "standard charge requires gross, discounted cash, or payer information",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_charge_fields(
     mut charge: ChargeRow,
     payers: &[PayerChargeRow],
     normalize_case: bool,
@@ -43,11 +62,6 @@ fn validate_charge(
         .additional_generic_notes
         .as_deref()
         .and_then(optional_text);
-    if charge.gross_charge.is_none() && charge.discounted_cash.is_none() && payers.is_empty() {
-        return Err(invalid(
-            "standard charge requires gross, discounted cash, or payer information",
-        ));
-    }
     if payers
         .iter()
         .any(|payer| payer.standard_charge_dollar.is_some())

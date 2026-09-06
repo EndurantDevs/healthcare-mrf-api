@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from process import hospital_hpt_registry as registry
+from process.hospital_hpt_locator import HospitalHptLocatorRecord, match_hospital_hpt_locator
 from tests.hospital_hpt_registry_fallbacks import (
     FALLBACK_URL_SHA256_BY_HOSPITAL_ID as _FALLBACK_URL_SHA256_BY_HOSPITAL_ID,
 )
@@ -19,17 +20,22 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-000047": "Adair County Memorial Hospital",
     "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
     "hospital-000188": "Amberwell Atchison Association",
+    "hospital-000207": "UTMB Health Angleton Danbury Hospital",
     "hospital-000342": "Ashland Health Center",
     "hospital-000600": "Baptist Health Hardin",
     "hospital-000833": "Beckett Springs",
-    **dict(pair.split(":", 1) for pair in "hospital-000685:39-3714515 BMH Oktibbeha County|hospital-000825:New Orleans Hospital|hospital-000826:New Orleans Westbank Hospital|hospital-002405:Good Shepherd Rehabilitation Hospital".split("|")),
+    **dict(pair.split(":", 1) for pair in "hospital-000685:39-3714515 BMH Oktibbeha County|hospital-000825:New Orleans Hospital|hospital-000826:New Orleans Westbank Hospital".split("|")),
     "hospital-001199": "Cottonwood Springs",
+    "hospital-001415": "UTMB Health Clear Lake Hospital",
+    "hospital-001458": "North Central Kansas Medical Center",
     **dict(pair.split(":", 1) for pair in "hospital-001587:Corewell Health Big Rapids|hospital-001590:Corewell Health Gerber|hospital-001592:Corewell Health Greenville|hospital-001594:Corewell Health Gross Pointe|hospital-001596:Corewell Health Lakeland Niles|hospital-001597:Corewell Health Lakeland St. Joseph|hospital-001602:Corewell Health Ludington|hospital-001604:Corewell Health Reed City|hospital-001607:Corewell Health Taylor|hospital-001609:Corewell Health Trenton|hospital-001611:Corewell Health Troy|hospital-001612:Corewell Health Lakeland Watervliet|hospital-001614:Corewell Health Wayne|hospital-001616:Corewell Health Zeeland".split("|")),
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002260": "Franciscan Health Orthopedic-Carmel",
+    "hospital-002332": "Garfield County Hospital District",
     "hospital-002421": "Grady Health System",
     "hospital-002914": "Highland-Clarksburg Hospital, Inc.",
+    "hospital-003007": "Memorial Health System Abilene",
     "hospital-003238": "Southern Humboldt Community Hospital",
     "hospital-003145": "Intermountain Health Good Samaritan Medical Center",
     "hospital-003148": "Holy Rosary Healthcare",
@@ -39,8 +45,13 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-003169": "St. Mary's Medical Center",
     "hospital-003170": "St. Vincent Healthcare",
     "hospital-003240": "Jersey Community Hospital",
+    "hospital-003517": "UTMB Health League City Hospital",
+    "hospital-003587": "Lindsborg Community Hospital",
+    "hospital-003588": "Lindsborg Community Hospital",
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
+    "hospital-005086": "Philadelphia Post-Acute Partners LLC",
+    "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
@@ -72,11 +83,11 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_901
+    assert len(registry.hospital_hpt_registry_groups()) == 6_899
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_695
+    assert sum("locator_name" in entry for entry in hospitals) == 1_706
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 106
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 119
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -90,23 +101,6 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in _REVIEWED_LOCATOR_NAMES
     } == _REVIEWED_LOCATOR_NAMES
-    assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
-        "hospital-000047", "hospital-000188", "hospital-000600",
-        "hospital-005162", "hospital-005163", "hospital-006475",
-        "hospital-006476", "hospital-006477", "hospital-007140",
-        "hospital-007141",
-    )] == [
-        "https://www.achsiowa.org/cms-hpt.txt",
-        "https://amberwellhealth.org/cms-hpt.txt",
-        "https://www.baptisthealth.com/cms-hpt.txt",
-        "https://www.pioneermemorial.org/cms-hpt.txt",
-        "https://www.pioneermemorial.org/cms-hpt.txt",
-        "https://scottishriteforchildren.org/cms-hpt.txt",
-        "https://scottishriteforchildren.org/cms-hpt.txt",
-        "https://scottishriteforchildren.org/cms-hpt.txt",
-        "https://whiteriverhealth.org/cms-hpt.txt",
-        "https://whiteriverhealth.org/cms-hpt.txt",
-    ]
     assert hospital_by_id["hospital-007141"]["name"] == "Stone County Medical Center"
     assert {
         hospital_id: hashlib.sha256(
@@ -124,6 +118,64 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     )
 
 
+def test_checked_in_registry_has_reviewed_cms_hpt_urls():
+    """Keep source-proven locator changes separate from catalog shape checks."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
+    assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
+        "hospital-000047", "hospital-000188", "hospital-000600", "hospital-002332",
+        "hospital-005162", "hospital-005163", "hospital-006475",
+        "hospital-006476", "hospital-006477", "hospital-007140",
+        "hospital-007141",
+        "hospital-001458", "hospital-003007", "hospital-003587", "hospital-003588",
+        "hospital-003117", "hospital-003118", "hospital-003119",
+    )] == [
+        "https://www.achsiowa.org/cms-hpt.txt",
+        "https://amberwellhealth.org/cms-hpt.txt",
+        "https://www.baptisthealth.com/cms-hpt.txt",
+        "https://www.garfieldcountyhospital.com/cms-hpt.txt",
+        "https://www.pioneermemorial.org/cms-hpt.txt",
+        "https://www.pioneermemorial.org/cms-hpt.txt",
+        "https://scottishriteforchildren.org/cms-hpt.txt",
+        "https://scottishriteforchildren.org/cms-hpt.txt",
+        "https://scottishriteforchildren.org/cms-hpt.txt",
+        "https://whiteriverhealth.org/cms-hpt.txt",
+        "https://whiteriverhealth.org/cms-hpt.txt",
+        "https://nckmed.com/cms-hpt.txt",
+        "https://mhsks.org/cms-hpt.txt",
+        "https://lindsborghospital.org/cms-hpt.txt",
+        "https://lindsborghospital.org/cms-hpt.txt",
+        "https://estimator.myinsightcare.com/cms-hpt.txt",
+        "https://insightcoldwater.org/cms-hpt.txt",
+        "https://insightsurgicalhospital.com/cms-hpt.txt",
+    ]
+
+
+def test_slidell_name_binding_preserves_distinct_campus_sources():
+    """Bind the reviewed Main name without sharing East's source or identity."""
+    hospitals = registry.selected_hospital_hpt_registry({"hospital_ids": [
+        "hospital-005821", "hospital-005822", "hospital-005823",
+    ]})
+    records = (
+        HospitalHptLocatorRecord(
+            "Slidell Memorial Hospital - Main Campus", "https://hospital.example/main.csv"
+        ),
+        HospitalHptLocatorRecord(
+            "Slidell Memorial Hospital- East Campus", "https://hospital.example/east.csv"
+        ),
+    )
+    match = match_hospital_hpt_locator(hospitals, hospitals[0]["cms_hpt_url"], records)
+    assert [(item.hospital_id, item.record_index) for item in match.bindings] == [
+        ("hospital-005821", 0), ("hospital-005822", 0), ("hospital-005823", 1),
+    ]
+    assert match.content_targets == tuple(record.mrf_url for record in records)
+    assert not match.unmatched_hospital_ids and not match.ambiguous_hospital_ids
+    assert all(registry.hospital_hpt_group_ids(item["hospital_id"]) == (
+        item["hospital_id"],
+    ) for item in hospitals)
+
+
 def test_checked_in_registry_has_reviewed_canonical_aliases():
     """Keep reviewed alias identities explicit while preserving every raw ID."""
     hospitals = registry.load_hospital_hpt_registry()
@@ -133,13 +185,26 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 455
+    assert len(aliases_by_id) == 457
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
     assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
+
+
+def test_philadelphia_branding_aliases_preserve_distinct_good_shepherd_facilities():
+    """Bind one Philadelphia specialty hospital without merging distinct campuses."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
+    group = ("hospital-005086", "hospital-002405", "hospital-005085")
+    for hospital_id in group:
+        assert registry.hospital_hpt_group_ids(hospital_id) == group
+        assert hospital_by_id[hospital_id]["locator_name"] == "Philadelphia Post-Acute Partners LLC"
+    for hospital_id in ("hospital-002406", "hospital-002407"):
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
 def test_primary_childrens_campuses_use_distinct_locator_records():
@@ -161,6 +226,25 @@ def test_primary_childrens_campuses_use_distinct_locator_records():
         "61": "942854057_primary-childrens-hospital_taylorsville_standardcharges.ashx",
         "72": "942854057_primary-childrens-hospital_standardcharges.ashx",
     }
+
+
+def test_shared_sources_preserve_lindsborg_identities_and_freeman_campuses():
+    """Share reviewed content without merging identities or unrelated campuses."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
+    for suffix in ("003587", "003588", "001853", "001854", "002305", "002306",
+                   "002311", "002312", "002313"):
+        hospital_id = f"hospital-{suffix}"
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+    assert [hospital_by_id[f"hospital-{suffix}"]["name"] for suffix in ("003587", "003588")] == [
+        "Lindsborg Community Hospital", "LINDSBORG COMMUNITY HOSPITAL ASSOCIATION",
+    ]
+    assert hospital_by_id["hospital-002306"]["fallback_mrf_url"] != (
+        hospital_by_id["hospital-002311"]["fallback_mrf_url"]
+    )
+    for suffix in ("002307", "002308", "002309", "002310"):
+        assert "fallback_mrf_url" not in hospital_by_id[f"hospital-{suffix}"]
 
 
 def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():

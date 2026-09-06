@@ -14,6 +14,7 @@ fn validate_csv_payer(
     generic_notes: Option<&str>,
     normalize_case: bool,
     profile: CmsProfile,
+    requires_estimated_amount: bool,
 ) -> io::Result<PayerChargeRow> {
     let methodology_optional = profile == CmsProfile::V2
         && payer.estimated_amount.is_some()
@@ -27,13 +28,13 @@ fn validate_csv_payer(
         methodology_optional,
     )?;
     match profile {
-        CmsProfile::V2 => validate_v2_payer(&payer)?,
+        CmsProfile::V2 => validate_v2_payer(&payer, requires_estimated_amount)?,
         CmsProfile::V3 => validate_v3_payer(&payer, generic_notes, normalize_case)?,
     }
     Ok(payer)
 }
 
-fn validate_v2_payer(payer: &PayerChargeRow) -> io::Result<()> {
+fn validate_v2_payer(payer: &PayerChargeRow, requires_estimated_amount: bool) -> io::Result<()> {
     if payer.median_amount.is_some()
         || payer.percentile_10.is_some()
         || payer.percentile_90.is_some()
@@ -44,6 +45,7 @@ fn validate_v2_payer(payer: &PayerChargeRow) -> io::Result<()> {
         ));
     }
     if (payer.standard_charge_percentage.is_some() || payer.standard_charge_algorithm.is_some())
+        && requires_estimated_amount
         && payer.standard_charge_dollar.is_none()
         && payer.estimated_amount.is_none()
     {
@@ -122,7 +124,8 @@ fn is_explicitly_uncontracted_csv_payer(payer: &PayerChargeRow) -> bool {
         && payer.percentile_10.is_none()
         && payer.percentile_90.is_none()
         && payer.allowed_count.is_none()
-        && payer.methodology.trim().is_empty()
+        && (payer.methodology.trim().is_empty()
+            || payer.methodology.trim().eq_ignore_ascii_case("per diem"))
         && payer.additional_payer_notes.as_deref().is_some_and(|notes| {
             notes.trim() == "NOT CONTRACTED, ALL SERVICES ARE BUNDLED INTO A PER DIEM RATE"
         })

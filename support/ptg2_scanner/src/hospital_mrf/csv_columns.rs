@@ -110,6 +110,7 @@ fn parse_common_columns(
 fn parse_tall_columns(
     headers: &StringRecord,
     profile: CmsProfile,
+    requires_estimated_amount: bool,
     max_fanout_rows: usize,
 ) -> io::Result<TallCsvColumns> {
     let estimated_amount = find_optional_header(headers, &["estimated_amount"])?;
@@ -127,10 +128,11 @@ fn parse_tall_columns(
                 {
                     return Err(invalid("CMS CSV data headers mix V2 and V3 payer profiles"));
                 }
+                if requires_estimated_amount && estimated_amount.is_none() {
+                    return Err(invalid("missing CSV header estimated_amount"));
+                }
                 (
-                    Some(
-                        estimated_amount.ok_or(invalid("missing CSV header estimated_amount"))?,
-                    ),
+                    estimated_amount,
                     None,
                     None,
                     None,
@@ -158,6 +160,7 @@ fn parse_tall_columns(
         };
     Ok(TallCsvColumns {
         profile,
+        requires_estimated_amount,
         common: parse_common_columns(headers, max_fanout_rows)?,
         payer_name: find_header(headers, &["payer_name"])?,
         plan_name: find_header(headers, &["plan_name"])?,
@@ -220,6 +223,7 @@ fn canonical_wide_rate_term(value: &str) -> io::Result<String> {
 fn parse_wide_columns(
     headers: &StringRecord,
     profile: CmsProfile,
+    requires_estimated_amount: bool,
     max_fanout_rows: usize,
 ) -> io::Result<WideCsvColumns> {
     let mut payer_order = Vec::<(String, String, Option<String>)>::new();
@@ -398,6 +402,7 @@ fn parse_wide_columns(
                     "negotiated_algorithm",
                 )?,
                 estimated_amount: match profile {
+                    CmsProfile::V2 if !requires_estimated_amount => builder.estimated_amount,
                     CmsProfile::V2 => Some(required_wide_column(
                         builder.estimated_amount,
                         &payer_label,
@@ -452,6 +457,7 @@ fn parse_wide_columns(
         .collect::<io::Result<Vec<_>>>()?;
     Ok(WideCsvColumns {
         profile,
+        requires_estimated_amount,
         common: parse_common_columns(headers, max_fanout_rows)?,
         payers,
     })
