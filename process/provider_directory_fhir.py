@@ -4019,6 +4019,7 @@ def _resource_acquisition_blocked_reason(
     coverage_issue = acquisition_coverage_blocked_reason(
         _clean_text(source_record.get("source_id")),
         _canonical_base(source_record.get("api_base")),
+        _canonical_base(source_record.get("canonical_api_base")),
     )
     if coverage_issue is not None:
         return coverage_issue
@@ -18666,6 +18667,7 @@ def _provider_directory_artifact_dataset_from_row(
         coverage_issue := acquisition_coverage_blocked_reason(
             value_by_name["source_id"],
             _canonical_base(source_record.get("api_base")),
+            _canonical_base(source_record.get("canonical_api_base")),
         )
     ):
         raise RuntimeError(

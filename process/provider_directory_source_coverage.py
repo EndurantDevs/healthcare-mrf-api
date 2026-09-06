@@ -21,12 +21,13 @@ MICHIGAN_COVERAGE_WARNING = (
 def acquisition_coverage_blocked_reason(
     source_id: str | None,
     api_base: str | None = None,
+    canonical_api_base: str | None = None,
 ) -> str | None:
     """Do not trust stale full-coverage metadata for a reviewed truncated source."""
-    if source_id == MICHIGAN_SOURCE_ID or api_base in {
+    if source_id == MICHIGAN_SOURCE_ID or {api_base, canonical_api_base}.intersection({
         INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         MICHIGAN_PROVIDER_DIRECTORY_BASE,
-    }:
+    }):
         return "upstream_search_window_incomplete"
     return None
 
