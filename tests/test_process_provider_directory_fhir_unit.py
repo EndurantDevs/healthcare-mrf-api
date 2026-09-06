@@ -17554,13 +17554,6 @@ def test_michigan_direct_probe_caps_role_without_synthesizing_offset():
     )
 
 
-def test_michigan_offset_substitute_is_not_equivalent_to_canonical_cursor_page():
-    canonical_second_page_ids = {"75147991", "75147992", "75204637"}
-    synthetic_offset_page_ids = {"75040123", "75317648", "75419649"}
-
-    assert canonical_second_page_ids.isdisjoint(synthetic_offset_page_ids)
-
-
 def test_resource_start_url_caps_uhc_insurance_plan_page_count():
     url = importer._resource_start_url(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
