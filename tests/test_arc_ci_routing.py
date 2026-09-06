@@ -123,7 +123,7 @@ def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
             }
         }
     }
-    assert document["jobs"].keys() == ARC_ROUTED_JOBS
+    assert document["jobs"].keys() == ARC_ROUTED_JOBS | {"readability-preflight"}
     for name in KUBERNETES_JOBS:
         job = document["jobs"][name]
         assert job["runs-on"] == KUBERNETES_RUNNER_EXPRESSION

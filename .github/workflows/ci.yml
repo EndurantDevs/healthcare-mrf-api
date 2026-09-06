@@ -67,6 +67,22 @@ jobs:
           fetch-depth: 0
       - name: Run shared pre-push gate
         run: scripts/ci/prepush hygiene
+  readability-preflight:
+    name: readability preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Check readability before starting heavy jobs
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+        run: python scripts/readability_budget.py --base "$BASE_SHA"
   python-quality:
     name: python quality
     runs-on: >-
@@ -101,6 +117,7 @@ jobs:
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
         run: scripts/ci/prepush quality
   python-tests:
+    needs: readability-preflight
     name: python test suite (${{ matrix.shard-index }}/4)
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -149,6 +166,7 @@ jobs:
           retention-days: 1
 
   capacity-evidence:
+    needs: readability-preflight
     name: ptg2 capacity evidence
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -194,11 +212,14 @@ jobs:
 
   test-coverage:
     name: test coverage ratchet
+    # Skipped required jobs satisfy protection; fail this check on any failed prerequisite.
+    if: always()
     permissions:
       actions: read
       contents: read
       packages: read
     needs:
+      - readability-preflight
       - public-hygiene
       - python-quality
       - python-tests
@@ -232,6 +253,10 @@ jobs:
         shell: bash
     timeout-minutes: 10
     steps:
+      - name: Require every CI prerequisite to succeed
+        env:
+          NEEDS_RESULTS: ${{ toJSON(needs.*.result) }}
+        run: jq --exit-status 'length > 0 and all(. == "success")' <<< "$NEEDS_RESULTS"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -340,6 +365,7 @@ jobs:
           retention-days: 1
 
   api-contract:
+    needs: readability-preflight
     name: openapi contract
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -370,6 +396,7 @@ jobs:
       - name: Run shared pre-push gate
         run: scripts/ci/prepush api-contract
   rust-scanner:
+    needs: readability-preflight
     name: rust scanner
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -410,6 +437,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
   container-package:
+    needs: readability-preflight
     name: linux container package
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -434,6 +462,7 @@ jobs:
       - name: Run shared pre-push gate
         run: scripts/ci/prepush container-package
   security:
+    needs: readability-preflight
     name: dependency and semgrep security
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -463,6 +492,7 @@ jobs:
       - name: Run shared pre-push gate
         run: scripts/ci/prepush security
   worker-queue-smoke:
+    needs: readability-preflight
     name: redis worker queue smoke
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -505,6 +535,7 @@ jobs:
           HLTHPRT_REDIS_ADDRESS: ${{ runner.environment == 'self-hosted' && 'redis://127.0.0.1:6379' || 'redis://redis:6379' }}
         run: scripts/ci/prepush redis
   address-canonical-db-tests:
+    needs: readability-preflight
     name: postgres18 postgis tests (${{ matrix.shard }})
     runs-on: >-
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&

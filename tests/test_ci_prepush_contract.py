@@ -45,7 +45,7 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
     for job, command in expected_command_by_job.items():
         job_body = _job(workflow, job)
         assert command in job_body
-        expected_run_steps = 2 if job == "test-coverage" else 1
+        expected_run_steps = 3 if job == "test-coverage" else 1
         assert len(re.findall(r"^        run:", job_body, re.M)) == expected_run_steps
 
 

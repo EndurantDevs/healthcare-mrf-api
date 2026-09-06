@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import re
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
 
+import pytest
 import yaml
 
 
@@ -60,19 +64,62 @@ def test_checkout_never_persists_the_workflow_token() -> None:
         assert workflow.count("persist-credentials: false") >= checkout_count
 
 
-def test_ci_producers_run_independently() -> None:
+def test_heavy_jobs_require_readability_success() -> None:
     jobs = yaml.safe_load(_workflow("ci.yml"))["jobs"]
-    quality = jobs["python-quality"]
-    assert "needs" not in quality
-    assert "if" not in quality
-    assert not quality.get("continue-on-error", False)
-    for step in quality["steps"]:
-        assert not step.get("continue-on-error", False)
+    for name in ("readability-preflight", "python-quality", "public-hygiene"):
+        job = jobs[name]
+        assert "needs" not in job
+        assert "if" not in job
+        assert not job.get("continue-on-error", False)
+        for step in job["steps"]:
+            assert "if" not in step
+            assert not step.get("continue-on-error", False)
 
     for name, job in jobs.items():
-        if name == "test-coverage":
+        if name in {"readability-preflight", "python-quality", "public-hygiene", "test-coverage"}:
             continue
-        assert "needs" not in job, name
+        assert job["needs"] == "readability-preflight", name
+        assert "if" not in job, f"{name} must not bypass failed dependencies"
+
+
+def test_readability_preflight_matches_required_quality() -> None:
+    jobs = yaml.safe_load(_workflow("ci.yml"))["jobs"]
+    preflight = jobs["readability-preflight"]
+    assert preflight["runs-on"] == "ubuntu-latest"
+    assert "container" not in preflight
+    assert preflight["timeout-minutes"] == 5
+    checkout, setup, check = preflight["steps"]
+    assert checkout["uses"].startswith("actions/checkout@")
+    assert checkout["with"] == {"persist-credentials": False, "fetch-depth": 0}
+    assert setup["uses"].startswith("actions/setup-python@")
+    assert setup["with"] == {"python-version": "${{ env.PYTHON_VERSION }}"}
+    assert check["env"] == jobs["python-quality"]["steps"][-1]["env"]
+    assert check["run"] == 'python scripts/readability_budget.py --base "$BASE_SHA"'
+    script = (REPOSITORY_ROOT / "scripts/ci/prepush").read_text(encoding="utf-8")
+    quality = script.split("run_quality() {", 1)[1].split("\n}", 1)[0]
+    assert check["run"] in quality
+
+
+@pytest.mark.parametrize("result", ("success", "failure", "cancelled", "skipped"))
+def test_coverage_guard_requires_success(result: str) -> None:
+    jobs = yaml.safe_load(_workflow("ci.yml"))["jobs"]
+    coverage = jobs["test-coverage"]
+    assert coverage["if"] == "always()"
+    assert set(coverage["needs"]) == set(jobs) - {"test-coverage"}
+    guard = coverage["steps"][0]
+    assert guard["name"] == "Require every CI prerequisite to succeed"
+    assert guard["env"] == {"NEEDS_RESULTS": "${{ toJSON(needs.*.result) }}"}
+    assert "if" not in guard
+    assert not guard.get("continue-on-error", False)
+    for index in range(len(coverage["needs"])):
+        results = ["success"] * len(coverage["needs"])
+        results[index] = result
+        completed = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", guard["run"]],
+            env={**os.environ, "NEEDS_RESULTS": json.dumps(results)},
+            capture_output=True, text=True, timeout=5,
+        )
+        assert (completed.returncode == 0) == (result == "success")
 
 
 def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
