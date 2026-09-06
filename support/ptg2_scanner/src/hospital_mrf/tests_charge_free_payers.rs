@@ -84,6 +84,169 @@ fn v3_wide_empty_payer_columns_are_ignored() {
         .is_empty());
 }
 
+fn service_only_tall_records() -> Vec<Vec<String>> {
+    let mut records = csv_fixture_records(&fixture_tall_csv());
+    for (header, value) in [
+        ("payer_name", "All Payers / All Plans"),
+        ("plan_name", ""),
+        ("standard_charge | negotiated_dollar", ""),
+        ("standard_charge | methodology", ""),
+        ("additional_generic_notes", "Published service charge note"),
+    ] {
+        let index = csv_fixture_index(&records[2], header);
+        records[3][index] = value.to_owned();
+    }
+    records
+}
+
+#[test]
+fn v3_tall_service_only_preserves_charges() {
+    for version in ["2.0.0", "3.0.0"] {
+        let mut records = service_only_tall_records();
+        historical_csv_metadata(&mut records, "version", version);
+        let payer = csv_fixture_index(&records[2], "payer_name");
+        records[3][payer].clear();
+        let control = csv_fixture_bytes(&records);
+        let baseline = run_fixture(InputFormat::TallCsv, &control, false);
+        let (_control_directory, packed_control) =
+            import_packed(InputFormat::TallCsv, &control, TEST_MAX_OUTPUT_BYTES);
+        for label in ["All Payers / All Plans", "  All Payers / All Plans  "] {
+            records[3][payer] = label.to_owned();
+            let payload = csv_fixture_bytes(&records);
+            let (rows, summary) = run_fixture_with_summary(InputFormat::TallCsv, &payload, false);
+            assert_eq!(summary.schema_version, version);
+            assert_eq!(rows, baseline);
+            assert!(rows["payer_charge"].is_empty());
+            assert!(String::from_utf8(rows["charge"].clone())
+                .unwrap()
+                .contains("Published service charge note"));
+            let (_directory, packed) =
+                import_packed(InputFormat::TallCsv, &payload, TEST_MAX_OUTPUT_BYTES);
+            let root = packed.root.as_ref().unwrap();
+            assert_eq!(
+                (root.service_count, root.charge_count, root.fact_count),
+                (1, 1, 0)
+            );
+            assert_eq!(packed.schema_version, version);
+            assert_eq!(
+                packed
+                    .artifacts
+                    .iter()
+                    .map(|a| (a.kind, &a.sha256))
+                    .collect::<Vec<_>>(),
+                packed_control
+                    .artifacts
+                    .iter()
+                    .map(|a| (a.kind, &a.sha256))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn v3_tall_service_only_rejects_values() {
+    let records = service_only_tall_records();
+    for field in [
+        "standard_charge | negotiated_dollar",
+        "standard_charge | negotiated_percentage",
+        "standard_charge | negotiated_algorithm",
+        "median_amount",
+        "10th_percentile",
+        "90th_percentile",
+        "count",
+        "standard_charge | methodology",
+    ] {
+        for value in ["0", "1"] {
+            let mut invalid = records.clone();
+            let index = csv_fixture_index(&invalid[2], field);
+            invalid[3][index] = value.to_owned();
+            let error = if value == "0"
+                && !matches!(
+                    field,
+                    "standard_charge | negotiated_algorithm"
+                        | "standard_charge | methodology"
+                        | "count"
+                ) {
+                "must be greater than zero"
+            } else if field == "count" && value == "1" {
+                "count values from 1 through 10 must use the literal 1 through 10"
+            } else {
+                "plan_name must be a non-empty string"
+            };
+            assert_historical_csv_error(InputFormat::TallCsv, &invalid, error);
+        }
+    }
+    for value in ["", "0", "1"] {
+        let mut invalid = records.clone();
+        for record in &mut invalid {
+            record.push(String::new());
+        }
+        *invalid[2].last_mut().unwrap() = "estimated_amount".to_owned();
+        *invalid[3].last_mut().unwrap() = value.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "headers mix V2 and V3 payer profiles",
+        );
+    }
+}
+
+#[test]
+fn v3_tall_service_only_requires_exact_identity() {
+    let records = service_only_tall_records();
+    for label in ["All Payers", "all payers / all plans", "Payer, Inc."] {
+        let mut invalid = records.clone();
+        let index = csv_fixture_index(&invalid[2], "payer_name");
+        invalid[3][index] = label.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "plan_name must be a non-empty string",
+        );
+    }
+    let mut invalid = records.clone();
+    let plan = csv_fixture_index(&invalid[2], "plan_name");
+    invalid[3][plan] = "All Plans".to_owned();
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "invalid standard charge methodology",
+    );
+    let mut invalid = records;
+    for field in [
+        "standard_charge | gross",
+        "standard_charge | discounted_cash",
+    ] {
+        let index = csv_fixture_index(&invalid[2], field);
+        invalid[3][index].clear();
+    }
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "standard charge requires gross, discounted cash, or payer information",
+    );
+}
+
+#[test]
+fn service_only_label_does_not_relax_json() {
+    let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+    let payer = payload["standard_charge_information"][0]["standard_charges"][0]
+        ["payers_information"][0]
+        .as_object_mut()
+        .unwrap();
+    payer.insert("payer_name".to_owned(), json!("All Payers / All Plans"));
+    payer.insert("plan_name".to_owned(), json!(""));
+    payer.insert("methodology".to_owned(), json!(""));
+    payer.remove("standard_charge_dollar");
+    assert_import_error(
+        InputFormat::Json,
+        &serde_json::to_vec(&payload).unwrap(),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "plan_name must be a non-empty string",
+    );
+}
+
 #[test]
 fn v3_tall_explicitly_uncontracted_payer_label_is_ignored() {
     let mut records = csv_fixture_records(&fixture_tall_csv());

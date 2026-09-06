@@ -221,6 +221,17 @@ fn parse_tall_payer(
         columns.percentile_90,
         columns.allowed_count,
     ];
+    if columns.profile == CmsProfile::V3
+        && csv_value(record, columns.payer_name) == "All Payers / All Plans"
+        && csv_value(record, columns.plan_name).is_empty()
+        && csv_value(record, columns.methodology).is_empty()
+        && payer_columns[2..]
+            .iter()
+            .all(|column| csv_profile_value(record, *column).is_empty())
+    {
+        // A generic service-price label is not a payer; the charge must still validate.
+        return Ok(None);
+    }
     if payer_columns
         .iter()
         .all(|column| csv_profile_value(record, *column).is_empty())
