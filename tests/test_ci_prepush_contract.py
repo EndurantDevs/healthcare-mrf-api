@@ -312,13 +312,16 @@ def test_container_and_lock_generator_use_exact_inputs() -> None:
         "python:3.14.6-slim-trixie@sha256:"
         "b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967"
     ) in dockerfile
-    assert "PREPUSH_PIP_REPORT=/tmp/python-lock-install-report.json /wheels/scripts/ci/install_python_lock" in dockerfile
-    assert "requirements.txt requirements-dev.txt requirements-ci.in" in dockerfile
-    assert "scripts/ci/install_python_lock" in dockerfile
-    assert "scripts/ci/validate_python_lock_inputs" in dockerfile
+    assert "requirements.txt requirements-runtime.in requirements-runtime.lock requirements-build.txt requirements-build.lock" in dockerfile
+    assert "scripts/python_locks.py check --root /build" in dockerfile
+    assert "scripts/python_locks.py check --root /wheels" in dockerfile
+    assert "requirements-ci" not in dockerfile
+    assert "scripts/ci/" not in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
-    assert "maturin==1\\.15\\.0 --hash=sha256:" in dockerfile
+    assert "-r /build/requirements-build.lock" in dockerfile
+    assert "-r /wheels/requirements-runtime.lock" in dockerfile
+    assert "python -m pip check" in dockerfile
     assert "pip install --no-compile --upgrade pip" not in dockerfile
     assert "-r /wheels/requirements-dev.txt" not in dockerfile
     assert "test \"$(python -m pip --version | awk '{print $2}')\" = 26.1.2" in generator

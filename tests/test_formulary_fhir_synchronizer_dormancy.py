@@ -127,7 +127,14 @@ def test_synthetic_canary_postgres_proof_and_fixtures_are_packaged():
     fixture_directory = ROOT / "scripts" / "smoke" / "fixtures" / "formulary_fhir"
 
     assert "tests/test_formulary_fhir_synthetic_canary_postgres.py" in prepush_source
-    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    script = "scripts/smoke/formulary_fhir_synthetic_canary.py"
+    assert f"COPY {script} /opt/{script}" in dockerfile_source
+    for fixture_name in (
+        "coverage_plan.json", "medication_a.json", "medication_b.json",
+        "canary_expected_v1.json",
+    ):
+        fixture = f"scripts/smoke/fixtures/formulary_fhir/{fixture_name}"
+        assert f"COPY {fixture} /opt/{fixture}" in dockerfile_source
     assert (fixture_directory / "coverage_plan.json").is_file()
     assert (fixture_directory / "medication_a.json").is_file()
     assert (fixture_directory / "medication_b.json").is_file()
@@ -195,7 +202,8 @@ def test_synthetic_seed_publisher_has_no_runtime_or_deployment_reachability():
         in prepush_source
     )
     assert "COPY process/ /opt/process/" in dockerfile_source
-    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    script = "scripts/smoke/formulary_fhir_synthetic_seed_publisher.py"
+    assert f"COPY {script} /opt/{script}" in dockerfile_source
 
 
 def test_reviewed_operator_modules_are_separated_and_dormant():
@@ -254,7 +262,8 @@ def test_reviewed_operator_library_and_script_paths_are_packaged():
     assert (ROOT / "process" / "formulary_fhir" / "reviewed_publication.py").is_file()
     assert operator_script.is_file()
     assert "COPY process/ /opt/process/" in dockerfile_source
-    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    script = operator_script.relative_to(ROOT).as_posix()
+    assert f"COPY {script} /opt/{script}" in dockerfile_source
     assert str(operator_script.relative_to(ROOT)) in prepush_source
     assert "tests/test_formulary_fhir_reviewed_operator_postgres.py" in (
         prepush_source
@@ -342,7 +351,8 @@ def test_uhc_operator_library_and_script_are_packaged_and_gated_in_ci():
 
     assert operator_script.is_file()
     assert "COPY process/ /opt/process/" in dockerfile_source
-    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    script = operator_script.relative_to(ROOT).as_posix()
+    assert f"COPY {script} /opt/{script}" in dockerfile_source
     assert str(operator_script.relative_to(ROOT)) in prepush_source
     assert "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED" in prepush_source
     assert "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED" in prepush_source

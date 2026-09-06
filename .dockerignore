@@ -1,4 +1,8 @@
 .git
+.github
+.worktrees
+.tasks
+.venv
 .DS_Store
 .coverage
 .env
@@ -6,6 +10,9 @@
 __pycache__
 logs
 reports
+docs
+tests
+ci
 venv
 venv*
 support/ptg2_scanner/target

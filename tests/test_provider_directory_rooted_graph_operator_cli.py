@@ -280,7 +280,10 @@ def test_operator_is_packaged_but_not_scheduled_or_publicly_activated() -> None:
     activation_paths.append(ROOT / "main.py")
 
     assert cli_path.is_file()
-    assert "COPY scripts/ /opt/scripts/" in dockerfile
+    assert (
+        "COPY scripts/smoke/provider_directory_rooted_graph_operator.py "
+        "/opt/scripts/smoke/provider_directory_rooted_graph_operator.py"
+    ) in dockerfile
     for path in allowed_manual_entrypoints:
         _assert_safe_top_level_imports(path)
     for path in activation_paths:
