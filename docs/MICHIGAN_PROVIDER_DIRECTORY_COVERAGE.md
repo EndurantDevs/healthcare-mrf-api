@@ -60,6 +60,24 @@ collections returned 504 at offset 1,000,000. A valid empty filtered Organizatio
 search is possible, but an unfiltered terminal boundary remains unverified.
 Gateway failures are errors, never evidence that the remainder is empty.
 
+Later checks confirmed Organization row-offset continuity at 2,000: one
+twenty-resource response exactly matched adjacent ten-resource windows. These
+requests took approximately 17–21 seconds. Practitioner windows at offsets 500
+and 510 already hit the 29-second timeout with either `_count=1` or `_count=2`.
+The failure is therefore not avoided simply by increasing the window size.
+
+The documented InterOp Station route is not a verified fallback. Its corresponding
+Organization offset 10,000 and Practitioner offsets 500/10,000 returned empty
+HTTP 200 searchset Bundles after approximately 29 seconds. This timing is
+consistent with the relay masking an upstream timeout; server logs are needed
+to confirm the mechanism. These empty responses cannot establish completeness.
+The relay also namespaces resource IDs differently, so endpoint substitution
+must not silently rewrite resource or reference identities.
+
+Count-only requests do not supply a census: `_count=0` returns empty Bundles with
+no total on four collections and HTTP 404 on Practitioner. The absence of a
+total is unknown coverage, not zero population.
+
 ## Containment
 
 The importer rejects acquisition and new publication for this source, including
