@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api import plan_pricing_em_distance
 from api.endpoint import pricing
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_release_serving import PlanReleaseServingSelection
@@ -63,6 +64,13 @@ def _release_selection():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("initial_window", "expected_windows"),
+    [
+        (128, [128, 256, 512, 1024, 2048, 4096, 8192]),
+        (512, [512, 1024, 2048, 4096, 8192]),
+    ],
+)
+@pytest.mark.parametrize(
     ("candidate_count", "unique_count", "expected"),
     [
         (8192, 1, None),
@@ -72,8 +80,9 @@ def _release_selection():
     ],
 )
 async def test_em_distance_page_boundaries(
-    candidate_count, unique_count, expected
+    monkeypatch, initial_window, expected_windows, candidate_count, unique_count, expected
 ):
+    monkeypatch.setattr(plan_pricing_em_distance, "_INITIAL_LOCATION_WINDOW", initial_window)
     session = _LocationWindowSession(candidate_count, unique_count)
     request = search_plan_pricing_em_distance(
         session,
@@ -99,11 +108,13 @@ async def test_em_distance_page_boundaries(
             pagination["has_more"],
             pagination["total_lower_bound"],
         ) == expected
-    assert session.windows == [512, 1024, 2048, 4096, 8192]
+    assert session.windows == expected_windows
 
 
 @pytest.mark.asyncio
-async def test_em_cap_refusal_has_no_retry(monkeypatch):
+@pytest.mark.parametrize("initial_window", (128, 512))
+async def test_em_cap_refusal_has_no_retry(monkeypatch, initial_window):
+    monkeypatch.setattr(plan_pricing_em_distance, "_INITIAL_LOCATION_WINDOW", initial_window)
     selection = _release_selection()
     monkeypatch.setattr(
         pricing, "resolve_plan_release_guard_selection", AsyncMock(return_value=selection)

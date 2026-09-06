@@ -18,7 +18,7 @@ from api.ptg2_response import _coerce_numeric_rate, _is_request_flag_enabled
 
 PROJECTION_CONTRACT = "plan_pricing_em_distance_v1"
 EM_CODES = ("99203", "99204", "99205", "99213", "99214", "99215")
-_INITIAL_LOCATION_WINDOW = 512
+_INITIAL_LOCATION_WINDOW = 128
 _MAX_LOCATION_WINDOW = 8192
 _CODE_INDEX = {code: index for index, code in enumerate(EM_CODES)}
 _UNSUPPORTED_FIELDS = (
