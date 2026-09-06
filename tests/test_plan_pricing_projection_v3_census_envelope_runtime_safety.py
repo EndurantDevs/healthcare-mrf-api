@@ -111,6 +111,35 @@ def test_arc_reappearance_at_pre_child_fence_blocks_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "scheduler_state",
+    [
+        "replicas-zero",
+        "replicas-two",
+        "unavailable",
+        "missing-pod",
+        "duplicate-pod",
+        "generation-drift",
+        "restart",
+    ],
+)
+def test_unhealthy_scheduler_blocks_run_without_scaling_it(
+    tmp_path: Path,
+    scheduler_state: str,
+) -> None:
+    """The drained node permits only a healthy singleton scheduler."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_SCHEDULER_STATE=scheduler_state,
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "child" not in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
+
+
+@pytest.mark.parametrize(
     "drift",
     [
         {"FAKE_ACTIVE_WORK_AFTER_CHILD": "1"},

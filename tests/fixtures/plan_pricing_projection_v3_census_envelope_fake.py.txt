@@ -10,6 +10,13 @@ def event(value: str) -> None:
         target.write(value + "\n")
 def raise_exit(code: int) -> None: raise SystemExit(code)
 def resource_path(kind: str) -> Path: return state / kind
+def scheduler_state() -> str:
+    if os.environ.get("FAKE_SCHEDULER_UNHEALTHY") == "1":
+        return "unavailable"
+    if (os.environ.get("FAKE_SCHEDULER_DRIFT_AFTER_CHILD") == "1"
+            and events.exists() and "child" in events.read_text()):
+        return "unavailable"
+    return os.environ.get("FAKE_SCHEDULER_STATE", "healthy")
 if name == "timeout":
     command_index = next(
         index + 1
@@ -471,12 +478,81 @@ elif name == "k3s":
                 residue = "pod"
             print(f"{residue}/other-census-resource" if residue else "")
         elif kind == "deployment" and args[2] == os.environ["FAKE_IMPORT_SCHEDULER"]:
-            scheduler_drift = (
-                os.environ.get("FAKE_SCHEDULER_DRIFT_AFTER_CHILD") == "1"
-                and events.exists()
-                and "child" in events.read_text()
-            )
-            print("1" if scheduler_drift else "0", end="")
+            scheduler = scheduler_state()
+            replicas = 0 if scheduler == "replicas-zero" else 2 if scheduler == "replicas-two" else 1
+            healthy = scheduler not in {"unavailable"}
+            print(json.dumps({
+                "metadata": {
+                    "generation": 7,
+                    "name": os.environ["FAKE_IMPORT_SCHEDULER"],
+                    "namespace": "healthporta-dev",
+                    "uid": "scheduler-deployment-uid",
+                },
+                "spec": {
+                    "replicas": replicas,
+                    "selector": {"matchLabels": {"app.kubernetes.io/name": os.environ["FAKE_IMPORT_SCHEDULER"]}},
+                    "template": {
+                        "metadata": {"labels": {"app.kubernetes.io/name": os.environ["FAKE_IMPORT_SCHEDULER"]}},
+                        "spec": {"containers": [{"name": "scheduler"}]},
+                    },
+                },
+                "status": {
+                    "observedGeneration": 6 if scheduler == "generation-drift" else 7,
+                    "replicas": replicas,
+                    "updatedReplicas": replicas,
+                    "readyReplicas": replicas if healthy else 0,
+                    "availableReplicas": replicas if healthy else 0,
+                    "unavailableReplicas": int(not healthy),
+                },
+            }))
+        elif kind == "replicasets" and any(
+            os.environ["FAKE_IMPORT_SCHEDULER"] in argument for argument in args
+        ):
+            scheduler = scheduler_state()
+            replicas = 0 if scheduler == "replicas-zero" else 2 if scheduler == "replicas-two" else 1
+            print(json.dumps({"items": [{
+                "metadata": {
+                    "generation": 3,
+                    "name": "scheduler-rs",
+                    "namespace": "healthporta-dev",
+                    "uid": "scheduler-rs-uid",
+                    "ownerReferences": [{
+                        "kind": "Deployment", "uid": "scheduler-deployment-uid", "controller": True,
+                    }],
+                },
+                "spec": {"replicas": replicas},
+                "status": {
+                    "observedGeneration": 3,
+                    "replicas": replicas,
+                    "readyReplicas": replicas if scheduler != "unavailable" else 0,
+                    "availableReplicas": replicas if scheduler != "unavailable" else 0,
+                },
+            }]}))
+        elif kind == "pods" and any(
+            os.environ["FAKE_IMPORT_SCHEDULER"] in argument for argument in args
+        ):
+            scheduler = scheduler_state()
+            count = 0 if scheduler == "missing-pod" else 2 if scheduler == "duplicate-pod" else 1
+            ready = scheduler != "unavailable"
+            print(json.dumps({"items": [{
+                "metadata": {
+                    "name": f"scheduler-pod-{index}",
+                    "namespace": "healthporta-dev",
+                    "labels": {"app.kubernetes.io/name": os.environ["FAKE_IMPORT_SCHEDULER"]},
+                    "ownerReferences": [{
+                        "kind": "ReplicaSet", "uid": "scheduler-rs-uid", "controller": True,
+                    }],
+                },
+                "spec": {"containers": [{"name": "scheduler"}]},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                    "containerStatuses": [{
+                        "name": "scheduler", "ready": ready,
+                        "restartCount": 1 if scheduler == "restart" else 0,
+                    }],
+                },
+            } for index in range(count)]}))
         elif kind in {"job", "configmap"}:
             if (
                 kind == "job"

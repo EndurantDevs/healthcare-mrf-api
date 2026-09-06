@@ -65,7 +65,8 @@ def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) ->
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     expected_events = (
         "lock_create arc_hold quota_create quota_probe_denied arc_verify drain_read drain_set_true "
-        "drain_read policy_create binding_create probe_denied capacity arc_verify drain_read "
+        "drain_read policy_create binding_create probe_denied drain_read drain_read drain_read "
+        "capacity arc_verify drain_read "
         "child arc_verify drain_read arc_identity drain_set_false drain_read binding_delete policy_delete "
         "quota_delete arc_restore lock_stop"
     ).split()

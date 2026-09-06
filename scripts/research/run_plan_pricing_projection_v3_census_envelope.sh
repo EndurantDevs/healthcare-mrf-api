@@ -465,7 +465,7 @@ render_plan() {
     '  - create UID-bound ARC pods=0 quota, prove admission, and drain ARC naturally' \
     '  - capture and set the exact import-node drain state' \
     '  - create UID-bound engine-worker deny policy and prove denial marker' \
-    '  - require scheduler=0 and three stable zero-work samples' \
+    '  - require a healthy singleton scheduler behind the drained node and three stable zero-work samples' \
     '  - require reviewed host memory, swap, and PostgreSQL tablespace headroom' \
     '  - run foreground census command under remaining deadline' \
     '  - restore drain, remove binding and policy, remove quota, restore ARC, release flock'
@@ -1266,13 +1266,126 @@ print(count)
 '
 }
 
+scheduler_is_healthy_singleton() {
+  local deployment replica_sets pods selector
+  selector="app.kubernetes.io/name=${IMPORT_SCHEDULER_DEPLOYMENT}"
+  deployment=$(kctl -n "${DEV_NAMESPACE}" get deployment \
+    "${IMPORT_SCHEDULER_DEPLOYMENT}" -o json) || return
+  replica_sets=$(kctl -n "${DEV_NAMESPACE}" get replicasets \
+    -l "${selector}" -o json) || return
+  pods=$(kctl -n "${DEV_NAMESPACE}" get pods -l "${selector}" -o json) \
+    || return
+  printf '%s\0%s\0%s\0' "${deployment}" "${replica_sets}" "${pods}" | \
+    python3 -c '
+import json, sys
+raw = sys.stdin.buffer.read().split(b"\0")
+if len(raw) != 4 or raw[-1]:
+    raise SystemExit(1)
+deployment, replica_set_list, pod_list = (json.loads(value) for value in raw[:3])
+namespace, name = sys.argv[1:]
+
+def metadata(item):
+    return item.get("metadata", {}) if isinstance(item, dict) else {}
+
+def owned_by(item, kind, uid):
+    references = metadata(item).get("ownerReferences", [])
+    return sum(
+        reference.get("kind") == kind
+        and reference.get("uid") == uid
+        and reference.get("controller") is True
+        for reference in references
+        if isinstance(reference, dict)
+    ) == 1
+
+deployment_metadata = metadata(deployment)
+deployment_spec = deployment.get("spec", {})
+deployment_status = deployment.get("status", {})
+selector = {"matchLabels": {"app.kubernetes.io/name": name}}
+template = deployment_spec.get("template", {})
+template_labels = metadata(template).get("labels", {})
+template_containers = template.get("spec", {}).get("containers", [])
+if not (
+    deployment_metadata.get("namespace") == namespace
+    and deployment_metadata.get("name") == name
+    and isinstance(deployment_metadata.get("uid"), str)
+    and deployment_metadata["uid"]
+    and not deployment_metadata.get("deletionTimestamp")
+    and deployment_spec.get("replicas") == 1
+    and deployment_spec.get("selector") == selector
+    and template_labels.get("app.kubernetes.io/name") == name
+    and len(template_containers) == 1
+    and template_containers[0].get("name") == "scheduler"
+    and deployment_status.get("observedGeneration")
+        == deployment_metadata.get("generation")
+    and all(deployment_status.get(field) == 1 for field in (
+        "replicas", "updatedReplicas", "readyReplicas", "availableReplicas"
+    ))
+    and deployment_status.get("unavailableReplicas", 0) == 0
+):
+    raise SystemExit(1)
+
+replica_sets = replica_set_list.get("items", [])
+current_replica_sets = [
+    item for item in replica_sets
+    if owned_by(item, "Deployment", deployment_metadata["uid"])
+    and item.get("spec", {}).get("replicas") == 1
+]
+if len(current_replica_sets) != 1:
+    raise SystemExit(1)
+replica_set = current_replica_sets[0]
+replica_set_metadata = metadata(replica_set)
+replica_set_status = replica_set.get("status", {})
+if not (
+    replica_set_metadata.get("namespace") == namespace
+    and isinstance(replica_set_metadata.get("uid"), str)
+    and replica_set_metadata["uid"]
+    and not replica_set_metadata.get("deletionTimestamp")
+    and replica_set_status.get("observedGeneration")
+        == replica_set_metadata.get("generation")
+    and all(replica_set_status.get(field) == 1 for field in (
+        "replicas", "readyReplicas", "availableReplicas"
+    ))
+):
+    raise SystemExit(1)
+
+pods = pod_list.get("items", [])
+if len(pods) != 1:
+    raise SystemExit(1)
+pod = pods[0]
+pod_metadata = metadata(pod)
+pod_status = pod.get("status", {})
+container_specs = pod.get("spec", {}).get("containers", [])
+container_statuses = pod_status.get("containerStatuses", [])
+ready = [
+    condition for condition in pod_status.get("conditions", [])
+    if condition.get("type") == "Ready" and condition.get("status") == "True"
+]
+if not (
+    pod_metadata.get("namespace") == namespace
+    and pod_metadata.get("labels", {}).get("app.kubernetes.io/name") == name
+    and not pod_metadata.get("deletionTimestamp")
+    and owned_by(pod, "ReplicaSet", replica_set_metadata["uid"])
+    and pod_status.get("phase") == "Running"
+    and len(ready) == 1
+    and len(container_specs) == 1
+    and container_specs[0].get("name") == "scheduler"
+    and len(container_statuses) == 1
+    and container_statuses[0].get("name") == "scheduler"
+    and container_statuses[0].get("ready") is True
+    and container_statuses[0].get("restartCount") == 0
+):
+    raise SystemExit(1)
+' "${DEV_NAMESPACE}" "${IMPORT_SCHEDULER_DEPLOYMENT}"
+}
+
 verify_stable_zero_work() {
-  local scheduler count check
-  scheduler=$(kctl -n "${DEV_NAMESPACE}" get deployment \
-    "${IMPORT_SCHEDULER_DEPLOYMENT}" -o jsonpath='{.spec.replicas}')
-  [ "${scheduler}" = 0 ] || die "import scheduler is not held at zero"
+  local count check
   for check in 1 2 3; do
     check_interrupted
+    [ "$(node_drain_mode read)" = true ] \
+      || die "import drain changed during the zero-work proof"
+    scheduler_is_healthy_singleton \
+      || die "import scheduler is not a healthy singleton"
     count=$(active_engine_count)
     [ "${count}" -eq 0 ] || die "active engine work blocks the census"
     verify_absent job "${CENSUS_JOB}" "${DEV_NAMESPACE}"
@@ -1320,8 +1433,7 @@ verify_child_fences() {
     && [ "$(binding_identity)" = "${BINDING_UID}" ] \
     && seed_is_absent \
     && [ "$(node_drain_mode read)" = true ] \
-    && [ "$(kctl -n "${DEV_NAMESPACE}" get deployment \
-      "${IMPORT_SCHEDULER_DEPLOYMENT}" -o jsonpath='{.spec.replicas}')" = 0 ] \
+    && scheduler_is_healthy_singleton \
     && [ "$(active_engine_count)" -eq 0 ] \
     && [ "$(active_arc_count)" -eq 0 ] \
     && census_resources_absent
