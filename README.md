@@ -192,29 +192,67 @@ Per-import documentation:
 
 ## Local Development
 
-Use [`.env.example`](./.env.example) as the configuration reference.
+The importer and API run independently of any commercial scheduler. Use
+CPython 3.14, a native Rust toolchain (1.97.1 for the container build), PostgreSQL
+18 and Redis 7. Geographic workloads also use PostGIS. The Dockerfile builds on
+the machine's native architecture; its runtime contains importer dependencies
+and native binaries, with deployment and CI tooling excluded.
 
-Typical local prerequisites:
-
-- Python virtual environment
-- PostgreSQL
-- Redis
-
-Basic setup:
+Install the pinned runtime and native build dependencies from the repository root:
 
 ```bash
-python -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
+python scripts/python_locks.py check
+python -m pip install --require-hashes -r requirements-runtime.lock
+python -m pip install --require-hashes -r requirements-build.lock
+cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
+maturin develop --release --features python-extension --manifest-path support/ptg2_scanner/Cargo.toml
+cp .env.example .env
 ```
 
-Start the API:
+Set the database credentials and Redis URL in `.env` to your local services.
+`HLTHPRT_DB_PORT` is the PostgreSQL port. The operator API stays inaccessible
+until you configure your own `HLTHPRT_CONTROL_API_TOKEN`; regular imports use
+the CLI directly. Most import-specific settings in `.env.example` are optional.
+
+Create a dedicated application role using your PostgreSQL administrator (shown
+as `postgres`), put its password in `.env`, then create the local database and
+run the bundled ZIP import. This reads the public
+CSV already in `support/zip/`, creates its table, and replaces that table's rows
+inside a transaction. It makes no external data requests:
 
 ```bash
-python main.py server start --host 0.0.0.0 --port 8080
+createuser --host=127.0.0.1 --username=postgres --no-superuser \
+  --no-createdb --no-createrole --pwprompt mrf_api
+createdb --host=127.0.0.1 --username=postgres --owner=mrf_api healthporta
+python main.py start geo
+python main.py server start --host 127.0.0.1 --port 8080
 ```
 
-The API becomes useful after at least one importer has been run successfully.
+In another terminal, read an imported ZIP with
+`curl http://127.0.0.1:8080/api/v1/geo/zip/10001`.
+Other importers, including their queue workers and bounded test modes, are listed
+in [the import guide](./docs/imports/README.md).
+
+For a small synthetic check of CSV parsing, batching and failure handling that
+does not require running services:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q tests/test_process_geo_import_unit.py tests/test_public_runtime_packaging.py
+```
+
+To build a local container, supply the source identity:
+
+```bash
+docker build --build-arg HLTHPRT_SOURCE_COMMIT="$(git rev-parse HEAD)" -t healthcare-mrf-api:local .
+```
+
+Maintainers regenerate the runtime/build locks with `uv 0.12.10` and
+`python scripts/python_locks.py compile`. The locks retain artifact hashes
+for native platforms and record the hash of their requirement input; the build
+rejects stale inputs. CI dependencies are managed separately.
 
 ## API Consumers
 

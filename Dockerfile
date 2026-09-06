@@ -4,24 +4,21 @@ ARG TARGETARCH
 ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
 
 WORKDIR /build
-COPY requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock /build/
-COPY scripts/ci/validate_python_lock_inputs /build/scripts/ci/validate_python_lock_inputs
+COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirements-build.txt requirements-build.lock /build/
+COPY scripts/python_locks.py /build/scripts/python_locks.py
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
-    && python3 /build/scripts/ci/validate_python_lock_inputs /build \
-    && grep '^maturin==1\.15\.0 --hash=sha256:' /build/requirements-ci.lock > /tmp/maturin.lock \
-    && test "$(wc -l < /tmp/maturin.lock)" -eq 1 \
+    && python3 /build/scripts/python_locks.py check --root /build \
     && python3 -m pip install \
         --break-system-packages \
         --no-cache-dir \
         --no-deps \
         --only-binary=:all: \
         --require-hashes \
-        -r /tmp/maturin.lock \
+        -r /build/requirements-build.lock \
     && python3 -m pip check \
-    && rm -f /tmp/maturin.lock \
     && rm -rf /var/lib/apt/lists/*
 RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
         RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
@@ -39,16 +36,18 @@ FROM docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a4
 
 #
 WORKDIR /wheels
-COPY requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock /wheels/
-COPY scripts/ci/install_python_lock scripts/ci/validate_python_lock_inputs /wheels/scripts/ci/
+COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirements-build.txt requirements-build.lock /wheels/
+COPY scripts/python_locks.py /wheels/scripts/python_locks.py
 
 WORKDIR /opt
 RUN apt-get update \
     && if apt-cache show libaio1t64 >/dev/null 2>&1; then LIBAIO_PKG=libaio1t64; else LIBAIO_PKG=libaio1; fi \
-    && apt-get install -y --no-install-recommends gcc g++ pkg-config libgdal-dev nginx git curl parallel "${LIBAIO_PKG}" \
+    && apt-get install -y --no-install-recommends nginx git curl parallel "${LIBAIO_PKG}" \
     && python3 -m venv venv \
     && . venv/bin/activate \
-    && PREPUSH_PIP_REPORT=/tmp/python-lock-install-report.json /wheels/scripts/ci/install_python_lock \
+    && python /wheels/scripts/python_locks.py check --root /wheels \
+    && python -m pip install --no-cache-dir --no-compile --only-binary=:all: --require-hashes -r /wheels/requirements-runtime.lock \
+    && python -m pip check \
     && test -x /opt/venv/bin/rapidgzip \
     && ln -sf /opt/venv/bin/rapidgzip /usr/local/bin/rapidgzip \
     && install -d -o nobody -g nogroup -m 755 /run /var/log/nginx \
@@ -59,7 +58,6 @@ RUN apt-get update \
         /var/lib/nginx/uwsgi \
         /var/lib/nginx/scgi \
     && rm -rf /wheels \
-    && rm -f /tmp/python-lock-install-report.json \
     && rm -rf /root/.cache/pip/* \
     && find . -name '*.pyc' -delete \
     && apt-get autoremove -y \
@@ -77,7 +75,7 @@ ARG HLTHPRT_DB_HOST=localhost
 ARG HLTHPRT_DB_PORT=5432
 ARG HLTHPRT_DB_DATABASE=healthporta
 ARG HLTHPRT_DB_SCHEMA='mrf'
-ARG HLTHPRT_DB_USER=dmytro
+ARG HLTHPRT_DB_USER=mrf_api
 ARG HLTHPRT_REDIS_ADDRESS=redis://localhost:6379
 
 ARG HLTHPRT_SAVE_PER_PACK=100
@@ -125,8 +123,10 @@ COPY specs/ /opt/specs/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
 COPY public_evidence/ /opt/public_evidence/
-COPY scripts/ /opt/scripts/
-COPY support/ /opt/support/
+COPY scripts/provider_directory_support_contract.py /opt/scripts/provider_directory_support_contract.py
+COPY scripts/validation/ptg2_v3_source_api_audit.py /opt/scripts/validation/ptg2_v3_source_api_audit.py
+COPY support/hospital_price_native_validation.py /opt/support/hospital_price_native_validation.py
+COPY support/zip/ /opt/support/zip/
 COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/ptg2_scanner \
     /opt/support/ptg2_scanner/target/release/ptg2_scanner
