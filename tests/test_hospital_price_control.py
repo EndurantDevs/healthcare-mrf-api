@@ -283,7 +283,7 @@ async def test_evidence_is_immutable_and_publication_is_one_generation_cas():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "contact_metadata",
-    ("", "contact-name: Price Team\ncontact-name: billing@example.com\n"),
+    ["", "contact-name: Price Team\ncontact-name: billing@example.com\n"],
 )
 async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch, contact_metadata):
     acquisition = _acquisition_module()
@@ -330,7 +330,8 @@ async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch, c
     assert options_by_name["max_bytes"] == 1_000_000
     assert options_by_name["user_agent"].startswith("Mozilla/5.0")
     assert locator_result.records[0].mrf_url.endswith("12-3456789_prices.json")
-    assert len(observations) == 1 and observations[0][3] == "verified"
+    assert len(observations) == 1
+    assert observations[0][3] == "verified"
     assert observations[0][4] is raw
     assert (raw.raw_sha256, raw.byte_count) == (hashlib.sha256(locator_payload).hexdigest(), len(locator_payload))
     assert locator_path.read_bytes() == locator_payload

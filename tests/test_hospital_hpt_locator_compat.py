@@ -199,14 +199,14 @@ def test_inter_record_headings_require_one_complete_boundary(payload):
         locator.parse_hospital_hpt_locator(payload)
 
 
-@pytest.mark.parametrize("position", ("before", "after", "inline"))
+@pytest.mark.parametrize("position", ["before", "after", "inline"])
 @pytest.mark.parametrize(
     "contacts",
-    (
+    [
         b"contact-name: Price Team\ncontact-name: Price Team\n",
         b"contact-name: Price Team\ncontact-name: billing@example.com\n",
         b"contact-name: Price Team\n CONTACT-NAME : Another Team\n",
-    ),
+    ],
 )
 def test_repeated_contact_names_preserve_the_binding(position, contacts):
     mrf = b"mrf-url: https://files.example/mrf.csv\n"
@@ -237,7 +237,7 @@ def test_repeated_contact_names_preserve_record_order():
 
 @pytest.mark.parametrize(
     ("fields", "reason"),
-    (
+    [
         (b"mrf-url: https://files.example/mrf.csv\nMRF-URL: https://files.example/mrf.csv\n", "duplicate_field"),
         (b"mrf-url: https://files.example/mrf.csv\nmrf_url: https://files.example/other.csv\n", "duplicate_field"),
         (b"source-page-url: https://hospital.example/prices\nsource-page_url: https://hospital.example/other\n", "duplicate_field"),
@@ -247,7 +247,7 @@ def test_repeated_contact_names_preserve_record_order():
         (b"mrf-url: https://files.example/mrf.csv#fragment\n", "mrf_url"),
         (b"contact-name: Invalid\x00Team\n", "control_character"),
         (b"", "mrf_url"),
-    ),
+    ],
 )
 def test_repeated_contacts_do_not_relax_other_validation(fields, reason):
     payload = b"location-name: Hospital\ncontact-name: One\ncontact-name: Two\n" + fields
