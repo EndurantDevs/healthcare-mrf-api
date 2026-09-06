@@ -16142,6 +16142,7 @@ hospitals:
   name: Ohio Valley Medical Center
   cms_hpt_url: https://www.ovsurgical.com/cms-hpt.txt
   locator_name: OHIO VALLEY SURGICAL HOSPITAL
+  alias_of: hospital-004819
 - hospital_id: hospital-004819
   name: OHIO VALLEY SURGICAL HOSPITAL
   cms_hpt_url: https://www.ovsurgical.com/cms-hpt.txt
