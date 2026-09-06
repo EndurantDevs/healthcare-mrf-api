@@ -17,6 +17,10 @@ from process import provider_directory_profile as profile_artifact
 from process.provider_directory_publication_catalog_authority import (
     canonical_manifest_digest,
 )
+from process.provider_directory_source_coverage import (
+    MICHIGAN_COVERAGE_WARNING,
+    acquisition_coverage_blocked_reason,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +88,11 @@ def _public_catalog_entry(
         else executable_resources or []
     )
     catalog_entry_by_field["runnable"] = is_runnable
+    if any(acquisition_coverage_blocked_reason(source_id) for source_id in source_ids):
+        catalog_entry_by_field["acquisition_blocked_reason"] = (
+            "upstream_search_window_incomplete"
+        )
+        catalog_entry_by_field["coverage_warning"] = MICHIGAN_COVERAGE_WARNING
     return catalog_entry_by_field, source_ids, is_runnable
 
 

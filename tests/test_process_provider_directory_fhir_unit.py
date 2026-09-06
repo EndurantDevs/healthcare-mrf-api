@@ -17554,13 +17554,6 @@ def test_michigan_direct_probe_caps_role_without_synthesizing_offset():
     )
 
 
-def test_michigan_offset_substitute_is_not_equivalent_to_canonical_cursor_page():
-    canonical_second_page_ids = {"75147991", "75147992", "75204637"}
-    synthetic_offset_page_ids = {"75040123", "75317648", "75419649"}
-
-    assert canonical_second_page_ids.isdisjoint(synthetic_offset_page_ids)
-
-
 def test_resource_start_url_caps_uhc_insurance_plan_page_count():
     url = importer._resource_start_url(
         {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
@@ -17639,7 +17632,7 @@ def test_michigan_direct_base_uses_upstream_for_metadata_and_resource_probes():
     )
 
 
-def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps():
+def test_michigan_keeps_probe_page_caps_without_claiming_complete_acquisition():
     source_row = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -17652,11 +17645,9 @@ def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps
     assert metadata["provider_directory_supported_resources"] == sorted(
         importer.MICHIGAN_SUPPORTED_RESOURCES
     )
-    assert metadata["provider_directory_fully_enumerable_resources"] == sorted(
-        importer.MICHIGAN_SUPPORTED_RESOURCES
-    )
-    assert metadata["provider_directory_coverage_mode"] == "full"
-    assert metadata["provider_directory_acquisition_enabled"] is True
+    assert metadata["provider_directory_fully_enumerable_resources"] == []
+    assert metadata["provider_directory_coverage_mode"] == "probe_only"
+    assert metadata["provider_directory_acquisition_enabled"] is False
     assert "provider_directory_candidate_status" not in metadata
     assert importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY not in metadata
     assert metadata["provider_directory_resource_page_count_caps"] == {
@@ -17680,7 +17671,7 @@ def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps
     assert importer._resource_acquisition_blocked_reason(
         source_row,
         sorted(importer.MICHIGAN_SUPPORTED_RESOURCES),
-    ) is None
+    ) == "upstream_search_window_incomplete"
 
 
 def test_michigan_preserves_advertised_opaque_next_link_without_offset_synthesis():
@@ -17714,7 +17705,7 @@ def test_michigan_candidate_excludes_unsupported_resource_acquisition():
     assert importer._resource_acquisition_blocked_reason(
         source_row,
         sorted(importer.MICHIGAN_SUPPORTED_RESOURCES),
-    ) is None
+    ) == "upstream_search_window_incomplete"
     assert importer._resource_start_url(
         source_row,
         "HealthcareService",
