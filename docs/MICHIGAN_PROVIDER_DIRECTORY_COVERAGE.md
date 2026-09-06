@@ -94,7 +94,7 @@ rebuild the global evidence layer.
 
 ## Required upstream resolution
 
-A complete import still requires verified exhaustive traversal and a trustworthy
+A complete import still requires a verified exhaustive traversal and a trustworthy
 terminal condition, or a supported full directory extract with per-resource
 counts and a stable snapshot identity. Any proposed search partitions must also
 account for missing values and overflowing partitions; ordinary successful
