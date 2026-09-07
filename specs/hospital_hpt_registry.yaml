@@ -4745,6 +4745,7 @@ hospitals:
 - hospital_id: hospital-001409
   name: Clarke County Hospital
   cms_hpt_url: https://clarkehosp.org/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/9347/426037982_clarke-county-public-hospital_standardcharges.csv
 - hospital_id: hospital-001410
   name: Clay County Hospital
   cms_hpt_url: https://www.claycountyhospital.org/cms-hpt.txt
