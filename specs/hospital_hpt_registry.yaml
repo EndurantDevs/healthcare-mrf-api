@@ -7418,6 +7418,7 @@ hospitals:
 - hospital_id: hospital-002218
   name: First Care Health Center
   cms_hpt_url: https://www.firstcarehc.com/cms-hpt.txt
+  fallback_mrf_url: https://www.firstcarehc.com/wp-content/uploads/2025/11/2026-FCHC-Pricing-Transparency-Standard-Charges.csv
 - hospital_id: hospital-002219
   name: Fisher County Hospital
   cms_hpt_url: https://fishercountyhospital.com/cms-hpt.txt
@@ -9553,6 +9554,7 @@ hospitals:
 - hospital_id: hospital-002849
   name: HealthSource Saginaw
   cms_hpt_url: https://www.healthsourcesaginaw.org/cms-hpt.txt
+  fallback_mrf_url: https://www.healthsourcesaginaw.org/wp-content/uploads/2026/04/386004889_healthsource-saginaw_standardcharges.csv
 - hospital_id: hospital-002850
   name: HEART HOSP OF AUSTIN
   cms_hpt_url: https://www.stdavids.com/cms-hpt.txt
@@ -14710,6 +14712,7 @@ hospitals:
 - hospital_id: hospital-004390
   name: Mountainview Medical Center
   cms_hpt_url: https://www.mvmc.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mvmc.org/documents/content/810255832_mountainview-medical-center-inc._standardcharges.csv
 - hospital_id: hospital-004391
   name: MOUNTAINVIEW PM&R
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
@@ -17275,6 +17278,7 @@ hospitals:
 - hospital_id: hospital-005166
   name: Pioneers Medical Center
   cms_hpt_url: https://www.pioneershospital.org/cms-hpt.txt
+  fallback_mrf_url: https://www.pioneershospital.org/wp-content/uploads/2026/04/pioneers-medical-center_standardcharges.csv
 - hospital_id: hospital-005167
   name: Pipeline East Dallas LLC
   cms_hpt_url: https://www.whiterockmedicalcenter.com/cms-hpt.txt
@@ -19595,6 +19599,7 @@ hospitals:
 - hospital_id: hospital-005866
   name: South Lyon Medical Center
   cms_hpt_url: https://slmcnv.org/cms-hpt.txt
+  fallback_mrf_url: https://slmcnv.org/wp-content/uploads/2026/04/880256932_south-lyon-health-center-inc-_standardcharges.csv
 - hospital_id: hospital-005867
   name: South Miami Hospital
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -21626,6 +21631,7 @@ hospitals:
 - hospital_id: hospital-006469
   name: Texas Institute for Surgery at Texas Health Presbyterian Dallas
   cms_hpt_url: https://www.texasinstituteforsurgery.com/cms-hpt.txt
+  fallback_mrf_url: https://www.texasinstituteforsurgery.com/wp-content/uploads/2026/03/770628004_Texas-Institute-for-Surgery-at-Texas-Health-Dallas_standardcharges.csv
 - hospital_id: hospital-006470
   name: Texas NeuroRehab Center
   cms_hpt_url: https://texasneurorehab.com/cms-hpt.txt
@@ -24008,6 +24014,7 @@ hospitals:
 - hospital_id: hospital-007197
   name: Wood County Hospital
   cms_hpt_url: https://www.woodcountyhospital.org/cms-hpt.txt
+  fallback_mrf_url: https://www.woodcountyhospital.org/media/kddhfk3m/344440884_wood-county_standardchargescsv.zip
 - hospital_id: hospital-007198
   name: Woodhull Medical Center
   cms_hpt_url: https://www.nychealthandhospitals.org/cms-hpt.txt
