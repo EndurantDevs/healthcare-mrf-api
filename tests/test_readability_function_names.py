@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 import textwrap
 from importlib import util
@@ -35,7 +36,16 @@ def _build_readability_snapshot_by_category(
     return readability_budget.build_snapshot(repo_root, readability_options_by_name)
 
 
-def test_confusable_function_names_reports_plurality_only_difference(tmp_path):
+def test_confusable_function_names_reports_plurality_only_difference(monkeypatch, tmp_path):
+    source_files = sys.modules["readability.source_files"]
+    original_parse = source_files.ast.parse
+    parse_calls = []
+
+    def counted_parse(source) -> ast.AST:
+        parse_calls.append(source)
+        return original_parse(source)
+
+    monkeypatch.setattr(source_files.ast, "parse", counted_parse)
     snapshot = _build_readability_snapshot_by_category(
         tmp_path,
         {
@@ -46,9 +56,12 @@ def test_confusable_function_names_reports_plurality_only_difference(tmp_path):
                 def _register_care_codes_tool():
                     return None
             """,
+            "pkg/broken.py": "def broken(:\n    pass\n",
         },
     )
 
+    assert len(parse_calls) == 2
+    assert snapshot["issue_counts"]["syntax_errors"] == 1
     assert snapshot["issue_counts"]["confusable_function_names"] == 1
     assert snapshot["issues"]["confusable_function_names"][0]["functions"] == [
         "_register_care_codes_tool",

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import stat
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
@@ -21,6 +22,7 @@ from process.nppes_public_evidence_chain import (
 from process.nppes_public_evidence_prepared_chain import (
     _listing_file_identity,
     build_prepared_nppes_release_chain,
+    validate_prepared_nppes_release_chain,
 )
 from process.nppes_public_evidence_import import (
     NppesEvidenceRuntimeConfig,
@@ -142,6 +144,17 @@ def test_prepared_chain_repr_and_listing_identity_boundaries(tmp_path) -> None:
     symlink.symlink_to(prepared_chain.listing.path)
     with pytest.raises(NppesPublicEvidenceArchiveError):
         _listing_file_identity(symlink)
+
+    listing_path = prepared_chain.listing.path
+    listing_mode = stat.S_IMODE(listing_path.stat().st_mode)
+    listing_path.chmod(listing_mode | stat.S_IXUSR)
+    prepared_chain = build_prepared_nppes_release_chain(
+        prepared_chain.listing,
+        prepared_chain.archives,
+    )
+    listing_path.chmod(listing_mode & ~stat.S_IXUSR)
+    with pytest.raises(NppesPublicEvidenceArchiveError):
+        validate_prepared_nppes_release_chain(prepared_chain)
 
     with pytest.raises(NppesPublicEvidenceArchiveError):
         build_prepared_nppes_release_chain(prepared_chain.listing, ())
