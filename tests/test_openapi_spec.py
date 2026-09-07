@@ -456,7 +456,7 @@ def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
     assert "never contains serialized JSON" in display_description
     assert schemas["ProviderProfileDocument"]["properties"]["composer_version"][
         "example"
-    ] == "provider-profile-composer/v5"
+    ] == "provider-profile-composer/v6"
     summary = schemas["ProviderProfessionalSummary"]
     assert summary["additionalProperties"] is False
     assert summary["required"] == ["label", "text", "authorship", "basis"]

@@ -41,8 +41,18 @@ discards its staging tables and never publishes either dataset.
 - Failed acquisition or publication removes the unpublished education stage
   created by that worker. Existing stages belonging to another run are retained.
 - Live tables retain one `_old` rollback generation. Florida and FHIR profile
-  publications are not modified. The education table is created by its importer;
-  API integration is delivered separately.
+  publications are not modified. The education table is created by its importer.
+- `GET /api/v1/npi/id/{npi}/profile` composes these assertions in the `education`
+  category alongside Florida and Provider Directory facts. CMS facts use the
+  `education_history` type with `institution` and `graduation_year` values and
+  `cms_reported` assertion metadata; neither value implies verified completion.
+  Source quality flags are retained, and future years are labeled as reported
+  future years. No clinical experience is calculated from graduation.
+- CMS evidence is under `provider_profile_evidence.sources.cms_doctors` when
+  `include_evidence=true`, filtered to the facts on the returned page. Profile
+  generation IDs include the CMS source generation, so stale category-page
+  requests receive the existing generation-conflict response. Before the first
+  CMS import, profiles continue to serve available Florida and FHIR data.
 - CMS covers Medicare-listed clinicians of multiple professions. It is not an
   exhaustive physician roster or a source of residency/employment history.
 

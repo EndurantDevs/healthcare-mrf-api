@@ -19,7 +19,7 @@ from api.provider_profile_public_facts import (
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
 from process.provider_profile_reported_range import normalize_projected_state_facts
 
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v5"
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v6"
 
 
 def _empty_profile(npi: int) -> dict[str, Any]:
@@ -83,10 +83,12 @@ def _source_generation_ids(
         fhir_generation_id = (
             "content:" + hashlib.sha256(serialized_profile.encode()).hexdigest()
         )
-    source_generation_ids_by_key = {
-        "state_regulator": state_generation_id,
-        "provider_directory_fhir": fhir_generation_id,
-    }
+    projection_generations = state_projection.get("source_generations") if state_projection else None
+    source_generation_ids_by_key = (
+        dict(projection_generations) if isinstance(projection_generations, Mapping)
+        else {"state_regulator": state_generation_id}
+    )
+    source_generation_ids_by_key["provider_directory_fhir"] = fhir_generation_id
     return {
         source_key: generation_id
         for source_key, generation_id in source_generation_ids_by_key.items()
@@ -165,7 +167,7 @@ def _existing_items_by_fhir_key(
         if isinstance(profile_item, Mapping)
     }
     for existing_item in existing_items_by_key.values():
-        if existing_item.get("source_record_id"):
+        if existing_item.get("source_record_id") and "cms_doctors" not in existing_item.get("source_kinds", []):
             existing_item["source_kinds"] = sorted(
                 {*existing_item.get("source_kinds", []), "state_regulator"}
             )
@@ -188,10 +190,10 @@ def _merge_existing_fhir_item(
     if not existing_item.get("assertions"):
         existing_item["assertions"] = [
             {
-                "source_kind": "state_regulator",
+                "source_kind": source_kind,
                 "assertion_type": existing_item.get("assertion_type"),
                 "verification_status": existing_item.get("verification_status"),
-            }
+            } for source_kind in existing_item.get("source_kinds") or ["state_regulator"]
         ]
     fhir_assertion_by_field = {
         "source_kind": "provider_directory_fhir",
