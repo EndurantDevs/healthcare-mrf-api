@@ -33,6 +33,30 @@ class _RecordingTransaction:
         self.executed.append((str(statement), params))
 
 
+def test_lifecycle_transaction_normalizes_retryable_database_error():
+    error = RuntimeError("lock unavailable")
+    error.sqlstate = "55P03"
+    transaction = _RecordingTransaction([])
+    database = AsyncMock()
+    database.transaction = lambda: transaction
+
+    async def exercise():
+        async with ptg2_lifecycle_lock.ptg2_lifecycle_transaction(
+            database,
+            busy_message="busy; retry",
+        ) as session:
+            assert session is transaction
+            raise error
+
+    with pytest.raises(
+        ptg2_lifecycle_lock.PTG2LifecycleLockDeferred,
+        match="busy; retry",
+    ) as caught:
+        asyncio.run(exercise())
+    assert caught.value.__cause__ is error
+    assert not transaction.active
+
+
 def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypatch):
     publish_calls = []
     clear_calls = []
