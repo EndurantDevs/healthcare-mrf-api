@@ -318,6 +318,7 @@ async def materialize_factorized_projection(
 
     _validated_binding_ordinals(bindings)
     state = _BuildState(content_digest)
+    _work._work_limits(state)
     await _create_stage_tables(session)
     code_identities = sorted(
         {

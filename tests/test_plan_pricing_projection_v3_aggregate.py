@@ -24,6 +24,17 @@ from api.plan_pricing_projection_source import BindingProjection
 PROJECTION_ID = "a" * 64
 
 
+@pytest.fixture
+def calibrated_work_limits(monkeypatch):
+    for limit_name in (
+        "MAX_CODE_MEMBERSHIP_PROBES",
+        "MAX_PROJECTION_MEMBERSHIP_PROBES",
+        "MAX_CODE_MEMBER_CELL_WORK_ROWS",
+        "MAX_PROJECTION_MEMBER_CELL_WORK_ROWS",
+    ):
+        monkeypatch.setattr(projection._work, limit_name, 100)
+
+
 class _ExecuteSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
@@ -156,6 +167,7 @@ def test_seal_counts_reject_inconsistent_builder_outputs() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("calibrated_work_limits")
 async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) -> None:
     create_stage = AsyncMock()
     materialize_cells = AsyncMock()
@@ -286,6 +298,7 @@ async def test_materializer_rejects_duplicate_binding_ordinals() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("calibrated_work_limits")
 async def test_materializer_work_rejection_precedes_both_writers(monkeypatch) -> None:
     monkeypatch.setattr(projection, "_create_stage_tables", AsyncMock())
     monkeypatch.setattr(
@@ -319,3 +332,27 @@ async def test_materializer_work_rejection_precedes_both_writers(monkeypatch) ->
     aggregate_records.assert_not_awaited()
     store_aggregate_packs.assert_not_awaited()
     persist_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limit_name",
+    (
+        "MAX_CODE_MEMBERSHIP_PROBES",
+        "MAX_PROJECTION_MEMBERSHIP_PROBES",
+        "MAX_CODE_MEMBER_CELL_WORK_ROWS",
+        "MAX_PROJECTION_MEMBER_CELL_WORK_ROWS",
+    ),
+)
+async def test_uncalibrated_materializer_rejects_before_staging(
+    monkeypatch, calibrated_work_limits, limit_name
+) -> None:
+    monkeypatch.setattr(projection._work, limit_name, None)
+    session = SimpleNamespace(execute=AsyncMock())
+
+    with pytest.raises(ValueError, match="not calibrated"):
+        await projection.materialize_factorized_projection(
+            session, PROJECTION_ID, [_binding()], hashlib.sha256()
+        )
+
+    session.execute.assert_not_awaited()
