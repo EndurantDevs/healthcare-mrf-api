@@ -3,6 +3,7 @@ from copy import deepcopy
 import io
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -18,6 +19,29 @@ from tests.ptg2_v4_graph_compiler_test_support import (
     compiler_fixture as _fixture,
     scanner_binary as _binary,
 )
+
+
+def test_scanner_binary_reuses_prebuilt(monkeypatch, tmp_path: Path) -> None:
+    target_root = tmp_path / "target"
+    candidate = target_root / "debug" / "ptg2_provider_graph_v4"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"exact-source test binary")
+    candidate.chmod(0o755)
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(target_root))
+    monkeypatch.delenv("PREPUSH_RUST_BINARIES", raising=False)
+
+    with mock.patch(
+        "tests.ptg2_v4_graph_compiler_test_support.subprocess.run"
+    ) as build:
+        assert _binary() == candidate
+        assert build.call_count == 1
+        monkeypatch.setenv("PREPUSH_RUST_BINARIES", "/exact-source-artifact")
+        assert _binary() == candidate
+        assert build.call_count == 1
+        candidate.chmod(0o644)
+        with pytest.raises(RuntimeError, match="test binary was not built"):
+            _binary()
+        assert build.call_count == 1
 
 
 def _progress_event(

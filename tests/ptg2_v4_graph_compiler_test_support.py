@@ -356,20 +356,21 @@ def scanner_binary() -> Path:
     target_root = Path(os.getenv("CARGO_TARGET_DIR", scanner_root / "target"))
     if not target_root.is_absolute():
         target_root = root / target_root
-    subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--locked",
-            "--bin",
-            "ptg2_provider_graph_v4",
-            "--manifest-path",
-            str(scanner_root / "Cargo.toml"),
-        ],
-        check=True,
-        cwd=root,
-        timeout=120,
-    )
+    if not os.environ.get("PREPUSH_RUST_BINARIES"):
+        subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--bin",
+                "ptg2_provider_graph_v4",
+                "--manifest-path",
+                str(scanner_root / "Cargo.toml"),
+            ],
+            check=True,
+            cwd=root,
+            timeout=120,
+        )
     candidate = target_root / "debug" / "ptg2_provider_graph_v4"
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
         raise RuntimeError("PTG2 V4 graph compiler test binary was not built")
