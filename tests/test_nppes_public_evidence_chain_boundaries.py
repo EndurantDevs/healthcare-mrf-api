@@ -147,7 +147,12 @@ def test_prepared_chain_repr_and_listing_identity_boundaries(tmp_path) -> None:
 
     listing_path = prepared_chain.listing.path
     listing_mode = stat.S_IMODE(listing_path.stat().st_mode)
-    listing_path.chmod(listing_mode ^ stat.S_IXUSR)
+    listing_path.chmod(listing_mode | stat.S_IXUSR)
+    prepared_chain = build_prepared_nppes_release_chain(
+        prepared_chain.listing,
+        prepared_chain.archives,
+    )
+    listing_path.chmod(listing_mode & ~stat.S_IXUSR)
     with pytest.raises(NppesPublicEvidenceArchiveError):
         validate_prepared_nppes_release_chain(prepared_chain)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 import textwrap
 from importlib import util
@@ -40,7 +41,7 @@ def test_confusable_function_names_reports_plurality_only_difference(monkeypatch
     original_parse = source_files.ast.parse
     parse_calls = []
 
-    def counted_parse(source):
+    def counted_parse(source) -> ast.AST:
         parse_calls.append(source)
         return original_parse(source)
 
