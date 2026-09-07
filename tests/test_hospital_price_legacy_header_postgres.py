@@ -45,6 +45,16 @@ PRODUCER_CSV_V4_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
 )
 
 
+@pytest.mark.asyncio
+async def test_postgres_v4_v2_requires_exact_current_csv_profile(monkeypatch) -> None:
+    """Run the current CSV shape proof in the hosted PostgreSQL core inventory."""
+    from tests.test_hospital_price_csv_v4_v2 import (
+        prove_csv_profile_constraints,
+    )
+
+    await prove_csv_profile_constraints(monkeypatch)
+
+
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     """Keep legacy-only successor fields absent without relaxing v3."""
 

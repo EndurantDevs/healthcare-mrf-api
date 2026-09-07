@@ -46,8 +46,7 @@ def test_v4_v2_migration_matches_current_model() -> None:
     assert migration.downgrade() is None
 
 
-@pytest.mark.asyncio
-async def test_postgres_v4_v2_requires_exact_current_csv_profile(monkeypatch) -> None:
+async def prove_csv_profile_constraints(monkeypatch) -> None:
     """Keep genuine V3 metadata strict inside the new admission constraint."""
 
     database_url = _database_url()
