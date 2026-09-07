@@ -289,6 +289,16 @@ def test_html_wrapper_preserves_literal_records_and_query_bytes():
     assert locator.parse_hospital_hpt_locator(fields.replace(b"\n", b"\r\n\r\n")) == expected
 
 
+def test_html_wrapper_allows_nonbinding_head_metadata():
+    payload = _html_wrapper(b"location-name: Hospital\nmrf-url: https://files.example/a\n")
+    with_metadata = payload.replace(
+        b"<head>", b'<head><!-- metadata --><meta charset="utf-8"/>'
+    )
+    assert locator.parse_hospital_hpt_locator(with_metadata) == (
+        _record("Hospital", "https://files.example/a"),
+    )
+
+
 @pytest.mark.parametrize(
     "fields",
     (
@@ -324,6 +334,8 @@ def test_html_wrapper_never_discovers_or_reconstructs_binding_fields(fields):
         lambda body: body.replace(b"<body>", b"<body><body>"),
         lambda body: body.replace(b"</html>", b"</html>unexpected"),
         lambda body: body.replace(b"</html>", b"</html>&amp;"),
+        lambda body: body.replace(b"</head>", b"</head><div>"),
+        lambda body: body.replace(b"<body>", b"<body><!DOCTYPE html>"),
         lambda body: body.replace(b"<head>", b"<head>\x00"),
         lambda body: body.replace(b"<head>", b"<head><template>"),
         lambda body: body.replace(b"<head>", b"<head><template/>"),
