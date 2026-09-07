@@ -281,11 +281,12 @@ async def test_evidence_is_immutable_and_publication_is_one_generation_cas():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("html_wrapper", (False, True))
 @pytest.mark.parametrize(
     "contact_metadata",
     ["", "contact-name: Price Team\ncontact-name: billing@example.com\n"],
 )
-async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch, contact_metadata):
+async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch, contact_metadata, html_wrapper):
     acquisition = _acquisition_module()
     locator_path = tmp_path / "cms-hpt.txt"
     locator_payload = (
@@ -293,6 +294,13 @@ async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch, c
         "mrf-url: https://hospital.example/12-3456789_prices.json\n"
         + contact_metadata
     ).encode()
+    if html_wrapper:
+        locator_payload = (
+            b"<!DOCTYPE html><html><head><script src='/site.js'></script></head><body>\n"
+            + locator_payload
+            + b"contact-email: <a href='/email-protection'>[email&#160;protected]</a>\n"
+            b"<script src='/email.js'></script></body></html>"
+        )
     locator_path.write_bytes(locator_payload)
     options_by_name: dict[str, Any] = {}
     raw = SimpleNamespace(

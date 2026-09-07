@@ -12791,7 +12791,7 @@ hospitals:
   cms_hpt_url: https://www.mclaren.org/cms-hpt.txt
 - hospital_id: hospital-003824
   name: McLean Hospital
-  cms_hpt_url: https://www.mcleanhospital.org/cms-hpt.txt
+  cms_hpt_url: https://www.massgeneralbrigham.org/cms-hpt.txt
 - hospital_id: hospital-003825
   name: McLeansboro Family Medicine
   cms_hpt_url: https://ferrellhospital.org/cms-hpt.txt
