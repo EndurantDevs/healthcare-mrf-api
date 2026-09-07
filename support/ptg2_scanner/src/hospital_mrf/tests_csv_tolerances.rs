@@ -136,6 +136,121 @@ include!("tests_metadata_address.rs");
         records
     }
 
+    fn csv_redundant_name_records(payload: &[u8]) -> Vec<Vec<String>> {
+        let mut records = csv_redundant_address_records(payload);
+        let legacy = csv_fixture_index(&records[0], "hospital_location");
+        let location = csv_fixture_index(&records[0], "location_name");
+        records[1][legacy] = records[1][location].clone();
+        records
+    }
+
+    #[test]
+    fn csv_redundant_name_detects_v3_and_preserves_declared_metadata() {
+        for (format, fixture) in [
+            (InputFormat::TallCsv, fixture_tall_csv()),
+            (InputFormat::WideCsv, fixture_wide_csv()),
+        ] {
+            for version in ["1", "1.0.0", "2", "2.0.0", "2.2.0", "2.2.1", "3.0.0", "3.0.1", "4.0.0"] {
+                let mut records = csv_fixture_records(&fixture);
+                for (field, value) in [
+                    ("version", version),
+                    (ATTESTATION_TEXT, if version == "2.0.0" { "false" } else { "true" }),
+                    ("type_2_npi", "1234567890, 1111111111"),
+                ] {
+                    let index = csv_fixture_index(&records[0], field);
+                    records[1][index] = value.to_owned();
+                }
+                let canonical = csv_fixture_bytes(&records);
+                let redundant = csv_fixture_bytes(&csv_redundant_name_records(&canonical));
+                let expected = run_fixture(format, &canonical, false);
+                let (actual, summary) = run_fixture_with_summary(format, &redundant, false);
+                assert_eq!(actual, expected);
+                assert_eq!(summary.schema_version, version);
+                let mrf = std::str::from_utf8(&actual["mrf"]).unwrap();
+                let fields = mrf.trim_end().split('\t').collect::<Vec<_>>();
+                assert_eq!(fields[3], version);
+                assert_eq!(fields[4], ATTESTATION_TEXT);
+                assert_eq!(fields[5], if version == "2.0.0" { "false" } else { "true" });
+                assert!(std::str::from_utf8(&actual["npi"]).unwrap()
+                    .contains("\t0\t1234567890, 1111111111\n"));
+                if version == "2.0.0" {
+                    assert_eq!(run_fixture(format, &redundant, true), expected);
+                    assert_eq!(run_zip_fixture(format, &redundant, CompressionMethod::Deflated), expected);
+                    let (_canonical_dir, canonical_summary) = import_packed(format, &canonical, TEST_MAX_OUTPUT_BYTES);
+                    let (_redundant_dir, redundant_summary) = import_packed(format, &redundant, TEST_MAX_OUTPUT_BYTES);
+                    assert_eq!(redundant_summary.schema_version, version);
+                    assert_eq!(
+                        canonical_summary.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>(),
+                        redundant_summary.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csv_redundant_name_rejects_ambiguity_and_keeps_v3_validation() {
+        for (format, fixture) in [
+            (InputFormat::TallCsv, fixture_tall_csv()),
+            (InputFormat::WideCsv, fixture_wide_csv()),
+        ] {
+            let mut fixture = csv_redundant_name_records(&fixture);
+            let version = csv_fixture_index(&fixture[0], "version");
+            fixture[1][version] = "2.0.0".to_owned();
+            for (legacy, location, address) in [
+                ("Other", "Main", "1 Main St"), (" Main", "Main", "1 Main St"),
+                ("Main", "Main ", "1 Main St"), ("main", "Main", "1 Main St"),
+                ("", "", "1 Main St"), (" ", " ", "1 Main St"),
+                ("Main|Second", "Main|Second", "1 Main St"),
+                ("Main", "Main", ""), ("Main", "Main", " "),
+                ("Main", "Main", "1 Main St|2 North St"),
+            ] {
+                let mut records = fixture.clone();
+                for (field, value) in [("hospital_location", legacy), ("location_name", location), ("hospital_address", address)] {
+                    let index = csv_fixture_index(&records[0], field);
+                    records[1][index] = value.to_owned();
+                }
+                assert_import_error(format, &csv_fixture_bytes(&records), DEFAULT_MAX_FANOUT_ROWS,
+                    "headers mix V2 and V3 profiles");
+            }
+            for (field, value, error) in [
+                ("type_2_npi", "", "type_2_npi"), ("attester_name", "", "attester_name"),
+                (ATTESTATION_TEXT, "1", "attestation value must be true or false"),
+                ("version", "5.0.0", "unsupported CMS CSV version"),
+            ] {
+                let mut records = fixture.clone();
+                let index = csv_fixture_index(&records[0], field);
+                records[1][index] = value.to_owned();
+                assert_import_error(format, &csv_fixture_bytes(&records), DEFAULT_MAX_FANOUT_ROWS, error);
+            }
+            for field in ["hospital_location", AFFIRMATION_TEXT] {
+                let mut records = fixture.clone();
+                let spare = records[0].iter().position(String::is_empty).unwrap();
+                records[0][spare] = field.to_owned();
+                assert_import_error(format, &csv_fixture_bytes(&records), DEFAULT_MAX_FANOUT_ROWS,
+                    if field == "hospital_location" { "duplicate general CSV header" } else { "headers mix V2 and V3 profiles" });
+            }
+            let mut missing_attestation = fixture.clone();
+            let index = csv_fixture_index(&missing_attestation[0], ATTESTATION_TEXT);
+            missing_attestation[0][index].clear();
+            assert_import_error(format, &csv_fixture_bytes(&missing_attestation), DEFAULT_MAX_FANOUT_ROWS,
+                "headers mix V2 and V3 profiles");
+            for replacement in ["", "estimated_amount"] {
+                let mut records = fixture.clone();
+                let index = records[2].iter().position(|h| h.starts_with("median_amount")).unwrap();
+                records[2][index] = if replacement.is_empty() { String::new() } else {
+                    records[2][index].replacen("median_amount", replacement, 1)
+                };
+                assert_import_error(format, &csv_fixture_bytes(&records), DEFAULT_MAX_FANOUT_ROWS,
+                    if replacement.is_empty() { "median_amount" } else { "mix V2 and V3 payer profiles" });
+            }
+            let mut excess_npis = fixture.clone();
+            let index = csv_fixture_index(&excess_npis[0], "type_2_npi");
+            excess_npis[1][index] = "1234567890|1111111111".to_owned();
+            assert_import_error(format, &csv_fixture_bytes(&excess_npis), 1, "fanout exceeds configured limit");
+        }
+    }
+
     #[test]
     fn csv_redundant_address_preserves_copy_packed_and_container_semantics() {
         for (format, fixture) in [

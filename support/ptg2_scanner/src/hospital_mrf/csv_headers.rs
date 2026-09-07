@@ -158,34 +158,35 @@ fn parse_csv_metadata(
     };
     let version = required_text(value("version")?, "version")?.to_owned();
     let declared_profile = CmsProfile::parse_csv(&version)?;
+    // A single V3 name may be repeated verbatim under the legacy header.
+    // Retain the existing 3.0.0 redundant-address case; compare decoded cells
+    // before trimming so conflicting or multi-site data stays invalid.
+    let has_redundant_legacy_location = matches!(
+        ["hospital_location", "hospital_address", "location_name"]
+            .map(|name| fields.get(name).and_then(|index| values.get(*index))),
+        [Some(legacy), Some(address), Some(location)]
+            if (legacy == location
+                || (version == HOSPITAL_MRF_SCHEMA_VERSION && legacy == address))
+                && !address.trim().is_empty() && !address.contains('|')
+                && !location.trim().is_empty() && !location.contains('|')
+    );
     let profile = if declared_profile == CmsProfile::V2
         && fields.contains_key("location_name")
         && attestation_index.is_some()
-        && !fields.contains_key("hospital_location")
+        && (!fields.contains_key("hospital_location") || has_redundant_legacy_location)
         && affirmation_index.is_none()
     {
         CmsProfile::V3
     } else {
         declared_profile
     };
-    // A single V3 address may also be repeated verbatim under the legacy header.
-    // Compare decoded cells before trimming; conflicting or multi-site data stays invalid.
-    let has_redundant_legacy_address = version == HOSPITAL_MRF_SCHEMA_VERSION
-        && matches!(
-            ["hospital_location", "hospital_address", "location_name"]
-                .map(|name| fields.get(name).and_then(|index| values.get(*index))),
-            [Some(legacy), Some(address), Some(location)]
-                if legacy == address
-                    && !address.trim().is_empty() && !address.contains('|')
-                    && !location.trim().is_empty() && !location.contains('|')
-        );
     let mixed_field = match profile {
         CmsProfile::V2 => fields
             .contains_key("location_name")
             .then_some("location_name")
             .or_else(|| attestation_index.map(|_| "attestation")),
         CmsProfile::V3 => (fields.contains_key("hospital_location")
-            && !has_redundant_legacy_address)
+            && !has_redundant_legacy_location)
             .then_some("hospital_location")
             .or_else(|| affirmation_index.map(|_| "affirmation")),
     };
