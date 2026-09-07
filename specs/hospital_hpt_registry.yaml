@@ -3820,9 +3820,11 @@ hospitals:
   name: Carson Tahoe Health
   cms_hpt_url: https://www.carsontahoe.com/cms-hpt.txt
   locator_name: Carson Tahoe Regional Healthcare
+  fallback_mrf_url: https://apim.services.craneware.com/api-pricing-transparency/api/public/633d776663e0de8f00d1b829ca9ce867/charges/mrf
 - hospital_id: hospital-001131
   name: Carson Tahoe Regional Healthcare
   cms_hpt_url: https://www.carsontahoe.com/cms-hpt.txt
+  fallback_mrf_url: https://apim.services.craneware.com/api-pricing-transparency/api/public/633d776663e0de8f00d1b829ca9ce867/charges/mrf
 - hospital_id: hospital-001132
   name: Carson Valley Health
   cms_hpt_url: https://carsonvalleyhealth.org/cms-hpt.txt
@@ -11371,10 +11373,10 @@ hospitals:
   cms_hpt_url: https://www.kdmc.org/cms-hpt.txt
 - hospital_id: hospital-003394
   name: King's Daughters Medical Center
-  cms_hpt_url: https://www.kingsdaughtershealth.com/cms-hpt.txt
+  cms_hpt_url: https://search.hospitalpriceindex.com/7804/cms-hpt.txt
 - hospital_id: hospital-003395
   name: King's Daughters Medical Center - Ohio
-  cms_hpt_url: https://www.kingsdaughtershealth.com/cms-hpt.txt
+  cms_hpt_url: https://search.hospitalpriceindex.com/7805/cms-hpt.txt
 - hospital_id: hospital-003396
   name: Kingman Healthcare Center
   cms_hpt_url: https://www.kingmanhc.com/cms-hpt.txt
@@ -16142,6 +16144,7 @@ hospitals:
   name: Ohio Valley Medical Center
   cms_hpt_url: https://www.ovsurgical.com/cms-hpt.txt
   locator_name: OHIO VALLEY SURGICAL HOSPITAL
+  alias_of: hospital-004819
 - hospital_id: hospital-004819
   name: OHIO VALLEY SURGICAL HOSPITAL
   cms_hpt_url: https://www.ovsurgical.com/cms-hpt.txt
@@ -24504,3 +24507,32 @@ hospitals:
 - hospital_id: hospital-007356
   name: "WellSpan Surgery & Rehabilitation Hospital"
   cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007357
+  name: "College Hospital Costa Mesa"
+  cms_hpt_url: https://chcm.us/cms-hpt.txt
+- hospital_id: hospital-007358
+  name: "El Camino Hospital (Mountain View)"
+  cms_hpt_url: https://www.elcaminohealth.org/cms-hpt.txt
+- hospital_id: hospital-007359
+  name: "El Camino Hospital (Los Gatos)"
+  cms_hpt_url: https://www.elcaminohealth.org/cms-hpt.txt
+- hospital_id: hospital-007360
+  name: "Andalusia Health"
+  cms_hpt_url: https://www.andalusiahealth.com/cms-hpt.txt
+- hospital_id: hospital-007361
+  name: "Oroville Hospital"
+  cms_hpt_url: https://www.orovillehospital.com/cms-hpt.txt
+- hospital_id: hospital-007362
+  name: "Evergreen Medical Center"
+  cms_hpt_url: https://www.evergreenmedical.org/cms-hpt.txt
+  fallback_mrf_url: https://irp.cdn-website.com/1a9867e2/files/uploaded/208057151_evergreenmedicalcenter_standardcharges-8969ef83.csv
+- hospital_id: hospital-007363
+  name: "Helen Keller Hospital"
+  cms_hpt_url: https://hh.health/cms-hpt.txt
+- hospital_id: hospital-007364
+  name: "Red Bay Hospital"
+  cms_hpt_url: https://hh.health/cms-hpt.txt
+  locator_mrf_url: https://hh.health/wp-content/uploads/472323163_red-bay-hospital_standardcharges.csv
+- hospital_id: hospital-007365
+  name: "Hale County Hospital"
+  cms_hpt_url: https://www.halecountyhospital.com/cms-hpt.txt

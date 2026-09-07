@@ -238,6 +238,7 @@ fn parse_wide_columns(
 ) -> io::Result<WideCsvColumns> {
     let mut payer_order = Vec::<(String, String, Option<String>)>::new();
     let mut payers = BTreeMap::<(String, String, Option<String>), WidePayerBuilder>::new();
+    let mut duplicate_columns = Vec::new();
     for (column, header) in headers.iter().enumerate() {
         let raw_parts = header.split('|').map(str::trim).collect::<Vec<_>>();
         let normalized_parts = raw_parts
@@ -362,8 +363,10 @@ fn parse_wide_columns(
             "additional_payer_notes" => &mut builder.additional_payer_notes,
             _ => unreachable!("wide payer field was filtered"),
         };
-        if slot.replace(column).is_some() {
-            return Err(invalid(format!("duplicate wide CSV payer header {header}")));
+        if let Some(first) = *slot {
+            duplicate_columns.push((first, column));
+        } else {
+            *slot = Some(column);
         }
     }
     let payers = payer_order
@@ -470,5 +473,6 @@ fn parse_wide_columns(
         requires_estimated_amount,
         common: parse_common_columns(headers, profile, max_fanout_rows)?,
         payers,
+        duplicate_columns,
     })
 }

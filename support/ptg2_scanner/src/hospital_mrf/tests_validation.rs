@@ -378,11 +378,11 @@
         duplicate.push(
             "STANDARD_CHARGE|payer, inc.|PLAN A|NEGOTIATED_DOLLAR".to_owned(),
         );
-        let error =
-            parse_wide_columns(&StringRecord::from(duplicate), CmsProfile::V3, true, 1).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("duplicate wide CSV payer header"));
+        let duplicate_columns =
+            parse_wide_columns(&StringRecord::from(duplicate), CmsProfile::V3, true, 1).unwrap();
+        assert_eq!(duplicate_columns.payers.len(), 1);
+        assert_eq!(duplicate_columns.payers[0].standard_charge_dollar, 10);
+        assert_eq!(duplicate_columns.duplicate_columns, vec![(10, headers.len())]);
 
         let missing_notes = headers
             .into_iter()
@@ -453,3 +453,4 @@
         );
         run_fixture(InputFormat::WideCsv, &note_only_payer, false);
     }
+include!("tests_duplicate_wide.rs");

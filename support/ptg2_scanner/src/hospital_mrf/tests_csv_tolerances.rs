@@ -127,6 +127,144 @@
     }
 include!("tests_metadata_address.rs");
 
+    fn csv_redundant_address_records(payload: &[u8]) -> Vec<Vec<String>> {
+        let mut records = csv_fixture_records(payload);
+        let spare = records[0].iter().position(String::is_empty).unwrap();
+        let address = csv_fixture_index(&records[0], "hospital_address");
+        records[0][spare] = "hospital_location".to_owned();
+        records[1][spare] = records[1][address].clone();
+        records
+    }
+
+    #[test]
+    fn csv_redundant_address_preserves_copy_packed_and_container_semantics() {
+        for (format, fixture) in [
+            (InputFormat::TallCsv, fixture_tall_csv()),
+            (InputFormat::WideCsv, fixture_wide_csv()),
+        ] {
+            for confirmation in ["true", "false"] {
+                let mut records = csv_fixture_records(&fixture);
+                let index = csv_fixture_index(&records[0], ATTESTATION_TEXT);
+                records[1][index] = confirmation.to_owned();
+                let canonical = csv_fixture_bytes(&records);
+                let redundant = csv_fixture_bytes(&csv_redundant_address_records(&canonical));
+                let expected = run_fixture(format, &canonical, false);
+                assert_eq!(run_fixture(format, &redundant, false), expected);
+                assert_eq!(run_fixture(format, &redundant, true), expected);
+                assert_eq!(
+                    run_zip_fixture(format, &redundant, CompressionMethod::Deflated),
+                    expected
+                );
+                let (_canonical_dir, canonical_summary) =
+                    import_packed(format, &canonical, TEST_MAX_OUTPUT_BYTES);
+                let (_redundant_dir, redundant_summary) =
+                    import_packed(format, &redundant, TEST_MAX_OUTPUT_BYTES);
+                assert_eq!(redundant_summary.schema_version, "3.0.0");
+                assert_eq!(
+                    canonical_summary.artifacts.iter()
+                        .map(|artifact| (artifact.kind, artifact.rows, &artifact.sha256))
+                        .collect::<Vec<_>>(),
+                    redundant_summary.artifacts.iter()
+                        .map(|artifact| (artifact.kind, artifact.rows, &artifact.sha256))
+                        .collect::<Vec<_>>()
+                );
+                let root = redundant_summary.root.unwrap();
+                assert_eq!((root.service_count, root.charge_count, root.fact_count), (1, 1, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn csv_redundant_address_rejects_ambiguous_metadata() {
+        let fixture = csv_redundant_address_records(&fixture_tall_csv());
+        for (legacy, address, location, version) in [
+            ("Other address", "1 Main St", "Main", "3.0.0"),
+            (" 1 Main St", "1 Main St", "Main", "3.0.0"),
+            ("1 Main St", "1 Main St ", "Main", "3.0.0"),
+            ("", "", "Main", "3.0.0"),
+            (" ", " ", "Main", "3.0.0"),
+            ("1 Main St", "1 Main St", "", "3.0.0"),
+            ("1 Main St", "1 Main St", " ", "3.0.0"),
+            ("1 Main St|", "1 Main St|", "Main", "3.0.0"),
+            ("1 Main St|2 Main St", "1 Main St|2 Main St", "Main", "3.0.0"),
+            ("1 Main St", "1 Main St", "Main|", "3.0.0"),
+            ("1 Main St", "1 Main St", "Main|Second", "3.0.0"),
+            ("1 Main St", "1 Main St", "Main", "2.0.0"),
+            ("1 Main St", "1 Main St", "Main", "3.0.1"),
+            ("1 Main St", "1 Main St", "Main", "4.0.0"),
+        ] {
+            let mut records = fixture.clone();
+            for (field, value) in [
+                ("hospital_location", legacy), ("hospital_address", address),
+                ("location_name", location), ("version", version),
+            ] {
+                let index = csv_fixture_index(&records[0], field);
+                records[1][index] = value.to_owned();
+            }
+            assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&records),
+                DEFAULT_MAX_FANOUT_ROWS, "headers mix V2 and V3 profiles");
+        }
+        for field in ["hospital_address", "location_name"] {
+            let mut records = fixture.clone();
+            let index = csv_fixture_index(&records[0], field);
+            records[0][index].clear();
+            assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&records),
+                DEFAULT_MAX_FANOUT_ROWS, "headers mix V2 and V3 profiles");
+        }
+        for (header, expected) in [
+            ("hospital_location", "duplicate general CSV header hospital_location"),
+            (AFFIRMATION_TEXT, "headers mix V2 and V3 profiles at affirmation"),
+        ] {
+            let mut records = fixture.clone();
+            let spare = records[0].iter().position(String::is_empty).unwrap();
+            records[0][spare] = header.to_owned();
+            records[1][spare] = "true".to_owned();
+            assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&records),
+                DEFAULT_MAX_FANOUT_ROWS, expected);
+        }
+    }
+
+    #[test]
+    fn csv_redundant_address_keeps_v3_validation_and_limits() {
+        let fixture = csv_redundant_address_records(&fixture_tall_csv());
+        for (field, value, expected) in [
+            ("type_2_npi", "", "type_2_npi"),
+            ("attester_name", "", "attester_name"),
+            (ATTESTATION_TEXT, "1", "attestation value must be true or false"),
+            (ATTESTATION_TEXT, "", "attestation value must be true or false"),
+        ] {
+            let mut records = fixture.clone();
+            let index = csv_fixture_index(&records[0], field);
+            records[1][index] = value.to_owned();
+            assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&records),
+                DEFAULT_MAX_FANOUT_ROWS, expected);
+        }
+        let mut missing_attestation = fixture.clone();
+        let index = csv_fixture_index(&missing_attestation[0], ATTESTATION_TEXT);
+        missing_attestation[0][index].clear();
+        assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&missing_attestation),
+            DEFAULT_MAX_FANOUT_ROWS, "missing attestation header");
+        let mut negative_rate = fixture.clone();
+        let index = csv_fixture_index(&negative_rate[2], "standard_charge | negotiated_dollar");
+        negative_rate[3][index] = "-1".to_owned();
+        assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&negative_rate),
+            DEFAULT_MAX_FANOUT_ROWS, "must be greater than zero");
+        let mut mixed_profile = fixture.clone();
+        let index = csv_fixture_index(&mixed_profile[2], "median_amount");
+        mixed_profile[2][index] = "estimated_amount".to_owned();
+        assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&mixed_profile),
+            DEFAULT_MAX_FANOUT_ROWS, "mix V2 and V3 payer profiles");
+        let mut excess_npis = fixture.clone();
+        let index = csv_fixture_index(&excess_npis[0], "type_2_npi");
+        excess_npis[1][index] = "1234567890|1111111111".to_owned();
+        assert_import_error(InputFormat::TallCsv, &csv_fixture_bytes(&excess_npis), 1,
+            "fanout exceeds configured limit");
+        let payload = csv_fixture_bytes(&fixture);
+        assert_import_error(InputFormat::TallCsv, &payload, 0, "max fanout rows must be positive");
+        assert_payload_limit_error(InputFormat::TallCsv, &payload, 128,
+            "CSV record exceeds configured limit");
+    }
+
     fn unquote_fixture_hospital_name(payload: &[u8]) -> Vec<u8> {
         let payload = std::str::from_utf8(payload).unwrap();
         assert!(payload.contains("\"North, Hospital\""));

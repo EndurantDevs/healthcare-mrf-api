@@ -15,6 +15,17 @@ fn parse_wide_records<R: Read>(
 
     for record in records {
         let record = record.map_err(to_io_error)?;
+        for &(first, duplicate) in &columns.duplicate_columns {
+            if !matches!((record.get(first), record.get(duplicate)),
+                (Some(left), Some(right)) if left == right)
+            {
+                return Err(invalid(format!(
+                    "duplicate wide CSV payer columns {} and {} must have identical present values",
+                    first + 1,
+                    duplicate + 1,
+                )));
+            }
+        }
         if record.iter().all(|value| value.trim().is_empty()) {
             continue;
         }
