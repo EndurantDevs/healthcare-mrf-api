@@ -24064,6 +24064,7 @@ hospitals:
 - hospital_id: hospital-007229
   name: Wyandot Memorial Hospital
   cms_hpt_url: https://www.wyandotmemorial.org/cms-hpt.txt
+  fallback_mrf_url: https://www.wyandotmemorial.org/wp-content/uploads/2026/04/346408698_Wyandot-Memorial-Hospital_standardcharges.april_.2026.csv
 - hospital_id: hospital-007230
   name: Wyoming County Community Health System
   cms_hpt_url: https://www.wcchs.net/cms-hpt.txt
