@@ -24,6 +24,7 @@ from db.connection import Base
 from db.json_mixin import JSONOutputMixin
 
 __all__ = (
+    "CMSDoctorEducation",
     "ProviderProfileArtifact",
     "ProviderProfileFact",
     "ProviderProfileImportRun",
@@ -32,6 +33,26 @@ __all__ = (
 )
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
+
+
+class CMSDoctorEducation(Base, JSONOutputMixin):
+    """Distinct education assertions from one published CMS source file."""
+
+    __tablename__ = "cms_doctor_education"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "education_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "education_key"]
+
+    npi = Column(BigInteger, nullable=False)
+    education_key = Column(String(64), nullable=False)
+    medical_school = Column(TEXT)
+    graduation_year = Column(Integer)
+    generation_id = Column(String(64), nullable=False)
+    source_json = Column(JSON, nullable=False)
+    imported_at = Column(TIMESTAMP, nullable=False)
 
 
 class ProviderProfileImportRun(Base, JSONOutputMixin):

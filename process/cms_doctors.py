@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import datetime
 import hashlib
 import logging
 import os
 import tempfile
-import zipfile
-from io import BytesIO, TextIOWrapper
 from pathlib import PurePath
 
 from arq import create_pool
 
-from db.models import DoctorClinicianAddress, db
+from db.models import CMSDoctorEducation, DoctorClinicianAddress, db
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
 from process.cms_doctors_rows import doctor_address_row
+from process.cms_doctors_education import (
+    discard_education_stage,
+    import_doctor_education,
+    open_doctors_csv,
+    swap_education_stage,
+    validate_education_stage,
+)
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
@@ -164,7 +168,8 @@ async def _fetch_doctors_download_url(client) -> str:
             identifier == DEFAULT_DOCTORS_DATASET_ID
             or f"/dataset/{DEFAULT_DOCTORS_DATASET_ID}" in landing_page
             or (
-                "national downloadable file" in title
+                DEFAULT_DOCTORS_DATASET_ID == "mj5m-pzi6"
+                and "national downloadable file" in title
                 and "doctors and clinicians" in description
             )
         ):
@@ -239,35 +244,9 @@ async def _import_doctors_source(
         "test_mode": test_mode,
         "test_row_limit": test_row_limit,
     }
-    if source_path.lower().endswith(".zip"):
-        with zipfile.ZipFile(source_path) as archive:
-            csv_filename = next(
-                (name for name in archive.namelist() if name.lower().endswith(".csv")),
-                None,
-            )
-            if not csv_filename:
-                raise ValueError("No CSV inside the CMS Doctors ZIP")
-            logger.info("Streaming CSV from ZIP: %s", csv_filename)
-            with archive.open(csv_filename) as raw_file:
-                text_file = TextIOWrapper(
-                    raw_file,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                return await _consume_doctors_reader(
-                    csv.DictReader(text_file),
-                    **reader_kwargs_by_name,
-                )
-    logger.info("Streaming CSV: %s", os.path.basename(source_path))
-    with open(
-        source_path,
-        "r",
-        encoding="utf-8",
-        errors="replace",
-        newline="",
-    ) as raw_file:
+    with open_doctors_csv(source_path) as reader:
         return await _consume_doctors_reader(
-            csv.DictReader(raw_file),
+            reader,
             **reader_kwargs_by_name,
         )
 
@@ -313,6 +292,9 @@ async def import_cms_doctors_data(ctx, task=None):
             source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
 
             await _download_doctors_source(client, url, source_path)
+            ctx["context"]["education"] = await import_doctor_education(
+                source_path, url, ctx, task, DEFAULT_DOCTORS_DATASET_ID,
+            )
             accepted_rows += await _import_doctors_source(
                 source_path,
                 ctx=ctx,
@@ -322,6 +304,9 @@ async def import_cms_doctors_data(ctx, task=None):
                 test_mode=test_mode,
                 test_row_limit=test_row_limit,
             )
+    except BaseException:
+        await discard_education_stage(ctx)
+        raise
     finally:
         await client.close()
 
@@ -383,7 +368,7 @@ async def _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema: str):
     return address_stats
 
 
-async def _publish_cms_doctors_stage(stage_cls, db_schema: str) -> None:
+async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str) -> None:
     async with db.transaction():
         table = DoctorClinicianAddress.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -417,9 +402,27 @@ async def _publish_cms_doctors_stage(stage_cls, db_schema: str) -> None:
                     f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
                     f"RENAME TO {old_live_name};"
                 )
+        await swap_education_stage(import_date, db_schema)
 
 
-async def publish_cms_doctors_generation(ctx):
+async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> dict:
+    """Discard this test run's stages and report success without publishing."""
+    for model in (DoctorClinicianAddress, CMSDoctorEducation):
+        stage_cls = make_class(model, ctx["import_date"])
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__}")
+    context = ctx.get("context") or {}
+    context.pop("education_stage_owned", None)
+    metrics_by_name = {"rows": stage_rows, "education": context.get("education"), "published": False}
+    await mark_control_run(
+        str(context.get("control_run_id") or ctx.get("control_run_id") or ""),
+        status="succeeded",
+        phase_detail="cms-doctors test completed without publication",
+        metrics=metrics_by_name,
+    )
+    return metrics_by_name
+
+
+async def _publish_cms_doctors_generation(ctx):
     """Publish a completed CMS Doctors stage or record its terminal failure."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
@@ -429,7 +432,7 @@ async def publish_cms_doctors_generation(ctx):
         return
 
     await ensure_database(bool(context.get("test_mode")))
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     stage_cls = make_class(DoctorClinicianAddress, import_date)
     stage_rows = int(
         await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
@@ -437,13 +440,20 @@ async def publish_cms_doctors_generation(ctx):
     )
     if context.get("test_mode"):
         logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
+        return await _finish_cms_doctors_test_run(ctx, db_schema, stage_rows)
     elif stage_rows < DEFAULT_MIN_ROWS:
         raise RuntimeError(
             f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
         )
 
+    education_manifest = context.get("education")
+    if not education_manifest:
+        raise RuntimeError("cms_education_manifest_missing")
+    await validate_education_stage(import_date, db_schema, education_manifest)
     address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
-    await _publish_cms_doctors_stage(stage_cls, db_schema)
+    await raise_if_cancelled(ctx, {})
+    await _publish_cms_doctors_stage(stage_cls, db_schema, import_date)
+    context.pop("education_stage_owned", None)
 
     logger.info("CMS Doctors publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
@@ -457,6 +467,7 @@ async def publish_cms_doctors_generation(ctx):
     }
     terminal_metrics_by_name = {
         "rows": stage_rows,
+        "education": education_manifest,
         **({"address_resolve": address_stats.__dict__} if address_stats else {}),
     }
     await mark_control_run(
@@ -471,6 +482,14 @@ async def publish_cms_doctors_generation(ctx):
         **terminal_metrics_by_name,
         "terminal_progress": terminal_progress_by_name,
     }
+
+
+async def publish_cms_doctors_generation(ctx):
+    """Publish both CMS datasets and release any remaining owned education stage."""
+    try:
+        return await _publish_cms_doctors_generation(ctx)
+    finally:
+        await discard_education_stage(ctx)
 
 
 shutdown = publish_cms_doctors_generation
