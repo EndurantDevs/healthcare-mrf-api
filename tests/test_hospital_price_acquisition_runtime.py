@@ -26,7 +26,15 @@ class _ServerError(Exception):
         self.status = status
 
 
-def test_content_only_locator_binding_preserves_unknown_location():
+@pytest.mark.parametrize(
+    "locator_names",
+    (
+        ("Parent Hospital",),
+        ("Parent Hospital", "Parent Hospital"),
+        ("Parent Hospital", "Parent Hospital Annex"),
+    ),
+)
+def test_content_only_locator_binding_preserves_unknown_location(locator_names):
     acquisition = _acquisition_module()
     locator_url = "https://hospital.example/cms-hpt.txt"
     selector = "https://files.example/shared.csv"
@@ -41,13 +49,11 @@ def test_content_only_locator_binding_preserves_unknown_location():
         "locator-a",
         "observation-a",
         (hospital_by_field,),
-        (
+        tuple(
             acquisition.HospitalHptLocatorRecord(
-                "Parent Hospital", f"{selector}?sig=fresh"
-            ),
-            acquisition.HospitalHptLocatorRecord(
-                "Parent Hospital Annex", f"{selector}?sig=fresh"
-            ),
+                name, f"{selector}?sig=fresh"
+            )
+            for name in locator_names
         ),
     )
 

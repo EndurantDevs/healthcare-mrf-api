@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.hospital_price_control_support import acquisition_module
 from tests.hospital_price_orchestration_support import (
     ROOT,
     ArtifactStore,
@@ -203,6 +204,7 @@ async def test_source_refresh_preserves_content_only_location(
     tmp_path, monkeypatch
 ):
     orchestrator = _orchestrator_module()
+    acquisition = acquisition_module()
     expired_url = "https://files.example/prices.json?sig=expired"
     fresh_url = "https://files.example/prices.json?sig=fresh"
     locator_url = "https://hospital.example/cms-hpt.txt"
@@ -210,26 +212,19 @@ async def test_source_refresh_preserves_content_only_location(
         "one", "a", "Catalog Sublocation", expired_url, 0,
         locator_name=None, locator_url=locator_url,
     )
-    locator_result = SimpleNamespace(
-        url=locator_url, locator_id="locator", observation_id="observation",
-        hospitals=(), records=(SimpleNamespace(mrf_url=fresh_url),),
-        error_code=None, error_detail=None,
-    )
 
     async def fetch(item, _store):
         hospital = item[1][0]
         assert hospital["locator_mrf_url"] == "https://files.example/prices.json"
         assert "locator_name" not in hospital
-        return locator_result
+        return acquisition.LocatorResult(
+            locator_url, "locator", "observation", item[1],
+            (acquisition.HospitalHptLocatorRecord("Parent Hospital", fresh_url),),
+        )
 
     monkeypatch.setattr(orchestrator, "fetch_locator", fetch)
     monkeypatch.setattr(
-        orchestrator, "candidates_from_locators", lambda _results: (
-            SimpleNamespace(
-                hospital_id="a", source_url=fresh_url, locator_name=None,
-                locator_url=locator_url, initial_error_code=None,
-            ),
-        )
+        orchestrator, "candidates_from_locators", acquisition.candidates_from_locators
     )
     monkeypatch.setattr(orchestrator, "rebind_attempt_sources", AsyncMock())
 
