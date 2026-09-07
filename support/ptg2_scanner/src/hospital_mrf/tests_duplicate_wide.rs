@@ -19,6 +19,37 @@ fn duplicate_wide_fixture_columns(
 }
 
 #[test]
+fn redundant_address_and_identical_wide_columns_preserve_artifacts() {
+    let payload = fixture_wide_csv();
+    let mut records = csv_redundant_address_records(&payload);
+    let column = csv_fixture_index(
+        &records[2],
+        "standard_charge|Payer, Inc.|Plan A|negotiated_dollar",
+    );
+    let duplicate = duplicate_wide_fixture_columns(&mut records, &[column])[0].1;
+    let combined = csv_fixture_bytes(&records);
+    let expected = run_fixture(InputFormat::WideCsv, &payload, false);
+    assert_eq!(run_fixture(InputFormat::WideCsv, &combined, false), expected);
+    let (_control, baseline) =
+        import_packed(InputFormat::WideCsv, &payload, TEST_MAX_OUTPUT_BYTES);
+    let (_candidate, actual) =
+        import_packed(InputFormat::WideCsv, &combined, TEST_MAX_OUTPUT_BYTES);
+    assert_eq!(
+        baseline.artifacts.iter().map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>(),
+        actual.artifacts.iter().map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>(),
+    );
+    records[3][duplicate].push(' ');
+    assert_import_error(
+        InputFormat::WideCsv,
+        &csv_fixture_bytes(&records),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "must have identical present values",
+    );
+}
+
+#[test]
 fn identical_wide_payer_columns_preserve_v2_v3_artifacts_and_order() {
     for payload in [
         fixture_wide_csv(),

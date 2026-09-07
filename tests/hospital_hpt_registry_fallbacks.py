@@ -10,6 +10,8 @@ FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-000874": "8325c9437233a1f1bc4fb7abd3c28e998a62a2438373df8f3f2dae79a798ab19",
     "hospital-000875": "606ee129031ed40da5b749bb94967c8bb6f22fbffa14d0afec73f92362ce7ec8",
     "hospital-000876": "c651aa8538a43382af9e7e7550f3449b2e0068d79f9b91bd296d7835383f641e",
+    "hospital-001130": "c9dc42e9994f3bbffd6712fce42561125fe5341ac4b0067eb5e8217c696cd8f5",
+    "hospital-001131": "c9dc42e9994f3bbffd6712fce42561125fe5341ac4b0067eb5e8217c696cd8f5",
     "hospital-001163": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-001503": "6c134e170f5dfe9aa4ac2ab2dae9f0523bfa17262bb97813e16f07d2bba14615",
     "hospital-001577": "a58f8620bb4a6b572d1cfde45987eda651186a769bd62a3fc19995c8bf49e8a6",
@@ -73,6 +75,7 @@ FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
     "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
     "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
+    "hospital-007362": "cd65e238820bfd2b14a06f7287f7ed0c0a502a09b3cbfc9c9a7fbf3c5a17107e",
 } | dict.fromkeys(
     "hospital-001479 hospital-001480 hospital-001481".split(),
     "b3ef0b1c3281769a465777af55237151ebfb1bb95999133ad7be0a21d8e971fb",

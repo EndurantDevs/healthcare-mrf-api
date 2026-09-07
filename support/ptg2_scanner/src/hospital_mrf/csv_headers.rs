@@ -168,13 +168,24 @@ fn parse_csv_metadata(
     } else {
         declared_profile
     };
+    // A single V3 address may also be repeated verbatim under the legacy header.
+    // Compare decoded cells before trimming; conflicting or multi-site data stays invalid.
+    let has_redundant_legacy_address = version == HOSPITAL_MRF_SCHEMA_VERSION
+        && matches!(
+            ["hospital_location", "hospital_address", "location_name"]
+                .map(|name| fields.get(name).and_then(|index| values.get(*index))),
+            [Some(legacy), Some(address), Some(location)]
+                if legacy == address
+                    && !address.trim().is_empty() && !address.contains('|')
+                    && !location.trim().is_empty() && !location.contains('|')
+        );
     let mixed_field = match profile {
         CmsProfile::V2 => fields
             .contains_key("location_name")
             .then_some("location_name")
             .or_else(|| attestation_index.map(|_| "attestation")),
-        CmsProfile::V3 => fields
-            .contains_key("hospital_location")
+        CmsProfile::V3 => (fields.contains_key("hospital_location")
+            && !has_redundant_legacy_address)
             .then_some("hospital_location")
             .or_else(|| affirmation_index.map(|_| "affirmation")),
     };
