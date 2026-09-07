@@ -12,7 +12,7 @@ from process.hospital_hpt_locator import HospitalHptLocatorRecord, match_hospita
 from tests.hospital_hpt_registry_fallbacks import (
     FALLBACK_URL_SHA256_BY_HOSPITAL_ID as _FALLBACK_URL_SHA256_BY_HOSPITAL_ID,
 )
-from tests.hospital_price_control_support import acquisition_module
+from tests.hospital_price_control_support import acquisition_module, store_module
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
     for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005429:001811 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 005975:006936 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236 000902:000901 003410:003409 004869:004870 005186:005187 005357:005358 006266:005582 006285:006284 006330:005919 006331:005920 006651:006652 003161:003159 003172:003160 001586:001587 001589:001590 001591:001592 001593:001594 001598:001596 001599:001597 001600:001612 001601:001602 001603:001604 001606:001607 001608:001609 001610:001611 001613:001614 001615:001616 000514:000511 004534:000825 004535:000826 001433:001435 001434:006080 006396:003096 006397:006395 000191:000190 000556:001528 000557:000558 000571:004809 000575:000577 000915:000916 001432:001416 002159:002158 004470:004236 004471:004237 004472:004238 005459:005427 006362:006363 006041:005093 000957:000956 000369:004907 000791:000790 001451:001452 001198:007129 001200:001773 001202:002924 001203:005479 001204:006589 005113:005116 005471:005469 006390:006573 006484:001013 006595:006613 006597:006598 006611:006608 006617:006614 006694:006693 006747:006538 007006:007005 007177:006691 006865:006864 006870:006869 000827:004573 000828:003656 001025:001024 004155:004156 005819:005820 006477:006475 004316:004315 004988:004987 003246:003245 003970:003969 006564:006565 006815:006692 001078:007241 004517:007241 007046:007241 007242:007241 007243:007241 007244:007241 007245:007241 007246:007241 007247:007241 007248:007241 007249:007241 007250:007241 007251:007241".split())
@@ -94,7 +94,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_713
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 128
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 131
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -273,6 +273,99 @@ def test_fulton_fallback_preserves_separate_hospital_sources(record_case):
         assert "fallback_mrf_url" not in hospital
         candidate = candidate_by_id[hospital["hospital_id"]]
         assert candidate.source_url == "https://files.example/main.csv" and candidate.initial_error_code is None
+
+
+@pytest.mark.parametrize("record_case", ("matching", "unmatched", "ambiguous"))
+def test_reviewed_pair_preserves_shared_locator(record_case):
+    """Replace two exact sources without changing their shared locator's other bindings."""
+    acquisition = acquisition_module()
+    locator_url = "https://www.kindredhospitals.com/cms-hpt.txt"
+    hospitals = tuple(hospital for hospital in registry.load_hospital_hpt_registry()
+                      if hospital["cms_hpt_url"] == locator_url)
+    replacements = registry.selected_hospital_hpt_registry({"hospital_ids": [
+        "hospital-004860", "hospital-004861",
+    ]})
+    replacement_by_id = {hospital["hospital_id"]: hospital for hospital in replacements}
+    assert len(hospitals) == 53
+    assert {hospital["hospital_id"] for hospital in hospitals if "fallback_mrf_url" in hospital} == set(replacement_by_id)
+    assert len({hospital["fallback_mrf_url"] for hospital in replacements}) == 2
+    for hospital in replacements:
+        assert set(hospital) == {"hospital_id", "name", "cms_hpt_url", "fallback_mrf_url"}
+        assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (hospital["hospital_id"],)
+    locator_records = tuple(HospitalHptLocatorRecord(
+        hospital.get("locator_name", hospital["name"]),
+        f"https://files.example/{hospital['hospital_id']}.json",
+    ) for hospital in hospitals if hospital["hospital_id"] not in replacement_by_id)
+    if record_case != "unmatched":
+        locator_records += tuple(HospitalHptLocatorRecord(
+            hospital["name"], f"https://files.example/stale-{index}.json",
+        ) for hospital in replacements for index in range(2 if record_case == "ambiguous" else 1))
+    previous_hospitals = tuple({field: field_value for field, field_value in hospital.items()
+                               if field != "fallback_mrf_url"} for hospital in hospitals)
+    candidate_snapshots = []
+    for cohort in (previous_hospitals, hospitals):
+        candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+            locator_url, "synthetic-locator", "synthetic-observation", cohort, locator_records,
+        ),))
+        candidate_snapshots.append({candidate.hospital_id: candidate for candidate in candidates})
+    previous_by_id, candidate_by_id = candidate_snapshots
+    assert set(candidate_by_id) == set(previous_by_id) == {hospital["hospital_id"] for hospital in hospitals}
+    for hospital_id, candidate in candidate_by_id.items():
+        if hospital_id not in replacement_by_id:
+            assert candidate == previous_by_id[hospital_id]
+            continue
+        hospital = replacement_by_id[hospital_id]
+        assert candidate.hospital_name == candidate.locator_name == hospital["name"]
+        assert candidate.locator_url == locator_url and candidate.observation_id == "synthetic-observation"
+        assert candidate.source_url == (locator_url if record_case == "ambiguous" else hospital["fallback_mrf_url"])
+        assert candidate.initial_error_code == ("locator_ambiguous" if record_case == "ambiguous" else None)
+
+
+@pytest.mark.parametrize("record_case", (
+    "matching", "unmatched", "fetch_failed", "body_failed", "ambiguous",
+))
+def test_reviewed_singleton_preserves_location_scope(record_case):
+    """A reviewed file keeps its exact hospital binding without assigning its clinic."""
+    acquisition = acquisition_module()
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-001409"})
+    assert set(hospital) == {"hospital_id", "name", "cms_hpt_url", "fallback_mrf_url"}
+    assert (hospital["name"], hospital["cms_hpt_url"]) == (
+        "Clarke County Hospital", "https://clarkehosp.org/cms-hpt.txt",
+    )
+    assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (hospital["hospital_id"],)
+    assert tuple(entry for entry in registry.load_hospital_hpt_registry()
+                 if entry["cms_hpt_url"] == hospital["cms_hpt_url"]
+                 or entry.get("fallback_mrf_url") == hospital["fallback_mrf_url"]) == (hospital,)
+    names = (hospital["name"], "Clarke County Clinic")
+    if record_case == "unmatched":
+        names = names[1:]
+    elif record_case == "ambiguous":
+        names = (hospital["name"], *names)
+    has_failed = record_case in {"fetch_failed", "body_failed"}
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation", (hospital,),
+        None if has_failed else tuple(HospitalHptLocatorRecord(
+            name, f"https://files.example/previous-{index}.csv",
+        ) for index, name in enumerate(names)),
+        error_code="clientresponse" if has_failed else None,
+        fetch_failed=record_case == "fetch_failed",
+    ),))
+    expected_error = {"ambiguous": "locator_ambiguous", "body_failed": "clientresponse"}.get(record_case)
+    assert candidate.initial_error_code == expected_error
+    assert candidate.source_url == (hospital["cms_hpt_url"] if expected_error else hospital["fallback_mrf_url"])
+    assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (
+        hospital["hospital_id"], hospital["name"], hospital["name"],
+    )
+    assert candidate.locator_url == hospital["cms_hpt_url"]
+    assert candidate.observation_id == "synthetic-observation"
+    if not expected_error:
+        store, _native = store_module()
+        assert store._location_ordinals((candidate,), (
+            (0, hospital["name"]), (1, "Clarke County Clinic"),
+        )) == {hospital["hospital_id"]: 0}
+        assert store._location_ordinals((candidate,), (
+            (1, "Clarke County Clinic"),
+        )) == {hospital["hospital_id"]: None}
 
 
 def test_checked_in_registry_has_reviewed_canonical_aliases():
