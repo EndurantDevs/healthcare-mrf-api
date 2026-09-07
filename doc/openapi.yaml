@@ -11943,9 +11943,44 @@ components:
           description: |
             Per-source-kind provenance summary. Its length can be smaller than
             `assertion_count` when one source kind has multiple supporting records.
+            Education assertions also retain each original source value, display,
+            supporting record IDs, and any source quality flags after corroboration.
           items:
             type: object
+            properties:
+              source_kind:
+                type: string
+              assertion_type:
+                type: string
+              verification_status:
+                type: string
+              value:
+                type: object
+                additionalProperties: true
+              display:
+                type: string
+              source_record_ids:
+                type: array
+                items:
+                  type: string
+              source_ids:
+                type: array
+                items:
+                  type: string
+              quality_flags:
+                type: array
+                items:
+                  type: string
             additionalProperties: true
+        corroborated_fields:
+          type: array
+          uniqueItems: true
+          description: |
+            Education fields shared by compatible source assertions. Agreement
+            does not verify completion, a degree, or an exact graduation date.
+          items:
+            type: string
+            enum: [institution, graduation_year]
         quality_flags:
           type: array
           description: Source quality flags; a future CMS graduation year is reported, not verified completion.
@@ -12065,7 +12100,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v6
+          example: provider-profile-composer/v7
         npi:
           type: integer
           minimum: 1000000000

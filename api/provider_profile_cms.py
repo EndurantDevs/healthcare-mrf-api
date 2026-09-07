@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 from collections.abc import Mapping
 
@@ -104,40 +103,6 @@ def _cms_projection(npi: int, education_rows: list[Mapping]) -> dict:
     }
 
 
-def _education_value_key(profile_item: Mapping) -> tuple[str, str]:
-    """Compare exact source meanings without collapsing dates into years."""
-    return str(profile_item.get("type")), json.dumps(profile_item.get("value"), sort_keys=True)
-
-
-def _merge_education_assertion(existing_item: dict, cms_item: Mapping) -> None:
-    """Retain the provenance of equal state and CMS education assertions."""
-    existing_kinds = set(existing_item.get("source_kinds") or ["state_regulator"])
-    if existing_item.get("source_record_id") and CMS_SOURCE_KIND not in existing_kinds:
-        existing_kinds.add("state_regulator")
-    if not existing_item.get("assertions"):
-        existing_item["assertions"] = [{
-            "source_kind": source_kind,
-            "assertion_type": existing_item.get("assertion_type"),
-            "verification_status": existing_item.get("verification_status"),
-        } for source_kind in sorted(existing_kinds)]
-    for assertion in cms_item["assertions"]:
-        if assertion not in existing_item["assertions"]:
-            existing_item["assertions"].append(copy.deepcopy(assertion))
-    existing_record_ids = set(existing_item.get("source_record_ids") or [])
-    if existing_item.get("source_record_id"):
-        existing_record_ids.add(existing_item["source_record_id"])
-    existing_item["assertion_count"] = max(
-        int(existing_item.get("assertion_count") or 1),
-        len(existing_record_ids),
-    ) + len(set(cms_item["source_record_ids"]) - existing_record_ids)
-    existing_item["source_record_ids"] = sorted(existing_record_ids | set(cms_item["source_record_ids"]))
-    existing_item.setdefault("source_record_id", cms_item["source_record_id"])
-    existing_item["source_kinds"] = sorted({*existing_kinds, CMS_SOURCE_KIND})
-    existing_item["quality_flags"] = sorted({
-        *existing_item.get("quality_flags", []), *cms_item["quality_flags"],
-    })
-
-
 def merge_cms_education_projection(npi: int, state_projection: Mapping | None, cms_projection: Mapping | None) -> dict | None:
     """Extend the existing projection envelope while preserving state evidence."""
     if cms_projection is None:
@@ -147,15 +112,7 @@ def merge_cms_education_projection(npi: int, state_projection: Mapping | None, c
         projection_by_field["profile"] = _empty_profile(npi)
     profile_by_field = projection_by_field["profile"]
     education_group = profile_by_field.setdefault("categories", {}).setdefault("education", {"items": []})
-    items_by_value = {_education_value_key(profile_item): profile_item for profile_item in education_group["items"]}
-    for cms_item in cms_projection["items"]:
-        item_key = _education_value_key(cms_item)
-        if item_key in items_by_value:
-            _merge_education_assertion(items_by_value[item_key], cms_item)
-        else:
-            retained_item = copy.deepcopy(cms_item)
-            education_group["items"].append(retained_item)
-            items_by_value[item_key] = retained_item
+    education_group["items"].extend(copy.deepcopy(cms_projection["items"]))
     education_group["availability"] = "available"
     profile_by_field.setdefault("sources", []).append(copy.deepcopy(cms_projection["source"]))
     profile_by_field.setdefault("important_context", []).append(

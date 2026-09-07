@@ -48,6 +48,18 @@ discards its staging tables and never publishes either dataset.
   `cms_reported` assertion metadata; neither value implies verified completion.
   Source quality flags are retained, and future years are labeled as reported
   future years. No clinical experience is calculated from graduation.
+- Profile composition groups education assertions with the same institution
+  after Unicode, case and whitespace normalization. Partial school/year matches
+  require a known matching year, compatible reported details and one reciprocal
+  candidate after exact duplicates are grouped. Punctuation, aliases, conflicting
+  dates or programs, ambiguous events, and differing visibility remain separate.
+  The richer original value remains the display value, and every source retains
+  its original value, display, record IDs and quality flags in `assertions`.
+  `corroborated_fields` reports only shared institution/year claims; agreement
+  does not verify a degree, exact graduation day or completed education.
+  Composer v7 introduces new education item IDs and fences this normalization
+  change with a new profile generation. Within v7, an unambiguous institution/year
+  identity stays stable when richer corroborating source details arrive.
 - CMS evidence is under `provider_profile_evidence.sources.cms_doctors` when
   `include_evidence=true`, filtered to the facts on the returned page. Profile
   generation IDs include the CMS source generation, so stale category-page
