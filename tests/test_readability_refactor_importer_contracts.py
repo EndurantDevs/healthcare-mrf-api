@@ -18,7 +18,7 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -449,22 +449,28 @@ async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
     """A bounded test removes its stages without renaming or publishing live data."""
 
     status = AsyncMock()
-    stage = SimpleNamespace(__tablename__="doctor_stage", __my_additional_indexes__=())
+    stage_by_model = {
+        cms_doctors.DoctorClinicianAddress: SimpleNamespace(__tablename__="doctor_stage"),
+        cms_doctors.CMSDoctorEducation: SimpleNamespace(__tablename__="education_stage"),
+    }
+    marked = create_autospec(cms_doctors.mark_control_run)
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
-    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
+    monkeypatch.setattr(cms_doctors, "make_class", lambda model, _suffix: stage_by_model[model])
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=1))
     monkeypatch.setattr(cms_doctors.db, "status", status)
     monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: False)
-    monkeypatch.setattr(cms_doctors, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
 
     result = await cms_doctors.publish_cms_doctors_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True}}
     )
     assert result["published"] is False
-    assert status.await_count == 2
-    assert all("DROP TABLE IF EXISTS mrf.doctor_stage" == call.args[0] for call in status.await_args_list)
+    assert [call.args[0] for call in status.await_args_list] == [
+        "DROP TABLE IF EXISTS mrf.doctor_stage", "DROP TABLE IF EXISTS mrf.education_stage",
+    ]
+    assert marked.await_args.kwargs["progress_message"] == "succeeded"
 
 
 @pytest.mark.asyncio

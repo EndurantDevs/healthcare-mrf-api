@@ -417,6 +417,7 @@ async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> 
         str(context.get("control_run_id") or ctx.get("control_run_id") or ""),
         status="succeeded",
         phase_detail="cms-doctors test completed without publication",
+        progress_message="succeeded",
         metrics=metrics_by_name,
     )
     return metrics_by_name
