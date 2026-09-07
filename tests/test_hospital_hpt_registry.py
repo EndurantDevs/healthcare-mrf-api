@@ -94,7 +94,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_713
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 131
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 137
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -150,6 +150,58 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     )
     assert candidate.locator_url == hospital["cms_hpt_url"]
     assert candidate.observation_id == "synthetic-observation"
+
+
+@pytest.mark.parametrize("hospital_id,name,locator_url,location_names,ordinal", (
+    ("hospital-002218", "First Care Health Center", "https://www.firstcarehc.com/cms-hpt.txt",
+     ("First Care Health Center",), 0),
+    ("hospital-004390", "Mountainview Medical Center", "https://www.mvmc.org/cms-hpt.txt",
+     ("Mountainview Medical Center",), 0),
+    ("hospital-005166", "Pioneers Medical Center", "https://www.pioneershospital.org/cms-hpt.txt",
+     ("PIONEERS MEDICAL", "PIONEERS MEDICAL"), None),
+    ("hospital-005866", "South Lyon Medical Center", "https://slmcnv.org/cms-hpt.txt",
+     ("South Lyon Medical Center",), 0),
+    ("hospital-006469", "Texas Institute for Surgery at Texas Health Presbyterian Dallas",
+     "https://www.texasinstituteforsurgery.com/cms-hpt.txt",
+     ("Texas Institute for Surgery at Texas Health Dallas",) * 2, None),
+    ("hospital-007197", "Wood County Hospital", "https://www.woodcountyhospital.org/cms-hpt.txt",
+     ("Wood County Hospital",), 0),
+))
+def test_reviewed_sources_preserve_location_binding(hospital_id, name, locator_url, location_names, ordinal):
+    """Replace reviewed stale files without changing singleton or file-wide scope."""
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+    assert set(hospital) == {"hospital_id", "name", "cms_hpt_url", "fallback_mrf_url"}
+    assert (hospital["name"], hospital["cms_hpt_url"]) == (name, locator_url)
+    assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+    assert tuple(entry for entry in registry.load_hospital_hpt_registry()
+                 if entry["cms_hpt_url"] == locator_url
+                 or entry.get("fallback_mrf_url") == hospital["fallback_mrf_url"]) == (hospital,)
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", (hospital,),
+        (HospitalHptLocatorRecord(name, "https://files.example/previous.csv"),),
+    ),))
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert candidate.initial_error_code is None
+    assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (hospital_id, name, name)
+    assert (candidate.locator_url, candidate.observation_id) == (locator_url, "synthetic-observation")
+    store, _native = store_module()
+    locations = tuple(enumerate(location_names))
+    assert store._location_ordinals((candidate,), locations) == {hospital_id: ordinal}
+
+
+def test_unproven_timeout_keeps_no_reviewed_source():
+    """An uncertain locator timeout does not authorize a reviewed source override."""
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-003267"})
+    assert hospital == {"hospital_id": "hospital-003267", "name": "Johnson County Hospital",
+                        "cms_hpt_url": "https://jchosp.com/cms-hpt.txt"}
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation", (hospital,),
+        None, error_code="timeout", fetch_failed=False,
+    ),))
+    assert candidate.initial_error_code == "timeout"
+    assert candidate.source_url == hospital["cms_hpt_url"]
 
 
 def test_checked_in_registry_has_reviewed_cms_hpt_urls():
