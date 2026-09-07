@@ -206,6 +206,105 @@ fn legacy_compact_scan_rejects_invalid_expiration_without_terminal_outputs() {
 #[cfg(unix)]
 #[test]
 fn gzip_scan_indexes_and_reorders_in_network_before_provider_references() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ScannerChild {
+        child: Child,
+        reaped: bool,
+        release_paths: [std::path::PathBuf; 2],
+    }
+
+    impl Drop for ScannerChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // Let the scanner finish and reap its independently grouped helpers.
+                for release in &self.release_paths {
+                    let _ = fs::write(release, b"release");
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => {
+                            self.reaped = true;
+                            break;
+                        }
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => break,
+                    }
+                }
+                if !self.reaped {
+                    // Only this unreaped scanner owns the test-created group.
+                    unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
+                    let _ = self.child.wait();
+                }
+            }
+            let mut cleanup_errors = Vec::new();
+            for release in &self.release_paths {
+                let pid_path = release.with_extension("pid");
+                let record = match fs::read_to_string(&pid_path) {
+                    Ok(record) => record,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        cleanup_errors.push(format!("{}: {error}", pid_path.display()));
+                        continue;
+                    }
+                };
+                let Ok(pid) = record.trim().parse::<libc::pid_t>() else {
+                    cleanup_errors.push(format!("invalid helper PID in {}", pid_path.display()));
+                    continue;
+                };
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    // Observe only: a recorded PID could have been reused after exit.
+                    if pid > 0
+                        && unsafe { libc::kill(-pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        cleanup_errors.push(format!("helper process group {pid} is not absent"));
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if !cleanup_errors.is_empty() {
+                let errors = cleanup_errors.join("; ");
+                if std::thread::panicking() {
+                    eprintln!("scanner fixture cleanup failed: {errors}");
+                } else {
+                    panic!("scanner fixture cleanup failed: {errors}");
+                }
+            }
+        }
+    }
+
+    fn wait_for_progress(stderr_path: &std::path::Path, completed: u64) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stderr = fs::read(stderr_path).expect("read scanner progress");
+            let stderr = String::from_utf8_lossy(&stderr);
+            if let Some(line) = stderr.lines().find(|line| {
+                line.contains("progress_basis=indexed_objects")
+                    && line.contains(&format!("\tindexed_objects_completed={completed}\t"))
+                    && line.contains("\tindexed_objects_total=2\t")
+                    && line.ends_with("\tdone=false")
+            }) {
+                return line.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing progress {completed}/2: {stderr}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let source = temporary.path().join("rates.json.gz");
     let rapidgzip = temporary.path().join("rapidgzip");
@@ -219,6 +318,23 @@ fn gzip_scan_indexes_and_reorders_in_network_before_provider_references() {
     let fixture: serde_json::Value =
         serde_json::from_slice(RAW_MRF).expect("parse compact fixture");
     let reordered = serde_json::to_vec(&fixture).expect("serialize reordered fixture");
+    let range_offsets: Vec<usize> = fixture["in_network"]
+        .as_array()
+        .expect("in-network objects")
+        .iter()
+        .map(|object| {
+            let encoded = serde_json::to_vec(object).expect("encode range object");
+            reordered
+                .windows(encoded.len())
+                .position(|window| window == encoded)
+                .expect("range object offset")
+        })
+        .collect();
+    assert_eq!(range_offsets.len(), 2);
+    let first_release = temporary.path().join("release-first-range");
+    let second_release = temporary.path().join("release-second-range");
+    let stdout_path = temporary.path().join("scanner.stdout");
+    let stderr_path = temporary.path().join("scanner.stderr");
     let in_network = reordered
         .windows(b"\"in_network\"".len())
         .position(|window| window == b"\"in_network\"")
@@ -254,7 +370,22 @@ fi
 if [ -n "$ranges" ]; then
   count=${ranges%@*}
   skip=${ranges#*@}
-  sleep 4
+  release=
+  case "$skip" in
+    "$TEST_FIRST_RANGE_OFFSET") release="$TEST_FIRST_RANGE_RELEASE" ;;
+    "$TEST_SECOND_RANGE_OFFSET") release="$TEST_SECOND_RANGE_RELEASE" ;;
+  esac
+  scanner_pid=$PPID
+  if [ -n "$release" ]; then
+    printf '%s\n' "$$" > "$release.pid"
+  fi
+  attempts=2000
+  while [ -n "$release" ] && [ ! -f "$release" ]; do
+    kill -0 "$scanner_pid" 2>/dev/null || exit 125
+    [ "$attempts" -gt 0 ] || exit 124
+    attempts=$((attempts - 1))
+    sleep 0.01
+  done
   gzip -dc "$input" | dd bs=1 skip="$skip" count="$count" 2>/dev/null
 else
   gzip -dc "$input"
@@ -265,7 +396,7 @@ fi
     fs::set_permissions(&rapidgzip, fs::Permissions::from_mode(0o700))
         .expect("make rapidgzip stand-in executable");
 
-    let completed = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
         .args(["--compact-serving", source.to_str().expect("UTF-8 source")])
         .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
         .env("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", &serving)
@@ -291,16 +422,55 @@ fi
         .env("HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS", "2")
         .env("HLTHPRT_PTG2_RUST_RAPIDGZIP_INDEX_THREADS", "2")
         .env("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "2")
-        .output()
+        .env("TEST_FIRST_RANGE_OFFSET", range_offsets[0].to_string())
+        .env("TEST_SECOND_RANGE_OFFSET", range_offsets[1].to_string())
+        .env("TEST_FIRST_RANGE_RELEASE", &first_release)
+        .env("TEST_SECOND_RANGE_RELEASE", &second_release)
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).expect("create stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("create stderr"),
+        ))
+        .process_group(0)
+        .spawn()
         .expect("run indexed compact scanner");
+    let mut scanner = ScannerChild {
+        child,
+        reaped: false,
+        release_paths: [first_release.clone(), second_release.clone()],
+    };
+
+    wait_for_progress(&stderr_path, 0);
+    fs::write(&first_release, b"release").expect("release first indexed range");
+    let partial_progress = wait_for_progress(&stderr_path, 1);
+    let eta = partial_progress
+        .split('\t')
+        .find_map(|field| field.strip_prefix("eta_seconds="))
+        .expect("partial indexed progress has ETA")
+        .parse::<f64>()
+        .expect("partial indexed progress has numeric ETA");
+    assert!(eta.is_finite() && eta >= 0.0, "{partial_progress}");
+    fs::write(&second_release, b"release").expect("release second indexed range");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = scanner.child.try_wait().expect("inspect scanner status") {
+            scanner.reaped = true;
+            break status;
+        }
+        assert!(Instant::now() < deadline, "indexed scanner did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = fs::read(&stderr_path).expect("read scanner stderr");
+    let stdout = fs::read(&stdout_path).expect("read scanner stdout");
 
     assert!(
-        completed.status.success(),
+        status.success(),
         "scanner failed:\n{}\nstdout:\n{}",
-        String::from_utf8_lossy(&completed.stderr),
-        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&stderr),
+        String::from_utf8_lossy(&stdout),
     );
-    let stderr = String::from_utf8_lossy(&completed.stderr);
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(
         stderr.lines().any(|line| {
             line.contains("progress_basis=indexed_objects")
@@ -309,7 +479,16 @@ fi
         }),
         "{stderr}"
     );
-    assert!(!completed.stdout.is_empty());
+    assert!(
+        stderr.lines().any(|line| {
+            line.contains("progress_basis=indexed_objects")
+                && line.contains("\tindexed_objects_completed=2\t")
+                && line.contains("\tindexed_objects_total=2\t")
+                && line.ends_with("\tdone=true")
+        }),
+        "{stderr}"
+    );
+    assert!(!stdout.is_empty());
     assert!(!fs::read_dir(serving)
         .unwrap()
         .collect::<Vec<_>>()

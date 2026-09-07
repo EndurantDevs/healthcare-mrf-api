@@ -108,6 +108,34 @@ fn reauthentication_rejects_declared_digest_mismatch() {
     assert_eq!(error.to_string(), ARTIFACT_DIGEST_MISMATCH);
 }
 
+#[test]
+fn reauthentication_rejects_size_change_before_rehashing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("sidecar");
+    let bytes = b"sidecar";
+    fs::write(&path, bytes).unwrap();
+    let expected_digest: [u8; 32] = Sha256::digest(bytes).into();
+    let (mut file, _, identity) =
+        open_authentic_artifact(&path, bytes.len() as u64, expected_digest).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(bytes.len() as u64 + 1)
+        .unwrap();
+
+    let error = reauthenticate_artifact(
+        &path,
+        &mut file,
+        &identity,
+        bytes.len() as u64,
+        expected_digest,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), ARTIFACT_DIGEST_MISMATCH);
+}
+
 #[cfg(unix)]
 #[test]
 fn descriptor_path_replacement_with_identical_bytes_is_rejected() {

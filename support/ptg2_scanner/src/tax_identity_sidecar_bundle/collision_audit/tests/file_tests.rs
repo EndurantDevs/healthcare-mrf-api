@@ -169,6 +169,46 @@ fn held_source_fd_is_reauthenticated_after_record_consumption() {
 }
 
 #[test]
+fn metadata_change_during_held_rehash_is_rejected() {
+    let fixture = matched_fixture();
+    let source = fixture.descriptors[0].path.clone();
+    let byte_count = fixture.descriptors[0].metadata.byte_count;
+    let changed_modified =
+        fs::metadata(&source).unwrap().modified().unwrap() + std::time::Duration::from_secs(60);
+    let scratch = fixture.scratch_root("source-held-rehash-metadata");
+    let mut changed = false;
+    let mut last_verified = 0;
+
+    let error = audit_tax_identity_sidecar_bundle_with_progress(
+        &fixture.checkpoint,
+        &fixture.descriptors,
+        &config(scratch.clone(), 1_000_000, 2, 6),
+        |event| {
+            if event.phase == TaxIdentityCollisionAuditPhase::VerifySource {
+                last_verified = event.completed;
+            }
+            if !changed
+                && event.phase == TaxIdentityCollisionAuditPhase::VerifySource
+                && event.completed == byte_count * 2
+            {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&source)?
+                    .set_times(fs::FileTimes::new().set_modified(changed_modified))?;
+                changed = true;
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert!(changed);
+    assert_eq!(last_verified, byte_count * 2);
+    assert_eq!(error.to_string(), artifacts::ARTIFACT_VERIFICATION_FAILED);
+    assert!(directory_is_empty(&scratch));
+}
+
+#[test]
 fn same_bytes_path_replacement_during_held_rehash_is_rejected() {
     let fixture = matched_fixture();
     let source = fixture.descriptors[0].path.clone();

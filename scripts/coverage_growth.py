@@ -170,8 +170,12 @@ def _line_set(raw_lines: Any, label: str) -> set[int]:
 def _coveragepy_line_sets(payload: dict[str, Any], label: str) -> tuple[set[int], set[int]]:
     executed = _line_set(payload.get("executed_lines"), f"{label} executed_lines")
     missing = _line_set(payload.get("missing_lines"), f"{label} missing_lines")
+    excluded = _line_set(payload.get("excluded_lines", []), f"{label} excluded_lines")
     if executed & missing:
         raise CoverageRatchetError(f"{label} coverage line sets overlap")
+    if excluded & missing:
+        raise CoverageRatchetError(f"{label} excluded and missing line sets overlap")
+    executed -= excluded
     return executed | missing, executed
 
 
