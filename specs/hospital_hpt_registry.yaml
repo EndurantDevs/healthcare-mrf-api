@@ -7230,7 +7230,8 @@ hospitals:
   locator_name: Avera Eureka Health Care Center
 - hospital_id: hospital-002163
   name: Evanston Hospital
-  cms_hpt_url: https://www.northshore.org/cms-hpt.txt
+  cms_hpt_url: https://www.endeavorhealth.org/cms-hpt.txt
+  alias_of: hospital-002062
 - hospital_id: hospital-002164
   name: EVANSTON HOSPITAL CORPORATION
   cms_hpt_url: https://evanstonregionalhospital.com/cms-hpt.txt
@@ -7950,7 +7951,8 @@ hospitals:
   cms_hpt_url: https://glenbeigh.com/cms-hpt.txt
 - hospital_id: hospital-002375
   name: Glenbrook Hospital
-  cms_hpt_url: https://www.northshore.org/cms-hpt.txt
+  cms_hpt_url: https://www.endeavorhealth.org/cms-hpt.txt
+  alias_of: hospital-002063
 - hospital_id: hospital-002376
   name: GLENDALE ADVENTIST MEDICAL CENTER
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -9795,7 +9797,8 @@ hospitals:
   locator_name: CHRISTUS Shreveport-Bossier Health System-Highland
 - hospital_id: hospital-002922
   name: Highland Park Hospital
-  cms_hpt_url: https://www.northshore.org/cms-hpt.txt
+  cms_hpt_url: https://www.endeavorhealth.org/cms-hpt.txt
+  alias_of: hospital-002064
 - hospital_id: hospital-002923
   name: Highland Springs
   cms_hpt_url: https://www.highlandspringshealth.com/cms-hpt.txt
@@ -19414,7 +19417,8 @@ hospitals:
   locator_name: Skagit Regional Health - Skagit Valley Hospital
 - hospital_id: hospital-005814
   name: Skokie Hospital
-  cms_hpt_url: https://www.northshore.org/cms-hpt.txt
+  cms_hpt_url: https://www.endeavorhealth.org/cms-hpt.txt
+  alias_of: hospital-002067
 - hospital_id: hospital-005815
   name: Sky Lakes Medical Center
   cms_hpt_url: https://www.skylakes.org/cms-hpt.txt
