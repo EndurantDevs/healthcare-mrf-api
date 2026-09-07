@@ -1786,3 +1786,47 @@ async def bind_snapshot_to_shared_layout(
     if retry_snapshot_key == int(snapshot_key):
         return
     raise RuntimeError("logical PTG snapshot is bound to another layout or physical layout is not sealed")
+
+
+def _validate_authoritative_mapping_summary(
+    summary: SharedMappingDigestSummary,
+    *lane_publications: Any,
+) -> None:
+    """Cross-check bounded lane aggregates against the authoritative mapping set."""
+
+    lane_kinds: list[str] = []
+    expected_mapping_count = 0
+    expected_unique_block_count = 0
+    expected_logical_byte_count = 0
+    for publication in lane_publications:
+        publication_kinds = tuple(publication.object_kinds)
+        if publication_kinds != tuple(sorted(set(publication_kinds))):
+            raise RuntimeError(
+                "strict V3 publication lane returned invalid object kinds"
+            )
+        duplicate_kinds = set(lane_kinds).intersection(publication_kinds)
+        if duplicate_kinds:
+            raise RuntimeError(
+                "strict V3 publication lanes overlap object kinds: "
+                f"{sorted(duplicate_kinds)}"
+            )
+        lane_kinds.extend(publication_kinds)
+        expected_mapping_count += int(publication.mapping_count)
+        expected_unique_block_count += int(publication.unique_block_count)
+        expected_logical_byte_count += int(publication.logical_byte_count)
+
+    expected_kinds = tuple(sorted(lane_kinds))
+    expected_by_field = {
+        "object_kinds": expected_kinds,
+        "mapping_count": expected_mapping_count,
+        "unique_block_count": expected_unique_block_count,
+        "logical_byte_count": expected_logical_byte_count,
+    }
+    for field_name, expected_value in expected_by_field.items():
+        observed_value = getattr(summary, field_name)
+        if observed_value != expected_value:
+            raise RuntimeError(
+                "strict V3 authoritative mapping summary disagrees with publication "
+                f"lanes for {field_name}: expected {expected_value!r}, "
+                f"observed {observed_value!r}"
+            )

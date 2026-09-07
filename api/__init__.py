@@ -32,6 +32,7 @@ from api.provider_directory_profile_capacity_preflight import (
     register_profile_capacity_preflight_route,
 )
 from api.runtime_identity import add_runtime_identity_headers
+from api.server_timing import register_server_timing
 from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
 
@@ -56,6 +57,7 @@ def _capacity_process_request_guard(request):
 def init_api(api):
     """Register public API blueprints on the Sanic application."""
 
+    register_server_timing(api)
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")

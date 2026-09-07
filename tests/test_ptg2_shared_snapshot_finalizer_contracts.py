@@ -38,8 +38,10 @@ from tests.ptg2_shared_snapshot_finalizer_test_support import (
 )
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owned", (False, True))
 async def test_v4_disabled_publication_keeps_v3_path(
     monkeypatch,
+    owned,
 ) -> None:
     """Leave the reviewed V3 publication path independent of V4 evidence."""
 
@@ -61,9 +63,12 @@ async def test_v4_disabled_publication_keeps_v3_path(
         graph_artifact_entries=(),
         provider_identifier_quarantine={},
         provider_graph_v4=False,
+        consume_serving_inputs=owned,
     )
 
     assert publication == "v3-publication"
+    assert state.publish_v3_mock.await_args.kwargs["consume_serving_inputs"] is owned
+    assert state.prepare_mock.await_args.kwargs["finalizer_inputs"].consume_serving_inputs is owned
     assert state.publish_v3_mock.await_args.kwargs["provider_graph_v4"] is False
     assert (
         state.publish_v3_mock.await_args.kwargs["compressed_acquisition_bytes"] is None
@@ -193,9 +198,11 @@ async def test_finalizer_failure_cancels_waiting_price_after_graph():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owned", (False, True))
 async def test_finalizer_starts_before_independent_atom_preparation_finishes(
     monkeypatch,
     tmp_path,
+    owned,
 ):
     """Start finalization and price publication at their exact dependencies."""
 
@@ -226,6 +233,7 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
                 code_dictionary_entries=(),
                 provider_set_metadata_entries=(),
                 expected_source_identities=(),
+                consume_serving_inputs=owned,
             ),
             publish_prepared_price=publish_price,
         )
@@ -244,6 +252,10 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
         state,
         prepared_price,
     )
+
+    serving_inputs = state.finalizer_calls[0]["serving_run_entries"]
+    assert isinstance(serving_inputs, shared_snapshot_publish.OwnedServingRunInputs) is owned
+    assert (serving_inputs.entries if owned else serving_inputs) == ()
 
 
 @pytest.mark.asyncio

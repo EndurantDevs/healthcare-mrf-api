@@ -231,3 +231,93 @@ def test_finalizer_summary_validates_durable_and_policy_failure_paths():
             summary_metadata,
             expected_scratch_durability="durable",
         )
+
+
+@pytest.mark.parametrize("alias_kind", ("parent", "symlink", "retained", "directory"))
+def test_owned_serving_inputs_reject_aliases(tmp_path, alias_kind):
+    serving = tmp_path / "serving.ready"
+    serving.write_bytes(b"serving")
+    entries = [{"path": str(serving)}]
+    retained_paths = []
+    if alias_kind == "parent":
+        directory = tmp_path / "nested"
+        directory.mkdir()
+        entries.append({"path": str(directory / ".." / serving.name)})
+    elif alias_kind == "symlink":
+        alias = tmp_path / "alias.ready"
+        alias.symlink_to(serving)
+        entries.append({"path": str(alias)})
+    elif alias_kind == "retained":
+        retained_paths.append(serving)
+    else:
+        entries = [{"path": str(tmp_path)}]
+    with pytest.raises(RuntimeError):
+        finalizer.validate_owned_serving_inputs(entries, retained_paths=retained_paths)
+    assert serving.read_bytes() == b"serving"
+
+
+def test_owned_serving_inputs_keep_distinct_hardlinks(tmp_path):
+    serving = tmp_path / "serving.ready"
+    hardlink = tmp_path / "second.ready"
+    retained = tmp_path / "witness.bin"
+    serving.write_bytes(b"serving")
+    hardlink.hardlink_to(serving)
+    retained.write_bytes(b"witness")
+    entries = [{"path": str(path), "source_key": 0} for path in (serving, hardlink)]
+    validated = finalizer.validate_owned_serving_inputs(
+        entries, retained_paths=(retained, tmp_path / "already-copied-price.copy")
+    )
+    assert [entry["path"] for entry in validated] == [
+        str(serving.resolve()), str(hardlink.resolve())
+    ]
+    assert all(entry["source_key"] == 0 for entry in validated)
+    assert retained.read_bytes() == b"witness"
+    assert serving.is_file() and hardlink.is_file()
+
+
+@pytest.mark.parametrize("owned", (False, True))
+@pytest.mark.parametrize("durability", ("durable", "ephemeral"))
+def test_finalizer_command_ownership_is_explicit(tmp_path, owned, durability):
+    from tests.test_ptg2_finalizer_cancellation import _TestResourceConfiguration
+
+    arguments = finalizer._v3_finalizer_command_args(
+        tmp_path / "binary", tmp_path / "output", tmp_path / "prices", 1,
+        durability, _TestResourceConfiguration(), tmp_path / "manifest",
+        consume_serving_inputs=owned,
+    )
+    assert ("--consume-serving-inputs" in arguments) is owned
+    assert arguments[-1] == str(tmp_path / "manifest")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owned", (False, True))
+@pytest.mark.parametrize("durability", ("durable", "ephemeral"))
+async def test_finalizer_input_ownership_is_independent_of_durability(
+    tmp_path, monkeypatch, owned, durability,
+):
+    import json
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from tests.test_ptg2_finalizer_cancellation import (
+        _finalizer_arguments, _TestResourceConfiguration,
+    )
+
+    arguments_by_name = _finalizer_arguments(tmp_path, tmp_path / "work")
+    arguments_by_name["scratch_durability"] = durability
+    serving_entries = arguments_by_name["serving_run_entries"]
+    if owned:
+        arguments_by_name["serving_run_entries"] = finalizer.OwnedServingRunInputs(serving_entries)
+    binary = tmp_path / "scanner"
+    binary.write_bytes(b"test scanner")
+    execute = AsyncMock(return_value={"test_complete": True})
+    monkeypatch.setattr(finalizer, "_ptg2_rust_scanner_binary", lambda: binary)
+    monkeypatch.setattr(finalizer, "_load_v3_finalizer_resource_configuration", _TestResourceConfiguration)
+    monkeypatch.setattr(finalizer, "_execute_v3_finalizer", execute)
+
+    assert await finalizer.run_v3_direct_finalizer(**arguments_by_name) == {"test_complete": True}
+    command_args = execute.await_args.args[0]
+    assert ("--consume-serving-inputs" in command_args) is owned
+    assert command_args[command_args.index("--scratch-durability") + 1] == durability
+    manifest = json.loads(Path(command_args[-1]).read_text())
+    assert manifest["serving_run_partition_files"][0]["path"] == serving_entries[0]["path"]
+    assert Path(serving_entries[0]["path"]).is_file()

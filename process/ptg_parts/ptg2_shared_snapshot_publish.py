@@ -36,6 +36,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     SharedBlockReference,
     SharedLayoutBuildOwnership,
     SharedMappingDigestSummary,
+    _validate_authoritative_mapping_summary,
     seal_shared_layout,
     shared_support_digest,
     summarize_native_v4_finalizer_mappings,
@@ -48,6 +49,7 @@ from process.ptg_parts.ptg2_shared_audit import (
     sealed_or_published_audit_metadata,
 )
 from process.ptg_parts.ptg2_shared_finalize import (
+    OwnedServingRunInputs,
     PTG2_V3_DURABLE_SCRATCH_DURABILITY,
     PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
     observe_v3_finalizer_progress,
@@ -273,6 +275,7 @@ class _EarlyFinalizerInputs:
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ]
+    consume_serving_inputs: bool = False
 
 
 _EarlyFinalizerResult = tuple[
@@ -576,50 +579,6 @@ def _completed_prepared_price(
         return None
 
 
-def _validate_authoritative_mapping_summary(
-    summary: SharedMappingDigestSummary,
-    *lane_publications: Any,
-) -> None:
-    """Cross-check bounded lane aggregates against the authoritative mapping set."""
-
-    lane_kinds: list[str] = []
-    expected_mapping_count = 0
-    expected_unique_block_count = 0
-    expected_logical_byte_count = 0
-    for publication in lane_publications:
-        publication_kinds = tuple(publication.object_kinds)
-        if publication_kinds != tuple(sorted(set(publication_kinds))):
-            raise RuntimeError(
-                "strict V3 publication lane returned invalid object kinds"
-            )
-        duplicate_kinds = set(lane_kinds).intersection(publication_kinds)
-        if duplicate_kinds:
-            raise RuntimeError(
-                "strict V3 publication lanes overlap object kinds: "
-                f"{sorted(duplicate_kinds)}"
-            )
-        lane_kinds.extend(publication_kinds)
-        expected_mapping_count += int(publication.mapping_count)
-        expected_unique_block_count += int(publication.unique_block_count)
-        expected_logical_byte_count += int(publication.logical_byte_count)
-
-    expected_kinds = tuple(sorted(lane_kinds))
-    expected_by_field = {
-        "object_kinds": expected_kinds,
-        "mapping_count": expected_mapping_count,
-        "unique_block_count": expected_unique_block_count,
-        "logical_byte_count": expected_logical_byte_count,
-    }
-    for field_name, expected_value in expected_by_field.items():
-        observed_value = getattr(summary, field_name)
-        if observed_value != expected_value:
-            raise RuntimeError(
-                "strict V3 authoritative mapping summary disagrees with publication "
-                f"lanes for {field_name}: expected {expected_value!r}, "
-                f"observed {observed_value!r}"
-            )
-
-
 async def _run_independent_publication_lanes(
     *,
     finalizer_blocks: Callable[[], Awaitable[Any]],
@@ -660,6 +619,7 @@ async def _export_price_map_and_run_finalizer(
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
     progress_callback: Callable[[str, int], None] | None = None,
+    consume_serving_inputs: bool = False,
 ) -> _PreparedFinalizer:
     """Export and finalize as soon as the independent price-key map is ready."""
 
@@ -674,7 +634,11 @@ async def _export_price_map_and_run_finalizer(
     with observe_v3_finalizer_progress(progress_callback):
         finalizer_summary = await run_v3_direct_finalizer(
             work_directory=raw_work_directory,
-            serving_run_entries=serving_run_entries,
+            serving_run_entries=(
+                OwnedServingRunInputs(serving_run_entries)
+                if consume_serving_inputs is True
+                else serving_run_entries
+            ),
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             expected_source_identities=expected_source_identities,
@@ -758,6 +722,7 @@ async def _complete_early_finalizer_pipeline(
                 finalizer_inputs.provider_set_metadata_entries
             ),
             expected_source_identities=finalizer_inputs.expected_source_identities,
+            consume_serving_inputs=finalizer_inputs.consume_serving_inputs,
             progress_callback=progress_callback,
         )
     )
@@ -5187,6 +5152,7 @@ async def _publish_prepared_shared_layout(
     tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
     progress_interval_seconds: float = 4.0,
+    consume_serving_inputs: bool = False,
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
@@ -5297,7 +5263,11 @@ async def _publish_prepared_shared_layout(
                 ):
                     finalizer_summary_by_field = await run_v3_direct_finalizer(
                         work_directory=raw_work_directory,
-                        serving_run_entries=serving_run_entries,
+                        serving_run_entries=(
+                            OwnedServingRunInputs(serving_run_entries)
+                            if consume_serving_inputs is True
+                            else serving_run_entries
+                        ),
                         code_dictionary_entries=code_dictionary_entries,
                         provider_set_metadata_entries=provider_set_metadata_entries,
                         expected_source_identities=expected_source_identities,
@@ -5901,6 +5871,7 @@ async def publish_strict_shared_v3_layout(
     tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
     progress_interval_seconds: float = 4.0,
+    consume_serving_inputs: bool = False,
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
 
@@ -6031,6 +6002,7 @@ async def publish_strict_shared_v3_layout(
                     code_dictionary_entries=code_dictionary_entries,
                     provider_set_metadata_entries=provider_set_metadata_entries,
                     expected_source_identities=expected_source_identities,
+                    consume_serving_inputs=consume_serving_inputs,
                 ),
                 publish_prepared_price=publish_prepared_price_early,
                 finalizer_progress_callback=(
@@ -6072,6 +6044,7 @@ async def publish_strict_shared_v3_layout(
                 tax_identity_source_artifacts=source_artifacts,
                 progress_callback=progress_callback,
                 progress_interval_seconds=progress_interval_seconds,
+                consume_serving_inputs=consume_serving_inputs,
             )
         except BaseException:
             cleanup_task = asyncio.create_task(

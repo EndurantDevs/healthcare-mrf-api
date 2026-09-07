@@ -53,6 +53,8 @@ def test_init_api_registers_group(monkeypatch):
                 return func
             return decorator
 
+        signal = listener
+
         def middleware(self, _phase):
             def decorator(func):
                 return func
@@ -68,6 +70,7 @@ def test_init_api_registers_group(monkeypatch):
     init_api(app)
 
     assert calls_by_name["init"] is True
+    assert {"http.lifecycle.handle", "http.lifecycle.response"} <= app.listeners.keys()
     assert app.registered is not None
     assert app.registered_middleware == [
         (init_api.__globals__["_capacity_process_request_guard"], "request"),
