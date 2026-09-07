@@ -159,6 +159,43 @@ def test_ohio_valley_alias_preserves_ids_and_locator_closure():
         assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
+def test_xavier_alias_preserves_rsfh_hospital_boundaries():
+    """Bind the reviewed former name without combining other system hospitals."""
+    locator_url = "https://www.rsfh.com/cms-hpt.txt"
+    groups = (
+        ("hospital-000934", "hospital-006029"),
+        ("hospital-005491",),
+        ("hospital-005492",),
+        ("hospital-005493", "hospital-004361"),
+    )
+    names = (
+        "Bon Secours St Francis Hospital", "Roper Hospital",
+        "Roper St Francis Berkeley Hospital", "Roper St Francis Mt Pleasant",
+    )
+    hospitals = tuple(hospital for hospital in registry.load_hospital_hpt_registry()
+                      if hospital["cms_hpt_url"] == locator_url)
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+    assert set(hospital_by_id) == {hospital_id for group in groups for hospital_id in group}
+    assert hospital_by_id["hospital-006029"] == {
+        "hospital_id": "hospital-006029", "name": "St Francis Xavier",
+        "cms_hpt_url": locator_url, "alias_of": "hospital-000934", "locator_name": names[0],
+    }
+    locator_records = tuple(locator.HospitalHptLocatorRecord(name, f"https://files.example/{index}.csv")
+                            for index, name in enumerate(names))
+    match = locator.match_hospital_hpt_locator(hospitals, locator_url, locator_records)
+    binding_by_id = {binding.hospital_id: binding for binding in match.bindings}
+    for index, group in enumerate(groups):
+        for hospital_id in group:
+            assert registry.hospital_hpt_group_ids(hospital_id) == group
+            selected = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+            assert {hospital["hospital_id"] for hospital in selected} == set(group)
+            assert binding_by_id[hospital_id].record_index == index
+    assert len(match.content_targets) == 4
+    assert set(match.content_targets) == {locator_record.mrf_url for locator_record in locator_records}
+    assert not match.unmatched_hospital_ids and not match.ambiguous_hospital_ids
+    assert not match.unmatched_record_indexes and not match.ambiguous_record_indexes
+
+
 def test_avera_shared_locator_closes_every_reviewed_id():
     hospitals = tuple(
         hospital for hospital in registry.load_hospital_hpt_registry()

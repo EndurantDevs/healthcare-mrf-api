@@ -2525,6 +2525,7 @@ hospitals:
 - hospital_id: hospital-000743
   name: Baxter Health Fulton County Hospital
   cms_hpt_url: https://baxterregional.org/cms-hpt.txt
+  fallback_mrf_url: https://www.fultoncountyhospital.org/plugins/show_image.php?id=68
 - hospital_id: hospital-000744
   name: Bay Area Hospital
   cms_hpt_url: https://bayareahospital.org/cms-hpt.txt
@@ -20148,6 +20149,7 @@ hospitals:
 - hospital_id: hospital-006029
   name: St Francis Xavier
   cms_hpt_url: https://www.rsfh.com/cms-hpt.txt
+  alias_of: hospital-000934
 - hospital_id: hospital-006030
   name: ST HELENA HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -24038,29 +24040,86 @@ hospitals:
   name: Wright Ranch FED
   cms_hpt_url: https://www.doctorshosplaredo.com/cms-hpt.txt
   locator_mrf_url: https://uhsfilecdn.eskycity.net/ac/233001904_doctors-hospital-of-laredo_standardcharges.csv
-- hospital_ids:
-  - hospital-007209
-  - hospital-007210
-  - hospital-007211
-  - hospital-007212
-  - hospital-007213
-  - hospital-007214
-  - hospital-007215
-  - hospital-007216
-  - hospital-007217
-  - hospital-007218
-  - hospital-007219
-  - hospital-007220
-  - hospital-007221
-  - hospital-007222
-  - hospital-007223
-  - hospital-007224
-  - hospital-007225
-  - hospital-007226
-  - hospital-007227
-  - hospital-007228
+- hospital_id: hospital-007209
   name: WVU Medicine
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-006189
+- hospital_id: hospital-007210
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-001050
+- hospital_id: hospital-007211
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-007116
+- hospital_id: hospital-007212
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-002546
+- hospital_id: hospital-007213
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-001524
+- hospital_id: hospital-007214
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-001395
+- hospital_id: hospital-007215
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-005389
+- hospital_id: hospital-007216
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-005213
+- hospital_id: hospital-007217
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-005193
+- hospital_id: hospital-007218
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-007131
+- hospital_id: hospital-007219
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-006740
+- hospital_id: hospital-007220
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-007133
+- hospital_id: hospital-007221
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-007115
+- hospital_id: hospital-007222
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-006737
+- hospital_id: hospital-007223
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-002898
+- hospital_id: hospital-007224
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-000715
+- hospital_id: hospital-007225
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-002440
+- hospital_id: hospital-007226
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-000967
+- hospital_id: hospital-007227
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-003226
+- hospital_id: hospital-007228
+  name: WVU Medicine
+  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  alias_of: hospital-007049
 - hospital_id: hospital-007229
   name: Wyandot Memorial Hospital
   cms_hpt_url: https://www.wyandotmemorial.org/cms-hpt.txt

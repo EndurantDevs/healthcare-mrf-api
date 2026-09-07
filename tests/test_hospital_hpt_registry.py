@@ -90,11 +90,11 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_902
+    assert len(registry.hospital_hpt_registry_groups()) == 6_900
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_711
+    assert sum("locator_name" in entry for entry in hospitals) == 1_713
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 127
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 128
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -235,6 +235,46 @@ def test_slidell_name_binding_preserves_distinct_campus_sources():
     ) for item in hospitals)
 
 
+@pytest.mark.parametrize("record_case", ("matching", "unmatched", "ambiguous"))
+def test_fulton_fallback_preserves_separate_hospital_sources(record_case):
+    """Use the reviewed file for one exact facility without borrowing main-site prices."""
+    acquisition = acquisition_module()
+    fallback_url = "https://www.fultoncountyhospital.org/plugins/show_image.php?id=68"
+    hospitals = registry.load_hospital_hpt_registry()
+    fulton, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-000743"})
+    assert fulton == {
+        "hospital_id": "hospital-000743", "name": "Baxter Health Fulton County Hospital",
+        "cms_hpt_url": "https://baxterregional.org/cms-hpt.txt", "fallback_mrf_url": fallback_url,
+    }
+    assert {hospital["hospital_id"] for hospital in hospitals if hospital.get("fallback_mrf_url") == fallback_url} == {fulton["hospital_id"]}
+    main_hospitals = registry.selected_hospital_hpt_registry({"hospital_ids": [
+        "hospital-000741", "hospital-000742",
+    ]})
+    for hospital in (fulton, *main_hospitals):
+        assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (hospital["hospital_id"],)
+    record_names = (fulton["name"], fulton["name"]) if record_case == "ambiguous" else (
+        "Baxter Health" if record_case == "unmatched" else fulton["name"],
+    )
+    candidates = acquisition.candidates_from_locators((
+        acquisition.LocatorResult(fulton["cms_hpt_url"], "fulton-locator", "fulton-observation", (fulton,), tuple(
+            HospitalHptLocatorRecord(name, f"https://files.example/stale-{index}.csv")
+            for index, name in enumerate(record_names)
+        )),
+        acquisition.LocatorResult(main_hospitals[0]["cms_hpt_url"], "main-locator", "main-observation", main_hospitals,
+                      (HospitalHptLocatorRecord("Baxter Health", "https://files.example/main.csv"),)),
+    ))
+    candidate_by_id = {candidate.hospital_id: candidate for candidate in candidates}
+    assert set(candidate_by_id) == {"hospital-000741", "hospital-000742", "hospital-000743"}
+    candidate = candidate_by_id[fulton["hospital_id"]]
+    assert candidate.source_url == (fulton["cms_hpt_url"] if record_case == "ambiguous" else fallback_url)
+    assert candidate.initial_error_code == ("locator_ambiguous" if record_case == "ambiguous" else None)
+    assert candidate.locator_name == fulton["name"] and candidate.locator_url == fulton["cms_hpt_url"]
+    for hospital in main_hospitals:
+        assert "fallback_mrf_url" not in hospital
+        candidate = candidate_by_id[hospital["hospital_id"]]
+        assert candidate.source_url == "https://files.example/main.csv" and candidate.initial_error_code is None
+
+
 def test_checked_in_registry_has_reviewed_canonical_aliases():
     """Keep reviewed alias identities explicit while preserving every raw ID."""
     hospitals = registry.load_hospital_hpt_registry()
@@ -244,7 +284,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 463
+    assert len(aliases_by_id) == 465
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
