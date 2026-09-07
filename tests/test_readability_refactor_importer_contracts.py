@@ -18,7 +18,7 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -263,7 +263,8 @@ async def test_cms_reader_deduplicates_before_bounded_push_and_honors_test_limit
             {"address_checksum": 3, "npi": 3},
         ]
     )
-    monkeypatch.setattr(cms_doctors.datetime, "datetime", SimpleNamespace(utcnow=lambda: now))
+    monkeypatch.setattr(cms_doctors, "datetime", SimpleNamespace(datetime=SimpleNamespace(utcnow=lambda: now)))
+    assert datetime.datetime is type(now)
     monkeypatch.setattr(cms_doctors, "doctor_address_row", lambda _row, _now: next(normalized_address_row_iterator))
     pushed_batch_list = []
 
@@ -334,7 +335,7 @@ async def test_cms_source_opens_csv_and_zip_and_rejects_zip_without_csv(monkeypa
     }
     assert await cms_doctors._import_doctors_source(str(csv_path), **import_kwargs_by_name) == 7
     assert await cms_doctors._import_doctors_source(str(zip_path), **import_kwargs_by_name) == 7
-    with pytest.raises(ValueError, match="No CSV"):
+    with pytest.raises(ValueError, match="exactly one CSV"):
         await cms_doctors._import_doctors_source(str(invalid_zip), **import_kwargs_by_name)
 
     assert [parsed_row_list[0]["NPI"] for parsed_row_list, _ in calls] == ["1234567890", "9876543210"]
@@ -362,7 +363,17 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     """A valid stage atomically replaces the live generation and retains metrics."""
 
     status = AsyncMock()
-    marked = AsyncMock()
+    worker_context_by_key = {
+        "import_date": "run", "context": {
+            "run": 1, "education": {"education_rows": 4},
+            "control_run_id": "control", "start": "started", "education_stage_owned": True,
+        },
+    }
+
+    def assert_stage_ownership_released(*_args, **_kwargs):
+        assert not worker_context_by_key["context"].get("education_stage_owned")
+
+    marked = AsyncMock(side_effect=assert_stage_ownership_released)
     stage = SimpleNamespace(
         __tablename__="doctor_stage",
         __my_additional_indexes__=({"name": "site", "index_elements": ("state",)},),
@@ -386,10 +397,11 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
+    monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
+    monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
 
-    terminal_result = await cms_doctors.publish_cms_doctors_generation(
-        {"import_date": "run", "context": {"run": 1, "test_mode": True, "control_run_id": "control", "start": "started"}}
-    )
+    terminal_result = await cms_doctors.publish_cms_doctors_generation(worker_context_by_key)
 
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
@@ -398,6 +410,7 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
     assert marked.await_args.kwargs["metrics"] == {
         "rows": 4,
+        "education": {"education_rows": 4},
         "address_resolve": address_stats.__dict__,
     }
     assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
@@ -418,32 +431,46 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: False)
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
+    monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
 
     await cms_doctors.publish_cms_doctors_generation(
-        {"import_date": "run", "context": {"run": 1, "control_run_id": "control", "start": "start"}}
+        {"import_date": "run", "context": {"run": 1, "education": {"education_rows": 10000}, "control_run_id": "control", "start": "start"}}
     )
-    assert marked.await_args.kwargs["metrics"] == {"rows": cms_doctors.DEFAULT_MIN_ROWS}
+    assert marked.await_args.kwargs["metrics"] == {
+        "rows": cms_doctors.DEFAULT_MIN_ROWS,
+        "education": {"education_rows": 10000},
+    }
 
 
 @pytest.mark.asyncio
-async def test_cms_publish_without_extra_stage_indexes_skips_extra_rename_work(monkeypatch):
-    """A stage with no secondary indexes cannot attempt to rename undeclared index names."""
+async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
+    """A bounded test removes its stages without renaming or publishing live data."""
 
     status = AsyncMock()
-    stage = SimpleNamespace(__tablename__="doctor_stage", __my_additional_indexes__=())
+    stage_by_model = {
+        cms_doctors.DoctorClinicianAddress: SimpleNamespace(__tablename__="doctor_stage"),
+        cms_doctors.CMSDoctorEducation: SimpleNamespace(__tablename__="education_stage"),
+    }
+    marked = create_autospec(cms_doctors.mark_control_run)
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
-    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
+    monkeypatch.setattr(cms_doctors, "make_class", lambda model, _suffix: stage_by_model[model])
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=1))
     monkeypatch.setattr(cms_doctors.db, "status", status)
     monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: False)
-    monkeypatch.setattr(cms_doctors, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
 
-    await cms_doctors.publish_cms_doctors_generation(
+    result = await cms_doctors.publish_cms_doctors_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True}}
     )
-    assert not any("_idx_site" in call.args[0] for call in status.await_args_list)
+    assert result["published"] is False
+    assert [call.args[0] for call in status.await_args_list] == [
+        "DROP TABLE IF EXISTS mrf.doctor_stage", "DROP TABLE IF EXISTS mrf.education_stage",
+    ]
+    assert marked.await_args.kwargs["progress_message"] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -458,6 +485,8 @@ async def test_cms_worker_downloads_one_source_closes_client_and_marks_run(monke
     monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", AsyncMock(return_value="https://example.test/doctors.csv"))
     monkeypatch.setattr(cms_doctors, "_download_doctors_source", AsyncMock())
     monkeypatch.setattr(cms_doctors, "_import_doctors_source", AsyncMock(return_value=7))
+    monkeypatch.setattr(cms_doctors, "import_doctor_education", AsyncMock(return_value={"education_rows": 7}))
+    monkeypatch.setattr(cms_doctors, "DEFAULT_DOCTORS_DATASET_ID", "synthetic-cms-dataset")
     worker_context_by_key = {"import_date": "run", "context": {}}
 
     await cms_doctors.import_cms_doctors_data(worker_context_by_key, {"test_mode": True})
@@ -465,6 +494,7 @@ async def test_cms_worker_downloads_one_source_closes_client_and_marks_run(monke
     assert worker_context_by_key["context"]["run"] == 1
     cms_doctors._import_doctors_source.assert_awaited_once()
     assert cms_doctors._import_doctors_source.await_args.kwargs["test_mode"] is True
+    assert cms_doctors.import_doctor_education.await_args.args[-1] == "synthetic-cms-dataset"
     client.close.assert_awaited_once()
 
 

@@ -312,6 +312,35 @@ async def test_cms_doctor_catalog_fallback_fails_closed(cms_doctors_module):
         await cms_doctors_module._fetch_doctors_download_url(unavailable_file_client)
 
 
+@pytest.mark.parametrize("has_requested_dataset", [False, True])
+async def test_custom_cms_dataset_never_falls_back_to_default_title(
+    monkeypatch, cms_doctors_module, has_requested_dataset,
+):
+    monkeypatch.setattr(cms_doctors_module, "DEFAULT_DOCTORS_DATASET_ID", "synthetic-dataset")
+    catalog_datasets = [{
+        "title": "National Downloadable File",
+        "description": "Doctors and Clinicians directory",
+        "distribution": [{"downloadURL": "https://example.test/default.csv"}],
+    }]
+    if has_requested_dataset:
+        catalog_datasets.append({
+            "identifier": "synthetic-dataset",
+            "distribution": [{"downloadURL": "https://example.test/requested.csv"}],
+        })
+    client = _CatalogClient(
+        get_responses=(
+            _CatalogResponse(enter_error=OSError("metastore unavailable")),
+            _CatalogResponse(payload={"dataset": catalog_datasets}),
+        ),
+        head_responses=(_CatalogResponse(status=200),),
+    )
+    if has_requested_dataset:
+        assert await cms_doctors_module._fetch_doctors_download_url(client) == "https://example.test/requested.csv"
+    else:
+        with pytest.raises(ValueError, match="Could not find CMS Doctors dataset"):
+            await cms_doctors_module._fetch_doctors_download_url(client)
+
+
 @pytest.mark.asyncio
 async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_doctors_module):
     csv_payload = (
@@ -334,6 +363,7 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
     )
     monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
+    monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
     monkeypatch.setitem(
         __import__("sys").modules,
         "aiohttp",
@@ -368,6 +398,7 @@ async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cm
     )
     monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
+    monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
     monkeypatch.setitem(
         __import__("sys").modules,
         "aiohttp",
