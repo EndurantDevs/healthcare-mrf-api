@@ -1,9 +1,13 @@
 #![recursion_limit = "512"]
 
+mod assigned_stream;
+mod finalizer_assignment;
 mod source_witness;
 mod source_witness_spool;
 
+use assigned_stream::AssignedFixedRecordStream;
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use finalizer_assignment::{assign_v3_partition, preflight_owned_serving_inputs};
 #[cfg(test)]
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -79,19 +83,19 @@ use ptg2_scanner::uhc_retained::run_uhc_retain_cli;
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
     external_sort_provider_code_pairs, external_sort_provider_identities, parse_coverage_scope_id,
-    partition_for_record, read_code_dictionary_exact, source_key_bits, source_key_bytes,
-    write_audit_candidate_file, AssignedServingRunBuilder, AssignedServingRunMerger,
-    AuditCandidateSelector, MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields,
-    PreparedNaturalLeanCode, ScratchDurability, ScratchSyncStats, ServingRunPartitionWriter,
-    ServingRunRecord, TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT,
-    AUDIT_CANDIDATE_FORMAT_VERSION, AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES,
-    AUDIT_CANDIDATE_SELECTION, CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION,
-    COVERAGE_SCOPE_ID_BYTES, PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES,
-    SERVING_RUN_FORMAT, SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
+    read_code_dictionary_exact, source_key_bits, source_key_bytes, write_audit_candidate_file,
+    MultiFileSortStats, NaturalLeanCode, NaturalLeanCodeFields, PreparedNaturalLeanCode,
+    ScratchDurability, ScratchSyncStats, ServingRunPartitionWriter, ServingRunRecord,
+    TaggedServingRunCodec, AUDIT_CANDIDATE_FORMAT, AUDIT_CANDIDATE_FORMAT_VERSION,
+    AUDIT_CANDIDATE_MAX_RECORDS, AUDIT_CANDIDATE_RECORD_BYTES, AUDIT_CANDIDATE_SELECTION,
+    CODE_DICTIONARY_FORMAT, CODE_DICTIONARY_FORMAT_VERSION, COVERAGE_SCOPE_ID_BYTES,
+    PROVIDER_CODE_PAIR_RECORD_BYTES, PROVIDER_IDENTITY_RECORD_BYTES, SERVING_RUN_FORMAT,
+    SERVING_RUN_FORMAT_VERSION, SERVING_RUN_RECORD_BYTES,
 };
 #[cfg(test)]
 use ptg2_scanner::v3_runs::{
-    natural_lean_code_identity, read_code_dictionary, tagged_serving_run_record_bytes,
+    natural_lean_code_identity, partition_for_record, read_code_dictionary,
+    tagged_serving_run_record_bytes,
 };
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -455,6 +459,77 @@ impl ProviderRefKey {
     }
 }
 
+impl<'de> Deserialize<'de> for ProviderRefKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::value::{
+            F64Deserializer, I128Deserializer, MapAccessDeserializer, U128Deserializer,
+        };
+
+        fn number_key<'de, D>(deserializer: D) -> Result<ProviderRefKey, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let number = serde_json::Number::deserialize(deserializer)?;
+            ProviderRefKey::from_number(number, "provider_references element")
+                .map_err(serde::de::Error::custom)
+        }
+
+        struct ProviderRefKeyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProviderRefKeyVisitor {
+            type Value = ProviderRefKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON number")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(ProviderRefKey::Signed(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(match i64::try_from(value) {
+                    Ok(signed) => ProviderRefKey::Signed(signed),
+                    Err(_) => ProviderRefKey::Unsigned(value),
+                })
+            }
+
+            fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                number_key(I128Deserializer::<E>::new(value))
+            }
+
+            fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                number_key(U128Deserializer::<E>::new(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                number_key(F64Deserializer::<E>::new(value))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                number_key(MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer.deserialize_any(ProviderRefKeyVisitor)
+    }
+}
+
 impl From<String> for ProviderRefKey {
     fn from(value: String) -> Self {
         if let Ok(integer) = value.parse::<i64>() {
@@ -807,7 +882,7 @@ struct RateLiteWire {
 #[derive(Deserialize)]
 struct V4RateLiteWire {
     #[serde(default)]
-    provider_references: Vec<serde_json::Number>,
+    provider_references: Vec<ProviderRefKey>,
     #[serde(default)]
     provider_groups: Option<Box<RawValue>>,
     #[serde(default)]
@@ -7816,7 +7891,6 @@ impl V4ProviderSetFactorCache {
         let mut component_hashes =
             Vec::with_capacity(provider_refs.len() + usize::from(inline.is_some()));
         let mut provider_network_names = Vec::new();
-        let mut components = BTreeMap::new();
         for key in provider_refs {
             let Some(entry) = provider_map.get(key) else {
                 return Err(io::Error::new(
@@ -7826,12 +7900,10 @@ impl V4ProviderSetFactorCache {
             };
             component_hashes.push(entry.entry_hash);
             provider_network_names.extend(entry.network_names.iter().cloned());
-            components.entry(entry.entry_hash).or_insert(entry);
         }
         if let Some(entry) = inline {
             component_hashes.push(entry.entry_hash);
             provider_network_names.extend(entry.network_names.iter().cloned());
-            components.entry(entry.entry_hash).or_insert(entry);
         }
         component_hashes.sort_unstable();
         component_hashes.dedup();
@@ -7860,6 +7932,15 @@ impl V4ProviderSetFactorCache {
                 .cloned());
         }
 
+        // References were validated above; preserve first-entry selection before the shared lock.
+        let mut components = BTreeMap::new();
+        for key in provider_refs {
+            let entry = &provider_map[key];
+            components.entry(entry.entry_hash).or_insert(entry);
+        }
+        if let Some(entry) = inline {
+            components.entry(entry.entry_hash).or_insert(entry);
+        }
         self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
         let shared_index = (bucket_key as u64 as usize) % self.shared.buckets.len();
         let mut shared_bucket = self.shared.buckets[shared_index].lock().unwrap();
@@ -10145,32 +10226,24 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
             let sorted_provider_hashes = provider_resolution.provider_group_hashes();
             let sorted_provider_npis = provider_resolution.provider_npis();
             let provider_count = provider_resolution.provider_count();
-            let (provider_set_hash, provider_set_global_id, network_names) =
-                if provider_resolution.is_v4_factor() {
-                    let entry = provider_resolution
-                        .factor_entry()
-                        .expect("factor provider resolution has an exact identity");
-                    (
-                        entry.provider_set_hash.clone(),
-                        entry.provider_set_global_id,
-                        entry.network_names.clone(),
-                    )
-                } else {
-                    let provider_set_scope = provider_set_scope_cache.resolve(
-                        provider_resolution
-                            .legacy_entry()
-                            .expect("legacy provider resolution has an entry"),
-                        rate,
-                        context,
-                    );
-                    (
-                        provider_set_scope.provider_set_hash.to_owned(),
-                        provider_set_scope.provider_set_global_id,
-                        provider_set_scope.network_names.to_vec(),
-                    )
-                };
-            let provider_set_hash = provider_set_hash.as_str();
-            let network_names = network_names.as_slice();
+            let provider_set_scope = if let Some(entry) = provider_resolution.factor_entry() {
+                CachedProviderSetScope {
+                    provider_set_hash: &entry.provider_set_hash,
+                    provider_set_global_id: entry.provider_set_global_id,
+                    network_names: &entry.network_names,
+                }
+            } else {
+                provider_set_scope_cache.resolve(
+                    provider_resolution
+                        .legacy_entry()
+                        .expect("legacy provider resolution has an entry"),
+                    rate,
+                    context,
+                )
+            };
+            let provider_set_hash = provider_set_scope.provider_set_hash;
+            let provider_set_global_id = provider_set_scope.provider_set_global_id;
+            let network_names = provider_set_scope.network_names;
             let legacy_price_set_id =
                 (!state.suppress_legacy_row_output).then(|| price_set.global_id.to_hex());
             let legacy_identity = legacy_serving_identity(
@@ -11161,13 +11234,7 @@ fn read_rate_lite_bytes_typed_v4_with_exclusion(
         .map(validate_raw_provider_groups_array)
         .transpose()?
         .unwrap_or(false);
-    let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
-    for provider_reference in wire.provider_references {
-        provider_refs.push(ProviderRefKey::from_number(
-            provider_reference,
-            "provider_references element",
-        )?);
-    }
+    let provider_refs = wire.provider_references;
     if provider_refs.is_empty() && !has_inline_provider_groups {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -21027,6 +21094,7 @@ struct V3FinalizerInputs {
 struct V3FinalizerOptions {
     output_directory: PathBuf,
     manifest_paths: Vec<PathBuf>,
+    consume_serving_inputs: bool,
     scratch_durability: ScratchDurability,
     total_sort_memory_bytes: usize,
     workers: usize,
@@ -21038,7 +21106,7 @@ struct V3FinalizerOptions {
 }
 
 fn v3_finalizer_usage() -> &'static str {
-    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --price-key-map-row-count N --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--scratch-durability durable|ephemeral] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
+    "usage: ptg2_scanner --finalize-v3-runs <output_directory> --price-key-map-input PATH --price-key-map-row-count N --workers N --identity-map-max-bytes N --total-sort-memory-bytes N [--scratch-durability durable|ephemeral] [--consume-serving-inputs] [--price-membership-input PATH]... [--price-atom-input PATH]... <scanner_summary.json>..."
 }
 
 fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOptions> {
@@ -21060,6 +21128,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     let mut price_key_map_input = None;
     let mut price_key_map_row_count = None;
     let mut scratch_durability = None;
+    let mut consume_serving_inputs = false;
     let mut price_membership_inputs = Vec::new();
     let mut price_atom_inputs = Vec::new();
     let mut manifest_paths = Vec::new();
@@ -21180,6 +21249,15 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
                     ));
                 }
             }
+            "--consume-serving-inputs" => {
+                if consume_serving_inputs {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--consume-serving-inputs may be specified only once",
+                    ));
+                }
+                consume_serving_inputs = true;
+            }
             "--scratch-durability" => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
@@ -21271,6 +21349,7 @@ fn parse_v3_finalizer_options(arguments: &[String]) -> io::Result<V3FinalizerOpt
     Ok(V3FinalizerOptions {
         output_directory: PathBuf::from(output_directory),
         manifest_paths,
+        consume_serving_inputs,
         scratch_durability: scratch_durability.unwrap_or_default(),
         total_sort_memory_bytes,
         workers,
@@ -24294,131 +24373,6 @@ trait AssignedV3RowSource {
     fn source_copy_format(&self) -> &'static str;
 }
 
-struct AssignedFixedRecordStream {
-    partition_paths: Vec<Vec<PathBuf>>,
-    partition_index: usize,
-    partition_merger: Option<AssignedServingRunMerger>,
-    previous_record: Option<[u8; V3_FINALIZER_ASSIGNED_BYTES]>,
-    audit_candidates: AuditCandidateSelector,
-    distinct_record_count: u64,
-    duplicate_record_count: u64,
-}
-
-impl AssignedFixedRecordStream {
-    #[cfg(test)]
-    fn new_many(paths: Vec<PathBuf>, population_count: u64) -> io::Result<Self> {
-        Self::new_partition_runs(
-            paths.into_iter().map(|path| vec![path]).collect(),
-            population_count,
-        )
-    }
-
-    fn new_partition_runs(
-        partition_paths: Vec<Vec<PathBuf>>,
-        population_count: u64,
-    ) -> io::Result<Self> {
-        if partition_paths.iter().flatten().any(|path| !path.is_file()) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "assigned partition input does not exist",
-            ));
-        }
-        if partition_paths.iter().any(Vec::is_empty) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned partition has no sorted runs",
-            ));
-        }
-        Ok(Self {
-            partition_paths,
-            partition_index: 0,
-            partition_merger: None,
-            previous_record: None,
-            audit_candidates: AuditCandidateSelector::new(population_count),
-            distinct_record_count: 0,
-            duplicate_record_count: 0,
-        })
-    }
-
-    fn audit_candidates(&self) -> io::Result<&[ptg2_scanner::v3_runs::AuditCandidateRecord]> {
-        self.audit_candidates.finish()
-    }
-
-    fn distinct_record_count(&self) -> u64 {
-        self.distinct_record_count
-    }
-
-    fn duplicate_record_count(&self) -> u64 {
-        self.duplicate_record_count
-    }
-}
-
-impl AssignedV3RowSource for AssignedFixedRecordStream {
-    fn next_row(&mut self) -> io::Result<Option<AssignedV3Row>> {
-        let record = loop {
-            if self.partition_merger.is_none() {
-                let Some(paths) = self.partition_paths.get(self.partition_index) else {
-                    return Ok(None);
-                };
-                self.partition_merger = Some(AssignedServingRunMerger::new(paths)?);
-                self.partition_index += 1;
-            }
-            if let Some(record) = self.partition_merger.as_mut().unwrap().next_record()? {
-                break record;
-            }
-            self.partition_merger = None;
-        };
-        if self
-            .previous_record
-            .is_some_and(|previous| record < previous)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "assigned partition files are not globally ordered",
-            ));
-        }
-        if self.previous_record == Some(record) {
-            self.duplicate_record_count = self.duplicate_record_count.saturating_add(1);
-        } else {
-            self.distinct_record_count = self.distinct_record_count.saturating_add(1);
-        }
-        self.previous_record = Some(record);
-        let code_key = i32::from_be_bytes(record[0..4].try_into().map_err(to_io_error)?);
-        let provider_set_key = i32::from_be_bytes(record[4..8].try_into().map_err(to_io_error)?);
-        let price_key = u32::from_be_bytes(record[8..12].try_into().map_err(to_io_error)?);
-        let source_key = u32::from_be_bytes(record[12..16].try_into().map_err(to_io_error)?);
-        let provider_count = u32::from_be_bytes(record[16..20].try_into().map_err(to_io_error)?);
-        self.audit_candidates.observe(
-            u32::try_from(code_key).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned code_key cannot be negative",
-                )
-            })?,
-            u32::try_from(provider_set_key).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned provider_set_key cannot be negative",
-                )
-            })?,
-            price_key,
-            source_key,
-            provider_count,
-        )?;
-        Ok(Some(AssignedV3Row {
-            code_key,
-            provider_set_key,
-            provider_count: u64::from(provider_count),
-            price_key,
-            source_key,
-        }))
-    }
-
-    fn source_copy_format(&self) -> &'static str {
-        "assigned_fixed_v1"
-    }
-}
-
 struct V3StageWriteSummary {
     row_count: u64,
     code_count: u64,
@@ -24491,6 +24445,7 @@ struct V3AssignmentContext<'a> {
     combined_provider_seen_words: &'a Mutex<Vec<u64>>,
     combined_price_seen_words: &'a Mutex<Vec<u64>>,
     assigned_record_limit: usize,
+    consume_serving_inputs: bool,
     scratch_durability: ScratchDurability,
 }
 
@@ -25107,228 +25062,6 @@ fn write_v3_code_dictionary_copy(
     })
 }
 
-fn assign_v3_partition(
-    partition: usize,
-    inputs: &[V3FinalizerPartitionInput],
-    context: &V3AssignmentContext<'_>,
-) -> io::Result<V3AssignedPartition> {
-    let started_at = Instant::now();
-    let partition_directory = context.work_root.join(format!("partition-{partition:03}"));
-    std::fs::create_dir_all(&partition_directory)?;
-    let mut assigned_runs = AssignedServingRunBuilder::with_scratch_durability(
-        &partition_directory,
-        context.assigned_record_limit,
-        context.scratch_durability,
-    )?;
-    let &(code_key_start, partition_code_count) = context
-        .code_partition_ranges
-        .get(partition)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing code partition"))?;
-    if partition_code_count == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "serving-run partition has rows but no code dictionary range",
-        ));
-    }
-    let mut code_rate_counts =
-        try_zeroed_u64_vec(partition_code_count, "partition code rate counts")?;
-    let mut provider_seen_words = try_zeroed_u64_vec(
-        context.provider_key_count.saturating_add(63) / 64,
-        "partition provider coverage bitmap",
-    )?;
-    let mut price_seen_words = try_zeroed_u64_vec(
-        context.price_key_count.saturating_add(63) / 64,
-        "partition price coverage bitmap",
-    )?;
-    let mut row_count = 0u64;
-    let mut source_bytes_read = 0u64;
-    for input in inputs {
-        let mut reader = BufReader::new(File::open(&input.path)?);
-        let mut input_digest = Sha256::new();
-        let mut input_rows = 0u64;
-        while let Some(record) = ServingRunRecord::read_from(&mut reader)? {
-            input_digest.update(record.encode());
-            let actual_partition = partition_for_record(&record, context.partition_count)?;
-            if actual_partition != partition {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "serving run record belongs to partition {actual_partition}, expected {}",
-                        partition
-                    ),
-                ));
-            }
-            let code = context.code_map.get(&record.code_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned code identity is absent",
-                )
-            })?;
-            let provider = context
-                .provider_map
-                .get(&record.provider_set_id)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "assigned provider identity is absent",
-                    )
-                })?;
-            if provider.auxiliary != record.provider_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned provider identity/count conflicts with immutable dense map",
-                ));
-            }
-            let price = context.price_map.get(&record.price_set_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned price identity is absent",
-                )
-            })?;
-            let provider_key = provider.key as usize;
-            if provider_key >= context.provider_key_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned provider key is outside the authoritative map",
-                ));
-            }
-            provider_seen_words[provider_key / 64] |= 1u64 << (provider_key % 64);
-            let price_key = price.key as usize;
-            if price_key >= context.price_key_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "assigned price key is outside the authoritative map",
-                ));
-            }
-            price_seen_words[price_key / 64] |= 1u64 << (price_key % 64);
-            let relative_code_key = code
-                .key
-                .checked_sub(code_key_start)
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value < code_rate_counts.len())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "code identity is outside its leading-bit partition range",
-                    )
-                })?;
-            let code_count = &mut code_rate_counts[relative_code_key];
-            *code_count = code_count.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "code rate_count overflow")
-            })?;
-            let mut assigned_record = [0u8; V3_FINALIZER_ASSIGNED_BYTES];
-            assigned_record[0..4].copy_from_slice(&code.key.to_be_bytes());
-            assigned_record[4..8].copy_from_slice(&provider.key.to_be_bytes());
-            assigned_record[8..12].copy_from_slice(&price.key.to_be_bytes());
-            assigned_record[12..16].copy_from_slice(&input.source_key.to_be_bytes());
-            assigned_record[16..20].copy_from_slice(&record.provider_count.to_be_bytes());
-            assigned_runs.push(assigned_record)?;
-            row_count = row_count.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "partition row_count overflow")
-            })?;
-            input_rows = input_rows.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "input row_count overflow")
-            })?;
-        }
-        if input_rows != input.row_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "serving run row count changed during authenticated assignment for {}",
-                    input.path.display()
-                ),
-            ));
-        }
-        let actual_digest: [u8; 32] = input_digest.finalize().into();
-        if actual_digest != input.sha256 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "serving run content digest mismatch during assignment scan for {}: expected {}, got {}",
-                    input.path.display(),
-                    sha256_hex(&input.sha256),
-                    sha256_hex(&actual_digest),
-                ),
-            ));
-        }
-        source_bytes_read = source_bytes_read.saturating_add(input.bytes);
-    }
-    let expected_rows = inputs.iter().map(|input| input.row_count).sum::<u64>();
-    if row_count != expected_rows {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "partition assignment changed the source multiset",
-        ));
-    }
-    {
-        let mut combined = context
-            .combined_provider_seen_words
-            .lock()
-            .map_err(|_| io::Error::other("combined provider coverage bitmap is poisoned"))?;
-        if combined.len() != provider_seen_words.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "partition provider coverage bitmap length mismatch",
-            ));
-        }
-        for (target, value) in combined.iter_mut().zip(provider_seen_words) {
-            *target |= value;
-        }
-    }
-    {
-        let mut combined = context
-            .combined_price_seen_words
-            .lock()
-            .map_err(|_| io::Error::other("combined price coverage bitmap is poisoned"))?;
-        if combined.len() != price_seen_words.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "partition price coverage bitmap length mismatch",
-            ));
-        }
-        for (target, value) in combined.iter_mut().zip(price_seen_words) {
-            *target |= value;
-        }
-    }
-    let assigned_run_set = assigned_runs.finish()?;
-    let sync_stats = assigned_run_set.sync_stats;
-    let mut sort_stats = assigned_run_set.stats;
-    sort_stats.input_file_count = inputs.len() as u64;
-    if sort_stats.input_records != row_count
-        || sort_stats.unique_records != row_count
-        || sort_stats.output_bytes != row_count.saturating_mul(V3_FINALIZER_ASSIGNED_BYTES as u64)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "partition-local assignment sort did not preserve every source occurrence",
-        ));
-    }
-    let scratch = V3ScratchBytes {
-        read: source_bytes_read.saturating_add(sort_stats.final_copy_bytes),
-        written: sort_stats.spill_bytes,
-    };
-    let elapsed_seconds = started_at.elapsed().as_secs_f64();
-    emit_v3_partition_progress(
-        "assign_sort",
-        partition,
-        context.partition_count,
-        row_count,
-        elapsed_seconds,
-        scratch,
-    );
-    Ok(V3AssignedPartition {
-        partition,
-        assigned_paths: assigned_run_set.paths,
-        row_count,
-        code_key_start,
-        code_rate_counts,
-        sort_stats,
-        elapsed_seconds,
-        scratch,
-        sync_stats,
-    })
-}
-
 #[cfg(test)]
 fn pg_binary_i16(field: &[u8], name: &str) -> io::Result<i16> {
     if field.len() != 2 {
@@ -25597,7 +25330,10 @@ fn v3_sort_memory_budget(
 fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let started_at = Instant::now();
     let validation_started_at = Instant::now();
-    let inputs = load_v3_finalizer_inputs(&options.manifest_paths)?;
+    let mut inputs = load_v3_finalizer_inputs(&options.manifest_paths)?;
+    if options.consume_serving_inputs {
+        preflight_owned_serving_inputs(options, &mut inputs)?;
+    }
     let source_encoding = SourceEncoding {
         count: inputs.source_count,
         key_bits: inputs.source_key_bits,
@@ -26187,6 +25923,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             combined_provider_seen_words: combined_provider_seen_words.as_ref(),
             combined_price_seen_words: combined_price_seen_words.as_ref(),
             assigned_record_limit: sort_memory.assigned_records_per_worker,
+            consume_serving_inputs: options.consume_serving_inputs,
             scratch_durability: options.scratch_durability,
         };
         worker_pool.install(|| {
@@ -26288,7 +26025,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         .iter()
         .map(|partition| partition.assigned_paths.clone())
         .collect::<Vec<_>>();
-    let mut assigned_stream = AssignedFixedRecordStream::new_partition_runs(
+    let mut assigned_stream = AssignedFixedRecordStream::new_owned_partition_runs(
         assigned_partition_runs,
         assigned_sort_stats.unique_records,
     )?;

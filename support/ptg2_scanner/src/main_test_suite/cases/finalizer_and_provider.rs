@@ -1490,10 +1490,17 @@ fn worker_dedupe_cache_preserves_global_counts_across_hits_and_resets() {
 }
 #[test]
 fn v3_emission_captures_every_atomic_price_provider_occurrence() {
+    assert_worker_emission_captures_every_atomic_price_provider_occurrence(false);
+}
+#[test]
+fn v4_emission_captures_every_atomic_price_provider_occurrence() {
+    assert_worker_emission_captures_every_atomic_price_provider_occurrence(true);
+}
+fn assert_worker_emission_captures_every_atomic_price_provider_occurrence(factor_mode: bool) {
     let directory = tempfile::tempdir().unwrap();
     let raw_provider_one = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}]}"#;
     let raw_provider_two = br#"{"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567891]}]}"#;
-    let raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"service_code":["11"]},{"negotiated_type":"negotiated","negotiated_rate":200,"service_code":["22"]}]}"#;
+    let raw_rate = br#"{"provider_references":[7],"network_names":[" Shared ","Shared"],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"service_code":["11"]},{"negotiated_type":"negotiated","negotiated_rate":200,"service_code":["22"]}]}"#;
     let source_witness = Arc::new(SourceWitnessCollector::new(&"ab".repeat(32)).unwrap());
     source_witness.configure_provider_spools(1).unwrap();
     source_witness.configure_rate_spools(1).unwrap();
@@ -1539,7 +1546,17 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
         source_witness: Arc::clone(&source_witness),
         invalid_price_exclusion: None,
     };
-    let paths = CopyPathConfig::default();
+    let provider_dictionary_path = directory.path().join("provider-set.copy");
+    let paths = CopyPathConfig {
+        manifest_provider_set_dictionary: Some(provider_dictionary_path.display().to_string()),
+        ..CopyPathConfig::default()
+    };
+    let expected_networks = vec!["Shared".to_string()];
+    let expected_provider_id = provider_set_global_id_from_group_hashes_and_network_names(
+        &provider_map[&ProviderRefKey::from("7")].provider_group_hashes,
+        &expected_networks,
+    );
+    let expected_price_id = rate_price_set(&rate).unwrap().global_id;
     let mut writer = io::sink();
     let mut compact_copy_writer = None;
     let mut manifest_serving_copy_writer = Some(
@@ -1551,15 +1568,25 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
         .unwrap(),
     );
     let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
-    let dedupe = SharedDedupe::new(1);
+    let dedupe = if factor_mode {
+        v4_test_shared_dedupe(1)
+    } else {
+        SharedDedupe::new(1)
+    };
     let mut worker_dedupe_cache = WorkerDedupeCache::new(16);
-    let mut provider_set_scope_cache = ProviderSetScopeCache::default();
+    let mut provider_set_scope_cache = ProviderSetScopeCache::with_v4_factor_mode(factor_mode);
     let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
-    let rates = [rate];
-    let source_inputs = [SourceRateWitnessInput {
-        coordinate: SourceWitnessCoordinate::new(9, 17),
-        raw_rate,
-    }];
+    let rates = [rate.clone(), rate];
+    let source_inputs = [
+        SourceRateWitnessInput {
+            coordinate: SourceWitnessCoordinate::new(9, 17),
+            raw_rate,
+        },
+        SourceRateWitnessInput {
+            coordinate: SourceWitnessCoordinate::new(9, 18),
+            raw_rate,
+        },
+    ];
     let mut state = SharedCompactState {
         writer: &mut writer,
         compact_copy_writer: &mut compact_copy_writer,
@@ -1578,6 +1605,24 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
 
     process_compact_rate_lites_worker_with_source(&mut state, &rates, &procedure, &source_inputs)
         .unwrap();
+    if factor_mode {
+        let factors = &state.provider_set_scope_cache.v4_factors;
+        assert_eq!(factors.metrics.cache_misses, 1);
+        assert_eq!(factors.metrics.cache_hits, 1);
+        assert_eq!(factors.metrics.flat_group_union_attempts, 1);
+        assert_eq!(state.provider_set_scope_cache.entry_count, 0);
+    } else {
+        assert_eq!(state.provider_set_scope_cache.entry_count, 1);
+        assert!(state
+            .provider_set_scope_cache
+            .buckets
+            .values()
+            .all(|bucket| {
+                bucket
+                    .iter()
+                    .all(|entry| entry.network_names == expected_networks)
+            }));
+    }
 
     let invalid_inline_rate = RateLite {
         provider_refs: vec![ProviderRefKey::from("missing")],
@@ -1605,15 +1650,34 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
     )
     .is_err());
 
-    manifest_serving_copy_writer
+    let (serving_events, _) = manifest_serving_copy_writer
         .take()
         .unwrap()
         .finish_silent()
         .unwrap();
     dictionary_copy_sinks.finish_silent().unwrap();
+    let dictionary = read_worker_copy_text(&provider_dictionary_path).unwrap();
+    assert_eq!(
+        dictionary,
+        format!("{}\t2\t{{\"Shared\"}}\n", expected_provider_id.to_hex())
+    );
+    let mut record_count = 0;
+    for event in serving_events
+        .iter()
+        .filter(|event| event.record_kind == "v3_serving_run_partition_file")
+    {
+        let mut reader = BufReader::new(File::open(&event.path).unwrap());
+        while let Some(record) = ServingRunRecord::read_from(&mut reader).unwrap() {
+            assert_eq!(record.provider_set_id, expected_provider_id.0);
+            assert_eq!(record.provider_count, 2);
+            assert_eq!(record.price_set_id, expected_price_id.0);
+            record_count += 1;
+        }
+    }
+    assert_eq!(record_count, 2);
     let summary = source_witness.write_bundle(directory.path()).unwrap();
-    assert_eq!(summary["queryable_occurrence_population_count"], 4);
-    assert_eq!(summary["occurrence_witness_count"], 4);
+    assert_eq!(summary["queryable_occurrence_population_count"], 8);
+    assert_eq!(summary["occurrence_witness_count"], 8);
 
     let bundle = std::fs::read(summary["path"].as_str().unwrap()).unwrap();
     let mut coordinates = source_witness_record_metadata(&bundle)
@@ -1621,6 +1685,7 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
         .filter(|metadata| metadata["kind"] == "rate_occurrence")
         .map(|metadata| {
             (
+                metadata["coordinate"]["rate_ordinal"].as_u64().unwrap(),
                 metadata["coordinate"]["price_ordinal"].as_u64().unwrap(),
                 metadata["coordinate"]["provider_ordinal"].as_u64().unwrap(),
                 metadata["provider_evidence"]["npi_ordinal"]
@@ -1632,7 +1697,16 @@ fn v3_emission_captures_every_atomic_price_provider_occurrence() {
     coordinates.sort_unstable();
     assert_eq!(
         coordinates,
-        vec![(0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0)]
+        vec![
+            (17, 0, 0, 0),
+            (17, 0, 1, 0),
+            (17, 1, 0, 0),
+            (17, 1, 1, 0),
+            (18, 0, 0, 0),
+            (18, 0, 1, 0),
+            (18, 1, 0, 0),
+            (18, 1, 1, 0),
+        ]
     );
 }
 #[test]
@@ -3268,18 +3342,74 @@ fn v4_factor_cache_covers_source_ordinals_and_shared_cache_paths() {
         .unwrap()
         .is_none());
 
-    let unresolved_error = second
+    // Duplicate references and a colliding inline component retain the first referenced entry.
+    let shadowed_inline = ProviderEntry {
+        entry_hash: provider_map[&key].entry_hash,
+        ..inline.clone()
+    };
+    let duplicate_refs = [key.clone(), key.clone()];
+    let first_selected = first
         .resolve(
             &provider_map,
-            &missing_rate.provider_refs,
-            None,
-            &missing_rate,
+            &duplicate_refs,
+            Some(&shadowed_inline),
+            &rate,
             &context,
         )
+        .unwrap()
+        .unwrap();
+    let expected_networks = vec![
+        "component-network".to_string(),
+        "inline-network".to_string(),
+        "rate-network".to_string(),
+    ];
+    assert_eq!(first_selected.provider_count, 2);
+    assert_eq!(first_selected.network_names, expected_networks);
+    assert_eq!(
+        first_selected.provider_set_global_id,
+        provider_set_global_id_from_group_hashes_and_network_names(
+            &provider_map[&key].provider_group_hashes,
+            &expected_networks,
+        )
+    );
+    let first_unions = first.metrics.flat_group_union_attempts;
+    let second_before = second.metrics;
+    for cache in [&mut first, &mut second] {
+        let cached = cache
+            .resolve(
+                &provider_map,
+                &duplicate_refs,
+                Some(&shadowed_inline),
+                &rate,
+                &context,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &first_selected));
+    }
+    assert_eq!(first.metrics.flat_group_union_attempts, first_unions);
+    assert_eq!(
+        second.metrics.flat_group_union_attempts,
+        second_before.flat_group_union_attempts
+    );
+    assert_eq!(second.metrics.cache_misses, second_before.cache_misses + 1);
+
+    let ordered_missing = [
+        key,
+        ProviderRefKey::from("missing"),
+        ProviderRefKey::from("later-missing"),
+    ];
+    let before_missing = second.metrics;
+    let unresolved_error = second
+        .resolve(&provider_map, &ordered_missing, None, &rate, &context)
         .unwrap_err();
-    assert!(unresolved_error
-        .to_string()
-        .contains("unresolved provider reference"));
+    assert_eq!(unresolved_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        unresolved_error.to_string(),
+        "unresolved provider reference: missing"
+    );
+    assert_eq!(second.metrics.cache_hits, before_missing.cache_hits);
+    assert_eq!(second.metrics.cache_misses, before_missing.cache_misses);
 }
 #[test]
 fn v4_factor_shared_cache_configuration_validates_byte_limit() {
@@ -3937,6 +4067,25 @@ fn v4_typed_rate_parser_retains_raw_inline_groups_without_deserializing_them() {
 }
 #[test]
 fn profiled_rate_parser_preserves_streaming_parser_contract() {
+    fn assert_parser_contract(raw: &[u8], allow_empty_npi_tin_only: bool) -> Option<bool> {
+        let profiled = read_rate_lite_bytes_profiled_with_policy(raw, allow_empty_npi_tin_only);
+        let streaming = read_rate_lite_bytes_streaming(raw, allow_empty_npi_tin_only);
+        match (profiled, streaming) {
+            (Ok((profiled, typed)), Ok(streaming)) => {
+                assert_eq!(profiled, streaming);
+                Some(typed)
+            }
+            (Err(profiled), Err(streaming)) => {
+                assert_eq!(profiled.kind(), streaming.kind());
+                assert_eq!(profiled.to_string(), streaming.to_string());
+                None
+            }
+            (profiled, streaming) => {
+                panic!("parser contract diverged: profiled={profiled:?} streaming={streaming:?}")
+            }
+        }
+    }
+
     let fixtures = [
         br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.50}]}"#.as_slice(),
         br#"{"provider_references":[7],"provider_groups":[{"npi":[1234567890],"tin":{"type":"ein","value":"123456789"}}],"negotiated_prices":[{"negotiated_rate":12.50}],"network_name":"one","network_names":["two"]}"#.as_slice(),
@@ -3958,18 +4107,107 @@ fn profiled_rate_parser_preserves_streaming_parser_contract() {
     ];
 
     for raw in fixtures {
-        let profiled = read_rate_lite_bytes_profiled(raw);
-        let streaming = read_rate_lite_bytes_streaming(raw, false);
-        match (profiled, streaming) {
-            (Ok((profiled, _)), Ok(streaming)) => assert_eq!(profiled, streaming),
-            (Err(profiled), Err(streaming)) => {
-                assert_eq!(profiled.kind(), streaming.kind());
-                assert_eq!(profiled.to_string(), streaming.to_string());
-            }
-            (profiled, streaming) => {
-                panic!("parser contract diverged: profiled={profiled:?} streaming={streaming:?}")
-            }
+        let _ = assert_parser_contract(raw, false);
+    }
+
+    for (references, expected_typed) in [
+        ("[7,7,0,-0,-1]", Some(true)),
+        (
+            "[-9223372036854775808,9223372036854775807,9223372036854775808,18446744073709551615]",
+            Some(true),
+        ),
+        (
+            "[-9223372036854775809,18446744073709551616,121591448686103182592848195376305442061]",
+            Some(true),
+        ),
+        ("[7.0,7e0,1e2,-0.0,1.000e3]", Some(true)),
+        (r#"[{"$serde_json::private::Number":"7"}]"#, Some(true)),
+        ("[]", None),
+        ("null", None),
+        (r#"["7"]"#, None),
+        ("[true]", None),
+        ("[null]", None),
+        ("[{}]", None),
+        ("[[]]", None),
+        ("[7.5]", None),
+        ("[1e-1]", None),
+        ("[7e]", None),
+        ("[-01]", None),
+    ] {
+        let raw = format!(
+            r#"{{"provider_references":{references},"negotiated_prices":[{{"negotiated_rate":12.5}}]}}"#
+        );
+        for allow_empty_npi_tin_only in [false, true] {
+            assert_eq!(
+                assert_parser_contract(raw.as_bytes(), allow_empty_npi_tin_only),
+                expected_typed,
+                "{raw}",
+            );
         }
+    }
+
+    for allow_empty_npi_tin_only in [false, true] {
+        assert_eq!(
+            assert_parser_contract(
+                br#"{"provider_references":[7],"provider_references":[8],"negotiated_prices":[{"negotiated_rate":12.5}]}"#,
+                allow_empty_npi_tin_only,
+            ),
+            Some(false),
+        );
+        for raw in [
+            br#"{"provider_references":["7"],"negotiated_prices":[{"negotiated_rate":"bad"}]}"#
+                .as_slice(),
+            br#"{"negotiated_prices":[{"negotiated_rate":"bad"}],"provider_references":["7"]}"#
+                .as_slice(),
+        ] {
+            assert_eq!(assert_parser_contract(raw, allow_empty_npi_tin_only), None);
+        }
+    }
+}
+#[test]
+fn provider_ref_key_numeric_callbacks_preserve_number_contract() {
+    use serde::de::value::{
+        Error, F64Deserializer, I128Deserializer, I64Deserializer, U128Deserializer,
+        U64Deserializer,
+    };
+
+    fn assert_same<'de, D>(deserializer: D)
+    where
+        D: serde::Deserializer<'de> + Clone,
+    {
+        let expected = serde_json::Number::deserialize(deserializer.clone()).and_then(|number| {
+            ProviderRefKey::from_number(number, "provider_references element")
+                .map_err(serde::de::Error::custom)
+        });
+        let actual = ProviderRefKey::deserialize(deserializer);
+        assert_eq!(
+            actual.map_err(|error| error.to_string()),
+            expected.map_err(|error| error.to_string()),
+        );
+    }
+
+    for value in [i64::MIN, -1, 0, 7, i64::MAX] {
+        assert_same(I64Deserializer::<Error>::new(value));
+    }
+    for value in [0, 7, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        assert_same(U64Deserializer::<Error>::new(value));
+    }
+    for value in [i128::MIN, -1, 0, i64::MAX as i128 + 1, i128::MAX] {
+        assert_same(I128Deserializer::<Error>::new(value));
+    }
+    for value in [0, u64::MAX as u128, u64::MAX as u128 + 1, u128::MAX] {
+        assert_same(U128Deserializer::<Error>::new(value));
+    }
+    for value in [
+        -0.0,
+        7.0,
+        7.5,
+        1e20,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        assert_same(F64Deserializer::<Error>::new(value));
     }
 }
 #[test]

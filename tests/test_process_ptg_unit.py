@@ -5385,6 +5385,9 @@ def _install_concurrent_layout_mocks(monkeypatch, publish):
             }
         ),
     )
+    monkeypatch.setattr(
+        process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries)
+    )
     monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
 
@@ -9059,11 +9062,7 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
         "_persist_plan_months_and_catalog_request",
         AsyncMock(return_value="persisted"),
     )
-    monkeypatch.setattr(
-        process_ptg,
-        "_should_auto_activate_ptg2_candidates",
-        lambda: True,
-    )
+    monkeypatch.setattr(process_ptg, "_should_auto_activate_ptg2_candidates", lambda: True)
     publication = _strict_v3_publication(serving_rates)
     publish = AsyncMock(return_value=publication)
     @asynccontextmanager
@@ -9100,6 +9099,9 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
                 },
             }
         ),
+    )
+    monkeypatch.setattr(
+        process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries)
     )
     monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
@@ -9467,6 +9469,7 @@ def _strict_v3_downloaded_job(job):
         raw_artifact=SimpleNamespace(
             raw_sha256=artifact_digest,
             raw_storage_uri=f"/tmp/{artifact_digest}.json.gz",
+            raw_path=f"/tmp/{artifact_digest}.json.gz",
         ),
         logical_artifact=SimpleNamespace(
             logical_path="/tmp/rates.json.gz",
@@ -11052,6 +11055,7 @@ def _run_manifest_import_case(
 
     create_stage_mock.assert_awaited_once()
     publish_mock.assert_awaited_once()
+    assert publish_mock.await_args.kwargs["consume_serving_inputs"] is True
     import_run_rows = [
         import_row
         for cls_name, import_row in pushed_list

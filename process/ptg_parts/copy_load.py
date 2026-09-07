@@ -510,3 +510,39 @@ async def _cancel_and_wait_tasks(tasks: set[asyncio.Task[Any]]) -> None:
     if remaining_tasks:
         await asyncio.gather(*remaining_tasks, return_exceptions=True)
     tasks.clear()
+
+
+def _collect_manifest_copy_entries(
+    successful_files: list[dict[str, Any]],
+    copy_kinds: Sequence[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Collect metadata-bearing deferred files without opening their payloads."""
+
+    entries_by_kind: dict[str, list[dict[str, Any]]] = {kind: [] for kind in copy_kinds}
+    seen_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in copy_kinds}
+    for file_summary in successful_files:
+        summary_payload = (
+            file_summary.get("summary") if isinstance(file_summary, dict) else None
+        )
+        manifest_payload = (
+            summary_payload.get("manifest")
+            if isinstance(summary_payload, dict)
+            else None
+        )
+        copy_files = (
+            manifest_payload.get("copy_files")
+            if isinstance(manifest_payload, dict)
+            else None
+        )
+        if not isinstance(copy_files, dict):
+            continue
+        for kind in copy_kinds:
+            for raw_entry in copy_files.get(kind) or ():
+                if not isinstance(raw_entry, dict):
+                    continue
+                path = str(raw_entry.get("path") or "").strip()
+                if not path or path in seen_paths_by_kind[kind]:
+                    continue
+                seen_paths_by_kind[kind].add(path)
+                entries_by_kind[kind].append(dict(raw_entry))
+    return entries_by_kind

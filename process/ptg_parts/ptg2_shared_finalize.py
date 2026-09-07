@@ -146,6 +146,13 @@ _PRACTICALLY_UNLIMITED_BYTES = 1 << 60
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedServingRunInputs:
+    """Exclusive inputs the caller may consume and must rescan after failure."""
+
+    entries: Iterable[Mapping[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
 class V3FinalizerResourceConfiguration:
     """Validated process-wide resource limits for one strict V3 finalizer."""
 
@@ -390,6 +397,24 @@ def _validated_entries(
     if not validated_entries:
         raise RuntimeError(f"strict V3 finalizer requires at least one {label} entry")
     return validated_entries
+
+
+def validate_owned_serving_inputs(
+    serving_run_entries: Iterable[Mapping[str, Any]],
+    *,
+    retained_paths: Iterable[str | Path],
+) -> list[dict[str, Any]]:
+    """Confirm exclusive serving paths before an importer opts into consumption."""
+
+    entries = tuple(serving_run_entries)
+    if any(Path(str(entry.get("path") or "")).is_symlink() for entry in entries):
+        raise RuntimeError("owned serving input must be a regular file, not a symlink")
+    validated = _validated_entries(entries, label="owned serving run")
+    retained_paths = {Path(path).resolve() for path in retained_paths if path}
+    for entry in validated:
+        if Path(entry["path"]) in retained_paths:
+            raise RuntimeError("owned serving input overlaps a retained input")
+    return validated
 
 
 def _required_non_negative_integer(value: Any, *, field_name: str) -> int:
@@ -2296,6 +2321,7 @@ def _v3_finalizer_command_args(
     scratch_durability: str,
     resource_configuration: V3FinalizerResourceConfiguration,
     manifest_path: Path,
+    consume_serving_inputs: bool = False,
 ) -> list[str]:
     command_args = [
         str(binary),
@@ -2309,6 +2335,8 @@ def _v3_finalizer_command_args(
         scratch_durability,
         *resource_configuration.command_arguments(),
     ]
+    if consume_serving_inputs:
+        command_args.append("--consume-serving-inputs")
     command_args.append(str(manifest_path))
     return command_args
 
@@ -2411,7 +2439,7 @@ async def _execute_v3_finalizer(
 async def run_v3_direct_finalizer(
     *,
     work_directory: str | Path,
-    serving_run_entries: Iterable[Mapping[str, Any]],
+    serving_run_entries: Iterable[Mapping[str, Any]] | OwnedServingRunInputs,
     code_dictionary_entries: Iterable[Mapping[str, Any]],
     provider_set_metadata_entries: Iterable[Mapping[str, Any]],
     expected_source_identities: Iterable[
@@ -2421,8 +2449,11 @@ async def run_v3_direct_finalizer(
     price_key_map_row_count: int,
     scratch_durability: str = PTG2_V3_DURABLE_SCRATCH_DURABILITY,
 ) -> dict[str, Any]:
-    """Run the bounded Rust external-sort/finalize path without Python row materialization."""
+    """Run the bounded finalizer; owned inputs require discard/rescan after failure."""
 
+    consume_serving_inputs = isinstance(serving_run_entries, OwnedServingRunInputs)
+    if consume_serving_inputs:
+        serving_run_entries = serving_run_entries.entries
     (
         resource_configuration,
         binary,
@@ -2453,6 +2484,7 @@ async def run_v3_direct_finalizer(
         scratch_durability,
         resource_configuration,
         manifest_path,
+        consume_serving_inputs,
     )
     return await _execute_v3_finalizer(
         command_args,
@@ -2465,6 +2497,7 @@ async def run_v3_direct_finalizer(
 
 
 __all__ = [
+    "OwnedServingRunInputs",
     "PTG2_V3_CODE_DICTIONARY_SOURCE_CONTRACT_VERSION",
     "PTG2_V3_FINALIZER_FORMAT",
     "PTG2_V3_FINALIZER_RESOURCE_CONTRACT",
@@ -2476,5 +2509,6 @@ __all__ = [
     "observe_v3_finalizer_progress",
     "run_v3_direct_finalizer",
     "validate_v3_finalizer_summary",
+    "validate_owned_serving_inputs",
     "write_v3_finalizer_input_manifest",
 ]

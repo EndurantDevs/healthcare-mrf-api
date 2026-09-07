@@ -181,6 +181,7 @@ from process.ptg_parts.frozen_rate_files import (
     validate_frozen_processed_results,
 )
 from process.ptg_parts.copy_load import (
+    _collect_manifest_copy_entries,
     _cancel_and_wait_tasks,
     _copy_manifest_paths,
     _copy_one_manifest_path,
@@ -329,6 +330,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_finalize import (
     attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
+    validate_owned_serving_inputs,
 )
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2SharedLayoutAbandonmentDeferred,
@@ -1909,42 +1911,6 @@ def _manifest_serving_row_count(
         )
     except (TypeError, ValueError):
         return 0
-
-
-def _collect_manifest_copy_entries(
-    successful_files: list[dict[str, Any]],
-    copy_kinds: Sequence[str],
-) -> dict[str, list[dict[str, Any]]]:
-    """Collect metadata-bearing deferred files without opening their payloads."""
-
-    entries_by_kind: dict[str, list[dict[str, Any]]] = {kind: [] for kind in copy_kinds}
-    seen_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in copy_kinds}
-    for file_summary in successful_files:
-        summary_payload = (
-            file_summary.get("summary") if isinstance(file_summary, dict) else None
-        )
-        manifest_payload = (
-            summary_payload.get("manifest")
-            if isinstance(summary_payload, dict)
-            else None
-        )
-        copy_files = (
-            manifest_payload.get("copy_files")
-            if isinstance(manifest_payload, dict)
-            else None
-        )
-        if not isinstance(copy_files, dict):
-            continue
-        for kind in copy_kinds:
-            for raw_entry in copy_files.get(kind) or ():
-                if not isinstance(raw_entry, dict):
-                    continue
-                path = str(raw_entry.get("path") or "").strip()
-                if not path or path in seen_paths_by_kind[kind]:
-                    continue
-                seen_paths_by_kind[kind].add(path)
-                entries_by_kind[kind].append(dict(raw_entry))
-    return entries_by_kind
 
 
 def _pending_strict_v3_copy_entries(
@@ -9039,6 +9005,33 @@ async def _main_with_artifact_lease(
             source_audit_witness_entries = (
                 strict_v3_copy_entries.get("source_audit_witness") or []
             )
+            run_entries = validate_owned_serving_inputs(
+                run_entries,
+                retained_paths=(
+                    [
+                        entry["path"]
+                        for kind, entries in strict_v3_copy_entries.items()
+                        if kind != "serving_run"
+                        for entry in entries if entry.get("path")
+                    ]
+                    + [
+                        entry["path"]
+                        for entry in (
+                            *(manifest_artifacts.get("sidecars") or ()),
+                            *(tax_identity_source_artifacts or ()),
+                        )
+                        if entry.get("path")
+                    ]
+                    + [
+                        path
+                        for downloaded in buffered_downloads
+                        for path in (
+                            downloaded.raw_artifact.raw_path,
+                            downloaded.logical_artifact.logical_path,
+                        )
+                    ]
+                ),
+            )
             v4_publication_progress = _PTG2V4PublicationProgress()
 
             def report_snapshot_publication_progress(
@@ -9063,6 +9056,7 @@ async def _main_with_artifact_lease(
                         shared_input_identity.source_identities
                     ),
                     serving_run_entries=run_entries,
+                    consume_serving_inputs=True,
                     code_dictionary_entries=code_dictionary_entries,
                     provider_set_metadata_entries=provider_set_metadata_entries,
                     source_audit_witness_entries=source_audit_witness_entries,

@@ -2707,6 +2707,7 @@ fn direct_v3_finalizer_is_deterministic_across_scratch_durability() {
         output_directory: output_a.clone(),
         manifest_paths: vec![manifest_a.clone(), manifest_b.clone()],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
         workers: 2,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -2719,17 +2720,54 @@ fn direct_v3_finalizer_is_deterministic_across_scratch_durability() {
     let output_b = base.join("output-b");
     let summary_b = finalize_v3_runs(&V3FinalizerOptions {
         output_directory: output_b.clone(),
-        manifest_paths: vec![manifest_b, manifest_a],
+        manifest_paths: vec![manifest_b.clone(), manifest_a.clone()],
         scratch_durability: ScratchDurability::Ephemeral,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
         workers: 2,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
-        price_key_map_input,
+        price_key_map_input: price_key_map_input.clone(),
         price_key_map_row_count: price_ids_in_key_order.len() as u64,
         price_membership_inputs: Vec::new(),
         price_atom_inputs: Vec::new(),
     })
     .unwrap();
+
+    let input_manifests = vec![manifest_a, manifest_b];
+    let retained_inputs = load_v3_finalizer_inputs(&input_manifests).unwrap();
+    assert!(retained_inputs
+        .partitions
+        .iter()
+        .all(|input| input.path.is_file()));
+    let output_owned = base.join("output-owned");
+    finalize_v3_runs(&V3FinalizerOptions {
+        output_directory: output_owned.clone(),
+        manifest_paths: input_manifests.clone(),
+        scratch_durability: ScratchDurability::Ephemeral,
+        consume_serving_inputs: true,
+        total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
+        workers: 2,
+        identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+        price_key_map_input: price_key_map_input.clone(),
+        price_key_map_row_count: price_ids_in_key_order.len() as u64,
+        price_membership_inputs: Vec::new(),
+        price_atom_inputs: Vec::new(),
+    })
+    .unwrap();
+    assert!(retained_inputs
+        .partitions
+        .iter()
+        .all(|input| !input.path.exists()));
+    assert!(retained_inputs
+        .code_dictionaries
+        .iter()
+        .all(|input| input.path.is_file()));
+    assert!(retained_inputs
+        .provider_metadata
+        .iter()
+        .all(|input| input.path.is_file()));
+    assert!(input_manifests.iter().all(|path| path.is_file()));
+    assert!(price_key_map_input.is_file());
 
     for file_name in [
         "audit_candidates.bin",
@@ -2742,6 +2780,11 @@ fn direct_v3_finalizer_is_deterministic_across_scratch_durability() {
             std::fs::read(output_a.join(file_name)).unwrap(),
             std::fs::read(output_b.join(file_name)).unwrap(),
             "{file_name} changed with input order or scratch durability"
+        );
+        assert_eq!(
+            std::fs::read(output_a.join(file_name)).unwrap(),
+            std::fs::read(output_owned.join(file_name)).unwrap(),
+            "{file_name} changed with owned serving consumption"
         );
     }
     let durable_sync = &summary_a["scratch_durability"];
@@ -3028,6 +3071,7 @@ fn direct_v3_finalizer_is_byte_identical_with_1_8_and_16_workers() {
             output_directory: output.clone(),
             manifest_paths: vec![manifest.clone()],
             scratch_durability: ScratchDurability::Durable,
+            consume_serving_inputs: false,
             total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(workers, 4),
             workers,
             identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -3118,6 +3162,7 @@ fn direct_v3_finalizer_matches_reference_on_randomized_duplicate_heavy_rows() {
         output_directory: output.clone(),
         manifest_paths: vec![manifest],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(4, 13),
         workers: 4,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -3229,6 +3274,7 @@ fn benchmark_v3_finalizer_250k_duplicate_heavy_rows() {
         output_directory: output,
         manifest_paths: vec![manifest],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(8, 50_000),
         workers: 8,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -3283,6 +3329,7 @@ fn benchmark_v3_finalizer_10m_64_partitions_two_runs() {
         output_directory: output,
         manifest_paths: vec![manifest],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(16, 100_000),
         workers: 16,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -3375,6 +3422,7 @@ fn direct_v3_finalizer_preserves_dense_source_provenance_and_multiplicity() {
         output_directory: output.clone(),
         manifest_paths: vec![source_one, source_zero],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(2, 1),
         workers: 2,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -3786,6 +3834,7 @@ fn v3_finalizer_authenticates_run_content_on_both_scans() {
             combined_price_seen_words: &combined_assignment_price_seen_words,
             assigned_record_limit: 2,
             scratch_durability: ScratchDurability::Durable,
+            consume_serving_inputs: false,
         },
     )
     .unwrap_err();
@@ -4167,6 +4216,7 @@ fn v3_finalizer_rejects_dictionary_memory_before_loading_it() {
         output_directory: base.join("output"),
         manifest_paths: vec![manifest],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 1),
         workers: 1,
         identity_map_max_bytes: required - 1,
@@ -4212,6 +4262,7 @@ fn v3_finalizer_counts_only_nonempty_partition_workers() {
         output_directory: base.join("output"),
         manifest_paths: vec![manifest],
         scratch_durability: ScratchDurability::Durable,
+        consume_serving_inputs: false,
         total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 2),
         workers: 16,
         identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
@@ -4316,6 +4367,7 @@ fn v3_finalizer_requires_one_existing_price_key_map_input() {
     assert_eq!(options.identity_map_max_bytes, 64 * 1024 * 1024);
     assert_eq!(options.total_sort_memory_bytes, 32 * 1024 * 1024);
     assert_eq!(options.scratch_durability, ScratchDurability::Durable);
+    assert!(!options.consume_serving_inputs);
 
     let explicit_ephemeral = parse_v3_finalizer_options(&[
         base.join("ephemeral-output").display().to_string(),
@@ -4331,6 +4383,7 @@ fn v3_finalizer_requires_one_existing_price_key_map_input() {
         (32 * 1024 * 1024usize).to_string(),
         "--scratch-durability".to_owned(),
         "ephemeral".to_owned(),
+        "--consume-serving-inputs".to_owned(),
         manifest.clone(),
     ])
     .unwrap();
@@ -4338,6 +4391,7 @@ fn v3_finalizer_requires_one_existing_price_key_map_input() {
         explicit_ephemeral.scratch_durability,
         ScratchDurability::Ephemeral
     );
+    assert!(explicit_ephemeral.consume_serving_inputs);
 
     let missing_durability = parse_v3_finalizer_options(&[
         base.join("missing-durability-output").display().to_string(),
@@ -4413,4 +4467,109 @@ fn v3_finalizer_sort_memory_budget_is_process_wide() {
     .unwrap_err()
     .to_string()
     .contains("reserve"));
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_unlink_failure_prevents_finalizer_publication() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root can bypass directory permissions, so this check requires an unprivileged run.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("owned unlink failure check skipped: requires an unprivileged Unix user");
+        return;
+    }
+    let _env_lock = scanner_env_lock().lock().unwrap();
+    let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+    let _block_bytes = TestEnvVar::set(PTG2_SERVING_BINARY_BLOCK_BYTES_ENV, "65536");
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path();
+    let row = V3FinalizerTestRow {
+        coverage_scope_id: [0x45; COVERAGE_SCOPE_ID_BYTES],
+        code_system: Some("CPT"),
+        code: Some("99213"),
+        negotiation_arrangement: Some("FFS"),
+        provider_id: prefixed_test_id(1, 1),
+        price_id: prefixed_test_id(2, 1),
+        provider_count: 2,
+    };
+    let manifest = write_v3_finalizer_test_manifest_with_source_and_partitions(
+        base,
+        "unlink-failure",
+        std::slice::from_ref(&row),
+        0,
+        1,
+        1,
+    );
+    let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
+    assert_eq!(inputs.partitions.len(), 1);
+    let raw_path = inputs.partitions[0].path.clone();
+    let raw_bytes = std::fs::read(&raw_path).unwrap();
+    let run_directory = raw_path.parent().unwrap();
+    let price_key_map_input =
+        write_v3_finalizer_test_price_key_map(base, "unlink-price", &[row.price_id]);
+    let mut options = V3FinalizerOptions {
+        output_directory: base.join("borrowed-output"),
+        manifest_paths: vec![manifest.clone()],
+        scratch_durability: ScratchDurability::Ephemeral,
+        consume_serving_inputs: false,
+        total_sort_memory_bytes: v3_finalizer_test_sort_memory_bytes(1, 1),
+        workers: 1,
+        identity_map_max_bytes: V3_FINALIZER_DEFAULT_IDENTITY_MAP_MAX_BYTES,
+        price_key_map_input: price_key_map_input.clone(),
+        price_key_map_row_count: 1,
+        price_membership_inputs: Vec::new(),
+        price_atom_inputs: Vec::new(),
+    };
+    finalize_v3_runs(&options).unwrap();
+    let reference_output = options.output_directory.clone();
+    options.output_directory = base.join("owned-output");
+    options.consume_serving_inputs = true;
+    let probe = run_directory.join("unlink-permission-probe");
+    std::fs::write(&probe, b"probe").unwrap();
+    let original_permissions = std::fs::metadata(run_directory).unwrap().permissions();
+    std::fs::set_permissions(run_directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // Restore exact directory permissions even if an assertion or finalizer panics.
+    let attempt = std::panic::catch_unwind(|| {
+        assert_eq!(
+            std::fs::remove_file(&probe).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        finalize_v3_runs(&options)
+    });
+    std::fs::set_permissions(run_directory, original_permissions).unwrap();
+    let error = attempt.unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read(&raw_path).unwrap(), raw_bytes);
+    assert!(!options.output_directory.exists());
+    assert!(!base.read_dir().unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".owned-output.ptg2-finalizer-")
+            || name.starts_with("ptg2-v3-finalizer-work-")
+    }));
+    assert!(manifest.is_file() && price_key_map_input.is_file());
+    assert!(inputs
+        .code_dictionaries
+        .iter()
+        .all(|input| input.path.is_file()));
+    assert!(inputs
+        .provider_metadata
+        .iter()
+        .all(|input| input.path.is_file()));
+    // The sole failed unlink consumed nothing; restored permissions permit this retry.
+    finalize_v3_runs(&options).unwrap();
+    assert!(!raw_path.exists());
+    for file_name in [
+        "audit_candidates.bin",
+        "shared_serving_blocks.copy",
+        "shared_price_dictionary_blocks.copy",
+        "code_dictionary.copy",
+        "provider_set_dictionary.copy",
+    ] {
+        assert_eq!(
+            std::fs::read(reference_output.join(file_name)).unwrap(),
+            std::fs::read(options.output_directory.join(file_name)).unwrap(),
+        );
+    }
 }

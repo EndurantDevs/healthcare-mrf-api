@@ -231,6 +231,9 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
 
     _assert_pid_exits(parent_pid)
     _assert_pid_exits(child_pid)
+    assert "consume_serving_inputs" not in finalizer_argument_map
+    for entry in finalizer_argument_map["serving_run_entries"]:
+        assert Path(entry["path"]).is_file()
     assert not (work_directory / "finalized").exists()
     assert not (work_directory / "scanner-summary.json").exists()
     assert not list(work_directory.glob(".finalized.ptg2-finalizer-*.tmp"))

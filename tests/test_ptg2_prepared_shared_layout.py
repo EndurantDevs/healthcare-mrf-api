@@ -281,7 +281,8 @@ def _assert_complete_publication(publication, mocks):
 
 
 @pytest.mark.asyncio
-async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
+@pytest.mark.parametrize("owned", (False, True))
+async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path, owned):
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
 
     publication = await _publish_prepared_layout(
@@ -289,6 +290,7 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
         tmp_path,
         prepared_work_directory=None,
         scratch_parent=tmp_path,
+        consume_serving_inputs=owned,
     )
 
     _assert_complete_publication(publication, mocks)
@@ -297,6 +299,9 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
     assert exported_path.parent.parent == tmp_path
     assert not exported_path.parent.exists()
     assert mocks.run_finalizer.await_args.kwargs["price_key_map_row_count"] == 2
+    serving_inputs = mocks.run_finalizer.await_args.kwargs["serving_run_entries"]
+    assert isinstance(serving_inputs, snapshot_publish.OwnedServingRunInputs) is owned
+    assert (serving_inputs.entries if owned else serving_inputs) == ({"source_key": 1},)
     assert mocks.run_finalizer.await_args.kwargs["scratch_durability"] == (
         snapshot_publish.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
     )
