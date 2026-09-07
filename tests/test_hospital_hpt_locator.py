@@ -450,7 +450,15 @@ def test_mrf_selector_bounds_credential_query_fields(query_field_count):
     ) == (url if query_field_count == 64 else None)
 
 
-def test_selector_binds_unique_content_without_inventing_a_location():
+@pytest.mark.parametrize(
+    "locator_names",
+    (
+        ("Parent Hospital",),
+        ("Parent Hospital", "Parent Hospital"),
+        ("Parent Hospital", "Parent Hospital Annex"),
+    ),
+)
+def test_selector_binds_unique_content_without_inventing_a_location(locator_names):
     shared_locator = "https://hospital.example/cms-hpt.txt"
     selected = "https://files.example/Case/File.csv"
     hospital_by_field = {
@@ -463,22 +471,23 @@ def test_selector_binds_unique_content_without_inventing_a_location():
     result = locator.match_hospital_hpt_locator(
         (hospital_by_field,),
         shared_locator,
-        (
-            _record("Parent Hospital", f"{selected}?sig=one"),
-            _record("Parent Hospital Annex", f"{selected}?sig=two"),
+        tuple(
+            _record(name, f"{selected}?sig={index}")
+            for index, name in enumerate(locator_names)
         ),
     )
 
     assert result.bindings == (
         locator.HospitalMrfBinding(
-            "content-only", None, f"{selected}?sig=one"
+            "content-only", None, f"{selected}?sig=0"
         ),
     )
     assert result.unmatched_hospital_ids == ()
     assert result.unmatched_record_indexes == ()
 
 
-def test_selector_retains_a_uniquely_proven_locator_location():
+@pytest.mark.parametrize("name_field", ("name", "locator_name"))
+def test_selector_retains_an_exactly_named_locator_location(name_field):
     shared_locator = "https://hospital.example/cms-hpt.txt"
     selected = "https://files.example/mrf.csv"
     hospital_by_field = {
@@ -487,6 +496,7 @@ def test_selector_retains_a_uniquely_proven_locator_location():
         "locator_mrf_url": selected,
         "cms_hpt_url": shared_locator,
     }
+    hospital_by_field[name_field] = " Only  Locator Location "
 
     result = locator.match_hospital_hpt_locator(
         (hospital_by_field,),

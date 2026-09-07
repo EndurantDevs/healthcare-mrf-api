@@ -395,17 +395,9 @@ def _selector_binding(
         index for index in named_indexes if index in selector_index_set
     )
     selected_index = (named_selector_indexes or selector_indexes)[0]
-    selected_names = {
-        normalized_hospital_location_name(locator_records[index].location_name)
-        for index in selector_indexes
-    }
     return HospitalMrfBinding(
         hospital_id=hospital["hospital_id"],
-        record_index=(
-            selected_index
-            if named_selector_indexes or len(selected_names) == 1
-            else None
-        ),
+        record_index=selected_index if named_selector_indexes else None,
         mrf_url=locator_records[selected_index].mrf_url,
     ), selector_indexes
 
