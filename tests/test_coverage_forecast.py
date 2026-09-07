@@ -578,6 +578,56 @@ def test_python_diff_coverage_counts_only_executable_changed_lines(tmp_path: Pat
     }
 
 
+def test_python_diff_coverage_excludes_executed_excluded_lines(tmp_path: Path) -> None:
+    """Both Coverage.py report variants omit excluded statements from the diff."""
+
+    source_path = tmp_path / "api" / "sample.py"
+    source_path.parent.mkdir()
+    source_path.write_text(
+        "if flag:  # pragma: no cover\n    excluded = 1\ncovered = 2\n"
+        "if not flag:\n    missing = 3\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "coverage.json"
+    subprocess.run(
+        [sys.executable, "-c",
+         "import runpy, sys\nfrom coverage import Coverage\n"
+         "measurement = Coverage(data_file=None, branch=True, config_file=False)\n"
+         "measurement.start()\nrunpy.run_path(sys.argv[1], init_globals={'flag': True})\n"
+         "measurement.stop()\n"
+         "measurement.json_report(morfs=[sys.argv[1]], outfile=sys.argv[2])\n",
+         str(source_path), str(report_path)],
+        check=True, capture_output=True, text=True,
+    )
+    document = json.loads(report_path.read_text(encoding="utf-8"))
+    file_report = next(iter(document["files"].values()))
+    assert file_report["excluded_lines"] == [1, 2]
+    config = _report_config(report_path, "coverage.py")
+    for executed_lines in (file_report["executed_lines"], [1, 2, 3, 4]):
+        file_report["executed_lines"] = executed_lines
+        report_path.write_text(json.dumps(document), encoding="utf-8")
+        diff_coverage = growth._report_diff_coverage(
+            tmp_path, "python", config, {"api/sample.py": {2, 3, 5}},
+        )
+        assert (diff_coverage["covered"], diff_coverage["total"], diff_coverage["uncovered_lines"]) == (
+            1, 2, ["api/sample.py:5"],
+        )
+    assert growth.find_added_exclusion_directives_in_diff(
+        "diff --git a/api/sample.py b/api/sample.py\n+++ b/api/sample.py\n"
+        "@@ -0,0 +1 @@\n+if flag:  # pragma: no cover\n",
+        {"reports": {"python": config}}, ["python"],
+    )
+
+
+@pytest.mark.parametrize("excluded_lines", [None, "2", [True], [0], ["2"], [5]])
+def test_python_diff_coverage_rejects_malformed_exclusions(excluded_lines) -> None:
+    with pytest.raises(CoverageRatchetError, match="excluded"):
+        growth._coveragepy_line_sets(
+            {"executed_lines": [3], "missing_lines": [5], "excluded_lines": excluded_lines},
+            "sample.py",
+        )
+
+
 def test_diff_coverage_fails_closed_when_a_changed_product_file_is_absent(
     tmp_path: Path,
 ) -> None:
