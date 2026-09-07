@@ -9,6 +9,8 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from html.parser import HTMLParser
+from itertools import accumulate
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from process.ptg_parts.domain import PTG2_STRIPPED_QUERY_PARAMS
@@ -100,6 +102,122 @@ def _decoded_locator(payload: bytes) -> str:
     ):
         raise _locator_error("control_character")
     return text
+
+
+class _LocatorHtmlBody(HTMLParser):
+    """Unwrap literal locator text, not HTML links or arbitrary page content."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self.text = text
+        self.offsets = tuple(accumulate(map(len, text.splitlines(keepends=True)), initial=0))
+        self.stack: list[str] = []
+        self.seen: set[str] = set()
+        self.parts: list[str] = []
+        self.cursor = 0
+        self.tail = ""
+
+    def _offset(self) -> int:
+        line, column = self.getpos()
+        return self.offsets[line - 1] + column
+
+    def _body_text(self) -> None:
+        # Slice the original text: HTMLParser entity callbacks split bare query
+        # parameters such as &type=CSV. Never reconstruct or unescape those bytes.
+        part = self.text[self.cursor:self._offset()]
+        self.parts.append(part)
+        self.tail = (self.tail + part).rsplit("\n", 1)[-1]
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        """Accept one envelope and only nonbinding markup inside its body."""
+        if tag in {"html", "head", "body"}:
+            expected = [] if tag == "html" else ["html"]
+            if self.stack != expected or tag in self.seen or "body" in self.seen:
+                raise _locator_error("html_wrapper")
+            self.seen.add(tag)
+            self.stack.append(tag)
+        elif self.stack == ["html", "head"]:
+            if tag in {"link", "meta"}:
+                return
+            if tag not in {"script", "style"}:
+                raise _locator_error("html_wrapper")
+            self.stack.append(tag)
+        elif self.stack == ["html", "body"]:
+            self._body_text()
+            is_contact_anchor = tag == "a" and re.fullmatch(
+                r"\s*contact-email\s*:\s*", self.tail, re.IGNORECASE
+            )
+            if not (is_contact_anchor or tag in {"script", "style"} and not self.tail.strip()):
+                raise _locator_error("html_wrapper")
+            self.stack.append(tag)
+        else:
+            raise _locator_error("html_wrapper")
+        self.cursor = self._offset() + len(self.get_starttag_text())
+
+    def handle_endtag(self, tag: str) -> None:
+        """Require balanced markup and retain only literal body text spans."""
+        if not self.stack or tag != self.stack[-1]:
+            raise _locator_error("html_wrapper")
+        if tag == "body":
+            self._body_text()
+        self.stack.pop()
+        self.cursor = self.text.index(">", self._offset()) + 1
+
+    def handle_data(self, data: str) -> None:
+        """Reject non-whitespace text outside the document head and body."""
+        if self.stack in ([], ["html"]) and data.strip():
+            raise _locator_error("html_wrapper")
+
+    def handle_comment(self, data: str) -> None:
+        """Reject comments that could splice locator fields inside the body."""
+        if "body" in self.stack:
+            raise _locator_error("html_wrapper")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        """Allow self-closing head metadata, never self-closing body markup."""
+        if self.stack != ["html", "head"] or tag not in {"link", "meta"}:
+            raise _locator_error("html_wrapper")
+
+    def handle_decl(self, decl: str) -> None:
+        """Allow only one optional HTML doctype before the document."""
+        if self.stack or self.seen or decl.casefold() != "doctype html":
+            raise _locator_error("html_wrapper")
+        self.seen.add("doctype")
+
+    def handle_entityref(self, name: str) -> None:
+        """Keep raw references for text slicing and reject outside entities."""
+        if self.stack in ([], ["html"]):
+            raise _locator_error("html_wrapper")
+
+    handle_charref = handle_entityref
+
+    def unknown_decl(self, data: str) -> None:
+        """Reject unsupported declarations and processing instructions."""
+        raise _locator_error("html_wrapper")
+
+    handle_pi = unknown_decl
+
+
+def _locator_text(payload: bytes) -> str:
+    text = _decoded_locator(payload)
+    if not re.match(r"\s*(?:<!doctype html>\s*)?<html(?:\s|>)", text, re.IGNORECASE):
+        return text
+    parser = _LocatorHtmlBody(text)
+    parser.feed(text)
+    parser.close()
+    if parser.stack or "body" not in parser.seen:
+        raise _locator_error("html_wrapper")
+    body = "".join(parser.parts)
+    if _field_key(body.lstrip().partition(":")[0]) != "location-name":
+        raise _locator_error("html_wrapper")
+    for line in body.split("\n"):
+        key = _field_key(line.partition(":")[0])
+        is_binding_line = key in {"location-name", "mrf-url", "source-page-url"} or (
+            line.strip().casefold().startswith(("http://", "https://", "/"))
+        )
+        if is_binding_line and (html.unescape(line) != line or "<" in line or ">" in line):
+            raise _locator_error("html_wrapper")
+    return body
 
 
 def _validated_mrf_url(value: str) -> str:
@@ -250,7 +368,7 @@ def parse_hospital_hpt_locator(
     has_records_started = False
     is_empty_mrf_continuation_allowed = False
     previous_field_key: str | None = None
-    lines = _decoded_locator(locator_payload).split("\n")
+    lines = _locator_text(locator_payload).split("\n")
     is_preceded_by_blank = False
     for index, line in enumerate(lines):
         if not line.strip():

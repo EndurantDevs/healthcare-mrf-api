@@ -136,6 +136,7 @@ def test_checked_in_registry_has_reviewed_cms_hpt_urls():
         "hospital-007141",
         "hospital-001458", "hospital-003007", "hospital-003587", "hospital-003588",
         "hospital-003117", "hospital-003118", "hospital-003119",
+        "hospital-003824",
     )] == [
         "https://www.achsiowa.org/cms-hpt.txt",
         "https://amberwellhealth.org/cms-hpt.txt",
@@ -155,7 +156,31 @@ def test_checked_in_registry_has_reviewed_cms_hpt_urls():
         "https://estimator.myinsightcare.com/cms-hpt.txt",
         "https://insightcoldwater.org/cms-hpt.txt",
         "https://insightsurgicalhospital.com/cms-hpt.txt",
+        "https://www.massgeneralbrigham.org/cms-hpt.txt",
     ]
+
+
+def test_mclean_shared_locator_keeps_fourteen_facilities_separate():
+    """Correct one locator without aliasing its other hospital records."""
+    locator_url = "https://www.massgeneralbrigham.org/cms-hpt.txt"
+    hospitals = tuple(row for row in registry.load_hospital_hpt_registry()
+                      if row["cms_hpt_url"] == locator_url)
+    assert len(hospitals) == 14 and all("alias_of" not in row for row in hospitals)
+    mclean = next(row for row in hospitals if row["hospital_id"] == "hospital-003824")
+    assert mclean == {"hospital_id": "hospital-003824", "name": "McLean Hospital",
+                      "cms_hpt_url": locator_url}
+    records = tuple(HospitalHptLocatorRecord(
+        row.get("locator_name", row["name"]),
+        f"https://files.example/{row['hospital_id']}.zip",
+    ) for row in hospitals)
+    match = match_hospital_hpt_locator(hospitals, locator_url, records)
+    assert len(match.bindings) == len(match.content_targets) == 14
+    assert not match.unmatched_hospital_ids and not match.unmatched_record_indexes
+    assert not match.ambiguous_hospital_ids and not match.ambiguous_record_indexes
+    assert {binding.hospital_id: binding.mrf_url for binding in match.bindings} == {
+        row["hospital_id"]: f"https://files.example/{row['hospital_id']}.zip"
+        for row in hospitals
+    }
 
 
 def test_slidell_name_binding_preserves_distinct_campus_sources():
