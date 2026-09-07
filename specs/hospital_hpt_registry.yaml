@@ -16299,9 +16299,11 @@ hospitals:
 - hospital_id: hospital-004860
   name: Orlando Health Melbourne Hospital
   cms_hpt_url: https://www.kindredhospitals.com/cms-hpt.txt
+  fallback_mrf_url: https://hospitalpricedisclosure.com/download.aspx?pi=K1PKLo31nox8yduJLcFWgw*-*&f=p22CpYLrWLxCnt4HoK7iZA*-*
 - hospital_id: hospital-004861
   name: Orlando Health Sebastian River Hospital
   cms_hpt_url: https://www.kindredhospitals.com/cms-hpt.txt
+  fallback_mrf_url: https://hospitalpricedisclosure.com/download.aspx?pi=AEq1Okiq8l6y84nlCfk8rw*-*&f=p22CpYLrWLxCnt4HoK7iZA*-*
 - hospital_id: hospital-004862
   name: Orlando Health South Lake Hospital
   cms_hpt_url: https://www.southlakehospital.com/cms-hpt.txt

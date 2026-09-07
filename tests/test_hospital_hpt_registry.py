@@ -94,7 +94,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_713
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 128
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 130
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -273,6 +273,52 @@ def test_fulton_fallback_preserves_separate_hospital_sources(record_case):
         assert "fallback_mrf_url" not in hospital
         candidate = candidate_by_id[hospital["hospital_id"]]
         assert candidate.source_url == "https://files.example/main.csv" and candidate.initial_error_code is None
+
+
+@pytest.mark.parametrize("record_case", ("matching", "unmatched", "ambiguous"))
+def test_reviewed_pair_preserves_shared_locator(record_case):
+    """Replace two exact sources without changing their shared locator's other bindings."""
+    acquisition = acquisition_module()
+    locator_url = "https://www.kindredhospitals.com/cms-hpt.txt"
+    hospitals = tuple(hospital for hospital in registry.load_hospital_hpt_registry()
+                      if hospital["cms_hpt_url"] == locator_url)
+    replacements = registry.selected_hospital_hpt_registry({"hospital_ids": [
+        "hospital-004860", "hospital-004861",
+    ]})
+    replacement_by_id = {hospital["hospital_id"]: hospital for hospital in replacements}
+    assert len(hospitals) == 53
+    assert {hospital["hospital_id"] for hospital in hospitals if "fallback_mrf_url" in hospital} == set(replacement_by_id)
+    assert len({hospital["fallback_mrf_url"] for hospital in replacements}) == 2
+    for hospital in replacements:
+        assert set(hospital) == {"hospital_id", "name", "cms_hpt_url", "fallback_mrf_url"}
+        assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (hospital["hospital_id"],)
+    locator_records = tuple(HospitalHptLocatorRecord(
+        hospital.get("locator_name", hospital["name"]),
+        f"https://files.example/{hospital['hospital_id']}.json",
+    ) for hospital in hospitals if hospital["hospital_id"] not in replacement_by_id)
+    if record_case != "unmatched":
+        locator_records += tuple(HospitalHptLocatorRecord(
+            hospital["name"], f"https://files.example/stale-{index}.json",
+        ) for hospital in replacements for index in range(2 if record_case == "ambiguous" else 1))
+    previous_hospitals = tuple({field: field_value for field, field_value in hospital.items()
+                               if field != "fallback_mrf_url"} for hospital in hospitals)
+    candidate_snapshots = []
+    for cohort in (previous_hospitals, hospitals):
+        candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+            locator_url, "synthetic-locator", "synthetic-observation", cohort, locator_records,
+        ),))
+        candidate_snapshots.append({candidate.hospital_id: candidate for candidate in candidates})
+    previous_by_id, candidate_by_id = candidate_snapshots
+    assert set(candidate_by_id) == set(previous_by_id) == {hospital["hospital_id"] for hospital in hospitals}
+    for hospital_id, candidate in candidate_by_id.items():
+        if hospital_id not in replacement_by_id:
+            assert candidate == previous_by_id[hospital_id]
+            continue
+        hospital = replacement_by_id[hospital_id]
+        assert candidate.hospital_name == candidate.locator_name == hospital["name"]
+        assert candidate.locator_url == locator_url and candidate.observation_id == "synthetic-observation"
+        assert candidate.source_url == (locator_url if record_case == "ambiguous" else hospital["fallback_mrf_url"])
+        assert candidate.initial_error_code == ("locator_ambiguous" if record_case == "ambiguous" else None)
 
 
 def test_checked_in_registry_has_reviewed_canonical_aliases():
