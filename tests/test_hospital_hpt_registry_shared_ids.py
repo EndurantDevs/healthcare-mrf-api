@@ -126,6 +126,39 @@ def test_rice_legal_name_alias_preserves_ids_and_locator_closure():
         assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
+def test_ohio_valley_alias_preserves_ids_and_locator_closure():
+    """Group the reviewed Ohio identity without merging neighboring hospitals."""
+    group = ("hospital-004819", "hospital-004818")
+    locator_url = "https://www.ovsurgical.com/cms-hpt.txt"
+    locator_records = (locator.HospitalHptLocatorRecord(
+        "OHIO VALLEY SURGICAL HOSPITAL", "https://hospital.example/ohio.csv"
+    ),)
+    hospitals = registry.load_hospital_hpt_registry()
+    cohort_hospitals = tuple(hospital for hospital in hospitals if hospital["cms_hpt_url"] == locator_url)
+    assert {hospital["hospital_id"] for hospital in cohort_hospitals} == set(group)
+    assert [hospital.get("alias_of") for hospital in cohort_hospitals] == [group[0], None]
+    assert [hospital["name"] for hospital in cohort_hospitals] == [
+        "Ohio Valley Medical Center", "OHIO VALLEY SURGICAL HOSPITAL",
+    ]
+    assert cohort_hospitals[0]["locator_name"] == "OHIO VALLEY SURGICAL HOSPITAL"
+    assert all("locator_mrf_url" not in hospital and "fallback_mrf_url" not in hospital for hospital in cohort_hospitals)
+    for hospital_id in group:
+        assert registry.hospital_hpt_group_ids(hospital_id) == group
+        selected = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+        assert selected == cohort_hospitals
+        match = locator.match_hospital_hpt_locator(selected, locator_url, locator_records)
+        assert [(binding.hospital_id, binding.record_index) for binding in match.bindings] == [
+            ("hospital-004818", 0), ("hospital-004819", 0),
+        ]
+        assert match.content_targets == (locator_records[0].mrf_url,)
+        assert not match.unmatched_hospital_ids
+        assert not match.ambiguous_hospital_ids
+        assert not match.unmatched_record_indexes
+        assert not match.ambiguous_record_indexes
+    for hospital_id in ("hospital-004817", "hospital-004820"):
+        assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+
+
 def test_avera_shared_locator_closes_every_reviewed_id():
     hospitals = tuple(
         hospital for hospital in registry.load_hospital_hpt_registry()

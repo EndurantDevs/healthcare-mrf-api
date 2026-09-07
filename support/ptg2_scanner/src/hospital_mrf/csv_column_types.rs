@@ -61,6 +61,7 @@ struct WideCsvColumns {
     requires_estimated_amount: bool,
     common: CommonCsvColumns,
     payers: Vec<WidePayerColumns>,
+    duplicate_columns: Vec<(usize, usize)>,
 }
 
 #[derive(Default)]
