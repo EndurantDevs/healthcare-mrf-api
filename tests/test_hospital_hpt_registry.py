@@ -94,7 +94,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_713
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 137
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 138
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -155,6 +155,8 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
 @pytest.mark.parametrize("hospital_id,name,locator_url,location_names,ordinal", (
     ("hospital-002218", "First Care Health Center", "https://www.firstcarehc.com/cms-hpt.txt",
      ("First Care Health Center",), 0),
+    ("hospital-002849", "HealthSource Saginaw", "https://www.healthsourcesaginaw.org/cms-hpt.txt",
+     ("HealthSource Saginaw",), 0),
     ("hospital-004390", "Mountainview Medical Center", "https://www.mvmc.org/cms-hpt.txt",
      ("Mountainview Medical Center",), 0),
     ("hospital-005166", "Pioneers Medical Center", "https://www.pioneershospital.org/cms-hpt.txt",

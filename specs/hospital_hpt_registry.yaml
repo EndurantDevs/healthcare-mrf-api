@@ -9554,6 +9554,7 @@ hospitals:
 - hospital_id: hospital-002849
   name: HealthSource Saginaw
   cms_hpt_url: https://www.healthsourcesaginaw.org/cms-hpt.txt
+  fallback_mrf_url: https://www.healthsourcesaginaw.org/wp-content/uploads/2026/04/386004889_healthsource-saginaw_standardcharges.csv
 - hospital_id: hospital-002850
   name: HEART HOSP OF AUSTIN
   cms_hpt_url: https://www.stdavids.com/cms-hpt.txt
