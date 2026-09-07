@@ -12,7 +12,6 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from db.models.hospital_price_header import HospitalPriceVersion
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
@@ -48,7 +47,7 @@ def _load_migration():
     return migration
 
 
-def test_csv_v3_0_1_migration_matches_current_model() -> None:
+def test_csv_v3_0_1_migration_preserves_original_boundary() -> None:
     migration = _load_migration()
     assert migration.revision == "20260905130000_hospital_price_csv_3_0_1"
     assert migration.down_revision == (
@@ -57,12 +56,8 @@ def test_csv_v3_0_1_migration_matches_current_model() -> None:
     drop, add = migration._upgrade_statements()
     assert "DROP CONSTRAINT hospital_price_version_shape_check" in drop
     migration_check = add.split(" CHECK (", 1)[1][:-2]
-    shape_check = next(
-        constraint
-        for constraint in HospitalPriceVersion.__table__.constraints
-        if constraint.name == "hospital_price_version_shape_check"
-    )
-    assert migration_check == str(shape_check.sqltext)
+    assert "template_version IN ('3.0.1', '4.0.0') AND npi_count > 0" in migration_check
+    assert "attestation_text" not in migration_check
     assert migration.downgrade() is None
 
 

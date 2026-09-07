@@ -67,7 +67,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
         in model_sql
     )
     assert model_sql.count("'3.0.1'") == 1
-    assert model_sql.count("'4.0.0'") == 1
+    assert model_sql.count("'4.0.0'") == 2
     assert "template_version IN ('2.0.0', '2.2.0', '2.2.1')" in model_sql
     assert "npi_count = 0 AND attester_name IS NULL" in model_sql
     assert "source_format IN ('csv-tall', 'csv-wide') AND npi_count >= 0" in model_sql

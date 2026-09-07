@@ -5,6 +5,16 @@ import pytest
 from tests.test_hospital_price_native import native
 
 
+def test_format_detection_uses_columns_not_declared_v4_label(tmp_path):
+    source = tmp_path / "input.csv"
+    source.write_bytes(
+        b"hospital_name,last_updated_on,version,hospital_location\n"
+        b"Example,4/25/2025,4.0.0,Example Hospital | Example Infusion Center\n"
+        b"code|1,code|1|type,description,plan_name,payer_name,estimated_amount\n"
+    )
+    assert native.detect_hospital_mrf_format(source) == "csv-tall"
+
+
 def test_format_detection_skips_blank_structural_records_beyond_sniff(tmp_path):
     source = tmp_path / "input.csv"
     source.write_bytes(

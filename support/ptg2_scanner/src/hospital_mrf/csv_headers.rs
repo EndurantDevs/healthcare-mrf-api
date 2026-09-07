@@ -170,7 +170,14 @@ fn parse_csv_metadata(
                 && !address.trim().is_empty() && !address.contains('|')
                 && !location.trim().is_empty() && !location.contains('|')
     );
-    let profile = if declared_profile == CmsProfile::V2
+    let profile = if version == "4.0.0"
+        && fields.contains_key("hospital_location")
+        && affirmation_index.is_some()
+        && !fields.contains_key("location_name")
+        && attestation_index.is_none()
+    {
+        CmsProfile::V2
+    } else if declared_profile == CmsProfile::V2
         && fields.contains_key("location_name")
         && attestation_index.is_some()
         && (!fields.contains_key("hospital_location") || has_redundant_legacy_location)

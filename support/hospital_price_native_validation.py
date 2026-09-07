@@ -124,6 +124,13 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = (1 << 64) - 1
 _PG_BINARY_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + b"\0" * 8
 _PG_BINARY_COPY_TRAILER = b"\xff\xff"
+_PROFILE_METADATA_MAX_BYTES = 65_536
+_CMS_V2_AFFIRMATION_TEXT = (
+    "To the best of its knowledge and belief, the hospital has included all "
+    "applicable standard charge information in accordance with the requirements "
+    "of 45 CFR 180.50, and the information encoded is true, accurate, and complete "
+    "as of the date indicated."
+)
 
 
 @dataclass(frozen=True)
@@ -449,6 +456,26 @@ def _semantic_sha256(
     return digest.hexdigest()
 
 
+def _has_v2_csv_metadata(
+    artifacts: tuple[HospitalParserArtifact, ...], version_id: str,
+) -> bool:
+    """Read exact V2 evidence from an already hash-validated COPY artifact."""
+
+    metadata = next(artifact for artifact in artifacts if artifact.kind == "mrf")
+    with metadata.path.open("rb") as metadata_stream:
+        encoded = metadata_stream.read(_PROFILE_METADATA_MAX_BYTES + 1)
+    fields = encoded.removesuffix(b"\n").split(b"\t")
+    return (
+        len(encoded) <= _PROFILE_METADATA_MAX_BYTES
+        and encoded.endswith(b"\n") and encoded.count(b"\n") == 1
+        and len(fields) == len(HOSPITAL_MRF_TEXT_COPY_COLUMNS["mrf"])
+        and fields[0] == version_id.encode("ascii")
+        and fields[3] == b"4.0.0"
+        and fields[4] == _CMS_V2_AFFIRMATION_TEXT.encode("ascii")
+        and fields[5] in {b"true", b"false"}
+    )
+
+
 def validate_hospital_parser_summary(
     summary_bytes: bytes, *,
     version_id: str,
@@ -473,6 +500,11 @@ def validate_hospital_parser_summary(
     if (
         summary_fields["schema_version"] in {"3.0.0", "3.0.1", "4.0.0"}
         and not next(artifact.rows for artifact in artifacts if artifact.kind == "npi")
+        and not (
+            source_format in {"csv-tall", "csv-wide"}
+            and summary_fields["schema_version"] == "4.0.0"
+            and _has_v2_csv_metadata(artifacts, version_id)
+        )
     ):
         raise ValueError("hospital parser v3 NPI artifact is empty")
     if _retained_artifact_bytes(artifacts) > max_output_bytes:

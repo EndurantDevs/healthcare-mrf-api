@@ -3,7 +3,7 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "673df26241674730fbeade8a0aa81db4bfd716f4b2f815bde725842deed33a59",
+      "attestation_id": "3b0a54e1a4f81d18b82c7d5f1c7b9fd7496cdaf3bf9269c5aeb030a6bfa30d19",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
@@ -33,11 +33,11 @@
         "healthcare_image_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
         "healthcare_source_commit": "1212121212121212121212121212121212121212",
         "postgres_server_version_num": 180002,
-        "profile_migration_revision": "20260904223000_provider_directory_michigan_generation_retirement",
+        "profile_migration_revision": "20260907193000_hospital_price_csv_v4_v2",
         "profile_schema_version": 1,
         "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
       },
-      "runtime_witness_sha256": "01631a9a97d38ba5a4f6fd716562a8c3589f6b45acce2bc1e552accd0bfc00b3",
+      "runtime_witness_sha256": "5e37ff217bdabb986b00a2c149bbb1eab264a17881271d2d1c403d794233e0d6",
       "signature_algorithm": "Ed25519",
       "signing_preflight_guard": {
         "bundle_validation_path": "/v1/provider-directory/profile-capacity-bundle-validation",
@@ -527,7 +527,7 @@
         }
       ]
     },
-    "signature": "WBOPWb-2nG4ZyhjqN0GAD4HFJiYlSG1S0uOGV3MBEEQOQfnEk5ngDVCblTKWMN-4qzQJXF3lnI7mbB4rmIjSAw"
+    "signature": "LeZUoEJLxFKvo6FS6tWzDb0y0SMKJDdqHmW7qUre7E-FlxyEE_TpVfxlcQZZp0FGD8xTiDXcwM3zc06X4FPCBg"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,
