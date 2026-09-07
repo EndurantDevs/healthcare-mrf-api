@@ -6,7 +6,6 @@ import ast
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 
 from .config import split_name_tokens
 from .model import Issue
@@ -37,20 +36,11 @@ _SINGULAR_EXCEPTIONS = {
 
 
 def confusable_function_name_issues(
-    repo_root: Path,
-    paths: list[Path],
+    collector: _FunctionNameCollector,
     exceptions: set[str] | None = None,
 ) -> list[Issue]:
     """Report functions in one logical module that differ only by plurality."""
 
-    collector = _FunctionNameCollector()
-    for path in paths:
-        relative = path.relative_to(repo_root).as_posix()
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue
-        collector.collect(relative, tree)
     issues: list[Issue] = []
     for (namespace, scope, normalized_tokens), definitions in sorted(collector.definitions_by_key.items()):
         raw_token_sets = {definition.tokens for definition in definitions}

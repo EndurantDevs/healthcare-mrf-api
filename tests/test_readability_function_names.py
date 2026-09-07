@@ -56,6 +56,35 @@ def test_confusable_function_names_reports_plurality_only_difference(tmp_path):
     ]
 
 
+def test_confusable_function_names_reuses_the_main_analysis_parse(monkeypatch, tmp_path):
+    source_files = sys.modules["readability.source_files"]
+    original_parse = source_files.ast.parse
+    parse_calls = []
+
+    def counted_parse(source):
+        parse_calls.append(source)
+        return original_parse(source)
+
+    monkeypatch.setattr(source_files.ast, "parse", counted_parse)
+    snapshot = _build_readability_snapshot_by_category(
+        tmp_path,
+        {
+            "pkg/module.py": """
+                def build_record():
+                    return None
+
+                def build_records():
+                    return []
+            """,
+            "pkg/broken.py": "def broken(:\n    pass\n",
+        },
+    )
+
+    assert len(parse_calls) == 2
+    assert snapshot["issue_counts"]["syntax_errors"] == 1
+    assert snapshot["issue_counts"]["confusable_function_names"] == 1
+
+
 def test_confusable_function_names_accepts_explicit_cardinality_and_owner_scope(tmp_path):
     snapshot = _build_readability_snapshot_by_category(
         tmp_path,

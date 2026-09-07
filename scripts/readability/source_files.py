@@ -12,7 +12,7 @@ from typing import Any
 from .config import (DEFAULT_COMMENT_NOISE_PATTERNS, compile_suppression_patterns, is_matching_path_pattern,
                      readability_options, threshold)
 from .function_visitor import FunctionVisitor
-from .function_names import confusable_function_name_issues
+from .function_names import _FunctionNameCollector, confusable_function_name_issues
 from .model import DEFAULT_ISSUE_CATEGORIES, Issue
 
 
@@ -25,19 +25,19 @@ def collect_issues(
     patterns = compile_suppression_patterns(config)
     issues_by_category: dict[str, list[Issue]] = {category: [] for category in DEFAULT_ISSUE_CATEGORIES}
     source_files = _iter_source_files(repo_root, config)
+    function_name_collector = _FunctionNameCollector()
     for path in source_files:
         split_issue = _split_module_name_issue(repo_root, path)
         if split_issue:
             issues_by_category[split_issue.category].append(split_issue)
-        for issue in _analyze_file(repo_root, path, config):
+        for issue in _analyze_file(repo_root, path, config, function_name_collector):
             issues_by_category[issue.category].append(issue)
         issues_by_category["inline_suppressions"].extend(_find_inline_suppressions(repo_root, path, patterns))
         if path.suffix == ".py":
             issues_by_category["comment_noise"].extend(_find_comment_noise(repo_root, path, config))
-    python_paths = [path for path in source_files if path.suffix == ".py"]
     name_exceptions = set(readability_options(config).get("confusable_function_name_exceptions", []))
     issues_by_category["confusable_function_names"].extend(
-        confusable_function_name_issues(repo_root, python_paths, name_exceptions)
+        confusable_function_name_issues(function_name_collector, name_exceptions)
     )
     if base_revision:
         issues_by_category["huge_file_growth"].extend(
@@ -174,7 +174,12 @@ def _comment_noise_issue(
     )
 
 
-def _analyze_file(repo_root: Path, path: Path, config: dict[str, Any]) -> list[Issue]:
+def _analyze_file(
+    repo_root: Path,
+    path: Path,
+    config: dict[str, Any],
+    function_name_collector: _FunctionNameCollector,
+) -> list[Issue]:
     relative = path.relative_to(repo_root).as_posix()
     issues = _file_size_issues(relative, path, config) if _is_file_length_path(relative, config) else []
     if path.suffix != ".py":
@@ -190,6 +195,7 @@ def _analyze_file(repo_root: Path, path: Path, config: dict[str, Any]) -> list[I
                 {"line": exc.lineno, "offset": exc.offset, "message": exc.msg},
             )
         ]
+    function_name_collector.collect(relative, tree)
     visitor = FunctionVisitor(repo_root, path, config)
     visitor.visit(tree)
     issues.extend(visitor.issues)
@@ -202,22 +208,23 @@ def _module_attribute_injection_issues(
     tree: ast.AST,
     config: dict[str, Any],
 ) -> list[Issue]:
+    nodes = list(ast.walk(tree))
     sys_aliases = {
         alias.asname or alias.name
-        for node in ast.walk(tree)
+        for node in nodes
         if isinstance(node, ast.Import)
         for alias in node.names
         if alias.name == "sys"
     }
     module_aliases = {
         alias.asname or alias.name.split(".", 1)[0]
-        for node in ast.walk(tree)
+        for node in nodes
         if isinstance(node, ast.Import)
         for alias in node.names
     }
     module_aliases.update(
         alias.asname or alias.name
-        for node in ast.walk(tree)
+        for node in nodes
         if isinstance(node, ast.ImportFrom) and node.module is None
         for alias in node.names
     )
@@ -225,7 +232,7 @@ def _module_attribute_injection_issues(
         readability_options(config).get("module_attribute_injection_allowlist", [])
     )
     issues: list[Issue] = []
-    for node in ast.walk(tree):
+    for node in nodes:
         issue = _assignment_injection_issue(
             relative, node, module_aliases, allowlisted_names
         )
