@@ -1020,6 +1020,206 @@ async def test_real_postgres_selective_copy_stages_each_new_hash_once(
         ) == 2
 
 
+async def _install_cas_timeout_trigger(quoted_schema: str) -> None:
+    await db.execute_ddl(f"CREATE SEQUENCE {quoted_schema}.cas_insert_attempt")
+    await db.execute_ddl(
+        f"CREATE TABLE {quoted_schema}.cas_insert_result (row_count bigint)"
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE FUNCTION {quoted_schema}.slow_large_cas_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE inserted_count bigint;
+        BEGIN
+            PERFORM nextval('{quoted_schema}.cas_insert_attempt');
+            SELECT count(*) INTO inserted_count FROM inserted_blocks;
+            IF inserted_count > 2 THEN PERFORM pg_sleep(6); END IF;
+            INSERT INTO {quoted_schema}.cas_insert_result VALUES (inserted_count);
+            RETURN NULL;
+        END $$
+        """
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE TRIGGER slow_large_cas_insert
+        AFTER INSERT ON {quoted_schema}.ptg2_v3_block
+        REFERENCING NEW TABLE AS inserted_blocks
+        FOR EACH STATEMENT EXECUTE FUNCTION {quoted_schema}.slow_large_cas_insert()
+        """
+    )
+
+
+async def _observe_cas_rollback(observer, quoted_schema, error):
+    import asyncpg
+
+    driver_error = error
+    while not isinstance(driver_error, asyncpg.QueryCanceledError):
+        driver_error = getattr(driver_error, "orig", None) or driver_error.__cause__
+        assert isinstance(driver_error, BaseException)
+    assert driver_error.sqlstate == "57014"
+    assert driver_error.message == "canceling statement due to statement timeout"
+    assert await observer.scalar(
+        f"SELECT count(*) FROM {quoted_schema}.ptg2_v3_block"
+    ) == 0
+    assert await observer.scalar(
+        f"SELECT count(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+    ) == 0
+    assert await observer.scalar(
+        f"SELECT last_value FROM {quoted_schema}.cas_insert_attempt"
+    ) == 1
+    pins = await observer.all(
+        f"SELECT block_hash, heartbeat_at FROM {quoted_schema}.ptg2_block_build_pin "
+        "ORDER BY block_hash"
+    )
+    assert len(pins) == 4
+    return tuple((bytes(row[0]), row[1]) for row in pins)
+
+
+def _observe_timed_out_cas_transaction(monkeypatch, observer, schema, rollbacks):
+    real_transaction = db.transaction
+
+    @asynccontextmanager
+    async def observe_transaction():
+        try:
+            async with real_transaction() as session:
+                yield session
+        except Exception as error:
+            if not rollbacks:
+                rollbacks.append(await _observe_cas_rollback(observer, schema, error))
+            raise
+
+    monkeypatch.setattr(db, "transaction", observe_transaction)
+
+
+@asynccontextmanager
+async def _cas_timeout_database(tmp_path, monkeypatch):
+    real_lock = ptg2_shared_publish.lock_shared_layout_for_dense_write
+    async with _selective_block_database(monkeypatch) as (schema_name, schema):
+        monkeypatch.setattr(
+            ptg2_shared_publish, "lock_shared_layout_for_dense_write", real_lock
+        )
+        await _stage_selective_block_copy(
+            tmp_path, schema_name,
+            (1, b"alpha", 1), (2, b"beta", 1), (3, b"gamma", 1),
+            (4, b"delta", 1), (5, b"alpha", 1),
+        )
+        await _install_cas_timeout_trigger(schema)
+        observer = Database()
+        await observer.connect()
+        rollbacks = []
+        _observe_timed_out_cas_transaction(monkeypatch, observer, schema, rollbacks)
+        try:
+            yield schema_name, schema, observer, rollbacks
+        finally:
+            await observer.disconnect()
+
+
+async def _assert_cas_rows_and_renewal(schema, rollbacks):
+    assert len(rollbacks) == 1
+    assert await db.scalar(
+        f"SELECT array_agg(row_count ORDER BY row_count) FROM {schema}.cas_insert_result"
+    ) == [2, 2]
+    assert await db.scalar(f"SELECT last_value FROM {schema}.cas_insert_attempt") == 3
+    assert await db.scalar(
+        f"""
+        SELECT count(*) FROM (
+            SELECT block_hash, format_version, object_kind, codec, entry_count,
+                   raw_byte_count, stored_byte_count, payload
+              FROM {schema}.block_stage WHERE payload IS NOT NULL
+            EXCEPT
+            SELECT block_hash, format_version, object_kind, codec, entry_count,
+                   raw_byte_count, stored_byte_count, payload
+              FROM {schema}.ptg2_v3_block
+        ) AS missing
+        """
+    ) == 0
+    assert await db.scalar(f"SELECT count(*) FROM {schema}.ptg2_v3_block") == 4
+    anchor_hash, previous_heartbeat = rollbacks[0][0]
+    renewed = await db.first(
+        f"SELECT heartbeat_at, lease_until > now() FROM {schema}.ptg2_block_build_pin "
+        "WHERE block_hash = :block_hash", block_hash=anchor_hash,
+    )
+    assert renewed[0] > previous_heartbeat and renewed[1]
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_cas_statement_timeout_splits_after_rollback(
+    tmp_path, monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    async with _cas_timeout_database(tmp_path, monkeypatch) as fixture:
+        schema_name, schema, _observer, rollbacks = fixture
+        publication_parameters_by_name = dict(
+            schema_name=schema_name, stage_table="block_stage", snapshot_key=91,
+            build_token="timeout-owner", expected_generation="shared_blocks_v3",
+        )
+        await ptg2_shared_publish.prepare_shared_cas_block_stage(**publication_parameters_by_name)
+        await _assert_cas_rows_and_renewal(schema, rollbacks)
+        before = await db.all(f"SELECT * FROM {schema}.ptg2_v3_block ORDER BY block_hash")
+        await ptg2_shared_publish.prepare_shared_cas_block_stage(**publication_parameters_by_name)
+        assert await db.all(
+            f"SELECT * FROM {schema}.ptg2_v3_block ORDER BY block_hash"
+        ) == before
+        assert await db.scalar(
+            f"SELECT array_agg(row_count ORDER BY row_count) FROM {schema}.cas_insert_result"
+        ) == [0, 2, 2]
+        expected_mappings = await db.all(
+            f"SELECT block_key, block_hash, entry_count FROM {schema}.block_stage ORDER BY block_key"
+        )
+        publication = await publish_shared_block_stage(**publication_parameters_by_name)
+        assert (publication.mapping_count, publication.unique_block_count) == (5, 4)
+        assert await db.all(
+            f"SELECT block_key, block_hash, entry_count FROM {schema}.ptg2_v3_snapshot_block "
+            "WHERE snapshot_key = 91 AND object_kind = 'serving' AND fragment_no = 0 ORDER BY block_key"
+        ) == expected_mappings
+        assert await db.scalar(f"SELECT count(*) FROM {schema}.ptg2_block_build_pin") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["stale_owner", "metadata_conflict"])
+async def test_real_postgres_cas_timeout_retry_rechecks_ownership_and_metadata(
+    tmp_path, monkeypatch, failure,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    real_observe = _observe_cas_rollback
+
+    async def change_after_rollback(observer, schema, error):
+        pins = await real_observe(observer, schema, error)
+        if failure == "stale_owner":
+            await observer.status(
+                f"UPDATE {schema}.ptg2_v3_snapshot_layout SET build_token = 'new-owner'"
+            )
+        else:
+            await observer.status(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_block
+                    (block_hash, format_version, object_kind, codec, entry_count,
+                     raw_byte_count, stored_byte_count, payload, created_at)
+                SELECT block_hash, format_version, object_kind, codec, 99,
+                       raw_byte_count, stored_byte_count, payload, now()
+                  FROM {schema}.block_stage WHERE payload IS NOT NULL
+                 ORDER BY block_hash LIMIT 1
+                """
+            )
+        return pins
+
+    monkeypatch.setitem(globals(), "_observe_cas_rollback", change_after_rollback)
+    async with _cas_timeout_database(tmp_path, monkeypatch) as fixture:
+        schema_name, schema, _observer, rollbacks = fixture
+        message = "lost its build ownership" if failure == "stale_owner" else "conflicts with stored content metadata"
+        with pytest.raises(RuntimeError, match=message):
+            await ptg2_shared_publish.prepare_shared_cas_block_stage(
+                schema_name=schema_name, stage_table="block_stage", snapshot_key=92,
+                build_token="timeout-owner", expected_generation="shared_blocks_v3",
+            )
+        assert len(rollbacks) == 1
+        assert await db.scalar(f"SELECT count(*) FROM {schema}.ptg2_v3_snapshot_block") == 0
+        assert await db.scalar(f"SELECT count(*) FROM {schema}.ptg2_v3_block") == (failure == "metadata_conflict")
+        assert await db.scalar(f"SELECT count(*) FROM {schema}.ptg2_block_build_pin") == 4
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_batched_shared_publish_orders_payload_before_reuses(
     monkeypatch,

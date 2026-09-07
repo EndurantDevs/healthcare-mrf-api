@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -47,6 +48,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
 from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name
 
 
+logger = logging.getLogger(__name__)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHARED_BLOCK_STAGE_COLUMNS = (
     "block_hash",
@@ -2049,7 +2051,69 @@ async def _publish_v4_durable_cas_batch(
     )
 
 
-async def _publish_durable_cas_batch(
+class _DurableCASStatementTimeout(Exception):
+    """Mark a timed-out CAS statement until its transaction has rolled back."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__("PTG CAS statement exceeded its time limit")
+        self.error = error
+
+
+def _is_cas_statement_timeout(error: BaseException) -> bool:
+    """Inspect primary messages; SQLSTATE 57014 also covers user cancellation.
+
+    Unknown or localized messages preserve the original failure without retry.
+    """
+
+    visited_error_ids: set[int] = set()
+    while id(error) not in visited_error_ids:
+        visited_error_ids.add(id(error))
+        sqlstate = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+        message = getattr(error, "message", None)
+        if message is None:
+            message = getattr(getattr(error, "diag", None), "message_primary", None)
+        if sqlstate and isinstance(message, str):
+            return (
+                str(sqlstate) == "57014"
+                and message == "canceling statement due to statement timeout"
+            )
+        nested = getattr(error, "orig", None)
+        if not isinstance(nested, BaseException):
+            nested = getattr(error, "__cause__", None)
+        if not isinstance(nested, BaseException):
+            return False
+        error = nested
+    return False
+
+
+async def _insert_and_validate_cas_batch(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    block_hashes: Sequence[bytes],
+) -> None:
+    block_parameters_by_name = {
+        "block_hashes": list(block_hashes),
+        "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
+    }
+    try:
+        await session.execute(
+            db.text(_V4_DURABLE_INSERT_BLOCK_SQL.format(schema=schema, stage=stage)),
+            block_parameters_by_name,
+        )
+        validation_result = await session.execute(
+            db.text(_V4_DURABLE_VALIDATE_BLOCK_SQL.format(schema=schema, stage=stage)),
+            block_parameters_by_name,
+        )
+    except Exception as error:
+        if _is_cas_statement_timeout(error):
+            raise _DurableCASStatementTimeout(error) from error
+        raise
+    _validate_shared_block_batch(validation_result.one())
+
+
+async def _publish_durable_cas_subbatch(
     *,
     schema_name: str,
     schema: str,
@@ -2059,8 +2123,6 @@ async def _publish_durable_cas_batch(
     expected_generation: str,
     block_hashes: Sequence[bytes],
 ) -> None:
-    """Commit one bounded CAS batch while the exact build owner is live."""
-
     async with db.transaction() as session:
         await configure_ptg2_lifecycle_transaction(
             session,
@@ -2074,29 +2136,9 @@ async def _publish_durable_cas_batch(
             build_token=str(build_token),
             expected_generation=expected_generation,
         )
-        block_parameters_by_name = {
-            "block_hashes": list(block_hashes),
-            "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
-        }
-        await session.execute(
-            db.text(
-                _V4_DURABLE_INSERT_BLOCK_SQL.format(
-                    schema=schema,
-                    stage=stage,
-                )
-            ),
-            block_parameters_by_name,
+        await _insert_and_validate_cas_batch(
+            session, schema=schema, stage=stage, block_hashes=block_hashes
         )
-        validation_result = await session.execute(
-            db.text(
-                _V4_DURABLE_VALIDATE_BLOCK_SQL.format(
-                    schema=schema,
-                    stage=stage,
-                )
-            ),
-            block_parameters_by_name,
-        )
-        _validate_shared_block_batch(validation_result.one())
         if not await is_pin_lease_renewed(
             session,
             schema_name=schema_name,
@@ -2105,6 +2147,44 @@ async def _publish_durable_cas_batch(
             pin_token=stage.strip('"'),
         ):
             raise RuntimeError("PTG block pin heartbeat lost ownership")
+
+
+async def _publish_durable_cas_batch(
+    *,
+    schema_name: str,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_generation: str,
+    block_hashes: Sequence[bytes],
+) -> None:
+    """Shrink timed-out CAS batches only after their transaction rolls back."""
+
+    offset = 0
+    batch_rows = len(block_hashes)
+    while offset < len(block_hashes):
+        subbatch = block_hashes[offset:offset + batch_rows]
+        try:
+            await _publish_durable_cas_subbatch(
+                schema_name=schema_name,
+                schema=schema,
+                stage=stage,
+                snapshot_key=snapshot_key,
+                build_token=build_token,
+                expected_generation=expected_generation,
+                block_hashes=subbatch,
+            )
+        except _DurableCASStatementTimeout as error:
+            if len(subbatch) == 1:
+                raise error.error from None
+            batch_rows = max(1, len(subbatch) // 2)
+            logger.warning(
+                "PTG CAS batch reduced after statement timeout: stage=%s rows=%s->%s",
+                stage, len(subbatch), batch_rows,
+            )
+        else:
+            offset += len(subbatch)
 
 
 async def prepare_shared_cas_block_stage(
