@@ -643,6 +643,7 @@ jobs:
   push:
     branches:
     - main
+    - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
   CI_REVISION: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
