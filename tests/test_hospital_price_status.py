@@ -78,13 +78,19 @@ def test_detected_schema_profile_sql_requires_exact_attestation(
     try:
         detected_profile = connection.execute(
             f"SELECT {status_api._DETECTED_SCHEMA_PROFILE_SQL} "
-            "FROM (SELECT ? AS attestation_text) AS version",
+            "FROM (SELECT ? AS attestation_text, '4.0.0' AS template_version) AS version",
             (attestation_text,),
         ).fetchone()[0]
     finally:
         connection.close()
 
     assert detected_profile == expected_profile
+    publication = status_api._publication_item({
+        "version_id": "a" * 64, "template_version": "4.0.0",
+        "source_format": "csv-tall", "detected_schema_profile": detected_profile,
+    })
+    assert publication["template_version"] == "4.0.0"
+    assert publication["detected_schema_profile"] == expected_profile
 
 
 def test_invalid_schema_fails_at_module_load(monkeypatch):
