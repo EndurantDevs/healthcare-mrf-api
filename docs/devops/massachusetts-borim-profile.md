@@ -1,6 +1,6 @@
 # Massachusetts physician education and training
 
-The `massachusetts-borim-profile` Import Control importer reads the official
+The `massachusetts-borim-profile` managed importer reads the official
 [Massachusetts physician profiles](https://findmydoctor.mass.gov/). Its coverage
 is a frozen NPPES cohort of individual providers in the exact NUCC Allopathic &
 Osteopathic Physicians grouping with numeric Massachusetts licenses. The state
@@ -17,7 +17,8 @@ See the board's [profile terms and definitions](https://www.mass.gov/info-detail
 
 ## Run and verify
 
-Use Import Control on the intended engine node. A bounded run uses
+Use the managed import API on the intended engine node. This importer requires
+a managed run identity; standalone CLI execution is disabled. A bounded run uses
 `{"max_providers": 100}` and completes without advancing public data. A full run
 uses `{}` and requests every eligible license in its frozen cohort. The worker
 fetches sequentially at no more than two requests per second; allow several
@@ -30,7 +31,7 @@ select another persistent root. The worker defaults to a 512Mi memory request,
 4Gi limit, and a 24-hour ARQ timeout; explicitly configured worker resource
 profiles retain precedence.
 
-A failed run less than seven days old can be resumed with a new Import Control
+A failed run less than seven days old can be resumed with a new managed
 run using `{"resume_from": "<profile-run-id>"}` and the original
 `max_providers` value, if any. Resume verifies the sealed cohort and every reused
 response, creates a new artifact directory, and requires the same publication
@@ -44,7 +45,7 @@ resolve to full-license profiles. The first publication additionally requires
 least 80% of both the incumbent matched-provider and received-profile counts.
 These guards have no partial-publication or volume-drop override.
 
-The source pointer, source completion, and exact Import Control attempt succeed
+The source pointer, source completion, and exact managed run attempt succeed
 in one transaction. Source retention preserves current/previous publications,
 the latest run, active runs and their resume dependencies, and recent failures;
 audit run rows remain. Florida retention must be source-scoped before this

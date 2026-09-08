@@ -60,6 +60,8 @@ class ImportHarness:
             self.store_by_name[name] = AsyncMock()
             monkeypatch.setattr(worker.store, name, self.store_by_name[name])
         monkeypatch.setattr(worker.store, "read_publication", AsyncMock(return_value={"current_run_id": PREDECESSOR}))
+        self.reconcile = AsyncMock(return_value=[])
+        monkeypatch.setattr(worker, "reconcile_failed_control_runs", self.reconcile)
         monkeypatch.setattr(worker.acquisition, "capture_registry_cohort", AsyncMock(return_value=self.cohort))
         monkeypatch.setattr(worker.acquisition, "fetch_profile", self.fetch)
         monkeypatch.setattr(worker.acquisition.aiohttp, "ClientSession", self.session)
@@ -295,7 +297,12 @@ def _retained_run(harness, *, limit=2):
 async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harness, monkeypatch):
     previous_run, previous_directory = _retained_run(harness)
     bytes_by_name = {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()}
-    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous_run))
+
+    async def recovered_resume(*_args, **_kwargs):
+        harness.reconcile.assert_awaited_once()
+        return previous_run
+
+    monkeypatch.setattr(worker.store, "read_resume_run", recovered_resume)
     worker.acquisition.capture_registry_cohort.side_effect = AssertionError("Resume must not read the current registry")
     await worker.process_data(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
     run_row = harness.store_by_name["claim_run"].call_args.args[0]
@@ -342,7 +349,7 @@ async def test_changed_retained_response_is_never_replaced_by_network(harness, m
     harness.store_by_name["mark_run_failed"].assert_awaited_once()
 
 
-def test_registry_adapter_cli_and_worker_agree():
+def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     from click.testing import CliRunner
     from api import control_imports, control_workers
     import process
@@ -365,9 +372,14 @@ def test_registry_adapter_cli_and_worker_agree():
     assert process.MassachusettsBORIMProfile.max_jobs == 1
     assert process.MassachusettsBORIMProfile.functions[0].name == adapter["function"]
     assert process.process_group.commands[importer] is worker.massachusetts_borim_profile
-    cli_result = CliRunner().invoke(process.process_group, [importer, "--help"])
-    assert cli_result.exit_code == 0
-    assert "--max-providers" in cli_result.output and "--resume-from" in cli_result.output
+    cli_help = CliRunner().invoke(process.process_group, [importer, "--help"])
+    assert cli_help.exit_code == 0
+    assert "--max-providers" in cli_help.output and "--resume-from" in cli_help.output
+    process_data = AsyncMock()
+    monkeypatch.setattr(worker, "process_data", process_data)
+    cli_run = CliRunner().invoke(process.process_group, [importer, "--max-providers", "2"])
+    assert cli_run.exit_code == 2 and "managed import API" in cli_run.output
+    process_data.assert_not_awaited()
 
 
 @pytest.mark.parametrize("limit", [None, 2])
@@ -404,32 +416,15 @@ async def test_cancelled_finish_does_not_enter_completion(monkeypatch):
     complete.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", [None, ValueError("synthetic CLI failure"), asyncio.CancelledError("synthetic CLI cancellation")])
-async def test_direct_cli_import_closes_database_after_work(monkeypatch, failure):
-    database = SimpleNamespace(connect=AsyncMock(), disconnect=AsyncMock())
-    process_data = AsyncMock(return_value={"published": False}, side_effect=failure)
-    monkeypatch.setattr(worker, "db", database)
-    monkeypatch.setattr(worker, "process_data", process_data)
-    if failure is None:
-        assert await worker._direct_import(2, "b" * 64) == {"published": False}
-    else:
-        with pytest.raises(type(failure)):
-            await worker._direct_import(2, "b" * 64)
-    database.connect.assert_awaited_once()
-    database.disconnect.assert_awaited_once()
-    process_data.assert_awaited_once_with({}, {"max_providers": 2, "resume_from": "b" * 64})
-
-
-@pytest.mark.parametrize(("arguments", "expected"), [([], (None, None)), (["--max-providers", "2", "--resume-from", "b" * 64], (2, "b" * 64))])
-def test_cli_routes_parameters_and_prints_result(monkeypatch, arguments, expected):
-    from click.testing import CliRunner
-
-    direct_import = AsyncMock(return_value={"published": expected[0] is None, "responses": 2})
-    monkeypatch.setattr(worker, "_direct_import", direct_import)
-    cli_result = CliRunner().invoke(worker.massachusetts_borim_profile, arguments)
-    assert cli_result.exit_code == 0
-    assert json.loads(cli_result.output) == direct_import.return_value
-    direct_import.assert_awaited_once_with(*expected)
+@pytest.mark.parametrize("task", [{}, {"run_id": None}, {"run_id": ""}, {"run_id": " "}, {"run_id": 123}])
+async def test_unmanaged_run_cannot_claim_source_or_start_acquisition(harness, task):
+    with pytest.raises(ValueError, match="managed_run_required"):
+        await worker.process_data(harness.ctx, task)
+    harness.store_by_name["ensure_tables"].assert_not_awaited()
+    harness.store_by_name["claim_run"].assert_not_awaited()
+    worker.acquisition.capture_registry_cohort.assert_not_awaited()
+    assert harness.requests == [] and harness.writes == []
+    assert not harness.artifact_root.exists()
 
 
 @pytest.mark.parametrize("component", ["run", "profiles"])

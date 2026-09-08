@@ -1,15 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Import public Massachusetts school and training facts through Import Control."""
+"""Import public Massachusetts school and training facts as a managed job."""
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import json
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +16,7 @@ from db.models import ProviderProfileArtifact, ProviderProfileSourceRecord, Prov
 from process.control_cancel import raise_if_cancelled
 from process.florida_mqa_profile import _upsert_rows
 from process.live_progress import enqueue_live_progress
-from process.massachusetts_profile_completion import complete_run
+from process.massachusetts_profile_completion import complete_run, reconcile_failed_control_runs
 from process import massachusetts_profile_acquisition as acquisition
 from process import massachusetts_profile_store as store
 from process.massachusetts_profile_rows import SCHEMA_VERSION, SOURCE_KEY, parse_profile
@@ -186,13 +183,17 @@ async def _run_claimed(ctx, task, run_row, cohort, retained, directory):
 async def process_data(ctx, task):
     """Acquire every eligible root; bounded tests cannot advance public data."""
     _parameters(task)
+    control_run_id = task.get("run_id")
+    if not isinstance(control_run_id, str) or not control_run_id.strip():
+        raise ValueError("massachusetts_profile_managed_run_required")
     await raise_if_cancelled(ctx, task)
     await store.ensure_tables()
+    await reconcile_failed_control_runs()
     publication = await store.read_publication()
     expected = publication["current_run_id"] if publication else None
     artifact_root = _artifact_root()
     cohort, retained = await _cohort_for_run(task, artifact_root, expected)
-    run_id = _hash([SOURCE_KEY, task.get("run_id") or uuid.uuid4().hex])
+    run_id = _hash([SOURCE_KEY, control_run_id])
     run_by_field = {
         "run_id": run_id, "source_key": SOURCE_KEY, "jurisdiction": "MA", "schema_version": SCHEMA_VERSION,
         "status": "running", "source_manifest": _source_manifest(task, cohort, expected),
@@ -212,17 +213,9 @@ async def process_data(ctx, task):
     return result
 
 
-async def _direct_import(max_providers, resume_from):
-    await db.connect()
-    try:
-        return await process_data({}, {"max_providers": max_providers, "resume_from": resume_from})
-    finally:
-        await db.disconnect()
-
-
-@click.command(help="Import Massachusetts BORIM medical school and training facts.")
+@click.command(help="Submit Massachusetts BORIM school and training imports through the managed import API.")
 @click.option("--max-providers", type=click.IntRange(min=1), default=None, help="Bounded acquisition without publication.")
 @click.option("--resume-from", default=None, help="Replay a recent failed run's frozen cohort and verified responses.")
 def massachusetts_borim_profile(max_providers, resume_from):
-    """Run the same bounded or complete acquisition from the CLI."""
-    click.echo(json.dumps(asyncio.run(_direct_import(max_providers, resume_from)), sort_keys=True))
+    """Retain importer registry metadata while refusing unmanaged execution."""
+    raise click.UsageError("Massachusetts profile imports require the managed import API.")

@@ -15,7 +15,7 @@ from sqlalchemy.orm import registry
 from process import control_lifecycle as lifecycle
 from process import massachusetts_profile_completion as completion
 from process.control_cancel import ImportCancelledError
-from tests.test_massachusetts_profile_store import _database, _metrics, _seed_run
+from tests.test_massachusetts_profile_store import _database, _metrics, _run, _seed_run
 
 CONTROL_RUN_ID = "run_ma_completion_synthetic"
 ATTEMPT = {"attempt_id": CONTROL_RUN_ID + ":" + "b" * 32,
@@ -46,8 +46,8 @@ async def _completion_database(monkeypatch):
             mapper_registry.dispose()
 
 
-async def _prepared_run(database, *, limit=None, control_changes=None):
-    candidate_run = await _seed_run(database, count=10000 if limit is None else 3, limit=limit)
+async def _prepared_run(database, *, limit=None, control_changes=None, predecessor=None):
+    candidate_run = await _seed_run(database, count=10000 if limit is None else 3, limit=limit, predecessor=predecessor)
     candidate_run["source_manifest"]["control_run_id"] = CONTROL_RUN_ID
     source_table = completion.ProviderProfileImportRun.__table__
     await database.execute(update(source_table).where(source_table.c.run_id == candidate_run["run_id"]).values(
@@ -65,6 +65,67 @@ async def _stored_state(database, candidate_run):
     source_row = await database.first(select(source_table).where(source_table.c.run_id == candidate_run["run_id"]))
     control_row = await database.first(select(control_table).where(control_table.c.run_id == CONTROL_RUN_ID))
     return dict(source_row._mapping), dict(control_row._mapping)
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "canceled", "cancelled", "dead_letter"])
+async def test_native_stopped_owner_recovers_stranded_run_without_changing_publication(monkeypatch, terminal_status):
+    async with _completion_database(monkeypatch) as database:
+        incumbent = await _seed_run(database)
+        await completion.store.publish_run(incumbent["run_id"], expected_current_run_id=None, metrics=_metrics())
+        pointer = await completion.store.read_publication()
+        incumbent_counts = await completion.store.retained_counts(incumbent["run_id"])
+        candidate = await _prepared_run(database, limit=1, predecessor=incumbent["run_id"])
+        source_table = completion.ProviderProfileImportRun.__table__
+        foreign_run_by_field = {**_run("f" * 64, limit=1), "source_key": "florida-mqa", "jurisdiction": "FL"}
+        await database.insert(source_table).values(foreign_run_by_field).status()
+        fresh = _run(limit=1, count=3, predecessor=incumbent["run_id"], resume_from=candidate["run_id"])
+        assert await completion.reconcile_failed_control_runs() == []
+        with pytest.raises(RuntimeError, match="source_already_running"):
+            await completion.store.claim_run(fresh)
+        with pytest.raises(RuntimeError, match="resume_not_eligible"):
+            await completion.store.read_resume_run(candidate["run_id"], max_providers=1, expected_current_run_id=incumbent["run_id"])
+
+        control_table = completion.ImportRun.__table__
+        await database.execute(update(control_table).where(control_table.c.run_id == CONTROL_RUN_ID).values(status=terminal_status))
+        _, owner_before = await _stored_state(database, candidate)
+        retained = await completion.store.retained_counts(candidate["run_id"])
+        assert await completion.reconcile_failed_control_runs() == [candidate["run_id"]]
+        source_run, owner_after = await _stored_state(database, candidate)
+        assert source_run["status"] == "failed" and source_run["finished_at"] is not None
+        assert source_run["source_manifest"] == candidate["source_manifest"]
+        assert owner_after == owner_before
+        assert await completion.store.retained_counts(candidate["run_id"]) == retained
+        await completion.store.read_resume_run(candidate["run_id"], max_providers=1, expected_current_run_id=incumbent["run_id"])
+        await completion.store.claim_run(fresh)
+        with pytest.raises(RuntimeError, match="control_attempt_changed"):
+            await completion.complete_run(_context(), {"run_id": CONTROL_RUN_ID}, candidate, _metrics(1))
+        assert await completion.store.read_publication() == pointer
+        assert await completion.store.retained_counts(incumbent["run_id"]) == incumbent_counts
+        foreign_after = await database.first(select(source_table).where(source_table.c.run_id == foreign_run_by_field["run_id"]))
+        assert all(foreign_after._mapping[key] == field_value for key, field_value in foreign_run_by_field.items())
+
+
+@pytest.mark.parametrize("owner_case", ["running", "canceling", "succeeded", "foreign", "missing", "cli", "blank"])
+async def test_native_recovery_keeps_live_or_ambiguous_source_claim(monkeypatch, owner_case):
+    async with _completion_database(monkeypatch) as database:
+        candidate = await _prepared_run(database, limit=1)
+        control_table = completion.ImportRun.__table__
+        source_table = completion.ProviderProfileImportRun.__table__
+        if owner_case in {"cli", "blank"}:
+            candidate["source_manifest"]["control_run_id"] = None if owner_case == "cli" else " "
+            await database.execute(update(source_table).where(source_table.c.run_id == candidate["run_id"]).values(source_manifest=candidate["source_manifest"]))
+        elif owner_case == "missing":
+            await database.execute(control_table.delete())
+        else:
+            await database.execute(update(control_table).values(
+                status="failed" if owner_case == "foreign" else owner_case,
+                importer="florida-mqa-profile" if owner_case == "foreign" else completion.IMPORTER))
+        before = await database.first(select(source_table).where(source_table.c.run_id == candidate["run_id"]))
+        assert await completion.reconcile_failed_control_runs() == []
+        after = await database.first(select(source_table).where(source_table.c.run_id == candidate["run_id"]))
+        assert dict(after._mapping) == dict(before._mapping)
+        with pytest.raises(RuntimeError, match="source_already_running"):
+            await completion.store.claim_run(_run(limit=1, count=3))
 
 
 @pytest.mark.parametrize("limit", [None, 1])
@@ -201,17 +262,17 @@ async def test_native_terminal_status_blocks_late_heartbeat_and_cancel(monkeypat
 
 
 @pytest.mark.parametrize("limit", [None, 1])
-async def test_direct_completion_needs_no_control_row_or_context(monkeypatch, limit):
+async def test_unmanaged_completion_cannot_publish(monkeypatch, limit):
     result_by_field = {"run_id": "a" * 64, "published": limit is None, "requested_licenses": 1}
     source_finisher = AsyncMock(return_value=result_by_field)
     monkeypatch.setattr(completion.store, "publish_run", source_finisher)
     monkeypatch.setattr(completion.store, "finish_unpublished_run", source_finisher)
     job_context_by_field = {}
     run_by_field = {"run_id": result_by_field["run_id"], "source_manifest": {"max_providers": limit, "expected_current_run_id": None}}
-    completed = await completion.complete_run(job_context_by_field, {}, run_by_field, _metrics(1))
-    assert completed["terminal_progress"]["phase"].startswith(completion.IMPORTER)
+    with pytest.raises(ValueError, match="control_attempt_missing"):
+        await completion.complete_run(job_context_by_field, {}, run_by_field, _metrics(1))
     assert job_context_by_field == {}
-    source_finisher.assert_awaited_once()
+    source_finisher.assert_not_awaited()
 
 
 @pytest.mark.parametrize(("task_by_field", "run_by_field", "job_context_by_field", "error"), [

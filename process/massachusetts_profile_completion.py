@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Commit BORIM publication and its exact Import Control attempt together."""
+"""Commit BORIM publication and its exact managed run attempt together."""
 
 from __future__ import annotations
 
@@ -11,19 +11,17 @@ from sqlalchemy import func, select, update
 
 from db.models import ImportRun, ProviderProfileImportRun, db
 from process.control_cancel import raise_if_cancelled
-from process.control_lifecycle import suppress_control_run_heartbeat_persistence
+from process.control_lifecycle import _TERMINAL_STATUSES, suppress_control_run_heartbeat_persistence
 from process import massachusetts_profile_store as store
 
 IMPORTER = "massachusetts-borim-profile"
 
 
 def _attempt(ctx, task, run_row):
-    """Bind a control attempt to the source run's frozen manifest, or CLI mode."""
+    """Bind a managed run attempt to the source run's frozen manifest."""
     control_run_id = task.get("run_id")
     if control_run_id != run_row["source_manifest"].get("control_run_id"):
         raise ValueError("massachusetts_profile_control_run_mismatch")
-    if control_run_id is None:
-        return None
     context = ctx.get("context") or {}
     attempt_by_field = {
         "run_id": control_run_id,
@@ -39,6 +37,37 @@ async def _locked_control_run(attempt):
     control_table = ImportRun.__table__
     return await db.first(select(control_table).where(
         control_table.c.run_id == attempt["run_id"]).with_for_update())
+
+
+async def reconcile_failed_control_runs():
+    """Recover managed acquisitions whose control owner has durably stopped."""
+    table = ProviderProfileImportRun.__table__
+    candidates = await db.all(select(table.c.run_id, table.c.source_manifest).where(
+        table.c.source_key == store.SOURCE_KEY, table.c.schema_version == store.SCHEMA_VERSION,
+        table.c.status.in_(store.ACTIVE_STATUSES)))
+    recovered_run_ids = []
+    for candidate in candidates:
+        manifest = candidate.source_manifest
+        control_id = manifest.get("control_run_id") if isinstance(manifest, dict) else None
+        if not isinstance(control_id, str) or not control_id.strip():
+            continue
+        async with db.transaction():
+            # Match completion's lock order; a live or ambiguous owner keeps its claim.
+            owner = await _locked_control_run({"run_id": control_id})
+            if (owner is None or owner.importer != IMPORTER or owner.status == "succeeded"
+                    or owner.status not in _TERMINAL_STATUSES):
+                continue
+            await store._lock_source()
+            source_run = await store._read_run(candidate.run_id)
+            if (source_run["status"] not in store.ACTIVE_STATUSES
+                    or source_run["source_manifest"].get("control_run_id") != control_id):
+                continue
+            publication = await store.read_publication()
+            if publication and candidate.run_id in (publication["current_run_id"], publication["previous_run_id"]):
+                raise RuntimeError("massachusetts_profile_recovery_published_run")
+            await store.mark_run_failed(candidate.run_id, f"control owner is {owner.status}")
+            recovered_run_ids.append(candidate.run_id)
+    return recovered_run_ids
 
 
 def _is_attempt(control_run, attempt):
@@ -141,9 +170,6 @@ def _install_committed_result(ctx, committed, result):
 async def complete_run(ctx, task, run_row, metrics):
     """Finish the source and control attempt atomically, including bounded runs."""
     attempt = _attempt(ctx, task, run_row)
-    if attempt is None:
-        result = await _finish_source(run_row, metrics)
-        return {**result, "terminal_progress": _terminal_progress(result)}
     result = committed = None
     try:
         async with suppress_control_run_heartbeat_persistence(attempt["run_id"]), db.transaction():
