@@ -180,7 +180,7 @@ async def _run_claimed(ctx, task, run_row, cohort, retained, directory):
     return await _finish_run(ctx, task, run_row, metrics)
 
 
-async def process_data(ctx, task):
+async def import_profiles(ctx, task):
     """Acquire every eligible root; bounded tests cannot advance public data."""
     _parameters(task)
     control_run_id = task.get("run_id")
@@ -202,7 +202,7 @@ async def process_data(ctx, task):
     await store.claim_run(run_by_field)
     try:
         artifact_root.mkdir(parents=True, exist_ok=True)
-        result = await _run_claimed(ctx, task, run_by_field, cohort, retained, artifact_root / run_id)
+        completed_run = await _run_claimed(ctx, task, run_by_field, cohort, retained, artifact_root / run_id)
     except BaseException as exc:
         await store.mark_run_failed(run_id, exc)
         raise
@@ -210,7 +210,7 @@ async def process_data(ctx, task):
         await store.retain_source_history(artifact_root)
     except Exception:
         logger.exception("Massachusetts profile retention failed after completed import %s", run_id)
-    return result
+    return completed_run
 
 
 @click.command(help="Submit Massachusetts BORIM school and training imports through the managed import API.")

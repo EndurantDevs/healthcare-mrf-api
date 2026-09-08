@@ -352,7 +352,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "function": "control_single_job_start",
         "payload": "control_wrapped",
         "target_module": "process.massachusetts_profile",
-        "target_function": "process_data",
+        "target_function": "import_profiles",
     },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",

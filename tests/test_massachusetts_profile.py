@@ -111,7 +111,7 @@ def harness(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("limit", [None, 2, 10])
 async def test_selected_scope_is_frozen_before_claim_and_retained(harness, limit):
-    await worker.process_data(harness.ctx, {**harness.task, "max_providers": limit})
+    await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": limit})
     claimed_run = harness.store_by_name["claim_run"].call_args.args[0]
     manifest = claimed_run["source_manifest"]
     expected = 3 if limit is None else min(limit, 3)
@@ -143,7 +143,7 @@ def test_bounded_selection_is_order_independent_and_preserves_roots():
 
 async def test_artifact_accounts_for_empty_response_without_inventing_facts(harness):
     harness.responses_by_license["456"] = _response("456", empty=True)
-    await worker.process_data(harness.ctx, harness.task)
+    await worker.import_profiles(harness.ctx, harness.task)
     artifact = harness.rows_for(worker.ProviderProfileArtifact)[0]
     path = harness.artifact_root / artifact["run_id"] / artifact["file_name"]
     assert artifact["content_bytes"] == path.stat().st_size
@@ -167,7 +167,7 @@ async def test_artifact_accounts_for_empty_response_without_inventing_facts(harn
 async def test_acquisition_failure_keeps_checkpoint_without_finishing(harness, failure):
     harness.responses_by_license["456"] = failure
     with pytest.raises(type(failure), match="synthetic transport failure"):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
     assert harness.requests == ["123", "456"]
     assert worker.acquisition.read_response(harness.artifact_root / run_id / "profiles" / "123.json", "123") == harness.responses_by_license["123"]
@@ -183,7 +183,7 @@ async def test_acquisition_failure_keeps_checkpoint_without_finishing(harness, f
 async def test_persistence_failure_rolls_back_batch_and_preserves_pointer(harness):
     harness.fail_model = worker.ProviderProfileFact
     with pytest.raises(RuntimeError, match="synthetic persistence failure"):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     assert len(harness.rows_for(worker.ProviderProfileArtifact)) == 1
     assert harness.rows_for(worker.ProviderProfileSourceRecord) == []
     assert harness.rows_for(worker.ProviderProfileFact) == []
@@ -195,7 +195,7 @@ async def test_persistence_failure_rolls_back_batch_and_preserves_pointer(harnes
 async def test_error_response_fails_before_any_profile_batch_is_stored(harness):
     harness.responses_by_license["456"] = _response("456", profile={"error": "upstream unavailable"})
     with pytest.raises(ValueError, match="identity_schema_invalid"):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     assert harness.rows_for(worker.ProviderProfileSourceRecord) == []
     assert harness.rows_for(worker.ProviderProfileFact) == []
     harness.finish.assert_not_called()
@@ -209,7 +209,7 @@ async def test_fresh_path_collision_never_overwrites_existing_artifacts(harness)
     retained = existing / "cohort.json"
     retained.write_text("existing evidence")
     with pytest.raises(FileExistsError):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     assert retained.read_text() == "existing evidence"
     assert harness.requests == [] and harness.writes == []
     harness.finish.assert_not_called()
@@ -219,7 +219,7 @@ async def test_fresh_path_collision_never_overwrites_existing_artifacts(harness)
 async def test_failed_claim_does_not_fail_someone_elses_run(harness):
     harness.store_by_name["claim_run"].side_effect = RuntimeError("synthetic occupied scope")
     with pytest.raises(RuntimeError, match="synthetic occupied scope"):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     assert not harness.artifact_root.exists()
     harness.store_by_name["mark_run_failed"].assert_not_called()
 
@@ -230,7 +230,7 @@ async def test_failed_claim_does_not_fail_someone_elses_run(harness):
 ])
 async def test_invalid_task_is_rejected_before_side_effects(harness, task):
     with pytest.raises(ValueError, match="massachusetts_profile_"):
-        await worker.process_data(harness.ctx, task)
+        await worker.import_profiles(harness.ctx, task)
     harness.store_by_name["ensure_tables"].assert_not_called()
     harness.store_by_name["claim_run"].assert_not_called()
     assert not harness.artifact_root.exists()
@@ -239,7 +239,7 @@ async def test_invalid_task_is_rejected_before_side_effects(harness, task):
 async def test_preflight_cancellation_claims_nothing(harness):
     harness.redis.get.return_value = b"1"
     with pytest.raises(ImportCancelledError):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     harness.store_by_name["ensure_tables"].assert_not_called()
     harness.store_by_name["claim_run"].assert_not_called()
     assert harness.requests == []
@@ -255,7 +255,7 @@ async def test_acquisition_cancellation_preserves_first_checkpoint(harness, monk
 
     monkeypatch.setattr(worker.acquisition, "fetch_profile", fetch_then_cancel)
     with pytest.raises(ImportCancelledError):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
     assert harness.requests == ["123"]
     assert (harness.artifact_root / run_id / "profiles" / "123.json").exists()
@@ -266,7 +266,7 @@ async def test_acquisition_cancellation_preserves_first_checkpoint(harness, monk
 async def test_persistence_cancellation_stops_before_source_rows(harness):
     harness.cancel_model = worker.ProviderProfileArtifact
     with pytest.raises(ImportCancelledError):
-        await worker.process_data(harness.ctx, harness.task)
+        await worker.import_profiles(harness.ctx, harness.task)
     assert len(harness.requests) == 3
     assert len(harness.rows_for(worker.ProviderProfileArtifact)) == 1
     assert harness.rows_for(worker.ProviderProfileSourceRecord) == []
@@ -276,7 +276,7 @@ async def test_persistence_cancellation_stops_before_source_rows(harness):
 
 async def test_retention_failure_does_not_downgrade_completed_import(harness):
     harness.store_by_name["retain_source_history"].side_effect = RuntimeError("synthetic cleanup error")
-    receipt = await worker.process_data(harness.ctx, harness.task)
+    receipt = await worker.import_profiles(harness.ctx, harness.task)
     assert receipt["responses"] == 3
     harness.finish.assert_awaited_once()
     harness.store_by_name["mark_run_failed"].assert_not_called()
@@ -304,7 +304,7 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
 
     monkeypatch.setattr(worker.store, "read_resume_run", recovered_resume)
     worker.acquisition.capture_registry_cohort.side_effect = AssertionError("Resume must not read the current registry")
-    await worker.process_data(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
+    await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
     run_row = harness.store_by_name["claim_run"].call_args.args[0]
     new_directory = harness.artifact_root / run_row["run_id"]
     assert new_directory != previous_directory and harness.requests == []
@@ -328,7 +328,7 @@ async def test_changed_resume_cohort_is_refused_before_new_claim(harness, monkey
     (previous_directory / "cohort.json").write_bytes(worker.acquisition.encoded_json(changed))
     monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous_run))
     with pytest.raises(ValueError, match="resume_cohort_changed"):
-        await worker.process_data(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
+        await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
     harness.store_by_name["claim_run"].assert_not_called()
     harness.store_by_name["mark_run_failed"].assert_not_called()
     assert harness.requests == []
@@ -342,7 +342,7 @@ async def test_changed_retained_response_is_never_replaced_by_network(harness, m
     path.write_bytes(worker.acquisition.encoded_json(response))
     monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous_run))
     with pytest.raises(ValueError, match="response_changed"):
-        await worker.process_data(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
+        await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous_run["run_id"]})
     assert harness.requests == []
     assert json.loads(path.read_text()) == response
     harness.finish.assert_not_called()
@@ -360,12 +360,12 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     assert registration["cancelable"] is True and registration["enqueue_adapter"] == "arq_single_job"
     assert {parameter["name"] for parameter in registration["params_schema"]} == {"max_providers", "resume_from"}
     adapter = control_imports._SINGLE_JOB_ADAPTERS[importer]
-    payload = control_imports._adapter_payload(adapter, {
+    dispatch_payload = control_imports._adapter_payload(adapter, {
         "run_id": "synthetic-control", "importer": importer, "family": "provider",
     }, {"max_providers": 2, "resume_from": "b" * 64})
-    assert payload["target_module"] == "process.massachusetts_profile"
-    assert payload["target_function"] == "process_data" and payload["call_style"] == "ctx_task"
-    assert payload["task"]["max_providers"] == 2 and payload["task"]["resume_from"] == "b" * 64
+    assert dispatch_payload["target_module"] == "process.massachusetts_profile"
+    assert dispatch_payload["target_function"] == "import_profiles" and dispatch_payload["call_style"] == "ctx_task"
+    assert dispatch_payload["task"]["max_providers"] == 2 and dispatch_payload["task"]["resume_from"] == "b" * 64
     spec = next(entry for entry in control_workers.worker_registry() if importer in entry["importers"] and entry["role"] == "start")
     assert spec["worker_class"] == "process.MassachusettsBORIMProfile"
     assert spec["queue"] == adapter["queue"] == registration["queue"] == process.MassachusettsBORIMProfile.queue_name
@@ -375,11 +375,11 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     cli_help = CliRunner().invoke(process.process_group, [importer, "--help"])
     assert cli_help.exit_code == 0
     assert "--max-providers" in cli_help.output and "--resume-from" in cli_help.output
-    process_data = AsyncMock()
-    monkeypatch.setattr(worker, "process_data", process_data)
+    import_profiles = AsyncMock()
+    monkeypatch.setattr(worker, "import_profiles", import_profiles)
     cli_run = CliRunner().invoke(process.process_group, [importer, "--max-providers", "2"])
     assert cli_run.exit_code == 2 and "managed import API" in cli_run.output
-    process_data.assert_not_awaited()
+    import_profiles.assert_not_awaited()
 
 
 @pytest.mark.parametrize("limit", [None, 2])
@@ -419,7 +419,7 @@ async def test_cancelled_finish_does_not_enter_completion(monkeypatch):
 @pytest.mark.parametrize("task", [{}, {"run_id": None}, {"run_id": ""}, {"run_id": " "}, {"run_id": 123}])
 async def test_unmanaged_run_cannot_claim_source_or_start_acquisition(harness, task):
     with pytest.raises(ValueError, match="managed_run_required"):
-        await worker.process_data(harness.ctx, task)
+        await worker.import_profiles(harness.ctx, task)
     harness.store_by_name["ensure_tables"].assert_not_awaited()
     harness.store_by_name["claim_run"].assert_not_awaited()
     worker.acquisition.capture_registry_cohort.assert_not_awaited()
