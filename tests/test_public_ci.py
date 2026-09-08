@@ -41,6 +41,9 @@ MATRIX_ROWS_BY_JOB = {
 
 def _assert_job_label(job_id, job) -> None:
     """Keep skipped metadata contexts separate from every real shard label."""
+    if job_id == "smoke":
+        assert job["name"] == "portable import checks"
+        return
     if job_id in MATRIX_ROWS_BY_JOB:
         assert job["name"] == "${{ " + METADATA_ONLY + f" && '{job_id} (metadata only)' || matrix.label " + "}}"
         return
@@ -99,7 +102,10 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
-        assert job["if"] == "${{ !(" + METADATA_ONLY + ") && (" + condition + ") }}"
+        if job_id == "smoke":
+            assert job["if"] == "${{ success() }}"
+        else:
+            assert job["if"] == "${{ !(" + METADATA_ONLY + ") && (" + condition + ") }}"
         assert "uses" not in job
         assert job["runs-on"] == "ubuntu-latest"
         assert not job.get("continue-on-error")
