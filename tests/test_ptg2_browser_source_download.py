@@ -150,9 +150,11 @@ async def test_avera_locator_uses_exact_browser_transport(tmp_path, monkeypatch)
     locator_url = "https://www.avera.org/cms-hpt.txt"
     store = object()
     locator_path = tmp_path / "cms-hpt.txt"
-    locator_path.write_text("Hospital|https://www.avera.org/file.csv\n")
+    locator_payload = b"location-name: Hospital\nmrf-url: https://files.example/hospital.csv\n"
+    locator_path.write_bytes(locator_payload)
     raw_artifact = SimpleNamespace(
-        raw_path=str(locator_path), raw_sha256="a" * 64, byte_count=48,
+        raw_path=str(locator_path), raw_sha256=hashlib.sha256(locator_payload).hexdigest(),
+        byte_count=len(locator_payload),
         head=SimpleNamespace(url=locator_url, status=200),
     )
     requests: list[dict[str, Any]] = []
@@ -166,18 +168,18 @@ async def test_avera_locator_uses_exact_browser_transport(tmp_path, monkeypatch)
 
     monkeypatch.setattr(acquisition, "download_raw_artifact", download)
     monkeypatch.setattr(acquisition, "_record_locator_observation", record)
-    monkeypatch.setattr(
-        acquisition,
-        "parse_hospital_hpt_locator",
-        lambda _payload: (object(),),
-    )
 
     locator_result = await acquisition.fetch_locator(
         (locator_url, ({"hospital_id": "a", "name": "Hospital"},)),
         store,
     )
 
-    assert locator_result.records is not None
+    assert locator_result.records == (
+        acquisition.HospitalHptLocatorRecord("Hospital", "https://files.example/hospital.csv"),
+    )
+    assert locator_result.error_code is None
+    assert locator_result.error_detail is None
+    assert locator_result.fetch_failed is False
     assert len(requests) == 1
     assert requests[0]["store"] is store
     assert requests[0]["browser_profile"] == "chrome136"
