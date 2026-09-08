@@ -159,6 +159,7 @@ async def test_combined_loader_preserves_state_projection(monkeypatch, include_c
     cms_loader = AsyncMock(return_value=_cms_projection() if include_cms else None)
     monkeypatch.setattr(profile_api, "fetch_state_profile_projection", state_loader)
     monkeypatch.setattr(profile_api, "fetch_cms_education_projection", cms_loader)
+    monkeypatch.setattr(profile_api, "fetch_massachusetts_profile_projection", AsyncMock(return_value=None))
 
     projection = await profile_api.fetch_provider_profile_projection(NPI)
 
