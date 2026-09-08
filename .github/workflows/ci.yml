@@ -1,47 +1,655 @@
+# Generated from the pinned Endurance CI workflow; refresh with scripts/render_workflow.py.
 name: CI
-
-on:
-  pull_request:
-  push:
-    branches: [main]
-
 permissions:
   contents: read
-
+  pull-requests: read
+  actions: read
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
+  group: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+    && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title
+    && !github.event.changes.base) && github.ref != 'refs/heads/main' }}
 jobs:
   smoke:
-    name: portable import checks
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'portable import checks (metadata only)' || 'portable import checks' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.14.6"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-      - name: Check public repository hygiene
-        run: python scripts/ci/public_hygiene.py
-      - name: Install runtime and test dependencies
-        run: python -m pip install -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio
-      - name: Run synthetic import and API checks
-        run: >-
-          python -m pytest -q
-          tests/test_process_nucc_unit.py tests/test_process_code_sets_unit.py tests/test_healthcheck.py tests/test_public_runtime_packaging.py tests/test_public_ci.py
-      - name: Check finalizer unlink failure as a non-root user
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: 3.14.6
+        cache: pip
+        cache-dependency-path: 'requirements.txt
+
+          requirements-dev.txt
+
+          '
+    - name: Check public repository hygiene
+      run: python scripts/ci/public_hygiene.py
+    - name: Install runtime and test dependencies
+      run: python -m pip install -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio
+    - name: Run synthetic import and API checks
+      run: python -m pytest -q tests/test_process_nucc_unit.py tests/test_process_code_sets_unit.py tests/test_healthcheck.py
+        tests/test_public_runtime_packaging.py tests/test_public_ci.py
+    - name: Check finalizer unlink failure as a non-root user
+      env:
+        CARGO_BUILD_JOBS: '2'
+      run: "test \"$(id -u)\" -ne 0\nrustup toolchain install 1.97.1 --profile minimal --no-self-update\ncargo +1.97.1 test\
+        \ --locked --manifest-path support/ptg2_scanner/Cargo.toml --bin ptg2_scanner \\\n  main_test_suite::cases::scanner_and_v3_finalizer::owned_unlink_failure_prevents_finalizer_publication\
+        \ \\\n  -- --exact --nocapture\n"
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  public-hygiene:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Repository checks (metadata only)' || 'Repository checks' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+      with:
+        rust: 'true'
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" hygiene &
+
+        hygiene_pid=$!
+
+        cargo_status=0
+
+        cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml || cargo_status=$?
+
+        wait "$hygiene_pid"
+
+        test "$cargo_status" = 0
+
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Stage shared Rust test binaries
+      run: "binary_directory=\"$GITHUB_WORKSPACE/rust-debug-binaries\"\nmkdir -p \"$binary_directory\"\ninstall -m 0755 \\\
+        \n  support/ptg2_scanner/target/debug/ptg2_scanner \\\n  support/ptg2_scanner/target/debug/ptg2_provider_graph_v4\
+        \ \\\n  support/ptg2_scanner/target/debug/raw_claim_check \\\n  support/ptg2_scanner/target/debug/uhc_semantic_facts\
+        \ \\\n  \"$binary_directory/\"\n"
+    - name: Upload exact-source Rust test binaries
+      id: rust-artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-rust-debug-${{ github.run_id }}-${{ github.run_attempt }}
+        path: 'rust-debug-binaries/ptg2_scanner
+
+          rust-debug-binaries/ptg2_provider_graph_v4
+
+          rust-debug-binaries/raw_claim_check
+
+          rust-debug-binaries/uhc_semantic_facts'
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 1
+    outputs:
+      rust_artifact_id: ${{ steps.rust-artifact.outputs.artifact-id }}
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  readability-preflight:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Readability checks (metadata only)' || 'Readability checks' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Check readability before starting heavy jobs
+      run: python scripts/readability_budget.py --base "$BASE_SHA"
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  python-quality:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Python lint (metadata only)' || 'Python lint' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" quality
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  python-tests:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'python-tests (metadata only)' || matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - public-hygiene
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Download exact-source Rust test binaries
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
+        digest-mismatch: error
+        path: rust-debug-binaries
+    - name: Run complete validation stage
+      env:
+        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "$CI_SHARD"
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload main-suite coverage data
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-python-coverage-main-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.${{ matrix.shard }}
+
+          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.${{ matrix.shard }}.json'
+        include-hidden-files: true
+        retention-days: 1
+        if-no-files-found: error
+      id: coverage-artifact
+    - name: Expose immutable coverage artifact
+      id: coverage-output
+      env:
+        ARTIFACT_OUTPUT: ${{ matrix.output }}
+        ARTIFACT_ID: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+
+        printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
+    outputs:
+      artifact_0: ${{ steps.coverage-output.outputs.artifact_0 }}
+      artifact_1: ${{ steps.coverage-output.outputs.artifact_1 }}
+      artifact_2: ${{ steps.coverage-output.outputs.artifact_2 }}
+      artifact_3: ${{ steps.coverage-output.outputs.artifact_3 }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - shard: '0'
+          label: Python tests (1/4)
+          output: artifact_0
+        - shard: '1'
+          label: Python tests (2/4)
+          output: artifact_1
+        - shard: '2'
+          label: Python tests (3/4)
+          output: artifact_2
+        - shard: '3'
+          label: Python tests (4/4)
+          output: artifact_3
+    env:
+      CI_SHARD: ${{ matrix.shard }}
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  capacity-evidence:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Capacity tests (metadata only)' || 'Capacity tests' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" capacity
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload capacity coverage data
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-python-coverage-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.capacity
+
+          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.capacity.json'
+        include-hidden-files: true
+        retention-days: 1
+        if-no-files-found: error
+      id: coverage-artifact
+    outputs:
+      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  api-contract:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'API contract (metadata only)' || 'API contract' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" api-contract
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  rust-scanner:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Rust tests (metadata only)' || 'Rust tests' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+      with:
+        rust: 'true'
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" rust
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload Rust coverage data
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-rust-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/healthcare-artifacts/coverage-artifacts/rust
+        if-no-files-found: error
+        retention-days: 1
+      id: coverage-artifact
+    outputs:
+      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  container-package:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Container build (metadata only)' || 'Container build' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" container-package
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  security:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Security scans (metadata only)' || 'Security scans' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - readability-preflight
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" security
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  worker-queue-smoke:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Worker queue tests (metadata only)' || 'Worker queue tests' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - readability-preflight
+    services:
+      redis:
+        image: redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73
+        ports:
+        - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Run complete validation stage
+      env:
+        HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" redis
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  address-canonical-db-tests:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'address-canonical-db-tests (metadata only)' || matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+    - public-hygiene
+    - readability-preflight
+    services:
+      postgres:
+        image: postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871
         env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          test "$(id -u)" -ne 0
-          rustup toolchain install 1.97.1 --profile minimal --no-self-update
-          cargo +1.97.1 test --locked --manifest-path support/ptg2_scanner/Cargo.toml --bin ptg2_scanner \
-            main_test_suite::cases::scanner_and_v3_finalizer::owned_unlink_failure_prevents_finalizer_publication \
-            -- --exact --nocapture
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
+        ports:
+        - 5432:5432
+        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
+          5s --health-retries 25
+    env:
+      PYTEST_ADDOPTS: --cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service
+        --cov=main --cov-branch --cov-report= --cov-append
+      HLTHPRT_DB_DRIVER: asyncpg
+      HLTHPRT_DB_PORT: '5432'
+      HLTHPRT_DB_USER: postgres
+      HLTHPRT_DB_PASSWORD: postgres
+      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
+      HLTHPRT_DB_SCHEMA: mrf
+      DB_SCHEMA: mrf
+      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      CI_SHARD: ${{ matrix.shard }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Install PostgreSQL client
+      run: 'sudo apt-get update -qq
+
+        sudo apt-get install --yes --no-install-recommends postgresql-client'
+    - name: Download exact-source Rust test binaries
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
+        digest-mismatch: error
+        path: rust-debug-binaries
+    - name: Run complete validation stage
+      env:
+        HLTHPRT_DB_HOST: 127.0.0.1
+        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload PostgreSQL coverage data
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-python-coverage-postgres-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.${{ matrix.shard }}
+
+          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.postgres.${{ matrix.shard }}.json'
+        include-hidden-files: true
+        retention-days: 1
+        if-no-files-found: error
+      id: coverage-artifact
+    - name: Expose immutable coverage artifact
+      id: coverage-output
+      env:
+        ARTIFACT_OUTPUT: ${{ matrix.output }}
+        ARTIFACT_ID: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+
+        printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
+    outputs:
+      artifact_core: ${{ steps.coverage-output.outputs.artifact_core }}
+      artifact_provider_directory: ${{ steps.coverage-output.outputs.artifact_provider_directory }}
+      artifact_provider_profile: ${{ steps.coverage-output.outputs.artifact_provider_profile }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - shard: core
+          label: Database tests (core)
+          output: artifact_core
+        - shard: provider-directory
+          label: Database tests (directory)
+          output: artifact_provider_directory
+        - shard: provider-profile
+          label: Database tests (profiles)
+          output: artifact_provider_profile
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  measurement:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Coverage results (metadata only)' || 'Coverage results' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+    - public-hygiene
+    - readability-preflight
+    - python-quality
+    - python-tests
+    - capacity-evidence
+    - api-contract
+    - rust-scanner
+    - container-package
+    - security
+    - worker-queue-smoke
+    - address-canonical-db-tests
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (always()) }}
+    steps:
+    - name: Require all validation jobs
+      env:
+        RESULTS: ${{ toJSON(needs.*.result) }}
+      run: jq -e 'length > 0 and all(. == "success")' <<< "$RESULTS"
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+        path: ci
+        persist-credentials: false
+    - name: Resolve exact source event
+      id: identity
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/source_identity.py
+      working-directory: ${{ github.workspace }}
+    - name: Download immutable measurement artifacts
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
+          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_directory
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_profile }}
+        digest-mismatch: error
+        path: ${{ runner.temp }}/healthcare-coverage-staging
+        merge-multiple: false
+    - name: Validate and bind public measurement
+      run: python3 ci/scripts/healthcare/measurement.py
+    - name: Upload public measurement
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-measurement-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/healthcare-public-measurement/
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 90
+  source-validation:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'Validation complete (metadata only)' || 'Validation complete' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (always()) }}
+    needs:
+    - measurement
+    permissions: {}
+    steps:
+    - name: Require complete public validation
+      env:
+        RESULTS: ${{ toJSON(needs.*.result) }}
+      run: jq -e 'length > 0 and all(. == "success")' <<< "$RESULTS"
+'on':
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - edited
+  push:
+    branches:
+    - main
+env:
+  CI_ROOT: ${{ github.workspace }}/ci
+  CI_REVISION: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
+  SOURCE_ROOT: ${{ github.workspace }}/source
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: '1'
+run-name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+  && 'CI metadata update' || 'CI' }}
