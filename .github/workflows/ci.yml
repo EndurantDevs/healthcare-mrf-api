@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -45,3 +46,12 @@ jobs:
           cargo +1.97.1 test --locked --manifest-path support/ptg2_scanner/Cargo.toml --bin ptg2_scanner \
             main_test_suite::cases::scanner_and_v3_finalizer::owned_unlink_failure_prevents_finalizer_publication \
             -- --exact --nocapture
+  source-validation:
+    name: Source validation
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: EndurantDevs/endurant-ci/.github/workflows/healthcare.yml@df40c093b47ab0c7eaa6d83e3b95142bc22500cc
+    with:
+      ci_revision: 'df40c093b47ab0c7eaa6d83e3b95142bc22500cc'

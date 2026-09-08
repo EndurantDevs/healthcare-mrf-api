@@ -12,9 +12,23 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
+    assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
+        "opened", "synchronize", "reopened", "edited",
+    }
     assert workflow["permissions"] == {"contents": "read"}
-    assert len(workflow["jobs"]) == 1
-    job = next(iter(workflow["jobs"].values()))
+    assert set(workflow["jobs"]) == {"smoke", "source-validation"}
+    validation = workflow["jobs"]["source-validation"]
+    assert set(validation) == {"name", "permissions", "uses", "with"}
+    assert validation["permissions"] == {
+        "contents": "read", "pull-requests": "read", "actions": "read",
+    }
+    match = re.fullmatch(
+        r"EndurantDevs/endurant-ci/\.github/workflows/healthcare\.yml@([0-9a-f]{40})",
+        validation["uses"],
+    )
+    assert match is not None and set(match[1]) != {"0"}
+    assert validation["with"] == {"ci_revision": match[1]}
+    job = workflow["jobs"]["smoke"]
     assert job["runs-on"] == "ubuntu-latest"
     assert "container" not in job and "services" not in job
     assert not job.get("continue-on-error")
