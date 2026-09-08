@@ -319,7 +319,9 @@ async def _load_target_metadata(
     )
     metadata_by_hash: dict[bytes, tuple[str, int, int]] = {}
     for raw_anchor in anchor_query:
-        anchor_fields = _row_mapping(raw_anchor)
+        anchor_fields = getattr(raw_anchor, "_mapping", None)
+        if anchor_fields is None:
+            anchor_fields = _row_mapping(raw_anchor)
         block_hash = bytes(anchor_fields.get("block_hash") or b"")
         codec = str(anchor_fields.get("codec") or "")
         object_kind = str(anchor_fields.get("object_kind") or "")
