@@ -22,7 +22,7 @@ from api.code_systems import (
 LEGACY_PROJECTION_CONTRACT = "plan_pricing_card_v2"
 FACTORIZED_V3_PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
 PROJECTION_CONTRACT = "plan_pricing_factorized_v4"
-PROJECTION_BUILD_REVISION = "physical-read-dedup-v1"
+PROJECTION_BUILD_REVISION = "sealed-physical-read-dedup-v2"
 FACTORIZED_PROJECTION_CONTRACTS = frozenset(
     {FACTORIZED_V3_PROJECTION_CONTRACT, PROJECTION_CONTRACT}
 )

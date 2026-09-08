@@ -171,6 +171,13 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
     }
 
 
+def _install_binding_sources(monkeypatch):
+    async def binding_source(_session, binding):
+        return object(), (binding["source_key"], binding["snapshot_id"])
+
+    monkeypatch.setattr(projection_build, "binding_source", binding_source)
+
+
 @pytest.mark.asyncio
 async def test_materialize_all_codes_requires_in_network_binding():
     with pytest.raises(ValueError, match="in-network binding"):
@@ -181,7 +188,9 @@ async def test_materialize_all_codes_requires_in_network_binding():
 
 @pytest.mark.asyncio
 async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
-    async def binding_projection(_session, binding, *, maximum_code_rows):
+    _install_binding_sources(monkeypatch)
+
+    async def binding_projection(_session, binding, *, maximum_code_rows, serving_tables):
         assert maximum_code_rows == (
             projection_build.MAX_PROJECTION_CODE_ROWS
         )
@@ -222,6 +231,7 @@ async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
+    _install_binding_sources(monkeypatch)
     too_many_bindings = [
         _binding(ordinal=ordinal)
         for ordinal in range(projection_build.MAX_PROJECTION_BINDINGS + 1)
@@ -231,7 +241,7 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
             object(), PROJECTION_ID, too_many_bindings
         )
 
-    async def oversized_projection(_session, binding, *, maximum_code_rows):
+    async def oversized_projection(_session, binding, *, maximum_code_rows, serving_tables):
         return SimpleNamespace(
             binding=binding,
             raw_code_row_count=maximum_code_rows + 1,
@@ -250,7 +260,7 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
 
     binding_calls = []
 
-    async def exactly_full_projection(_session, binding, *, maximum_code_rows):
+    async def exactly_full_projection(_session, binding, *, maximum_code_rows, serving_tables):
         binding_calls.append(binding)
         assert len(binding_calls) == 1
         return SimpleNamespace(
