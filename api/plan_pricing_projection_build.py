@@ -174,7 +174,7 @@ async def _materialize_all_codes(
 ) -> tuple[Any, ProjectionV3Counts]:
     in_network_bindings = [
         binding_by_field
-        for binding_by_field in binding_manifest
+        for binding_by_field in normalized_bindings(binding_manifest)
         if str(binding_by_field.get("role")) == "in_network"
     ]
     if not in_network_bindings:
@@ -183,7 +183,20 @@ async def _materialize_all_codes(
         raise ValueError("pricing projection binding bound exceeded")
     remaining_code_rows = MAX_PROJECTION_CODE_ROWS
     binding_projections = []
+    seen_reads: set[tuple[str, str, str, str]] = set()
     for binding_by_field in in_network_bindings:
+        read_identity = (
+            str(binding_by_field["source_key"]),
+            str(binding_by_field["snapshot_id"]),
+            str(binding_by_field["plan_id"]).strip(),
+            str(
+                binding_by_field.get("market_type")
+                or binding_by_field.get("plan_market_type") or ""
+            ).strip().lower(),
+        )
+        if read_identity in seen_reads:
+            continue
+        seen_reads.add(read_identity)
         if remaining_code_rows <= 0:
             raise ValueError("pricing projection code-row bound exceeded")
         binding = await binding_projection(

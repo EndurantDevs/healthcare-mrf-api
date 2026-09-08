@@ -22,6 +22,7 @@ from api.code_systems import (
 LEGACY_PROJECTION_CONTRACT = "plan_pricing_card_v2"
 FACTORIZED_V3_PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
 PROJECTION_CONTRACT = "plan_pricing_factorized_v4"
+PROJECTION_BUILD_REVISION = "physical-read-dedup-v1"
 FACTORIZED_PROJECTION_CONTRACTS = frozenset(
     {FACTORIZED_V3_PROJECTION_CONTRACT, PROJECTION_CONTRACT}
 )
@@ -94,9 +95,12 @@ def canonical_json(serializable: Any) -> str:
 
 
 def projection_id(binding_digest: str, provider_signature: str) -> str:
-    """Derive one immutable projection identity from both bound inputs."""
+    """Bind a new candidate to its inputs and build semantics."""
 
-    identity = f"{PROJECTION_CONTRACT}\0{binding_digest}\0{provider_signature}"
+    identity = (
+        f"{PROJECTION_CONTRACT}\0{PROJECTION_BUILD_REVISION}\0"
+        f"{binding_digest}\0{provider_signature}"
+    )
     return hashlib.sha256(identity.encode("ascii")).hexdigest()
 
 
@@ -120,6 +124,7 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
     if not isinstance(bindings, list) or not bindings:
         raise ValueError("pricing projection bindings must be a non-empty array")
     normalized_bindings_list: list[dict[str, Any]] = []
+    seen_ordinals: set[tuple[str, int]] = set()
     for raw_binding in bindings:
         if not isinstance(raw_binding, Mapping):
             raise ValueError("pricing projection bindings must be objects")
@@ -129,16 +134,21 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
             for field in ("snapshot_id", "source_key", "plan_id", "role")
         ):
             raise ValueError("pricing projection binding is incomplete")
+        raw_ordinal = binding_by_field.get(
+            "ordinal", binding_by_field.get("binding_ordinal")
+        )
+        if isinstance(raw_ordinal, bool):
+            raise ValueError("pricing projection binding ordinal is invalid")
         try:
-            ordinal = int(
-                binding_by_field.get(
-                    "ordinal", binding_by_field.get("binding_ordinal")
-                )
-            )
-        except (TypeError, ValueError) as exc:
+            ordinal = int(raw_ordinal)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("pricing projection binding ordinal is invalid") from exc
         if ordinal < 0:
             raise ValueError("pricing projection binding ordinal is invalid")
+        ordinal_key = (str(binding_by_field["role"]), ordinal)
+        if ordinal_key in seen_ordinals:
+            raise ValueError("pricing projection binding ordinals are not unique")
+        seen_ordinals.add(ordinal_key)
         normalized_bindings_list.append(binding_by_field)
     return normalized_bindings_list
 
