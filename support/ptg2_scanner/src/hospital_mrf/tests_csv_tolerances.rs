@@ -477,7 +477,7 @@ include!("tests_metadata_address.rs");
             (1, "2026-01-01"),
             (2, "2026-02-30"),
             (2, "2025-02-29"),
-            (2, "2/19/26"),
+            (2, "2/19/026"),
             (2, "2026-02/19"),
             (3, "5.0.0"),
             (3, ""),
@@ -506,6 +506,16 @@ include!("tests_metadata_address.rs");
             &StringRecord::from(headers),
             &StringRecord::from(values)
         ).is_none());
+    }
+
+    #[test]
+    fn csv_two_digit_years_use_the_2000s() {
+        assert_eq!(canonical_csv_date("10/1/25").unwrap(), "2025-10-01");
+        assert_eq!(canonical_csv_date("12/11/25").unwrap(), "2025-12-11");
+        for value in ["10/1/2", "10/1/025", "25-10-01"] {
+            assert!(canonical_csv_date(value).is_err());
+        }
+        assert!(canonical_json_date("10/1/25").is_err());
     }
 
     #[test]
