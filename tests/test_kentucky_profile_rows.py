@@ -133,6 +133,33 @@ def test_ambiguous_registry_matches_retain_unattached_assertions():
     assert parsed_profile(candidates=inconsistent_candidates)[0]["match_status"] == "identity_conflict"
 
 
+@pytest.mark.parametrize(("display_name", "expected"), [
+    ("Alex Morgan Do", "deterministic"),
+    ("Alex Morgan Do M.D.", "deterministic"),
+    ("Alex Morgan Do D.O.", "deterministic"),
+    ("Alex Morgan D.O.", "identity_conflict"),
+    ("Alex Morgan DO", "identity_conflict"),
+    ("Alex Morgan MD", "identity_conflict"),
+])
+def test_surname_do_is_distinct_from_a_credential(display_name, expected):
+    fields = [("Name", display_name), *FIELDS[1:]]
+    candidate_by_field = {**CANDIDATE, "last_name": "Do", "suffix": None}
+    source_record, facts = parsed_profile(fields, candidates=[candidate_by_field])
+    assert source_record["match_status"] == expected
+    assert facts[0]["npi"] == (int(NPI) if expected == "deterministic" else None)
+
+
+def test_explicit_credential_cannot_match_a_same_license_surname():
+    fields = [("Name", "Alex Morgan D.O."), *FIELDS[1:]]
+    candidates = [{**CANDIDATE, "middle_name": None, "last_name": "Morgan", "suffix": None},
+                  {**CANDIDATE, "npi": OTHER_NPI, "last_name": "Do", "suffix": None}]
+    assert parsed_profile(fields, candidates=candidates)[0]["matched_npi"] == int(NPI)
+    fields = [("Name", "Alex Morgan DO"), *FIELDS[1:]]
+    source_record, facts = parsed_profile(fields, candidates=[])
+    assert source_record["match_status"] == "unmatched" and facts[0]["npi"] is None
+    assert source_record["match_evidence"]["reason"] == "ambiguous_undotted_credential"
+
+
 @pytest.mark.parametrize("license_number", ["00079", "C0007"])
 def test_original_license_text_is_not_coerced(license_number):
     fields = [(label, license_number if label == "License" else text) for label, text in FIELDS]
@@ -164,6 +191,8 @@ def test_year_quality_keeps_raw_source(year, normalized, flag):
     assert facts[0]["source_json"]["raw_fields"]["Year Graduated"] == year
     assert facts[0]["source_json"]["quality_flags"] == [flag]
     assert source_record["normalized_payload"]["quality_flags"] == [flag]
+    facts[0]["source_json"]["quality_flags"].append("additional_fact_flag")
+    assert source_record["normalized_payload"]["quality_flags"] == [flag]
 
 
 def test_blank_education_and_year_only_are_distinct():
@@ -186,6 +215,25 @@ def test_only_validated_empty_result_is_not_found():
     assert source_record["normalized_payload"]["visibility"] == "not_found" and facts == []
     with pytest.raises(ValueError, match="result_envelope_invalid"):
         rows.parse_profile("<html><body>Temporarily unavailable</body></html>", license_number=LICENSE, candidates=[], evidence=EVIDENCE)
+
+
+def test_valueless_class_is_inert_outside_results_and_rejected_inside():
+    html = response_html([]).replace("<body>", "<body><div class></div>")
+    assert rows.parse_profile(html, license_number=LICENSE, candidates=[], evidence=EVIDENCE)[0]["match_status"] == "not_found"
+    html = response_html().replace('class="row"', "class", 1)
+    with pytest.raises(ValueError, match="kentucky_profile_unexpected_result_markup"):
+        rows.parse_profile(html, license_number=LICENSE, candidates=[CANDIDATE], evidence=EVIDENCE)
+
+
+@pytest.mark.parametrize("evidence_by_field", [
+    {key: value for key, value in EVIDENCE.items() if key != "content_sha256"},
+    {**EVIDENCE, "downloaded_at": "not-a-timestamp"},
+    {**EVIDENCE, "downloaded_at": 20260908},
+    {**EVIDENCE, "downloaded_at": None},
+])
+def test_malformed_evidence_is_rejected_with_source_error(evidence_by_field):
+    with pytest.raises(ValueError, match="kentucky_profile_evidence_"):
+        parsed_profile(evidence=evidence_by_field)
 
 
 @pytest.mark.parametrize("unexpected", ["Service temporarily unavailable", "<p>Service temporarily unavailable</p>", "<table></table>"])

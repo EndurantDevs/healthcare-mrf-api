@@ -73,7 +73,7 @@ class _DetailParser(HTMLParser):
             _require(self.content_depth is not None, "criterion_outside_result_content")
             self.criterion_count += 1
             self.in_criterion = True
-        classes = attrs_by_name.get("class", "").split()
+        classes = (attrs_by_name.get("class") or "").split()
         if self.results_started and self.in_result_form and self.cell_depth is None:
             allowed_classes = {"row", "cols2-col1", "cols2-col2"} if self.content_depth is not None else {"ky-cm-post"}
             _require(tag == "div" and bool(set(classes) & allowed_classes), "unexpected_result_markup")
@@ -197,11 +197,17 @@ def _match_profile(profile, license_number, candidates):
     eligible_candidates = [candidate for candidate in candidates if candidate.get("license_state", "KY") == "KY"
                 and str(candidate.get("license_number") or "").strip() == license_number
                 and is_valid_npi(candidate.get("npi"))]
-    source_name = re.sub(r" (?:md|do)$", "", _normalized_name(profile["Name"]))
-    compatible_npis = {int(candidate["npi"]) for candidate in eligible_candidates if source_name in _candidate_names(candidate)}
+    display_name = _text(unicodedata.normalize("NFKC", profile["Name"]))
+    source_name = _normalized_name(re.sub(r" (?i:M\.D\.?|D\.O\.?)$", "", display_name))
     evidence_by_field = {"method": "exact_ky_full_license_full_name", "jurisdiction": "KY",
                          "requested_license_number": license_number, "source_name": profile["Name"],
                          "candidate_npis": sorted({int(candidate["npi"]) for candidate in eligible_candidates})}
+    # Undotted uppercase MD/DO may be a credential or a surname; preserve it without guessing.
+    if re.search(r" (?:MD|DO)$", display_name):
+        return None, "identity_conflict" if eligible_candidates else "unmatched", {
+            **evidence_by_field, "reason": "ambiguous_undotted_credential",
+        }
+    compatible_npis = {int(candidate["npi"]) for candidate in eligible_candidates if source_name in _candidate_names(candidate)}
     if len(compatible_npis) == 1:
         matched_npi = next(iter(compatible_npis))
         if all(source_name in _candidate_names(candidate) for candidate in eligible_candidates if int(candidate["npi"]) == matched_npi):
@@ -216,7 +222,10 @@ def _validated_evidence(evidence):
     evidence_by_field = {key: copy.deepcopy(evidence[key]) for key in fields}
     if isinstance(evidence_by_field["downloaded_at"], datetime):
         evidence_by_field["downloaded_at"] = evidence_by_field["downloaded_at"].isoformat()
-    datetime.fromisoformat(evidence_by_field["downloaded_at"])
+    try:
+        datetime.fromisoformat(evidence_by_field["downloaded_at"])
+    except (TypeError, ValueError):
+        raise ValueError("kentucky_profile_evidence_timestamp_invalid") from None
     return evidence_by_field
 
 
@@ -249,7 +258,7 @@ def _education_value(profile, observed_year):
 
 def _education_fact(profile, source_record, evidence):
     value_by_field, flags = _education_value(profile, datetime.fromisoformat(evidence["downloaded_at"]).year)
-    source_record["normalized_payload"]["quality_flags"] = flags
+    source_record["normalized_payload"]["quality_flags"] = list(flags)
     if not value_by_field:
         source_record["normalized_payload"]["visibility"] = "education_unusable" if flags else "education_not_reported"
         return []
