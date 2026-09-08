@@ -4,6 +4,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from api import plan_release_serving, ptg2_serving
 
 from .test_plan_release_serving import (
@@ -15,6 +17,66 @@ from .test_plan_release_serving import (
     _release_selection,
 )
 from .test_plan_release_serving_readiness import _serving_table_descriptor
+from .test_ptg2_serving import ConcurrentSessionFactory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("network_count", (1, 3))
+@pytest.mark.parametrize("has_descriptors", (False, True))
+async def test_reverse_release_reuses_descriptors_and_preserves_fallback(
+    monkeypatch, network_count, has_descriptors
+):
+    """Reuse exact release proof without changing legacy loads or rate output."""
+    bindings = tuple(
+        _network_binding(index, f"snapshot-{index}", f"source-{index}")
+        for index in range(network_count)
+    )
+    descriptor_by_snapshot_id = {
+        binding.snapshot_id: _serving_table_descriptor(
+            snapshot_id=binding.snapshot_id, source_key=binding.source_key
+        )
+        for binding in bindings
+    }
+    selection = _release_selection(
+        *bindings,
+        validated_serving_tables=tuple(descriptor_by_snapshot_id.items()) if has_descriptors else (),
+    )
+    loaded_snapshot_ids, searched_snapshot_ids = [], []
+    sessions = ConcurrentSessionFactory()
+
+    async def load_descriptor(_session, snapshot_id, **_kwargs):
+        loaded_snapshot_ids.append(snapshot_id)
+        return descriptor_by_snapshot_id[snapshot_id]
+
+    async def search(_session, npi, args, _pagination, *, snapshot_id, serving_tables):
+        await asyncio.sleep(0)
+        assert serving_tables is descriptor_by_snapshot_id[snapshot_id]
+        assert args["source_key"] == serving_tables.source_key
+        assert args["plan_id"] == bindings[0].plan_id
+        searched_snapshot_ids.append(snapshot_id)
+        return {
+            "items": [{"reported_code": "99213", "npi": npi,
+                       "prices": [{"negotiated_rate": "125.00"}]}],
+            "pagination": {"total": 1, "total_is_exact": True},
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", sessions.session)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", load_descriptor)
+    monkeypatch.setattr(ptg2_serving, "_search_ptg2_manifest_provider_procedures", search)
+    response = await ptg2_serving._search_plan_release_provider_procedures(
+        object(), 1234567890, {"plan_release_id": PLAN_RELEASE_ID},
+        SimpleNamespace(limit=25, offset=0, page=1, source="page"), selection,
+    )
+
+    assert sorted(searched_snapshot_ids) == sorted(descriptor_by_snapshot_id)
+    assert sorted(loaded_snapshot_ids) == ([] if has_descriptors else sorted(descriptor_by_snapshot_id))
+    assert response["plan_release_id"] == PLAN_RELEASE_ID
+    assert [procedure_item["prices"] for procedure_item in response["items"]] == [
+        [{"negotiated_rate": "125.00"}]
+    ] * network_count
+    assert len(sessions.sessions) == (network_count if network_count > 1 else 0)
+    assert sessions.active == 0
 
 
 def test_release_resolver_retains_validated_serving_descriptor(monkeypatch):

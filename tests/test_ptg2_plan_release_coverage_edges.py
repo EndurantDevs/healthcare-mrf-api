@@ -69,7 +69,10 @@ async def test_multi_provider_release_binds_known_network_and_skips_unknown(
     selection = _selection(binding)
     read_calls = []
 
-    async def read_network(source_key, snapshot_id, npi, args, pagination):
+    async def read_network(
+        source_key, snapshot_id, npi, args, pagination, *, serving_tables=None
+    ):
+        assert serving_tables is None
         read_calls.append((source_key, snapshot_id, npi, args, pagination.limit))
         return (
             source_key,

@@ -10,6 +10,7 @@ import json
 import os
 import re
 from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -21139,24 +21140,16 @@ async def search_ptg2_serving_table(
     resolved_args_by_name = dict(args)
     if tables.source_key and not resolved_args_by_name.get("source_key"):
         resolved_args_by_name["source_key"] = tables.source_key
-    if tables.uses_v4_graph:
-        with v4_graph_request_scope():
-            return await _search_manifest_serving_table(
-                session,
-                snapshot_id,
-                resolved_args_by_name,
-                pagination,
-                tables,
-                mode_value,
-            )
-    return await _search_manifest_serving_table(
-        session,
-        snapshot_id,
-        resolved_args_by_name,
-        pagination,
-        tables,
-        mode_value,
-    )
+    scope = v4_graph_request_scope if tables.uses_v4_graph else nullcontext
+    with scope():
+        return await _search_manifest_serving_table(
+            session,
+            snapshot_id,
+            resolved_args_by_name,
+            pagination,
+            tables,
+            mode_value,
+        )
 
 
 @dataclass(frozen=True)
@@ -21641,9 +21634,10 @@ async def _search_ptg2_provider_procedures_snapshot(
     pagination,
     *,
     snapshot_id: str,
+    serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
     """Search one explicitly selected snapshot for a provider's procedures."""
-    serving_tables = await snapshot_serving_tables(
+    serving_tables = serving_tables or await snapshot_serving_tables(
         session,
         snapshot_id,
         candidate_audit_access=candidate_audit_access_from_args(args),
@@ -21652,24 +21646,16 @@ async def _search_ptg2_provider_procedures_snapshot(
     resolved_args_by_name = dict(args)
     if serving_tables.source_key and not resolved_args_by_name.get("source_key"):
         resolved_args_by_name["source_key"] = serving_tables.source_key
-    if serving_tables.uses_v4_graph:
-        with v4_graph_request_scope():
-            return await _search_ptg2_manifest_provider_procedures(
-                session,
-                npi,
-                resolved_args_by_name,
-                pagination,
-                snapshot_id=snapshot_id,
-                serving_tables=serving_tables,
-            )
-    return await _search_ptg2_manifest_provider_procedures(
-        session,
-        npi,
-        resolved_args_by_name,
-        pagination,
-        snapshot_id=snapshot_id,
-        serving_tables=serving_tables,
-    )
+    scope = v4_graph_request_scope if serving_tables.uses_v4_graph else nullcontext
+    with scope():
+        return await _search_ptg2_manifest_provider_procedures(
+            session,
+            npi,
+            resolved_args_by_name,
+            pagination,
+            snapshot_id=snapshot_id,
+            serving_tables=serving_tables,
+        )
 
 
 def _provider_procedure_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -21725,6 +21711,8 @@ async def _search_provider_procedures_network(
     npi: int,
     args: dict[str, Any],
     pagination,
+    *,
+    serving_tables: PTG2ServingTables | None = None,
 ) -> tuple[str, str, dict[str, Any] | None]:
     async with sa_db.session() as network_session:
         response = await _search_ptg2_provider_procedures_snapshot(
@@ -21733,6 +21721,7 @@ async def _search_provider_procedures_network(
             args,
             pagination,
             snapshot_id=snapshot_id,
+            serving_tables=serving_tables,
         )
     return source_key, snapshot_id, response
 
@@ -21861,6 +21850,11 @@ async def _search_multi_ptg2_provider_procedures(
             npi,
             network_args,
             sub_pagination,
+            serving_tables=(
+                release_selection.serving_tables_for_snapshot(snapshot_id)
+                if release_selection is not None
+                else None
+            ),
         )
 
     network_responses = await _gather_ptg2_network_reads(
@@ -22041,6 +22035,9 @@ async def _search_plan_release_provider_procedures(
             binding_query_args(args, binding),
             pagination,
             snapshot_id=binding.snapshot_id,
+            serving_tables=release_selection.serving_tables_for_snapshot(
+                binding.snapshot_id
+            ),
         )
     return _plan_release_response_or_no_match(
         response_by_field,
