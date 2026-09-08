@@ -75,8 +75,8 @@ def test_legacy_spacing_and_blank_layout_rows_preserve_education():
     html = response_html([*FIELDS, ("", " ")]).replace(
         "Synthetic &amp; Medical School", "Synthetic<br>&amp; Medical School"
     ).replace("</form>", '<div class="ky-cm-post">Published: 09/28/2004 [wvd]</div></form>')
-    evidence = {**EVIDENCE, "downloaded_at": datetime.fromisoformat(EVIDENCE["downloaded_at"])}
-    record, facts = rows.parse_profile(html, license_number=LICENSE, candidates=[CANDIDATE], evidence=evidence)
+    evidence_by_field = {**EVIDENCE, "downloaded_at": datetime.fromisoformat(EVIDENCE["downloaded_at"])}
+    record, facts = rows.parse_profile(html, license_number=LICENSE, candidates=[CANDIDATE], evidence=evidence_by_field)
     assert record["match_status"] == "deterministic"
     assert facts[0]["value_json"] == {"institution": "Synthetic & Medical School", "graduation_year": 2001}
     assert facts[0]["source_json"]["downloaded_at"] == "2026-09-08T00:00:00+00:00"
@@ -95,8 +95,8 @@ def test_incomplete_or_malformed_registry_names_never_attach_facts(candidate_cha
 
 def test_matching_names_without_middle_name_or_suffix_need_no_inference():
     fields = [("Name", "Alex Example M.D."), *FIELDS[1:]]
-    candidate = {**CANDIDATE, "middle_name": None, "suffix": None}
-    record, facts = parsed_profile(fields, candidates=[candidate])
+    candidate_by_field = {**CANDIDATE, "middle_name": None, "suffix": None}
+    record, facts = parsed_profile(fields, candidates=[candidate_by_field])
     assert record["match_status"] == "deterministic" and facts[0]["npi"] == int(NPI)
 
 
