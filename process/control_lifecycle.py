@@ -70,11 +70,11 @@ def _committed_target_result(
     *,
     target_module: str,
 ) -> dict[str, Any] | None:
-    """Return the exact NPI result already committed with its database state."""
+    """Return a supported importer's result committed with its database state."""
 
     context = control_context.get("context")
     if (
-        target_module != "process.npi"
+        target_module not in {"process.npi", "process.massachusetts_profile"}
         or not isinstance(context, dict)
         or context.get("control_run_terminal_committed") is not True
     ):
@@ -185,25 +185,25 @@ async def suppress_control_run_heartbeat_persistence(
 async def _project_control_target_success(
     run_id: str,
     *,
+    target_module: str,
     target_function: str,
     target_result: Any,
     control_context: dict[str, Any],
-    run_shutdown: bool,
     attempt_id: str | None,
     attempt_started_at: str | None,
 ) -> None:
     """Project one successful target result through the terminal status seam."""
 
-    job_context_by_field = control_context.get("context") if run_shutdown else None
+    committed_result = _committed_target_result(control_context, target_module=target_module)
+    job_context_by_field = control_context.get("context")
+    if committed_result is not None:
+        target_result = committed_result
     terminal_metrics = _terminal_metrics_from_result(target_result, context=job_context_by_field)
     terminal_progress = _terminal_progress_from_result(
         target_function,
         target_result,
     ) or _terminal_progress_from_result(target_function, terminal_metrics)
-    is_database_state_committed = bool(
-        isinstance(job_context_by_field, dict)
-        and job_context_by_field.get("control_run_terminal_committed")
-    )
+    is_database_state_committed = committed_result is not None
     terminal_projection = _mark_and_flush_terminal_control_run(
         run_id,
         phase_detail=(
@@ -423,12 +423,15 @@ async def control_single_job_start(
         await _stop_live_progress_heartbeat(heartbeat_task)
         if live_token is not None:
             reset_live_progress_context(live_token)
+    committed_result = _committed_target_result(ctx, target_module=target_module)
+    if committed_result is not None:
+        target_result = committed_result
     await _project_control_target_success(
         run_id,
+        target_module=target_module,
         target_function=target_function,
         target_result=target_result,
-        control_context=ctx,
-        run_shutdown=run_shutdown,
+        control_context=ctx if run_shutdown or committed_result is not None else {},
         attempt_id=attempt_id,
         attempt_started_at=started_at if run_id else None,
     )
