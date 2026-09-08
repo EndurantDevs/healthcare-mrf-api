@@ -1154,6 +1154,7 @@ class _SingleGetDownloadState:
 class _DownloadTransport:
     user_agent: str | None = None
     browser_profile: str | None = None
+    retained_raw_pin: tuple[str, int] | None = None
 
 
 class _DownloadSizeLimitError(RuntimeError):
@@ -1673,8 +1674,26 @@ async def download_raw_artifact(
 ) -> PTG2RawArtifact:
     """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
 
+    return await _download_raw_request(
+        url, store=store, reuse_raw_artifacts=reuse_raw_artifacts,
+        max_bytes=max_bytes, keep_partial_artifacts=keep_partial_artifacts,
+        exact_get_evidence=exact_get_evidence,
+        transport=_DownloadTransport(user_agent, browser_profile),
+    )
+
+
+async def _download_raw_request(
+    url: str,
+    *,
+    store: PTG2ArtifactStore | None,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+    exact_get_evidence: bool = False,
+    transport: _DownloadTransport | None = None,
+) -> PTG2RawArtifact:
+    """Share URL validation and locking with internally pinned frozen jobs."""
     store = store or PTG2ArtifactStore()
-    transport = _DownloadTransport(user_agent, browser_profile)
     try:
         await assert_safe_url(url)
         canonical_url = canonicalize_url(url)
@@ -1745,8 +1764,20 @@ def _select_reuse_candidate(
     store: PTG2ArtifactStore,
     candidates: list[dict[str, Any]],
     head: PTG2HeadMetadata,
+    retained_raw_pin: tuple[str, int] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    candidate, mode = choose_reusable_raw_artifact(candidates, head, store=store)
+    if retained_raw_pin is not None:
+        candidates = [
+            candidate for candidate in candidates
+            if candidate.get("raw_sha256") == retained_raw_pin[0]
+            and candidate.get("content_length") == retained_raw_pin[1]
+        ]
+    elif head.status is None or not 200 <= head.status < 300:
+        return None, None
+    candidate, mode = choose_reusable_raw_artifact(
+        candidates, head, store=store,
+        reuse_policy="metadata_or_hash" if retained_raw_pin is not None else "metadata",
+    )
     if candidate is None or mode is None:
         return None, None
     candidate_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
@@ -1789,10 +1820,11 @@ def _try_reuse_raw_artifact(
     canonical_url: str,
     head: PTG2HeadMetadata,
     started_at: float,
+    retained_raw_pin: tuple[str, int] | None = None,
 ) -> tuple[PTG2RawArtifact | None, bool]:
     candidates = store.find_candidates(canonical_url)
     _protect_reuse_candidates(store, candidates)
-    candidate, mode = _select_reuse_candidate(store, candidates, head)
+    candidate, mode = _select_reuse_candidate(store, candidates, head, retained_raw_pin)
     if candidate is None or mode is None:
         return None, False
     raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
@@ -1805,6 +1837,8 @@ def _try_reuse_raw_artifact(
             expected_sha256=expected, actual_sha256=actual,
         )
         return None, True
+    if retained_raw_pin is not None and (actual, byte_count) != retained_raw_pin:
+        return None, False
     container_error = _artifact_container_error(
         url,
         raw_path,
@@ -2189,7 +2223,6 @@ async def _download_raw_artifact_locked(
     transport: _DownloadTransport | None = None,
 ) -> PTG2RawArtifact:
     """Run one raw download after this canonical URL has been serialized."""
-
     transport = transport or _DownloadTransport()
     head = await fetch_head_metadata(url, **_user_agent_kwargs(transport.user_agent))
     progress_started_at = time.monotonic()
@@ -2197,16 +2230,15 @@ async def _download_raw_artifact_locked(
     if reuse_raw_artifacts:
         reused, corrupt_candidate = _try_reuse_raw_artifact(
             url, store=store, canonical_url=canonical_url, head=head, started_at=progress_started_at,
+            retained_raw_pin=transport.retained_raw_pin,
         )
         if reused is not None:
             return reused
         should_validate_downloaded_gzip |= corrupt_candidate
-    keep_partials, partial_path, temporary_path, private_stage_directory = (
-        _prepare_raw_download(
-            store, canonical_url=canonical_url, url=url,
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            keep_partial_artifacts=keep_partial_artifacts,
-        )
+    keep_partials, partial_path, temporary_path, private_stage_directory = _prepare_raw_download(
+        store, canonical_url=canonical_url, url=url,
+        reuse_raw_artifacts=reuse_raw_artifacts,
+        keep_partial_artifacts=keep_partial_artifacts,
     )
     failure_digest, downloaded_byte_count = hashlib.sha256(), 0
     _emit_download_started(url, head, progress_started_at)
@@ -2513,6 +2545,30 @@ def _download_failure(
     )
 
 
+async def _download_job_raw_artifact(
+    job: dict[str, Any],
+    store: PTG2ArtifactStore,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2RawArtifact:
+    """Carry validated frozen byte pins into the shared request path."""
+    options_by_name = dict(
+        store=store, reuse_raw_artifacts=reuse_raw_artifacts,
+        max_bytes=max_bytes, keep_partial_artifacts=keep_partial_artifacts,
+    )
+    descriptor_by_field = job.get("_frozen_rate_file")
+    if not isinstance(descriptor_by_field, dict):
+        return await download_raw_artifact(job["url"], **options_by_name)
+    # Frozen dispatch validates this descriptor. A transport flag alone does
+    # not authorize replay of a completed cached artifact.
+    raw_pin = (descriptor_by_field["raw_sha256"], descriptor_by_field["content_length"])
+    return await _download_raw_request(
+        job["url"], **options_by_name, exact_get_evidence=True,
+        transport=_DownloadTransport(retained_raw_pin=raw_pin),
+    )
+
+
 async def _download_ptg_job_artifact(
     job: dict[str, Any],
     *,
@@ -2526,13 +2582,8 @@ async def _download_ptg_job_artifact(
     try:
         store = PTG2ArtifactStore()
         frozen_descriptor = job.get("_frozen_rate_file")
-        raw_artifact = await download_raw_artifact(
-            job["url"],
-            store=store,
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            max_bytes=max_bytes,
-            keep_partial_artifacts=keep_partial_artifacts,
-            exact_get_evidence=isinstance(frozen_descriptor, dict),
+        raw_artifact = await _download_job_raw_artifact(
+            job, store, reuse_raw_artifacts, max_bytes, keep_partial_artifacts,
         )
         _observe_raw_artifact_stage(artifact_stage_observer, raw_artifact)
         logical_artifact = (

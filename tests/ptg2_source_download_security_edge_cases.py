@@ -47,7 +47,7 @@ def test_corrupt_reuse_candidate_is_recorded_before_fresh_download(
     container_checked_paths = []
 
     async def head(url):
-        return PTG2HeadMetadata(url=url, content_length=3)
+        return PTG2HeadMetadata(url=url, status=200, content_length=3)
 
     monkeypatch.setattr(source_download, "fetch_head_metadata", head)
     monkeypatch.setattr(

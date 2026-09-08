@@ -162,7 +162,7 @@ def test_query_named_zip_rejects_cached_html(monkeypatch, tmp_path):
 
     async def handle(request):
         if request.method == "HEAD":
-            return web.Response(headers={"Content-Length": str(len(zip_bytes))})
+            return web.Response(headers={"Content-Length": str(len(html_bytes)), "ETag": '"cached"'})
         get_requests.append(request.path_qs)
         return web.Response(body=zip_bytes)
 
@@ -178,6 +178,7 @@ def test_query_named_zip_rejects_cached_html(monkeypatch, tmp_path):
                 "raw_storage_uri": store.storage_uri(raw_path),
                 "raw_sha256": digest,
                 "content_length": len(html_bytes),
+                "etag": '"cached"',
                 "status": "available",
             }
         )

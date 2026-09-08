@@ -6487,6 +6487,51 @@ async def test_healthcarebluebook_resolver_applies_max_targets_early(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,content_type,redirected,head_error,expected",
+    [
+        (200, "application/zip", True, False, True),
+        (200, "application/zip", False, False, True),
+        (200, "text/html", False, False, False),
+        (404, "application/zip", False, False, False),
+        (410, "application/zip", False, False, False),
+        (200, "application/zip", False, True, True),
+    ],
+)
+async def test_healthcarebluebook_numeric_probe_uses_isolated_http_transport(
+    monkeypatch, status, content_type, redirected, head_error, expected,
+):
+    url = "https://mrf.healthcarebluebook.com/Example/123456"
+    response = _FakeFetchResponse(
+        status=status, body=b"", content_type=content_type,
+        url="https://files.example.test/rates.zip" if redirected else url,
+    )
+    response.headers["Content-Length"] = "42"
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.head = Mock(
+        return_value=response,
+        side_effect=OSError("synthetic HEAD failure") if head_error else None,
+    )
+    session_factory = Mock(return_value=session)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(
+        discovery.socket, "getaddrinfo",
+        Mock(return_value=[(
+            discovery.socket.AF_INET, discovery.socket.SOCK_STREAM,
+            6, "", ("8.8.8.8", 443),
+        )]),
+    )
+
+    assert await discovery._is_healthcarebluebook_numeric_url_downloadable(
+        url, session=None,
+    ) is expected
+    session.head.assert_called_once_with(url, allow_redirects=True)
+    assert session_factory.call_args.kwargs["trust_env"] is False
+    session.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_links(
     monkeypatch,
 ):
@@ -6513,6 +6558,12 @@ async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_li
         return html_by_url[url]
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    numeric_probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        discovery,
+        "_is_healthcarebluebook_numeric_url_downloadable",
+        numeric_probe,
+    )
 
     crawl_targets = await discovery._resolve_html_mrf_with_healthcarebluebook(
         source_dict,
@@ -6531,6 +6582,9 @@ async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_li
     assert csv_target.metadata["target_file_type"] == "allowed-amounts"
     assert csv_target.metadata["source_format"] == "csv"
     delegated = by_url["https://mrf.healthcarebluebook.com/BRMS/314355"]
+    numeric_probe.assert_any_await("https://mrf.healthcarebluebook.com/BRMS/326940", None)
+    numeric_probe.assert_any_await("https://mrf.healthcarebluebook.com/BRMS/314355", None)
+    assert numeric_probe.await_count == 2
     assert delegated.metadata["resolver"] == "html_mrf_with_healthcarebluebook"
     assert delegated.metadata["nested_resolver"] == "healthcarebluebook_mrf"
     assert delegated.metadata["plan_info"][0]["plan_id"] == "030506501"

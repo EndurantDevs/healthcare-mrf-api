@@ -495,11 +495,16 @@ async def _acquire_and_scan_frozen_parts(
 
     async def download_local_artifact(url: str, **options):
         assert options["exact_get_evidence"] is True
-        return raw_artifacts_by_url[url]
+        artifact = raw_artifacts_by_url[url]
+        assert options["transport"].retained_raw_pin == (
+            artifact.raw_sha256,
+            artifact.byte_count,
+        )
+        return artifact
 
     monkeypatch.setattr(
         source_download,
-        "download_raw_artifact",
+        "_download_raw_request",
         download_local_artifact,
     )
     downloaded_jobs = await _download_frozen_jobs(normalized_descriptors)
