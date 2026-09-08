@@ -33,7 +33,7 @@ JOB_LABELS = {
 }
 
 
-def _assert_job_actions(job_id, job, revision):
+def _assert_job_actions(job_id, job, revision) -> None:
     """Require hosted actions and the approved package before local setup."""
     has_pinned_checkout = False
     for step in job.get("steps", []):
@@ -75,7 +75,10 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert "inputs.ci_revision" not in text
     assert workflow["run-name"] == "${{ " + METADATA_ONLY + " && 'CI metadata update' || 'CI' }}"
     assert workflow["concurrency"] == {
-        "group": "${{ " + METADATA_ONLY + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}",
+        "group": (
+            "${{ " + METADATA_ONLY
+            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+        ),
         "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
     }
     for job_id, job in workflow["jobs"].items():
