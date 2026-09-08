@@ -12392,6 +12392,7 @@ hospitals:
 - hospital_id: hospital-003700
   name: Maimonides Midwood Community Hospital
   cms_hpt_url: https://maimo.org/cms-hpt.txt
+  fallback_mrf_url: https://nych.com/wp-content/uploads/2025/03/111986351_NYCHB_Brooklyn_Community_standardcharges.csv
 - hospital_id: hospital-003701
   name: Main Campus
   cms_hpt_url: https://www.barlowhospital.org/cms-hpt.txt

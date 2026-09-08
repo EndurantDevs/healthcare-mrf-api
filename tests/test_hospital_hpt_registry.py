@@ -95,7 +95,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_714
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 140
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 141
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -455,21 +455,26 @@ def test_reviewed_pair_preserves_shared_locator(record_case):
 @pytest.mark.parametrize("record_case", (
     "matching", "unmatched", "fetch_failed", "body_failed", "ambiguous",
 ))
-def test_reviewed_singleton_preserves_location_scope(record_case):
-    """A reviewed file keeps its exact hospital binding without assigning its clinic."""
+@pytest.mark.parametrize("hospital_id,hospital_name,locator_url,other_location,unmatched_name", (
+    ("hospital-001409", "Clarke County Hospital", "https://clarkehosp.org/cms-hpt.txt",
+     "Clarke County Clinic", "Clarke County Clinic"),
+    ("hospital-003700", "Maimonides Midwood Community Hospital", "https://maimo.org/cms-hpt.txt",
+     "Maimonides Midwood Community Hospital Infusion Center", "Maimonides Medical Center"),
+))
+def test_reviewed_singleton_preserves_location_scope(record_case, hospital_id, hospital_name, locator_url,
+                                                   other_location, unmatched_name):
+    """A reviewed file binds its named location and retains unknown-location behavior."""
     acquisition = acquisition_module()
-    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-001409"})
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
     assert set(hospital) == {"hospital_id", "name", "cms_hpt_url", "fallback_mrf_url"}
-    assert (hospital["name"], hospital["cms_hpt_url"]) == (
-        "Clarke County Hospital", "https://clarkehosp.org/cms-hpt.txt",
-    )
+    assert (hospital["name"], hospital["cms_hpt_url"]) == (hospital_name, locator_url)
     assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (hospital["hospital_id"],)
     assert tuple(entry for entry in registry.load_hospital_hpt_registry()
                  if entry["cms_hpt_url"] == hospital["cms_hpt_url"]
                  or entry.get("fallback_mrf_url") == hospital["fallback_mrf_url"]) == (hospital,)
-    names = (hospital["name"], "Clarke County Clinic")
+    names = (hospital["name"], other_location)
     if record_case == "unmatched":
-        names = names[1:]
+        names = (unmatched_name,)
     elif record_case == "ambiguous":
         names = (hospital["name"], *names)
     has_failed = record_case in {"fetch_failed", "body_failed"}
@@ -492,10 +497,10 @@ def test_reviewed_singleton_preserves_location_scope(record_case):
     if not expected_error:
         store, _native = store_module()
         assert store._location_ordinals((candidate,), (
-            (0, hospital["name"]), (1, "Clarke County Clinic"),
+            (0, hospital["name"]), (1, other_location),
         )) == {hospital["hospital_id"]: 0}
         assert store._location_ordinals((candidate,), (
-            (1, "Clarke County Clinic"),
+            (1, other_location),
         )) == {hospital["hospital_id"]: None}
 
 
