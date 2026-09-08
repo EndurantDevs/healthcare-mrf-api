@@ -4511,7 +4511,7 @@ async def _post_success_retention(
     artifact_root: Path,
     failed_retention_days: int,
 ) -> dict[str, Any]:
-    """Bound heavy history after success while retaining live and rollback audits."""
+    """Bound Florida history while retaining its live and rollback audits."""
     schema = ProviderProfileProjection.__table__.schema or "mrf"
     live_name = ProviderProfileProjection.__tablename__
     old_name = f"{live_name}_old"
@@ -4519,7 +4519,6 @@ async def _post_success_retention(
     eligible_run_ids: list[str] = []
     deleted_rows_by_key: dict[str, int] = {}
     failed_cutoff = _utcnow() - timedelta(days=failed_retention_days)
-
     async with db.transaction():
         await db.scalar(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
@@ -4532,7 +4531,8 @@ async def _post_success_retention(
                 ProviderProfileImportRun.status,
                 ProviderProfileImportRun.finished_at,
             ).where(
-                ProviderProfileImportRun.status.in_(("completed", "failed"))
+                ProviderProfileImportRun.source_key == FL_MQA_SOURCE_KEY,
+                ProviderProfileImportRun.status.in_(("completed", "failed")),
             )
         )
         eligible_run_ids = _retention_eligible_run_ids(
