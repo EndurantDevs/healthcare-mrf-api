@@ -18797,6 +18797,7 @@ hospitals:
 - hospital_id: hospital-005626
   name: San Joaquin General Hospital
   cms_hpt_url: https://www.sanjoaquingeneral.org/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=9150f7c69ef6e33ccd3eab7900459e38729dcdbe49a0561ed9dd8d5b35f7449a
 - hospital_id: hospital-005627
   name: San Joaquin Valley Rehabilitation Hospital
   cms_hpt_url: https://sjvrehab.com/cms-hpt.txt
