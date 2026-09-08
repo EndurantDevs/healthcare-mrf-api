@@ -85,7 +85,9 @@ def test_public_download_revalidates_each_retained_candidate(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pin_change", [None, "raw_sha256", "content_length"])
+@pytest.mark.parametrize(
+    "pin_change", [None, "raw_sha256", "content_length", "cached_content_length"],
+)
 async def test_frozen_job_reuses_only_its_explicit_headless_byte_pin(
     monkeypatch, tmp_path, pin_change,
 ):
@@ -107,8 +109,11 @@ async def test_frozen_job_reuses_only_its_explicit_headless_byte_pin(
     monkeypatch.setattr(source_download, "_download_raw_artifact_single_get", get)
     if pin_change == "raw_sha256":
         descriptor[pin_change] = "a" * 64
-    elif pin_change == "content_length":
-        descriptor[pin_change] += 1
+    elif pin_change in {"content_length", "cached_content_length"}:
+        descriptor["content_length"] += 1
+    if pin_change == "cached_content_length":
+        candidate = store.find_candidates(harness.canonical_url)[-1]
+        store.record_manifest({**candidate, "content_length": descriptor["content_length"]})
     job_by_field = {"url": harness.canonical_url, "type": "in_network", "_frozen_rate_file": descriptor}
     arguments_by_name = dict(reuse_raw_artifacts=True, max_bytes=None, keep_partial_artifacts=False)
     if pin_change:
