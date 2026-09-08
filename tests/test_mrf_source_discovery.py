@@ -6558,10 +6558,11 @@ async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_li
         return html_by_url[url]
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    numeric_probe = AsyncMock(return_value=True)
     monkeypatch.setattr(
         discovery,
         "_is_healthcarebluebook_numeric_url_downloadable",
-        AsyncMock(return_value=True),
+        numeric_probe,
     )
 
     crawl_targets = await discovery._resolve_html_mrf_with_healthcarebluebook(
@@ -6581,6 +6582,9 @@ async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_li
     assert csv_target.metadata["target_file_type"] == "allowed-amounts"
     assert csv_target.metadata["source_format"] == "csv"
     delegated = by_url["https://mrf.healthcarebluebook.com/BRMS/314355"]
+    numeric_probe.assert_any_await("https://mrf.healthcarebluebook.com/BRMS/326940", None)
+    numeric_probe.assert_any_await("https://mrf.healthcarebluebook.com/BRMS/314355", None)
+    assert numeric_probe.await_count == 2
     assert delegated.metadata["resolver"] == "html_mrf_with_healthcarebluebook"
     assert delegated.metadata["nested_resolver"] == "healthcarebluebook_mrf"
     assert delegated.metadata["plan_info"][0]["plan_id"] == "030506501"
