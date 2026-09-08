@@ -3330,6 +3330,7 @@ hospitals:
   name: Bristol Hospital
   cms_hpt_url: https://www.bristolhealth.org/cms-hpt.txt
   locator_name: Bristol Hospital, Incorporated
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/7807/060646559_bristol-hospital-inc_standardcharges.csv
 - hospital_id: hospital-000983
   name: Bristol Regional Medical Center
   cms_hpt_url: https://www.balladhealth.org/cms-hpt.txt

@@ -95,7 +95,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_714
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 138
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 140
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -244,6 +244,43 @@ def test_reviewed_locator_preserves_filewide_binding(signature):
     ),))
     assert unmatched.initial_error_code == "locator_unmatched"
     assert unmatched.source_url == locator_url
+
+
+@pytest.mark.parametrize("selected_id", ("hospital-000982", "hospital-007286"))
+def test_reviewed_alias_preserves_filewide_binding(selected_id):
+    """An inherited replacement changes the file, not alias identity or scope."""
+    hospitals = registry.selected_hospital_hpt_registry({"hospital_id": selected_id})
+    hospital_ids = ("hospital-000982", "hospital-007286")
+    hospital_names = ("Bristol Hospital", "Bristol Hospital, Incorporated")
+    locator_url = "https://www.bristolhealth.org/cms-hpt.txt"
+    assert tuple(hospital["hospital_id"] for hospital in hospitals) == hospital_ids
+    assert registry.hospital_hpt_group_ids(selected_id) == hospital_ids
+    assert tuple(hospital["name"] for hospital in hospitals) == hospital_names
+    assert "alias_of" not in hospitals[0]
+    assert hospitals[1]["alias_of"] == hospital_ids[0]
+    for hospital in hospitals:
+        assert hospital["locator_name"] == hospital_names[1]
+        assert hospital["cms_hpt_url"] == locator_url
+        assert "locator_mrf_url" not in hospital
+    fallback_url = hospitals[0]["fallback_mrf_url"]
+    assert hospitals[1]["fallback_mrf_url"] == fallback_url
+    assert tuple(hospital for hospital in registry.load_hospital_hpt_registry()
+                 if hospital["cms_hpt_url"] == locator_url
+                 or hospital.get("fallback_mrf_url") == fallback_url) == hospitals
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", hospitals,
+        (HospitalHptLocatorRecord(hospital_names[1], "https://files.example/previous.csv"),),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert tuple(candidate.hospital_name for candidate in candidates) == hospital_names
+    for candidate in candidates:
+        assert candidate.initial_error_code is None
+        assert candidate.source_url == fallback_url
+        assert candidate.locator_name == hospital_names[1]
+        assert (candidate.locator_url, candidate.observation_id) == (locator_url, "synthetic-observation")
+    store, _native = store_module()
+    assert store._location_ordinals(candidates, ((0, hospital_names[0]),)) == dict.fromkeys(hospital_ids)
 
 
 def test_checked_in_registry_has_reviewed_cms_hpt_urls():
