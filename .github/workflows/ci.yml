@@ -57,7 +57,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -121,7 +121,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -144,7 +144,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -159,9 +159,9 @@ jobs:
         test -z "$(git ls-files --others --exclude-standard)"'
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  python-tests-0:
+  python-tests:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Python tests (1/4) (metadata only)' || 'Python tests (1/4)' }}
+      && 'python-tests (metadata only)' || matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -176,7 +176,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -190,7 +190,7 @@ jobs:
     - name: Run complete validation stage
       env:
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "0"
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "$CI_SHARD"
 
         git diff --exit-code
 
@@ -200,175 +200,45 @@ jobs:
     - name: Upload main-suite coverage data
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: mrf-python-coverage-main-0-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.0
+        name: mrf-python-coverage-main-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.${{ matrix.shard }}
 
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.0.json'
+          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.${{ matrix.shard }}.json'
         include-hidden-files: true
         retention-days: 1
         if-no-files-found: error
       id: coverage-artifact
-    outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-  python-tests-1:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Python tests (2/4) (metadata only)' || 'Python tests (2/4)' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs:
-    - public-hygiene
-    - readability-preflight
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-    - name: Run complete validation stage
+    - name: Expose immutable coverage artifact
+      id: coverage-output
       env:
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "1"
+        ARTIFACT_OUTPUT: ${{ matrix.output }}
+        ARTIFACT_ID: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
 
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-    - name: Upload main-suite coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-python-coverage-main-1-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.1
-
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.1.json'
-        include-hidden-files: true
-        retention-days: 1
-        if-no-files-found: error
-      id: coverage-artifact
+        printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-  python-tests-2:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Python tests (3/4) (metadata only)' || 'Python tests (3/4)' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs:
-    - public-hygiene
-    - readability-preflight
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-    - name: Run complete validation stage
-      env:
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "2"
-
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-    - name: Upload main-suite coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-python-coverage-main-2-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.2
-
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.2.json'
-        include-hidden-files: true
-        retention-days: 1
-        if-no-files-found: error
-      id: coverage-artifact
-    outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-  python-tests-3:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Python tests (4/4) (metadata only)' || 'Python tests (4/4)' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs:
-    - public-hygiene
-    - readability-preflight
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-    - name: Run complete validation stage
-      env:
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" python-main "3"
-
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-    - name: Upload main-suite coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-python-coverage-main-3-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.main.3
-
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.main.3.json'
-        include-hidden-files: true
-        retention-days: 1
-        if-no-files-found: error
-      id: coverage-artifact
-    outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      artifact_0: ${{ steps.coverage-output.outputs.artifact_0 }}
+      artifact_1: ${{ steps.coverage-output.outputs.artifact_1 }}
+      artifact_2: ${{ steps.coverage-output.outputs.artifact_2 }}
+      artifact_3: ${{ steps.coverage-output.outputs.artifact_3 }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - shard: '0'
+          label: Python tests (1/4)
+          output: artifact_0
+        - shard: '1'
+          label: Python tests (2/4)
+          output: artifact_1
+        - shard: '2'
+          label: Python tests (3/4)
+          output: artifact_2
+        - shard: '3'
+          label: Python tests (4/4)
+          output: artifact_3
+    env:
+      CI_SHARD: ${{ matrix.shard }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   capacity-evidence:
@@ -387,7 +257,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -431,7 +301,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -462,7 +332,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -505,7 +375,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -536,7 +406,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -573,7 +443,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -590,9 +460,9 @@ jobs:
         test -z "$(git ls-files --others --exclude-standard)"'
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  address-canonical-db-tests-core:
+  address-canonical-db-tests:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Database tests (core) (metadata only)' || 'Database tests (core)' }}
+      && 'address-canonical-db-tests (metadata only)' || matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -619,6 +489,7 @@ jobs:
       HLTHPRT_DB_SCHEMA: mrf
       DB_SCHEMA: mrf
       HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      CI_SHARD: ${{ matrix.shard }}
     defaults:
       run:
         shell: bash
@@ -628,7 +499,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -647,7 +518,7 @@ jobs:
       env:
         HLTHPRT_DB_HOST: 127.0.0.1
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "core"
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
 
         git diff --exit-code
 
@@ -657,174 +528,39 @@ jobs:
     - name: Upload PostgreSQL coverage data
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: mrf-python-coverage-postgres-core-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.core
+        name: mrf-python-coverage-postgres-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.${{ matrix.shard }}
 
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.postgres.core.json'
+          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.postgres.${{ matrix.shard }}.json'
         include-hidden-files: true
         retention-days: 1
         if-no-files-found: error
       id: coverage-artifact
-    outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-  address-canonical-db-tests-provider-directory:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Database tests (directory) (metadata only)' || 'Database tests (directory)' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs:
-    - public-hygiene
-    - readability-preflight
-    services:
-      postgres:
-        image: postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
-        ports:
-        - 5432:5432
-        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
-          5s --health-retries 25
-    env:
-      PYTEST_ADDOPTS: --cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service
-        --cov=main --cov-branch --cov-report= --cov-append
-      HLTHPRT_DB_DRIVER: asyncpg
-      HLTHPRT_DB_PORT: '5432'
-      HLTHPRT_DB_USER: postgres
-      HLTHPRT_DB_PASSWORD: postgres
-      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
-      HLTHPRT_DB_SCHEMA: mrf
-      DB_SCHEMA: mrf
-      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Install PostgreSQL client
-      run: 'sudo apt-get update -qq
-
-        sudo apt-get install --yes --no-install-recommends postgresql-client'
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-    - name: Run complete validation stage
+    - name: Expose immutable coverage artifact
+      id: coverage-output
       env:
-        HLTHPRT_DB_HOST: 127.0.0.1
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "provider-directory"
+        ARTIFACT_OUTPUT: ${{ matrix.output }}
+        ARTIFACT_ID: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
 
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-    - name: Upload PostgreSQL coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-python-coverage-postgres-provider-directory-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.provider-directory
-
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.postgres.provider-directory.json'
-        include-hidden-files: true
-        retention-days: 1
-        if-no-files-found: error
-      id: coverage-artifact
+        printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-  address-canonical-db-tests-provider-profile:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Database tests (profiles) (metadata only)' || 'Database tests (profiles)' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs:
-    - public-hygiene
-    - readability-preflight
-    services:
-      postgres:
-        image: postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
-        ports:
-        - 5432:5432
-        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
-          5s --health-retries 25
-    env:
-      PYTEST_ADDOPTS: --cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service
-        --cov=main --cov-branch --cov-report= --cov-append
-      HLTHPRT_DB_DRIVER: asyncpg
-      HLTHPRT_DB_PORT: '5432'
-      HLTHPRT_DB_USER: postgres
-      HLTHPRT_DB_PASSWORD: postgres
-      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
-      HLTHPRT_DB_SCHEMA: mrf
-      DB_SCHEMA: mrf
-      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Install PostgreSQL client
-      run: 'sudo apt-get update -qq
-
-        sudo apt-get install --yes --no-install-recommends postgresql-client'
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-    - name: Run complete validation stage
-      env:
-        HLTHPRT_DB_HOST: 127.0.0.1
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "provider-profile"
-
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-    - name: Upload PostgreSQL coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-python-coverage-postgres-provider-profile-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/.coverage.postgres.provider-profile
-
-          ${{ runner.temp }}/healthcare-artifacts/.coverage-provenance.postgres.provider-profile.json'
-        include-hidden-files: true
-        retention-days: 1
-        if-no-files-found: error
-      id: coverage-artifact
-    outputs:
-      artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
+      artifact_core: ${{ steps.coverage-output.outputs.artifact_core }}
+      artifact_provider_directory: ${{ steps.coverage-output.outputs.artifact_provider_directory }}
+      artifact_provider_profile: ${{ steps.coverage-output.outputs.artifact_provider_profile }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - shard: core
+          label: Database tests (core)
+          output: artifact_core
+        - shard: provider-directory
+          label: Database tests (directory)
+          output: artifact_provider_directory
+        - shard: provider-profile
+          label: Database tests (profiles)
+          output: artifact_provider_profile
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   measurement:
@@ -836,19 +572,14 @@ jobs:
     - public-hygiene
     - readability-preflight
     - python-quality
-    - python-tests-0
-    - python-tests-1
-    - python-tests-2
-    - python-tests-3
+    - python-tests
     - capacity-evidence
     - api-contract
     - rust-scanner
     - container-package
     - security
     - worker-queue-smoke
-    - address-canonical-db-tests-core
-    - address-canonical-db-tests-provider-directory
-    - address-canonical-db-tests-provider-profile
+    - address-canonical-db-tests
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (always()) }}
     steps:
@@ -860,7 +591,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8634e3a123b973a2567bf4be58e4d705491da4cb
+        ref: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
         path: ci
         persist-credentials: false
     - name: Resolve exact source event
@@ -872,11 +603,10 @@ jobs:
     - name: Download immutable measurement artifacts
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        artifact-ids: ${{ needs.python-tests-0.outputs.artifact_id }},${{ needs.python-tests-1.outputs.artifact_id }},${{
-          needs.python-tests-2.outputs.artifact_id }},${{ needs.python-tests-3.outputs.artifact_id }},${{ needs.capacity-evidence.outputs.artifact_id
-          }},${{ needs.rust-scanner.outputs.artifact_id }},${{ needs.address-canonical-db-tests-core.outputs.artifact_id }},${{
-          needs.address-canonical-db-tests-provider-directory.outputs.artifact_id }},${{ needs.address-canonical-db-tests-provider-profile.outputs.artifact_id
-          }}
+        artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
+          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_directory
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_profile }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
@@ -917,7 +647,7 @@ jobs:
     - main
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 8634e3a123b973a2567bf4be58e4d705491da4cb
+  CI_REVISION: 248dfe6c3f8e04919bac56bf3529b9a1d05fff6d
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
