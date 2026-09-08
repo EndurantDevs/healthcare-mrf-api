@@ -17733,6 +17733,7 @@ hospitals:
 - hospital_id: hospital-005306
   name: Randolph Health
   cms_hpt_url: https://www.randolphhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://www.randolphhealth.org/media/1699/854354835_randolphhealth_standardcharges.csv
 - hospital_id: hospital-005307
   name: Range Regional Health Services
   cms_hpt_url: https://www.fairview.org/cms-hpt.txt
