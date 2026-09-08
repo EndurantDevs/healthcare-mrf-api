@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 from pathlib import Path
 import uuid
 
@@ -14,7 +15,7 @@ from sqlalchemy.pool import NullPool
 
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
-    HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_csv_v1_labels import (
     _assert_rejected,
@@ -47,7 +48,7 @@ def _load_migration():
     return migration
 
 
-def test_csv_v3_0_1_migration_preserves_original_boundary() -> None:
+def test_csv_v3_0_1_preserves_original_boundary() -> None:
     migration = _load_migration()
     assert migration.revision == "20260905130000_hospital_price_csv_3_0_1"
     assert migration.down_revision == (
@@ -56,8 +57,12 @@ def test_csv_v3_0_1_migration_preserves_original_boundary() -> None:
     drop, add = migration._upgrade_statements()
     assert "DROP CONSTRAINT hospital_price_version_shape_check" in drop
     migration_check = add.split(" CHECK (", 1)[1][:-2]
+    assert HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 in migration_check
     assert "template_version IN ('3.0.1', '4.0.0') AND npi_count > 0" in migration_check
     assert "attestation_text" not in migration_check
+    assert hashlib.sha256(migration_check.encode()).hexdigest() == (
+        "f1d08cbf0d02b684e85dd90f90149b0b8df25fefc6e5368b93d7e6c1c5d8f520"
+    )
     assert migration.downgrade() is None
 
 
@@ -80,7 +85,7 @@ async def test_postgres_csv_v3_0_1_is_current_parser_csv_only(monkeypatch) -> No
         connection = await asyncpg.connect(str(database_url.set(drivername="postgresql")))
         try:
             valid_fields_by_name = {
-                "parser_contract_sha256": HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+                "parser_contract_sha256": HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
                 "source_format": "csv-wide",
                 "template_version": "3.0.1",
                 "npi_count": 1,

@@ -6,7 +6,7 @@ mod tests {
         HospitalPriceFactRow {
             charge_key: service,
             payer_name: payer.to_owned(),
-            plan_name: plan.to_owned(),
+            plan_name: Some(plan.to_owned()),
             negotiated_rate_term: service
                 .is_multiple_of(2)
                 .then(|| "JAN 2026-MAY 2026".to_owned()),
@@ -46,6 +46,25 @@ mod tests {
         let raw = assemble_raw(lanes).unwrap();
         let block = frame_raw(&raw, row_count).unwrap();
         assert!(decode_fact_block(&block, None, None, 0, row_count).is_err());
+    }
+
+    #[test]
+    fn missing_plan_is_versioned_and_distinct() {
+        let named = row(2, "Payer", "Plan");
+        let mut missing = named.clone();
+        missing.plan_name = None;
+        missing.negotiated_dollar = Some("64.32".to_owned());
+        let rows = vec![missing.clone(), named.clone()];
+        let block = encode_fact_block(&rows).unwrap();
+        assert_eq!(decode_fact_block(&block, None, None, 0, 10).unwrap(), rows);
+        assert_eq!(decode_fact_block(&block, Some("Payer"), Some("Plan"), 0, 10)
+            .unwrap(), vec![named.clone()]);
+        let raw = raw_from(&block);
+        let old = frame_raw_version(&raw, 2, HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION).unwrap();
+        assert!(decode_fact_block(&old, None, None, 0, 10).is_err());
+        let named_raw = raw_from(&encode_fact_block(std::slice::from_ref(&named)).unwrap());
+        let old = frame_raw_version(&named_raw, 1, HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION).unwrap();
+        assert_eq!(decode_fact_block(&old, None, None, 0, 10).unwrap(), vec![named]);
     }
 
     #[test]
@@ -94,7 +113,7 @@ mod tests {
             .iter()
             .map(|row| {
                 previous_payer_plans
-                    .intern(&row.payer_name, &row.plan_name, None)
+                    .intern(&row.payer_name, row.plan_name.as_deref(), None)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -213,9 +232,9 @@ mod tests {
         .encode()
         .is_err());
         for entry in [
-            (oversized.clone(), "plan".to_owned(), None),
-            ("payer".to_owned(), oversized.clone(), None),
-            ("payer".to_owned(), "plan".to_owned(), Some(oversized.clone())),
+            (oversized.clone(), Some("plan".to_owned()), None),
+            ("payer".to_owned(), Some(oversized.clone()), None),
+            ("payer".to_owned(), Some("plan".to_owned()), Some(oversized.clone())),
         ] {
             assert!(PayerPlanDictionary {
                 entries: vec![entry],
@@ -242,12 +261,12 @@ mod tests {
         assert!(text.intern("new").is_err());
         let mut payer_plan = PayerPlanDictionary {
             entries: vec![
-                ("payer".to_owned(), "plan".to_owned(), None);
+                ("payer".to_owned(), Some("plan".to_owned()), None);
                 HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS
             ],
             ids: HashMap::new(),
         };
-        assert!(payer_plan.intern("new payer", "new plan", None).is_err());
+        assert!(payer_plan.intern("new payer", Some("new plan"), None).is_err());
     }
 
     #[test]
@@ -326,7 +345,7 @@ mod tests {
         let base = current_lanes(&raw_from(&valid));
 
         assert!(decode_lanes(&[], HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
-        assert!(decode_payer_plan_dictionary(&[], true).is_err());
+        assert!(decode_payer_plan_dictionary(&[], true, true).is_err());
         let mut bad_lane_count = raw_from(&valid);
         bad_lane_count[..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_lanes(&bad_lane_count, HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());

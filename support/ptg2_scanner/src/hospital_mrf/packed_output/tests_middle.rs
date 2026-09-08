@@ -153,7 +153,7 @@
             selector_code("12345"),
             HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "payer".to_owned(),
-                plan_name: "plan".to_owned(),
+                plan_name: Some("plan".to_owned()),
             },
         ];
         let directory = tempfile::tempdir().unwrap();

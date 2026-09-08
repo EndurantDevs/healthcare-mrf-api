@@ -68,7 +68,8 @@ fn selector_ref_capacity(
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => selector_text_bytes(payer_name)? + selector_text_bytes(plan_name)?,
+        } => selector_text_bytes(payer_name)?
+            + plan_name.as_deref().map_or(Ok(4), selector_text_bytes)?,
     };
     let capacity = (crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES
         - key_bytes
@@ -88,7 +89,7 @@ fn selector_key_memory_bytes(
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => payer_name.len() + plan_name.len(),
+        } => payer_name.len() + plan_name.as_deref().map_or(0, str::len),
     };
     text_bytes as u64 * 2 + SELECTOR_KEY_MEMORY_OVERHEAD_BYTES
 }

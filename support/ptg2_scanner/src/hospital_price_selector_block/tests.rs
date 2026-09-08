@@ -20,7 +20,7 @@ mod tests {
         HospitalPriceSelectorEntry {
             key: HospitalPriceSelectorKey::PayerPlan {
                 payer_name: payer.to_owned(),
-                plan_name: plan.to_owned(),
+                plan_name: Some(plan.to_owned()),
             },
             refs: refs.to_vec(),
         }
@@ -28,6 +28,35 @@ mod tests {
 
     fn raw_from(block: &[u8]) -> Vec<u8> {
         decode_frame(block).unwrap().1
+    }
+
+    #[test]
+    fn missing_plan_keeps_distinct_exact_references() {
+        let named = payer_plan("Payer", "Plan", &[2]);
+        assert_eq!(selector_key_sha256(&named.key), [
+            140, 129, 154, 243, 197, 134, 87, 106, 66, 131, 248, 173, 34, 242, 140, 96,
+            4, 135, 239, 159, 143, 158, 194, 125, 11, 62, 132, 52, 9, 78, 0, 167,
+        ]);
+        let missing = HospitalPriceSelectorEntry {
+            key: HospitalPriceSelectorKey::PayerPlan {
+                payer_name: "Payer".to_owned(), plan_name: None,
+            },
+            refs: vec![1, 3],
+        };
+        assert_ne!(selector_key_sha256(&missing.key), selector_key_sha256(&named.key));
+        assert_ne!(selector_key_sha256(&missing.key),
+            selector_key_sha256(&payer_plan("Payer", "", &[1]).key));
+        let mut block = encode_selector_page(named.key.kind(), 0, 1,
+            &[named.clone(), missing.clone()]).unwrap();
+        let page = decode_selector_page(&block).unwrap();
+        assert_eq!(page.exact_refs(&missing.key), Some(&[1, 3][..]));
+        assert_eq!(page.exact_refs(&named.key), Some(&[2][..]));
+        block[8..12].copy_from_slice(&HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION.to_le_bytes());
+        assert!(decode_selector_page(&block).is_err());
+        let mut block =
+            encode_selector_page(named.key.kind(), 0, 1, std::slice::from_ref(&named)).unwrap();
+        block[8..12].copy_from_slice(&HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION.to_le_bytes());
+        assert_eq!(decode_selector_page(&block).unwrap().entries, vec![named]);
     }
 
     #[test]
@@ -86,21 +115,21 @@ mod tests {
         assert_eq!(
             page.exact_refs(&HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "ab".to_owned(),
-                plan_name: "c".to_owned(),
+                plan_name: Some("c".to_owned()),
             }),
             Some(&[4][..])
         );
         assert_eq!(
             page.exact_refs(&HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "a".to_owned(),
-                plan_name: "bc".to_owned(),
+                plan_name: Some("bc".to_owned()),
             }),
             Some(&[3][..])
         );
         assert_eq!(
             page.exact_refs(&HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "a\0".to_owned(),
-                plan_name: "bc".to_owned(),
+                plan_name: Some("bc".to_owned()),
             }),
             Some(&[2][..])
         );
@@ -294,7 +323,7 @@ mod tests {
             ("truncated header", valid[..71].to_vec(), "header is truncated"),
             (
                 "version",
-                corrupt_u32(8, 2),
+                corrupt_u32(8, HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION + 1),
                 "version is unsupported",
             ),
             ("kind", corrupt_u32(12, 3), "kind is unsupported"),
@@ -412,11 +441,13 @@ mod tests {
         assert!(decode_key(
             HospitalPriceSelectorKind::PayerPlanToFact,
             &mut payer_cursor,
+            HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION,
         )
         .is_err());
         assert!(decode_key(
             HospitalPriceSelectorKind::PayerPlanToFact,
             &mut SliceCursor::new(&[]),
+            HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION,
         )
         .is_err());
 

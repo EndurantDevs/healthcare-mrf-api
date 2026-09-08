@@ -13,6 +13,7 @@ import struct
 
 DEFAULT_HOSPITAL_PRICE_LIMIT = 25
 MAX_HOSPITAL_PRICE_LIMIT = 100
+MISSING_PLAN_SELECTOR = object()
 _HOSPITAL_ID_PATTERN = re.compile(r"hospital-[0-9]{6}\Z")
 _VERSION_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _LIMIT_PATTERN = re.compile(r"[1-9][0-9]{0,2}\Z")
@@ -49,6 +50,17 @@ class HospitalPriceQuery:
     version_id: str | None
     cursor: str | None
     limit: int
+    plan_missing: bool = False
+
+
+def validate_hospital_price_plan(plan_name: object, plan_missing: object) -> object:
+    """Decode an explicit absent-plan selector without inventing plan text."""
+
+    if plan_missing is None:
+        return plan_name
+    if plan_missing != "true" or plan_name is not None:
+        raise HospitalPriceInvalidRequestError("plan_missing must be true and excludes plan_name")
+    return MISSING_PLAN_SELECTOR
 
 
 def validate_hospital_price_query(
@@ -73,8 +85,13 @@ def validate_hospital_price_query(
         or len(code.encode("utf-8")) > 1024
     ):
         raise HospitalPriceInvalidRequestError("hospital price code is invalid")
+    is_missing_plan = plan_name is MISSING_PLAN_SELECTOR
+    if is_missing_plan:
+        plan_name = None
+        if payer_name is None:
+            raise HospitalPriceInvalidRequestError("plan_missing requires payer_name")
     has_payer_field = payer_name is not None or plan_name is not None
-    if has_payer_field != (payer_name is not None and plan_name is not None):
+    if not is_missing_plan and has_payer_field != (payer_name is not None and plan_name is not None):
         raise HospitalPriceInvalidRequestError(
             "payer_name and plan_name must be supplied together"
         )
@@ -103,12 +120,15 @@ def validate_hospital_price_query(
         raise HospitalPriceInvalidRequestError("hospital price limit is invalid")
     return HospitalPriceQuery(
         hospital_id, code_type, code, payer_name, plan_name,
-        version_id, cursor, parsed_limit,
+        version_id, cursor, parsed_limit, is_missing_plan,
     )
 
 
 def _scope_digest(query: HospitalPriceQuery) -> bytes:
-    digest = hashlib.sha256(b"healthporta.hospital-price-charge-cursor.v1\0")
+    domain = b"healthporta.hospital-price-charge-cursor.v1\0"
+    if query.plan_missing:
+        domain = b"healthporta.hospital-price-charge-cursor.missing-plan.v1\0"
+    digest = hashlib.sha256(domain)
     for value in (
         query.hospital_id, query.code_type, query.code,
         query.payer_name or "", query.plan_name or "",

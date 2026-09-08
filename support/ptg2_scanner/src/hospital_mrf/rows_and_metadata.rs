@@ -98,7 +98,7 @@ struct ContractProvision {
 #[derive(Clone, Debug)]
 struct PayerChargeRow {
     payer_name: String,
-    plan_name: String,
+    plan_name: Option<String>,
     negotiated_rate_term: Option<String>,
     standard_charge_dollar: Option<String>,
     standard_charge_percentage: Option<String>,

@@ -19,6 +19,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
@@ -121,7 +122,7 @@ def test_rate_term_migration_admits_current_contract_and_modifier_metadata() -> 
     assert rate_term.down_revision == "20260902103500_hospital_price_count_invariants"
     rate_term_sql = inspect.getsource(rate_term.upgrade)
     assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in rate_term_sql
-    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in rate_term_sql
+    assert HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 in rate_term_sql
     assert "ADD COLUMN negotiated_rate_term text" in rate_term_sql
     assert "ALTER COLUMN payer_name DROP NOT NULL" in rate_term_sql
     assert "ALTER COLUMN plan_name DROP NOT NULL" in rate_term_sql
@@ -134,7 +135,7 @@ def test_producer_csv_v4_migration_is_current_parser_only() -> None:
     assert migration.revision == "20260903100000_hospital_price_producer_csv_4_0_0"
     assert migration.down_revision == "20260902160000_hospital_price_rate_term"
     migration_sql = inspect.getsource(migration.upgrade)
-    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in migration_sql
+    assert HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 in migration_sql
     assert "template_version = '4.0.0' AND npi_count > 0" in migration_sql
     assert "source_format IN ('csv-tall', 'csv-wide')" in migration_sql
     assert migration_sql.count("'4.0.0'") == 1
@@ -503,6 +504,11 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         await _run_migration(
             engine, _load_migration(PRODUCER_CSV_V4_MIGRATION_PATH), "upgrade"
         )
+        await _run_migration(engine, _load_migration(
+            CSV_SHORT_V2_MIGRATION_PATH.with_name(
+                "20260907220000_hospital_price_missing_plan.py"
+            )
+        ), "upgrade")
         await _prove_current_headers(database_url, quoted)
     finally:
         await _drop_schema(engine, schema)

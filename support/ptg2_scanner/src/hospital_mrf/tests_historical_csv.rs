@@ -80,7 +80,7 @@ fn assert_historical_selectors(directory: &Path) {
             (
                 HospitalPriceSelectorKey::PayerPlan {
                     payer_name: "Payer, Inc.".to_owned(),
-                    plan_name: "Plan A".to_owned(),
+                    plan_name: Some("Plan A".to_owned()),
                 },
                 vec![0]
             ),
@@ -126,7 +126,7 @@ fn historical_csv_packed_rates_are_deterministic_without_invented_estimates() {
                 let fact = historical_packed_fact(directory.path());
                 assert_eq!(fact.charge_key, 0);
                 assert_eq!(fact.payer_name, "Payer, Inc.");
-                assert_eq!(fact.plan_name, "Plan A");
+                assert_eq!(fact.plan_name.as_deref(), Some("Plan A"));
                 assert_eq!(fact.negotiated_dollar, None);
                 assert_eq!(fact.estimated_amount, None);
                 assert_eq!(
@@ -445,7 +445,7 @@ fn historical_tall_empty_siblings_preserve_packed_rates_and_order() {
         ] {
             assert_eq!(fact.charge_key, 0);
             assert_eq!(fact.payer_name, "Payer, Inc.");
-            assert_eq!(fact.plan_name, plan);
+            assert_eq!(fact.plan_name.as_deref(), Some(plan));
             assert_eq!(fact.negotiated_dollar.as_deref(), dollar);
             assert_eq!(fact.negotiated_percentage.as_deref(), percentage);
             assert_eq!(fact.estimated_amount, None);

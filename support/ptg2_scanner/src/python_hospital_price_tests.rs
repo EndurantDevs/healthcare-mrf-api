@@ -34,7 +34,7 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
         let payer_key =
             crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "Synthetic payer".to_owned(),
-                plan_name: "Synthetic plan".to_owned(),
+                plan_name: Some("Synthetic plan".to_owned()),
             };
         assert_eq!(
             selector_sha256
@@ -45,6 +45,23 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
             crate::hospital_price_selector_block::selector_key_sha256(&payer_key),
         );
         assert!(selector_sha256.call1(("invalid", "a", "b")).is_err());
+        assert!(selector_sha256.call1(("code", "CPT", py.None())).is_err());
+        let missing_key = crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
+            payer_name: "Synthetic payer".to_owned(), plan_name: None,
+        };
+        assert_eq!(selector_sha256.call1(("payer_plan", "Synthetic payer", py.None()))
+            .unwrap().extract::<Vec<u8>>().unwrap(),
+            crate::hospital_price_selector_block::selector_key_sha256(&missing_key));
+        let missing_payload = crate::hospital_price_selector_block::encode_selector_page(
+            missing_key.kind(), 0, 1,
+            &[crate::hospital_price_selector_block::HospitalPriceSelectorEntry {
+                key: missing_key, refs: vec![1, 3],
+            }],
+        ).unwrap();
+        let missing_refs = decode_selector.call1((PyBytes::new(py, &missing_payload),
+            "payer_plan", "Synthetic payer", py.None(), vec![(0_u64, 4_u64)], 10_usize))
+            .unwrap();
+        assert_eq!(missing_refs.get_item("refs").unwrap().extract::<Vec<u64>>().unwrap(), vec![1, 3]);
 
         let selector_page = decode_selector
             .call1((
@@ -324,7 +341,7 @@ fn python_hospital_price_decoders_return_normalized_rows() {
             crate::hospital_price_block::HospitalPriceFactRow {
                 charge_key: 0,
                 payer_name: "Synthetic payer".to_owned(),
-                plan_name: "Synthetic plan".to_owned(),
+                plan_name: Some("Synthetic plan".to_owned()),
                 negotiated_rate_term: Some("JAN 2026-MAY 2026".to_owned()),
                 negotiated_dollar: Some("75.00".to_owned()),
                 negotiated_percentage: None,
@@ -377,6 +394,12 @@ fn python_hospital_price_decoders_return_normalized_rows() {
         assert!(decode_services
             .call1((PyBytes::new(py, b"invalid"),))
             .is_err());
+        let mut missing_rows = crate::hospital_price_block::decode_fact_block(
+            &fact_payload, None, None, 0, 10).unwrap();
+        missing_rows[0].plan_name = None;
+        let missing_payload = crate::hospital_price_block::encode_fact_block(&missing_rows).unwrap();
+        let missing_facts = decode_facts.call1((PyBytes::new(py, &missing_payload),)).unwrap();
+        assert!(missing_facts.get_item(0).unwrap().get_item("plan_name").unwrap().is_none());
         assert!(decode_facts
             .call1((PyBytes::new(py, b"invalid"),))
             .is_err());

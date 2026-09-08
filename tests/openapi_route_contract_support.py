@@ -41,6 +41,7 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "cursor",
         "limit",
         "payer_name",
+        "plan_missing",
         "plan_name",
         "version_id",
     },

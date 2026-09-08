@@ -36,6 +36,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
@@ -60,6 +61,7 @@ _PARSER_CONTRACTS_BY_FORMAT = {
         HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
         HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
         HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
+        HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
         HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
     }),
 }
@@ -146,7 +148,7 @@ async def _selector_refs(
     selector_records: tuple[Mapping[str, Any], ...],
     kind: str,
     first: str,
-    second: str,
+    second: str | None,
     ranges: list[tuple[int, int]],
     max_refs: int,
     key_sha256: bytes,
@@ -335,7 +337,7 @@ async def _selected_fact_ordinals(
     version_id: str,
     ranges: list[tuple[int, int, int]],
 ) -> dict[int, int]:
-    if not ranges or query.payer_name is None or query.plan_name is None:
+    if not ranges or query.payer_name is None:
         return {}
     native = _native_module()
     key_sha256 = bytes(native.hospital_price_selector_sha256(
@@ -471,6 +473,7 @@ async def read_hospital_price_page(session: Any, query: HospitalPriceQuery) -> d
         "query": {
             "code_type": query.code_type, "code": query.code,
             "payer_name": query.payer_name, "plan_name": query.plan_name,
+            "plan_missing": query.plan_missing,
             "negotiated_prices_requested": has_payer_filter,
         },
         "pagination": {

@@ -18,6 +18,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(u32, usize, Vec<u8>)>
         version,
         HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION
             | HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION
             | HOSPITAL_PRICE_FACT_BLOCK_VERSION
     ) {
         return Err(invalid("version is unsupported"));
@@ -131,7 +132,8 @@ impl<'a> SliceCursor<'a> {
 fn decode_lanes(raw: &[u8], version: u32) -> HospitalPriceBlockResult<Vec<&[u8]>> {
     let lane_count = match version {
         HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION => LEGACY_LANE_COUNT,
-        HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION => {
+        HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION
+        | HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION => {
             LANE_COUNT
         }
         _ => return Err(invalid("version is unsupported")),
@@ -326,7 +328,8 @@ pub fn decode_fact_block(
     // Resolve filters before parsing or materializing any other fact lane.
     let payer_plans = decode_payer_plan_dictionary(
         lanes[PAYER_PLAN_DICTIONARY],
-        version == HOSPITAL_PRICE_FACT_BLOCK_VERSION,
+        version >= HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION,
+        version >= HOSPITAL_PRICE_FACT_BLOCK_VERSION,
     )?;
     let payer_plan_ids =
         decode_all_required_ids(lanes[PAYER_PLAN_IDS], row_count, payer_plans.len())?;
@@ -335,7 +338,7 @@ pub fn decode_fact_block(
     for (row, id) in payer_plan_ids.iter().copied().enumerate() {
         let (payer, plan, _) = payer_plans[id as usize];
         if payer_name.is_none_or(|expected| expected == payer)
-            && plan_name.is_none_or(|expected| expected == plan)
+            && plan_name.is_none_or(|expected| Some(expected) == plan)
         {
             if matched >= offset && selected_rows.len() < limit {
                 selected_rows.push(row);
@@ -432,7 +435,7 @@ pub fn decode_fact_block(
         let (payer, plan, rate_term) = payer_plans[payer_plan_ids[source_row] as usize];
         let values = [
             Some(payer),
-            Some(plan),
+            plan,
             rate_term,
             negotiated_dollars[slot].as_deref(),
             negotiated_percentages[slot].as_deref(),
@@ -463,7 +466,7 @@ pub fn decode_fact_block(
         output.push(HospitalPriceFactRow {
             charge_key: charge_keys[slot],
             payer_name: payer.to_owned(),
-            plan_name: plan.to_owned(),
+            plan_name: plan.map(str::to_owned),
             negotiated_rate_term: rate_term.map(str::to_owned),
             negotiated_dollar: negotiated_dollars[slot].clone(),
             negotiated_percentage: negotiated_percentages[slot].clone(),

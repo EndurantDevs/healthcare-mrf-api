@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 pub const HOSPITAL_PRICE_SELECTOR_BLOCK_MAGIC: &[u8; 8] = b"HPTSEL\0\0";
-pub const HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION: u32 = 1;
+const HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION: u32 = 1;
+pub const HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION: u32 = 2;
 pub const HOSPITAL_PRICE_SELECTOR_BLOCK_HEADER_BYTES: usize = 72;
 pub const HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_ROWS: usize = 4_096;
 pub const HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES: usize = 1024 * 1024;
@@ -41,7 +42,7 @@ pub enum HospitalPriceSelectorKey {
     },
     PayerPlan {
         payer_name: String,
-        plan_name: String,
+        plan_name: Option<String>,
     },
 }
 
@@ -68,11 +69,17 @@ pub fn selector_key_sha256(key: &HospitalPriceSelectorKey) -> [u8; 32] {
             payer_name,
             plan_name,
         } => {
-            digest.update(b"payer-plan\0");
+            digest.update(if plan_name.is_some() {
+                b"payer-plan\0".as_slice()
+            } else {
+                b"payer-missing-plan\0".as_slice()
+            });
             digest.update((payer_name.len() as u64).to_le_bytes());
             digest.update(payer_name.as_bytes());
-            digest.update((plan_name.len() as u64).to_le_bytes());
-            digest.update(plan_name.as_bytes());
+            if let Some(plan) = plan_name {
+                digest.update((plan.len() as u64).to_le_bytes());
+                digest.update(plan.as_bytes());
+            }
         }
     }
     digest.finalize().into()
@@ -156,7 +163,9 @@ pub(crate) fn entry_raw_len(
         HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => checked_text_len(payer_name)? + checked_text_len(plan_name)?,
+        } => {
+            checked_text_len(payer_name)? + plan_name.as_deref().map_or(Ok(4), checked_text_len)?
+        }
     };
     let refs_bytes = entry.refs.len() * 8;
     Ok(key_bytes + 4 + refs_bytes)
@@ -214,7 +223,10 @@ fn encode_raw(entries: &[HospitalPriceSelectorEntry]) -> (Vec<u8>, usize) {
                 plan_name,
             } => {
                 put_text(&mut raw, payer_name);
-                put_text(&mut raw, plan_name);
+                match plan_name {
+                    Some(plan) => put_text(&mut raw, plan),
+                    None => put_u32(&mut raw, u32::MAX),
+                }
             }
         }
         put_u32(&mut raw, entry.refs.len() as u32);
@@ -286,6 +298,7 @@ fn header_u32(block: &[u8], offset: usize) -> u32 {
 
 #[derive(Clone, Copy)]
 struct FrameMetadata {
+    version: u32,
     kind: HospitalPriceSelectorKind,
     row_count: usize,
     page_index: u32,
@@ -300,7 +313,11 @@ fn decode_frame(block: &[u8]) -> HospitalPriceSelectorBlockResult<(FrameMetadata
     if &block[..8] != HOSPITAL_PRICE_SELECTOR_BLOCK_MAGIC {
         return Err(invalid("magic is invalid"));
     }
-    if header_u32(block, 8) != HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION {
+    let version = header_u32(block, 8);
+    if !matches!(
+        version,
+        HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION | HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION
+    ) {
         return Err(invalid("version is unsupported"));
     }
     let kind = HospitalPriceSelectorKind::from_u32(header_u32(block, 12))?;
@@ -352,6 +369,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceSelectorBlockResult<(FrameMetadata
     }
     Ok((
         FrameMetadata {
+            version,
             kind,
             row_count,
             page_index,
@@ -396,6 +414,10 @@ impl<'a> SliceCursor<'a> {
 
     fn text(&mut self) -> HospitalPriceSelectorBlockResult<&'a str> {
         let length = self.u32()? as usize;
+        self.text_bytes(length)
+    }
+
+    fn text_bytes(&mut self, length: usize) -> HospitalPriceSelectorBlockResult<&'a str> {
         if length > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES {
             return Err(invalid("key component exceeds 1 MiB"));
         }
@@ -414,6 +436,7 @@ impl<'a> SliceCursor<'a> {
 fn decode_key(
     kind: HospitalPriceSelectorKind,
     cursor: &mut SliceCursor<'_>,
+    version: u32,
 ) -> HospitalPriceSelectorBlockResult<HospitalPriceSelectorKey> {
     Ok(match kind {
         HospitalPriceSelectorKind::CodeToCharge => HospitalPriceSelectorKey::Code {
@@ -422,7 +445,14 @@ fn decode_key(
         },
         HospitalPriceSelectorKind::PayerPlanToFact => HospitalPriceSelectorKey::PayerPlan {
             payer_name: cursor.text()?.to_owned(),
-            plan_name: cursor.text()?.to_owned(),
+            plan_name: {
+                let length = cursor.u32()?;
+                if length == u32::MAX && version == HOSPITAL_PRICE_SELECTOR_BLOCK_VERSION {
+                    None
+                } else {
+                    Some(cursor.text_bytes(length as usize)?.to_owned())
+                }
+            },
         },
     })
 }
@@ -436,7 +466,7 @@ pub fn decode_selector_page(
     let mut previous_key: Option<HospitalPriceSelectorKey> = None;
     let mut decoded_ref_count = 0usize;
     for _ in 0..metadata.row_count {
-        let key = decode_key(metadata.kind, &mut cursor)?;
+        let key = decode_key(metadata.kind, &mut cursor, metadata.version)?;
         if previous_key
             .as_ref()
             .is_some_and(|previous| previous >= &key)

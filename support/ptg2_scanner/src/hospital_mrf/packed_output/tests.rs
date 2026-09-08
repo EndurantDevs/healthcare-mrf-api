@@ -36,7 +36,7 @@ mod packed_output_tests {
     fn payer(amount: &str) -> PayerChargeRow {
         PayerChargeRow {
             payer_name: "Shared Payer".to_owned(),
-            plan_name: "Shared Plan".to_owned(),
+            plan_name: Some("Shared Plan".to_owned()),
             negotiated_rate_term: None,
             standard_charge_dollar: Some(amount.to_owned()),
             standard_charge_percentage: None,
@@ -151,7 +151,7 @@ mod packed_output_tests {
         crate::hospital_price_block::HospitalPriceFactRow {
             charge_key: 0,
             payer_name: "payer".to_owned(),
-            plan_name: "plan".to_owned(),
+            plan_name: Some("plan".to_owned()),
             negotiated_rate_term: None,
             negotiated_dollar: Some("90".to_owned()),
             negotiated_percentage: None,

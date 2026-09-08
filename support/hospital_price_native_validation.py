@@ -39,8 +39,12 @@ HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 = hashlib.sha256(
     b"hospital-mrf-copy-v2-v3-packed-v5-resource-bounded:"
     b"hospital-mrf-packed-blocks-v3"
 ).hexdigest()
-HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v4"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v6"
+HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    b"hospital-mrf-copy-v2-v3-packed-v6-resource-bounded:"
+    b"hospital-mrf-packed-blocks-v4"
+).hexdigest()
+HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v5"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v7"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"

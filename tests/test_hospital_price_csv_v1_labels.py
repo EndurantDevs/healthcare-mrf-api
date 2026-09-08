@@ -14,7 +14,7 @@ from sqlalchemy.pool import NullPool
 
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
-    HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
     _database_url,
@@ -125,7 +125,7 @@ async def _assert_v1_shape_boundaries(
             connection,
             table,
             marker,
-            HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+            HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
             source_format,
             template_version,
         )
@@ -136,7 +136,7 @@ async def _assert_v1_shape_boundaries(
         version_record["template_version"] for version_record in preserved_versions
     ] == ["1", "1.0.0"]
     v1_fields_by_name = {
-        "parser_contract_sha256": HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+        "parser_contract_sha256": HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
         "source_format": "csv-tall",
         "template_version": "1",
     }

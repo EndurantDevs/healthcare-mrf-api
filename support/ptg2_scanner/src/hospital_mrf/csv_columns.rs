@@ -246,6 +246,20 @@ fn parse_wide_columns(
             .map(|part| part.to_ascii_lowercase())
             .collect::<Vec<_>>();
         let (payer_name, plan_name, rate_term, field) = match normalized_parts.as_slice() {
+            [prefix, _payer, field]
+                if prefix == "standard_charge"
+                    && matches!(field.as_str(), "negotiated_dollar" | "negotiated_percentage"
+                        | "negotiated_algorithm" | "methodology") =>
+            {
+                (raw_parts[1], "", None, field.as_str())
+            }
+            [field, _payer]
+                if matches!(field.as_str(), "estimated_amount" | "median_amount"
+                    | "10th_percentile" | "90th_percentile" | "count"
+                    | "additional_payer_notes") =>
+            {
+                (raw_parts[1], "", None, field.as_str())
+            }
             [prefix, _payer, _plan, field]
                 if prefix == "standard_charge"
                     && matches!(
@@ -327,6 +341,9 @@ fn parse_wide_columns(
         let negotiated_rate_term = rate_term
             .map(canonical_wide_rate_term)
             .transpose()?;
+        if negotiated_rate_term.is_some() && plan_name.is_empty() {
+            return Err(invalid("negotiated rate terms require plan_name"));
+        }
         let key = (
             payer_name.to_lowercase(),
             plan_name.to_lowercase(),

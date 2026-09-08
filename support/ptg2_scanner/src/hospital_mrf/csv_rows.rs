@@ -30,7 +30,7 @@ fn parse_csv_service(
     let drug_type = optional_text(csv_profile_value(record, columns.drug_type));
     let service = validate_service(
         ServiceRow {
-            description: csv_value(record, columns.description).to_owned(),
+            description: record.get(columns.description).unwrap_or("").to_owned(),
             codes,
             drug_unit,
             drug_type,
@@ -269,7 +269,7 @@ fn parse_tall_payer(
     }
     let payer = PayerChargeRow {
         payer_name: csv_value(record, columns.payer_name).to_owned(),
-        plan_name: csv_value(record, columns.plan_name).to_owned(),
+        plan_name: Some(csv_value(record, columns.plan_name).to_owned()),
         negotiated_rate_term: None,
         standard_charge_dollar: optional_decimal(
             csv_value(record, columns.standard_charge_dollar),
@@ -351,7 +351,7 @@ fn parse_wide_payers(
         }
         let parsed = PayerChargeRow {
             payer_name: payer.payer_name.clone(),
-            plan_name: payer.plan_name.clone(),
+            plan_name: optional_text(&payer.plan_name),
             negotiated_rate_term: payer.negotiated_rate_term.clone(),
             standard_charge_dollar: optional_decimal(
                 csv_value(record, payer.standard_charge_dollar),

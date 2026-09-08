@@ -1,5 +1,8 @@
 fn validate_service(mut service: ServiceRow, normalize_case: bool) -> io::Result<ServiceRow> {
-    service.description = required_text(&service.description, "description")?.to_owned();
+    // Retain a present whitespace-only source label without inventing a description.
+    if service.description.is_empty() || !service.description.trim().is_empty() {
+        service.description = required_text(&service.description, "description")?.to_owned();
+    }
     if service.codes.is_empty() {
         return Err(invalid("code_information must contain at least one code"));
     }
@@ -198,6 +201,9 @@ fn emit_payer(
     let service_ordinal_text = service_ordinal.to_string();
     let charge_ordinal_text = charge_ordinal.to_string();
     let payer_ordinal_text = payer_ordinal.to_string();
+    if outputs.packed.is_none() && payer.plan_name.is_none() {
+        return Err(invalid("missing plan_name requires packed hospital MRF output"));
+    }
     if outputs.packed.is_none() && payer.negotiated_rate_term.is_some() {
         return Err(invalid(
             "negotiated rate terms require packed hospital MRF output",
@@ -212,7 +218,7 @@ fn emit_payer(
                 Some(&charge_ordinal_text),
                 Some(&payer_ordinal_text),
                 Some(&payer.payer_name),
-                Some(&payer.plan_name),
+                payer.plan_name.as_deref(),
                 payer.negotiated_rate_term.as_deref(),
                 payer.standard_charge_dollar.as_deref(),
                 payer.standard_charge_percentage.as_deref(),
@@ -236,7 +242,7 @@ fn emit_payer(
             Some(&charge_ordinal_text),
             Some(&payer_ordinal_text),
             Some(&payer.payer_name),
-            Some(&payer.plan_name),
+            payer.plan_name.as_deref(),
             payer.standard_charge_dollar.as_deref(),
             payer.standard_charge_percentage.as_deref(),
             payer.standard_charge_algorithm.as_deref(),
