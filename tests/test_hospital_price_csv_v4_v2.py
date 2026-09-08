@@ -17,6 +17,7 @@ from support.hospital_price_native_validation import (
     _CMS_V2_AFFIRMATION_TEXT,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_csv_v1_labels import _create_version_table, _insert_header
@@ -73,11 +74,15 @@ async def prove_csv_profile_constraints(monkeypatch) -> None:
         await _run_migration(engine, _load_migration(MIGRATION_PATH.with_name(
             "20260907220000_hospital_price_missing_plan.py"
         )), "upgrade")
+        await _run_migration(engine, _load_migration(MIGRATION_PATH.with_name(
+            "20260908160000_hospital_price_tall_notes.py"
+        )), "upgrade")
         connection = await asyncpg.connect(database_url.set(
             drivername="postgresql").render_as_string(hide_password=False))
         try:
             for parser_contract in (
                 HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
+                HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256,
                 HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
             ):
                 await _check_v4_v2_headers(connection, table, parser_contract)

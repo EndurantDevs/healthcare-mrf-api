@@ -13,6 +13,7 @@ from api.hospital_price_request import MISSING_PLAN_SELECTOR, validate_hospital_
 from db.models.hospital_price_facts import HospitalPricePayerCharge
 from db.models.hospital_price_header import HospitalPriceVersion
 from support.hospital_price_native_validation import HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256
+from support.hospital_price_native_validation import HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256
 from support.hospital_price_native_validation import HOSPITAL_MRF_PARSER_CONTRACT_SHA256
 from tests.test_hospital_price_serving import _query, _Session, VERSION_ID
 
@@ -67,7 +68,8 @@ def test_missing_plan_admission_preserves_header_guards():
     _drop, statement = migration["_upgrade_statements"]()
     shape = next(str(constraint.sqltext) for constraint in HospitalPriceVersion.__table__.constraints
         if constraint.name == "hospital_price_version_shape_check")
-    assert statement.endswith(f"CHECK ({shape});")
-    assert statement.count(HOSPITAL_MRF_PARSER_CONTRACT_SHA256) == 2
+    historical_shape = shape.replace(f", '{HOSPITAL_MRF_PARSER_CONTRACT_SHA256}'", "")
+    assert statement.endswith(f"CHECK ({historical_shape});")
+    assert statement.count(HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256) == 2
     assert statement.count(HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256) == 2
     assert HospitalPricePayerCharge.__table__.c.plan_name.nullable is False

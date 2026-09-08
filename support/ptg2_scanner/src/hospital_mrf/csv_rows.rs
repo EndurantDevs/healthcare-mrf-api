@@ -123,7 +123,10 @@ fn parse_tall_modifier_payer(
     )?;
     let standard_charge_algorithm =
         optional_text(csv_value(record, columns.standard_charge_algorithm));
-    let description = optional_text(csv_value(record, columns.common.additional_generic_notes));
+    let description = optional_text(csv_value(
+        record,
+        columns.additional_payer_notes.unwrap_or(columns.common.additional_generic_notes),
+    ));
     if payer_name.is_none()
         && plan_name.is_none()
         && standard_charge_dollar.is_none()
@@ -304,7 +307,10 @@ fn parse_tall_payer(
             .map(|value| allowed_count(value, true))
             .transpose()?,
         methodology: csv_value(record, columns.methodology).to_owned(),
-        additional_payer_notes: generic_notes.and_then(optional_text),
+        additional_payer_notes: match columns.additional_payer_notes {
+            Some(column) => optional_text(csv_value(record, column)),
+            None => generic_notes.and_then(optional_text),
+        },
     };
     if columns.profile == CmsProfile::V3 && is_explicitly_uncontracted_csv_payer(&payer) {
         return Ok(None);
@@ -428,9 +434,10 @@ fn parse_tall_records<R: Read>(
             flush_charge(&mut charge_accumulator, outputs, version_id)?;
             let mut modifier = parse_csv_modifier(&record, &columns.common)?;
             let payer = parse_tall_modifier_payer(&record, columns)?;
-            if payer.is_some() {
+            if payer.is_some() && columns.additional_payer_notes.is_none() {
                 modifier.additional_generic_notes = None;
-            } else if modifier.additional_generic_notes.is_none() {
+            }
+            if payer.is_none() && modifier.additional_generic_notes.is_none() {
                 return Err(invalid(
                     "CSV modifier information requires a payer adjustment or generic note",
                 ));
@@ -464,8 +471,13 @@ fn parse_tall_records<R: Read>(
             columns,
             raw_charge.additional_generic_notes.as_deref(),
         )?;
-        if payer.is_some() {
-            // Tall has one notes column; on a payer row it canonically belongs to that payer.
+        if payer.is_none()
+            && !csv_profile_value(&record, columns.additional_payer_notes).is_empty()
+        {
+            return Err(invalid("explicit additional_payer_notes requires a material payer charge"));
+        }
+        if payer.is_some() && columns.additional_payer_notes.is_none() {
+            // Legacy one-column tall notes belong to the payer; explicit columns stay separate.
             raw_charge.additional_generic_notes = None;
         }
         let payers = payer.into_iter().collect::<Vec<_>>();
