@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
@@ -17,6 +18,11 @@ from process.ptg_parts.domain import PTG2_STRIPPED_QUERY_PARAMS
 
 
 MAX_HOSPITAL_HPT_LOCATOR_BYTES = 1_000_000
+HCA_STRUCTURED_LOCATOR_URL = (
+    "https://www.medicalcityhealthcare.com/patient-resources/"
+    "patient-financial-resources/"
+    "pricing-transparency-cms-required-file-of-standard-charges"
+)
 _HOSPITAL_MRF_CREDENTIAL_QUERY_KEYS = frozenset(
     PTG2_STRIPPED_QUERY_PARAMS
 ) | {"si", "sr"}
@@ -79,15 +85,19 @@ def _locator_error(reason: str) -> HospitalHptLocatorError:
     return HospitalHptLocatorError(f"hospital_hpt_locator_invalid:{reason}")
 
 
-def _decoded_locator(payload: bytes) -> str:
+def _utf8_locator(payload: bytes) -> str:
     if type(payload) is not bytes:
         raise _locator_error("payload_type")
     if len(payload) > MAX_HOSPITAL_HPT_LOCATOR_BYTES:
         raise _locator_error("payload_too_large")
     try:
-        text = payload.decode("utf-8-sig")
+        return payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise _locator_error("utf8") from exc
+
+
+def _decoded_locator(payload: bytes) -> str:
+    text = _utf8_locator(payload)
     if "\n" not in text:
         text = text.replace("\r", "\n")
     else:
@@ -247,6 +257,139 @@ def _record(fields: Mapping[str, str]) -> HospitalHptLocatorRecord:
         location_name=location_name,
         mrf_url=_validated_mrf_url(fields.get("mrf-url", "")),
     )
+
+
+class _HcaNextData(HTMLParser):
+    """Read only the unique Next.js JSON script, never rendered page links."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.seen = False
+        self.active = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        """Require unique binding attributes on the sole data script."""
+        if tag != "script" or ("id", "__NEXT_DATA__") not in attrs:
+            return
+        binding_attrs = [(key, value) for key, value in attrs if key in {"id", "type"}]
+        if self.seen or len(binding_attrs) != 2 or dict(binding_attrs) != {
+            "id": "__NEXT_DATA__", "type": "application/json"
+        }:
+            raise _locator_error("hca_script")
+        self.seen = self.active = True
+
+    def handle_endtag(self, tag: str) -> None:
+        """Finish the captured data script without interpreting its contents."""
+        if tag == "script":
+            self.active = False
+
+    def handle_data(self, data: str) -> None:
+        """Retain the script's literal JSON text for one decoding pass."""
+        if self.active:
+            self.parts.append(data)
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        """Reject a self-closing data script without a JSON body."""
+        if tag == "script" and ("id", "__NEXT_DATA__") in attrs:
+            raise _locator_error("hca_script")
+
+
+def _unique_hca_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields_by_key: dict[str, object] = {}
+    for key, value in pairs:
+        if key in fields_by_key:
+            raise _locator_error("hca_json")
+        fields_by_key[key] = value
+    return fields_by_key
+
+
+def _invalid_hca_constant(value: str) -> None:
+    raise _locator_error("hca_json")
+
+
+def _hca_facilities(text: str) -> list[dict]:
+    parser = _HcaNextData()
+    parser.feed(text)
+    parser.close()
+    if not parser.seen or parser.active:
+        raise _locator_error("hca_script")
+    try:
+        document = json.loads(
+            "".join(parser.parts), object_pairs_hook=_unique_hca_object,
+            parse_constant=_invalid_hca_constant,
+        )
+        route = document["props"]["pageProps"]["layoutData"]["sitecore"]["route"]
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise _locator_error("hca_json") from exc
+    if not isinstance(route, dict) or "placeholders" not in route or "componentName" in route:
+        raise _locator_error("hca_component")
+    pending_components = [route]
+    facilities = None
+    while pending_components:
+        component = pending_components.pop()
+        if not isinstance(component, dict):
+            raise _locator_error("hca_component")
+        if component.get("componentName") == "PricingTransparencyBlockPOC":
+            fields_by_key = component.get("fields")
+            if facilities is not None or not isinstance(fields_by_key, dict):
+                raise _locator_error("hca_component")
+            facilities = fields_by_key.get("facilities")
+            if not isinstance(facilities, list) or not facilities:
+                raise _locator_error("hca_facilities")
+        placeholders = component.get("placeholders", {})
+        if not isinstance(placeholders, dict):
+            raise _locator_error("hca_component")
+        for children in placeholders.values():
+            if not isinstance(children, list):
+                raise _locator_error("hca_component")
+            pending_components.extend(children)
+    if facilities is None:
+        raise _locator_error("hca_component")
+    return facilities
+
+
+def _hca_text(value: object) -> str:
+    if (
+        type(value) is not str or not value or value != value.strip()
+        or any(unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value)
+    ):
+        raise _locator_error("hca_text")
+    return value
+
+
+def _hca_locator_records(locator_payload: bytes) -> tuple[HospitalHptLocatorRecord, ...]:
+    """Keep each reviewed facility group's labels on its own literal file URL."""
+    locator_records: list[HospitalHptLocatorRecord] = []
+    seen_names: set[str] = set()
+    seen_selectors: set[str] = set()
+    for facility in _hca_facilities(_utf8_locator(locator_payload)):
+        if not isinstance(facility, dict) or set(facility) != {
+            "locations", "mrfPriceTransparencyDownloadURL"
+        }:
+            raise _locator_error("hca_facility")
+        locations = facility["locations"]
+        if not isinstance(locations, list) or not locations:
+            raise _locator_error("hca_locations")
+        mrf_url = _validated_mrf_url(_hca_text(facility["mrfPriceTransparencyDownloadURL"]))
+        selector = hospital_mrf_selector(mrf_url, allow_credentials=True)
+        if selector is None or selector in seen_selectors:
+            raise _locator_error("hca_file_identity")
+        seen_selectors.add(selector)
+        for location in locations:
+            if (
+                not isinstance(location, dict)
+                or set(location) != {"locationName", "isParentFacility"}
+                or type(location["isParentFacility"]) is not bool
+            ):
+                raise _locator_error("hca_location")
+            location_name = _hca_text(location["locationName"])
+            normalized_name = normalized_hospital_location_name(location_name)
+            if not normalized_name or normalized_name in seen_names:
+                raise _locator_error("hca_location_identity")
+            seen_names.add(normalized_name)
+            locator_records.append(HospitalHptLocatorRecord(location_name, mrf_url))
+    return tuple(locator_records)
 
 
 def _field_key(value: str) -> str:
@@ -417,6 +560,15 @@ def parse_hospital_hpt_locator(
     if not locator_records:
         raise _locator_error("empty")
     return tuple(locator_records)
+
+
+def parse_hospital_locator_source(
+    locator_payload: bytes, *, cms_hpt_url: str | None,
+) -> tuple[HospitalHptLocatorRecord, ...]:
+    """Dispatch only the reviewed structured page; other locators stay textual."""
+    if cms_hpt_url == HCA_STRUCTURED_LOCATOR_URL:
+        return _hca_locator_records(locator_payload)
+    return parse_hospital_hpt_locator(locator_payload)
 
 
 def normalized_hospital_location_name(value: str) -> str:

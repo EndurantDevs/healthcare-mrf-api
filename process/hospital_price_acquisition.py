@@ -21,6 +21,7 @@ from process.hospital_hpt_locator import (
     HospitalHptLocatorRecord,
     match_hospital_hpt_locator,
     parse_hospital_hpt_locator,
+    parse_hospital_locator_source,
 )
 from process.hospital_price_native import (
     HospitalParserReceipt,
@@ -258,7 +259,7 @@ async def fetch_locator(
             _HOSPITAL_USER_AGENT, exact_get_evidence=True,
         )
         locator_payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
-        locator_records = parse_hospital_hpt_locator(locator_payload)
+        locator_records = parse_hospital_locator_source(locator_payload, cms_hpt_url=url)
         status = "redirected_verified" if raw.head and raw.head.url != url else "verified"
         await _record_locator_observation(url, locator, observation, status, raw)
         return LocatorResult(url, locator, observation, hospitals, locator_records)

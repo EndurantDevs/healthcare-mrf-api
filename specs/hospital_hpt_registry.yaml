@@ -13021,10 +13021,11 @@ hospitals:
   cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
 - hospital_id: hospital-003890
   name: MEDICAL CITY MENTAL HEALTH AND WELLNESS CENTER FRISCO
-  cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
+  cms_hpt_url: https://www.medicalcityhealthcare.com/patient-resources/patient-financial-resources/pricing-transparency-cms-required-file-of-standard-charges
+  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1682203_MEDICAL-CITY-MH-FRISCO_standardcharges.json
 - hospital_id: hospital-003891
   name: MEDICAL CITY MH FRISCO
-  cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
+  cms_hpt_url: https://www.medicalcityhealthcare.com/patient-resources/patient-financial-resources/pricing-transparency-cms-required-file-of-standard-charges
   alias_of: hospital-003890
   locator_name: MEDICAL CITY MENTAL HEALTH AND WELLNESS CENTER FRISCO
 - hospital_id: hospital-003892

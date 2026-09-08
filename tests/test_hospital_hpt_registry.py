@@ -94,7 +94,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 6_900
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_714
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 141
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
@@ -124,6 +124,49 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         }
         for entry in hospitals
     )
+
+
+@pytest.mark.parametrize("selected_id", ("hospital-003890", "hospital-003891"))
+def test_structured_locator_preserves_alias_identity(selected_id):
+    """An exact file selector changes routing, never the two aliases' price scope."""
+    hospitals = registry.selected_hospital_hpt_registry({"hospital_id": selected_id})
+    hospital_ids = ("hospital-003890", "hospital-003891")
+    names = ("MEDICAL CITY MENTAL HEALTH AND WELLNESS CENTER FRISCO", "MEDICAL CITY MH FRISCO")
+    locator_url = (
+        "https://www.medicalcityhealthcare.com/patient-resources/patient-financial-resources/"
+        "pricing-transparency-cms-required-file-of-standard-charges"
+    )
+    selector = (
+        "https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/"
+        "62-1682203_MEDICAL-CITY-MH-FRISCO_standardcharges.json"
+    )
+    assert tuple(hospital["hospital_id"] for hospital in hospitals) == hospital_ids
+    assert registry.hospital_hpt_group_ids(selected_id) == hospital_ids
+    assert tuple(hospital["name"] for hospital in hospitals) == names
+    assert "alias_of" not in hospitals[0] and "locator_name" not in hospitals[0]
+    assert hospitals[1]["alias_of"] == hospital_ids[0]
+    assert hospitals[1]["locator_name"] == names[0]
+    assert all(hospital["cms_hpt_url"] == locator_url
+               and hospital["locator_mrf_url"] == selector
+               and "fallback_mrf_url" not in hospital for hospital in hospitals)
+    all_hospitals = registry.load_hospital_hpt_registry()
+    assert tuple(hospital for hospital in all_hospitals if hospital["cms_hpt_url"] == locator_url) == hospitals
+    assert sum(hospital["cms_hpt_url"] == "https://www.medicalcityhealthcare.com/cms-hpt.txt"
+               for hospital in all_hospitals) == 47
+    acquisition = acquisition_module()
+    source_url = selector + "?sig=synthetic%2Fsignature"
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", hospitals,
+        (HospitalHptLocatorRecord("Medical City Frisco Hospital", "https://files.example/acute.json"),
+         HospitalHptLocatorRecord("Medical City Mental Health and Wellness Center of Frisco", source_url),
+         HospitalHptLocatorRecord("Medical City Mental Health and Wellness Center Alliance", "https://files.example/alliance.json")),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert tuple(candidate.hospital_name for candidate in candidates) == names
+    assert all(candidate.source_url == source_url and candidate.locator_name is None
+               and candidate.initial_error_code is None for candidate in candidates)
+    store, _native = store_module()
+    assert store._location_ordinals(candidates, ((0, names[1]),)) == dict.fromkeys(hospital_ids)
 
 
 def test_reviewed_publisher_replacement_preserves_singleton_identity():
