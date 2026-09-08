@@ -19,7 +19,7 @@ from api.provider_profile_public_facts import (
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
 from process.provider_profile_reported_range import normalize_projected_state_facts
 
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v7"
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v8"
 
 
 def _empty_profile(npi: int) -> dict[str, Any]:
@@ -54,6 +54,8 @@ def _stable_item_id(npi: int, category: str, item: Mapping[str, Any]) -> str:
         stable_value = language_identity(stable_value)
     if category == "education" and str(item.get("type")) == "education_history":
         stable_value = item.get("logical_fact_key") or stable_value
+    if category == "training" and (item.get("sensitive") or not item.get("public_default")):
+        stable_value = (stable_value, bool(item.get("sensitive")), bool(item.get("public_default")))
     payload = json.dumps(
         [npi, category, "canonical_fact", str(item.get("type") or ""), stable_value],
         sort_keys=True,

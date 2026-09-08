@@ -20,6 +20,11 @@ from api.provider_profile_cms import (
     fetch_cms_education_projection,
     merge_cms_education_projection,
 )
+from api.provider_profile_states import (
+    canonicalize_training_category,
+    fetch_massachusetts_profile_projection,
+    merge_state_profile_projection,
+)
 from api.provider_profile_composer_parts import (
     PROFILE_COMPOSER_VERSION,
     _append_fhir_sources,
@@ -69,10 +74,12 @@ async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
 
 async def fetch_provider_profile_projection(npi: int) -> dict[str, Any] | None:
     """Load independently published state and CMS facts without replacing either."""
-    state_projection, cms_projection = await asyncio.gather(
+    state_projection, cms_projection, massachusetts_projection = await asyncio.gather(
         fetch_state_profile_projection(npi), fetch_cms_education_projection(npi),
+        fetch_massachusetts_profile_projection(npi),
     )
-    return merge_cms_education_projection(npi, state_projection, cms_projection)
+    projection = merge_cms_education_projection(npi, state_projection, cms_projection)
+    return merge_state_profile_projection(npi, projection, massachusetts_projection)
 
 
 def compose_provider_profile(
@@ -97,6 +104,7 @@ def compose_provider_profile(
     _merge_fhir_profile_facts(categories, fhir_profile)
     _append_fhir_sources(profile, fhir_profile)
     canonicalize_education_category(categories["education"])
+    canonicalize_training_category(categories["training"])
     canonicalize_language_category(
         categories["languages"],
         fhir_source_rows=_fhir_source_rows(fhir_profile),
@@ -274,6 +282,10 @@ def compose_provider_profile_evidence(
         )
         if source_payload is not None:
             evidence_by_key["sources"][source_kind] = source_payload
+    for source_key, source_evidence in (state_projection or {}).get("additional_state_evidence", {}).items():
+        source_payload = _projection_evidence_payload(source_evidence, provider_profile, returned_record_ids)
+        if source_payload is not None:
+            evidence_by_key["sources"][source_key] = source_payload
     fhir_payload = _fhir_evidence_payload(
         fhir_evidence,
         provider_profile,
