@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -65,8 +66,9 @@ def test_packed_root_rejects_invalid_count_and_geometry() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("database_row", (False, True))
 @pytest.mark.parametrize("case", ("empty", "invalid", "missing"))
-async def test_packed_target_metadata_fails_closed(case: str) -> None:
+async def test_packed_target_metadata_fails_closed(case: str, database_row: bool) -> None:
     object_kind = PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS[0]
     _pack, targets, _mapping = _packed_fixture(object_kind)
     block_hash = bytes(targets[0]["block_hash"])
@@ -77,7 +79,8 @@ async def test_packed_target_metadata_fails_closed(case: str) -> None:
         return
     if case == "invalid":
         targets[0]["format_version"] = -1
-        rows = _Rows((targets[0],))
+        row = SimpleNamespace(_mapping=targets[0]) if database_row else targets[0]
+        rows = _Rows((row,))
         message = "target CAS metadata is invalid"
     else:
         rows = _Rows()
@@ -90,6 +93,26 @@ async def test_packed_target_metadata_fails_closed(case: str) -> None:
             snapshot_key=7,
             target_hashes={block_hash},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("database_row", (False, True))
+async def test_packed_target_metadata_preserves_rows(database_row: bool) -> None:
+    object_kind = PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS[0]
+    _pack, targets, _mapping = _packed_fixture(object_kind)
+    original = deepcopy(targets)
+    rows = [SimpleNamespace(_mapping=row) if database_row else row for row in targets]
+    result = await finalizer_maps._load_target_metadata(
+        _ScriptedSession((_Rows(rows),)),
+        schema='"mrf"',
+        snapshot_key=7,
+        target_hashes={bytes(row["block_hash"]) for row in targets},
+    )
+    assert result == {
+        bytes(row["block_hash"]): (object_kind, row["entry_count"], row["raw_byte_count"])
+        for row in targets
+    }
+    assert targets == original
 
 
 @pytest.mark.parametrize(
