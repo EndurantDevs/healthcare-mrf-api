@@ -1760,7 +1760,7 @@ async def _assert_uhc_facility_profile_endpoint(
     evidence_profile = _decoded(profile_row.evidence_json)
     monkeypatch.setattr(
         npi_endpoint,
-        "fetch_state_profile_projection",
+        "fetch_provider_profile_projection",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(

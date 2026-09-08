@@ -11881,7 +11881,7 @@ components:
         item_id:
           type: string
           pattern: '^[0-9a-f]{64}$'
-          description: Stable across state/FHIR assertion composition changes.
+          description: Stable across state/CMS/FHIR assertion composition changes.
         type:
           type: string
         display:
@@ -11919,11 +11919,11 @@ components:
           type: boolean
         source_record_id:
           type: string
-          description: Representative state-regulator source record identifier.
+          description: Representative state-regulator or CMS source record identifier.
         source_record_ids:
           type: array
           uniqueItems: true
-          description: State-regulator source records supporting this normalized fact.
+          description: State-regulator and CMS source records supporting this normalized fact.
           items:
             type: string
         source_ids:
@@ -11937,7 +11937,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [state_regulator, provider_directory_fhir]
+            enum: [state_regulator, cms_doctors, provider_directory_fhir]
         assertions:
           type: array
           description: |
@@ -11946,6 +11946,11 @@ components:
           items:
             type: object
             additionalProperties: true
+        quality_flags:
+          type: array
+          description: Source quality flags; a future CMS graduation year is reported, not verified completion.
+          items:
+            type: string
         assertion_count:
           type: integer
           minimum: 1
@@ -12060,7 +12065,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v5
+          example: provider-profile-composer/v6
         npi:
           type: integer
           minimum: 1000000000
@@ -12076,6 +12081,8 @@ components:
             generation after adoption. During the one-time pre-adoption
             transition, it retains the selected profile row's existing
             materialization generation.
+            `cms_doctors` binds the exact source artifact, dataset, and acquisition
+            timestamp; future-year flags are fixed to that acquisition date.
           additionalProperties:
             type: string
         profile_as_of:

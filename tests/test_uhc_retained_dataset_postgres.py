@@ -1602,7 +1602,7 @@ async def _assert_native_profile_api(monkeypatch, profile_row) -> None:
     evidence_profile = _decode_json(profile_row.evidence_json)
     monkeypatch.setattr(
         npi_endpoint,
-        "fetch_state_profile_projection",
+        "fetch_provider_profile_projection",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(

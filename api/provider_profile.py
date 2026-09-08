@@ -1,9 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Compose state-regulator and Provider Directory facts into one public profile."""
+"""Compose state, CMS and Provider Directory facts into one public profile."""
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import re
 from typing import Any, Iterable, Mapping
@@ -13,6 +14,10 @@ from sqlalchemy import text
 from api.provider_language_merge import (
     canonicalize_language_category,
     evidence_value_key,
+)
+from api.provider_profile_cms import (
+    fetch_cms_education_projection,
+    merge_cms_education_projection,
 )
 from api.provider_profile_composer_parts import (
     PROFILE_COMPOSER_VERSION,
@@ -61,6 +66,14 @@ async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
     }
 
 
+async def fetch_provider_profile_projection(npi: int) -> dict[str, Any] | None:
+    """Load independently published state and CMS facts without replacing either."""
+    state_projection, cms_projection = await asyncio.gather(
+        fetch_state_profile_projection(npi), fetch_cms_education_projection(npi),
+    )
+    return merge_cms_education_projection(npi, state_projection, cms_projection)
+
+
 def compose_provider_profile(
     npi: int,
     *,
@@ -72,7 +85,7 @@ def compose_provider_profile(
     page_limit: int = 25,
     page_offset: int = 0,
 ) -> dict[str, Any] | None:
-    """Merge FHIR and state assertions into the canonical provider profile."""
+    """Merge FHIR and independently published assertions into one provider profile."""
     if state_projection is None and fhir_profile is None:
         return None
     profile, categories, language_availability = _initialize_composed_profile(
@@ -124,10 +137,10 @@ def _returned_profile_items(
     return returned_items
 
 
-def _returned_state_record_ids(
+def _returned_projection_record_ids(
     returned_items: Iterable[Mapping[str, Any]],
 ) -> set[str]:
-    """Collect direct and grouped state-record identities from visible facts."""
+    """Collect direct and grouped source-record identities from visible facts."""
     returned_record_ids = {
         str(profile_item.get("source_record_id"))
         for profile_item in returned_items
@@ -142,24 +155,23 @@ def _returned_state_record_ids(
     return returned_record_ids
 
 
-def _state_evidence_payload(
-    state_projection: Mapping[str, Any] | None,
+def _projection_evidence_payload(
+    source_evidence: Mapping[str, Any] | None,
     provider_profile: Mapping[str, Any] | None,
     returned_record_ids: set[str],
 ) -> dict[str, Any] | None:
-    """Filter state evidence to records visible in the composed profile."""
-    state_evidence = state_projection.get("evidence") if state_projection else None
-    if not isinstance(state_evidence, Mapping):
+    """Filter one source's evidence to records visible in the composed profile."""
+    if not isinstance(source_evidence, Mapping):
         return None
-    state_payload = copy.deepcopy(state_evidence)
+    source_payload = copy.deepcopy(source_evidence)
     if provider_profile:
-        state_payload["records"] = [
+        source_payload["records"] = [
             source_record
-            for source_record in state_payload.get("records", [])
+            for source_record in source_payload.get("records", [])
             if isinstance(source_record, Mapping)
             and str(source_record.get("source_record_id")) in returned_record_ids
         ]
-    return state_payload
+    return source_payload
 
 
 def _returned_fhir_fact_keys(
@@ -251,13 +263,15 @@ def compose_provider_profile_evidence(
     """Return provenance limited to assertions visible on the composed profile page."""
     evidence_by_key = {"schema_version": PROFILE_SCHEMA_VERSION, "sources": {}}
     returned_items = _returned_profile_items(provider_profile)
-    state_payload = _state_evidence_payload(
-        state_projection,
-        provider_profile,
-        _returned_state_record_ids(returned_items),
-    )
-    if state_payload is not None:
-        evidence_by_key["sources"]["state_regulator"] = state_payload
+    returned_record_ids = _returned_projection_record_ids(returned_items)
+    for source_kind, evidence_field in (("state_regulator", "evidence"), ("cms_doctors", "cms_evidence")):
+        source_payload = _projection_evidence_payload(
+            state_projection.get(evidence_field) if state_projection else None,
+            provider_profile,
+            returned_record_ids,
+        )
+        if source_payload is not None:
+            evidence_by_key["sources"][source_kind] = source_payload
     fhir_payload = _fhir_evidence_payload(
         fhir_evidence,
         provider_profile,

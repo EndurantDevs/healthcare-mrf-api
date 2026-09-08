@@ -45,7 +45,7 @@ from api.provider_specialty_filters import (
 from api.provider_profile import (
     compose_provider_profile,
     compose_provider_profile_evidence,
-    fetch_state_profile_projection,
+    fetch_provider_profile_projection,
 )
 from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        NPIAddress, NPIData, NPIDataOtherIdentifier,
@@ -11946,7 +11946,7 @@ async def get_provider_profile(request, npi):
         return response.json(exc.response_by_key, status=exc.status)
     normalized_npi = int(npi)
     state_projection, fhir_profile_map = await asyncio.gather(
-        fetch_state_profile_projection(normalized_npi),
+        fetch_provider_profile_projection(normalized_npi),
         _fetch_provider_directory_profile_map(
             [normalized_npi],
             include_evidence=query.include_evidence,

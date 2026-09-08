@@ -35,7 +35,7 @@ def _install_route_dependencies(
     compose_evidence = MagicMock(return_value=composed_evidence)
     monkeypatch.setattr(
         npi_module,
-        "fetch_state_profile_projection",
+        "fetch_provider_profile_projection",
         state_fetch,
     )
     monkeypatch.setattr(
