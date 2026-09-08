@@ -3258,8 +3258,11 @@ async def test_multi_network_forward_failure_never_returns_partial_union(monkeyp
 async def test_multi_network_reverse_reads_use_independent_concurrent_sessions(monkeypatch):
     session_factory = ConcurrentSessionFactory()
 
-    async def fake_search(_session, _npi, _args, _pagination, *, snapshot_id):
+    async def fake_search(
+        _session, _npi, _args, _pagination, *, snapshot_id, serving_tables=None
+    ):
         await asyncio.sleep(0.01)
+        assert serving_tables is None
         assert _pagination.limit == 26
         return {
             "items": [
