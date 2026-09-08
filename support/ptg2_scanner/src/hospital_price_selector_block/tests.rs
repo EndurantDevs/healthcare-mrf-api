@@ -53,7 +53,8 @@ mod tests {
         assert_eq!(page.exact_refs(&named.key), Some(&[2][..]));
         block[8..12].copy_from_slice(&HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION.to_le_bytes());
         assert!(decode_selector_page(&block).is_err());
-        let mut block = encode_selector_page(named.key.kind(), 0, 1, &[named.clone()]).unwrap();
+        let mut block =
+            encode_selector_page(named.key.kind(), 0, 1, std::slice::from_ref(&named)).unwrap();
         block[8..12].copy_from_slice(&HOSPITAL_PRICE_SELECTOR_BLOCK_LEGACY_VERSION.to_le_bytes());
         assert_eq!(decode_selector_page(&block).unwrap().entries, vec![named]);
     }

@@ -62,7 +62,7 @@ mod tests {
         let raw = raw_from(&block);
         let old = frame_raw_version(&raw, 2, HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION).unwrap();
         assert!(decode_fact_block(&old, None, None, 0, 10).is_err());
-        let named_raw = raw_from(&encode_fact_block(&[named.clone()]).unwrap());
+        let named_raw = raw_from(&encode_fact_block(std::slice::from_ref(&named)).unwrap());
         let old = frame_raw_version(&named_raw, 1, HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION).unwrap();
         assert_eq!(decode_fact_block(&old, None, None, 0, 10).unwrap(), vec![named]);
     }
