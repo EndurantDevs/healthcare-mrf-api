@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import copy
+from datetime import datetime
 from html import escape
 
 import pytest
@@ -68,6 +69,35 @@ def test_labels_allow_reordering_nested_text_and_optional_field_absence():
     assert source_record["matched_npi"] == int(NPI)
     assert facts[0]["value_json"]["graduation_year"] == 2001
     assert facts[0]["value_json"]["institution"] == "Synthetic & Medical School"
+
+
+def test_legacy_spacing_and_blank_layout_rows_preserve_education():
+    html = response_html([*FIELDS, ("", " ")]).replace(
+        "Synthetic &amp; Medical School", "Synthetic<br>&amp; Medical School"
+    ).replace("</form>", '<div class="ky-cm-post">Published: 09/28/2004 [wvd]</div></form>')
+    evidence = {**EVIDENCE, "downloaded_at": datetime.fromisoformat(EVIDENCE["downloaded_at"])}
+    record, facts = rows.parse_profile(html, license_number=LICENSE, candidates=[CANDIDATE], evidence=evidence)
+    assert record["match_status"] == "deterministic"
+    assert facts[0]["value_json"] == {"institution": "Synthetic & Medical School", "graduation_year": 2001}
+    assert facts[0]["source_json"]["downloaded_at"] == "2026-09-08T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("candidate_changes", [
+    {"first_name": None}, {"first_name": " "}, {"last_name": None}, {"last_name": " "},
+    {"middle_name": 123}, {"suffix": 123},
+])
+def test_incomplete_or_malformed_registry_names_never_attach_facts(candidate_changes):
+    record, facts = parsed_profile(candidates=[{**CANDIDATE, **candidate_changes}])
+    assert record["match_status"] == "identity_conflict" and record["matched_npi"] is None
+    assert facts[0]["npi"] is None
+    assert facts[0]["value_json"]["institution"] == "Synthetic & Medical School"
+
+
+def test_matching_names_without_middle_name_or_suffix_need_no_inference():
+    fields = [("Name", "Alex Example M.D."), *FIELDS[1:]]
+    candidate = {**CANDIDATE, "middle_name": None, "suffix": None}
+    record, facts = parsed_profile(fields, candidates=[candidate])
+    assert record["match_status"] == "deterministic" and facts[0]["npi"] == int(NPI)
 
 
 @pytest.mark.parametrize(("display_name", "candidate_changes", "expected"), [
