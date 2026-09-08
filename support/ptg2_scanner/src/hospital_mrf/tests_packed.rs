@@ -489,3 +489,4 @@ fn packed_zip_matches_plain_and_late_finish_failure_cleans_everything() {
         .is_err());
     assert_eq!(fs::read_dir(cleanup.path()).unwrap().count(), 0);
 }
+include!("tests_missing_plan.rs");
