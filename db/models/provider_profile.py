@@ -30,6 +30,7 @@ __all__ = (
     "ProviderProfileImportRun",
     "ProviderProfileProjection",
     "ProviderProfileSourceRecord",
+    "ProviderProfileSourcePublication",
 )
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
@@ -72,6 +73,21 @@ class ProviderProfileImportRun(Base, JSONOutputMixin):
     error = Column(JSON)
     started_at = Column(TIMESTAMP)
     finished_at = Column(TIMESTAMP)
+
+
+class ProviderProfileSourcePublication(Base, JSONOutputMixin):
+    """Publish an additional source without replacing Florida's projection."""
+
+    __tablename__ = "provider_profile_source_publication"
+    __table_args__ = (
+        PrimaryKeyConstraint("source_key"),
+        {"schema": _SCHEMA, "extend_existing": True},
+    )
+
+    source_key = Column(String(96), nullable=False)
+    current_run_id = Column(String(64), nullable=False)
+    previous_run_id = Column(String(64))
+    published_at = Column(TIMESTAMP, nullable=False)
 
 
 class ProviderProfileArtifact(Base, JSONOutputMixin):
