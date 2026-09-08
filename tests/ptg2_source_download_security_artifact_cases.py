@@ -188,7 +188,7 @@ def test_reuse_candidate_second_protection_failure_disables_reuse(
         return True
 
     async def head(url):
-        return PTG2HeadMetadata(url=url, content_length=3)
+        return PTG2HeadMetadata(url=url, status=200, content_length=3)
 
     monkeypatch.setattr(
         source_download,

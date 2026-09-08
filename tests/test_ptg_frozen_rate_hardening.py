@@ -352,7 +352,7 @@ async def test_download_aggregation_preserves_typed_mismatch(
 
     monkeypatch.setattr(
         source_download,
-        "download_raw_artifact",
+        "_download_raw_request",
         download,
     )
     monkeypatch.setattr(

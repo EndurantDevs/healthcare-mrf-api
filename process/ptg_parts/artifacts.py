@@ -342,6 +342,18 @@ def _has_matching_content_length(
     )
 
 
+def _has_raw_metadata_conflict(candidate: dict[str, Any], head: PTG2HeadMetadata) -> bool:
+    """Keep weaker validators and checksums from overriding live contradictions."""
+    return bool(
+        (head.etag and candidate.get("etag") and candidate["etag"] != head.etag)
+        or (
+            head.content_length is not None
+            and candidate.get("content_length") is not None
+            and not _has_matching_content_length(candidate, head)
+        )
+    )
+
+
 def choose_reusable_raw_artifact(
     candidates: list[dict[str, Any]],
     head: PTG2HeadMetadata | None,
@@ -359,6 +371,10 @@ def choose_reusable_raw_artifact(
         return None, None
 
     if head is not None:
+        candidates = [
+            candidate for candidate in candidates
+            if not _has_raw_metadata_conflict(candidate, head)
+        ]
         for candidate in reversed(candidates):
             if (
                 _has_matching_content_length(candidate, head)

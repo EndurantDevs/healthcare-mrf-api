@@ -151,7 +151,7 @@ async def test_frozen_download_error_does_not_reflect_private_exception(
 
     monkeypatch.setattr(
         source_download,
-        "download_raw_artifact",
+        "_download_raw_request",
         fail_download,
     )
 

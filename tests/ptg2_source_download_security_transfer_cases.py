@@ -133,7 +133,7 @@ def test_reuse_candidate_missing_external_unprotected_and_valid(tmp_path, monkey
     }
 
     async def head(url):
-        return PTG2HeadMetadata(url=url, content_length=len(b"cached"))
+        return PTG2HeadMetadata(url=url, status=200, content_length=len(b"cached"))
 
     monkeypatch.setattr(source_download, "fetch_head_metadata", head)
     monkeypatch.setattr(
