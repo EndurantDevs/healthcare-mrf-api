@@ -6513,6 +6513,11 @@ async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_li
         return html_by_url[url]
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_is_healthcarebluebook_numeric_url_downloadable",
+        AsyncMock(return_value=True),
+    )
 
     crawl_targets = await discovery._resolve_html_mrf_with_healthcarebluebook(
         source_dict,
