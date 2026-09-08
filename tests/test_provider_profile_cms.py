@@ -215,13 +215,16 @@ def test_equal_education_unions_assertions_and_evidence():
     assert len(evidence["sources"]["state_regulator"]["records"]) == 1
     assert len(evidence["sources"]["cms_doctors"]["records"]) == 1
     repeated = cms_api.merge_cms_education_projection(NPI, projection, cms_projection)
-    assert repeated["profile"]["categories"]["education"]["items"][0]["assertion_count"] == 2
+    repeated_profile = _compose_projection(repeated)
+    assert repeated_profile["categories"]["education"]["items"][0]["assertion_count"] == 2
 
 
-def test_full_state_date_is_distinct_from_year():
+def test_full_state_date_corroborates_year_without_losing_date():
     state_projection = _state_projection(education_value={"institution": "Example Medical School", "graduation_date": "2001-06-01"})
     projection = cms_api.merge_cms_education_projection(NPI, state_projection, _cms_projection())
-    assert len(_compose_projection(projection)["categories"]["education"]["items"]) == 2
+    profile_item, = _compose_projection(projection)["categories"]["education"]["items"]
+    assert profile_item["value"]["graduation_date"] == "2001-06-01"
+    assert profile_item["corroborated_fields"] == ["institution", "graduation_year"]
 
 
 def test_equal_education_keeps_grouped_state_evidence():

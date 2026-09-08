@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.provider_education import canonicalize_education_category
 from api.provider_language_merge import (
     canonicalize_language_category,
     evidence_value_key,
@@ -95,6 +96,7 @@ def compose_provider_profile(
     )
     _merge_fhir_profile_facts(categories, fhir_profile)
     _append_fhir_sources(profile, fhir_profile)
+    canonicalize_education_category(categories["education"])
     canonicalize_language_category(
         categories["languages"],
         fhir_source_rows=_fhir_source_rows(fhir_profile),
