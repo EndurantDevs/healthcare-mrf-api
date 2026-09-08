@@ -4990,7 +4990,8 @@ hospitals:
   fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=c03ea0e53387f2e22f8262e5ee5ac871e45c53fb6ce9ca014b7159b7175da354
 - hospital_id: hospital-001482
   name: COLLETON MEDICAL CENTER
-  cms_hpt_url: https://colletonmedical.com/cms-hpt.txt
+  cms_hpt_url: https://www.hcahealthcarecolleton.com/cms-hpt.txt
+  locator_name: COLLETON HOSPITAL
 - hospital_id: hospital-001483
   name: COLON & RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt

@@ -29,6 +29,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001199": "Cottonwood Springs",
     "hospital-001415": "UTMB Health Clear Lake Hospital",
     "hospital-001458": "North Central Kansas Medical Center",
+    "hospital-001482": "COLLETON HOSPITAL",
     **dict(pair.split(":", 1) for pair in "hospital-001587:Corewell Health Big Rapids|hospital-001590:Corewell Health Gerber|hospital-001592:Corewell Health Greenville|hospital-001594:Corewell Health Gross Pointe|hospital-001596:Corewell Health Lakeland Niles|hospital-001597:Corewell Health Lakeland St. Joseph|hospital-001602:Corewell Health Ludington|hospital-001604:Corewell Health Reed City|hospital-001607:Corewell Health Taylor|hospital-001609:Corewell Health Trenton|hospital-001611:Corewell Health Troy|hospital-001612:Corewell Health Lakeland Watervliet|hospital-001614:Corewell Health Wayne|hospital-001616:Corewell Health Zeeland".split("|")),
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
@@ -92,7 +93,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_900
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_713
+    assert sum("locator_name" in entry for entry in hospitals) == 1_714
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 138
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -204,6 +205,45 @@ def test_unproven_timeout_keeps_no_reviewed_source():
     ),))
     assert candidate.initial_error_code == "timeout"
     assert candidate.source_url == hospital["cms_hpt_url"]
+
+
+@pytest.mark.parametrize("signature", ("synthetic%2fvalue", "synthetic%2Fvalue"))
+def test_reviewed_locator_preserves_filewide_binding(signature):
+    """Bind the current locator without rewriting signed bytes or inventing a site."""
+    hospital_id = "hospital-001482"
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+    locator_url = "https://www.hcahealthcarecolleton.com/cms-hpt.txt"
+    assert hospital == {
+        "hospital_id": hospital_id, "name": "COLLETON MEDICAL CENTER",
+        "cms_hpt_url": locator_url, "locator_name": "COLLETON HOSPITAL",
+    }
+    assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
+    assert tuple(entry for entry in registry.load_hospital_hpt_registry()
+                 if entry["cms_hpt_url"] in (locator_url, "https://colletonmedical.com/cms-hpt.txt")) == (hospital,)
+    source_url = f"https://files.example/standardcharges.json?sv=2026-02-06&sig={signature}"
+    acquisition = acquisition_module()
+    locator_records = acquisition.parse_hospital_hpt_locator(
+        f"location-name: COLLETON HOSPITAL\nmrf-url: {source_url}\n".encode()
+    )
+    assert locator_records[0].mrf_url == source_url
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", (hospital,), locator_records,
+    ),))
+    assert candidate.initial_error_code is None
+    assert candidate.source_url == source_url
+    assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (
+        hospital_id, "COLLETON MEDICAL CENTER", "COLLETON HOSPITAL",
+    )
+    store, _native = store_module()
+    assert store._location_ordinals(
+        (candidate,), ((0, "HCA Healthcare Colleton Hospital"),)
+    ) == {hospital_id: None}
+    unmatched, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", (hospital,),
+        (HospitalHptLocatorRecord("HCA Healthcare Colleton Hospital", source_url),),
+    ),))
+    assert unmatched.initial_error_code == "locator_unmatched"
+    assert unmatched.source_url == locator_url
 
 
 def test_checked_in_registry_has_reviewed_cms_hpt_urls():
