@@ -83,6 +83,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
         "opened", "synchronize", "reopened", "edited",
     }
+    assert workflow.get("on", workflow.get(True))["push"]["branches"] == ["main", "dev"]
     assert workflow["permissions"] == {
         "contents": "read", "pull-requests": "read", "actions": "read",
     }
@@ -121,6 +122,13 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert "python -m pytest -q" in commands
     assert "test_process_" in commands or "tests/process/" in commands
     assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
+
+
+def test_dependency_updates_target_the_development_branch():
+    path = Path(__file__).resolve().parents[1] / ".github/dependabot.yml"
+    updates = yaml.safe_load(path.read_text(encoding="utf-8"))["updates"]
+    assert {update["package-ecosystem"] for update in updates} == {"pip", "cargo", "github-actions"}
+    assert all(update["target-branch"] == "dev" for update in updates)
 
 
 def _assert_matrix_artifact_identity(job_id, job) -> None:

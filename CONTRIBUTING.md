@@ -17,6 +17,11 @@ pull request.
 
 ## Branches
 
+Create feature and fix branches from `dev` and open normal pull requests into
+`dev`. After CI and development acceptance, maintainers promote the reviewed
+content to stable `main` through a release pull request using **Rebase and merge**.
+The public default branch remains `main`.
+
 Use `type/short-slug` names: `feature/<slug>`, `fix/<slug>`,
 `docs/<slug>`, `test/<slug>`, or `chore/<slug>`.
 
