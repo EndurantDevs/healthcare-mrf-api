@@ -38,16 +38,16 @@ fn hospital_price_dict_list<'py>(
 fn hospital_price_selector_key(
     kind: &str,
     first: &str,
-    second: &str,
+    second: Option<&str>,
 ) -> PyResult<HospitalPriceSelectorKey> {
     match kind {
         "code" => Ok(HospitalPriceSelectorKey::Code {
             code_type: first.to_owned(),
-            code: second.to_owned(),
+            code: second.ok_or_else(|| PyValueError::new_err("code is required"))?.to_owned(),
         }),
         "payer_plan" => Ok(HospitalPriceSelectorKey::PayerPlan {
             payer_name: first.to_owned(),
-            plan_name: second.to_owned(),
+            plan_name: second.map(str::to_owned),
         }),
         _ => Err(PyValueError::new_err(
             "hospital price selector kind is invalid",
@@ -56,23 +56,25 @@ fn hospital_price_selector_key(
 }
 
 #[pyfunction]
+#[pyo3(signature = (kind, first, second))]
 fn hospital_price_selector_sha256<'py>(
     py: Python<'py>,
     kind: &str,
     first: &str,
-    second: &str,
+    second: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let key = hospital_price_selector_key(kind, first, second)?;
     Ok(PyBytes::new(py, &selector_key_sha256(&key)))
 }
 
 #[pyfunction]
+#[pyo3(signature = (payload, kind, first, second, ranges, max_refs))]
 fn hospital_price_decode_selector_page<'py>(
     py: Python<'py>,
     payload: &Bound<'py, PyBytes>,
     kind: &str,
     first: &str,
-    second: &str,
+    second: Option<&str>,
     ranges: Vec<(u64, u64)>,
     max_refs: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -297,7 +299,7 @@ fn hospital_price_fact_payload<'py>(
             ),
             (
                 "plan_name",
-                hospital_price_py_value(py, fact.plan_name.as_str()),
+                hospital_price_py_value(py, fact.plan_name.as_deref()),
             ),
             (
                 "negotiated_rate_term",

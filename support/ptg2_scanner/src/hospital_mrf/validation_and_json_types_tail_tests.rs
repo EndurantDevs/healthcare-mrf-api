@@ -38,7 +38,7 @@ mod validation_tail_tests {
 
         let payer = PayerChargeRow {
             payer_name: "payer".to_owned(),
-            plan_name: "plan".to_owned(),
+            plan_name: Some("plan".to_owned()),
             negotiated_rate_term: None,
             standard_charge_dollar: Some("1".to_owned()),
             standard_charge_percentage: None,
@@ -55,7 +55,7 @@ mod validation_tail_tests {
         invalid_payer.payer_name.clear();
         assert!(validate_payer(invalid_payer, None, false).is_err());
         let mut invalid_payer = payer.clone();
-        invalid_payer.plan_name.clear();
+        invalid_payer.plan_name = Some(String::new());
         assert!(validate_payer(invalid_payer, None, false).is_err());
         let mut derived_payer = payer;
         derived_payer.standard_charge_dollar = None;

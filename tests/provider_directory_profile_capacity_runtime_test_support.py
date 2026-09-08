@@ -15,7 +15,7 @@ from process.provider_directory_profile_capacity_runtime_witness import (
 # This revision is signed into the neutral cross-repository execution golden.
 # Any repository head change requires regenerating that fixture and its hashes.
 PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION = (
-    "20260907193000_hospital_price_csv_v4_v2"
+    "20260907220000_hospital_price_missing_plan"
 )
 _RUNTIME_WITNESS_BY_FIELD = {
     "healthcare_source_commit": "12" * 20,

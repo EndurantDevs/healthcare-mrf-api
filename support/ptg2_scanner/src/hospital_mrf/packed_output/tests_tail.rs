@@ -221,7 +221,7 @@
         );
         let key = HospitalPriceSelectorKey::PayerPlan {
             payer_name: component.clone(),
-            plan_name: component,
+            plan_name: Some(component),
         };
         let capacity = selector_ref_capacity(&key).unwrap();
         output.selector_key_ordinal(key).unwrap();
@@ -335,7 +335,7 @@
 
         let payer = HospitalPriceSelectorKey::PayerPlan {
             payer_name: "payer".to_owned(),
-            plan_name: "plan".to_owned(),
+            plan_name: Some("plan".to_owned()),
         };
         assert!(output
             .write_selector_pack(

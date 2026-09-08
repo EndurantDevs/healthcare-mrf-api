@@ -1,3 +1,170 @@
+    fn service_description_fixture(format: InputFormat, descriptions: &[&str]) -> Vec<u8> {
+        if format == InputFormat::Json {
+            let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+            let service = payload["standard_charge_information"][0].clone();
+            payload["standard_charge_information"] = descriptions.iter().map(|description| {
+                let mut service = service.clone();
+                service["description"] = json!(description);
+                service
+            }).collect();
+            return serde_json::to_vec(&payload).unwrap();
+        }
+        let fixture = match format {
+            InputFormat::TallCsv => fixture_tall_csv(),
+            InputFormat::WideCsv => fixture_wide_csv(),
+            InputFormat::Json => unreachable!(),
+        };
+        let mut records = csv_fixture_records(&fixture);
+        let description_column = csv_fixture_index(&records[2], "description");
+        let service = records.pop().unwrap();
+        for description in descriptions {
+            let mut service = service.clone();
+            service[description_column] = (*description).to_owned();
+            records.push(service);
+        }
+        csv_fixture_bytes(&records)
+    }
+
+    #[test]
+    fn service_description_preserves_present_whitespace() {
+        for (description, copy_description) in [
+            (" ", " "),
+            (" \t\r\n", " \\t\\r\\n"),
+            ("\u{a0}\u{2003}", "\u{a0}\u{2003}"),
+        ] {
+            let payload = service_description_fixture(InputFormat::Json, &[description]);
+            let expected_copy = run_fixture(InputFormat::Json, &payload, false);
+            assert_eq!(
+                expected_copy["service"],
+                format!("{VERSION_ID}\t0\t{copy_description}\t\\N\t\\N\n").as_bytes(),
+            );
+            let (_, expected_packed) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
+            for format in [InputFormat::Json, InputFormat::TallCsv, InputFormat::WideCsv] {
+                let payload = service_description_fixture(format, &[description]);
+                assert_eq!(run_fixture(format, &payload, false), expected_copy);
+                let (directory, summary) = import_packed(format, &payload, TEST_MAX_OUTPUT_BYTES);
+                assert_eq!(
+                    summary.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>(),
+                    expected_packed.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>()
+                );
+                let blocks = super::packed_output_tests::payloads(
+                    &directory.path().join("output/service_block.copy"),
+                );
+                let services = crate::hospital_price_service_block::decode_service_block(&blocks[0]).unwrap();
+                assert_eq!(services[0].description, description);
+                assert_eq!(services[0].codes[0].code, "70551");
+                assert_eq!(services[0].charges[0].gross_charge.as_deref(), Some("12.34"));
+                assert_eq!(summary.root.unwrap().fact_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn service_description_keeps_nonblank_trimming() {
+        for format in [InputFormat::Json, InputFormat::TallCsv, InputFormat::WideCsv] {
+            let plain = service_description_fixture(format, &["MRI,\nbrain"]);
+            let padded = service_description_fixture(format, &[" \tMRI,\nbrain\r\n "]);
+            assert_eq!(run_fixture(format, &plain, false), run_fixture(format, &padded, false));
+            let (_, plain) = import_packed(format, &plain, TEST_MAX_OUTPUT_BYTES);
+            let (_, padded) = import_packed(format, &padded, TEST_MAX_OUTPUT_BYTES);
+            assert_eq!(
+                plain.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>(),
+                padded.artifacts.iter().map(|a| (a.kind, a.rows, &a.sha256)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn service_description_keeps_distinct_source_ordinals() {
+        let descriptions = [" ", "  ", "MRI", " "];
+        for format in [InputFormat::Json, InputFormat::TallCsv, InputFormat::WideCsv] {
+            let payload = service_description_fixture(format, &descriptions);
+            let rows = run_fixture(format, &payload, false);
+            for kind in ["service", "code", "charge", "payer_charge"] {
+                assert_eq!(rows[kind].split(|byte| *byte == b'\n').count() - 1, 4);
+            }
+            let (directory, summary) = import_packed(format, &payload, TEST_MAX_OUTPUT_BYTES);
+            let root = summary.root.unwrap();
+            assert_eq!((root.service_count, root.charge_count, root.fact_count), (4, 4, 4));
+            assert_eq!((root.code_selector_key_count, root.code_selector_ref_count), (1, 4));
+            assert_eq!((root.payer_plan_selector_key_count, root.payer_plan_selector_ref_count), (1, 4));
+            let blocks = super::packed_output_tests::payloads(
+                &directory.path().join("output/service_block.copy"),
+            );
+            let services = crate::hospital_price_service_block::decode_service_block(&blocks[0]).unwrap();
+            assert_eq!(services.len(), descriptions.len());
+            for (ordinal, service) in services.iter().enumerate() {
+                assert_eq!(service.service_ordinal, ordinal as u64);
+                assert_eq!(service.description, descriptions[ordinal]);
+                assert_eq!(service.charges.len(), 1);
+                let charge = &service.charges[0];
+                assert_eq!((charge.charge_key, charge.charge_ordinal), (ordinal as u32, 0));
+                assert_eq!((charge.first_fact_ordinal, charge.fact_count), (ordinal as u64, 1));
+            }
+            let blocks = super::packed_output_tests::payloads(
+                &directory.path().join("output/fact_block.copy"),
+            );
+            let facts = crate::hospital_price_block::decode_fact_block(&blocks[0], None, None, 0, 4).unwrap();
+            assert_eq!(facts.len(), 4);
+            for (ordinal, fact) in facts.iter().enumerate() {
+                assert_eq!(fact.charge_key, ordinal as u32);
+                assert_eq!(fact.negotiated_dollar.as_deref(), Some("9.125"));
+            }
+        }
+    }
+
+    fn assert_description_error(format: InputFormat, payload: &[u8], expected: &str) {
+        assert_import_error(format, payload, DEFAULT_MAX_FANOUT_ROWS, expected);
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        let output = directory.path().join("output");
+        fs::write(&input, payload).unwrap();
+        fs::create_dir(&output).unwrap();
+        let error = import_hospital_mrf_with_output_mode(
+            format, VERSION_ID, &input, &output,
+            HospitalMrfLimits::new(DEFAULT_MAX_FANOUT_ROWS, TEST_MAX_DECOMPRESSED_BYTES, TEST_MAX_OUTPUT_BYTES),
+            HospitalMrfOutputMode::Packed,
+        ).unwrap_err();
+        assert!(error.to_string().contains(expected), "expected {expected:?} in {error}");
+        assert_eq!(fs::read_dir(output).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn service_description_rejects_absent_empty_and_nul() {
+        for (description, expected) in [
+            (json!(""), "description must be a non-empty string"),
+            (json!(null), "String"),
+            (json!(1), "String"),
+            (json!(" \0 "), "contains NUL"),
+        ] {
+            let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+            payload["standard_charge_information"][0]["description"] = description;
+            assert_description_error(InputFormat::Json, &serde_json::to_vec(&payload).unwrap(), expected);
+        }
+        let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        payload["standard_charge_information"][0].as_object_mut().unwrap().remove("description");
+        assert_description_error(InputFormat::Json, &serde_json::to_vec(&payload).unwrap(), "description");
+        for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+            for (description, expected) in [("", "description must be a non-empty string"), (" \0 ", "contains NUL")] {
+                assert_description_error(format, &service_description_fixture(format, &[description]), expected);
+            }
+            let mut records = csv_fixture_records(&service_description_fixture(format, &[" "]));
+            records[2][0] = "not_description".to_owned();
+            assert_description_error(format, &csv_fixture_bytes(&records), "description");
+        }
+    }
+
+    #[test]
+    fn service_description_keeps_code_requirements() {
+        for codes in [json!([]), json!([{"code": " ", "type": "CPT"}])] {
+            let mut payload: serde_json::Value = serde_json::from_slice(
+                &service_description_fixture(InputFormat::Json, &[" "]),
+            ).unwrap();
+            payload["standard_charge_information"][0]["code_information"] = codes;
+            assert_description_error(InputFormat::Json, &serde_json::to_vec(&payload).unwrap(), "code");
+        }
+    }
+
     #[test]
     fn optional_fields_are_preserved_and_json_enums_are_case_sensitive() {
         assert_eq!(canonical_drug_type("gr", true).unwrap(), "GR");
@@ -26,7 +193,7 @@
         let other_payer = validate_payer(
             PayerChargeRow {
                 payer_name: "Payer".to_owned(),
-                plan_name: "Plan".to_owned(),
+                plan_name: Some("Plan".to_owned()),
                 negotiated_rate_term: None,
                 standard_charge_dollar: Some("1".to_owned()),
                 standard_charge_percentage: None,

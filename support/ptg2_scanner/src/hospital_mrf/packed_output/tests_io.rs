@@ -283,12 +283,12 @@
             .is_err());
         assert!(selector_ref_capacity(&HospitalPriceSelectorKey::PayerPlan {
             payer_name: oversized.clone(),
-            plan_name: "plan".to_owned(),
+            plan_name: Some("plan".to_owned()),
         })
         .is_err());
         assert!(selector_ref_capacity(&HospitalPriceSelectorKey::PayerPlan {
             payer_name: "payer".to_owned(),
-            plan_name: oversized.clone(),
+            plan_name: Some(oversized.clone()),
         })
         .is_err());
         output.selector_keys = vec![selector_code(oversized)];

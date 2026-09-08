@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import uuid
 
@@ -12,10 +13,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from api.hospital_price_status import _CMS_V3_ATTESTATION_TEXT
-from db.models.hospital_price_header import HospitalPriceVersion
 from support.hospital_price_native_validation import (
     _CMS_V2_AFFIRMATION_TEXT,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_csv_v1_labels import _create_version_table, _insert_header
@@ -30,19 +31,22 @@ MIGRATION_PATH = (
 )
 
 
-def test_v4_v2_migration_matches_current_model() -> None:
+def test_v4_v2_keeps_original_boundary() -> None:
     migration = _load_migration(MIGRATION_PATH)
     assert migration.revision == "20260907193000_hospital_price_csv_v4_v2"
     assert migration.down_revision == (
         "20260904223000_provider_directory_michigan_generation_retirement"
     )
     drop, add = migration._upgrade_statements()
-    shape_check = next(
-        constraint for constraint in HospitalPriceVersion.__table__.constraints
-        if constraint.name == "hospital_price_version_shape_check"
-    )
     assert "DROP CONSTRAINT hospital_price_version_shape_check" in drop
-    assert add.split(" CHECK (", 1)[1][:-2] == str(shape_check.sqltext)
+    shape = add.split(" CHECK (", 1)[1][:-2]
+    assert _CMS_V2_AFFIRMATION_TEXT in shape
+    assert "template_version IN ('3.0.1', '4.0.0') AND npi_count > 0" in shape
+    assert HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 in shape
+    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 not in shape
+    assert hashlib.sha256(shape.encode()).hexdigest() == (
+        "d1378406bfcd25835ac83ab9b2ce8f2b8bd610f6c038fd030e20932c933f6de1"
+    )
     assert migration.downgrade() is None
 
 
@@ -66,10 +70,18 @@ async def prove_csv_profile_constraints(monkeypatch) -> None:
                 f"DEFAULT '{_CMS_V2_AFFIRMATION_TEXT}'"
             )
         await _run_migration(engine, _load_migration(MIGRATION_PATH), "upgrade")
+        await _run_migration(engine, _load_migration(MIGRATION_PATH.with_name(
+            "20260907220000_hospital_price_missing_plan.py"
+        )), "upgrade")
         connection = await asyncpg.connect(database_url.set(
             drivername="postgresql").render_as_string(hide_password=False))
         try:
-            await _check_v4_v2_headers(connection, table)
+            for parser_contract in (
+                HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
+                HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+            ):
+                await _check_v4_v2_headers(connection, table, parser_contract)
+                await connection.execute(f"DELETE FROM {table}")
         finally:
             await connection.close()
     finally:
@@ -77,9 +89,9 @@ async def prove_csv_profile_constraints(monkeypatch) -> None:
         await engine.dispose()
 
 
-async def _check_v4_v2_headers(connection, table):
+async def _check_v4_v2_headers(connection, table, parser_contract):
     fields_by_name = {
-        "parser_contract_sha256": HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+        "parser_contract_sha256": parser_contract,
         "source_format": "csv-tall", "template_version": "4.0.0",
     }
     for marker, source_format in (("1", "csv-tall"), ("2", "csv-wide")):

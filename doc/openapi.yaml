@@ -2114,8 +2114,10 @@ paths:
       summary: Read one hospital's packed prices for an exact billing code
       description: |
         Returns a bounded, immutable-version page. Supplying `payer_name`
-        requires `plan_name` and includes only their exact negotiated-price
-        facts; omitting both returns charge metadata without payer facts.
+        requires either `plan_name` or `plan_missing=true` and includes only
+        their exact negotiated-price facts. Missing means the publisher supplied
+        no plan, not all plans. Omitting payer selectors returns charge metadata
+        without payer facts.
       parameters:
         - name: hospital_id
           in: path
@@ -2142,7 +2144,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 4096
-          description: Exact payer name; must be supplied with plan_name.
+          description: Exact payer name; requires plan_name or plan_missing=true.
         - name: plan_name
           in: query
           schema:
@@ -2150,6 +2152,12 @@ paths:
             minLength: 1
             maxLength: 4096
           description: Exact plan name; must be supplied with payer_name.
+        - name: plan_missing
+          in: query
+          schema:
+            type: string
+            enum: ['true']
+          description: Select source-absent plans only; requires payer_name and excludes plan_name.
         - name: version_id
           in: query
           schema:
@@ -2194,7 +2202,7 @@ paths:
                         pattern: '^[0-9a-f]{64}$'
                   query:
                     type: object
-                    required: [code_type, code, payer_name, plan_name, negotiated_prices_requested]
+                    required: [code_type, code, payer_name, plan_name, plan_missing, negotiated_prices_requested]
                     properties:
                       code_type:
                         type: string
@@ -2207,6 +2215,8 @@ paths:
                         type: string
                         nullable: true
                       negotiated_prices_requested:
+                        type: boolean
+                      plan_missing:
                         type: boolean
                   pagination:
                     type: object
@@ -2253,6 +2263,10 @@ paths:
                           items:
                             type: object
                             properties:
+                              plan_name:
+                                type: string
+                                nullable: true
+                                description: Null only when the publisher supplied no plan.
                               negotiated_rate_term:
                                 type: string
                                 nullable: true

@@ -118,7 +118,7 @@ fn payer_has_charge(payer: &PayerChargeRow) -> bool {
 
 fn is_explicitly_uncontracted_csv_payer(payer: &PayerChargeRow) -> bool {
     !payer.payer_name.trim().is_empty()
-        && payer.plan_name.trim().is_empty()
+        && payer.plan_name.as_deref().is_none_or(|plan| plan.trim().is_empty())
         && !payer_has_charge(payer)
         && payer.median_amount.is_none()
         && payer.percentile_10.is_none()
@@ -152,7 +152,9 @@ fn validate_payer_common(
     methodology_optional: bool,
 ) -> io::Result<PayerChargeRow> {
     payer.payer_name = required_text(&payer.payer_name, "payer_name")?.to_owned();
-    payer.plan_name = required_text(&payer.plan_name, "plan_name")?.to_owned();
+    payer.plan_name = payer.plan_name.as_deref()
+        .map(|plan| required_text(plan, "plan_name").map(str::to_owned))
+        .transpose()?;
     payer.negotiated_rate_term = payer
         .negotiated_rate_term
         .as_deref()

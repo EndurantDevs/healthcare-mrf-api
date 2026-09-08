@@ -18,6 +18,7 @@ from api.hospital_price_serving import HospitalPriceNotFoundError
 from api.hospital_price_serving import HospitalPriceServingUnavailableError
 from api.hospital_price_serving import read_hospital_price_page
 from api.hospital_price_serving import validate_hospital_price_query
+from api.hospital_price_request import validate_hospital_price_plan
 
 
 blueprint = Blueprint(
@@ -27,7 +28,7 @@ blueprint = Blueprint(
 )
 logger = logging.getLogger(__name__)
 _QUERY_FIELDS = frozenset(
-    {"code_type", "code", "payer_name", "plan_name", "version_id", "cursor", "limit"}
+    {"code_type", "code", "payer_name", "plan_name", "plan_missing", "version_id", "cursor", "limit"}
 )
 _ERROR_BY_STATUS = {
     400: ("hospital_price_invalid_request", "Hospital price request is invalid."),
@@ -125,7 +126,7 @@ async def get_hospital_prices(request: Any, hospital_id: str):
             code_type=values.get("code_type"),
             code=values.get("code"),
             payer_name=values.get("payer_name"),
-            plan_name=values.get("plan_name"),
+            plan_name=validate_hospital_price_plan(values.get("plan_name"), values.get("plan_missing")),
             version_id=values.get("version_id"),
             cursor=values.get("cursor"),
             limit=values.get("limit"),

@@ -372,7 +372,7 @@ fn emit_json_service(
             let payer = validate_json_payer(
                 PayerChargeRow {
                     payer_name: payer.payer_name,
-                    plan_name: payer.plan_name,
+                    plan_name: Some(payer.plan_name),
                     negotiated_rate_term: None,
                     standard_charge_dollar: optional_json_decimal(
                         payer.standard_charge_dollar.as_ref(),

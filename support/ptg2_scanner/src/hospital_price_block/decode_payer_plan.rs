@@ -1,7 +1,10 @@
+type PayerPlanRef<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
+
 fn decode_payer_plan_dictionary(
     lane: &[u8],
     include_rate_term: bool,
-) -> HospitalPriceBlockResult<Vec<(&str, &str, Option<&str>)>> {
+    allow_missing_plan: bool,
+) -> HospitalPriceBlockResult<Vec<PayerPlanRef<'_>>> {
     let mut cursor = SliceCursor::new(lane);
     let count = cursor.u16()? as usize;
     if count > HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS {
@@ -12,7 +15,7 @@ fn decode_payer_plan_dictionary(
     for _ in 0..count {
         let value = (
             cursor.text()?,
-            cursor.text()?,
+            if allow_missing_plan { cursor.optional_text()? } else { Some(cursor.text()?) },
             if include_rate_term {
                 cursor.optional_text()?
             } else {

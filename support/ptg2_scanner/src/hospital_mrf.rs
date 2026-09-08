@@ -53,5 +53,6 @@ mod tests {
     include!("hospital_mrf/tests_limits.rs");
     include!("hospital_mrf/tests_rate_term.rs");
     include!("hospital_mrf/tests_packed.rs");
+    include!("hospital_mrf/tests_missing_plan.rs");
     include!("hospital_mrf/tests_optional_methodology.rs");
 }

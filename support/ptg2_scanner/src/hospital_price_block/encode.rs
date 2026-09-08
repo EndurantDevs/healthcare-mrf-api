@@ -122,7 +122,7 @@ fn add_preflight_bytes(total: &mut usize, bytes: usize) {
 }
 
 fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResult<()> {
-    let mut payer_plans = HashSet::<(&str, &str, Option<&str>)>::new();
+    let mut payer_plans = HashSet::<(&str, Option<&str>, Option<&str>)>::new();
     let mut algorithms = HashSet::<&str>::new();
     let mut methodologies = HashSet::<&str>::new();
     let mut allowed_counts = HashSet::<&str>::new();
@@ -131,12 +131,12 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
     for row in rows {
         if payer_plans.insert((
             &row.payer_name,
-            &row.plan_name,
+            row.plan_name.as_deref(),
             row.negotiated_rate_term.as_deref(),
         )) {
             add_preflight_bytes(&mut total, 12);
             add_preflight_bytes(&mut total, row.payer_name.len());
-            add_preflight_bytes(&mut total, row.plan_name.len());
+            add_preflight_bytes(&mut total, row.plan_name.as_deref().map_or(0, str::len));
             add_preflight_bytes(
                 &mut total,
                 row.negotiated_rate_term.as_deref().map_or(0, str::len),
@@ -202,6 +202,7 @@ fn frame_raw_version(
         version,
         HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION
             | HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_RATE_TERM_VERSION
             | HOSPITAL_PRICE_FACT_BLOCK_VERSION
     ) {
         return Err(invalid("version is unsupported"));
@@ -244,7 +245,7 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
             payer_plans
                 .intern(
                     &row.payer_name,
-                    &row.plan_name,
+                    row.plan_name.as_deref(),
                     row.negotiated_rate_term.as_deref(),
                 )
                 .expect("row cap bounds payer-plan dictionary IDs"),
