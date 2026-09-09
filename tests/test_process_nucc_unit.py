@@ -117,33 +117,33 @@ async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path)
 async def test_nucc_csv_preserves_text_across_read_chunks(
     monkeypatch, nucc_module, tmp_path, encoding
 ):
-    definitions = [
-        f'{index}: A quoted "term", a newline\r\n and UTF-8 café. ' * 16
-        for index in range(1000)
+    definition_text_list = [
+        f'{row_number}: A quoted "term", a newline\r\n and UTF-8 café. ' * 16
+        for row_number in range(1000)
     ]
-    source = tmp_path / "nucc.csv"
-    with source.open("w", encoding=encoding, newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(["Code", "Definition"])
-        for index, definition in enumerate(definitions):
-            writer.writerow([f"{index:010d}", definition])
-    rows = []
+    source_csv_path = tmp_path / "nucc.csv"
+    with source_csv_path.open("w", encoding=encoding, newline="") as csv_stream:
+        csv_writer = csv.writer(csv_stream)
+        csv_writer.writerow(["Code", "Definition"])
+        for row_number, definition_text in enumerate(definition_text_list):
+            csv_writer.writerow([f"{row_number:010d}", definition_text])
+    taxonomy_row_list = []
 
-    async def capture_rows(items, _model):
-        rows.extend(items)
+    async def capture_rows(taxonomy_row_batch, _model):
+        taxonomy_row_list.extend(taxonomy_row_batch)
 
     monkeypatch.setattr(nucc_module, "push_objects", capture_rows)
-    csv_map = await nucc_module._read_nucc_csv_map(str(source))
-    count = await nucc_module._stage_nucc_taxonomy_rows(
-        {"context": {}}, {}, str(source), csv_map, object(),
+    csv_map = await nucc_module._read_nucc_csv_map(str(source_csv_path))
+    row_count = await nucc_module._stage_nucc_taxonomy_rows(
+        {"context": {}}, {}, str(source_csv_path), csv_map, object(),
         test_mode=False, run_id="", source_file="nucc.csv",
     )
 
-    assert count == len(definitions)
-    for index, row in enumerate(rows):
-        code = f"{index:010d}"
-        assert row == {
-            "code": code, "definition": definitions[index],
+    assert row_count == len(definition_text_list)
+    for row_number, taxonomy_row in enumerate(taxonomy_row_list):
+        code = f"{row_number:010d}"
+        assert taxonomy_row == {
+            "code": code, "definition": definition_text_list[row_number],
             "int_code": nucc_module.return_checksum([code], crc=32),
         }
 
