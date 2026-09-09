@@ -22,6 +22,7 @@ from api.provider_directory_rooted_fhir_publication import (
     is_rooted_fhir_catalog_entry,
     rooted_fhir_publication_summary,
     ROOTED_FHIR_PUBLICATION_FIELD,
+    ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID,
     ROOTED_FHIR_SOURCE_ID_GROUP,
 )
 from api.provider_directory_source_dataset_selection import (
@@ -308,6 +309,23 @@ def _publication_candidate_context(
     )
 
 
+def _attach_rooted_summary(
+    enriched_entry_map: dict[str, Any], rooted_summary: dict[str, Any]
+) -> None:
+    """Attach request omissions without implying complete resource coverage."""
+
+    enriched_entry_map[ROOTED_FHIR_PUBLICATION_FIELD] = rooted_summary
+    if (
+        rooted_summary.get("contract_id")
+        == ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID
+        and rooted_summary.get("state") == "partial"
+    ):
+        enriched_entry_map["coverage_warning"] = (
+            enriched_entry_map.get("coverage_warning")
+            or "Some logical requests failed; missing-resource coverage is unknown."
+        )
+
+
 def _enriched_catalog_entry(
     catalog_entry: Mapping[str, Any],
     dataset_by_source_ids: Mapping[
@@ -364,7 +382,7 @@ def _enriched_catalog_entry(
             candidate_payload_map
         )
     if rooted_summary is not None and is_rooted_fhir_catalog_entry(catalog_entry):
-        enriched_entry_map[ROOTED_FHIR_PUBLICATION_FIELD] = rooted_summary
+        _attach_rooted_summary(enriched_entry_map, rooted_summary)
     return enriched_entry_map
 
 

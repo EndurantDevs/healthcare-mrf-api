@@ -10,8 +10,12 @@ import json
 from typing import Any
 
 from db.connection import db
+from process.fhir_request_failure_policy import can_tolerate_fhir_request_failures
 from process import uhc_flex_official_cohort_store as official_cohort
 from process import uhc_flex_practitioner_single_root_contract as single_root
+from process.uhc_flex_practitioner_acquisition_contract import (
+    UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+)
 from process.uhc_flex_practitioner_store_contract import (
     ACQUISITION_PATTERN,
     strict_identifier,
@@ -345,6 +349,17 @@ async def admit_uhc_flex_practitioner_single_root(
             )
         except ValueError as error:
             raise UHCFlexPractitionerTwinStoreError("identity") from error
+        if not can_tolerate_fhir_request_failures(
+            total_count=candidate.expected_npi_count,
+            completed_count=candidate.expected_npi_count - candidate.error_count,
+            error_count_by_code={
+                UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE: candidate.error_count
+            },
+        ):
+            # Historical admissions stay readable, but cannot be newly minted.
+            stored_admission = await _read_admission(database, candidate_acquisition_id)
+            _require_exact_admission(stored_admission, expected_admission)
+            return stored_admission
         await _insert_admission(database, expected_admission)
         stored_admission = await _read_admission(database, candidate_acquisition_id)
         _require_exact_admission(stored_admission, expected_admission)

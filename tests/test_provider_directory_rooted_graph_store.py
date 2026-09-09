@@ -239,7 +239,7 @@ async def test_dedicated_census_claim_returns_db_sorted_root_network_anchors() -
             "Organization/network.synthetic-a",
             "Organization/network.synthetic-b",
         ),
-        "root_closure_complete": True,
+        "root_frontier_drained": True,
         "census_count": 0,
     }
     database = _Database(
@@ -262,7 +262,7 @@ async def test_dedicated_census_claim_returns_db_sorted_root_network_anchors() -
     )
     sql = "\n".join(statement for statement, _ in database.statements)
     assert "LOCK TABLE" in sql
-    assert "root_closure_complete" in sql
+    assert "root_frontier_drained" in sql
     assert "full_insurance_plan_census" in sql
     assert "claim_census" in str(database.statements)
 

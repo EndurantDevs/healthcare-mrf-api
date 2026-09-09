@@ -53,6 +53,7 @@ def _has_valid_authority_branch(candidate: object) -> bool:
         != candidate.comparison_acquisition_id
         and candidate.reviewed_root_policy_json is None
         and candidate.acquisition_operation_key is None
+        and candidate.request_failure_coverage is None
     )
     is_single_root = bool(
         candidate.admission_contract_id
@@ -105,12 +106,14 @@ def _has_valid_admission_coordinates(candidate: object) -> bool:
 
 
 def _has_valid_admission_proof(candidate: object) -> bool:
+    from process.provider_directory_rooted_graph_twin_contract import (
+        _has_valid_terminal_work,
+    )
+
     count_fields = (
         "completed_count",
         "resource_count",
         "edge_count",
-        "insurance_plan_count",
-        "insurance_plan_page_count",
         "used_work_items",
         "used_resource_rows",
         "used_edge_rows",
@@ -137,9 +140,9 @@ def _has_valid_admission_proof(candidate: object) -> bool:
             type(getattr(candidate, name)) is int and getattr(candidate, name) >= 0
             for name in count_fields
         )
-        and candidate.completed_count >= 1
-        and candidate.insurance_plan_page_count >= 1
-        and candidate.used_work_items == candidate.completed_count
+        and _has_valid_terminal_work(
+            candidate, candidate.used_work_items - candidate.completed_count
+        )
         and candidate.used_resource_rows == candidate.resource_count
         and candidate.used_edge_rows == candidate.edge_count
         and candidate.used_work_items <= candidate.max_work_items
@@ -192,8 +195,8 @@ class ProviderDirectoryRootedGraphTwinAdmission:
     completed_count: int
     resource_count: int
     edge_count: int
-    insurance_plan_count: int
-    insurance_plan_page_count: int
+    insurance_plan_count: int | None
+    insurance_plan_page_count: int | None
     used_work_items: int
     used_resource_rows: int
     used_edge_rows: int
@@ -206,6 +209,7 @@ class ProviderDirectoryRootedGraphTwinAdmission:
     admitted_at: datetime
     reviewed_root_policy_json: dict[str, object] | None = None
     acquisition_operation_key: str | None = None
+    request_failure_coverage: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         """Reject forged admission capabilities at the public type boundary."""
@@ -230,12 +234,16 @@ class ProviderDirectoryRootedGraphTwinAdmission:
             raise ValueError("provider_directory_rooted_graph_twin_admission_invalid")
 
 
-def _admission_identity_fields(contract_id: object) -> tuple[str, ...]:
+def _admission_identity_fields(
+    contract_id: object, request_failure_coverage: object = None
+) -> tuple[str, ...]:
     from process.provider_directory_rooted_graph_twin_contract import (
         PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID,
     )
 
     excluded_fields = {"admission_id", "admitted_at"}
+    if request_failure_coverage is None:
+        excluded_fields.add("request_failure_coverage")
     if contract_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID:
         excluded_fields.update(
             {"reviewed_root_policy_json", "acquisition_operation_key"}
@@ -250,7 +258,8 @@ def _admission_identity_fields(contract_id: object) -> tuple[str, ...]:
 def _admission_identity_values(admission: object) -> tuple[object, ...]:
     values: list[object] = []
     for field_name in _admission_identity_fields(
-        getattr(admission, "admission_contract_id", None)
+        getattr(admission, "admission_contract_id", None),
+        getattr(admission, "request_failure_coverage", None),
     ):
         values.append(
             _normalized_admission_identity_value(
@@ -264,7 +273,7 @@ def _normalized_admission_identity_value(
     field_name: str,
     value: object,
 ) -> object:
-    if field_name == "reviewed_root_policy_json":
+    if field_name in {"reviewed_root_policy_json", "request_failure_coverage"}:
         return json.dumps(value, separators=(",", ":"), sort_keys=True)
     return value
 
@@ -378,6 +387,7 @@ def build_rooted_graph_twin_admission(
     if (
         type(attempt) is not ProviderDirectoryRootedGraphTwinAttempt
         or type(publication_root) is not ProviderDirectoryRootedGraphSealedRoot
+        or publication_root.request_failure_coverage is not None
         or attempt.matched is not True
         or publication_root.acquisition_role != "candidate"
         or publication_root.acquisition_id
@@ -397,7 +407,8 @@ def build_rooted_graph_twin_admission(
             field_name, admission_by_field[field_name]
         )
         for field_name in _admission_identity_fields(
-            admission_by_field["admission_contract_id"]
+            admission_by_field["admission_contract_id"],
+            admission_by_field.get("request_failure_coverage"),
         )
     )
     admission_by_field["admission_id"] = _digest_identifier(
@@ -458,7 +469,8 @@ def build_rooted_graph_single_root_admission(
             field_name, admission_by_field[field_name]
         )
         for field_name in _admission_identity_fields(
-            admission_by_field["admission_contract_id"]
+            admission_by_field["admission_contract_id"],
+            admission_by_field.get("request_failure_coverage"),
         )
     )
     admission_by_field["admission_id"] = _digest_identifier(

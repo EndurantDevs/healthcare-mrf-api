@@ -14,7 +14,10 @@ from process.provider_directory_rooted_graph_identity import (
     SHA256_PATTERN,
 )
 from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
+)
+from process.provider_directory_rooted_graph_request_coverage import (
+    has_matching_rooted_request_coverage,
 )
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
@@ -126,8 +129,9 @@ def _has_invalid_variant_lineage(candidate: object) -> bool:
     )
     return bool(
         variant not in {"uhc_flex_practitioner", "rooted_combined"}
-        or PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT.get(variant)
-        != publication_contract_id
+        or not has_matching_rooted_graph_root_publication(
+            variant, publication_contract_id
+        )
         or (
             variant == "rooted_combined" and not (has_same_source and has_same_endpoint)
         )
@@ -135,6 +139,33 @@ def _has_invalid_variant_lineage(candidate: object) -> bool:
             variant == "uhc_flex_practitioner"
             and (has_same_source or has_same_endpoint)
         )
+    )
+
+
+def _has_valid_terminal_work(candidate: object, error_count: int) -> bool:
+    coverage = candidate.request_failure_coverage
+    if (
+        not has_matching_rooted_request_coverage(
+            coverage, completed_count=candidate.completed_count, error_count=error_count
+        )
+        or candidate.used_work_items < 1
+        or candidate.used_work_items != candidate.completed_count + error_count
+    ):
+        return False
+    plan_count = candidate.insurance_plan_count
+    page_count = candidate.insurance_plan_page_count
+    if plan_count is None or page_count is None:
+        return bool(
+            coverage is not None
+            and error_count > 0
+            and plan_count is None
+            and page_count is None
+        )
+    return bool(
+        type(plan_count) is int
+        and plan_count >= 0
+        and type(page_count) is int
+        and page_count >= 1
     )
 
 
@@ -174,8 +205,8 @@ class ProviderDirectoryRootedGraphSealedRoot:
     error_count: int
     resource_count: int
     edge_count: int
-    insurance_plan_count: int
-    insurance_plan_page_count: int
+    insurance_plan_count: int | None
+    insurance_plan_page_count: int | None
     used_work_items: int
     used_resource_rows: int
     used_edge_rows: int
@@ -184,9 +215,14 @@ class ProviderDirectoryRootedGraphSealedRoot:
     resource_set_sha256: str
     edge_set_sha256: str
     rooted_graph_sha256: str
+    request_failure_coverage: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
-        counts = tuple(getattr(self, name) for name in _SEALED_COUNT_FIELDS)
+        counts = tuple(
+            getattr(self, name)
+            for name in _SEALED_COUNT_FIELDS
+            if name not in {"insurance_plan_count", "insurance_plan_page_count"}
+        )
         hashes = tuple(getattr(self, name) for name in _SEALED_HASH_FIELDS)
         if (
             ACQUISITION_PATTERN.fullmatch(self.acquisition_id) is None
@@ -228,10 +264,7 @@ class ProviderDirectoryRootedGraphSealedRoot:
             or any(type(count) is not int or count < 0 for count in counts)
             or self.pending_count != 0
             or self.leased_count != 0
-            or self.completed_count < 1
-            or self.error_count != 0
-            or self.insurance_plan_page_count < 1
-            or self.used_work_items != self.completed_count
+            or not _has_valid_terminal_work(self, self.error_count)
             or self.used_resource_rows != self.resource_count
             or self.used_edge_rows != self.edge_count
             or self.used_work_items > self.max_work_items
@@ -265,6 +298,8 @@ def _ordered_roots(
     if (
         type(first) is not ProviderDirectoryRootedGraphSealedRoot
         or type(second) is not ProviderDirectoryRootedGraphSealedRoot
+        or first.request_failure_coverage is not None
+        or second.request_failure_coverage is not None
         or first.acquisition_id == second.acquisition_id
         or {first.acquisition_role, second.acquisition_role}
         != {"baseline", "candidate"}

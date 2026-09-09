@@ -8,6 +8,10 @@ import json
 from typing import Any
 
 from db.connection import db
+from process.fhir_request_failure_policy import (
+    FHIR_REQUEST_FAILURE_BUDGET_MULTIPLIER,
+    can_tolerate_fhir_request_failures,
+)
 from process.uhc_flex_practitioner_acquisition_contract import (
     UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
     UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
@@ -272,6 +276,11 @@ _SEAL_BUILDING_HEADER_SQL = """
       FROM census, resource_census
      WHERE acquisition.acquisition_id = :acquisition_id
        AND acquisition.status = 'building'
+       AND census.pending_count = 0 AND census.leased_count = 0
+       AND census.matched_count + census.unmatched_count + census.error_count
+           = acquisition.expected_npi_count
+       AND census.error_count * :failure_budget_multiplier
+           < acquisition.expected_npi_count
        AND NOT EXISTS (
             SELECT 1 FROM {work_table} AS exhausted
              WHERE exhausted.acquisition_id = acquisition.acquisition_id
@@ -306,6 +315,7 @@ async def _seal_building_header(
             UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE
         ),
         max_attempts=UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
+        failure_budget_multiplier=FHIR_REQUEST_FAILURE_BUDGET_MULTIPLIER,
     )
 
 
@@ -314,7 +324,7 @@ async def seal_uhc_flex_practitioner_acquisition(
     *,
     database: Any = db,
 ) -> UHCFlexPractitionerAcquisitionSummary:
-    """Seal exact or retry-exhausted coverage after every member terminates."""
+    """Seal terminal coverage below the failure budget; preserve sealed replays."""
 
     if type(identity) is not UHCFlexPractitionerAcquisitionIdentity:
         raise ValueError("Flex Practitioner acquisition identity is invalid")
@@ -338,7 +348,16 @@ async def seal_uhc_flex_practitioner_acquisition(
         sealed_header = await _seal_building_header(database, identity.acquisition_id)
         if sealed_header is None:
             raise UHCFlexPractitionerStoreError("state")
-        return _summary_from_row(sealed_header)
+        summary = _summary_from_row(sealed_header)
+        if not can_tolerate_fhir_request_failures(
+            total_count=summary.expected_npi_count,
+            completed_count=summary.matched_count + summary.unmatched_count,
+            error_count_by_code={
+                UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE: summary.error_count
+            },
+        ):
+            raise UHCFlexPractitionerStoreError("state")
+        return summary
 
 
 async def _resource_page_records(

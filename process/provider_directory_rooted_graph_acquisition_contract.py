@@ -26,7 +26,7 @@ from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_AUTHORITY_ID,
@@ -64,7 +64,9 @@ PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ROOT_TIMEOUT_SECONDS = (
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ROOT_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 ROOT_ROLES = ("baseline", "candidate")
 ACQUISITION_STATES = frozenset({"absent", "building", "sealed"})
-CENSUS_STATES = frozenset({"absent", "pending", "leased", "completed", "error"})
+CENSUS_STATES = frozenset(
+    {"absent", "pending", "leased", "completed", "error", "timeout_skipped"}
+)
 
 
 class ProviderDirectoryRootedGraphAcquisitionError(RuntimeError):
@@ -115,10 +117,9 @@ def _is_snapshot_registry_valid(snapshot: Any) -> bool:
     return bool(
         type(snapshot.root_publication_contract_id) is str
         and 0 < len(snapshot.root_publication_contract_id) <= 96
-        and PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT.get(
-            snapshot.root_dataset_variant
+        and has_matching_rooted_graph_root_publication(
+            snapshot.root_dataset_variant, snapshot.root_publication_contract_id
         )
-        == snapshot.root_publication_contract_id
         and type(snapshot.root_source_id) is str
         and 0 < len(snapshot.root_source_id) <= 64
         and type(snapshot.root_endpoint_id) is str
@@ -355,7 +356,7 @@ class ProviderDirectoryRootedGraphInputSnapshot:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ProviderDirectoryRootedGraphRootReceipt:
-    """Compact evidence that one role reached an error-free sealed graph."""
+    """Compact sealed-root receipt; admission carries request-coverage evidence."""
 
     acquisition_role: str
     acquisition_id: str = field(repr=False)

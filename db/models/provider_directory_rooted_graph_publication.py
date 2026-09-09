@@ -9,6 +9,7 @@ import os
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date
 from sqlalchemy import ForeignKeyConstraint, Integer, PrimaryKeyConstraint
 from sqlalchemy import String, TIMESTAMP, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -32,6 +33,8 @@ _ACQUISITION = "provider_directory_rooted_graph_acquisition"
 _SOURCE = "provider_directory_source"
 _ENDPOINT = "provider_directory_api_endpoint"
 _PUBLICATION_CONTRACT = "healthporta.provider-directory.rooted-graph-publication.v1"
+_PARTIAL_PUBLICATION_CONTRACT = "healthporta.provider-directory.rooted-graph-publication.v2"
+_FAILURE_VALID = '"' + _SCHEMA.replace('"', '""') + '"."provider_directory_fhir_request_failure_coverage_valid"'
 _LEGACY_PUBLICATION_CONTRACT = (
     "healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"
 )
@@ -136,7 +139,12 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
             name="pd_rooted_graph_dataset_previous_fkey",
         ),
         CheckConstraint(
-            f"publication_contract_id = '{_PUBLICATION_CONTRACT}' AND "
+            "((request_failure_coverage IS NULL AND "
+            f"publication_contract_id = '{_PUBLICATION_CONTRACT}' "
+            "AND census_insurance_plan_count IS NOT NULL AND insurance_plan_page_count IS NOT NULL) OR "
+            "(request_failure_coverage IS NOT NULL AND "
+            f"publication_contract_id = '{_PARTIAL_PUBLICATION_CONTRACT}' AND "
+            f"{_FAILURE_VALID}(request_failure_coverage))) AND "
             "publication_kind = 'rooted_combined' AND "
             "dataset_id ~ '^pdrgpd_[0-9a-f]{48}$' AND "
             "acquisition_root_run_id ~ '^pdrgpr_[0-9a-f]{48}$' AND "
@@ -153,14 +161,15 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
             f"root_source_id = '{_LEGACY_SOURCE_ID}' AND "
             f"root_endpoint_id = '{_LEGACY_ENDPOINT_ID}') OR "
             "(root_dataset_variant = 'rooted_combined' AND "
-            f"root_publication_contract_id = '{_PUBLICATION_CONTRACT}' AND "
+            f"root_publication_contract_id IN ('{_PUBLICATION_CONTRACT}', '{_PARTIAL_PUBLICATION_CONTRACT}') AND "
             "root_source_id = source_id AND root_endpoint_id = endpoint_id)) AND "
             "root_dataset_hash ~ '^[0-9a-f]{64}$' AND "
             "root_content_proof_sha256 ~ '^[0-9a-f]{64}$' AND "
             "operation_key ~ '^[0-9a-f]{64}$' AND "
             "rooted_graph_sha256 ~ '^[0-9a-f]{64}$' AND "
             "resource_hash_contract = 'semantic_content_v3' AND "
-            "cohort_complete IN (TRUE, FALSE) AND rooted_graph_complete IS TRUE AND "
+            "cohort_complete IN (TRUE, FALSE) AND rooted_graph_complete = "
+            "(COALESCE((request_failure_coverage ->> 'rooted_failed_requests')::bigint, 0) = 0) AND "
             "endpoint_collection_complete IS FALSE AND endpoint_complete IS FALSE "
             "AND max_work_items > root_practitioner_resource_count "
             "AND max_work_items BETWEEN 1 AND 16500000 "
@@ -171,7 +180,7 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
             "AND used_resource_rows BETWEEN 0 AND max_resource_rows "
             "AND used_edge_rows BETWEEN 0 AND max_edge_rows "
             "AND used_payload_bytes BETWEEN 0 AND max_payload_bytes "
-            "AND completed_count = used_work_items "
+            "AND completed_count + COALESCE((request_failure_coverage ->> 'rooted_failed_requests')::bigint, 0) = used_work_items "
             "AND graph_resource_count = used_resource_rows "
             "AND graph_edge_count = used_edge_rows "
             "AND root_practitioner_resource_count > 0 "
@@ -261,8 +270,9 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
     completed_count = Column(BigInteger, nullable=False)
     graph_resource_count = Column(BigInteger, nullable=False)
     graph_edge_count = Column(BigInteger, nullable=False)
-    census_insurance_plan_count = Column(BigInteger, nullable=False)
-    insurance_plan_page_count = Column(Integer, nullable=False)
+    census_insurance_plan_count = Column(BigInteger)
+    insurance_plan_page_count = Column(Integer)
+    request_failure_coverage = Column(JSONB)
     terminal_set_sha256 = Column(String(64), nullable=False)
     resource_set_sha256 = Column(String(64), nullable=False)
     edge_set_sha256 = Column(String(64), nullable=False)

@@ -8,6 +8,7 @@ import asyncio
 from dataclasses import dataclass, field
 import hashlib
 from typing import Any
+import urllib.parse
 
 import aiohttp
 from yarl import URL
@@ -27,6 +28,7 @@ from process.provider_directory_rooted_graph_http_transport import (
     ProviderDirectoryRootedGraphHTTPBounds,
     ProviderDirectoryRootedGraphHTTPError,
     ProviderDirectoryRootedGraphHTTPResult,
+    _QueryBudget,
     _read_body,
     _request_url_identity,
     _require_response_url,
@@ -193,8 +195,13 @@ async def _request_payload(
     request_url: str,
     claim: ProviderDirectoryRootedGraphWorkClaim,
     bounds: ProviderDirectoryRootedGraphHTTPBounds,
-    query_remaining: int,
+    budget: _QueryBudget,
 ) -> tuple[dict[str, Any], bytes, int | None]:
+    if budget.requests_remaining <= 0:
+        raise ProviderDirectoryRootedGraphHTTPError("page_limit")
+    if budget.bytes_remaining <= 0:
+        raise ProviderDirectoryRootedGraphHTTPError("query_limit")
+    budget.requests_remaining -= 1
     async with session.get(
         URL(request_url, encoded=True),
         headers={
@@ -214,7 +221,8 @@ async def _request_payload(
             response,
             declared_length=declared,
             page_limit=body_limit,
-            query_remaining=min(query_remaining, body_limit),
+            query_remaining=min(budget.bytes_remaining, body_limit),
+            budget=budget,
         )
     response_by_field = _strict_json_payload(body)
     if missing_status is not None:
@@ -322,10 +330,11 @@ async def _fetch_query(
     query: ProviderDirectoryRootedGraphQuery,
     claim: ProviderDirectoryRootedGraphWorkClaim,
     bounds: ProviderDirectoryRootedGraphHTTPBounds,
+    request_url: str,
+    budget: _QueryBudget,
 ) -> ProviderDirectoryRootedGraphHTTPResult:
     """Fetch every page of one rebound query under exact finite bounds."""
 
-    request_url = query.url
     if _url_byte_length(request_url) > bounds.max_url_bytes:
         raise ProviderDirectoryRootedGraphHTTPError("request_invalid")
     search_state = _SearchState()
@@ -337,7 +346,7 @@ async def _fetch_query(
             request_url,
             claim,
             bounds,
-            bounds.max_query_bytes - search_state.total_bytes,
+            budget,
         )
         if missing_status is not None:
             return ProviderDirectoryRootedGraphHTTPResult(
@@ -375,6 +384,47 @@ async def _fetch_query(
     return search_state.build_result(claim)
 
 
+def _search_start_url(query: ProviderDirectoryRootedGraphQuery, page_size: int) -> str:
+    """Change only the wire page-size hint, not the durable logical query."""
+
+    parsed = urllib.parse.urlsplit(query.url)
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query_text = urllib.parse.urlencode(
+        [(key, str(page_size) if key == "_count" else value) for key, value in pairs]
+    )
+    return urllib.parse.urlunsplit(parsed._replace(query=query_text))
+
+
+async def _fetch_with_smaller_pages(
+    session: Any,
+    query: ProviderDirectoryRootedGraphQuery,
+    claim: ProviderDirectoryRootedGraphWorkClaim,
+    bounds: ProviderDirectoryRootedGraphHTTPBounds,
+) -> ProviderDirectoryRootedGraphHTTPResult:
+    """Restart timed-out searches at smaller sizes within shared hard caps."""
+
+    budget = _QueryBudget(bounds.max_pages, bounds.max_query_bytes)
+    request_url = query.url
+    page_size = query.page_size
+    while True:
+        try:
+            return await _fetch_query(
+                session, query, claim, bounds, request_url, budget
+            )
+        except (TimeoutError, ProviderDirectoryRootedGraphHTTPError) as error:
+            if (
+                isinstance(error, ProviderDirectoryRootedGraphHTTPError)
+                and error.code != "transport_timeout"
+            ):
+                raise
+        if page_size is None or page_size <= 1:
+            raise ProviderDirectoryRootedGraphHTTPError(
+                "transport_timeout", retryable=page_size is None
+            ) from None
+        page_size = max(1, page_size // 2)
+        request_url = _search_start_url(query, page_size)
+
+
 async def fetch_provider_directory_rooted_graph_query(
     session: Any,
     api_base: str,
@@ -390,7 +440,7 @@ async def fetch_provider_directory_rooted_graph_query(
         raise ProviderDirectoryRootedGraphHTTPError("request_invalid")
     try:
         query = rebind_provider_directory_rooted_graph_query(api_base, claim)
-        return await _fetch_query(session, query, claim, bounds)
+        return await _fetch_with_smaller_pages(session, query, claim, bounds)
     except asyncio.CancelledError:
         raise
     except ProviderDirectoryRootedGraphHTTPError:
@@ -398,11 +448,6 @@ async def fetch_provider_directory_rooted_graph_query(
     except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError, EOFError):
         raise ProviderDirectoryRootedGraphHTTPError(
             "payload_truncated",
-            retryable=True,
-        ) from None
-    except (asyncio.TimeoutError, TimeoutError):
-        raise ProviderDirectoryRootedGraphHTTPError(
-            "transport_timeout",
             retryable=True,
         ) from None
     except (aiohttp.ClientConnectionError, ConnectionError, OSError):

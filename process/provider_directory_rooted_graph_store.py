@@ -273,7 +273,7 @@ async def _root_closure_fields(
     )
     if (
         type(closure_fields.get("canonical_api_base")) is not str
-        or closure_fields.get("root_closure_complete") is not True
+        or closure_fields.get("root_frontier_drained") is not True
         or closure_fields.get("census_count") not in {0, 1}
     ):
         raise ProviderDirectoryRootedGraphStoreError("state")
@@ -319,7 +319,7 @@ async def claim_provider_directory_rooted_graph_census(
     lease_seconds: int = 300,
     database: Any = db,
 ) -> ProviderDirectoryRootedGraphCensusClaim | None:
-    """Admit and claim the plan census only after locked root fixed-point proof."""
+    """Claim the plan census after locked known-root frontier terminality proof."""
 
     if type(identity) is not ProviderDirectoryRootedGraphAcquisitionIdentity:
         raise ValueError("provider_directory_rooted_graph_identity_invalid")

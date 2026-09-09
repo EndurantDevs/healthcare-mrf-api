@@ -18,7 +18,7 @@ from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 
 
@@ -205,10 +205,10 @@ def _validated_scope_by_field(
         and root_pair == acquisition_pair
     )
     if (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT.get(
-            identity_by_field["root_dataset_variant"]
+        not has_matching_rooted_graph_root_publication(
+            identity_by_field["root_dataset_variant"],
+            identity_by_field["root_publication_contract_id"],
         )
-        != identity_by_field["root_publication_contract_id"]
         or not is_lineage_variant_valid
         or identity_by_field["max_work_items"]
         <= identity_by_field["root_resource_count"]

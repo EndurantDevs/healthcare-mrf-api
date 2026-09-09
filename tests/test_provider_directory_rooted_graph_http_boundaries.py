@@ -391,7 +391,7 @@ async def test_payload_truncation_is_retryable_and_response_url_must_be_exact() 
     ],
 )
 @pytest.mark.asyncio
-async def test_timeout_connection_and_truncation_failures_are_retryable(
+async def test_transport_failures_retry_except_exhausted_search_timeouts(
     error: BaseException,
 ) -> None:
     query, claim = role_claim()
@@ -406,7 +406,7 @@ async def test_timeout_connection_and_truncation_failures_are_retryable(
             API_BASE,
             claim,
         )
-    assert error_info.value.retryable is True
+    assert error_info.value.retryable is (not isinstance(error, TimeoutError))
 
 
 def test_retry_after_parser_is_bounded_and_rejects_bad_values() -> None:
