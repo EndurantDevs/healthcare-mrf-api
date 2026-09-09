@@ -10,6 +10,7 @@ import hashlib
 import io
 import re
 from datetime import date, datetime
+from itertools import count
 
 from process.massachusetts_profile_rows import _source_date
 from process.provider_directory_projection_types import stable_hash
@@ -34,6 +35,9 @@ PRACTICE_FIELDS = (
     "PracticeZIP", "PracticeAreaCode", "PracticePhoneNumber", "PracticeExtension", "PracticeCounty",
 )
 EXTRA_FIELDS = ("Gender", "Race") + PRACTICE_FIELDS
+ORDERED_PRACTICE_HEADER = (BASE_FIELDS + FACT_FIELDS_BY_CATEGORY["specialties"] + PRACTICE_FIELDS
+                           + FACT_FIELDS_BY_CATEGORY["education"] + FACT_FIELDS_BY_CATEGORY["training"])
+IDENTITY_PREFIX = re.compile(r'(?:"(?:[^"]|"")*",){14}')
 REQUIRED_FIELDS = frozenset(BASE_FIELDS + sum(FACT_FIELDS_BY_CATEGORY.values(), ()))
 PROFESSION_CODES = {("Medical Examiners", "Medical Doctor"): "1606", ("Osteopathy", "Osteopathic Physician"): "1907"}
 FACT_TYPES = {"education": "education_history", "training": "other_training", "specialties": "specialty"}
@@ -67,18 +71,64 @@ def _validated_evidence(content, evidence):
     return evidence_by_field
 
 
+def _captured_lines(source_text, captured_lines):
+    for line in io.StringIO(source_text, newline=""):
+        captured_lines.append(line)
+        yield line
+
+
 def _csv_reader(content):
     try:
         source_text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise ValueError("tennessee_profile_encoding_invalid") from None
     _require("\x00" not in source_text, "input_invalid")
-    reader = csv.reader(io.StringIO(source_text, newline=""), strict=True)
+    captured_lines = []
+    reader = csv.reader(_captured_lines(source_text, captured_lines), strict=True)
     header = next(reader, [])
     _require(len(header) == len(set(header)) and set(header) in (
         REQUIRED_FIELDS, REQUIRED_FIELDS | set(PRACTICE_FIELDS), REQUIRED_FIELDS | set(EXTRA_FIELDS),
     ), "headers_invalid")
-    return header, reader
+    return header, reader, captured_lines
+
+
+def _quarantined_row(header, captured_lines, error, physical_line):
+    """Read only a strict identity prefix from the observed single-line quote error."""
+    _require(tuple(header) == ORDERED_PRACTICE_HEADER and len(captured_lines) == 1
+             and str(error) == "',' expected after '\"'", "csv_invalid")
+    raw_text = captured_lines[0]
+    # Bound the entire uninterpreted line so no possible field exceeds its cap.
+    _require(len(raw_text) <= MAX_FIELD_CHARS, "field_limit")
+    _require(raw_text.startswith('"') and raw_text.endswith('"\r\n')
+             and raw_text.count('\",\"') == 33, "csv_invalid")
+    prefix = IDENTITY_PREFIX.match(raw_text)
+    _require(prefix is not None, "csv_invalid")
+    cells = next(csv.reader([prefix.group(0)[:-1]], strict=True))
+    _require(len(cells) == len(BASE_FIELDS) and (cells[0], cells[1]) in PROFESSION_CODES
+             and cells[3].strip() and cells[4].strip() and re.fullmatch(r"[0-9]{1,32}", cells[7].strip()), "csv_invalid")
+    return dict(zip(BASE_FIELDS, cells)), {
+        "reason": "csv_quote_invalid", "raw_text": raw_text,
+        "content_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+        "physical_line_start": physical_line, "physical_line_end": physical_line,
+    }
+
+
+def _source_rows(header, reader, captured_lines):
+    for row_number in count(1):
+        captured_lines.clear()
+        physical_line = reader.line_num + 1
+        try:
+            cells = next(reader)
+        except StopIteration:
+            return
+        except csv.Error as error:
+            source_by_field, malformed = _quarantined_row(header, captured_lines, error, physical_line)
+        else:
+            _require(len(cells) == len(header), "row_width_invalid")
+            _require(all(len(cell) <= MAX_FIELD_CHARS for cell in cells), "field_limit")
+            source_by_field, malformed = dict(zip(header, cells)), None
+        _require(row_number <= MAX_ROWS, "row_limit")
+        yield row_number, source_by_field, malformed
 
 
 def _retained_record(source_row, row_number, evidence):
@@ -100,23 +150,25 @@ def _retained_record(source_row, row_number, evidence):
     }
 
 
-def _group_source_rows(header, reader, evidence):
+def _group_source_rows(header, reader, captured_lines, evidence):
     records_by_key = {}
-    for row_number, cells in enumerate(reader, start=1):
-        _require(row_number <= MAX_ROWS, "row_limit")
-        _require(len(cells) == len(header), "row_width_invalid")
-        _require(all(len(cell) <= MAX_FIELD_CHARS for cell in cells), "field_limit")
-        source_by_field = dict(zip(header, cells))
+    for row_number, source_by_field, malformed in _source_rows(header, reader, captured_lines):
         source_record = _retained_record(source_by_field, row_number, evidence)
         source_record = records_by_key.setdefault(source_record["source_record_key"], source_record)
-        source_record["raw_payload"]["rows"].append({"row_number": row_number, "fields": source_by_field})
+        retained_by_field = {"row_number": row_number, "fields": source_by_field}
+        if malformed is None:
+            source_record["raw_payload"]["rows"].append(retained_by_field)
+        else:
+            source_record["raw_payload"].setdefault("malformed_rows", []).append({**retained_by_field, **malformed})
     return list(records_by_key.values())
 
 
 def _is_held_identity(source_record):
     source_rows = source_record["raw_payload"]["rows"]
     reason = None
-    if source_record["license_number"] is None:
+    if source_record["raw_payload"].get("malformed_rows"):
+        reason = "malformed_source_row"
+    elif source_record["license_number"] is None:
         reason = "license_number_missing"
     elif any(not _text(entry["fields"][field]) for entry in source_rows for field in ("FirstName", "LastName")):
         reason = "source_identity_conflict"
@@ -223,14 +275,16 @@ def parse_report(content, *, evidence):
     remain literal. Blank licenses and conflicting identities yield held records.
     Education, other training and recognized specialties deduplicate separately;
     optional practice/demographic fields and unknown modifiers remain raw only.
+    Observed one-line quote failures retain only their identity prefix and hold
+    the entire license group. Unsupported corruption still rejects the report.
     No source completeness, NPI identity, publication or degree completion is inferred.
     """
     _require(isinstance(content, bytes) and len(content) <= MAX_REPORT_BYTES, "input_invalid")
     evidence_by_field = _validated_evidence(content, evidence)
     # ponytail: retain one report up to 64 MiB; stream staging if measured statewide inputs require it.
     try:
-        header, reader = _csv_reader(content)
-        source_records = _group_source_rows(header, reader, evidence_by_field)
+        header, reader, captured_lines = _csv_reader(content)
+        source_records = _group_source_rows(header, reader, captured_lines, evidence_by_field)
     except csv.Error:
         raise ValueError("tennessee_profile_csv_invalid") from None
     facts = [fact for source_record in source_records for fact in _profile_facts(source_record, evidence_by_field)]

@@ -61,6 +61,21 @@ def parse_sample(source_rows, headers=HEADERS):
     return rows.parse_report(content, evidence={**EVIDENCE, "content_sha256": hashlib.sha256(content).hexdigest()})
 
 
+def quoted_row(source_record, headers=PRACTICE_HEADERS):
+    buffer = io.StringIO(newline="")
+    csv.DictWriter(buffer, fieldnames=headers, extrasaction="ignore", quoting=csv.QUOTE_ALL).writerow(source_record)
+    return buffer.getvalue().encode("utf-8")
+
+
+def malformed_row(*, field="EducationProvider", headers=PRACTICE_HEADERS, **changes):
+    source_record = source_row(**{field: 'Synthetic "Quoted" Value', **changes})
+    return quoted_row(source_record, headers).replace(b'""Quoted""', b'"Quoted"', 1)
+
+
+def parse_content(content):
+    return rows.parse_report(content, evidence={**EVIDENCE, "content_sha256": hashlib.sha256(content).hexdigest()})
+
+
 def test_cartesian_rows_preserve_independent_histories():
     source_rows = [source_row(EducationProvider=school, GraduationDate=graduated,
         OtherTrainingProvider=training, ModifierDescription=specialty)
@@ -253,3 +268,83 @@ def test_report_and_field_limits(monkeypatch):
     monkeypatch.setattr(rows, "MAX_FIELD_CHARS", 3)
     with pytest.raises(ValueError, match="^tennessee_profile_field_limit$"):
         parse_sample([source_row()])
+
+
+def test_late_malformed_row_holds_valid_rows_and_preserves_source_coordinates():
+    valid = quoted_row(source_row(EducationProvider='Synthetic, "Medical"\nSchool'))
+    malformed = malformed_row()
+    content = report_bytes([], PRACTICE_HEADERS) + valid + malformed + quoted_row(source_row(LicenseNumber="000999"))
+    records, facts = parse_content(content)
+    held, unaffected = records
+    assert held["license_number"] == "000123" and held["matched_npi"] is None
+    assert held["normalized_payload"]["visibility"] == "held_identity"
+    assert held["match_evidence"]["reason"] == "malformed_source_row"
+    assert len(held["raw_payload"]["rows"]) == 1
+    assert held["raw_payload"]["rows"][0]["fields"]["EducationProvider"] == 'Synthetic, "Medical"\nSchool'
+    error, = held["raw_payload"]["malformed_rows"]
+    assert error["row_number"] == 2 and error["physical_line_start"] == error["physical_line_end"] == 4
+    assert error["raw_text"].encode("utf-8") == malformed
+    assert error["content_sha256"] == hashlib.sha256(malformed).hexdigest()
+    assert set(error["fields"]) == set(BASE_COLUMNS) and error["reason"] == "csv_quote_invalid"
+    assert len(facts) == 3 and {fact["source_record_id"] for fact in facts} == {unaffected["record_id"]}
+    assert unaffected["raw_payload"]["rows"][0]["row_number"] == 3
+
+
+@pytest.mark.parametrize("field", ["EducationProvider", "OtherTrainingProvider", "PracticeName", "PracticeAddress",
+                                 "PracticeCity", "PracticeAddress2", "PracticeZIP"])
+def test_malformed_only_license_retains_exact_line_without_fact_interpretation(field):
+    malformed = malformed_row(field=field)
+    records, facts = parse_content(report_bytes([], PRACTICE_HEADERS) + malformed)
+    assert len(records) == 1 and facts == []
+    assert records[0]["raw_payload"]["rows"] == []
+    assert records[0]["raw_payload"]["malformed_rows"][0]["raw_text"].encode() == malformed
+    assert records[0]["normalized_payload"]["quality_flags"] == ["malformed_source_row"]
+    assert records[0]["matched_npi"] is None and records[0]["match_status"] == "unmatched"
+
+
+def test_malformed_row_before_valid_row_holds_whole_license():
+    content = report_bytes([], PRACTICE_HEADERS) + malformed_row() + quoted_row(source_row()) + malformed_row()
+    records, facts = parse_content(content)
+    assert facts == [] and len(records) == 1
+    assert len(records[0]["raw_payload"]["rows"]) == 1
+    assert [entry["row_number"] for entry in records[0]["raw_payload"]["malformed_rows"]] == [1, 3]
+
+
+@pytest.mark.parametrize("headers", [HEADERS, FULL_HEADERS, tuple(reversed(PRACTICE_HEADERS))])
+def test_unobserved_malformed_layouts_still_reject_report(headers):
+    with pytest.raises(ValueError, match="^tennessee_profile_csv_invalid$"):
+        parse_content(report_bytes([], headers) + malformed_row(headers=headers))
+
+
+@pytest.mark.parametrize("changes", [{"LicenseNumber": ""}, {"LicenseNumber": "12A"}, {"FirstName": ""},
+                                    {"LastName": ""}, {"Board": "Unknown"}, {"Profession": "Medical Doctor (Special Training)"}])
+def test_unidentifiable_malformed_record_rejects_entire_report(changes):
+    content = report_bytes([], PRACTICE_HEADERS) + quoted_row(source_row()) + malformed_row(**changes)
+    with pytest.raises(ValueError, match="^tennessee_profile_csv_invalid$"):
+        parse_content(content)
+
+
+@pytest.mark.parametrize("corruption", ["identity", "multiline", "lf_only", "unterminated", "extra_delimiter"])
+def test_unsupported_corruption_is_never_recovered(corruption):
+    malformed = malformed_row(field="FirstName") if corruption == "identity" else malformed_row()
+    if corruption == "multiline":
+        malformed = malformed.replace(b'Synthetic "Quoted"', b'Synthetic\n"Quoted"')
+    if corruption == "lf_only":
+        malformed = malformed.replace(b"\r\n", b"\n")
+    if corruption == "unterminated":
+        malformed = malformed[:-3]
+    if corruption == "extra_delimiter":
+        malformed = malformed.replace(b'"Quoted"', b'"Quoted","Extra"')
+    content = report_bytes([], PRACTICE_HEADERS) + malformed + quoted_row(source_row())
+    with pytest.raises(ValueError, match="^tennessee_profile_csv_invalid$"):
+        parse_content(content)
+
+
+def test_quarantined_rows_obey_unchanged_row_and_field_caps(monkeypatch):
+    malformed = malformed_row()
+    monkeypatch.setattr(rows, "MAX_ROWS", 1)
+    with pytest.raises(ValueError, match="^tennessee_profile_row_limit$"):
+        parse_content(report_bytes([], PRACTICE_HEADERS) + malformed * 2)
+    monkeypatch.setattr(rows, "MAX_FIELD_CHARS", len(malformed.decode()) - 1)
+    with pytest.raises(ValueError, match="^tennessee_profile_field_limit$"):
+        parse_content(report_bytes([], PRACTICE_HEADERS) + malformed)
