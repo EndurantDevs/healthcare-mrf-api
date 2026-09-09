@@ -446,11 +446,8 @@ fn canonical_drug_type(value: &str, normalize_case: bool) -> io::Result<String> 
 }
 
 fn canonical_billing_class(value: &str, normalize_case: bool) -> io::Result<String> {
-    let value = if normalize_case {
-        value.trim().to_ascii_lowercase()
-    } else {
-        value.to_owned()
-    };
+    let value = if normalize_case { value.trim() } else { value };
+    let value = value.to_ascii_lowercase();
     match value.as_str() {
         "professional" | "facility" | "both" => Ok(value),
         "hospital" | "facilty" if normalize_case => Ok("facility".to_owned()),

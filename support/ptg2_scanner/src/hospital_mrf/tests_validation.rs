@@ -224,6 +224,17 @@
             .ends_with("\tfacility\n"));
 
         let original: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        let mut uppercase_billing_class = original.clone();
+        uppercase_billing_class["standard_charge_information"][0]["standard_charges"][0]
+            ["billing_class"] = json!("PROFESSIONAL");
+        let rows = run_fixture(
+            InputFormat::Json,
+            &serde_json::to_vec(&uppercase_billing_class).unwrap(),
+            false,
+        );
+        assert!(String::from_utf8(rows["charge"].clone())
+            .unwrap()
+            .ends_with("\tprofessional\n"));
         assert!(serde_json::from_str::<FanoutVec<String>>("{}")
             .unwrap_err()
             .to_string()
@@ -256,7 +267,7 @@
             ),
             (
                 "/standard_charge_information/0/standard_charges/0/billing_class",
-                "FACILITY",
+                "clinical",
                 "billing_class must be",
             ),
             (
@@ -347,7 +358,14 @@
     }
 
     #[test]
-    fn csv_billing_class_aliases_do_not_relax_json_validation() {
+    fn billing_class_case_is_canonical_but_csv_aliases_do_not_relax_json() {
+        for (value, expected) in [
+            ("PROFESSIONAL", "professional"),
+            ("Facility", "facility"),
+            ("BOTH", "both"),
+        ] {
+            assert_eq!(canonical_billing_class(value, false).unwrap(), expected);
+        }
         for alias in ["hospital", "facilty"] {
             assert_eq!(canonical_billing_class(alias, true).unwrap(), "facility");
             assert!(canonical_billing_class(alias, false).is_err());
