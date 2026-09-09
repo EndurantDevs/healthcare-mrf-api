@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import csv
 import importlib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -109,6 +110,42 @@ async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path)
     assert table == "nucc_taxonomy_20260101"
     assert rewrite is False
     assert taxonomy_rows[0]["code"] == "1234"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+async def test_nucc_csv_preserves_text_across_read_chunks(
+    monkeypatch, nucc_module, tmp_path, encoding
+):
+    definitions = [
+        f'{index}: A quoted "term", a newline\r\n and UTF-8 café. ' * 16
+        for index in range(1000)
+    ]
+    source = tmp_path / "nucc.csv"
+    with source.open("w", encoding=encoding, newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["Code", "Definition"])
+        for index, definition in enumerate(definitions):
+            writer.writerow([f"{index:010d}", definition])
+    rows = []
+
+    async def capture_rows(items, _model):
+        rows.extend(items)
+
+    monkeypatch.setattr(nucc_module, "push_objects", capture_rows)
+    csv_map = await nucc_module._read_nucc_csv_map(str(source))
+    count = await nucc_module._stage_nucc_taxonomy_rows(
+        {"context": {}}, {}, str(source), csv_map, object(),
+        test_mode=False, run_id="", source_file="nucc.csv",
+    )
+
+    assert count == len(definitions)
+    for index, row in enumerate(rows):
+        code = f"{index:010d}"
+        assert row == {
+            "code": code, "definition": definitions[index],
+            "int_code": nucc_module.return_checksum([code], crc=32),
+        }
 
 
 @pytest.mark.asyncio
