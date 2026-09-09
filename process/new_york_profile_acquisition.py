@@ -123,12 +123,18 @@ async def _acquire_education(session, destination, manifest):
     await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
     source_url = PROFILE_URL + physician_id + f"?sections=EDUCATIONALL&physicianId={physician_id}"
     body, profile_response = await _fetch_response(session, destination, "education", _request("GET", source_url, session_id))
+    return _education_result(manifest, physician_by_field, search_response, body, profile_response)
+
+
+def _education_result(manifest, physician_by_field, search_response, body, profile_response):
+    physician_id = physician_by_field["physicianID"]
     evidence_by_field = {
         "run_id": manifest["run_id"], "artifact_id": hashlib.sha256(encoded_json(profile_response)).hexdigest(),
-        "source_url": source_url, "downloaded_at": profile_response["downloaded_at"],
+        "source_url": profile_response["source_url"], "downloaded_at": profile_response["downloaded_at"],
         "content_sha256": profile_response["content_sha256"], "row_number": 1,
     }
-    source_record, facts = parse_education(body, license_number=license_number, physician_id=physician_id, evidence=evidence_by_field)
+    source_record, facts = parse_education(body, license_number=manifest["license_number"], physician_id=physician_id,
+                                         evidence=evidence_by_field)
     identity_by_field = source_record["raw_payload"]["data"]["phyInfo"]
     has_matching_names = (identity_by_field["firstName"] == physician_by_field["physicianFirstName"]
                           and identity_by_field["lastName"] == physician_by_field["physicianLastName"])
