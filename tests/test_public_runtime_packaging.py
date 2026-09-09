@@ -85,8 +85,8 @@ def test_documented_container_commands_are_packaged():
 def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path):
     dockerfile = (ROOT / "Dockerfile").read_text()
     assert (
-        "python:3.14.6-slim-trixie@sha256:"
-        "b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967"
+        "python:3.14.7-slim-trixie@sha256:"
+        "cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6"
     ) in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile

@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:fc0648ac2962539be80bd424729a20fd80f7b64bfba7e90bbd642aed6c697c5a AS ptg2-scanner-builder
+FROM docker.io/library/rust:1.98.1-slim-trixie@sha256:ce84a5edd80c5f91e05c5533b1e53eb1da54028f33734dc06aa6b49fa190462d AS ptg2-scanner-builder
 
 ARG TARGETARCH
 ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
@@ -32,7 +32,7 @@ RUN cd /build/support/ptg2_scanner \
         python3 -m maturin build --release --features python-extension --out /build/wheels; \
     fi
 
-FROM docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967
+FROM docker.io/library/python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
 #
 WORKDIR /wheels

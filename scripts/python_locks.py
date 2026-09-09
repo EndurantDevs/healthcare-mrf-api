@@ -44,7 +44,7 @@ def compile_locks(root: Path) -> None:
                 candidate.write_bytes(current.read_bytes())
             subprocess.run([
                 "uv", "pip", "compile", str(root / input_names[-1]),
-                "--python-version", "3.14.6", "--universal", "--generate-hashes",
+                "--python-version", "3.14.7", "--universal", "--generate-hashes",
                 "--only-binary", ":all:", "--emit-build-options", "--no-annotate",
                 "--no-header", "--no-strip-extras", "--no-python-downloads",
                 "--output-file", str(candidate), "--quiet",
