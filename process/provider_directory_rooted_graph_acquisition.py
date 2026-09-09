@@ -142,11 +142,16 @@ def _root_receipt(
     identity: ProviderDirectoryRootedGraphAcquisitionIdentity,
     summary: ProviderDirectoryRootedGraphAcquisitionSummary,
     elapsed_seconds: float,
+    *,
+    allow_request_failure_coverage: bool = False,
 ) -> ProviderDirectoryRootedGraphRootReceipt:
     if (
         summary.acquisition_id != identity.acquisition_id
         or summary.scope_id != identity.scope_id
-        or summary.error_count != 0
+        or (
+            summary.request_failure_coverage is not None
+            and not allow_request_failure_coverage
+        )
     ):
         raise ProviderDirectoryRootedGraphAcquisitionError("state")
     return ProviderDirectoryRootedGraphRootReceipt(
@@ -326,7 +331,12 @@ async def acquire_rooted_graph_single_root(
         database=database,
         expected_source=expected_source,
     )
-    return _root_receipt(candidate_identity, summary, elapsed_seconds)
+    return _root_receipt(
+        candidate_identity,
+        summary,
+        elapsed_seconds,
+        allow_request_failure_coverage=True,
+    )
 
 
 __all__ = (
