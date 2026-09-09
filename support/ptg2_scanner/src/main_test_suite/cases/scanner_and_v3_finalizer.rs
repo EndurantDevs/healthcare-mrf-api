@@ -2484,6 +2484,16 @@ fn shared_block_fail_after_writer_preserves_complete_copy_on_sufficient_capacity
 }
 #[test]
 fn shared_block_writer_summary_matches_reread_oracle() {
+    let _env_lock = scanner_env_lock().lock().unwrap();
+    let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "zlib");
+    let _compression_level =
+        TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_LEVEL_ENV, "6");
+    let _minimum_bytes =
+        TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES_ENV, "128");
+    let _minimum_savings = TestEnvVar::set(
+        PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT_ENV,
+        "2",
+    );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("shared-blocks.copy");
     let file = OpenOptions::new()
