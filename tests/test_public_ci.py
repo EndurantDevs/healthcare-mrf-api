@@ -117,9 +117,18 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert "container" not in job
     assert "services" not in job
     assert not job.get("continue-on-error")
+    setup = next(step for step in job["steps"] if step.get("name") == "Install uv and Python")
+    assert setup == {
+        "name": "Install uv and Python",
+        "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+        "with": {"version": "0.12.12", "python-version": "3.14.7", "enable-cache": False},
+    }
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ci/public_hygiene.py" in commands
-    assert "python -m pytest -q" in commands
+    assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
+    assert "uv pip install --python .venv/bin/python" in commands
+    assert ".venv/bin/python -m pytest -q" in commands
+    assert "python -m pip" not in commands
     assert "test_process_" in commands or "tests/process/" in commands
     assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
 
