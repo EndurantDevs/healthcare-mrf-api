@@ -165,30 +165,34 @@ async def retained_counts(run_id):
     facts = _table(ProviderProfileFact)
     artifacts = _table(ProviderProfileArtifact)
     count_row = await db.first(text(f"""
-        SELECT count(*) AS retained_source_records,
+        WITH source_counts AS (
+            SELECT count(*) AS retained_source_records,
                count(*) FILTER (WHERE raw_payload->>'licenseNumber' = license_number
                                   AND raw_payload->>'licenseMetaId' = '1') AS received_profiles,
                count(*) FILTER (WHERE source_key <> :source_key
-                     OR normalized_payload->>'schema_version' IS DISTINCT FROM :schema_version) AS invalid_source_records,
-               (SELECT count(*) FROM {facts} WHERE run_id = :run_id) AS retained_facts,
-               (SELECT count(DISTINCT f.npi) FROM {facts} f JOIN {source_records} r
-                   ON r.record_id = f.source_record_id AND r.run_id = f.run_id
-                 WHERE f.run_id = :run_id AND r.source_key = :source_key
+                     OR normalized_payload->>'schema_version' IS DISTINCT FROM :schema_version) AS invalid_source_records
+              FROM {source_records} WHERE run_id = :run_id
+        ), fact_counts AS (
+            SELECT count(*) AS retained_facts,
+               count(DISTINCT f.npi) FILTER (WHERE r.run_id = f.run_id AND r.source_key = :source_key
                    AND r.match_status = 'deterministic' AND r.matched_npi = f.npi
                    AND r.normalized_payload->>'visibility' = 'public'
                    AND NOT f.sensitive AND f.public_default AND f.availability = 'available') AS matched_public_providers,
-               (SELECT count(*) FROM {facts} f LEFT JOIN {source_records} r
-                   ON r.record_id = f.source_record_id AND r.run_id = f.run_id
-                 WHERE f.run_id = :run_id AND (r.record_id IS NULL OR r.source_key <> :source_key
+               count(*) FILTER (WHERE r.record_id IS NULL OR r.run_id IS DISTINCT FROM f.run_id
+                    OR r.source_key <> :source_key
                     OR f.source_json->>'source_key' IS DISTINCT FROM :source_key
                     OR f.source_json->>'schema_version' IS DISTINCT FROM :schema_version
                     OR f.source_json->>'source_record_id' IS DISTINCT FROM f.source_record_id
                     OR f.npi IS DISTINCT FROM r.matched_npi
                     OR r.normalized_payload->>'visibility' IS DISTINCT FROM 'public'
-                    OR (f.npi IS NOT NULL AND r.match_status <> 'deterministic'))) AS invalid_facts,
+                    OR (f.npi IS NOT NULL AND r.match_status <> 'deterministic')) AS invalid_facts
+              FROM {facts} f LEFT JOIN {source_records} r ON r.record_id = f.source_record_id
+             WHERE f.run_id = :run_id
+        )
+        SELECT source_counts.*, fact_counts.*,
                (SELECT count(*) FROM {artifacts} WHERE run_id = :run_id
                     AND source_key <> :source_key) AS foreign_artifacts
-          FROM {source_records} WHERE run_id = :run_id
+          FROM source_counts CROSS JOIN fact_counts
     """), run_id=run_id, source_key=SOURCE_KEY, schema_version=SCHEMA_VERSION)
     return {key: int(count) for key, count in count_row._mapping.items()}
 
