@@ -179,7 +179,7 @@ async def test_unpublished_trailing_alias_cannot_reuse_a_published_layout(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ordinal", [0, False, float("inf")])
+@pytest.mark.parametrize("ordinal", [0, False, float("inf"), 4.9, -0.9])
 async def test_alias_cannot_hide_invalid_raw_ordinal(monkeypatch, ordinal):
     reader = AsyncMock()
     monkeypatch.setattr(build, "binding_projection", reader)
@@ -188,6 +188,12 @@ async def test_alias_cannot_hide_invalid_raw_ordinal(monkeypatch, ordinal):
             _binding(), _binding(ordinal=ordinal),
         ])
     reader.assert_not_awaited()
+
+
+@pytest.mark.parametrize("ordinal", [4, "4", 4.0])
+def test_integral_ordinals_preserve_raw_manifest(ordinal):
+    bindings = [_binding(ordinal=ordinal)]
+    assert contract.normalized_bindings(bindings) == bindings
 
 
 def test_new_build_identity_preserves_storage_contract():

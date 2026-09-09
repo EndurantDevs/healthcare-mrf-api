@@ -143,7 +143,7 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
             ordinal = int(raw_ordinal)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("pricing projection binding ordinal is invalid") from exc
-        if ordinal < 0:
+        if ordinal < 0 or (isinstance(raw_ordinal, float) and raw_ordinal != ordinal):
             raise ValueError("pricing projection binding ordinal is invalid")
         ordinal_key = (str(binding_by_field["role"]), ordinal)
         if ordinal_key in seen_ordinals:
