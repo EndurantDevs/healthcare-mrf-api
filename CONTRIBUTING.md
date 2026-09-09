@@ -26,6 +26,14 @@ not authorize a stable release. The public default branch remains `main`.
 Use `type/short-slug` names: `feature/<slug>`, `fix/<slug>`,
 `docs/<slug>`, `test/<slug>`, or `chore/<slug>`.
 
+## Coding Agent Contributions
+
+Coding agents follow the same branch, validation, and release process described
+here. Preserve unrelated work and obtain an explicit human request before a
+stable release. Keep public code, logs, examples, and documentation free of
+credentials, personal data, and internal operational details; use synthetic
+test fixtures.
+
 ## Commit Messages
 
 Use `type(scope): imperative summary` subjects so history is readable during
