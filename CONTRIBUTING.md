@@ -18,9 +18,10 @@ pull request.
 ## Branches
 
 Create feature and fix branches from `dev` and open normal pull requests into
-`dev`. After CI and development acceptance, maintainers promote the reviewed
-content to stable `main` through a release pull request using **Rebase and merge**.
-The public default branch remains `main`.
+`dev`. GitHub CI and testing in the DEV environment must pass before release.
+Promotion to stable `main` is a separate, explicitly requested maintainer action:
+open a release pull request and use **Rebase and merge**. Merging into `dev` does
+not authorize a stable release. The public default branch remains `main`.
 
 Use `type/short-slug` names: `feature/<slug>`, `fix/<slug>`,
 `docs/<slug>`, `test/<slug>`, or `chore/<slug>`.
@@ -37,11 +38,18 @@ python3 scripts/check_commit_messages.py --last 1
 
 ## Tests and Smoke Runs
 
-Run the regular suite with:
+Run focused checks for the behavior you change, for example:
 
 ```bash
-pytest tests -x
+pytest tests/test_healthcheck.py -q
 ```
+
+GitHub CI is the required full-validation gate on the current pull request head.
+Do not run local pre-push suites or hooks. When a push is authorized, use
+`git push --no-verify` to avoid invoking a local pre-push hook.
+
+After merge, verify the change in DEV before requesting a stable release.
+Coordinate tests that change shared runtime state with its owner.
 
 Before merging importer changes that support bounded test mode, run a smoke
 import with `--test`, for example:
