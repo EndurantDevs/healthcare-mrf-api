@@ -17906,6 +17906,7 @@ hospitals:
 - hospital_id: hospital-005358
   name: Rehabilitation Hospital of Indiana
   cms_hpt_url: https://www.rhirehab.com/cms-hpt.txt
+  fallback_mrf_url: https://www.rhirehab.com/media/2612/2026-rhi-machine_readable-file.csv
 - hospital_id: hospital-005359
   name: Rehabilitation Hospital of Kingsport, a joint venture of Ballad Health and Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -22512,6 +22513,7 @@ hospitals:
 - hospital_id: hospital-006730
   name: UNION GENERAL HOSPITAL
   cms_hpt_url: https://www.uniongen.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbUGHFARMERVILLELA&type=CDMWithoutLabel
 - hospital_id: hospital-006731
   name: union hospital
   cms_hpt_url: https://my.clevelandclinic.org/cms-hpt.txt

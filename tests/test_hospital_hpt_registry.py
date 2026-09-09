@@ -96,9 +96,9 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_900
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_720
+    assert sum("locator_name" in entry for entry in hospitals) == 1_717
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 147
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 150
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -217,6 +217,8 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     ("hospital-006469", "Texas Institute for Surgery at Texas Health Presbyterian Dallas",
      "https://www.texasinstituteforsurgery.com/cms-hpt.txt",
      ("Texas Institute for Surgery at Texas Health Dallas",) * 2, None),
+    ("hospital-006730", "UNION GENERAL HOSPITAL", "https://www.uniongen.org/cms-hpt.txt",
+     ("Union General Hospital",), 0),
     ("hospital-007197", "Wood County Hospital", "https://www.woodcountyhospital.org/cms-hpt.txt",
      ("Wood County Hospital",), 0),
 ))
