@@ -15,6 +15,15 @@ from process.provider_directory_profile import is_valid_npi
 
 SOURCE_KEY = "massachusetts-borim"
 SCHEMA_VERSION = "ma-borim-profile/v1"
+LEGACY_CATEGORIES = ("education", "training")
+PROFILE_CATEGORIES = (*LEGACY_CATEGORIES, "certifications", "specialties")
+EDUCATION_DISPLAY_FIELDS = ("institution", "program_type", "specialty", "graduation_date", "attendance_start", "attendance_end")
+FACT_FORMAT_BY_CATEGORY = {
+    "education": ("education_history", "educationAndTrainings.education", EDUCATION_DISPLAY_FIELDS),
+    "training": ("postgraduate_training", "educationAndTrainings.trainings[{index}]", EDUCATION_DISPLAY_FIELDS),
+    "certifications": ("board_certification", "boardCertifications.{index}", ("certifying_board",)),
+    "specialties": ("specialty", "specialties[{index}]", ("text",)),
+}
 
 
 def _hash(value):
@@ -108,9 +117,8 @@ def _source_date(raw, field, observed_on):
 
 
 def _fact(source_record, evidence, category, value_by_field, raw_fields, index, flags):
-    fact_type = "education_history" if category == "education" else "postgraduate_training"
+    fact_type, source_path, display_fields = FACT_FORMAT_BY_CATEGORY[category]
     logical_key = _hash([SOURCE_KEY, source_record["license_number"], category, fact_type, index, value_by_field])
-    display_fields = ("institution", "program_type", "specialty", "graduation_date", "attendance_start", "attendance_end")
     display = " — ".join(str(value_by_field[field]) for field in display_fields if value_by_field.get(field))
     return {
         "fact_id": _hash([source_record["record_id"], logical_key]),
@@ -134,7 +142,7 @@ def _fact(source_record, evidence, category, value_by_field, raw_fields, index, 
             "agency": "Massachusetts Board of Registration in Medicine",
             "jurisdiction": "MA",
             "source_record_id": source_record["record_id"],
-            "source_path": "educationAndTrainings.education" if category == "education" else f"educationAndTrainings.trainings[{index}]",
+            "source_path": source_path.format(index=index),
             "raw_fields": copy.deepcopy(raw_fields),
             "quality_flags": flags,
         },
@@ -253,7 +261,55 @@ def _visible_facts(profile, source_record, evidence):
     return facts
 
 
-def parse_profile(profile, *, license_number, candidates, evidence):
+def _reported_specialties(values):
+    if values is None:
+        return []
+    if not isinstance(values, list) or any(not isinstance(value, str) or not _text(value) for value in values):
+        raise ValueError("massachusetts_profile_specialties_schema_invalid")
+    return [_text(value) for value in values]
+
+
+def _certification_facts(profile, source_record, evidence):
+    section = profile.get("boardCertifications")
+    if section is None:
+        return []
+    if not isinstance(section, dict):
+        raise ValueError("massachusetts_profile_certification_schema_invalid")
+    facts = []
+    for family in ("abms", "aoa"):
+        boards = section.get(family)
+        if boards is None:
+            continue
+        if not isinstance(boards, list) or any(not isinstance(board, dict) for board in boards):
+            raise ValueError("massachusetts_profile_certification_schema_invalid")
+        for index, board in enumerate(boards):
+            board_name = _text(board.get("boardName"))
+            if not board_name:
+                raise ValueError("massachusetts_profile_certification_board_missing")
+            value_by_field = {
+                "certifying_board": board_name, "board_family": family,
+                "specialties": _reported_specialties(board.get("specialties")),
+                "subspecialties": _reported_specialties(board.get("subspecialties")),
+            }
+            facts.append(_fact(
+                source_record, evidence, "certifications", value_by_field, board, f"{family}[{index}]", [],
+            ))
+    return facts
+
+
+def _portfolio_facts(profile, source_record, evidence):
+    facts = _certification_facts(profile, source_record, evidence)
+    for index, specialty in enumerate(_reported_specialties(profile.get("specialties"))):
+        facts.append(_fact(
+            source_record, evidence, "specialties", {"text": specialty}, profile["specialties"][index], index, [],
+        ))
+    if facts and source_record["normalized_payload"]["visibility"] == "education_section_hidden":
+        # The public board and specialty sections have no school-name gate.
+        source_record["normalized_payload"].update(visibility="public", education_visibility="education_section_hidden")
+    return facts
+
+
+def parse_profile(profile, *, license_number, candidates, evidence, categories=LEGACY_CATEGORIES):
     """Normalize one public response against a trusted captured physician cohort.
 
     Candidates must already be filtered by the exact NUCC physician grouping,
@@ -262,12 +318,18 @@ def parse_profile(profile, *, license_number, candidates, evidence):
     remain exact. No prefix, leading-zero or taxonomy-prefix guesses occur here.
 
     Invalid schemas raise ValueError. Conflicts retain npi=None; hidden sections
-    yield no facts. The caller owns acquisition, persistence and publication.
+    yield no facts. The frozen category scope preserves legacy resume behavior.
+    The caller owns acquisition, persistence and publication.
     """
+    if categories not in (LEGACY_CATEGORIES, PROFILE_CATEGORIES, list(LEGACY_CATEGORIES), list(PROFILE_CATEGORIES)):
+        raise ValueError("massachusetts_profile_categories_invalid")
     evidence_by_field = _parser_evidence(profile, license_number, candidates, evidence)
     source_record = _retained_record(profile, license_number, evidence_by_field)
     if _is_held_profile(profile, license_number, source_record):
         return source_record, []
     npi, status, match_evidence = _match(profile, license_number, candidates)
     source_record.update(matched_npi=npi, match_status=status, match_evidence=match_evidence)
-    return source_record, _visible_facts(profile, source_record, evidence_by_field)
+    facts = _visible_facts(profile, source_record, evidence_by_field)
+    if "certifications" in categories:
+        facts.extend(_portfolio_facts(profile, source_record, evidence_by_field))
+    return source_record, facts

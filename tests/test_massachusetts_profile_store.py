@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
 from process import massachusetts_profile_store as store
+from process import provider_profile_source_store as shared_store
 
 
 florida = importlib.import_module("process.florida_mqa_profile")
@@ -27,7 +28,7 @@ MODEL_NAMES = (
 )
 
 
-def _run(run_id=None, *, limit=None, count=10000, predecessor=None, resume_from=None):
+def _run(run_id=None, *, limit=None, count=10000, predecessor=None, resume_from=None, categories=("education", "training")):
     return {
         "run_id": run_id or uuid.uuid4().hex, "source_key": store.SOURCE_KEY, "jurisdiction": "MA",
         "schema_version": store.SCHEMA_VERSION, "status": "running", "started_at": store._now(),
@@ -35,7 +36,7 @@ def _run(run_id=None, *, limit=None, count=10000, predecessor=None, resume_from=
             "max_providers": limit, "full_cohort_licenses": count,
             "requested_licenses": min(limit, count) if limit is not None else count,
             "expected_current_run_id": predecessor, "resume_from": resume_from,
-            "cohort_sha256": "a" * 64, "categories": ["education", "training"],
+            "cohort_sha256": "a" * 64, "categories": list(categories),
             "source": {"source_key": store.SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "MA"},
         },
     }
@@ -47,7 +48,7 @@ def _metrics(count=10000):
 
 def _counts(count=10000):
     return {"retained_source_records": count, "received_profiles": count,
-            "retained_facts": count, "matched_public_providers": count,
+            "retained_facts": count, "matched_public_providers": count, "portfolio_only_public_providers": 0,
             "invalid_source_records": 0, "invalid_facts": 0, "foreign_artifacts": 0}
 
 
@@ -139,8 +140,8 @@ def _guard_database(monkeypatch, responses=()):
         insert=Mock(side_effect=AssertionError("unexpected insert")),
     )
     claim = AsyncMock(side_effect=AssertionError("unexpected claim"))
-    monkeypatch.setattr(store, "db", database)
-    monkeypatch.setattr(store, "_claim_import_run", claim)
+    monkeypatch.setattr(shared_store, "db", database)
+    monkeypatch.setattr(shared_store, "_claim_import_run", claim)
     yield database
     database.update.assert_not_called()
     database.insert.assert_not_called()
@@ -230,9 +231,10 @@ async def _database(monkeypatch):
             table = getattr(store, name).__table__.to_metadata(metadata, schema=schema)
             model = SimpleNamespace(__table__=table, **{column.name: column for column in table.c})
             monkeypatch.setattr(store, name, model)
+            monkeypatch.setattr(shared_store, name, model)
             if hasattr(florida, name):
                 monkeypatch.setattr(florida, name, model)
-        monkeypatch.setattr(store, "db", database)
+        monkeypatch.setattr(shared_store, "db", database)
         monkeypatch.setattr(florida, "db", database)
         await store.ensure_tables()
         yield database
@@ -304,7 +306,7 @@ async def _legacy_retained_counts(database, run_id):
                     AND source_key <> :source_key) AS foreign_artifacts
           FROM {source_records} WHERE run_id = :run_id
     """, run_id=run_id, source_key=store.SOURCE_KEY, schema_version=store.SCHEMA_VERSION)
-    return dict(count_row._mapping)
+    return {**dict(count_row._mapping), "portfolio_only_public_providers": 0}
 
 
 @pytest.mark.parametrize(("record_changes", "fact_changes", "expected_changes"), [
@@ -374,7 +376,7 @@ async def test_empty_and_repeated_fact_counts_match_legacy_in_postgresql(monkeyp
     async with _database(monkeypatch) as database:
         run_id = uuid.uuid4().hex
         assert await store.retained_counts(run_id) == await _legacy_retained_counts(database, run_id) == _counts(0)
-        await _seed_payloads(database, run_id, 2)
+        await _seed_run(database, run_id=run_id, limit=2)
         facts_table = store.ProviderProfileFact.__table__
         fact = await database.first(facts_table.select().where(facts_table.c.fact_id == run_id + "000001"))
         repeated_fact_by_field = {**fact._mapping, "fact_id": uuid.uuid4().hex, "category": "training", "fact_type": "postgraduate_training"}
@@ -522,3 +524,105 @@ async def test_integrity_failure_preserves_data_in_postgresql(monkeypatch, tmp_p
             await store.retain_source_history(tmp_path)
         assert (tmp_path/run_id).exists()
         assert await database.scalar(f"SELECT count(*) FROM {facts_table}") == 2
+
+
+@pytest.mark.parametrize("original_scope", [store.LEGACY_CATEGORIES, store.PROFILE_CATEGORIES])
+async def test_resume_cannot_change_category_scope_under_claim_lock(monkeypatch, original_scope):
+    async with _database(monkeypatch) as database:
+        original = await _seed_run(database, limit=2, categories=original_scope)
+        await store.mark_run_failed(original["run_id"], "synthetic interruption")
+        other_scope = store.PROFILE_CATEGORIES if original_scope == store.LEGACY_CATEGORIES else store.LEGACY_CATEGORIES
+        candidate = _run(limit=2, resume_from=original["run_id"], categories=other_scope)
+        with pytest.raises(RuntimeError, match="resume_cohort_mismatch"):
+            await store.claim_run(candidate)
+        assert await database.scalar(f"SELECT count(*) FROM {store._table(store.ProviderProfileImportRun)}") == 1
+        candidate["source_manifest"]["categories"] = list(original_scope)
+        await store.claim_run(candidate)
+        assert (await store._read_run(candidate["run_id"]))["source_manifest"]["categories"] == list(original_scope)
+
+
+@pytest.mark.parametrize("limit", [None, 2])
+async def test_out_of_manifest_fact_blocks_completion_without_pointer_change(monkeypatch, limit):
+    async with _database(monkeypatch) as database:
+        incumbent = await _seed_run(database)
+        await store.publish_run(incumbent["run_id"], expected_current_run_id=None, metrics=_metrics())
+        candidate = await _seed_run(database, limit=limit, predecessor=incumbent["run_id"])
+        run_id = candidate["run_id"]
+        facts_table = store._table(store.ProviderProfileFact)
+        await database.status(f"""UPDATE {facts_table} SET category='certifications', fact_type='board_certification'
+            WHERE fact_id=(SELECT min(fact_id) FROM {facts_table} WHERE run_id=:run_id)""", run_id=run_id)
+        assert (await store.retained_counts(run_id))["invalid_facts"] == 1
+        with pytest.raises(RuntimeError, match="retained_integrity_invalid"):
+            if limit is None:
+                await store.publish_run(run_id, expected_current_run_id=incumbent["run_id"], metrics=_metrics())
+            else:
+                await store.finish_unpublished_run(run_id, _metrics(limit))
+        assert (await store.read_publication())["current_run_id"] == incumbent["run_id"]
+        assert (await store._read_run(run_id))["status"] == "running"
+        assert await database.scalar(f"SELECT count(*) FROM {facts_table} WHERE run_id=:run_id AND published_at IS NOT NULL", run_id=run_id) == 0
+
+
+async def test_richer_publication_advances_from_readable_legacy_manifest(monkeypatch):
+    async with _database(monkeypatch) as database:
+        legacy = await _seed_run(database)
+        await store.publish_run(legacy["run_id"], expected_current_run_id=None, metrics=_metrics())
+        original_manifest = (await store._read_run(legacy["run_id"]))["source_manifest"]
+        assert original_manifest["categories"] == ["education", "training"]
+        richer = await _seed_run(database, predecessor=legacy["run_id"], categories=store.PROFILE_CATEGORIES)
+        facts_table = store._table(store.ProviderProfileFact)
+        await database.status(f"""UPDATE {facts_table} SET category='certifications', fact_type='board_certification'
+            WHERE fact_id=(SELECT min(fact_id) FROM {facts_table} WHERE run_id=:run_id)""", run_id=richer["run_id"])
+        assert (await store.retained_counts(richer["run_id"]))["invalid_facts"] == 0
+        await store.publish_run(richer["run_id"], expected_current_run_id=legacy["run_id"], metrics=_metrics())
+        pointer = await store.read_publication()
+        assert pointer["current_run_id"] == richer["run_id"] and pointer["previous_run_id"] == legacy["run_id"]
+        assert (await store._read_run(legacy["run_id"]))["source_manifest"] == original_manifest
+
+
+@pytest.mark.parametrize("has_incumbent", [False, True])
+async def test_portfolio_only_providers_cannot_replace_guarded_education_coverage(monkeypatch, has_incumbent):
+    async with _database(monkeypatch) as database:
+        incumbent_id = None
+        if has_incumbent:
+            incumbent = await _seed_run(database)
+            incumbent_id = incumbent["run_id"]
+            await store.publish_run(incumbent_id, expected_current_run_id=None, metrics=_metrics())
+        candidate = await _seed_run(database, predecessor=incumbent_id, categories=store.PROFILE_CATEGORIES)
+        run_id = candidate["run_id"]
+        retained_education = 7900 if has_incumbent else 0
+        facts_table = store._table(store.ProviderProfileFact)
+        await database.status(f"""UPDATE {facts_table} SET category='certifications', fact_type='board_certification'
+            WHERE run_id=:run_id AND npi>1000000000+:retained_education""", run_id=run_id, retained_education=retained_education)
+        counts = await store.retained_counts(run_id)
+        assert counts["matched_public_providers"] == retained_education
+        assert counts["portfolio_only_public_providers"] == 10000 - retained_education
+        assert counts["invalid_facts"] == 0 and counts["received_profiles"] == 10000
+        error = "volume_drop:matched_public_providers" if has_incumbent else "first_publication_too_small"
+        with pytest.raises(RuntimeError, match=error):
+            await store.publish_run(run_id, expected_current_run_id=incumbent_id, metrics=_metrics())
+        pointer = await store.read_publication()
+        assert (pointer["current_run_id"] if pointer else None) == incumbent_id
+        assert (await store._read_run(run_id))["status"] == "running"
+        assert await database.scalar(f"SELECT count(*) FROM {facts_table} WHERE run_id=:run_id AND published_at IS NOT NULL", run_id=run_id) == 0
+
+
+async def test_portfolio_overlap_counts_once_and_is_reported_separately(monkeypatch):
+    async with _database(monkeypatch) as database:
+        candidate = await _seed_run(database, limit=3, categories=store.PROFILE_CATEGORIES)
+        run_id = candidate["run_id"]
+        facts_table = store._table(store.ProviderProfileFact)
+        await database.status(f"""INSERT INTO {facts_table}
+            (fact_id, run_id, npi, source_record_id, logical_fact_key, category, fact_type, display,
+             value_json, availability, assertion_type, verification_status, source_json, sensitive, public_default)
+            SELECT fact_id || '-board', run_id, npi, source_record_id, logical_fact_key || '-board',
+                   'certifications', 'board_certification', display, value_json, availability,
+                   assertion_type, verification_status, source_json, sensitive, public_default
+              FROM {facts_table} WHERE run_id=:run_id""", run_id=run_id)
+        await database.status(f"""UPDATE {facts_table} SET public_default=false
+            WHERE run_id=:run_id AND npi=1000000003 AND category='education'""", run_id=run_id)
+        counts = await store.retained_counts(run_id)
+        assert counts["retained_facts"] == 6
+        assert counts["matched_public_providers"] == 2 and counts["portfolio_only_public_providers"] == 1
+        result = await store.finish_unpublished_run(run_id, _metrics(3))
+        assert result["matched_public_providers"] == 2 and result["portfolio_only_public_providers"] == 1
+        assert (await store._read_run(run_id))["metrics"]["portfolio_only_public_providers"] == 1

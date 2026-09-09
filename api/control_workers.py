@@ -84,6 +84,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:ProviderDirectoryFHIR", "process.ProviderDirectoryFHIR", ("provider-directory-fhir",)),
     WorkerSpec("arq:FloridaMQAProfile", "process.FloridaMQAProfile", ("florida-mqa-profile",)),
     WorkerSpec("arq:MassachusettsBORIMProfile", "process.MassachusettsBORIMProfile", ("massachusetts-borim-profile",)),
+    WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),
     WorkerSpec("arq:PlacesZcta", "process.PlacesZcta", ("places-zcta",)),
@@ -1128,7 +1129,7 @@ def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = Non
     profile = _worker_job_resource_profile(spec, payload or {})
     if profile:
         return profile
-    if spec.worker_class == "process.MassachusettsBORIMProfile":
+    if spec.worker_class in {"process.MassachusettsBORIMProfile", "process.KentuckyKBMLProfile"}:
         return {"requests": {"cpu": "500m", "memory": "512Mi"},
                 "limits": {"cpu": "4", "memory": "4Gi"}}
     requests_dict = {

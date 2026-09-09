@@ -22,6 +22,7 @@ TRAINING = {"institution": "Example Hospital", "program_type": "Resident", "spec
 
 def _row(fact_id="school", *, category="education", fact_value=None, generation=GENERATION, **overrides):
     row_by_field = {
+        "publication_source_key": SOURCE_KEY,
         "generation_id": generation,
         "source_published_at": datetime(2026, 9, 8),
         "run_status": "completed",
@@ -99,9 +100,9 @@ def _legacy_envelope(fact_value=None, *, category="education", sensitive=False):
 async def test_loader_optional_relations_and_absent_pointer(monkeypatch):
     database = SimpleNamespace(scalar=AsyncMock(side_effect=[False, True, True]), all=AsyncMock(side_effect=[[], [SimpleNamespace(_mapping=_row())]]))
     monkeypatch.setattr(state_api, "db", database)
-    assert await state_api.fetch_massachusetts_profile_projection(NPI) is None
-    assert await state_api.fetch_massachusetts_profile_projection(NPI) is None
-    projection = await state_api.fetch_massachusetts_profile_projection(NPI)
+    assert await state_api.fetch_additional_state_profile_projections(NPI) == []
+    assert await state_api.fetch_additional_state_profile_projections(NPI) == []
+    projection, = await state_api.fetch_additional_state_profile_projections(NPI)
     assert projection["generation_id"] == GENERATION
     assert database.all.await_count == 2
     statement = str(database.all.call_args.args[0])
@@ -110,7 +111,7 @@ async def test_loader_optional_relations_and_absent_pointer(monkeypatch):
     assert "JOIN mrf.provider_profile_fact" in statement
     assert "fact.run_id = publication.current_run_id" in statement
     assert "fact.npi = :npi" in statement
-    assert database.all.call_args.kwargs == {"npi": NPI, "source_key": SOURCE_KEY}
+    assert database.all.call_args.kwargs == {"npi": NPI, "source_keys": [SOURCE_KEY, state_api.KENTUCKY_SOURCE_KEY]}
     assert set(database.scalar.call_args.kwargs) == {"publication", "run", "fact"}
 
 
@@ -121,14 +122,14 @@ async def test_loader_propagates_real_database_errors(monkeypatch, method):
     getattr(database, method).side_effect = RuntimeError("database-unavailable")
     monkeypatch.setattr(state_api, "db", database)
     with pytest.raises(RuntimeError, match="database-unavailable"):
-        await state_api.fetch_massachusetts_profile_projection(NPI)
+        await state_api.fetch_additional_state_profile_projections(NPI)
 
 
 @pytest.mark.asyncio
 async def test_loader_rejects_invalid_schema(monkeypatch):
     monkeypatch.setattr(ProviderProfileSourcePublication.__table__, "schema", "unsafe-schema")
     with pytest.raises(RuntimeError, match="schema_invalid"):
-        await state_api.fetch_massachusetts_profile_projection(NPI)
+        await state_api.fetch_additional_state_profile_projections(NPI)
 
 
 @pytest.mark.parametrize("row_by_field", [_row(fact_id=None), _row(sensitive=True), _row(public_default=False), _row(availability="restricted")])
@@ -190,7 +191,7 @@ def test_massachusetts_only_has_actual_source_generation_and_no_florida_claim():
     assert profile["categories"]["training"]["availability"] == "not_reported"
     assert profile["categories"]["professional_experience"]["items"] == []
     assert "Florida" not in str(profile)
-    assert profile["composer_version"] == "provider-profile-composer/v8"
+    assert profile["composer_version"] == "provider-profile-composer/v9"
 
 
 @pytest.mark.parametrize("same_date", [True, False])
@@ -305,7 +306,7 @@ async def test_combined_loader_keeps_every_independent_source(monkeypatch):
     }
     monkeypatch.setattr(profile_api, "fetch_state_profile_projection", AsyncMock(return_value=_legacy_envelope()))
     monkeypatch.setattr(profile_api, "fetch_cms_education_projection", AsyncMock(return_value=_cms_projection(NPI, [cms_row_by_field])))
-    monkeypatch.setattr(profile_api, "fetch_massachusetts_profile_projection", AsyncMock(return_value=_projection()))
+    monkeypatch.setattr(profile_api, "fetch_additional_state_profile_projections", AsyncMock(return_value=[_projection()]))
     envelope = await profile_api.fetch_provider_profile_projection(NPI)
     fhir_profile_by_field = {"generation_id": "fhir-generation", "facts": {"name": {"items": [{"value": {"text": "Alex Example"}, "source_ids": ["payer"]}]}}, "sources": [{"source_id": "payer"}]}
     profile = profile_api.compose_provider_profile(NPI, state_projection=envelope, fhir_profile=fhir_profile_by_field)

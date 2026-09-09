@@ -1,11 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Fixed Massachusetts binding for atomic source and managed control completion."""
+"""Fixed Kentucky binding for atomic source and managed control completion."""
 
-from process import massachusetts_profile_store as store
+from process import kentucky_profile_store as store
 from process.provider_profile_source_completion import SourceProfileCompletion
 
-IMPORTER = "massachusetts-borim-profile"
+IMPORTER = "kentucky-kbml-profile"
 _completion = SourceProfileCompletion(store._store, IMPORTER)
 
 _attempt = _completion._attempt

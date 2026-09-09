@@ -107,6 +107,7 @@ _PROFILE_SOURCES = {
     "cms-doctors": {"source_key": "cms-doctors", "display_name": "CMS Doctors & Clinicians"},
     "florida-mqa-profile": {"source_key": "florida-mqa", "display_name": "Florida MQA"},
     "massachusetts-borim-profile": {"source_key": "massachusetts-borim", "display_name": "Massachusetts BORIM"},
+    "kentucky-kbml-profile": {"source_key": "kentucky-kbml", "display_name": "Kentucky KBML"},
 }
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
@@ -167,6 +168,7 @@ _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "npi": ["nucc"],
     "florida-mqa-profile": ["npi"],
     "massachusetts-borim-profile": ["npi"],
+    "kentucky-kbml-profile": ["npi"],
     "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
@@ -359,6 +361,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.massachusetts_profile",
         "target_function": "import_profiles",
     },
+    "kentucky-kbml-profile": {
+        "queue": "arq:KentuckyKBMLProfile",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.kentucky_profile",
+        "target_function": "import_profiles",
+    },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",
         "function": "control_single_job_start",
@@ -465,6 +474,7 @@ _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
 
 _CANCELABLE_IMPORTERS = {
     "massachusetts-borim-profile",
+    "kentucky-kbml-profile",
     "ptg",
     "ptg-candidate-audit",
     "npi",
@@ -779,6 +789,7 @@ def _importer_family(importer: str) -> str:
         "provider-directory-fhir",
         "florida-mqa-profile",
         "massachusetts-borim-profile",
+        "kentucky-kbml-profile",
         "entity-address-unified",
         "cms-doctors",
         "address-archive-v2-migrate",

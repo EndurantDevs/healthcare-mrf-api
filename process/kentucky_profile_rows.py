@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Pure retention of exact-license Kentucky public medical education results."""
+"""Pure retention of exact-license Kentucky public physician profiles."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from process.provider_directory_profile import is_valid_npi
 
 SOURCE_KEY = "kentucky-kbml"
 SCHEMA_VERSION = "ky-kbml-profile/v1"
+LEGACY_CATEGORIES = ("education",)
+PROFILE_CATEGORIES = (*LEGACY_CATEGORIES, "specialties", "services")
 MAX_HTML_BYTES = 1_000_000
 MAX_FIELD_ROWS = 2048
 
@@ -38,8 +40,9 @@ def _hash(value):
 class _DetailParser(HTMLParser):
     """Read complete label/value div rows; surrounding legacy markup is inert."""
 
-    def __init__(self):
+    def __init__(self, *, reject_hidden=False):
         super().__init__(convert_charrefs=True)
+        self.reject_hidden = reject_hidden
         self.div_depth = 0
         self.row_depth = None
         self.cell_depth = None
@@ -64,6 +67,10 @@ class _DetailParser(HTMLParser):
         _require(not self.closed_html, "markup_after_document")
         attrs_by_name = dict(attrs)
         _require(len(attrs_by_name) == len(attrs), "duplicate_html_attribute")
+        if self.reject_hidden and not (tag == "input" and (attrs_by_name.get("type") or "").lower() == "hidden"):
+            _require("hidden" not in attrs_by_name and (attrs_by_name.get("aria-hidden") or "").lower() != "true"
+                     and not re.search(r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)",
+                                       attrs_by_name.get("style") or "", re.IGNORECASE), "hidden_profile_markup")
         if tag == "form" and attrs_by_name.get("id") == "Form1":
             self.form_actions.append(attrs_by_name.get("action", ""))
             self.in_result_form = True
@@ -152,11 +159,11 @@ def _validate_envelope(parser, license_number):
     _require(not tail or re.fullmatch(r"Published: [0-9]{2}/[0-9]{2}/[0-9]{4} \[wvd\]", tail), "unexpected_result_text")
 
 
-def extract_profiles(html, *, license_number):
+def extract_profiles(html, *, license_number, reject_hidden=False):
     """Extract all profiles from the validated exact-license detail envelope."""
     _require(isinstance(license_number, str) and re.fullmatch(r"[A-Za-z0-9]{1,32}", license_number), "invalid_license")
     _require(isinstance(html, str) and len(html.encode()) <= MAX_HTML_BYTES, "html_input_limit")
-    parser = _DetailParser()
+    parser = _DetailParser(reject_hidden=reject_hidden)
     parser.feed(html)
     parser.close()
     _validate_envelope(parser, license_number)
@@ -262,20 +269,45 @@ def _education_fact(profile, source_record, evidence):
     if not value_by_field:
         source_record["normalized_payload"]["visibility"] = "education_unusable" if flags else "education_not_reported"
         return []
-    logical_key = _hash([SOURCE_KEY, source_record["license_number"], "education_history", value_by_field])
-    return [{"fact_id": _hash([source_record["record_id"], logical_key]), "run_id": source_record["run_id"],
+    return [_profile_fact(source_record, evidence, "education", "education_history", value_by_field,
+                          {label: profile[label] for label in ("Medical School", "Year Graduated")},
+                          " — ".join(str(value) for value in value_by_field.values()), flags)]
+
+
+def _profile_fact(source_record, evidence, category, fact_type, value_by_field, raw_fields, display, flags):
+    logical_key = _hash([SOURCE_KEY, source_record["license_number"], fact_type, value_by_field])
+    return {"fact_id": _hash([source_record["record_id"], logical_key]), "run_id": source_record["run_id"],
              "npi": source_record["matched_npi"], "source_record_id": source_record["record_id"],
-             "logical_fact_key": logical_key, "category": "education", "fact_type": "education_history",
-             "display": " — ".join(str(value) for value in value_by_field.values()), "value_json": value_by_field,
+             "logical_fact_key": logical_key, "category": category, "fact_type": fact_type,
+             "display": display, "value_json": value_by_field,
              "availability": "available", "assertion_type": "source_reported", "verification_status": "not_independently_verified",
              "effective_start": None, "effective_end": None, "sensitive": False, "public_default": True, "published_at": None,
              "source_json": {**evidence, "source_key": SOURCE_KEY, "schema_version": SCHEMA_VERSION,
                  "agency": "Kentucky Board of Medical Licensure", "jurisdiction": "KY", "source_record_id": source_record["record_id"],
-                 "source_path": "detail.Medical School+Year Graduated", "quality_flags": flags,
-                 "raw_fields": {label: profile[label] for label in ("Medical School", "Year Graduated")}}}]
+                 "source_path": "detail." + "+".join(raw_fields), "quality_flags": flags,
+                 "raw_fields": raw_fields}}
 
 
-def parse_profile(html, *, license_number, candidates, evidence):
+def _portfolio_facts(profile, source_record, evidence):
+    _require({"*Area of Practice", "Type of Practice"} <= profile.keys(), "portfolio_labels_missing")
+    facts = []
+    for label, category, fact_type, value_field, display_label in (
+        ("*Area of Practice", "specialties", "specialty", "text", "Reported area of practice"),
+        ("Type of Practice", "services", "practice_type", "practice_type", "Reported type of practice"),
+    ):
+        raw_value = profile[label]
+        reported = _text(raw_value)
+        if reported and reported.casefold() != "none on file":
+            facts.append(_profile_fact(source_record, evidence, category, fact_type, {value_field: reported},
+                                       {label: raw_value}, f"{display_label}: {reported}", []))
+    if facts and source_record["normalized_payload"]["visibility"] != "public":
+        normalized = source_record["normalized_payload"]
+        normalized["education_visibility"] = normalized["visibility"]
+        normalized["visibility"] = "public"
+    return facts
+
+
+def parse_profile(html, *, license_number, candidates, evidence, categories=LEGACY_CATEGORIES):
     """Retain one exact-license result, without acquisition or publication.
 
     Candidates are trusted registry rows already restricted to individual
@@ -285,8 +317,10 @@ def parse_profile(html, *, license_number, candidates, evidence):
     unmatched source facts retain npi=None. Multiple source results are held.
     """
     _require(isinstance(candidates, (list, tuple)) and all(isinstance(candidate, dict) for candidate in candidates), "invalid_candidates")
+    _require(categories in (LEGACY_CATEGORIES, PROFILE_CATEGORIES, list(LEGACY_CATEGORIES), list(PROFILE_CATEGORIES)),
+             "categories_invalid")
     evidence_by_field = _validated_evidence(evidence)
-    profiles = extract_profiles(html, license_number=license_number)
+    profiles = extract_profiles(html, license_number=license_number, reject_hidden="specialties" in categories)
     source_record = _retained_record(html, profiles, license_number, evidence_by_field)
     if not profiles:
         source_record.update(match_status="not_found")
@@ -299,4 +333,7 @@ def parse_profile(html, *, license_number, candidates, evidence):
         return source_record, []
     matched_npi, status, match_evidence = _match_profile(profiles[0], license_number, candidates)
     source_record.update(matched_npi=matched_npi, match_status=status, match_evidence=match_evidence)
-    return source_record, _education_fact(profiles[0], source_record, evidence_by_field)
+    facts = _education_fact(profiles[0], source_record, evidence_by_field)
+    if "specialties" in categories:
+        facts.extend(_portfolio_facts(profiles[0], source_record, evidence_by_field))
+    return source_record, facts

@@ -74,6 +74,7 @@ class ProfileSession:
         self.responses = list(responses)
         self.requests = []
         self.closed = False
+        self._retry_connection = True
 
     def get(self, url, **options):
         self.requests.append((url, options))
@@ -398,6 +399,27 @@ async def test_transport_failure_has_no_retry_and_preserves_prior_response(tmp_p
         await acquisition.acquire_profiles([{"license_number": "C0007"}, {"license_number": "00042"}], destination, AsyncMock())
     assert len(session.requests) == 2 and session.closed
     assert [path.name for path in destination.iterdir()] == ["C0007.json"]
+
+
+@pytest.mark.parametrize("control", ["absent", None, 0, "false"])
+async def test_retry_control_unavailable_fails_before_requests(tmp_path, install_session, control):
+    session = install_session(ProfileResponse())
+    if control == "absent":
+        del session._retry_connection
+    else:
+        session._retry_connection = control
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError, match="kentucky_profile_retry_control_unavailable"):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert session.requests == [] and session.closed and list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("control", [True, False])
+async def test_existing_boolean_retry_control_is_disabled(tmp_path, install_session, control):
+    session = install_session(ProfileResponse())
+    session._retry_connection = control
+    await acquisition.acquire_profiles([{"license_number": "C0007"}], tmp_path / "new", AsyncMock())
+    assert session._retry_connection is False and len(session.requests) == 1 and session.closed
 
 
 @pytest.mark.parametrize("failure_type", [acquisition.aiohttp.ServerDisconnectedError, acquisition.aiohttp.ClientOSError])

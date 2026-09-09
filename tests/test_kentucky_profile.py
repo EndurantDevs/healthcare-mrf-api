@@ -14,31 +14,29 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from process.control_cancel import ImportCancelledError
+from tests.test_kentucky_profile_rows import CANDIDATE, FIELDS, response_html
 
-worker = importlib.import_module("process.massachusetts_profile")
+worker = importlib.import_module("process.kentucky_profile")
 PREDECESSOR = "a" * 64
 
 
-def _cohort(licenses=("123", "456", "789")):
+def _cohort(licenses=("00042", "C0007", "C0008")):
     return worker.acquisition.build_cohort([
-        {"license_number": license_number, "npi": 1000000004,
-         "first_name": "Alex", "last_name": "Example", "taxonomy": "207Q00000X"}
+        {**CANDIDATE, "license_number": license_number, "npi": 1000000004, "taxonomy": "207Q00000X"}
         for license_number in licenses
     ], {"mrf.npi": 101, "mrf.npi_taxonomy": 102, "mrf.nucc_taxonomy": 103})
 
 
-def _response(license_number, *, profile=None, empty=False):
-    profile_by_field = profile if profile is not None else {
-        "licenseNumber": license_number, "licenseMetaId": 1,
-        "firstName": "Alex", "lastName": "Example", "npiNumber": "1000000004",
-        "educationAndTrainings": {"education": {"name": "École Synthetic Medical School", "graduationDate": "2001"}},
-    }
-    body = b"" if empty else worker.acquisition.encoded_json(profile_by_field)
+def _response(license_number, *, html=None, empty=False):
+    fields = [] if empty else [(label, license_number if label == "License" else value) for label, value in FIELDS]
+    if not empty:
+        fields.extend([("*Area of Practice", ""), ("Type of Practice", "")])
+    body = (response_html(fields, license_number=license_number) if html is None else html).encode("utf-8")
     return {
-        "schema_version": worker.acquisition.RESPONSE_SCHEMA,
-        "license_number": license_number, "source_url": worker.acquisition.API_BASE + license_number,
+        "schema_version": worker.acquisition.RESPONSE_SCHEMA, "source_key": worker.SOURCE_KEY,
+        "license_number": license_number, "source_url": worker.acquisition.source_url(license_number),
         "downloaded_at": "2026-09-08T12:00:00+00:00", "status": 200,
-        "content_type": "application/json", "body_text": body.decode(),
+        "content_type": "text/html; charset=utf-8", "body_text": body.decode(),
         "content_sha256": hashlib.sha256(body).hexdigest(),
     }
 
@@ -71,11 +69,11 @@ class ImportHarness:
         monkeypatch.setattr(worker, "enqueue_live_progress", Mock())
         self.finish = AsyncMock(side_effect=lambda _ctx, _task, run, metrics: {"run_id": run["run_id"], **metrics})
         monkeypatch.setattr(worker, "_finish_run", self.finish)
-        monkeypatch.setenv("HLTHPRT_MA_BORIM_ARTIFACT_ROOT", str(self.artifact_root))
+        monkeypatch.setenv("HLTHPRT_KY_KBML_ARTIFACT_ROOT", str(self.artifact_root))
 
     @asynccontextmanager
     async def session(self, **_options):
-        yield object()
+        yield SimpleNamespace(_retry_connection=True)
 
     @asynccontextmanager
     async def transaction(self):
@@ -87,10 +85,12 @@ class ImportHarness:
             raise
 
     async def fetch(self, _session, license_number):
+        assert _session._retry_connection is False
         self.requests.append(license_number)
         response = self.responses_by_license[license_number]
         if isinstance(response, BaseException):
             raise response
+        worker.acquisition.decoded_profile(response)
         return copy.deepcopy(response)
 
     async def upsert(self, model, rows, key):
@@ -118,17 +118,50 @@ async def test_selected_scope_is_frozen_before_claim_and_retained(harness, limit
     assert manifest["full_cohort_licenses"] == 3
     assert manifest["requested_licenses"] == expected
     assert manifest["max_providers"] == limit
-    assert manifest["categories"] == ["education", "training", "certifications", "specialties"]
     assert manifest["expected_current_run_id"] == PREDECESSOR
     assert manifest["cohort_sha256"] == worker._hash(harness.cohort)
     assert manifest["source"]["registry_generation"] == harness.cohort["registry_generation"]
+    assert manifest["categories"] == list(worker.PROFILE_CATEGORIES)
+    assert manifest["source"]["agency"] == "Kentucky Board of Medical Licensure"
+    assert manifest["source"]["jurisdiction"] == "KY" and manifest["source"]["source_key"] == worker.SOURCE_KEY
     assert len(harness.requests) == len(set(harness.requests)) == expected
     assert len(harness.rows_for(worker.ProviderProfileSourceRecord)) == expected
     assert len(harness.rows_for(worker.ProviderProfileFact)) == expected
+    assert all(fact["npi"] == 1000000004 and fact["category"] == "education"
+               and fact["fact_type"] == "education_history" for fact in harness.rows_for(worker.ProviderProfileFact))
     assert worker.acquisition.read_cohort(harness.artifact_root / claimed_run["run_id"] / "cohort.json") == harness.cohort
     harness.finish.assert_awaited_once()
     assert harness.finish.call_args.args[3]["responses"] == expected
     harness.store_by_name["mark_run_failed"].assert_not_called()
+
+
+async def test_frozen_claim_precedes_artifact_creation_and_run_ids_are_source_bound(harness):
+    async def claim_before_directory(run):
+        worker.acquisition.capture_registry_cohort.assert_awaited_once()
+        assert not harness.artifact_root.exists()
+        assert run["run_id"] == worker._hash([worker.SOURCE_KEY, harness.task["run_id"]])
+        assert run["run_id"] != worker._hash(["massachusetts-borim", harness.task["run_id"]])
+        assert run["source_manifest"]["cohort_sha256"] == worker._hash(harness.cohort)
+
+    harness.store_by_name["claim_run"].side_effect = claim_before_directory
+    await worker.import_profiles(harness.ctx, harness.task)
+    harness.store_by_name["claim_run"].assert_awaited_once()
+
+
+async def test_first_publication_freezes_an_absent_predecessor(harness):
+    worker.store.read_publication.return_value = None
+    await worker.import_profiles(harness.ctx, harness.task)
+    claimed_run = harness.store_by_name["claim_run"].call_args.args[0]
+    assert claimed_run["source_manifest"]["expected_current_run_id"] is None
+    harness.finish.assert_awaited_once()
+
+
+async def test_invalid_license_root_fails_before_claim_or_artifact_paths(harness):
+    harness.cohort["roots"][-1]["license_number"] = "../outside"
+    with pytest.raises(ValueError, match="cohort_licenses_invalid"):
+        await worker.import_profiles(harness.ctx, harness.task)
+    harness.store_by_name["claim_run"].assert_not_awaited()
+    assert not harness.artifact_root.exists() and harness.requests == []
 
 
 def test_bounded_selection_is_order_independent_and_preserves_roots():
@@ -142,8 +175,8 @@ def test_bounded_selection_is_order_independent_and_preserves_roots():
     assert worker._selected_roots(cohort, None) == cohort["roots"]
 
 
-async def test_artifact_accounts_for_empty_response_without_inventing_facts(harness):
-    harness.responses_by_license["456"] = _response("456", empty=True)
+async def test_artifact_accounts_for_not_found_without_inventing_facts(harness):
+    harness.responses_by_license["C0007"] = _response("C0007", empty=True)
     await worker.import_profiles(harness.ctx, harness.task)
     artifact = harness.rows_for(worker.ProviderProfileArtifact)[0]
     path = harness.artifact_root / artifact["run_id"] / artifact["file_name"]
@@ -153,25 +186,25 @@ async def test_artifact_accounts_for_empty_response_without_inventing_facts(harn
     expected_hash = hashlib.sha256()
     for license_number in harness.requests:
         response = harness.responses_by_license[license_number]
-        expected_hash.update(worker.acquisition.encoded_json([license_number, response["content_sha256"], response["downloaded_at"]]))
+        expected_hash.update(worker.acquisition.encoded_json(response))
     assert metrics["responses_sha256"] == expected_hash.hexdigest()
     assert metrics["response_bytes"] == sum(len(response["body_text"].encode()) for response in harness.responses_by_license.values())
     assert metrics["responses"] == 3 and metrics["reused_responses"] == 0
     assert metrics["acquisition_complete"] is True and metrics["transport_failures"] == 0
-    missing = [source_row for source_row in harness.rows_for(worker.ProviderProfileSourceRecord) if source_row["license_number"] == "456"][0]
+    missing = [source_row for source_row in harness.rows_for(worker.ProviderProfileSourceRecord) if source_row["license_number"] == "C0007"][0]
     assert missing["match_status"] == "not_found" and missing["matched_npi"] is None
-    assert missing["raw_payload"] == {}
+    assert missing["raw_payload"] == {"html": harness.responses_by_license["C0007"]["body_text"], "profiles": []}
     assert len(harness.rows_for(worker.ProviderProfileFact)) == 2
 
 
 @pytest.mark.parametrize("failure", [ValueError("synthetic transport failure"), asyncio.CancelledError("synthetic transport failure")])
 async def test_acquisition_failure_keeps_checkpoint_without_finishing(harness, failure):
-    harness.responses_by_license["456"] = failure
+    harness.responses_by_license["C0007"] = failure
     with pytest.raises(type(failure), match="synthetic transport failure"):
         await worker.import_profiles(harness.ctx, harness.task)
     run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
-    assert harness.requests == ["123", "456"]
-    assert worker.acquisition.read_response(harness.artifact_root / run_id / "profiles" / "123.json", "123") == harness.responses_by_license["123"]
+    assert harness.requests == ["00042", "C0007"]
+    assert worker.acquisition.read_response(harness.artifact_root / run_id / "profiles" / "00042.json", "00042") == harness.responses_by_license["00042"]
     assert not (harness.artifact_root / run_id / "manifest.json").exists()
     assert harness.writes == []
     harness.finish.assert_not_called()
@@ -194,8 +227,8 @@ async def test_persistence_failure_rolls_back_batch_and_preserves_pointer(harnes
 
 
 async def test_error_response_fails_before_any_profile_batch_is_stored(harness):
-    harness.responses_by_license["456"] = _response("456", profile={"error": "upstream unavailable"})
-    with pytest.raises(ValueError, match="identity_schema_invalid"):
+    harness.responses_by_license["C0007"] = _response("C0007", html="<html><body>Upstream unavailable</body></html>")
+    with pytest.raises(ValueError, match="result_envelope_invalid"):
         await worker.import_profiles(harness.ctx, harness.task)
     assert harness.rows_for(worker.ProviderProfileSourceRecord) == []
     assert harness.rows_for(worker.ProviderProfileFact) == []
@@ -230,7 +263,7 @@ async def test_failed_claim_does_not_fail_someone_elses_run(harness):
     {"resume_from": "../previous"}, {"resume_from": 1},
 ])
 async def test_invalid_task_is_rejected_before_side_effects(harness, task):
-    with pytest.raises(ValueError, match="massachusetts_profile_"):
+    with pytest.raises(ValueError, match="kentucky_profile_"):
         await worker.import_profiles(harness.ctx, task)
     harness.store_by_name["ensure_tables"].assert_not_called()
     harness.store_by_name["claim_run"].assert_not_called()
@@ -258,8 +291,8 @@ async def test_acquisition_cancellation_preserves_first_checkpoint(harness, monk
     with pytest.raises(ImportCancelledError):
         await worker.import_profiles(harness.ctx, harness.task)
     run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
-    assert harness.requests == ["123"]
-    assert (harness.artifact_root / run_id / "profiles" / "123.json").exists()
+    assert harness.requests == ["00042"]
+    assert (harness.artifact_root / run_id / "profiles" / "00042.json").exists()
     harness.finish.assert_not_called()
     harness.store_by_name["mark_run_failed"].assert_awaited_once()
 
@@ -275,6 +308,66 @@ async def test_persistence_cancellation_stops_before_source_rows(harness):
     harness.store_by_name["mark_run_failed"].assert_awaited_once()
 
 
+async def test_persistence_cancellation_between_record_and_fact_writes_rolls_back(harness):
+    harness.cancel_model = worker.ProviderProfileSourceRecord
+    with pytest.raises(ImportCancelledError):
+        await worker.import_profiles(harness.ctx, harness.task)
+    assert len(harness.rows_for(worker.ProviderProfileArtifact)) == 1
+    assert harness.rows_for(worker.ProviderProfileSourceRecord) == harness.rows_for(worker.ProviderProfileFact) == []
+    harness.finish.assert_not_awaited()
+    harness.store_by_name["publish_run"].assert_not_awaited()
+
+
+async def test_cancellation_during_cohort_capture_prevents_a_claim(harness, monkeypatch):
+    async def capture_then_cancel(_schema):
+        harness.redis.get.return_value = b"1"
+        return harness.cohort
+
+    monkeypatch.setattr(worker.acquisition, "capture_registry_cohort", capture_then_cancel)
+    with pytest.raises(ImportCancelledError):
+        await worker.import_profiles(harness.ctx, harness.task)
+    harness.store_by_name["claim_run"].assert_not_awaited()
+    assert not harness.artifact_root.exists() and harness.requests == []
+
+
+async def test_cancellation_after_claim_prevents_the_run_directory(harness):
+    async def claim_then_cancel(_run):
+        harness.redis.get.return_value = b"1"
+
+    harness.store_by_name["claim_run"].side_effect = claim_then_cancel
+    with pytest.raises(ImportCancelledError):
+        await worker.import_profiles(harness.ctx, harness.task)
+    assert list(harness.artifact_root.iterdir()) == [] and harness.requests == []
+    harness.store_by_name["mark_run_failed"].assert_awaited_once()
+
+
+@pytest.mark.parametrize("changed_field", ["body_text", "downloaded_at", "response_bytes"])
+async def test_retention_requires_acquisition_digest_and_byte_count(harness, changed_field):
+    """Rehashing a changed response cannot bypass the manifest's aggregate digest."""
+    async def rewrite_after_acquisition(run_id, _fields):
+        if changed_field == "response_bytes":
+            _fields["metrics"]["response_bytes"] += 1
+            return
+        path = harness.artifact_root / run_id / "profiles" / "C0007.json"
+        response = json.loads(path.read_text())
+        if changed_field == "body_text":
+            response["body_text"] = response["body_text"].replace("Synthetic &amp; Medical School", "Different Medical School")
+            response["content_sha256"] = hashlib.sha256(response["body_text"].encode()).hexdigest()
+        else:
+            response["downloaded_at"] = "2026-09-08T13:00:00+00:00"
+        path.write_bytes(worker.acquisition.encoded_json(response))
+
+    harness.store_by_name["update_run"].side_effect = rewrite_after_acquisition
+    with pytest.raises(ValueError, match="retained_responses_changed"):
+        await worker.import_profiles(harness.ctx, harness.task)
+    harness.finish.assert_not_awaited()
+    harness.store_by_name["publish_run"].assert_not_awaited()
+    harness.store_by_name["mark_run_failed"].assert_awaited_once()
+    run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
+    manifest = json.loads((harness.artifact_root / run_id / "manifest.json").read_text())
+    assert manifest["acquisition"] == harness.store_by_name["update_run"].call_args.args[1]["metrics"]
+
+
 async def test_retention_failure_does_not_downgrade_completed_import(harness):
     harness.store_by_name["retain_source_history"].side_effect = RuntimeError("synthetic cleanup error")
     receipt = await worker.import_profiles(harness.ctx, harness.task)
@@ -283,7 +376,7 @@ async def test_retention_failure_does_not_downgrade_completed_import(harness):
     harness.store_by_name["mark_run_failed"].assert_not_called()
 
 
-def _retained_run(harness, *, limit=2, categories=("education", "training")):
+def _retained_run(harness, *, limit=2):
     run_id = "b" * 64
     directory = harness.artifact_root / run_id
     (directory / "profiles").mkdir(parents=True)
@@ -291,7 +384,7 @@ def _retained_run(harness, *, limit=2, categories=("education", "training")):
     selected = worker._selected_roots(harness.cohort, limit)
     for root in selected:
         worker.acquisition.write_new_json(directory / "profiles" / f"{root['license_number']}.json", harness.responses_by_license[root["license_number"]])
-    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR, categories=categories)
+    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR)
     return {"run_id": run_id, "source_manifest": manifest}, directory
 
 
@@ -313,7 +406,6 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
     assert {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()} == bytes_by_name
     assert run_row["source_manifest"]["cohort_sha256"] == previous_run["source_manifest"]["cohort_sha256"]
     assert run_row["source_manifest"]["expected_current_run_id"] == PREDECESSOR
-    assert run_row["source_manifest"]["categories"] == ["education", "training"]
     assert harness.finish.call_args.args[3]["reused_responses"] == 2
     artifact = harness.rows_for(worker.ProviderProfileArtifact)[0]
     for root in worker._selected_roots(harness.cohort, 2):
@@ -324,35 +416,9 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
         assert old_facts[0]["fact_id"] != new_facts[0]["fact_id"]
 
 
-@pytest.mark.parametrize("richer", [False, True])
-async def test_full_resume_keeps_frozen_categories_and_original_response_bytes(harness, monkeypatch, richer):
-    categories = ["education", "training", "certifications", "specialties"] if richer else ["education", "training"]
-    for license_number, response in harness.responses_by_license.items():
-        profile = worker.acquisition.decoded_profile(response)
-        profile["boardCertifications"] = {"abms": [{"boardName": "Example Board"}]} if richer else "unselected malformed value"
-        profile["specialties"] = ["Example Specialty"] if richer else 42
-        harness.responses_by_license[license_number] = _response(license_number, profile=profile)
-    previous, previous_directory = _retained_run(harness, limit=None, categories=categories)
-    bytes_by_name = {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()}
-    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous))
-    worker.acquisition.capture_registry_cohort.side_effect = AssertionError("Resume must use its frozen registry")
-    await worker.import_profiles(harness.ctx, {**harness.task, "resume_from": previous["run_id"]})
-    run = harness.store_by_name["claim_run"].call_args.args[0]
-    assert run["source_manifest"]["categories"] == categories
-    assert run["source_manifest"]["max_providers"] is None
-    assert harness.requests == [] and harness.finish.call_args.args[3]["reused_responses"] == 3
-    new_directory = harness.artifact_root / run["run_id"]
-    assert {path.name: path.read_bytes() for path in (new_directory / "profiles").iterdir()} == bytes_by_name
-    assert {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()} == bytes_by_name
-    assert json.loads((new_directory / "manifest.json").read_bytes())["source_manifest"]["categories"] == categories
-    facts = harness.rows_for(worker.ProviderProfileFact)
-    assert len(facts) == (9 if richer else 3)
-    assert {fact["category"] for fact in facts} == ({"education", "certifications", "specialties"} if richer else {"education"})
-
-
 async def test_changed_resume_cohort_is_refused_before_new_claim(harness, monkeypatch):
     previous_run, previous_directory = _retained_run(harness)
-    changed = _cohort(("123", "456", "999"))
+    changed = _cohort(("00042", "C0007", "C0009"))
     (previous_directory / "cohort.json").write_bytes(worker.acquisition.encoded_json(changed))
     monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous_run))
     with pytest.raises(ValueError, match="resume_cohort_changed"):
@@ -382,7 +448,7 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     from api import control_imports, control_workers
     import process
 
-    importer = "massachusetts-borim-profile"
+    importer = "kentucky-kbml-profile"
     registration = next(entry for entry in control_imports.importer_registry() if entry["name"] == importer)
     assert registration["family"] == "provider" and registration["depends_on"] == ["npi"]
     assert registration["cancelable"] is True and registration["enqueue_adapter"] == "arq_single_job"
@@ -391,15 +457,16 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     dispatch_payload = control_imports._adapter_payload(adapter, {
         "run_id": "synthetic-control", "importer": importer, "family": "provider",
     }, {"max_providers": 2, "resume_from": "b" * 64})
-    assert dispatch_payload["target_module"] == "process.massachusetts_profile"
+    assert dispatch_payload["target_module"] == "process.kentucky_profile"
     assert dispatch_payload["target_function"] == "import_profiles" and dispatch_payload["call_style"] == "ctx_task"
     assert dispatch_payload["task"]["max_providers"] == 2 and dispatch_payload["task"]["resume_from"] == "b" * 64
     spec = next(entry for entry in control_workers.worker_registry() if importer in entry["importers"] and entry["role"] == "start")
-    assert spec["worker_class"] == "process.MassachusettsBORIMProfile"
-    assert spec["queue"] == adapter["queue"] == registration["queue"] == process.MassachusettsBORIMProfile.queue_name
-    assert process.MassachusettsBORIMProfile.max_jobs == 1
-    assert process.MassachusettsBORIMProfile.functions[0].name == adapter["function"]
-    assert process.process_group.commands[importer] is worker.massachusetts_borim_profile
+    assert spec["worker_class"] == "process.KentuckyKBMLProfile"
+    assert spec["queue"] == adapter["queue"] == registration["queue"] == process.KentuckyKBMLProfile.queue_name
+    assert process.KentuckyKBMLProfile.max_jobs == 1
+    assert process.KentuckyKBMLProfile.functions[0].name == adapter["function"]
+    assert process.KentuckyKBMLProfile.functions[0].max_tries == 1
+    assert process.process_group.commands[importer] is worker.kentucky_kbml_profile
     cli_help = CliRunner().invoke(process.process_group, [importer, "--help"])
     assert cli_help.exit_code == 0
     assert "--max-providers" in cli_help.output and "--resume-from" in cli_help.output
@@ -468,7 +535,7 @@ def test_retained_resume_rejects_symlink_directories(tmp_path, component):
     else:
         run_directory.mkdir()
         (run_directory / "profiles").symlink_to(actual, target_is_directory=True)
-    with pytest.raises(ValueError, match="retained_directory_invalid"):
+    with pytest.raises(ValueError, match="artifact_symlink"):
         worker._retained_directory(artifact_root, run_id)
     assert actual.is_dir() and list(actual.iterdir()) == []
 
@@ -476,16 +543,43 @@ def test_retained_resume_rejects_symlink_directories(tmp_path, component):
 def test_artifact_root_uses_pvc_default_and_explicit_override(monkeypatch, tmp_path):
     from pathlib import Path
 
-    monkeypatch.delenv("HLTHPRT_MA_BORIM_ARTIFACT_ROOT", raising=False)
-    assert worker._artifact_root() == Path("/work/massachusetts-borim")
+    monkeypatch.delenv("HLTHPRT_KY_KBML_ARTIFACT_ROOT", raising=False)
+    assert worker._artifact_root() == Path("/work/kentucky-kbml")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HLTHPRT_MA_BORIM_ARTIFACT_ROOT", "relative-artifacts")
+    monkeypatch.setenv("HLTHPRT_KY_KBML_ARTIFACT_ROOT", "relative-artifacts")
     assert worker._artifact_root() == tmp_path / "relative-artifacts"
     assert not (tmp_path / "relative-artifacts").exists()
 
 
+@pytest.mark.parametrize("setting", ["", " "])
+def test_artifact_root_rejects_blank_override(monkeypatch, setting):
+    monkeypatch.setenv("HLTHPRT_KY_KBML_ARTIFACT_ROOT", setting)
+    with pytest.raises(ValueError, match="artifact_root_invalid"):
+        worker._artifact_root()
+
+
+async def test_symlink_artifact_root_is_rejected_before_cohort_and_claim(harness, monkeypatch, tmp_path):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+    monkeypatch.setenv("HLTHPRT_KY_KBML_ARTIFACT_ROOT", str(linked))
+    with pytest.raises(ValueError, match="artifact_symlink"):
+        await worker.import_profiles(harness.ctx, harness.task)
+    worker.acquisition.capture_registry_cohort.assert_not_awaited()
+    harness.store_by_name["claim_run"].assert_not_awaited()
+    assert list(actual.iterdir()) == [] and harness.requests == []
+
+
+@pytest.mark.parametrize("run_id", ["../other", "", None])
+def test_retained_directory_validates_run_id_before_deriving_path(tmp_path, run_id):
+    with pytest.raises(ValueError, match="run_id_invalid"):
+        worker._retained_directory(tmp_path, run_id)
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("profiles", ["", '{"process.PTGHuge":{"limits":{"memory":"64Gi"}}}'])
-def test_ma_resources_fall_back_without_changing_other_workers(monkeypatch, profiles):
+def test_ky_resources_fall_back_without_changing_other_workers(monkeypatch, profiles):
     from api import control_workers
 
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON", profiles)
@@ -493,9 +587,9 @@ def test_ma_resources_fall_back_without_changing_other_workers(monkeypatch, prof
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_MEMORY_REQUEST", "4Gi")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_CPU_LIMIT", "16")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_MEMORY_LIMIT", "64Gi")
-    ma_spec = control_workers.WorkerSpec("arq:MassachusettsBORIMProfile", "process.MassachusettsBORIMProfile", ("massachusetts-borim-profile",))
+    ky_spec = control_workers.WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",))
     other_spec = control_workers.WorkerSpec("arq:CMSDoctors", "process.CMSDoctors", ("cms-doctors",))
-    assert control_workers._worker_job_resources(ma_spec) == {
+    assert control_workers._worker_job_resources(ky_spec) == {
         "requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"cpu": "4", "memory": "4Gi"},
     }
     assert control_workers._worker_job_resources(other_spec) == {
@@ -503,11 +597,11 @@ def test_ma_resources_fall_back_without_changing_other_workers(monkeypatch, prof
     }
 
 
-@pytest.mark.parametrize("selector", ["process.MassachusettsBORIMProfile", "arq:MassachusettsBORIMProfile"])
-def test_explicit_ma_resource_profile_precedes_default(monkeypatch, selector):
+@pytest.mark.parametrize("selector", ["process.KentuckyKBMLProfile", "arq:KentuckyKBMLProfile"])
+def test_explicit_ky_resource_profile_precedes_default(monkeypatch, selector):
     from api import control_workers
 
     resources_by_kind = {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"cpu": "2", "memory": "2Gi"}}
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON", json.dumps({selector: resources_by_kind}))
-    spec = control_workers.WorkerSpec("arq:MassachusettsBORIMProfile", "process.MassachusettsBORIMProfile", ("massachusetts-borim-profile",))
+    spec = control_workers.WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",))
     assert control_workers._worker_job_resources(spec) == resources_by_kind
