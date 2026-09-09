@@ -25,11 +25,11 @@ def input_header(root: Path, input_name: str) -> str:
 
 
 def validate(root: Path) -> None:
-    """Reject a stale lock before pip can install its hashed artifacts."""
+    """Reject a stale lock before uv can install its hashed artifacts."""
     for lock_name, input_names in LOCK_INPUTS.items():
         recorded = re.findall(r"^# Input: .+$", (root / lock_name).read_text(), re.M)
         if recorded != [input_header(root, name) for name in input_names]:
-            raise ValueError(f"{lock_name} is stale; run python scripts/python_locks.py compile")
+            raise ValueError(f"{lock_name} is stale; run uv run scripts/python_locks.py compile")
 
 
 def compile_locks(root: Path) -> None:

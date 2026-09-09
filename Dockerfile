@@ -1,4 +1,8 @@
+FROM ghcr.io/astral-sh/uv:0.12.11@sha256:79c6f4776b851471cc73b7d21d0cc834bb94383c292e83640d27eff512864df7 AS uv-bin
+
 FROM docker.io/library/rust:1.98.1-slim-trixie@sha256:ce84a5edd80c5f91e05c5533b1e53eb1da54028f33734dc06aa6b49fa190462d AS ptg2-scanner-builder
+
+COPY --from=uv-bin /uv /usr/local/bin/uv
 
 ARG TARGETARCH
 ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
@@ -8,18 +12,16 @@ COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirem
 COPY scripts/python_locks.py /build/scripts/python_locks.py
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip \
-    && python3 /build/scripts/python_locks.py check --root /build \
-    && python3 -m pip install \
-        --break-system-packages \
-        --no-cache-dir \
+RUN uv venv --python 3.14.7 /build/venv \
+    && /build/venv/bin/python /build/scripts/python_locks.py check --root /build \
+    && uv pip install \
+        --python /build/venv/bin/python \
+        --no-cache \
         --no-deps \
         --only-binary=:all: \
         --require-hashes \
         -r /build/requirements-build.lock \
-    && python3 -m pip check \
-    && rm -rf /var/lib/apt/lists/*
+    && uv pip check --python /build/venv/bin/python
 RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
         RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
     else \
@@ -27,12 +29,14 @@ RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
     fi
 RUN cd /build/support/ptg2_scanner \
     && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
-        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" python3 -m maturin build --release --features python-extension --out /build/wheels; \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" /build/venv/bin/python -m maturin build --release --features python-extension --out /build/wheels; \
     else \
-        python3 -m maturin build --release --features python-extension --out /build/wheels; \
+        /build/venv/bin/python -m maturin build --release --features python-extension --out /build/wheels; \
     fi
 
 FROM docker.io/library/python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
+
+COPY --from=uv-bin /uv /usr/local/bin/uv
 
 #
 WORKDIR /wheels
@@ -43,11 +47,10 @@ WORKDIR /opt
 RUN apt-get update \
     && if apt-cache show libaio1t64 >/dev/null 2>&1; then LIBAIO_PKG=libaio1t64; else LIBAIO_PKG=libaio1; fi \
     && apt-get install -y --no-install-recommends nginx git curl parallel "${LIBAIO_PKG}" \
-    && python3 -m venv venv \
-    && . venv/bin/activate \
-    && python /wheels/scripts/python_locks.py check --root /wheels \
-    && python -m pip install --no-cache-dir --no-compile --only-binary=:all: --require-hashes -r /wheels/requirements-runtime.lock \
-    && python -m pip check \
+    && uv venv --python /usr/local/bin/python3 --no-python-downloads /opt/venv \
+    && python3 /wheels/scripts/python_locks.py check --root /wheels \
+    && uv pip install --python /opt/venv/bin/python --no-cache --only-binary=:all: --require-hashes -r /wheels/requirements-runtime.lock \
+    && uv pip check --python /opt/venv/bin/python \
     && test -x /opt/venv/bin/rapidgzip \
     && ln -sf /opt/venv/bin/rapidgzip /usr/local/bin/rapidgzip \
     && install -d -o nobody -g nogroup -m 755 /run /var/log/nginx \
@@ -58,7 +61,7 @@ RUN apt-get update \
         /var/lib/nginx/uwsgi \
         /var/lib/nginx/scgi \
     && rm -rf /wheels \
-    && rm -rf /root/.cache/pip/* \
+    && rm -rf /root/.cache/uv/* \
     && find . -name '*.pyc' -delete \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
@@ -150,9 +153,8 @@ COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/uhc_semantic_facts \
     /opt/support/ptg2_scanner/target/release/uhc_semantic_facts
 COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
-RUN . /opt/venv/bin/activate \
-    && pip install --no-compile --no-deps /tmp/ptg2-address-canon-wheels/*.whl \
-    && python -m pip check \
+RUN uv pip install --python /opt/venv/bin/python --no-cache --no-build --no-deps /tmp/ptg2-address-canon-wheels/*.whl \
+    && uv pip check --python /opt/venv/bin/python \
     && rm -rf /tmp/ptg2-address-canon-wheels
 COPY logging.yaml main.py alembic.ini /opt/
 

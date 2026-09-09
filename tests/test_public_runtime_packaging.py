@@ -90,7 +90,14 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     ) in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
-    assert "python -m pip check" in dockerfile
+    assert (
+        "ghcr.io/astral-sh/uv:0.12.11@sha256:"
+        "79c6f4776b851471cc73b7d21d0cc834bb94383c292e83640d27eff512864df7"
+    ) in dockerfile
+    assert "uv pip check" in dockerfile
+    assert "uv pip install" in dockerfile
+    assert not re.search(r"(?:python3? -m|&&) pip ", dockerfile)
+    assert "python3-pip" not in dockerfile
     validate(ROOT)
     for name in {*LOCK_INPUTS, *(name for inputs in LOCK_INPUTS.values() for name in inputs)}:
         (tmp_path / name).write_bytes((ROOT / name).read_bytes())
@@ -98,7 +105,12 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     with pytest.raises(ValueError, match="requirements-runtime.lock is stale"):
         validate(tmp_path)
     names = set(re.findall(r"^([a-z0-9-]+)(?:\[[^]]+\])?==", (ROOT / "requirements-runtime.lock").read_text(), re.M))
-    assert not names & {"pytest", "coverage", "pip-audit", "maturin", "uv", "pytest-xdist"}
+    assert not names & {"pip", "pytest", "coverage", "pip-audit", "maturin", "uv", "pytest-xdist"}
+
+
+def test_native_extension_supports_python_314_and_newer():
+    assert 'requires-python = ">=3.14"' in (ROOT / "support/ptg2_scanner/pyproject.toml").read_text()
+    assert 'features = ["abi3-py314"]' in (ROOT / "support/ptg2_scanner/Cargo.toml").read_text()
 
 
 def test_local_example_has_neutral_database_and_no_shared_operator_token():

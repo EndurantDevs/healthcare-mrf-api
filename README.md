@@ -101,7 +101,7 @@ Detailed run instructions for every importer are documented in [docs/imports/REA
 
 ## Import Commands (Complete)
 
-Run from repo root in an activated virtualenv.
+Run from repo root in an activated uv environment.
 
 ### Queue-based imports
 
@@ -193,7 +193,7 @@ Per-import documentation:
 ## Local Development
 
 The importer and API run independently of any commercial scheduler. Use
-CPython 3.14, a native Rust toolchain (1.97.1 for the container build), PostgreSQL
+CPython 3.14 or newer, a native Rust toolchain (1.98.1 for the container build), PostgreSQL
 18 and Redis 7. Geographic workloads also use PostGIS. The Dockerfile builds on
 the machine's native architecture; its runtime contains importer dependencies
 and native binaries, with deployment and CI tooling excluded.
@@ -201,11 +201,11 @@ and native binaries, with deployment and CI tooling excluded.
 Install the pinned runtime and native build dependencies from the repository root:
 
 ```bash
-python3.14 -m venv .venv
+uv venv --python 3.14 --no-python-downloads .venv
 source .venv/bin/activate
 python scripts/python_locks.py check
-python -m pip install --require-hashes -r requirements-runtime.lock
-python -m pip install --require-hashes -r requirements-build.lock
+uv pip install --require-hashes -r requirements-runtime.lock
+uv pip install --require-hashes -r requirements-build.lock
 cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
 maturin develop --release --features python-extension --manifest-path support/ptg2_scanner/Cargo.toml
 cp .env.example .env
@@ -239,7 +239,7 @@ For a small synthetic check of CSV parsing, batching and failure handling that
 does not require running services:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+uv pip install -r requirements-dev.txt
 python -m pytest -q tests/test_process_geo_import_unit.py tests/test_public_runtime_packaging.py
 ```
 
@@ -249,8 +249,8 @@ To build a local container, supply the source identity:
 docker build --build-arg HLTHPRT_SOURCE_COMMIT="$(git rev-parse HEAD)" -t healthcare-mrf-api:local .
 ```
 
-Maintainers regenerate the runtime/build locks with `uv 0.12.10` and
-`python scripts/python_locks.py compile`. The locks retain artifact hashes
+Maintainers regenerate the runtime/build locks with `uv 0.12.11` and
+`uv run scripts/python_locks.py compile`. The locks retain artifact hashes
 for native platforms and record the hash of their requirement input; the build
 rejects stale inputs. CI dependencies are managed separately.
 
