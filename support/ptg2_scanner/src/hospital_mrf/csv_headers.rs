@@ -347,7 +347,7 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     let parts = value.split(['-', '/']).collect::<Vec<_>>();
     if parts.len() != 3 || (value.contains('-') && value.contains('/')) {
         return Err(invalid(
-            "last_updated_on must be YYYY-MM-DD, M/D/YYYY, or MM/DD/YYYY",
+            "last_updated_on must be YYYY-MM-DD, M/D/YYYY, MM/DD/YYYY, M/D/YY, or MM/DD/YY",
         ));
     }
     let (year, month, day) = if value.contains('/') {
@@ -360,10 +360,13 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     }) {
         return Err(invalid("last_updated_on contains an invalid month or day"));
     }
-    if year.len() != 4 || !year.bytes().all(|byte| byte.is_ascii_digit()) {
+    let two_digit_year = value.contains('/') && year.len() == 2;
+    if !year.bytes().all(|byte| byte.is_ascii_digit())
+        || (year.len() != 4 && !two_digit_year)
+    {
         return Err(invalid("last_updated_on contains an invalid year"));
     }
-    let year_number = parse_date_number(year, "year")?;
+    let year_number = parse_date_number(year, "year")? + u32::from(two_digit_year) * 2000;
     let month_number = parse_date_number(month, "month")?;
     let day_number = parse_date_number(day, "day")?;
     let leap_year = year_number.is_multiple_of(4)
