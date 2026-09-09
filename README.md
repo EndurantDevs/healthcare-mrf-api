@@ -249,7 +249,7 @@ To build a local container, supply the source identity:
 docker build --build-arg HLTHPRT_SOURCE_COMMIT="$(git rev-parse HEAD)" -t healthcare-mrf-api:local .
 ```
 
-Maintainers regenerate the runtime/build locks with `uv 0.12.11` and
+Maintainers regenerate and refresh the runtime/build locks with `uv 0.12.12` and
 `uv run scripts/python_locks.py compile`. The locks retain artifact hashes
 for native platforms and record the hash of their requirement input; the build
 rejects stale inputs. CI dependencies are managed separately.

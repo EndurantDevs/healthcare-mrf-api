@@ -84,6 +84,7 @@ def test_documented_container_commands_are_packaged():
 
 def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path):
     dockerfile = (ROOT / "Dockerfile").read_text()
+    lock_script = (ROOT / "scripts/python_locks.py").read_text()
     assert (
         "python:3.14.7-slim-trixie@sha256:"
         "cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6"
@@ -91,11 +92,12 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
     assert (
-        "ghcr.io/astral-sh/uv:0.12.11@sha256:"
-        "79c6f4776b851471cc73b7d21d0cc834bb94383c292e83640d27eff512864df7"
+        "ghcr.io/astral-sh/uv:0.12.12@sha256:"
+        "73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4"
     ) in dockerfile
     assert "uv pip check" in dockerfile
     assert "uv pip install" in dockerfile
+    assert '"--upgrade"' in lock_script
     assert not re.search(r"(?:python3? -m|&&) pip ", dockerfile)
     assert "python3-pip" not in dockerfile
     validate(ROOT)

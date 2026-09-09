@@ -47,7 +47,7 @@ def compile_locks(root: Path) -> None:
                 "--python-version", "3.14.7", "--universal", "--generate-hashes",
                 "--only-binary", ":all:", "--emit-build-options", "--no-annotate",
                 "--no-header", "--no-strip-extras", "--no-python-downloads",
-                "--output-file", str(candidate), "--quiet",
+                "--upgrade", "--output-file", str(candidate), "--quiet",
             ], check=True)
             if "\n".join(input_header(root, name) for name in input_names) != header:
                 raise ValueError(f"{lock_name} inputs changed during compilation")
