@@ -95,7 +95,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_714
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 143
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 144
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -240,18 +240,37 @@ def test_reviewed_sources_preserve_location_binding(hospital_id, name, locator_u
     assert store._location_ordinals((candidate,), locations) == {hospital_id: ordinal}
 
 
-def test_unproven_timeout_keeps_no_reviewed_source():
-    """An uncertain locator timeout does not authorize a reviewed source override."""
+def test_reviewed_johnson_publisher_fallback_preserves_singleton_identity():
+    """Use the reviewed publisher endpoint without widening Johnson's scope."""
     hospital, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-003267"})
-    assert hospital == {"hospital_id": "hospital-003267", "name": "Johnson County Hospital",
-                        "cms_hpt_url": "https://jchosp.com/cms-hpt.txt"}
+    assert hospital == {
+        "hospital_id": "hospital-003267",
+        "name": "Johnson County Hospital",
+        "cms_hpt_url": "https://jchosp.com/cms-hpt.txt",
+        "fallback_mrf_url": (
+            "https://secure.claraprice.net/price-transparency/"
+            "OPIU-1673956354318/machine-readable"
+        ),
+    }
+    assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (
+        hospital["hospital_id"],
+    )
+    assert tuple(
+        entry
+        for entry in registry.load_hospital_hpt_registry()
+        if entry["cms_hpt_url"] == hospital["cms_hpt_url"]
+        or entry.get("fallback_mrf_url") == hospital["fallback_mrf_url"]
+    ) == (hospital,)
     acquisition = acquisition_module()
     candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
         hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation", (hospital,),
-        None, error_code="timeout", fetch_failed=False,
+        None, error_code="clientresponse", error_detail="401", fetch_failed=True,
     ),))
-    assert candidate.initial_error_code == "timeout"
-    assert candidate.source_url == hospital["cms_hpt_url"]
+    assert candidate.initial_error_code is None
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (
+        hospital["hospital_id"], hospital["name"], hospital["name"],
+    )
 
 
 @pytest.mark.parametrize("signature", ("synthetic%2fvalue", "synthetic%2Fvalue"))

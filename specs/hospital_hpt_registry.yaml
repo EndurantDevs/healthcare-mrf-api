@@ -10972,6 +10972,7 @@ hospitals:
 - hospital_id: hospital-003267
   name: Johnson County Hospital
   cms_hpt_url: https://jchosp.com/cms-hpt.txt
+  fallback_mrf_url: https://secure.claraprice.net/price-transparency/OPIU-1673956354318/machine-readable
 - hospital_id: hospital-003268
   name: Johnson Memorial Health
   cms_hpt_url: https://johnsonmemorial.org/cms-hpt.txt
