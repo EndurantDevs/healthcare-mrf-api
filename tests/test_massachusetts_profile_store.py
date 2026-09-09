@@ -273,6 +273,119 @@ async def _seed_run(database, **kwargs):
     return candidate_run
 
 
+async def _legacy_retained_counts(database, run_id):
+    """Keep the pre-rewrite SQL as an independent oracle for retained-count parity."""
+    source_records = store._table(store.ProviderProfileSourceRecord)
+    facts = store._table(store.ProviderProfileFact)
+    artifacts = store._table(store.ProviderProfileArtifact)
+    count_row = await database.first(f"""
+        SELECT count(*) AS retained_source_records,
+               count(*) FILTER (WHERE raw_payload->>'licenseNumber' = license_number
+                                  AND raw_payload->>'licenseMetaId' = '1') AS received_profiles,
+               count(*) FILTER (WHERE source_key <> :source_key
+                     OR normalized_payload->>'schema_version' IS DISTINCT FROM :schema_version) AS invalid_source_records,
+               (SELECT count(*) FROM {facts} WHERE run_id = :run_id) AS retained_facts,
+               (SELECT count(DISTINCT f.npi) FROM {facts} f JOIN {source_records} r
+                   ON r.record_id = f.source_record_id AND r.run_id = f.run_id
+                 WHERE f.run_id = :run_id AND r.source_key = :source_key
+                   AND r.match_status = 'deterministic' AND r.matched_npi = f.npi
+                   AND r.normalized_payload->>'visibility' = 'public'
+                   AND NOT f.sensitive AND f.public_default AND f.availability = 'available') AS matched_public_providers,
+               (SELECT count(*) FROM {facts} f LEFT JOIN {source_records} r
+                   ON r.record_id = f.source_record_id AND r.run_id = f.run_id
+                 WHERE f.run_id = :run_id AND (r.record_id IS NULL OR r.source_key <> :source_key
+                    OR f.source_json->>'source_key' IS DISTINCT FROM :source_key
+                    OR f.source_json->>'schema_version' IS DISTINCT FROM :schema_version
+                    OR f.source_json->>'source_record_id' IS DISTINCT FROM f.source_record_id
+                    OR f.npi IS DISTINCT FROM r.matched_npi
+                    OR r.normalized_payload->>'visibility' IS DISTINCT FROM 'public'
+                    OR (f.npi IS NOT NULL AND r.match_status <> 'deterministic'))) AS invalid_facts,
+               (SELECT count(*) FROM {artifacts} WHERE run_id = :run_id
+                    AND source_key <> :source_key) AS foreign_artifacts
+          FROM {source_records} WHERE run_id = :run_id
+    """, run_id=run_id, source_key=store.SOURCE_KEY, schema_version=store.SCHEMA_VERSION)
+    return dict(count_row._mapping)
+
+
+@pytest.mark.parametrize(("record_changes", "fact_changes", "expected_changes"), [
+    ({}, {}, {}),
+    ({"source_key": "florida-mqa"}, {}, {"invalid_source_records": 1, "invalid_facts": 1, "matched_public_providers": 1}),
+    ({"normalized_payload": None}, {}, {"invalid_source_records": 1, "invalid_facts": 1, "matched_public_providers": 1}),
+    ({"normalized_payload": {"schema_version": store.SCHEMA_VERSION}}, {}, {"invalid_facts": 1, "matched_public_providers": 1}),
+    ({"match_status": "unmatched"}, {}, {"invalid_facts": 1, "matched_public_providers": 1}),
+    ({"matched_npi": None}, {}, {"invalid_facts": 1, "matched_public_providers": 1}),
+    ({}, {"npi": None}, {"invalid_facts": 1, "matched_public_providers": 1}),
+    ({"matched_npi": None}, {"npi": None}, {"matched_public_providers": 1}),
+    ({"matched_npi": None, "match_status": "unmatched"}, {"npi": None}, {"matched_public_providers": 1}),
+    ({}, {"source_json": {}}, {"invalid_facts": 1}),
+    ({}, {"source_json": None}, {"invalid_facts": 1}),
+    ({}, {"sensitive": True}, {"matched_public_providers": 1}),
+    ({}, {"public_default": False}, {"matched_public_providers": 1}),
+    ({}, {"availability": "unavailable"}, {"matched_public_providers": 1}),
+    ({"license_number": None}, {}, {"received_profiles": 1}),
+])
+async def test_retained_count_predicates_match_legacy_in_postgresql(monkeypatch, record_changes, fact_changes, expected_changes):
+    async with _database(monkeypatch) as database:
+        candidate_run = await _seed_run(database, limit=2)
+        run_id = candidate_run["run_id"]
+        record_id = run_id + "000001"
+        if record_changes:
+            records_table = store.ProviderProfileSourceRecord.__table__
+            await database.update(records_table).where(records_table.c.record_id == record_id).values(record_changes).status()
+        if fact_changes:
+            facts_table = store.ProviderProfileFact.__table__
+            await database.update(facts_table).where(facts_table.c.fact_id == record_id).values(fact_changes).status()
+        legacy_counts = await _legacy_retained_counts(database, run_id)
+        assert legacy_counts == {**_counts(2), **expected_changes}
+        assert await store.retained_counts(run_id) == legacy_counts
+
+
+@pytest.mark.parametrize("parent_kind", ["orphan", "other_run", "other_source_run"])
+async def test_orphan_and_cross_run_parents_remain_invalid_in_postgresql(monkeypatch, parent_kind):
+    async with _database(monkeypatch) as database:
+        candidate_run = await _seed_run(database, limit=2)
+        run_id = candidate_run["run_id"]
+        other_run_id = uuid.uuid4().hex
+        await _seed_payloads(database, other_run_id, 1)
+        records_table = store.ProviderProfileSourceRecord.__table__
+        parent_id = other_run_id + "000001"
+        if parent_kind == "orphan":
+            parent_id = "absent_record"
+        elif parent_kind == "other_source_run":
+            await database.update(records_table).where(records_table.c.record_id == parent_id).values(source_key="florida-mqa").status()
+        else:
+            parent = await database.first(records_table.select().where(records_table.c.record_id == parent_id))
+            assert parent.run_id == other_run_id and parent.matched_npi == 1000000001
+        facts_table = store.ProviderProfileFact.__table__
+        await database.update(facts_table).where(facts_table.c.fact_id == run_id + "000001").values(
+            source_record_id=parent_id,
+            source_json={"source_key": store.SOURCE_KEY, "schema_version": store.SCHEMA_VERSION, "source_record_id": parent_id},
+        ).status()
+        expected_count_by_field = {**_counts(2), "matched_public_providers": 1, "invalid_facts": 1}
+        assert await _legacy_retained_counts(database, run_id) == expected_count_by_field
+        assert await store.retained_counts(run_id) == expected_count_by_field
+        with pytest.raises(RuntimeError, match="retained_integrity_invalid"):
+            await store.finish_unpublished_run(run_id, _metrics(2))
+        assert await store.read_publication() is None
+        assert (await store._read_run(run_id))["status"] == "running"
+
+
+async def test_empty_and_repeated_fact_counts_match_legacy_in_postgresql(monkeypatch):
+    async with _database(monkeypatch) as database:
+        run_id = uuid.uuid4().hex
+        assert await store.retained_counts(run_id) == await _legacy_retained_counts(database, run_id) == _counts(0)
+        await _seed_payloads(database, run_id, 2)
+        facts_table = store.ProviderProfileFact.__table__
+        fact = await database.first(facts_table.select().where(facts_table.c.fact_id == run_id + "000001"))
+        repeated_fact_by_field = {**fact._mapping, "fact_id": uuid.uuid4().hex, "category": "training", "fact_type": "postgraduate_training"}
+        await database.insert(facts_table).values(repeated_fact_by_field).status()
+        assert await store.retained_counts(run_id) == await _legacy_retained_counts(database, run_id) == {**_counts(2), "retained_facts": 3}
+        await database.execute(facts_table.delete().where(facts_table.c.run_id == run_id))
+        assert await store.retained_counts(run_id) == await _legacy_retained_counts(database, run_id) == {
+            **_counts(2), "retained_facts": 0, "matched_public_providers": 0,
+        }
+
+
 async def test_atomic_publication_and_terminal_status_in_postgresql(monkeypatch):
     async with _database(monkeypatch) as database:
         candidate_run = await _seed_run(database)
