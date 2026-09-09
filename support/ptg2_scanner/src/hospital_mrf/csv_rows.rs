@@ -309,9 +309,23 @@ fn parse_tall_payer(
     if columns.profile == CmsProfile::V3 && is_explicitly_uncontracted_csv_payer(&payer) {
         return Ok(None);
     }
-    if columns.profile == CmsProfile::V2 && !payer_has_charge(&payer) {
-        validate_charge_free_csv_payer(&payer)?;
-        return Ok(None);
+    let charge_free_v3_statistics = columns.profile == CmsProfile::V3
+        && payer.plan_name.as_deref() == Some("")
+        && !payer
+            .payer_name
+            .eq_ignore_ascii_case("All Payers / All Plans")
+        && (payer.median_amount.is_some()
+            || payer.percentile_10.is_some()
+            || payer.percentile_90.is_some()
+            || payer.allowed_count.is_some());
+    if !payer_has_charge(&payer) {
+        if columns.profile == CmsProfile::V2 {
+            validate_charge_free_csv_payer(&payer)?;
+            return Ok(None);
+        }
+        if charge_free_v3_statistics && validate_charge_free_csv_payer(&payer).is_ok() {
+            return Ok(None);
+        }
     }
     let payer = validate_csv_payer(
         payer,
