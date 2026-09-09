@@ -173,6 +173,45 @@ def test_source_notices_hold_assertions_with_original_content():
     assert source_record['raw_payload']['profile']['education'][0]['fields']['SchoolLocation'] == SCHOOL
 
 
+@pytest.mark.parametrize(('missing_field', 'reported_field', 'value_field', 'flag'), [
+    ('ProgramType', 'Specialty', 'program', 'program_type_unreported'),
+    ('Specialty', 'ProgramType', 'program_type', 'specialty_unreported'),
+])
+def test_reported_training_survives_one_absent_description(missing_field, reported_field, value_field, flag):
+    reported_by_field = {field: value for field, value in TRAINING.items() if field != missing_field}
+    html = profile_html(trainings=[(8, reported_by_field)])
+    record, facts = rows.parse_profile(html, evidence=evidence_for(html))
+    fact = facts[1]
+    assert record['raw_payload']['html'] == html
+    assert fact['source_json']['raw_fields'] == reported_by_field
+    assert missing_field not in fact['source_json']['field_ids']
+    assert fact['value_json'] == {'completion_year': 2004, 'reported_school_location': TRAINING['SchoolLocation'],
+                                 value_field: TRAINING[reported_field]}
+    assert flag in fact['source_json']['quality_flags']
+    for missing in reported_by_field:
+        incomplete = profile_html(trainings=[(8, {key: value for key, value in reported_by_field.items() if key != missing})])
+        with pytest.raises(ValueError, match='incomplete_repeater_row'):
+            rows.parse_profile(incomplete, evidence=evidence_for(incomplete))
+    marker = span('repSection3_ctl08_ctl00_SchoolLocation', TRAINING['SchoolLocation'])
+    hidden = html.replace(marker, span('repSection3_ctl08_ctl00_' + missing_field, 'Hidden value').replace('<span ', '<span hidden ') + marker)
+    with pytest.raises(ValueError, match='hidden_or_active_section'):
+        rows.parse_profile(hidden, evidence=evidence_for(hidden))
+
+
+def test_legacy_navigation_width_has_narrow_exception():
+    original = profile_html()
+    opening = '<table class="profile_tabs_selected profile_tabs" cellpadding="0" cellspacing="0" border="0" width="100%" width="95"><tr><td>'
+    html = original.replace('<a class="profile_tabs_selected"', opening + '<a class="profile_tabs_selected"', 1)
+    html = html.replace('</a>', '</a></td></tr></table>', 1)
+    assert rows.extract_profile(html) == rows.extract_profile(original)
+    for changed in (html.replace('width="95"', 'width="96"'), html.replace('cellpadding="0"', 'cellpadding="0" cellpadding="1"')):
+        with pytest.raises(ValueError, match='duplicate_attribute'):
+            rows.parse_profile(changed, evidence=evidence_for(changed))
+    nested = original.replace(f'<div id="{PREFIX}divSection2">', f'<div id="{PREFIX}divSection2">' + opening)
+    with pytest.raises(ValueError, match='duplicate_attribute'):
+        rows.parse_profile(nested, evidence=evidence_for(nested))
+
+
 @pytest.mark.parametrize(('old', 'new'), [
     ('profile_tabs_selected', 'profile_tabs'),
     ('Medical School', 'Other School'),

@@ -73,7 +73,7 @@ class _EducationParser(HTMLParser):
         """Track visible profile containers before accepting their source fields."""
         _require(not self.html_closed, "markup_after_document")
         attrs_by_name = dict(attrs)
-        _require(len(attrs_by_name) == len(attrs), "duplicate_attribute")
+        self._validate_attributes(tag, attrs, attrs_by_name)
         is_hidden = _is_hidden(attrs_by_name)
         if self.capture is not None:
             _require(tag in {"span", "b", "strong", "i", "em", "br"}, "unexpected_field_markup")
@@ -104,6 +104,17 @@ class _EducationParser(HTMLParser):
         if tag == "br" and self.capture is not None:
             self.capture["parts"].append("\n")
         _require(not is_hidden or tag == "input", "hidden_container")
+
+    def _validate_attributes(self, tag, attrs, attrs_by_name):
+        if len(attrs_by_name) == len(attrs):
+            return
+        # The observed legacy navigation repeats width; data-field duplicates stay invalid.
+        expected_attrs = [("class", attrs_by_name.get("class")), ("cellpadding", "0"), ("cellspacing", "0"),
+                          ("border", "0"), ("width", "100%"), ("width", "95")]
+        _require(tag == "table" and self.in_form and self._section() is None
+                 and self.capture is None and not any(identifier.endswith("_divProfileHeader") for identifier, _ in self.divs)
+                 and attrs_by_name.get("class") in {"profile_tabs", "profile_tabs_selected profile_tabs"}
+                 and attrs == expected_attrs, "duplicate_attribute")
 
     def _start_form(self, attrs, hidden):
         action = urlsplit(attrs.get("action") or "")
@@ -215,10 +226,13 @@ def _section_entries(fields, number):
         retained["fields"][entry["field"]] = entry["raw"]
         retained["field_ids"][entry["field"]] = entry["id"]
     expected = {"SchoolLocation"} if number == "2" else {"ProgramType", "Specialty", "SchoolLocation"}
+    allowed_fields = [expected]
+    if number == "3":
+        allowed_fields.extend((expected - {"ProgramType"}, expected - {"Specialty"}))
     _require(entries_by_index, "unrecognized_empty_section")
     _require(len({entry["table"] for entry in entries_by_index.values()}) == len(entries_by_index), "mixed_repeater_rows")
     for entry in entries_by_index.values():
-        _require(set(entry["fields"]) == expected, "incomplete_repeater_row")
+        _require(set(entry["fields"]) in allowed_fields, "incomplete_repeater_row")
         _require(any(_text(raw) for raw in entry["fields"].values()), "empty_repeater_row")
         entry.pop("table")
     return list(entries_by_index.values())
@@ -308,7 +322,11 @@ def _education_fact(entry, category, source_record, evidence):
         value_by_field["reported_school_location"] = composite
     if category == "training":
         value_by_field.update({field: _text(raw_fields[raw_name]) for field, raw_name in
-                               (("program_type", "ProgramType"), ("program", "Specialty")) if _text(raw_fields[raw_name])})
+                               (("program_type", "ProgramType"), ("program", "Specialty")) if _text(raw_fields.get(raw_name, ""))})
+        if "ProgramType" not in raw_fields:
+            flags.append("program_type_unreported")
+        if "Specialty" not in raw_fields:
+            flags.append("specialty_unreported")
     fact_type = "education_history" if category == "education" else "postgraduate_training"
     logical_key = _hash([source_record["source_record_key"], category, entry["source_path"], value_by_field])
     return {"fact_id": _hash([source_record["record_id"], logical_key]), "run_id": source_record["run_id"],
