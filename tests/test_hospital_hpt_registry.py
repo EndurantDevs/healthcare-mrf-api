@@ -55,13 +55,16 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-005086": "Philadelphia Post-Acute Partners LLC",
     "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
+    "hospital-005482": "MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL",
     "hospital-005915": "Mee Memorial Hospital",
+    "hospital-006733": "Union Hospital Terre Haute",
     "hospital-006345": "Summa Rehab Hospital, LLC",
     "hospital-003109": "Mesa Springs",
     "hospital-003110": "Mesa Springs Changes",
     "hospital-004749": "Ochsner Behavioral Health Acadiana - Broussard",
     "hospital-006677": "UCSF Parnassus",
     "hospital-006918": "USMD Hospital at Arlington LLC",
+    "hospital-007007": "Wagoner Community Hospital",
 }
 _NORTHSHORE_ALIAS_GROUPS = (
     ("hospital-002062", "hospital-002163", "Evanston Hospital"),
@@ -93,9 +96,9 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_900
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_714
+    assert sum("locator_name" in entry for entry in hospitals) == 1_720
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 144
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 147
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"

@@ -2445,6 +2445,7 @@ hospitals:
 - hospital_id: hospital-000719
   name: BARTLETT - Psychiatric Unit
   cms_hpt_url: https://www.bartletthospital.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbBRHJUNEAUAK&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-000720
   name: Bartlett Anesthesia Services
   cms_hpt_url: https://www.bartletthospital.org/cms-hpt.txt
@@ -18324,6 +18325,7 @@ hospitals:
 - hospital_id: hospital-005482
   name: Rockville General
   cms_hpt_url: https://echn.org/cms-hpt.txt
+  locator_name: MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL
 - hospital_id: hospital-005483
   name: ROCKY MTN HOSP FOR CHILDREN
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
@@ -19809,6 +19811,7 @@ hospitals:
 - hospital_id: hospital-005925
   name: Southwest Arkansas Regional Medical Center
   cms_hpt_url: https://www.swarmc.org/cms-hpt.txt
+  fallback_mrf_url: https://www.swarmc.org/wp-content/uploads/2026/05/994554436_southwest-arkansas-regional-medical-center_standardcharges-1.csv
 - hospital_id: hospital-005926
   name: Southwest General Health Center
   cms_hpt_url: https://www.swgeneral.com/cms-hpt.txt
@@ -22518,6 +22521,7 @@ hospitals:
 - hospital_id: hospital-006733
   name: Union Hospital Inc
   cms_hpt_url: https://union.health/cms-hpt.txt
+  locator_name: Union Hospital Terre Haute
 - hospital_id: hospital-006734
   name: Union Hospital Regional
   cms_hpt_url: https://union.health/cms-hpt.txt
@@ -23067,6 +23071,7 @@ hospitals:
 - hospital_id: hospital-006906
   name: Upson Regional Medical Center
   cms_hpt_url: https://urmc.org/cms-hpt.txt
+  fallback_mrf_url: https://hospitalpricedisclosure.com/download.aspx?ci=S5WFReNwWX5BkPqChnLG0w*-*
 - hospital_id: hospital-006907
   name: Upstate Community Hospital
   cms_hpt_url: https://www.upstate.edu/cms-hpt.txt
@@ -23393,6 +23398,7 @@ hospitals:
 - hospital_id: hospital-007007
   name: Wagoner Orthopedic Center
   cms_hpt_url: https://wagonerhospital.com/cms-hpt.txt
+  locator_name: Wagoner Community Hospital
 - hospital_id: hospital-007008
   name: WakeMed Cary Hospital
   cms_hpt_url: https://www.wakemed.org/cms-hpt.txt
