@@ -118,6 +118,7 @@ async def test_selected_scope_is_frozen_before_claim_and_retained(harness, limit
     assert manifest["full_cohort_licenses"] == 3
     assert manifest["requested_licenses"] == expected
     assert manifest["max_providers"] == limit
+    assert manifest["categories"] == ["education", "training", "certifications", "specialties"]
     assert manifest["expected_current_run_id"] == PREDECESSOR
     assert manifest["cohort_sha256"] == worker._hash(harness.cohort)
     assert manifest["source"]["registry_generation"] == harness.cohort["registry_generation"]
@@ -282,7 +283,7 @@ async def test_retention_failure_does_not_downgrade_completed_import(harness):
     harness.store_by_name["mark_run_failed"].assert_not_called()
 
 
-def _retained_run(harness, *, limit=2):
+def _retained_run(harness, *, limit=2, categories=("education", "training")):
     run_id = "b" * 64
     directory = harness.artifact_root / run_id
     (directory / "profiles").mkdir(parents=True)
@@ -290,7 +291,7 @@ def _retained_run(harness, *, limit=2):
     selected = worker._selected_roots(harness.cohort, limit)
     for root in selected:
         worker.acquisition.write_new_json(directory / "profiles" / f"{root['license_number']}.json", harness.responses_by_license[root["license_number"]])
-    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR)
+    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR, categories=categories)
     return {"run_id": run_id, "source_manifest": manifest}, directory
 
 
@@ -312,6 +313,7 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
     assert {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()} == bytes_by_name
     assert run_row["source_manifest"]["cohort_sha256"] == previous_run["source_manifest"]["cohort_sha256"]
     assert run_row["source_manifest"]["expected_current_run_id"] == PREDECESSOR
+    assert run_row["source_manifest"]["categories"] == ["education", "training"]
     assert harness.finish.call_args.args[3]["reused_responses"] == 2
     artifact = harness.rows_for(worker.ProviderProfileArtifact)[0]
     for root in worker._selected_roots(harness.cohort, 2):
@@ -320,6 +322,32 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
         _, new_facts = worker._source_rows(root, harness.responses_by_license[root["license_number"]], artifact, 1)
         assert old_facts[0]["logical_fact_key"] == new_facts[0]["logical_fact_key"]
         assert old_facts[0]["fact_id"] != new_facts[0]["fact_id"]
+
+
+@pytest.mark.parametrize("richer", [False, True])
+async def test_full_resume_keeps_frozen_categories_and_original_response_bytes(harness, monkeypatch, richer):
+    categories = ["education", "training", "certifications", "specialties"] if richer else ["education", "training"]
+    for license_number, response in harness.responses_by_license.items():
+        profile = worker.acquisition.decoded_profile(response)
+        profile["boardCertifications"] = {"abms": [{"boardName": "Example Board"}]} if richer else "unselected malformed value"
+        profile["specialties"] = ["Example Specialty"] if richer else 42
+        harness.responses_by_license[license_number] = _response(license_number, profile=profile)
+    previous, previous_directory = _retained_run(harness, limit=None, categories=categories)
+    bytes_by_name = {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()}
+    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous))
+    worker.acquisition.capture_registry_cohort.side_effect = AssertionError("Resume must use its frozen registry")
+    await worker.import_profiles(harness.ctx, {**harness.task, "resume_from": previous["run_id"]})
+    run = harness.store_by_name["claim_run"].call_args.args[0]
+    assert run["source_manifest"]["categories"] == categories
+    assert run["source_manifest"]["max_providers"] is None
+    assert harness.requests == [] and harness.finish.call_args.args[3]["reused_responses"] == 3
+    new_directory = harness.artifact_root / run["run_id"]
+    assert {path.name: path.read_bytes() for path in (new_directory / "profiles").iterdir()} == bytes_by_name
+    assert {path.name: path.read_bytes() for path in (previous_directory / "profiles").iterdir()} == bytes_by_name
+    assert json.loads((new_directory / "manifest.json").read_bytes())["source_manifest"]["categories"] == categories
+    facts = harness.rows_for(worker.ProviderProfileFact)
+    assert len(facts) == (9 if richer else 3)
+    assert {fact["category"] for fact in facts} == ({"education", "certifications", "specialties"} if richer else {"education"})
 
 
 async def test_changed_resume_cohort_is_refused_before_new_claim(harness, monkeypatch):

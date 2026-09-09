@@ -18,7 +18,7 @@ from db.models import (
 from process.florida_mqa_profile import (
     _claim_import_run, _delete_retained_payload_rows, _remove_artifact_run_directories,
 )
-from process.massachusetts_profile_rows import SCHEMA_VERSION, SOURCE_KEY
+from process.massachusetts_profile_rows import LEGACY_CATEGORIES, PROFILE_CATEGORIES, SCHEMA_VERSION, SOURCE_KEY
 
 RUN_ID_PATTERN = re.compile(r"(?:[a-f0-9]{32}|[a-f0-9]{64})")
 ACTIVE_STATUSES = ("running", "validating")
@@ -92,7 +92,7 @@ def _manifest(run_by_field):
     if (not isinstance(descriptor, dict) or descriptor.get("source_key") != SOURCE_KEY
             or descriptor.get("source_kind") != "state_regulator" or descriptor.get("jurisdiction") != "MA"):
         raise ValueError("massachusetts_profile_manifest_source_invalid")
-    if manifest_by_field["categories"] != ["education", "training"]:
+    if manifest_by_field["categories"] not in (list(LEGACY_CATEGORIES), list(PROFILE_CATEGORIES)):
         raise ValueError("massachusetts_profile_manifest_categories_invalid")
     if not re.fullmatch(r"[a-f0-9]{64}", str(manifest_by_field["cohort_sha256"])):
         raise ValueError("massachusetts_profile_cohort_hash_invalid")
@@ -136,7 +136,7 @@ async def claim_run(run_row):
         if manifest["resume_from"] is not None:
             resume_run = await _resume_run(manifest["resume_from"], manifest["max_providers"], manifest["expected_current_run_id"])
             if any(manifest[key] != resume_run["source_manifest"][key]
-                   for key in ("cohort_sha256", "full_cohort_licenses", "requested_licenses")):
+                   for key in ("cohort_sha256", "full_cohort_licenses", "requested_licenses", "categories")):
                 raise RuntimeError("massachusetts_profile_resume_cohort_mismatch")
         await _claim_import_run(run_row)
 
@@ -164,6 +164,7 @@ async def retained_counts(run_id):
     source_records = _table(ProviderProfileSourceRecord)
     facts = _table(ProviderProfileFact)
     artifacts = _table(ProviderProfileArtifact)
+    runs = _table(ProviderProfileImportRun)
     count_row = await db.first(text(f"""
         WITH source_counts AS (
             SELECT count(*) AS retained_source_records,
@@ -177,9 +178,15 @@ async def retained_counts(run_id):
                count(DISTINCT f.npi) FILTER (WHERE r.run_id = f.run_id AND r.source_key = :source_key
                    AND r.match_status = 'deterministic' AND r.matched_npi = f.npi
                    AND r.normalized_payload->>'visibility' = 'public'
+                   AND NOT f.sensitive AND f.public_default AND f.availability = 'available') AS all_public_providers,
+               count(DISTINCT f.npi) FILTER (WHERE r.run_id = f.run_id AND r.source_key = :source_key
+                   AND r.match_status = 'deterministic' AND r.matched_npi = f.npi
+                   AND r.normalized_payload->>'visibility' = 'public'
+                   AND f.category IN ('education', 'training')
                    AND NOT f.sensitive AND f.public_default AND f.availability = 'available') AS matched_public_providers,
                count(*) FILTER (WHERE r.record_id IS NULL OR r.run_id IS DISTINCT FROM f.run_id
                     OR r.source_key <> :source_key
+                    OR (source_run.source_manifest::jsonb->'categories' ? f.category) IS DISTINCT FROM TRUE
                     OR f.source_json->>'source_key' IS DISTINCT FROM :source_key
                     OR f.source_json->>'schema_version' IS DISTINCT FROM :schema_version
                     OR f.source_json->>'source_record_id' IS DISTINCT FROM f.source_record_id
@@ -187,9 +194,12 @@ async def retained_counts(run_id):
                     OR r.normalized_payload->>'visibility' IS DISTINCT FROM 'public'
                     OR (f.npi IS NOT NULL AND r.match_status <> 'deterministic')) AS invalid_facts
               FROM {facts} f LEFT JOIN {source_records} r ON r.record_id = f.source_record_id
+              LEFT JOIN {runs} source_run ON source_run.run_id = f.run_id
              WHERE f.run_id = :run_id
         )
-        SELECT source_counts.*, fact_counts.*,
+        SELECT source_counts.*, fact_counts.retained_facts, fact_counts.matched_public_providers,
+               fact_counts.all_public_providers - fact_counts.matched_public_providers AS portfolio_only_public_providers,
+               fact_counts.invalid_facts,
                (SELECT count(*) FROM {artifacts} WHERE run_id = :run_id
                     AND source_key <> :source_key) AS foreign_artifacts
           FROM source_counts CROSS JOIN fact_counts

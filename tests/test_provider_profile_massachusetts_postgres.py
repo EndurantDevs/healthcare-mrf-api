@@ -77,7 +77,7 @@ def _fact(generation, suffix, *, category, value_by_field):
     }
 
 
-async def _seed_generation(database, generation, *, status="completed", school="Example Medical School"):
+async def _seed_generation(database, generation, *, status="completed", school="Example Medical School", portfolio=False):
     manifest_by_field = {
         "source": {"source_key": SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "MA",
                    "agency": "Massachusetts Board of Registration in Medicine", "coverage_scope": "full_physician_license",
@@ -86,6 +86,8 @@ async def _seed_generation(database, generation, *, status="completed", school="
         "full_cohort_licenses": 1, "requested_licenses": 1, "cohort_sha256": "a" * 64,
         "expected_current_run_id": None, "resume_from": None,
     }
+    if portfolio:
+        manifest_by_field["categories"].extend(["certifications", "specialties"])
     await database.insert(state_api.ProviderProfileImportRun.__table__).values({
         "run_id": generation, "source_key": SOURCE_KEY, "jurisdiction": "MA",
         "schema_version": SCHEMA_VERSION, "status": status, "source_manifest": manifest_by_field,
@@ -225,3 +227,41 @@ async def test_native_composition_preserves_sources_and_isolates_evidence(monkey
                 assert public_item["assertion_count"] == 3
         assert (await profile_api.fetch_state_profile_projection(NPI))["generation_id"] == "florida-generation"
         assert (await cms_api.fetch_cms_education_projection(NPI))["generation_id"] == "cms-generation"
+
+
+async def test_native_portfolio_scope_preserves_incumbent_education_and_source_generations(monkeypatch):
+    from tests.test_massachusetts_profile_portfolio import _parse
+
+    async with _database(monkeypatch) as (database, schema):
+        legacy_generation, richer_generation = uuid.uuid4().hex, uuid.uuid4().hex
+        await _seed_generation(database, legacy_generation)
+        await _seed_generation(database, richer_generation, portfolio=True)
+        await _point_to(database, legacy_generation)
+        await _seed_incumbents(database)
+        before = await profile_api.fetch_provider_profile_projection(NPI)
+        legacy_profile = profile_api.compose_provider_profile(NPI, state_projection=before, fhir_profile=None)
+        assert legacy_profile["categories"]["certifications"]["availability"] == "unavailable"
+        _, parsed_facts = _parse(evidence={
+            "run_id": richer_generation, "artifact_id": "synthetic-artifact", "row_number": 1,
+            "source_url": "https://example.test/profile", "downloaded_at": "2026-09-08T00:00:00Z", "content_sha256": "a" * 64,
+        })
+        portfolio_facts = [fact for fact in parsed_facts if fact["category"] in {"certifications", "specialties"}]
+        await database.insert(state_api.ProviderProfileFact.__table__).values(portfolio_facts).status()
+        assert (await state_api.fetch_massachusetts_profile_projection(NPI))["generation_id"] == legacy_generation
+        await database.status(f"UPDATE {schema}.provider_profile_source_publication SET current_run_id=:generation", generation=richer_generation)
+        after = await profile_api.fetch_provider_profile_projection(NPI)
+        profile = profile_api.compose_provider_profile(NPI, state_projection=after, fhir_profile=None)
+        assert profile["source_generations"] == {"state_regulator": "florida-generation", "cms_doctors": "cms-generation", SOURCE_KEY: richer_generation}
+        school, = profile["categories"]["education"]["items"]
+        assert school["assertion_count"] == 3 and school["value"] == legacy_profile["categories"]["education"]["items"][0]["value"]
+        assert profile["generation_id"] != legacy_profile["generation_id"]
+        for category in ("certifications", "specialties"):
+            assert profile["categories"][category]["availability"] == "available"
+            page = profile_api.compose_provider_profile(NPI, state_projection=after, fhir_profile=None,
+                                                       requested_categories=[category], page_category=category, page_limit=1)
+            evidence = profile_api.compose_provider_profile_evidence(state_projection=after, fhir_evidence=None,
+                                                                     provider_profile=page, page_category=category)
+            source_record, = evidence["sources"][SOURCE_KEY]["records"]
+            assert source_record["source_record_id"] in page["categories"][category]["items"][0]["source_record_ids"]
+            assert source_record["run_id"] == richer_generation
+            assert evidence["sources"]["state_regulator"]["records"] == evidence["sources"]["cms_doctors"]["records"] == []

@@ -70,7 +70,7 @@ def _state_projection(npi: int, fact_rows: list[Mapping]) -> dict | None:
         "source_key", "source_kind", "agency", "jurisdiction", "coverage_scope", "registry_generation",
     )}
     loaded_categories = set(manifest["categories"])
-    if not loaded_categories <= {"education", "training"}:
+    if not loaded_categories <= {"education", "training", "certifications", "specialties"}:
         raise RuntimeError("state_profile_categories_invalid")
     grouped = defaultdict(dict)
     evidence_records = []
@@ -130,6 +130,11 @@ def merge_state_profile_projection(npi: int, projection: Mapping | None, state_p
         "Massachusetts education and training are source-reported. Missing training dates do not establish "
         "current enrollment or completion; no clinical experience is inferred."
     )
+    if any(state_projection["categories"][category]["items"] for category in ("certifications", "specialties")):
+        profile["important_context"].append(
+            "Massachusetts board certifications and practice specialties are source-reported. "
+            "Certification validity, expiration and taxonomy codes are not inferred."
+        )
     source_key = state_projection["source"]["source_key"]
     merged["source_generations"] = {
         **_source_generation_ids(projection, projection.get("profile") if projection else None, None),

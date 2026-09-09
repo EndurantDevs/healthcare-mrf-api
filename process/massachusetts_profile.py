@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Import public Massachusetts school and training facts as a managed job."""
+"""Import public Massachusetts physician profile facts as a managed job."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from process.live_progress import enqueue_live_progress
 from process.massachusetts_profile_completion import complete_run, reconcile_failed_control_runs
 from process import massachusetts_profile_acquisition as acquisition
 from process import massachusetts_profile_store as store
-from process.massachusetts_profile_rows import SCHEMA_VERSION, SOURCE_KEY, parse_profile
+from process.massachusetts_profile_rows import LEGACY_CATEGORIES, PROFILE_CATEGORIES, SCHEMA_VERSION, SOURCE_KEY, parse_profile
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ async def _cohort_for_run(task, artifact_root, expected_current_run_id):
     limit, resume_from = _parameters(task)
     if resume_from is None:
         schema = ProviderProfileSourceRecord.__table__.schema or "mrf"
-        return await acquisition.capture_registry_cohort(schema), None
+        return await acquisition.capture_registry_cohort(schema), None, PROFILE_CATEGORIES
     previous_run = await store.read_resume_run(
         resume_from, max_providers=limit, expected_current_run_id=expected_current_run_id,
     )
@@ -67,10 +67,10 @@ async def _cohort_for_run(task, artifact_root, expected_current_run_id):
     cohort = acquisition.read_cohort(directory / "cohort.json")
     if _hash(cohort) != previous_run["source_manifest"]["cohort_sha256"]:
         raise ValueError("massachusetts_profile_resume_cohort_changed")
-    return cohort, directory / "profiles"
+    return cohort, directory / "profiles", previous_run["source_manifest"]["categories"]
 
 
-def _source_manifest(task, cohort, expected_current_run_id):
+def _source_manifest(task, cohort, expected_current_run_id, *, categories=PROFILE_CATEGORIES):
     limit, resume_from = _parameters(task)
     count = len(cohort["roots"])
     return {
@@ -78,7 +78,7 @@ def _source_manifest(task, cohort, expected_current_run_id):
         "expected_current_run_id": expected_current_run_id,
         "full_cohort_licenses": count, "requested_licenses": min(limit, count) if limit is not None else count,
         "cohort_sha256": _hash(cohort), "control_run_id": task.get("run_id"),
-        "categories": ["education", "training"],
+        "categories": list(categories),
         "source": {
             "source_key": SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "MA",
             "agency": "Massachusetts Board of Registration in Medicine",
@@ -132,12 +132,13 @@ def _artifact(run_row, directory, metrics):
     }
 
 
-def _source_rows(root, response, artifact, row_number):
+def _source_rows(root, response, artifact, row_number, *, categories=LEGACY_CATEGORIES):
     evidence_by_field = {key: response[key] for key in ("source_url", "downloaded_at", "content_sha256")}
     evidence_by_field.update(run_id=artifact["run_id"], artifact_id=artifact["artifact_id"], row_number=row_number)
     profile = acquisition.decoded_profile(response)
     if profile is not None:
-        return parse_profile(profile, license_number=root["license_number"], candidates=root["candidates"], evidence=evidence_by_field)
+        return parse_profile(profile, license_number=root["license_number"], candidates=root["candidates"],
+                             evidence=evidence_by_field, categories=categories)
     record_key = f"{SOURCE_KEY}:{root['license_number']}"
     return {
         "record_id": _hash([artifact["run_id"], record_key]), "run_id": artifact["run_id"],
@@ -148,14 +149,14 @@ def _source_rows(root, response, artifact, row_number):
     }, []
 
 
-async def _persist_profiles(ctx, task, roots, directory, artifact):
+async def _persist_profiles(ctx, task, roots, directory, artifact, *, categories):
     await _upsert_rows(ProviderProfileArtifact, [artifact], "artifact_id")
     for offset in range(0, len(roots), 250):
         await raise_if_cancelled(ctx, task)
         source_records, facts = [], []
         for index, root in enumerate(roots[offset:offset + 250], offset + 1):
             response = acquisition.read_response(directory / "profiles" / f"{root['license_number']}.json", root["license_number"])
-            record, parsed_facts = _source_rows(root, response, artifact, index)
+            record, parsed_facts = _source_rows(root, response, artifact, index, categories=categories)
             source_records.append(record)
             facts.extend(parsed_facts)
         async with db.transaction():
@@ -176,7 +177,7 @@ async def _run_claimed(ctx, task, run_row, cohort, retained, directory):
     roots, metrics = await _acquire(ctx, task, run_row, cohort, directory, retained)
     await store.update_run(run_row["run_id"], {"metrics": metrics})
     artifact = _artifact(run_row, directory, metrics)
-    await _persist_profiles(ctx, task, roots, directory, artifact)
+    await _persist_profiles(ctx, task, roots, directory, artifact, categories=run_row["source_manifest"]["categories"])
     return await _finish_run(ctx, task, run_row, metrics)
 
 
@@ -192,11 +193,11 @@ async def import_profiles(ctx, task):
     publication = await store.read_publication()
     expected = publication["current_run_id"] if publication else None
     artifact_root = _artifact_root()
-    cohort, retained = await _cohort_for_run(task, artifact_root, expected)
+    cohort, retained, categories = await _cohort_for_run(task, artifact_root, expected)
     run_id = _hash([SOURCE_KEY, control_run_id])
     run_by_field = {
         "run_id": run_id, "source_key": SOURCE_KEY, "jurisdiction": "MA", "schema_version": SCHEMA_VERSION,
-        "status": "running", "source_manifest": _source_manifest(task, cohort, expected),
+        "status": "running", "source_manifest": _source_manifest(task, cohort, expected, categories=categories),
         "metrics": {}, "error": None, "started_at": _now(), "finished_at": None,
     }
     await store.claim_run(run_by_field)
@@ -213,7 +214,7 @@ async def import_profiles(ctx, task):
     return completed_run
 
 
-@click.command(help="Submit Massachusetts BORIM school and training imports through the managed import API.")
+@click.command(help="Submit Massachusetts BORIM physician profile imports through the managed import API.")
 @click.option("--max-providers", type=click.IntRange(min=1), default=None, help="Bounded acquisition without publication.")
 @click.option("--resume-from", default=None, help="Replay a recent failed run's frozen cohort and verified responses.")
 def massachusetts_borim_profile(max_providers, resume_from):
