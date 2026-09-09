@@ -193,6 +193,26 @@ class ProviderDirectoryRootedGraphContractError(ValueError):
     """Reject drift from the reviewed rooted-graph acquisition contract."""
 
 
+def has_matching_rooted_graph_root_publication(
+    variant: object, contract_id: object
+) -> bool:
+    """Accept rooted v2 parents without changing the immutable v1 graph contract."""
+
+    return bool(
+        type(variant) is str
+        and type(contract_id) is str
+        and (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT.get(variant)
+            == contract_id
+            or (
+                variant == PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_VARIANT
+                and contract_id
+                == "healthporta.provider-directory.rooted-graph-publication.v2"
+            )
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderDirectoryRootedGraphExactSearch:
     """Describe one allowed exact reference search in the rooted graph."""

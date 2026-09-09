@@ -28,6 +28,7 @@ _ACQUISITION = "provider_directory_rooted_graph_acquisition"
 _ATTEMPT = "provider_directory_rooted_graph_twin_attempt"
 _ADMISSION = "provider_directory_rooted_graph_twin_admission"
 _STORAGE_CONTRACT = "healthporta.provider-directory.rooted-graph-acquisition.v1"
+_FAILURE_VALID = '"' + _SCHEMA.replace('"', '""') + '"."provider_directory_fhir_request_failure_coverage_valid"'
 
 
 def _ref(table: str, column: str) -> str:
@@ -164,8 +165,14 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
             name="pd_rooted_graph_twin_admission_comparison_fkey",
         ),
         CheckConstraint(
-            "admission_id ~ '^pdrgad_[0-9a-f]{48}$' AND "
+            "((request_failure_coverage IS NULL AND insurance_plan_count IS NOT NULL "
+            "AND insurance_plan_page_count IS NOT NULL) OR "
+            "(request_failure_coverage IS NOT NULL AND "
+            f"{_FAILURE_VALID}(request_failure_coverage) AND admission_contract_id = "
+            "'healthporta.provider-directory.rooted-graph-single-root-admission.v1')) "
+            "AND admission_id ~ '^pdrgad_[0-9a-f]{48}$' AND "
             f"storage_contract_id = '{_STORAGE_CONTRACT}' AND "
+            "publication_authority IS TRUE AND "
             "((admission_contract_id = "
             "'healthporta.provider-directory.rooted-graph-matched-admission.v1' "
             "AND attempt_id IS NOT NULL AND comparison_acquisition_id IS NOT NULL "
@@ -174,11 +181,11 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
             "(admission_contract_id = "
             "'healthporta.provider-directory.rooted-graph-single-root-admission.v1' "
             "AND attempt_id IS NULL AND comparison_acquisition_id IS NULL "
-            "AND reviewed_root_policy_json = CAST("
+            "AND reviewed_root_policy_json IS NOT NULL AND reviewed_root_policy_json = "
             "'{\"policy_version\":\"provider-directory-reviewed-root-policy-v1\","
-            "\"required_root_count\"\\:1}' AS jsonb) "
-            "AND acquisition_operation_key ~ '^[0-9a-f]{64}$')) "
-            "AND publication_authority IS TRUE",
+            "\"required_root_count\"\\:1}'::jsonb "
+            "AND acquisition_operation_key IS NOT NULL "
+            "AND acquisition_operation_key ~ '^[0-9a-f]{64}$'))",
             name="pd_rooted_graph_twin_admission_check",
         ),
         {"schema": _SCHEMA, "extend_existing": True},
@@ -192,6 +199,7 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
     publication_acquisition_id = Column(String(54), nullable=False)
     comparison_acquisition_id = Column(String(54))
     reviewed_root_policy_json = Column(JSONB)
+    request_failure_coverage = Column(JSONB)
     acquisition_operation_key = Column(String(64))
     publication_run_id = Column(String(54), nullable=False)
     dataset_intent_id = Column(String(54), nullable=False)
@@ -219,8 +227,8 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
     completed_count = Column(BigInteger, nullable=False)
     resource_count = Column(BigInteger, nullable=False)
     edge_count = Column(BigInteger, nullable=False)
-    insurance_plan_count = Column(BigInteger, nullable=False)
-    insurance_plan_page_count = Column(BigInteger, nullable=False)
+    insurance_plan_count = Column(BigInteger)
+    insurance_plan_page_count = Column(BigInteger)
     used_work_items = Column(BigInteger, nullable=False)
     used_resource_rows = Column(BigInteger, nullable=False)
     used_edge_rows = Column(BigInteger, nullable=False)

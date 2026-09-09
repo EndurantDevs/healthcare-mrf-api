@@ -292,13 +292,16 @@ class _RootRunner:
         session: Any,
         claim: ProviderDirectoryRootedGraphWorkClaim,
         state: _ClaimState,
-    ) -> ProviderDirectoryRootedGraphHTTPResult | tuple[str, float]:
+    ) -> ProviderDirectoryRootedGraphHTTPResult | tuple[str, float] | None:
         try:
             return await self._fetch_with_heartbeat(session, claim)
         except ProviderDirectoryRootedGraphHTTPError as error:
             if error.retryable and claim.attempt < self.config.max_attempts:
                 await self.release_for_retry(claim, state)
                 return claim.query_id, self.retry_delay(error, claim.attempt)
+            if error.code == "transport_timeout":
+                await self._complete_error(claim, "transport_timeout", state)
+                return None
             terminal_code = "retry_exhausted" if error.retryable else error.code
             await self._complete_error(claim, terminal_code, state)
             raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
@@ -369,6 +372,8 @@ class _RootRunner:
                 await self._complete_error(claim, "retry_exhausted", state)
                 raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
             fetch_outcome = await self._fetch_or_retry(session, claim, state)
+            if fetch_outcome is None:
+                return None
             if type(fetch_outcome) is tuple:
                 return fetch_outcome
             await self._complete_response(
@@ -437,7 +442,7 @@ class _RootRunner:
         return census_claim
 
     async def process_census(self, session: Any) -> None:
-        """Run the dedicated census or prove its prior completion."""
+        """Run the census or prove its completed/eligible-timeout terminal state."""
 
         census_claim = await self._claim_census()
         if census_claim is None:
@@ -445,7 +450,7 @@ class _RootRunner:
                 self.identity.acquisition_id,
                 database=self.database,
             )
-            if state != "completed":
+            if state not in {"completed", "timeout_skipped"}:
                 raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
             return
         expected_references = census_claim.root_network_references

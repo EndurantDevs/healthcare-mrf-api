@@ -28,7 +28,7 @@ from process.provider_directory_dataset_scoped_publication_support import (
     validate_exact_pair_registry as _validate_pair_registry,
 )
 from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 
 
@@ -265,8 +265,9 @@ async def _validate_locked_header(
         or header.get("root_endpoint_id") != expected_endpoint_id
         or header.get("acquisition_source_id") != pair.rooted_source_id
         or header.get("acquisition_endpoint_id") != pair.rooted_endpoint_id
-        or header.get("root_publication_contract_id")
-        != PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT[variant]
+        or not has_matching_rooted_graph_root_publication(
+            variant, header.get("root_publication_contract_id")
+        )
         or header.get("practitioner_origin_source_id") != pair.legacy_source_id
         or header.get("practitioner_origin_endpoint_id") != pair.legacy_endpoint_id
         or header.get("source_id") != expected_source_id

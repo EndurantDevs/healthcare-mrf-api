@@ -61,8 +61,10 @@ async def _install_single_root_schema(context: SimpleNamespace) -> None:
     await context.database.connect()
     await register_provider_directory_rooted_graph_source(database=context.database)
     await run_migration(context.engine, context.base_migration, "upgrade")
-    await run_migration(context.engine, context.canonical_migration, "install")
     await run_migration(context.engine, context.single_root_migration, "upgrade")
+    from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
+
+    await install_request_failure_budget(context.engine, context.schema_name)
 
 
 @asynccontextmanager

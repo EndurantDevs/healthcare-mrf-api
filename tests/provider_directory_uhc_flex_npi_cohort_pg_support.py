@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import asyncpg
@@ -122,6 +123,18 @@ def _practitioner_payload(npi: int) -> dict[str, object]:
     }
 
 
+def official_resource_specs() -> tuple[tuple[str, str, str], ...]:
+    """Keep default proof hashes stable while allowing larger synthetic cohorts."""
+
+    return tuple(
+        (
+            "Practitioner", f"practitioner-{index}",
+            str(index) * 64 if index < 10 else hashlib.sha256(str(index).encode()).hexdigest(),
+        )
+        for index in range(1, len(PRACTITIONER_NPIS) + 1)
+    ) + (("Organization", "organization-1", "4" * 64),)
+
+
 def _content_proof() -> dict[str, object]:
     return {
         "contract_id": "healthporta.uhc.canonical-content-proof.v1",
@@ -131,8 +144,8 @@ def _content_proof() -> dict[str, object]:
         "endpoint_id": ENDPOINT_ID,
         "acquisition_root_run_id": ACQUISITION_ROOT_RUN_ID,
         "dataset_hash": DATASET_HASH,
-        "resource_count": 4,
-        "resource_counts": {"Practitioner": 3, "Organization": 1},
+        "resource_count": len(PRACTITIONER_NPIS) + 1,
+        "resource_counts": {"Practitioner": len(PRACTITIONER_NPIS), "Organization": 1},
         "proof_sha256": CONTENT_PROOF_SHA256,
     }
 
@@ -141,7 +154,7 @@ async def seed_official_dataset(
     connection: asyncpg.Connection,
     schema_name: str,
 ) -> None:
-    """Seed three Practitioner rows with two distinct canonical NPIs."""
+    """Seed the exact synthetic cohort and its one Organization."""
 
     schema = quoted(schema_name)
     await connection.execute(
@@ -159,22 +172,25 @@ async def seed_official_dataset(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
         "(dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash, "
         "status, is_current, resource_count, publication_metadata_json) "
-        "VALUES ($1, $2, $3, $4, 'published', true, 4, $5::jsonb)",
+        "VALUES ($1, $2, $3, $4, 'published', true, $5, $6::jsonb)",
         DATASET_ID,
         ENDPOINT_ID,
         ACQUISITION_ROOT_RUN_ID,
         DATASET_HASH,
+        len(PRACTITIONER_NPIS) + 1,
         json.dumps({"uhc_canonical_content_proof_v1": _content_proof()}),
     )
     resource_rows = tuple(
         (
             DATASET_ID,
-            "Practitioner",
-            f"practitioner-{index}",
-            str(index) * 64,
+            resource_type,
+            resource_id,
+            payload_hash,
             json.dumps(_practitioner_payload(npi)),
         )
-        for index, npi in enumerate(PRACTITIONER_NPIS, start=1)
+        for (resource_type, resource_id, payload_hash), npi in zip(
+            official_resource_specs(), PRACTITIONER_NPIS
+        )
     ) + (
         (DATASET_ID, "Organization", "organization-1", "4" * 64, "{}"),
     )

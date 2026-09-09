@@ -15,7 +15,7 @@ from process.provider_directory_dataset_scoped_publication import (
     ROOTED_COMBINED_VARIANT,
 )
 from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
@@ -34,6 +34,9 @@ from process.uhc_flex_official_cohort_contract import (
 
 PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID = (
     "healthporta.provider-directory.rooted-graph-publication.v1"
+)
+PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID = (
+    "healthporta.provider-directory.rooted-graph-publication.v2"
 )
 PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_ROOT_CONTRACT_ID = (
     "healthporta.provider-directory.rooted-graph-dataset-root.v1"
@@ -119,8 +122,11 @@ class ProviderDirectoryRootedGraphDatasetReadiness:
     rooted_graph_complete: bool
     endpoint_collection_complete: bool
     endpoint_complete: bool
+    request_failure_coverage: dict[str, object] | None = None
+    publication_contract_id: str = PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
 
     def __post_init__(self) -> None:
+        """Bind exact dataset lineage, retained counts, and truthful coverage."""
         counts = self.resource_counts
         try:
             projection = date.fromisoformat(self.semantic_projection_as_of)
@@ -143,10 +149,9 @@ class ProviderDirectoryRootedGraphDatasetReadiness:
             or self.source_authority_id != UHC_FLEX_OFFICIAL_AUTHORITY_ID
             or self.root_dataset_variant
             not in {LEGACY_PRACTITIONER_VARIANT, ROOTED_COMBINED_VARIANT}
-            or PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT.get(
-                self.root_dataset_variant
+            or not has_matching_rooted_graph_root_publication(
+                self.root_dataset_variant, self.root_publication_contract_id
             )
-            != self.root_publication_contract_id
             or type(self.root_dataset_hash) is not str
             or HASH_PATTERN.fullmatch(self.root_dataset_hash) is None
             or type(self.root_content_proof_sha256) is not str
@@ -169,16 +174,36 @@ class ProviderDirectoryRootedGraphDatasetReadiness:
             or counts.get("Practitioner") != self.practitioner_resource_count
             or sum(counts.values()) != self.resource_count
             or self.publication_kind != PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
-            or type(self.retry_exhausted_count) is not int
-            or self.retry_exhausted_count < 0
-            or self.cohort_complete is not (self.retry_exhausted_count == 0)
-            or self.rooted_graph_complete is not True
-            or self.endpoint_collection_complete is not False
-            or self.endpoint_complete is not False
+            or not _has_valid_readiness_coverage(self)
         ):
             raise ValueError(
                 "provider_directory_rooted_graph_dataset_readiness_invalid"
             )
+
+
+def _has_valid_readiness_coverage(candidate: ProviderDirectoryRootedGraphDatasetReadiness) -> bool:
+    from process.provider_directory_rooted_graph_request_coverage import (
+        has_matching_rooted_publication_coverage,
+    )
+
+    expected_contract = (
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID
+        if candidate.request_failure_coverage is not None
+        else PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+    )
+    return bool(
+        type(candidate.retry_exhausted_count) is int
+        and candidate.retry_exhausted_count >= 0
+        and candidate.cohort_complete is (candidate.retry_exhausted_count == 0)
+        and candidate.publication_contract_id == expected_contract
+        and has_matching_rooted_publication_coverage(
+            candidate.request_failure_coverage,
+            retry_exhausted_count=candidate.retry_exhausted_count,
+            rooted_graph_complete=candidate.rooted_graph_complete,
+        )
+        and candidate.endpoint_collection_complete is False
+        and candidate.endpoint_complete is False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,5 +233,6 @@ __all__ = (
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_ROOT_CONTRACT_ID",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_OUTPUT_RESOURCES",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID",
+    "PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND",
 )

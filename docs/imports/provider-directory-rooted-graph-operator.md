@@ -41,6 +41,43 @@ the existing bounded graph acquisition, and admits the sealed result under the
 reviewed single-root policy. Repeating the same root and key replays the same
 authority; it does not publish.
 
+### Smaller pages after a timeout
+
+The canonical search identity uses `_count=100`. A transport timeout retries
+the same logical search from page one with smaller wire page sizes:
+`100 -> 50 -> 25 -> 12 -> 6 -> 3 -> 1`. Direct resource reads do not use this
+fallback. A smaller `_count` is a page-size request, not an offset or a promise
+that the server has that many resources. Continuation always follows the
+server's validated `Bundle.link[next]`; issuing the same smaller request twice
+would repeat its first page.
+
+An incomplete pagination attempt is discarded before restarting. The successful
+attempt must still pass reference, duplicate, advertised-total, and terminal-page
+checks. All attempts share the request and byte caps, including bytes received
+before a timeout. Fallback does not change the durable claim identity or rearm
+failed work. A search timeout at the smallest page size is a terminal failed
+logical request; the worker does not repeat the entire size ladder. Direct reads
+retain their existing bounded retry limit.
+
+### Source-scoped request failure budget
+
+The request-failure policy permits publication only when fewer than 2% of the
+source's distinct logical requests failed: `50 * failed_requests < total_requests`.
+Exactly 2% fails. The source census includes the exact inherited Flex cohort
+requests and the current rooted crawl's distinct work items. Retries, pagination,
+page-size fallbacks, and previous rooted attempts do not inflate the denominator.
+All known work must be terminal, with no pending or leased requests. Only the
+closed transport-timeout categories qualify; validation, authorization, and
+integrity failures remain hard errors.
+
+Policy-bearing partial publications use publication v2 and retain the exact
+`request_failure_coverage` receipt. Missing-resource coverage is explicitly
+`unknown`: a failed search can hide multiple resources and undiscovered children.
+An unavailable plan census retains a null count, not zero. Rooted graph
+completeness is false when rooted requests failed; inherited Flex failures keep
+their separate cohort-completeness flag. Historical v1 receipts remain unchanged.
+This source-local policy does not authorize global Profile dispatch.
+
 ## Retired acquisition contract
 
 This section describes historical v1 receipts only. No new rooted acquisition
