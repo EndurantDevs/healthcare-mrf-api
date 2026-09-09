@@ -17,6 +17,9 @@ class _Rows:
     def __iter__(self):
         return iter(self._rows)
 
+    def scalar_one_or_none(self):
+        return self._rows[0] if self._rows else None
+
 
 class _Session:
     def __init__(self, rows):
@@ -25,6 +28,8 @@ class _Session:
 
     async def execute(self, statement, params=None):
         self.statements.append((str(statement), dict(params or {})))
+        if "SELECT plan_market_type" in str(statement):
+            return _Rows([params["market_type"] or "group"])
         return _Rows(self.rows)
 
 
@@ -35,7 +40,10 @@ async def test_binding_projection_uses_release_market_type(monkeypatch):
     scope_kwargs_dict = {}
 
     async def _tables(_session, _snapshot_id):
-        return SimpleNamespace(network_names=[])
+        return SimpleNamespace(
+            network_names=[], snapshot_id=_snapshot_id, source_key="source",
+            storage_generation="shared_blocks_v3", coverage_scope_id="c" * 64,
+        )
 
     def _scope(_tables, **kwargs):
         scope_kwargs_dict.update(kwargs)
@@ -51,6 +59,7 @@ async def test_binding_projection_uses_release_market_type(monkeypatch):
         _Session([]),
         {
             "snapshot_id": "snapshot",
+            "source_key": "source",
             "plan_id": "plan",
             "market_type": "individual",
             "plan_market_type": "group",
@@ -106,7 +115,10 @@ def _install_binding_projection_sources(monkeypatch) -> None:
     from api import ptg2_serving as serving
 
     async def _tables(_session, _snapshot_id):
-        return SimpleNamespace(network_names=[])
+        return SimpleNamespace(
+            network_names=[], snapshot_id=_snapshot_id, source_key="source",
+            storage_generation="shared_blocks_v3", coverage_scope_id="c" * 64,
+        )
 
     monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
     monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
@@ -135,6 +147,7 @@ async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
         session,
         {
             "snapshot_id": "snapshot",
+            "source_key": "source",
             "plan_id": "plan",
             "market_type": "group",
         },
@@ -163,6 +176,6 @@ async def test_binding_projection_rejects_raw_overflow_before_grouping(
     with pytest.raises(ValueError, match="code-row bound exceeded"):
         await projection._binding_projection(
             _Session([_binding_code_rows()[0], invalid_code_row_by_field]),
-            {"snapshot_id": "snapshot", "plan_id": "plan"},
+            {"snapshot_id": "snapshot", "source_key": "source", "plan_id": "plan"},
             maximum_code_rows=1,
         )

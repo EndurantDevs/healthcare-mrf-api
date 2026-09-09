@@ -21,7 +21,7 @@ from api.plan_pricing_projection_contract import (
     provider_signature,
     table,
 )
-from api.plan_pricing_projection_source import binding_projection
+from api.plan_pricing_projection_source import binding_projection, binding_source
 from api.plan_pricing_projection_v3 import (
     ProjectionV3Counts,
     materialize_factorized_projection,
@@ -174,22 +174,31 @@ async def _materialize_all_codes(
 ) -> tuple[Any, ProjectionV3Counts]:
     in_network_bindings = [
         binding_by_field
-        for binding_by_field in binding_manifest
+        for binding_by_field in normalized_bindings(binding_manifest)
         if str(binding_by_field.get("role")) == "in_network"
     ]
     if not in_network_bindings:
         raise ValueError("pricing projection requires an in-network binding")
     if len(in_network_bindings) > MAX_PROJECTION_BINDINGS:
         raise ValueError("pricing projection binding bound exceeded")
+    binding_sources = [
+        (binding, await binding_source(session, binding))
+        for binding in in_network_bindings
+    ]
     remaining_code_rows = MAX_PROJECTION_CODE_ROWS
     binding_projections = []
-    for binding_by_field in in_network_bindings:
+    seen_reads: set[tuple[str, int, str, str, str]] = set()
+    for binding_by_field, (serving_tables, read_identity) in binding_sources:
+        if read_identity in seen_reads:
+            continue
+        seen_reads.add(read_identity)
         if remaining_code_rows <= 0:
             raise ValueError("pricing projection code-row bound exceeded")
         binding = await binding_projection(
             session,
             binding_by_field,
             maximum_code_rows=remaining_code_rows,
+            serving_tables=serving_tables,
         )
         code_row_count = binding.raw_code_row_count
         if code_row_count > remaining_code_rows:

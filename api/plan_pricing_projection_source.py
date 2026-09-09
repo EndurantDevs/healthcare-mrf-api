@@ -49,21 +49,65 @@ def _group_code_rows(code_result: Any, serving: Any) -> dict[
     return dict(code_rows_by_identity)
 
 
+async def binding_source(
+    session: Any,
+    binding: Mapping[str, Any],
+) -> tuple[Any, tuple[str, int, str, str, str]]:
+    """Validate logical authority and identify its sealed physical read."""
+
+    from api import ptg2_serving as serving
+
+    snapshot_id = str(binding["snapshot_id"])
+    serving_tables = await snapshot_serving_tables(session, snapshot_id)
+    serving._require_strict_shared_v3(serving_tables)
+    source_key = str(binding.get("source_key") or "").strip().lower()
+    if (
+        serving_tables.snapshot_id != snapshot_id
+        or not source_key
+        or source_key != str(serving_tables.source_key or "").strip().lower()
+    ):
+        raise ValueError("pricing projection binding source scope is invalid")
+    plan_id = str(binding["plan_id"]).strip()
+    market_type = serving._normalized_plan_market_type(
+        binding.get("market_type") or binding.get("plan_market_type")
+    )
+    scope_result = await session.execute(
+        text(f"""
+            SELECT plan_market_type
+              FROM {serving._shared_plan_scope_table()}
+             WHERE snapshot_id = :snapshot_id
+               AND plan_id = :plan_id
+               AND (:market_type = '' OR plan_market_type = :market_type)
+             ORDER BY plan_market_type
+             LIMIT 1
+        """),
+        {"snapshot_id": snapshot_id, "plan_id": plan_id, "market_type": market_type},
+    )
+    effective_market_type = scope_result.scalar_one_or_none()
+    if effective_market_type is None:
+        raise ValueError("pricing projection binding plan scope is unavailable")
+    return serving_tables, (
+        serving_tables.storage_generation,
+        serving._required_shared_snapshot_key(serving_tables),
+        serving_tables.coverage_scope_id,
+        plan_id,
+        effective_market_type,
+    )
+
+
 async def binding_projection(
     session: Any,
     binding: dict[str, Any],
     *,
     maximum_code_rows: int | None = None,
+    serving_tables: Any = None,
 ) -> BindingProjection:
     """Read the sealed code scope for one release binding."""
 
     from api import ptg2_serving as serving
 
-    serving_tables = await snapshot_serving_tables(
-        session,
-        str(binding["snapshot_id"]),
-    )
-    serving._require_strict_shared_v3(serving_tables)
+    if serving_tables is None:
+        serving_tables, _read_identity = await binding_source(session, binding)
     code_statement, parameters_by_name = _binding_code_query(
         serving,
         serving_tables,

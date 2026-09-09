@@ -65,6 +65,14 @@ def _candidate(**updates):
     return candidate_by_field
 
 
+def _binding(**updates):
+    return {
+        "ordinal": 0, "role": "in_network", "snapshot_id": "snapshot",
+        "source_key": "source", "plan_id": "plan", "market_type": "group",
+        **updates,
+    }
+
+
 def test_factorized_v3_receipt_omits_v4_counts():
     built_receipt = projection_build.receipt(
         _candidate(contract_version=projection_build.FACTORIZED_V3_PROJECTION_CONTRACT)
@@ -163,17 +171,26 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
     }
 
 
+def _install_binding_sources(monkeypatch):
+    async def binding_source(_session, binding):
+        return object(), (binding["source_key"], binding["snapshot_id"])
+
+    monkeypatch.setattr(projection_build, "binding_source", binding_source)
+
+
 @pytest.mark.asyncio
 async def test_materialize_all_codes_requires_in_network_binding():
     with pytest.raises(ValueError, match="in-network binding"):
         await projection_build._materialize_all_codes(
-            object(), PROJECTION_ID, [{"role": "allowed_amounts"}]
+            object(), PROJECTION_ID, [_binding(role="allowed_amounts")]
         )
 
 
 @pytest.mark.asyncio
 async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
-    async def binding_projection(_session, binding, *, maximum_code_rows):
+    _install_binding_sources(monkeypatch)
+
+    async def binding_projection(_session, binding, *, maximum_code_rows, serving_tables):
         assert maximum_code_rows == (
             projection_build.MAX_PROJECTION_CODE_ROWS
         )
@@ -203,7 +220,7 @@ async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
     )
     digest, counts = (
         await projection_build._materialize_all_codes(
-            object(), PROJECTION_ID, [{"role": "in_network"}]
+            object(), PROJECTION_ID, [_binding()]
         )
     )
     assert calls[0][0] == PROJECTION_ID
@@ -214,16 +231,17 @@ async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
+    _install_binding_sources(monkeypatch)
     too_many_bindings = [
-        {"role": "in_network"}
-        for _ in range(projection_build.MAX_PROJECTION_BINDINGS + 1)
+        _binding(ordinal=ordinal)
+        for ordinal in range(projection_build.MAX_PROJECTION_BINDINGS + 1)
     ]
     with pytest.raises(ValueError, match="binding bound exceeded"):
         await projection_build._materialize_all_codes(
             object(), PROJECTION_ID, too_many_bindings
         )
 
-    async def oversized_projection(_session, binding, *, maximum_code_rows):
+    async def oversized_projection(_session, binding, *, maximum_code_rows, serving_tables):
         return SimpleNamespace(
             binding=binding,
             raw_code_row_count=maximum_code_rows + 1,
@@ -237,12 +255,12 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
     )
     with pytest.raises(ValueError, match="code-row bound exceeded"):
         await projection_build._materialize_all_codes(
-            object(), PROJECTION_ID, [{"role": "in_network"}]
+            object(), PROJECTION_ID, [_binding()]
         )
 
     binding_calls = []
 
-    async def exactly_full_projection(_session, binding, *, maximum_code_rows):
+    async def exactly_full_projection(_session, binding, *, maximum_code_rows, serving_tables):
         binding_calls.append(binding)
         assert len(binding_calls) == 1
         return SimpleNamespace(
@@ -258,7 +276,7 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
         await projection_build._materialize_all_codes(
             object(),
             PROJECTION_ID,
-            [{"role": "in_network"}, {"role": "in_network"}],
+            [_binding(), _binding(ordinal=1, source_key="another-source")],
         )
     assert len(binding_calls) == 1
 
