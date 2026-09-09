@@ -29,10 +29,11 @@ FACT_FIELDS_BY_CATEGORY = {
     "training": ("OtherTrainingProvider", "OtherTrainingLocation", "OtherTrainingFromDate", "OtherTrainingEndDate"),
     "specialties": ("ModifierDescription", "ModifierType"),
 }
-EXTRA_FIELDS = (
-    "Gender", "Race", "PracticeName", "PracticeAddress", "PracticeAddress2", "PracticeCity", "PracticeState",
+PRACTICE_FIELDS = (
+    "PracticeName", "PracticeAddress", "PracticeAddress2", "PracticeCity", "PracticeState",
     "PracticeZIP", "PracticeAreaCode", "PracticePhoneNumber", "PracticeExtension", "PracticeCounty",
 )
+EXTRA_FIELDS = ("Gender", "Race") + PRACTICE_FIELDS
 REQUIRED_FIELDS = frozenset(BASE_FIELDS + sum(FACT_FIELDS_BY_CATEGORY.values(), ()))
 PROFESSION_CODES = {("Medical Examiners", "Medical Doctor"): "1606", ("Osteopathy", "Osteopathic Physician"): "1907"}
 FACT_TYPES = {"education": "education_history", "training": "other_training", "specialties": "specialty"}
@@ -75,7 +76,7 @@ def _csv_reader(content):
     reader = csv.reader(io.StringIO(source_text, newline=""), strict=True)
     header = next(reader, [])
     _require(len(header) == len(set(header)) and set(header) in (
-        REQUIRED_FIELDS, REQUIRED_FIELDS | set(EXTRA_FIELDS),
+        REQUIRED_FIELDS, REQUIRED_FIELDS | set(PRACTICE_FIELDS), REQUIRED_FIELDS | set(EXTRA_FIELDS),
     ), "headers_invalid")
     return header, reader
 
@@ -216,7 +217,7 @@ def _profile_facts(source_record, evidence):
 
 
 def parse_report(content, *, evidence):
-    """Parse one captured 24/36-column report into unbound source records/facts.
+    """Parse one captured 24/34/36-column report into unbound source records/facts.
 
     Only observed MD/DO profession schemas are supported. All ranks and statuses
     remain literal. Blank licenses and conflicting identities yield held records.

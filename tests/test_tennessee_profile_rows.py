@@ -25,6 +25,7 @@ PRACTICE_COLUMNS = (
     "PracticeZIP", "PracticeAreaCode", "PracticePhoneNumber", "PracticeExtension", "PracticeCounty",
 )
 HEADERS = BASE_COLUMNS + FACT_COLUMNS
+PRACTICE_HEADERS = BASE_COLUMNS + FACT_COLUMNS[:2] + PRACTICE_COLUMNS + FACT_COLUMNS[2:]
 FULL_HEADERS = BASE_COLUMNS + ("Gender", "Race") + FACT_COLUMNS[:2] + PRACTICE_COLUMNS + FACT_COLUMNS[2:]
 EVIDENCE = {
     "run_id": "synthetic-run", "artifact_id": "synthetic-artifact",
@@ -91,6 +92,21 @@ def test_full_header_retains_unprojected_fields():
     assert retained[0]["raw_payload"]["rows"][0]["fields"] == source_record
     assert {fact["category"] for fact in facts} == {"education", "training", "specialties"}
     assert "Race" not in str(facts) and "PracticeName" not in str(facts)
+
+
+@pytest.mark.parametrize("headers", [PRACTICE_HEADERS, tuple(reversed(PRACTICE_HEADERS))])
+@pytest.mark.parametrize("profession", [{}, {"Board": "Osteopathy", "Profession": "Osteopathic Physician", "DegreeEarned": "DO"}])
+def test_practice_header_retains_fields_without_demographics(headers, profession):
+    source_record = source_row(**profession, PracticeName="Synthetic Practice", PracticeState="FL")
+    retained, facts = parse_sample([source_record], headers)
+    assert retained[0]["raw_payload"]["rows"][0]["fields"] == {field: source_record[field] for field in headers}
+    assert "Gender" not in retained[0]["raw_payload"]["rows"][0]["fields"]
+    assert "Race" not in retained[0]["raw_payload"]["rows"][0]["fields"]
+    _, baseline_facts = parse_sample([source_record])
+    assert {fact["logical_fact_key"]: fact["value_json"] for fact in facts} == {
+        fact["logical_fact_key"]: fact["value_json"] for fact in baseline_facts}
+    assert all(fact["npi"] is None and fact["published_at"] is None for fact in facts)
+    assert "PracticeName" not in str(facts) and "PracticeState" not in str(facts)
 
 
 def test_blank_licenses_are_separate_held_applications():
@@ -178,7 +194,8 @@ def test_ids_are_stable_across_row_order_and_runs():
     assert {fact["logical_fact_key"] for fact in third_facts} == {fact["logical_fact_key"] for fact in first_facts}
 
 
-@pytest.mark.parametrize("headers", [HEADERS[:-1], HEADERS + ("Unexpected",), HEADERS[:-1] + (HEADERS[0],)])
+@pytest.mark.parametrize("headers", [HEADERS[:-1], HEADERS + ("Unexpected",), HEADERS[:-1] + (HEADERS[0],),
+                                   PRACTICE_HEADERS[:-1], PRACTICE_HEADERS + ("Gender",)])
 def test_changed_header_is_rejected(headers):
     with pytest.raises(ValueError, match="^tennessee_profile_headers_invalid$"):
         parse_sample([source_row()], headers)
