@@ -78,7 +78,7 @@ Use this sequence for a campaign or documentation review:
 1. Validate the manifest without starting runs:
 
    ```bash
-   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+   ./.venv/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
      --validate-only
    ```
 
@@ -86,7 +86,7 @@ Use this sequence for a campaign or documentation review:
    or resume live runs:
 
    ```bash
-   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+   ./.venv/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
      --entry "$ENTRY_ID" \
      --output /tmp/provider-directory-operator-plan.json
    ```
@@ -95,7 +95,7 @@ Use this sequence for a campaign or documentation review:
    result and write an updater-compatible report:
 
    ```bash
-   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+   ./.venv/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
      --entry "$ENTRY_ID" \
      --operator-input /path/to/operator-input.json \
      --output reports/provider-directory-endpoint-acquisition/report.json \
@@ -107,7 +107,7 @@ Use this sequence for a campaign or documentation review:
    when it names a non-default report path:
 
    ```bash
-   ./venv314/bin/python scripts/update_provider_directory_verification.py \
+   ./.venv/bin/python scripts/update_provider_directory_verification.py \
      --report reports/provider-directory-endpoint-acquisition/report.json \
      --environment mrf-dev
    ```
@@ -121,7 +121,7 @@ Use this sequence for a campaign or documentation review:
 4. Check for drift before review. This is also the [CI drift check](../../.github/workflows/ci.yml):
 
    ```bash
-   ./venv314/bin/python scripts/generate_provider_directory_support_docs.py \
+   ./.venv/bin/python scripts/generate_provider_directory_support_docs.py \
      --check
    ```
 
@@ -138,7 +138,7 @@ Use this sequence for a campaign or documentation review:
    ```bash
    PROVIDER_DIRECTORY_API_BASE_URL="$HEALTHPORTA_API_BASE_URL" \
    PROVIDER_DIRECTORY_API_BEARER_TOKEN="$HEALTHPORTA_API_TOKEN" \
-   ./venv314/bin/python scripts/research/provider_directory_api_evidence_harness.py \
+   ./.venv/bin/python scripts/research/provider_directory_api_evidence_harness.py \
      --max-sources 100
    ```
 
@@ -1800,7 +1800,7 @@ for SCAN roles is skipped because the resource is incomplete.
 Run the parser-only harness:
 
 ```bash
-./venv314/bin/python scripts/research/provider_directory_fhir_harness.py
+./.venv/bin/python scripts/research/provider_directory_fhir_harness.py
 ```
 
 Run the disposable SQL typing harness before deploys that change artifact
@@ -1809,7 +1809,7 @@ address-key batch SQL through SQLAlchemy's asyncpg dialect with null keyset
 parameters, and drops the schema:
 
 ```bash
-./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
+./.venv/bin/python scripts/research/provider_directory_fhir_harness.py \
   --sql-typing \
   --db-host 127.0.0.1 \
   --db-port 5440 \
@@ -1825,7 +1825,7 @@ HLTHPRT_DB_PORT=5440 \
 HLTHPRT_DB_USER=nick \
 HLTHPRT_DB_DATABASE=mrf_dev \
 HLTHPRT_TEST_DATABASE_SUFFIX=_test \
-./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
+./.venv/bin/python scripts/research/provider_directory_fhir_harness.py \
   --local-cli \
   --seed-db-path /tmp/provider-directory-db/data/provider_directory.db \
   --retest-results-path /tmp/provider-directory-db/data/retest_results.json \
@@ -1852,7 +1852,7 @@ HLTHPRT_DB_HOST=127.0.0.1 \
 HLTHPRT_DB_PORT=5440 \
 HLTHPRT_DB_USER=nick \
 HLTHPRT_DB_DATABASE=mrf_pd_harness_monthly \
-./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
+./.venv/bin/python scripts/research/provider_directory_fhir_harness.py \
   --local-cli \
   --coverage-audit \
   --no-cli-test-mode \
@@ -1880,7 +1880,7 @@ When validating a completed artifact-publishing run rather than a bounded
 resource smoke, replace the pod-safe audit with the serving-readiness gate:
 
 ```bash
-./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
+./.venv/bin/python scripts/research/provider_directory_fhir_harness.py \
   --coverage-audit \
   --coverage-audit-full \
   --coverage-audit-require-serving-ready \
@@ -1915,7 +1915,7 @@ coverage, resource yield, address-key usefulness, PTG overlap, and unresolved
 network refs:
 
 ```bash
-./venv314/bin/python scripts/research/provider_directory_coverage_audit.py \
+./.venv/bin/python scripts/research/provider_directory_coverage_audit.py \
   --host 127.0.0.1 \
   --port 5440 \
   --database mrf_dev \
@@ -1963,7 +1963,7 @@ Before building or accepting a dev image for the monthly Provider Directory
 chain, run the no-DB runtime contract preflight:
 
 ```bash
-./venv314/bin/python scripts/smoke/provider_directory_runtime_contract.py
+./.venv/bin/python scripts/smoke/provider_directory_runtime_contract.py
 ```
 
 It verifies the actual Click CLI exposes `--refresh-preset` and
@@ -1973,7 +1973,7 @@ registry publishes `refresh_preset=monthly-full`, and the monthly preset enables
 supplemental catalogs. The JSON form is useful in deployment logs:
 
 ```bash
-./venv314/bin/python scripts/smoke/provider_directory_runtime_contract.py --format json
+./.venv/bin/python scripts/smoke/provider_directory_runtime_contract.py --format json
 ```
 
 Every audit report includes `serving_readiness`. This is the post-import gate:
@@ -1990,7 +1990,7 @@ Use `--require-serving-ready` when the audit should fail the surrounding job or
 schedule check instead of only reporting readiness:
 
 ```bash
-./venv314/bin/python scripts/research/provider_directory_coverage_audit.py \
+./.venv/bin/python scripts/research/provider_directory_coverage_audit.py \
   --host 127.0.0.1 \
   --port 5440 \
   --database mrf_dev \

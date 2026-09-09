@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 import re
 import shlex
+import subprocess
 
 import pytest
 
@@ -124,3 +125,31 @@ def test_local_example_has_neutral_database_and_no_shared_operator_token():
     assert "HLPRT_DB_PORT" not in value_by_name
     assert value_by_name["HLTHPRT_DB_USER"] == "mrf_api"
     assert value_by_name["HLTHPRT_CONTROL_API_TOKEN"] == ""
+
+
+def test_parallel_mrf_helper_requires_python_314_project_environment(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    helper = checkout / "support" / "run_mrf_parallel.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        (ROOT / "support/run_mrf_parallel.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    monkeypatch.delenv("PYTHON_BIN", raising=False)
+    missing = subprocess.run(
+        [helper], cwd=checkout, capture_output=True, text=True, check=False
+    )
+    assert missing.returncode == 1
+    assert "Python executable not found or not executable: .venv/bin/python" in missing.stderr
+
+    old_python = checkout / "python-3.13"
+    old_python.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+    old_python.chmod(0o755)
+    monkeypatch.setenv("PYTHON_BIN", str(old_python))
+    unsupported = subprocess.run(
+        [helper], cwd=checkout, capture_output=True, text=True, check=False
+    )
+    assert unsupported.returncode == 1
+    assert f"Python 3.14 or newer is required: {old_python}" in unsupported.stderr
