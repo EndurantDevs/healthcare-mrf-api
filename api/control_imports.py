@@ -103,6 +103,11 @@ from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
 ENGINE_NAME = "healthcare-mrf-api"
+_PROFILE_SOURCES = {
+    "cms-doctors": {"source_key": "cms-doctors", "display_name": "CMS Doctors & Clinicians"},
+    "florida-mqa-profile": {"source_key": "florida-mqa", "display_name": "Florida MQA"},
+    "massachusetts-borim-profile": {"source_key": "massachusetts-borim", "display_name": "Massachusetts BORIM"},
+}
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
@@ -738,6 +743,7 @@ def importer_registry() -> list[dict[str, Any]]:
                 "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
                 "depends_on": list(_IMPORTER_DEPENDENCIES.get(name, [])),
                 "params_schema": _control_param_schema(name, command),
+                **({"profile_source": dict(_PROFILE_SOURCES[name])} if name in _PROFILE_SOURCES else {}),
             }
         )
     importers.extend(
