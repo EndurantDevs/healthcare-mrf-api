@@ -51,7 +51,11 @@ def _evidence(evidence):
         raise ValueError("illinois_roster_source_url_invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", evidence_by_field["content_sha256"]):
         raise ValueError("illinois_roster_content_hash_invalid")
-    if datetime.fromisoformat(evidence_by_field["downloaded_at"]).utcoffset() is None:
+    try:
+        observed_at = datetime.fromisoformat(evidence_by_field["downloaded_at"])
+    except ValueError as exc:
+        raise ValueError("illinois_roster_observation_timestamp_invalid") from exc
+    if observed_at.utcoffset() is None:
         raise ValueError("illinois_roster_observation_timezone_missing")
     return evidence_by_field
 

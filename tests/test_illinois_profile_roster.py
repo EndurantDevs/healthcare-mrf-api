@@ -206,15 +206,18 @@ def test_observed_credential_suffix_preserves_original_identity_and_conflicts(cr
         assert match_profile(identity, retained)["status"] == "identity_conflict"
 
 
-@pytest.mark.parametrize("changes", [
-    {"source_url": "https://other.example/resource/pzzh-kp68.json"},
-    {"source_url": "https://data.illinois.gov/api/views/pzzh-kp68.json"},
-    {"source_url": "https://data.illinois.gov/resource/pzzh-kp68.json#wrong"},
-    {"source_url": "http://data.illinois.gov/resource/pzzh-kp68.json"},
-    {"downloaded_at": "2026-09-08"}, {"downloaded_at": "invalid"}, {"content_sha256": "bad"}, {"run_id": ""},
+@pytest.mark.parametrize(("changes", "reason"), [
+    ({"source_url": "https://other.example/resource/pzzh-kp68.json"}, "illinois_roster_source_url_invalid"),
+    ({"source_url": "https://data.illinois.gov/api/views/pzzh-kp68.json"}, "illinois_roster_source_url_invalid"),
+    ({"source_url": "https://data.illinois.gov/resource/pzzh-kp68.json#wrong"}, "illinois_roster_source_url_invalid"),
+    ({"source_url": "http://data.illinois.gov/resource/pzzh-kp68.json"}, "illinois_roster_source_url_invalid"),
+    ({"downloaded_at": "2026-09-08"}, "illinois_roster_observation_timezone_missing"),
+    ({"downloaded_at": "invalid"}, "illinois_roster_observation_timestamp_invalid"),
+    ({"content_sha256": "bad"}, "illinois_roster_content_hash_invalid"),
+    ({"run_id": ""}, "illinois_roster_evidence_missing"),
 ])
-def test_provenance_must_bind_an_official_roster_response_and_aware_observation(changes):
-    with pytest.raises(ValueError):
+def test_provenance_must_bind_an_official_roster_response_and_aware_observation(changes, reason):
+    with pytest.raises(ValueError, match=reason):
         parse_roster([physician()], evidence={**evidence(), **changes})
 
 
@@ -222,12 +225,12 @@ def test_invalid_programmatic_envelopes_fail_without_mutating_inputs():
     rows = [physician()]
     original = copy.deepcopy(rows)
     for invalid in (None, [], {"schema_version": "wrong"}):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="illinois_roster_normalized_input_required"):
             match_profile(profile(), invalid)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="illinois_roster_row_sequence_required"):
         parse_roster({}, evidence=evidence())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="illinois_roster_evidence_missing"):
         parse_roster(rows, evidence=None)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="illinois_roster_json_row_required"):
         parse_roster([{"bad": object()}], evidence=evidence())
     assert rows == original
