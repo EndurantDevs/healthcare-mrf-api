@@ -25,6 +25,8 @@ JOB_LABELS = {
     "address-canonical-db-tests": "${{ matrix.label }}",
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
+    "dev-image-publication": "DEV image publication",
+    "artifact-cleanup": "CI artifact cleanup",
 }
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
@@ -96,9 +98,10 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+            + " && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' "
+            + "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' && !(" + METADATA_ONLY + ") }}",
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
@@ -110,7 +113,14 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         assert "uses" not in job
         assert job["runs-on"] == "ubuntu-latest"
         assert not job.get("continue-on-error")
-        assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
+        if job_id == "dev-image-publication":
+            assert job["permissions"] == {
+                "contents": "read", "pull-requests": "read", "actions": "read", "packages": "write",
+            }
+        elif job_id == "artifact-cleanup":
+            assert job["permissions"] == {"contents": "read", "actions": "write"}
+        else:
+            assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
     job = workflow["jobs"]["smoke"]
     assert job["runs-on"] == "ubuntu-latest"
@@ -183,7 +193,9 @@ def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
     publisher = jobs["measurement"]
-    assert set(publisher["needs"]) == set(JOB_LABELS) - {"smoke", "measurement", "source-validation"}
+    assert set(publisher["needs"]) == set(JOB_LABELS) - {
+        "smoke", "measurement", "source-validation", "dev-image-publication", "artifact-cleanup",
+    }
     download = next(step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts")
     identities = [" ".join(selector.split()) for selector in download["with"]["artifact-ids"].split(",")]
     expected_ids = [f"${{{{ needs.python-tests.outputs.artifact_{index} }}}}" for index in range(4)]
@@ -199,3 +211,5 @@ def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
+    assert jobs["dev-image-publication"]["needs"] == ["smoke", "source-validation"]
+    assert jobs["artifact-cleanup"]["needs"] == ["dev-image-publication"]
