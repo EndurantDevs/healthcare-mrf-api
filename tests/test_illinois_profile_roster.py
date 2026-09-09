@@ -146,6 +146,21 @@ def test_unrelated_invalid_row_is_retained_without_blocking():
     assert roster["records"][0]["originals"][0]["raw_payload"] == raw
 
 
+@pytest.mark.parametrize("changes", [
+    {"first_name": "", "last_name": ""}, {"first_name": ""}, {"business": "Y", "first_name": "", "last_name": ""},
+])
+def test_known_other_issue_date_does_not_make_missing_names_globally_relevant(changes):
+    raw = physician(license_number="036000008", original_issue_date="04/29/2014", **changes)
+    roster = parse_roster([physician(), raw], evidence=evidence())
+    result = match_profile(profile(), roster)
+    assert result["status"] == "matched" and result["license_number"] == "036000007"
+    assert roster["records"][1]["status"] == "invalid"
+    assert roster["records"][1]["originals"][0]["raw_payload"] == raw
+    for conflict in ({"original_issue_date": "04/28/2014"}, {"original_issue_date": ""},
+                     {"license_number": "036000007"}):
+        assert bridge([physician(), {**raw, **conflict}])["status"] == "identity_conflict"
+
+
 def test_malformed_rows_preserve_name_split_conflicts():
     raw = physician(first_name="ALEX QUINN", middle="", title=None, license_number="036000008")
     assert bridge([physician(), raw])["reason"] == "relevant_roster_identity_invalid"
@@ -164,6 +179,31 @@ def test_case_whitespace_and_blank_components():
     assert bridge([raw], profile(display_name=" alex  example "))["license_number"] == "036000007"
     assert bridge([], profile())["status"] == "unmatched"
     assert bridge([physician(license_type="OTHER BOARD")])["status"] == "unmatched"
+
+
+@pytest.mark.parametrize("credential", ["MD", "DO"])
+def test_observed_credential_suffix_preserves_original_identity_and_conflicts(credential):
+    raw = physician(title="", suffix=credential)
+    identity = profile(display_name=f"ALEX QUINN EXAMPLE {credential}")
+    roster = parse_roster([raw], evidence=evidence())
+    result = match_profile(identity, roster)
+    assert result["status"] == "matched" and result["license_number"] == raw["license_number"]
+    assert roster["records"][0]["originals"] == [{"row_number": 1, "raw_payload": raw}]
+    assert roster["records"][0]["identity"]["title"] == ""
+    assert roster["records"][0]["identity"]["suffix"] == credential
+    assert result["profile_identity"] == identity and "npi" not in result
+    assert bridge([raw], profile(display_name="ALEX QUINN EXAMPLE"))["status"] == "unmatched"
+    assert bridge([raw, physician(title=credential)], identity)["status"] == "ambiguous"
+    split_by_field = {**raw, "first_name": "ALEX QUINN", "middle": "", "license_number": "invalid"}
+    conflict = bridge([raw, split_by_field], identity)
+    assert conflict["reason"] == "relevant_roster_identity_invalid" and conflict["license_number"] is None
+    assert len(conflict["candidate_records"]) == 2
+    for changes in ({"suffix": "D.O."}, {"suffix": "M.D."}, {"suffix": "JR"}, {"title": credential}, {"prefix": "DR"}):
+        unsupported_by_field = {**raw, **changes}
+        retained = parse_roster([raw, unsupported_by_field], evidence=evidence())
+        assert retained["records"][1]["status"] == "invalid"
+        assert retained["records"][1]["originals"][0]["raw_payload"] == unsupported_by_field
+        assert match_profile(identity, retained)["status"] == "identity_conflict"
 
 
 @pytest.mark.parametrize("changes", [

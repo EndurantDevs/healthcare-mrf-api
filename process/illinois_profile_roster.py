@@ -56,34 +56,37 @@ def _evidence(evidence):
     return evidence_by_field
 
 
-def _row_identity(row):
+def _row_identity(raw_row):
     """Hold unsupported identity formats while retaining the complete original row."""
-    if not isinstance(row, dict):
+    if not isinstance(raw_row, dict):
         return "invalid", "row_object_required", None
-    if set(row) - ROSTER_COLUMNS or any(value is not None and not isinstance(value, str) for value in row.values()):
+    if set(raw_row) - ROSTER_COLUMNS or any(column_value is not None and not isinstance(column_value, str) for column_value in raw_row.values()):
         return "invalid", "column_schema_invalid", None
-    if not _text(row.get("license_type")) or not _text(row.get("description")):
+    if not _text(raw_row.get("license_type")) or not _text(raw_row.get("description")):
         return "invalid", "license_category_missing", None
-    if row["license_type"] != "MEDICAL BOARD" or row["description"] != PHYSICIAN_DESCRIPTION:
+    if raw_row["license_type"] != "MEDICAL BOARD" or raw_row["description"] != PHYSICIAN_DESCRIPTION:
         return "excluded", "not_physician_and_surgeon", None
     required = (*NAME_FIELDS, "license_number", "original_issue_date", "business")
-    if any(not isinstance(row.get(field), str) for field in required):
+    if any(not isinstance(raw_row.get(field), str) for field in required):
         return "invalid", "identity_component_missing", None
-    if row["business"] != "N":
+    if raw_row["business"] != "N":
         return "invalid", "individual_physician_required", None
-    if not _text(row["first_name"]) or not _text(row["last_name"]):
+    if not _text(raw_row["first_name"]) or not _text(raw_row["last_name"]):
         return "invalid", "legal_name_missing", None
-    if _text(row["prefix"]) or _text(row["suffix"]):
+    # Observed MD/DO suffixes follow the last name with empty title and prefix.
+    if (_text(raw_row["prefix"]) or _text(raw_row["suffix"]) not in {"", "MD", "DO"}
+            or (_text(raw_row["suffix"]) and _text(raw_row["title"]))):
         return "invalid", "name_affix_order_unverified", None
-    if not re.fullmatch(r"036[0-9]{6}", row["license_number"]):
+    if not re.fullmatch(r"036[0-9]{6}", raw_row["license_number"]):
         return "invalid", "physician_license_format_unverified", None
-    issued_on = _issue_date(row["original_issue_date"])
+    issued_on = _issue_date(raw_row["original_issue_date"])
     if issued_on is None:
         return "invalid", "original_issue_date_invalid", None
-    identity_by_field = {field: _text(row[field]) for field in NAME_FIELDS}
-    identity_by_field["display_name"] = " ".join(identity_by_field[field] for field in NAME_FIELDS[:4] if identity_by_field[field])
+    identity_by_field = {field: _text(raw_row[field]) for field in NAME_FIELDS}
+    identity_by_field["display_name"] = " ".join(identity_by_field[field] for field in (*NAME_FIELDS[:4], "suffix")
+                                                if identity_by_field[field])
     identity_by_field["original_issue_date"] = issued_on
-    identity_by_field["license_number"] = row["license_number"]
+    identity_by_field["license_number"] = raw_row["license_number"]
     return "eligible", "complete_physician_identity", identity_by_field
 
 
@@ -116,16 +119,25 @@ def _profile_identity(identity):
     return (name.casefold(), issued_on) if name and issued_on else None
 
 
-def _relevant_invalid(record, named_records):
+def _relevant_invalid(record, named_records, issued_on):
     """A malformed row cannot be silently removed from a potentially matching name."""
     raw = record["originals"][0]["raw_payload"]
+    if isinstance(raw, dict):
+        if any(raw.get("license_number") == row["identity"]["license_number"] for row in named_records):
+            return True
+        raw_date = _issue_date(raw.get("original_issue_date"))
+        if raw_date is not None and raw_date != issued_on:
+            return False
     if not isinstance(raw, dict) or any(not isinstance(raw.get(field), str) for field in NAME_FIELDS):
         return True
     first, last = _text(raw.get("first_name")).casefold(), _text(raw.get("last_name")).casefold()
     if not first or not last:
         return True
     name = " ".join(_text(raw[field]) for field in NAME_FIELDS[:4] if _text(raw[field])).casefold()
-    return any(name == row["identity"]["display_name"].casefold()
+    names = {name}
+    if _text(raw["suffix"]) in {"MD", "DO"} and not _text(raw["title"]) and not _text(raw["prefix"]):
+        names.add(name + " " + _text(raw["suffix"]).casefold())
+    return any(row["identity"]["display_name"].casefold() in names
                or (first == row["identity"]["first_name"].casefold()
                    and last == row["identity"]["last_name"].casefold()) for row in named_records)
 
@@ -133,7 +145,7 @@ def _relevant_invalid(record, named_records):
 def _candidate_result(profile_key, records):
     named_records = [row for row in records if row["status"] == "eligible"
                      and row["identity"]["display_name"].casefold() == profile_key[0]]
-    malformed_records = [row for row in records if row["status"] == "invalid" and _relevant_invalid(row, named_records)]
+    malformed_records = [row for row in records if row["status"] == "invalid" and _relevant_invalid(row, named_records, profile_key[1])]
     if malformed_records:
         return "identity_conflict", "relevant_roster_identity_invalid", None, named_records + malformed_records
     if not named_records:
