@@ -37,7 +37,7 @@ jobs:
     - name: Check finalizer unlink failure as a non-root user
       env:
         CARGO_BUILD_JOBS: '2'
-      run: "test \"$(id -u)\" -ne 0\nrustup toolchain install 1.97.1 --profile minimal --no-self-update\ncargo +1.97.1 test\
+      run: "test \"$(id -u)\" -ne 0\nrustup toolchain install 1.98.1 --profile minimal --no-self-update\ncargo +1.98.1 test\
         \ --locked --manifest-path support/ptg2_scanner/Cargo.toml --bin ptg2_scanner \\\n  main_test_suite::cases::scanner_and_v3_finalizer::owned_unlink_failure_prevents_finalizer_publication\
         \ \\\n  -- --exact --nocapture\n"
     if: ${{ success() }}
