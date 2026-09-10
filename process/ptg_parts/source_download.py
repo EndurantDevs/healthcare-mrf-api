@@ -1441,14 +1441,14 @@ def _curl_transport_option_map(
         CurlOpt.NOPROXY: "" if proxy_url else "*",
     }
     if proxy_url:
-        parsed_proxy = urlsplit(validated_socks_proxy_url(proxy_url))
+        parsed_proxy = urlsplit(validated_http_proxy_url(proxy_url))
         proxy_hostname = str(parsed_proxy.hostname)
         if ":" in proxy_hostname:
             proxy_hostname = f"[{proxy_hostname}]"
         option_map.update(
             {
                 CurlOpt.PROXY: (
-                    f"socks5://{proxy_hostname}:{parsed_proxy.port}"
+                    f"http://{proxy_hostname}:{parsed_proxy.port}"
                 ),
                 CurlOpt.PROXYUSERNAME: parsed_proxy.username,
                 CurlOpt.PROXYPASSWORD: parsed_proxy.password,
@@ -1480,16 +1480,16 @@ def _curl_request_option_map(
     return option_map
 
 
-def validated_socks_proxy_url(value: str) -> str:
-    """Return one authenticated local-DNS SOCKS URL or fail closed."""
+def validated_http_proxy_url(value: str) -> str:
+    """Return one authenticated HTTP proxy URL or fail closed."""
 
     try:
         parsed = urlsplit(value)
         port = parsed.port
     except ValueError:
-        raise RuntimeError("hospital SOCKS proxy URL is invalid") from None
+        raise RuntimeError("hospital egress proxy URL is invalid") from None
     if (
-        parsed.scheme != "socks5"
+        parsed.scheme != "http"
         or parsed.hostname is None
         or port is None
         or not 1 <= port <= 65535
@@ -1502,7 +1502,7 @@ def validated_socks_proxy_url(value: str) -> str:
         or parsed.fragment
     ):
         raise RuntimeError(
-            "hospital SOCKS proxy must be an authenticated socks5 URL"
+            "hospital egress proxy must be an authenticated HTTP URL"
         )
     return value
 
@@ -1788,7 +1788,7 @@ async def download_raw_artifact_via_proxy(
 ) -> PTG2RawArtifact:
     """Download one uncached artifact through an explicitly selected proxy."""
 
-    proxy_url = validated_socks_proxy_url(proxy_url)
+    proxy_url = validated_http_proxy_url(proxy_url)
     return await _download_raw_request(
         url,
         store=store,

@@ -15,11 +15,11 @@ from process.control_cancel import ImportCancelledError
 from process.ptg_parts.artifacts import PTG2ArtifactStore
 from process.ptg_parts.domain import PTG2RawArtifact
 from process.ptg_parts.source_download import download_raw_artifact_via_proxy
-from process.ptg_parts.source_download import validated_socks_proxy_url
+from process.ptg_parts.source_download import validated_http_proxy_url
 
 _RUNTIME_USER_AGENT = "Python/3.12 aiohttp/3.11"
 _AVERA_BROWSER_PROFILE = "chrome136"
-_HOSPITAL_PROXY_ENV = "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY"
+_HOSPITAL_PROXY_ENV = "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY"
 _PROXY_HOSTS_ENV = "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS"
 _PROXY_MAX_BYTES = 512 * 1024**2
 
@@ -43,7 +43,7 @@ def _configured_proxy(url: str) -> str | None:
     value = os.getenv(_HOSPITAL_PROXY_ENV, "").strip()
     if not value:
         return None
-    proxy_url = validated_socks_proxy_url(value)
+    proxy_url = validated_http_proxy_url(value)
     allowed_hosts = {
         host.strip().lower()
         for host in os.getenv(_PROXY_HOSTS_ENV, "").split(",")
