@@ -144,29 +144,30 @@ class _DetailParser(HTMLParser):
         self.div_depth -= 1
 
 
-def _validate_envelope(parser, license_number):
+def _validate_envelope(parser, license_number, last_name=""):
     _require(parser.closed_html and parser.div_depth == 0 and not parser.in_criterion
              and not parser.in_result_form, "incomplete_html")
     _require(len(parser.form_actions) == 1 and parser.detail_choices == [True]
              and parser.criterion_count == 1 and parser.content_count == 1, "result_envelope_invalid")
     action = urlsplit(parser.form_actions[0])
-    expected_query_by_field = {"AGY": ["5"], "FLD1": [""], "FLD2": [license_number], "FLD3": ["0"], "FLD4": ["0"], "TYPE": [""]}
+    expected_query_by_field = {"AGY": ["5"], "FLD1": [last_name], "FLD2": [license_number], "FLD3": ["0"], "FLD4": ["0"], "TYPE": [""]}
     _require(action.path == "LicenseList.aspx" and not action.scheme and not action.netloc and not action.fragment
              and parse_qs(action.query, keep_blank_values=True) == expected_query_by_field, "result_query_mismatch")
-    expected = f"Search Criterion: KY License Number = {license_number}; Practice County = 0; Specialty = 0;"
-    _require(_text("".join(parser.criterion_parts)) == expected, "result_criterion_mismatch")
+    name_criterion = f"Last Name = {last_name}; " if last_name else ""
+    expected = f"Search Criterion: {name_criterion}KY License Number = {license_number}; Practice County = 0; Specialty = 0;"
+    _require(_text("".join(parser.criterion_parts)) == _text(expected), "result_criterion_mismatch")
     tail = _text("".join(parser.result_tail_parts))
     _require(not tail or re.fullmatch(r"Published: [0-9]{2}/[0-9]{2}/[0-9]{4} \[wvd\]", tail), "unexpected_result_text")
 
 
-def extract_profiles(html, *, license_number, reject_hidden=False):
-    """Extract all profiles from the validated exact-license detail envelope."""
+def extract_profiles(html, *, license_number, reject_hidden=False, last_name=""):
+    """Extract all profiles from the validated literal-license lookup envelope."""
     _require(isinstance(license_number, str) and re.fullmatch(r"[A-Za-z0-9]{1,32}", license_number), "invalid_license")
     _require(isinstance(html, str) and len(html.encode()) <= MAX_HTML_BYTES, "html_input_limit")
     parser = _DetailParser(reject_hidden=reject_hidden)
     parser.feed(html)
     parser.close()
-    _validate_envelope(parser, license_number)
+    _validate_envelope(parser, license_number, last_name)
     profiles = []
     for raw_label, raw_value in parser.field_rows:
         label = _text(raw_label).rstrip(":").strip()
@@ -236,12 +237,12 @@ def _validated_evidence(evidence):
     return evidence_by_field
 
 
-def _retained_record(html, profiles, license_number, evidence):
+def _retained_record(raw_payload, profiles, license_number, evidence):
     record_key = f"{SOURCE_KEY}:{license_number}"
     return {"record_id": _hash([evidence["run_id"], record_key]), "run_id": evidence["run_id"],
             "artifact_id": evidence["artifact_id"], "source_key": SOURCE_KEY, "source_record_key": record_key,
             "profession_code": None, "license_id": None, "license_number": license_number,
-            "raw_payload": {"html": html, "profiles": copy.deepcopy(profiles)},
+            "raw_payload": {**copy.deepcopy(raw_payload), "profiles": copy.deepcopy(profiles)},
             "normalized_payload": {"schema_version": SCHEMA_VERSION, "visibility": "public", "quality_flags": []},
             "matched_npi": None, "match_status": "unmatched", "row_number": evidence["row_number"],
             "match_evidence": {"jurisdiction": "KY", "requested_license_number": license_number}}
@@ -316,12 +317,20 @@ def parse_profile(html, *, license_number, candidates, evidence, categories=LEGA
     the source. Missing middle names or suffixes are not guessed. Ambiguous or
     unmatched source facts retain npi=None. Multiple source results are held.
     """
+    _require(categories in (LEGACY_CATEGORIES, PROFILE_CATEGORIES, list(LEGACY_CATEGORIES), list(PROFILE_CATEGORIES)),
+             "categories_invalid")
+    profiles = extract_profiles(html, license_number=license_number, reject_hidden="specialties" in categories)
+    return _parsed_profiles(profiles, {"html": html}, license_number=license_number,
+                            candidates=candidates, evidence=evidence, categories=categories)
+
+
+def _parsed_profiles(profiles, raw_payload, *, license_number, candidates, evidence, categories):
+    """Apply identical identity and fact guards to validated source profile payloads."""
     _require(isinstance(candidates, (list, tuple)) and all(isinstance(candidate, dict) for candidate in candidates), "invalid_candidates")
     _require(categories in (LEGACY_CATEGORIES, PROFILE_CATEGORIES, list(LEGACY_CATEGORIES), list(PROFILE_CATEGORIES)),
              "categories_invalid")
     evidence_by_field = _validated_evidence(evidence)
-    profiles = extract_profiles(html, license_number=license_number, reject_hidden="specialties" in categories)
-    source_record = _retained_record(html, profiles, license_number, evidence_by_field)
+    source_record = _retained_record(raw_payload, profiles, license_number, evidence_by_field)
     if not profiles:
         source_record.update(match_status="not_found")
         source_record["normalized_payload"]["visibility"] = "not_found"

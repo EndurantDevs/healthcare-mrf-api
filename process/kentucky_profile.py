@@ -15,13 +15,30 @@ from db.models import ProviderProfileArtifact, ProviderProfileSourceRecord, Prov
 from process.control_cancel import raise_if_cancelled
 from process.florida_mqa_profile import _upsert_rows
 from process.live_progress import enqueue_live_progress
-from process.massachusetts_profile import _hash, _now, _selected_roots
+from process.massachusetts_profile import _hash, _now, _selected_roots as _hash_selected_roots
 from process.kentucky_profile_completion import complete_run, reconcile_failed_control_runs
 from process import kentucky_profile_acquisition as acquisition
 from process import kentucky_profile_store as store
-from process.kentucky_profile_rows import LEGACY_CATEGORIES, PROFILE_CATEGORIES, SCHEMA_VERSION, SOURCE_KEY, parse_profile
+from process.kentucky_profile_rows import (
+    LEGACY_CATEGORIES, PROFILE_CATEGORIES, SCHEMA_VERSION, SOURCE_KEY,
+    _parsed_profiles, extract_profiles, parse_profile,
+)
 
 logger = logging.getLogger(__name__)
+SAMPLING_STRATEGY = "lexical_first_then_stable_hash/v2"
+LEGACY_SAMPLING_STRATEGY = "stable_hash/v1"
+ACQUISITION_STRATEGY = "literal_license_then_candidate_surnames/v2"
+
+
+def _selected_roots(cohort, limit, *, strategy=SAMPLING_STRATEGY):
+    """Exercise the lexical boundary in new bounded runs without changing full order."""
+    if strategy not in (SAMPLING_STRATEGY, LEGACY_SAMPLING_STRATEGY):
+        raise ValueError("kentucky_profile_sampling_strategy_invalid")
+    if strategy == LEGACY_SAMPLING_STRATEGY or limit is None or not cohort["roots"]:
+        return _hash_selected_roots(cohort, limit)
+    first = min(cohort["roots"], key=lambda root: root["license_number"])
+    remaining_roots = [root for root in _hash_selected_roots(cohort, len(cohort["roots"])) if root != first]
+    return [first, *remaining_roots[:limit - 1]]
 
 
 def _parameters(task):
@@ -56,18 +73,24 @@ async def _cohort_for_run(task, artifact_root, expected_current_run_id):
     limit, resume_from = _parameters(task)
     if resume_from is None:
         schema = ProviderProfileSourceRecord.__table__.schema or "mrf"
-        return await acquisition.capture_registry_cohort(schema), None, PROFILE_CATEGORIES
+        return await acquisition.capture_registry_cohort(schema), None, PROFILE_CATEGORIES, SAMPLING_STRATEGY
     previous_run = await store.read_resume_run(
         resume_from, max_providers=limit, expected_current_run_id=expected_current_run_id,
     )
+    previous_manifest = previous_run["source_manifest"]
+    if (previous_manifest.get("acquisition_strategy") != ACQUISITION_STRATEGY
+            and "response_too_large" in str(previous_run.get("error"))):
+        raise ValueError("kentucky_profile_legacy_oversized_checkpoint_incomplete")
     directory = _retained_directory(artifact_root, resume_from)
     cohort = acquisition.read_cohort(directory / "cohort.json")
     if _hash(cohort) != previous_run["source_manifest"]["cohort_sha256"]:
         raise ValueError("kentucky_profile_resume_cohort_changed")
-    return cohort, directory / "profiles", previous_run["source_manifest"]["categories"]
+    strategy = previous_manifest.get("sampling_strategy", LEGACY_SAMPLING_STRATEGY)
+    _selected_roots(cohort, limit, strategy=strategy)
+    return cohort, directory / "profiles", previous_manifest["categories"], strategy
 
 
-def _source_manifest(task, cohort, expected_current_run_id, *, categories=PROFILE_CATEGORIES):
+def _source_manifest(task, cohort, expected_current_run_id, *, categories=PROFILE_CATEGORIES, sampling_strategy=SAMPLING_STRATEGY):
     limit, resume_from = _parameters(task)
     count = len(cohort["roots"])
     return {
@@ -75,6 +98,7 @@ def _source_manifest(task, cohort, expected_current_run_id, *, categories=PROFIL
         "expected_current_run_id": expected_current_run_id,
         "full_cohort_licenses": count, "requested_licenses": min(limit, count) if limit is not None else count,
         "cohort_sha256": _hash(cohort), "control_run_id": task.get("run_id"), "categories": list(categories),
+        "sampling_strategy": sampling_strategy, "acquisition_strategy": ACQUISITION_STRATEGY,
         "source": {
             "source_key": SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "KY",
             "agency": "Kentucky Board of Medical Licensure", "source_url": acquisition.LOOKUP_URL,
@@ -93,7 +117,8 @@ def _progress(task, run_id, phase, done, total):
 
 
 async def _acquire(ctx, task, run_row, cohort, directory, retained):
-    roots = _selected_roots(cohort, run_row["source_manifest"]["max_providers"])
+    manifest = run_row["source_manifest"]
+    roots = _selected_roots(cohort, manifest["max_providers"], strategy=manifest.get("sampling_strategy", LEGACY_SAMPLING_STRATEGY))
 
     async def progress(done, total):
         """Check every request checkpoint for cancellation and throttle visible updates."""
@@ -102,7 +127,8 @@ async def _acquire(ctx, task, run_row, cohort, directory, retained):
             _progress(task, run_row["run_id"], "acquiring", done, total)
 
     metrics = await acquisition.acquire_profiles(roots, directory / "profiles", progress, retained=retained)
-    return roots, {**metrics, "acquisition_complete": True, "transport_failures": 0}
+    return roots, {**metrics, "acquisition_complete": True, "transport_failures": 0,
+                   "acquisition_complete_scope": acquisition.NARROWED_SCOPE}
 
 
 def _artifact(run_row, directory, metrics):
@@ -119,10 +145,39 @@ def _artifact(run_row, directory, metrics):
 
 
 def _source_rows(root, response, artifact, row_number, *, categories=LEGACY_CATEGORIES):
+    if response["schema_version"] == acquisition.NARROWED_SCHEMA:
+        return _narrowed_rows(root, response, artifact, row_number, categories=categories)
     evidence_by_field = {key: response[key] for key in ("source_url", "downloaded_at", "content_sha256")}
     evidence_by_field.update(run_id=artifact["run_id"], artifact_id=artifact["artifact_id"], row_number=row_number)
     return parse_profile(response["body_text"], license_number=root["license_number"],
                          candidates=root["candidates"], evidence=evidence_by_field, categories=categories)
+
+
+def _narrowed_rows(root, response, artifact, row_number, *, categories):
+    """Retain every narrowed result; deduplicate only identical complete profile payloads."""
+    acquisition._validate_narrowed(response, root)
+    profiles_by_payload, sources_by_payload = {}, {}
+    for query, receipt in zip(response["query_scope"]["queries"], response["responses"], strict=True):
+        profiles = extract_profiles(receipt["body_text"], license_number=root["license_number"],
+                                    last_name=query["last_name"], reject_hidden="specialties" in categories)
+        for profile in profiles:
+            payload = acquisition.encoded_json(profile)
+            profiles_by_payload.setdefault(payload, profile)
+            sources_by_payload.setdefault(payload, receipt)
+    profiles = list(profiles_by_payload.values())
+    source = next(iter(sources_by_payload.values()), response["responses"][0])
+    evidence_by_field = {key: source[key] for key in ("source_url", "downloaded_at", "content_sha256")}
+    evidence_by_field.update(run_id=artifact["run_id"], artifact_id=artifact["artifact_id"], row_number=row_number)
+    record, facts = _parsed_profiles(profiles, {"acquisition": response}, license_number=root["license_number"],
+                                     candidates=root["candidates"], evidence=evidence_by_field, categories=categories)
+    record["match_evidence"]["query_scope"] = response["query_scope"]
+    if not profiles:
+        record.update(match_status="unmatched")
+        record["normalized_payload"]["visibility"] = "held_identity"
+        record["match_evidence"]["reason"] = "no_profile_within_candidate_name_queries"
+    for fact in facts:
+        fact["source_json"]["acquisition_scope"] = acquisition.NARROWED_SCOPE
+    return record, facts
 
 
 async def _persist_profiles(ctx, task, roots, directory, artifact, *, categories=LEGACY_CATEGORIES):
@@ -136,9 +191,10 @@ async def _persist_profiles(ctx, task, roots, directory, artifact, *, categories
         source_records, facts = [], []
         for index, root in enumerate(roots[offset:offset + 250], offset + 1):
             await raise_if_cancelled(ctx, task)
-            response = acquisition.read_response(directory / "profiles" / f"{root['license_number']}.json", root["license_number"])
+            response = acquisition.read_response(directory / "profiles" / f"{root['license_number']}.json", root["license_number"],
+                                                 candidates=root.get("candidates"))
             response_hash.update(acquisition.encoded_json(response))
-            response_bytes += len(response["body_text"].encode("utf-8"))
+            response_bytes += acquisition.response_bytes(response)
             record, parsed_facts = _source_rows(root, response, artifact, index, categories=categories)
             source_records.append(record)
             facts.extend(parsed_facts)
@@ -182,13 +238,14 @@ async def import_profiles(ctx, task):
     publication = await store.read_publication()
     expected = publication["current_run_id"] if publication else None
     artifact_root = _artifact_root()
-    cohort, retained, categories = await _cohort_for_run(task, artifact_root, expected)
+    cohort, retained, categories, sampling_strategy = await _cohort_for_run(task, artifact_root, expected)
     acquisition._license_numbers(cohort["roots"])
     await raise_if_cancelled(ctx, task)
     run_id = _hash([SOURCE_KEY, control_run_id])
     run_by_field = {
         "run_id": run_id, "source_key": SOURCE_KEY, "jurisdiction": "KY", "schema_version": SCHEMA_VERSION,
-        "status": "running", "source_manifest": _source_manifest(task, cohort, expected, categories=categories),
+        "status": "running", "source_manifest": _source_manifest(task, cohort, expected, categories=categories,
+                                                                  sampling_strategy=sampling_strategy),
         "metrics": {}, "error": None, "started_at": _now(), "finished_at": None,
     }
     await store.claim_run(run_by_field)

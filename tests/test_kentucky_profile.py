@@ -175,6 +175,18 @@ def test_bounded_selection_is_order_independent_and_preserves_roots():
     assert worker._selected_roots(cohort, None) == cohort["roots"]
 
 
+@pytest.mark.parametrize("limit", [1, 2, 100, 300])
+def test_bounded_sample_includes_lexical_first_then_existing_hash_order(limit):
+    cohort = _cohort(tuple(str(number) for number in range(201)))
+    selected = worker._selected_roots(cohort, limit)
+    original_sample = worker._hash_selected_roots(cohort, len(cohort["roots"]))
+    assert selected[0]["license_number"] == "0"
+    assert selected[1:] == [root for root in original_sample if root["license_number"] != "0"][:limit - 1]
+    assert len(selected) == len({root["license_number"] for root in selected}) == min(limit, 201)
+    assert worker._selected_roots(cohort, None) is cohort["roots"]
+    assert worker._selected_roots(cohort, limit, strategy=worker.LEGACY_SAMPLING_STRATEGY) == original_sample[:limit]
+
+
 async def test_artifact_accounts_for_not_found_without_inventing_facts(harness):
     harness.responses_by_license["C0007"] = _response("C0007", empty=True)
     await worker.import_profiles(harness.ctx, harness.task)
@@ -376,16 +388,39 @@ async def test_retention_failure_does_not_downgrade_completed_import(harness):
     harness.store_by_name["mark_run_failed"].assert_not_called()
 
 
-def _retained_run(harness, *, limit=2):
+def _retained_run(harness, *, limit=2, strategy=worker.SAMPLING_STRATEGY):
     run_id = "b" * 64
     directory = harness.artifact_root / run_id
     (directory / "profiles").mkdir(parents=True)
     worker.acquisition.write_new_json(directory / "cohort.json", harness.cohort)
-    selected = worker._selected_roots(harness.cohort, limit)
+    selected = worker._selected_roots(harness.cohort, limit, strategy=strategy)
     for root in selected:
         worker.acquisition.write_new_json(directory / "profiles" / f"{root['license_number']}.json", harness.responses_by_license[root["license_number"]])
-    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR)
+    manifest = worker._source_manifest({"max_providers": limit}, harness.cohort, PREDECESSOR, sampling_strategy=strategy)
     return {"run_id": run_id, "source_manifest": manifest}, directory
+
+
+async def test_historical_resume_preserves_old_hash_sample(harness, monkeypatch):
+    previous, directory = _retained_run(harness, strategy=worker.LEGACY_SAMPLING_STRATEGY)
+    previous["source_manifest"].pop("sampling_strategy")
+    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous))
+    await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous["run_id"]})
+    claimed = harness.store_by_name["claim_run"].call_args.args[0]
+    assert claimed["source_manifest"]["sampling_strategy"] == worker.LEGACY_SAMPLING_STRATEGY
+    assert harness.requests == []
+    assert {path.name for path in (directory / "profiles").iterdir()} == {
+        path.name for path in (harness.artifact_root / claimed["run_id"] / "profiles").iterdir()}
+
+
+async def test_legacy_uncheckpointed_oversize_is_not_repeated_on_resume(harness, monkeypatch):
+    previous, _directory = _retained_run(harness)
+    previous["source_manifest"].pop("acquisition_strategy")
+    previous["error"] = "ValueError: kentucky_profile_response_too_large"
+    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous))
+    with pytest.raises(ValueError, match="legacy_oversized_checkpoint_incomplete"):
+        await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 2, "resume_from": previous["run_id"]})
+    assert harness.requests == []
+    harness.store_by_name["claim_run"].assert_not_called()
 
 
 async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harness, monkeypatch):
