@@ -135,9 +135,11 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     }
     bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
     assert bootstrap["run"] == (
-        "python -m pip install --disable-pip-version-check --no-deps "
-        "--only-binary=:all: 'uv==0.12.12'\n"
-        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12"
+        "printf '%s\\n' 'uv==0.12.12 "
+        "--hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n"
+        "  python -m pip install --disable-pip-version-check --no-deps "
+        "--only-binary=:all: --require-hashes -r /dev/stdin\n"
+        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
     )
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ci/public_hygiene.py" in commands
