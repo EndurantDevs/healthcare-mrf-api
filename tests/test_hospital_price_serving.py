@@ -297,19 +297,21 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     assert page["pagination"]["scanned"] == 2
     assert page["pagination"]["next_cursor"]
     assert page["query"]["negotiated_prices_requested"] is True
-    assert [item["charge"]["charge_ordinal"] for item in page["items"]] == [10]
+    assert [
+        price_item["charge"]["charge_ordinal"] for price_item in page["items"]
+    ] == [10]
     assert page["items"][0]["negotiated_prices"][0]["payer_name"] == "Payer"
     assert page["items"][0]["negotiated_prices"][0]["negotiated_rate_term"] == (
         "JAN 2026-MAY 2026"
     )
-    fact = page["items"][0]["negotiated_prices"][0]
-    assert set(fact) == {
+    negotiated_price = page["items"][0]["negotiated_prices"][0]
+    assert set(negotiated_price) == {
         "payer_name", "plan_name", "negotiated_rate_term", "negotiated_dollar",
         "negotiated_percentage", "negotiated_algorithm", "estimated_amount",
         "methodology", "median_amount", "percentile_10", "percentile_90",
         "allowed_count", "additional_payer_notes", "comparison_amount",
     }
-    assert "private_source_locator" not in fact
+    assert "private_source_locator" not in negotiated_price
 
     next_page = await serving.read_hospital_price_page(
         session,
@@ -317,7 +319,9 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     )
     assert next_page["pagination"]["scanned"] == 1
     assert next_page["pagination"]["next_cursor"] is None
-    assert [item["charge"]["charge_ordinal"] for item in next_page["items"]] == [12]
+    assert [
+        price_item["charge"]["charge_ordinal"] for price_item in next_page["items"]
+    ] == [12]
 
 
 @pytest.mark.asyncio
