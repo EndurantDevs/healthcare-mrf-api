@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import copy
+import json
 from itertools import permutations
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from api.provider_education import canonicalize_education_category
 from api.provider_profile import compose_provider_profile, compose_provider_profile_evidence
+from api import provider_profile_composer_parts
+from api.endpoint import npi as npi_api
 
 
 SCHOOL = "Example Medical School"
 YEAR_VALUE = {"institution": SCHOOL, "graduation_year": 2001}
 DATE_VALUE = {"institution": SCHOOL.upper(), "graduation_date": "2001-06-01", "graduation_date_precision": "day", "program": "Medicine", "degree_or_certificate_code": "MD"}
+YEAR_DATE_VALUE = {"institution": SCHOOL, "graduation_date": "2001", "graduation_date_precision": "year"}
 
 
 def _fact(record_id, value, *, source_kind="state_regulator", **overrides):
@@ -95,9 +101,51 @@ def test_weak_year_does_not_choose_between_two_known_events(second_details):
         assert all("corroborated_fields" not in fact for fact in result)
 
 
-def test_three_partial_candidates_remain_ambiguous():
-    facts = [_fact("state-1", DATE_VALUE), _fact("state-2", {**YEAR_VALUE, "major": "Medicine"}), _fact("cms-1", YEAR_VALUE, source_kind="cms_doctors")]
-    assert len(_canonical(*facts)) == 3
+@pytest.mark.parametrize("state_values", [(DATE_VALUE, {**YEAR_VALUE, "major": "Medicine"}), (YEAR_DATE_VALUE, {**YEAR_DATE_VALUE, "graduation_year": 2001})])
+@pytest.mark.parametrize("missing_fields", [(), ("display",), ("source_ids",), ("display", "source_ids")])
+def test_three_compatible_sources_corroborate_and_preserve_every_assertion_in_any_order(state_values, missing_fields):
+    facts = [
+        _fact("state-1", state_values[0], source_ids=["florida-profile"]),
+        _fact("state-2", state_values[1], source_ids=["new-york-profile"]),
+        _fact("cms-1", {**YEAR_VALUE, "institution": "  Example\u00a0MEDICAL   School "}, source_kind="cms_doctors", source_ids=["cms-doctors"]),
+    ]
+    for field in missing_fields:
+        facts[2].pop(field)
+    originals = copy.deepcopy(facts)
+    merged, = expected = _canonical(*facts)
+    assert merged["value"] in state_values
+    assert merged["corroborated_fields"] == ["institution", "graduation_year"]
+    assert merged["source_kinds"] == ["cms_doctors", "state_regulator"]
+    assert merged["source_ids"] == (["cms-doctors"] if "source_ids" not in missing_fields else []) + ["florida-profile", "new-york-profile"]
+    assert merged["source_record_ids"] == ["cms-1", "state-1", "state-2"]
+    assert merged["assertion_count"] == len(merged["assertions"]) == 3
+    for original in originals:
+        assertions = [item for item in merged["assertions"] if item["source_record_ids"] == original["source_record_ids"]]
+        assert len(assertions) == 1
+        for field in ("value", "display", "source_ids", "source_record_ids", "assertion_type", "verification_status"):
+            if field in original:
+                assert assertions[0][field] == original[field]
+            else:
+                assert field not in assertions[0]
+    for shuffled in permutations(facts):
+        assert _canonical(*shuffled) == expected
+    assert _canonical(merged) == expected
+    assert facts == originals
+
+
+def test_compatible_triple_with_external_candidate_keeps_every_event_separate():
+    facts = [
+        _fact("first", {**YEAR_VALUE, "program": "Medicine"}),
+        _fact("second", {**YEAR_VALUE, "major": "Medicine"}),
+        _fact("bridge", {**YEAR_VALUE, "degree_or_certificate_code": "MD"}),
+        _fact("external", {**YEAR_VALUE, "program": "Dentistry", "major": "Dentistry"}),
+    ]
+    expected = _canonical(*facts)
+    assert len(expected) == len({fact["logical_fact_key"] for fact in expected}) == 4
+    assert all("corroborated_fields" not in fact for fact in expected)
+    for shuffled in permutations(facts):
+        assert _canonical(*shuffled) == expected
+    assert _canonical(*expected) == expected
 
 
 @pytest.mark.parametrize("other_value", [
@@ -228,19 +276,43 @@ def test_normalization_works_for_explicit_non_cms_source_and_preserves_source_id
     assert assertion_by_field["source_ids"] == ["directory-feed"]
 
 
-def test_composed_identity_survives_unique_richer_support_and_evidence_is_retained():
+@pytest.mark.parametrize("state_values", [(DATE_VALUE,), (DATE_VALUE, {**YEAR_VALUE, "major": "Medicine"})])
+def test_composed_identity_survives_unique_richer_support_and_evidence_is_retained(state_values):
     cms_fact = _fact("cms-1", YEAR_VALUE, source_kind="cms_doctors")
     first_profile = _compose(_projection(cms_fact))
-    projection = _projection(cms_fact, _fact("state-1", DATE_VALUE))
+    state_facts = [_fact(f"state-{index}", value) for index, value in enumerate(state_values, start=1)]
+    projection = _projection(cms_fact, *state_facts)
     next_profile = _compose(projection)
     first_item, = first_profile["categories"]["education"]["items"]
     next_item, = next_profile["categories"]["education"]["items"]
     assert first_item["item_id"] == next_item["item_id"]
     evidence = compose_provider_profile_evidence(state_projection=projection, fhir_evidence=None, provider_profile=next_profile)
-    assert evidence["sources"]["state_regulator"]["records"] == [{"source_record_id": "state-1"}]
+    assert evidence["sources"]["state_regulator"]["records"] == [{"source_record_id": fact["source_record_ids"][0]} for fact in state_facts]
     assert evidence["sources"]["cms_doctors"]["records"] == [{"source_record_id": "cms-1"}]
 
 
 def test_other_education_types_remain_unchanged():
     other_fact_by_field = {"type": "training_history", "value": "Reported training", "display": "Training"}
     assert _canonical(other_fact_by_field) == [other_fact_by_field]
+
+
+@pytest.mark.asyncio
+async def test_corroboration_change_fences_previous_category_pagination(monkeypatch):
+    projection = _projection(_fact("florida", YEAR_DATE_VALUE), _fact("new-york", {**YEAR_DATE_VALUE, "graduation_year": 2001}), _fact("cms", YEAR_VALUE, source_kind="cms_doctors"))
+    profile = _compose(projection)
+    assert len(profile["categories"]["education"]["items"]) == 1
+    with monkeypatch.context() as previous_version:
+        previous_version.setattr(provider_profile_composer_parts, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v9")
+        previous_generation = provider_profile_composer_parts._composed_generation_id(profile["source_generations"])
+    assert previous_generation != profile["generation_id"]
+    monkeypatch.setattr(npi_api, "fetch_provider_profile_projection", AsyncMock(return_value=projection))
+    monkeypatch.setattr(npi_api, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
+    request = SimpleNamespace(args={"category": "education", "generation_id": previous_generation, "limit": "1", "offset": "1"})
+    response = await npi_api.get_provider_profile(request, "1000000004")
+    assert response.status == 409
+    assert json.loads(response.body) == {
+        "error": "provider_profile_generation_changed",
+        "message": "The provider profile changed; restart category pagination.",
+        "requested_generation_id": previous_generation,
+        "current_generation_id": profile["generation_id"],
+    }

@@ -191,7 +191,7 @@ def test_massachusetts_only_has_actual_source_generation_and_no_florida_claim():
     assert profile["categories"]["training"]["availability"] == "not_reported"
     assert profile["categories"]["professional_experience"]["items"] == []
     assert "Florida" not in str(profile)
-    assert profile["composer_version"] == "provider-profile-composer/v9"
+    assert profile["composer_version"] == "provider-profile-composer/v10"
 
 
 @pytest.mark.parametrize("same_date", [True, False])
@@ -280,7 +280,7 @@ def test_public_descriptor_does_not_expose_internal_manifest_fields():
     assert "internal-only" not in str(_compose(_envelope(row_by_field)))
 
 
-def test_three_distinct_partial_education_events_remain_conservative():
+def test_three_compatible_partial_education_sources_corroborate():
     envelope = _envelope(_row(fact_value={**SCHOOL, "graduation_year": 2001}), incumbent=_legacy_envelope())
     envelope["profile"]["categories"]["education"]["items"].append({
         "type": "education_history",
@@ -291,10 +291,10 @@ def test_three_distinct_partial_education_events_remain_conservative():
         "sensitive": False,
         "public_default": True,
     })
-    items = _compose(envelope)["categories"]["education"]["items"]
-    assert len(items) == 3
-    assert len({item["item_id"] for item in items}) == 3
-    assert {tuple(item["source_record_ids"]) for item in items} == {("florida-record",), (f"{SOURCE_KEY}:school",), ("cms-record",)}
+    item, = _compose(envelope)["categories"]["education"]["items"]
+    assert item["source_record_ids"] == ["cms-record", "florida-record", f"{SOURCE_KEY}:school"]
+    assert item["assertion_count"] == len(item["assertions"]) == 3
+    assert item["corroborated_fields"] == ["institution", "graduation_year"]
 
 
 @pytest.mark.asyncio

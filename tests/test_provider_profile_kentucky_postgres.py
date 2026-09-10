@@ -139,7 +139,7 @@ async def test_native_four_source_corroboration_preserves_incumbents_and_page_ev
                                                 state_api.MASSACHUSETTS_SOURCE_KEY: "ma-generation", SOURCE_KEY: "ky-generation"}
         assert sorted(profile_item["assertion_count"] for profile_item in profile["categories"]["education"]["items"]) == [1, 4]
         assert profile["categories"]["training"]["items"] and profile["categories"]["professional_experience"]["items"] == []
-        assert profile["composer_version"] == "provider-profile-composer/v9"
+        assert profile["composer_version"] == "provider-profile-composer/v10"
         for category, offset in (("education", 0), ("education", 1), ("training", 0)):
             page = profile_api.compose_provider_profile(NPI, state_projection=projection, fhir_profile=None,
                                                        requested_categories=[category], page_category=category, page_limit=1, page_offset=offset)
