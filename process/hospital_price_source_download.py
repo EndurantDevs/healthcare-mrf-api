@@ -9,12 +9,11 @@ import os
 from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
-from curl_cffi.requests.exceptions import RequestException
-
 from process.control_cancel import ImportCancelledError
 from process.ptg_parts.artifacts import PTG2ArtifactStore
 from process.ptg_parts.domain import PTG2RawArtifact
 from process.ptg_parts.source_download import download_raw_artifact_via_proxy
+from process.ptg_parts.source_download import is_prebody_connect_or_timeout
 from process.ptg_parts.source_download import validated_http_proxy_url
 
 _RUNTIME_USER_AGENT = "Python/3.12 aiohttp/3.11"
@@ -97,7 +96,10 @@ def _is_proxyable_failure(error: Exception) -> bool:
     terminal_error = getattr(error, "_hospital_terminal_error", error)
     return (
         getattr(terminal_error, "_ptg2_response_body_started", None) is False
-        and getattr(terminal_error, "status", None) in {None, 403}
+        and (
+            getattr(terminal_error, "status", None) == 403
+            or is_prebody_connect_or_timeout(terminal_error)
+        )
     )
 
 
@@ -152,9 +154,8 @@ async def download_hospital_source(
         raise
     except Exception as proxy_error:
         if (
-            isinstance(proxy_error, RequestException)
-            and getattr(direct_error, "status", None) == 403
-            and getattr(proxy_error, "_ptg2_response_body_started", None) is False
+            getattr(direct_error, "status", None) == 403
+            and is_prebody_connect_or_timeout(proxy_error)
         ):
             raise direct_error
         raise

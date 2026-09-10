@@ -10,6 +10,7 @@ import traceback
 from types import SimpleNamespace
 from typing import Any
 
+import aiohttp
 import pytest
 from curl_cffi import CurlHttpVersion, CurlOpt
 
@@ -315,6 +316,120 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
     }
 
 
+@pytest.mark.asyncio
+async def test_proxied_download_connects_to_the_validated_origin_ip(
+    tmp_path, monkeypatch
+):
+    requests = []
+
+    async def proxy(reader, writer):
+        requests.append((await reader.readline()).decode().rstrip())
+        while await reader.readline() != b"\r\n":
+            continue
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    proxy_port = server.sockets[0].getsockname()[1]
+
+    async def resolve(_url):
+        return "hospital.example", 443, ("8.8.8.8",)
+
+    monkeypatch.setattr(source_download, "resolve_safe_url", resolve)
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 0)
+    try:
+        with pytest.raises(source_download.RequestException):
+            await _download(
+                tmp_path / "artifact.part",
+                url="https://hospital.example/file.csv",
+                browser_profile=None,
+                proxy_url=(
+                    f"http://hospital-test:test-token@127.0.0.1:{proxy_port}"
+                ),
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert requests == ["CONNECT 8.8.8.8:443 HTTP/1.1"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        source_download.CurlECode.COULDNT_CONNECT,
+        source_download.CurlECode.OPERATION_TIMEDOUT,
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_retries_prebody_connect_and_timeout(
+    tmp_path, monkeypatch, code
+):
+    attempts = []
+    successful_download = object()
+
+    async def download_once(**_options):
+        attempts.append(1)
+        if len(attempts) == 1:
+            error = source_download.RequestException("transient", code=code)
+            error._ptg2_response_body_started = False
+            raise error
+        return successful_download
+
+    monkeypatch.setattr(
+        source_download,
+        "_download_raw_artifact_browser_once",
+        download_once,
+    )
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 2)
+    monkeypatch.setattr(source_download, "_download_retry_delay_seconds", lambda: 0)
+
+    assert await _download(
+        tmp_path / "artifact.part",
+        browser_profile=None,
+        proxy_url="http://hospital-test:test-token@10.42.0.1:39081",
+    ) is successful_download
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    ("code", "body_started"),
+    [
+        (source_download.CurlECode.PEER_FAILED_VERIFICATION, False),
+        (source_download.CurlECode.RECV_ERROR, True),
+        (source_download.CurlECode.OPERATION_TIMEDOUT, True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_does_not_retry_policy_or_midbody_failures(
+    tmp_path, monkeypatch, code, body_started
+):
+    attempts = []
+
+    async def download_once(**_options):
+        attempts.append(1)
+        error = source_download.RequestException("terminal", code=code)
+        error._ptg2_response_body_started = body_started
+        error._ptg2_downloaded_byte_count = int(body_started)
+        raise error
+
+    monkeypatch.setattr(
+        source_download,
+        "_download_raw_artifact_browser_once",
+        download_once,
+    )
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 2)
+
+    with pytest.raises(source_download.RequestException):
+        await _download(
+            tmp_path / "artifact.part",
+            browser_profile=None,
+            proxy_url="http://hospital-test:test-token@10.42.0.1:39081",
+        )
+    assert len(attempts) == 1
+
+
 def test_proxy_transport_formats_ipv6_and_rejects_invalid_port():
     options = source_download._curl_transport_option_map(
         "www.avera.org",
@@ -409,7 +524,7 @@ async def test_hospital_download_falls_back_once_to_configured_us_proxy(
 
     async def download(_url, **options):
         requests.append(options)
-        error = TimeoutError("direct route timed out")
+        error = aiohttp.ServerTimeoutError("direct route timed out")
         error._ptg2_response_body_started = False
         raise error
 
@@ -434,6 +549,108 @@ async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     assert "proxy_url" not in requests[0]
     assert requests[1]["proxy_url"] == proxy_url
     assert requests[1]["max_bytes"] == 1024
+
+
+@pytest.mark.parametrize(
+    "direct_error",
+    [
+        UnsafeUrlError("unsafe source"),
+        source_download._DownloadSizeLimitError("too large"),
+        PermissionError("local write denied"),
+        aiohttp.ClientConnectorSSLError(None, OSError("TLS failed")),
+        source_download.RequestException(
+            "certificate rejected",
+            code=source_download.CurlECode.PEER_FAILED_VERIFICATION,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_hospital_proxy_rejects_prebody_nontransport_failures(
+    monkeypatch, direct_error
+):
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY",
+        "http://hospital-test:test-token@10.42.0.1:39081",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+        "hospital.example",
+    )
+    direct_error._ptg2_response_body_started = False
+    proxy_calls = []
+
+    async def direct_download(*_args, **_options):
+        raise direct_error
+
+    async def proxy_download(*_args, **_options):
+        proxy_calls.append(1)
+
+    monkeypatch.setattr(
+        hospital_price_source_download,
+        "download_raw_artifact_via_proxy",
+        proxy_download,
+    )
+
+    with pytest.raises(type(direct_error)) as failure:
+        await hospital_price_source_download.download_hospital_source(
+            direct_download,
+            "https://hospital.example/file.csv",
+            object(),
+            1024,
+            "Mozilla/5.0",
+        )
+    assert failure.value is direct_error
+    assert proxy_calls == []
+
+
+@pytest.mark.parametrize(
+    "direct_error",
+    [
+        aiohttp.ClientConnectorError(None, OSError("connect failed")),
+        aiohttp.ServerTimeoutError("timed out"),
+        source_download.RequestException(
+            "connect failed", code=source_download.CurlECode.COULDNT_CONNECT
+        ),
+        source_download.RequestException(
+            "timed out", code=source_download.CurlECode.OPERATION_TIMEDOUT
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_hospital_proxy_accepts_prebody_connect_and_timeout(
+    monkeypatch, direct_error
+):
+    proxy_url = "http://hospital-test:test-token@10.42.0.1:39081"
+    monkeypatch.setenv("HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY", proxy_url)
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+        "hospital.example",
+    )
+    direct_error._ptg2_response_body_started = False
+    proxy_calls = []
+    downloaded = object()
+
+    async def direct_download(*_args, **_options):
+        raise direct_error
+
+    async def proxy_download(*_args, **_options):
+        proxy_calls.append(1)
+        return downloaded
+
+    monkeypatch.setattr(
+        hospital_price_source_download,
+        "download_raw_artifact_via_proxy",
+        proxy_download,
+    )
+
+    assert await hospital_price_source_download.download_hospital_source(
+        direct_download,
+        "https://hospital.example/file.csv",
+        object(),
+        1024,
+        "Mozilla/5.0",
+    ) is downloaded
+    assert proxy_calls == [1]
 
 
 @pytest.mark.asyncio
@@ -467,7 +684,7 @@ async def test_hospital_proxy_propagates_cancellation(monkeypatch):
         "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
         "cdn.hs.uab.edu",
     )
-    direct_error = TimeoutError("direct route timed out")
+    direct_error = aiohttp.ServerTimeoutError("direct route timed out")
     direct_error._ptg2_response_body_started = False
 
     async def direct_download(*_args, **_options):
@@ -526,12 +743,28 @@ async def test_hospital_proxy_requires_the_terminal_direct_failure_to_be_prebody
 
 
 @pytest.mark.parametrize(
-    ("proxy_body_started", "expected_message"),
-    [(False, "blocked outside the US"), (True, "proxy unavailable")],
+    ("proxy_code", "proxy_body_started", "expected_message"),
+    [
+        (
+            source_download.CurlECode.COULDNT_CONNECT,
+            False,
+            "blocked outside the US",
+        ),
+        (
+            source_download.CurlECode.COULDNT_CONNECT,
+            True,
+            "proxy unavailable",
+        ),
+        (
+            source_download.CurlECode.PEER_FAILED_VERIFICATION,
+            False,
+            "proxy unavailable",
+        ),
+    ],
 )
 @pytest.mark.asyncio
 async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
-    monkeypatch, proxy_body_started, expected_message
+    monkeypatch, proxy_code, proxy_body_started, expected_message
 ):
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY",
@@ -549,7 +782,9 @@ async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
         raise direct_error
 
     async def proxy_download(*_args, **_options):
-        error = source_download.RequestException("proxy unavailable")
+        error = source_download.RequestException(
+            "proxy unavailable", code=proxy_code
+        )
         error._ptg2_response_body_started = proxy_body_started
         raise error
 
@@ -568,7 +803,10 @@ async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
             "Mozilla/5.0",
         )
     assert getattr(failure.value, "status", None) == (
-        None if proxy_body_started else 403
+        403
+        if proxy_code == source_download.CurlECode.COULDNT_CONNECT
+        and not proxy_body_started
+        else None
     )
 
 
