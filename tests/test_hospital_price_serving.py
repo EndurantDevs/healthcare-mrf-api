@@ -283,6 +283,7 @@ def _query(**overrides):
 @pytest.mark.asyncio
 async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypatch):
     session = _Session()
+    session.native.fact_rows[0]["private_source_locator"] = "private"
     monkeypatch.setattr(serving, "_NATIVE", session.native)
 
     page = await serving.read_hospital_price_page(session, _query())
@@ -296,12 +297,21 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     assert page["pagination"]["scanned"] == 2
     assert page["pagination"]["next_cursor"]
     assert page["query"]["negotiated_prices_requested"] is True
-    assert [item["charge"]["charge_ordinal"] for item in page["items"]] == [10]
+    assert [
+        price_item["charge"]["charge_ordinal"] for price_item in page["items"]
+    ] == [10]
     assert page["items"][0]["negotiated_prices"][0]["payer_name"] == "Payer"
     assert page["items"][0]["negotiated_prices"][0]["negotiated_rate_term"] == (
         "JAN 2026-MAY 2026"
     )
-    assert "charge_key" not in page["items"][0]["negotiated_prices"][0]
+    negotiated_price = page["items"][0]["negotiated_prices"][0]
+    assert set(negotiated_price) == {
+        "payer_name", "plan_name", "negotiated_rate_term", "negotiated_dollar",
+        "negotiated_percentage", "negotiated_algorithm", "estimated_amount",
+        "methodology", "median_amount", "percentile_10", "percentile_90",
+        "allowed_count", "additional_payer_notes", "comparison_amount",
+    }
+    assert "private_source_locator" not in negotiated_price
 
     next_page = await serving.read_hospital_price_page(
         session,
@@ -309,7 +319,9 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     )
     assert next_page["pagination"]["scanned"] == 1
     assert next_page["pagination"]["next_cursor"] is None
-    assert [item["charge"]["charge_ordinal"] for item in next_page["items"]] == [12]
+    assert [
+        price_item["charge"]["charge_ordinal"] for price_item in next_page["items"]
+    ] == [12]
 
 
 @pytest.mark.asyncio
@@ -443,6 +455,137 @@ def test_query_validation_is_exact_and_bounded(overrides):
     )
     with pytest.raises(error):
         _query(**overrides)
+
+
+@pytest.mark.parametrize(
+    "values_by_field",
+    [
+        {"q": " Michigan"},
+        {"q": "x" * 257},
+        {"published": "1"},
+        {"cursor": "bad"},
+        {"limit": "0"},
+        {"limit": "201"},
+    ],
+)
+def test_facility_search_query_is_closed_and_bounded(values_by_field):
+    with pytest.raises(serving.HospitalPriceInvalidRequestError):
+        endpoint._facility_search_query(values_by_field)
+
+
+def test_facility_search_defaults_and_unpublished_shape():
+    assert endpoint._facility_search_query({}) == {
+        "query": None,
+        "status": None,
+        "cursor": None,
+        "limit": 50,
+    }
+    item = _private_facility_status_page()["items"][0]
+    item["publication"] = None
+    assert endpoint._public_facility_item(item)["publication"] is None
+
+
+def _private_facility_status_page():
+    return {
+        "items": [{
+            "hospital_id": "hospital-000001",
+            "alias_hospital_ids": ["hospital-000002"],
+            "name": "Example Hospital",
+            "cms_hpt_url": "https://private.example/cms-hpt.txt",
+            "facility_anchor_id": "private-anchor",
+            "latest_attempt": {
+                "attempt_id": "private-attempt",
+                "error_code": "private-error",
+            },
+            "publication": {
+                "version_id": VERSION_ID,
+                "template_version": "3.0.0",
+                "source_format": "csv-tall",
+                "detected_schema_profile": "cms-v3",
+                "last_updated_on": "2026-09-01",
+                "last_success_at": "2026-09-03T12:00:00+00:00",
+                "service_count": 10,
+                "charge_count": 20,
+                "payer_charge_count": 30,
+                "npi_count": 2,
+            },
+        }],
+        "next_cursor": "hospital-000001",
+        "summary": {"total": 1},
+    }
+
+
+def _public_facility_page():
+    return {
+        "items": [{
+            "hospital_id": "hospital-000001",
+            "alias_hospital_ids": ["hospital-000002"],
+            "name": "Example Hospital",
+            "publication": {
+                "version_id": VERSION_ID,
+                "source_format": "csv-tall",
+                "schema_version": "3.0.0",
+                "detected_schema_profile": "cms-v3",
+                "last_updated_on": "2026-09-01",
+                "last_success_at": "2026-09-03T12:00:00+00:00",
+                "service_count": 10,
+                "charge_count": 20,
+                "payer_charge_count": 30,
+            },
+        }],
+        "next_cursor": "hospital-000001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_public_facility_search_is_deduplicated_and_source_hidden(monkeypatch):
+    """Public search returns one source-hidden canonical identity group."""
+
+    app = Sanic(f"hospital-facility-search-{uuid.uuid4().hex}")
+    app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
+    received_by_field = {}
+
+    async def list_status_page(**search_by_field):
+        received_by_field.update(search_by_field)
+        return _private_facility_status_page()
+
+    monkeypatch.setattr(endpoint, "list_hospital_price_status_page", list_status_page)
+    _request, http_response = await app.asgi_client.get(
+        "/api/v1/hospital-prices/facilities"
+        "?q=Example&published=true&cursor=hospital-000000&limit=25"
+    )
+
+    assert http_response.status == 200
+    assert http_response.headers["cache-control"] == "private, no-store"
+    assert received_by_field == {
+        "query": "Example",
+        "status": "succeeded",
+        "cursor": "hospital-000000",
+        "limit": 25,
+        "identity_query_only": True,
+    }
+    response_payload = json.loads(http_response.body)
+    assert response_payload == _public_facility_page()
+    assert "private" not in http_response.body.decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query_string",
+    ["unknown=x", "q=a&q=b", "published=1", "cursor=bad", "limit=201"],
+)
+async def test_public_facility_search_rejects_invalid_queries(query_string):
+    app = Sanic(f"hospital-facility-search-invalid-{uuid.uuid4().hex}")
+    app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
+
+    _request, result = await app.asgi_client.get(
+        f"/api/v1/hospital-prices/facilities?{query_string}"
+    )
+
+    assert result.status == 400
+    assert json.loads(result.body)["error"]["code"] == (
+        "hospital_price_invalid_request"
+    )
 
 
 @pytest.mark.asyncio

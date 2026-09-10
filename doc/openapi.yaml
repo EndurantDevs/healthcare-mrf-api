@@ -2108,6 +2108,112 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /hospital-prices/facilities:
+    get:
+      operationId: searchHospitalPriceFacilities
+      summary: Search canonical facilities with hospital-price catalog status
+      description: |
+        Returns one canonical facility per reviewed identity group. Alternate
+        project IDs are retained in `alias_hospital_ids`. Publication metadata
+        is null until that facility has a last-known-good packed dataset.
+        Source URLs and import-attempt details are never returned.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Case-insensitive facility name or hospital ID search.
+        - name: published
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+          description: Restrict results by last-known-good publication presence.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            pattern: '^hospital-[0-9]{6}$'
+          description: Canonical hospital ID returned by the previous page; reuse only with the same `q` and `published` filters.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Source-hidden canonical facility page
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `private, no-store`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [hospital_id, alias_hospital_ids, name, publication]
+                      properties:
+                        hospital_id:
+                          type: string
+                          pattern: '^hospital-[0-9]{6}$'
+                        alias_hospital_ids:
+                          type: array
+                          items:
+                            type: string
+                            pattern: '^hospital-[0-9]{6}$'
+                        name:
+                          type: string
+                        publication:
+                          type: object
+                          nullable: true
+                          required: [version_id, source_format, schema_version, detected_schema_profile, last_updated_on, last_success_at, service_count, charge_count, payer_charge_count]
+                          properties:
+                            version_id:
+                              type: string
+                              pattern: '^[0-9a-f]{64}$'
+                            source_format:
+                              type: string
+                              enum: [json, csv-tall, csv-wide]
+                            schema_version:
+                              type: string
+                            detected_schema_profile:
+                              type: string
+                              nullable: true
+                              enum: [cms-v2, cms-v3]
+                            last_updated_on:
+                              type: string
+                              format: date
+                            last_success_at:
+                              type: string
+                              format: date-time
+                            service_count:
+                              type: integer
+                              minimum: 0
+                            charge_count:
+                              type: integer
+                              minimum: 0
+                            payer_charge_count:
+                              type: integer
+                              minimum: 0
+                  next_cursor:
+                    type: string
+                    nullable: true
+                    pattern: '^hospital-[0-9]{6}$'
+        '400':
+          description: Invalid query, cursor, filter, or pagination input
+        '503':
+          description: Hospital-price catalog serving is unavailable
   /hospital-prices/facilities/{hospital_id}/prices:
     get:
       operationId: getHospitalPrices

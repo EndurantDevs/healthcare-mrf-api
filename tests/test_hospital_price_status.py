@@ -124,6 +124,16 @@ def test_status_match_handles_success_and_attempt_statuses():
     assert status_api._is_status_match(published_item_by_field, "published")
 
 
+def test_summary_counts_publication_with_optional_metadata_absent():
+    summary = status_api._summary([{"latest_attempt": None, "publication": {}}])
+
+    assert summary["succeeded"] == 1
+    assert summary["unpublished"] == 0
+    assert summary["template_versions"] == {}
+    assert summary["source_formats"] == {}
+    assert summary["detected_schema_profiles"] == {}
+
+
 @pytest.mark.asyncio
 async def test_registry_load_does_not_block_status_event_loop(monkeypatch):
     event_loop_thread = threading.get_ident()
@@ -263,6 +273,23 @@ async def test_query_status_and_cursor_are_stable():
         "hospital-000003",
     ]
     assert page["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_public_identity_query_does_not_match_hidden_source_url():
+    status_api.db.rows = []
+
+    hidden_source_page = await status_api.list_hospital_price_status_page(
+        query="a.example", identity_query_only=True
+    )
+    identity_page = await status_api.list_hospital_price_status_page(
+        query="hospital-000001", identity_query_only=True
+    )
+
+    assert hidden_source_page["items"] == []
+    assert [item["hospital_id"] for item in identity_page["items"]] == [
+        "hospital-000001"
+    ]
 
 
 @pytest.mark.parametrize(

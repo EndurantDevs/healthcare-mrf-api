@@ -197,6 +197,26 @@ def _is_status_match(item: Mapping[str, Any], status: str | None) -> bool:
     return _item_status(item) == status
 
 
+def _is_registry_group_match(
+    hospitals: tuple[Mapping[str, str], ...],
+    normalized_query: str,
+    *,
+    identity_query_only: bool,
+) -> bool:
+    if not normalized_query:
+        return True
+    fields = ("hospital_id", "name") if identity_query_only else None
+    registry_values = (
+        (hospital.get(field, "") for field in fields)
+        if fields is not None
+        else hospital.values()
+        for hospital in hospitals
+    )
+    return normalized_query in "\n".join(
+        value for hospital_values in registry_values for value in hospital_values
+    ).casefold()
+
+
 def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
     count_by_status = {
         name: 0 for name in ("queued", "running", "succeeded", "failed", "unpublished")
@@ -246,6 +266,7 @@ async def list_hospital_price_status_page(
     status: str | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_HOSPITAL_PRICE_PAGE_SIZE,
+    identity_query_only: bool = False,
 ) -> dict[str, Any]:
     """Return reviewed registry rows with latest attempt and LKG kept separate."""
 
@@ -269,13 +290,11 @@ async def list_hospital_price_status_page(
     status_items = [
         _status_item(hospitals, rows_by_hospital_id)
         for hospitals in hospital_groups
-        if not normalized_query
-        or normalized_query
-        in "\n".join(
-            registry_value
-            for hospital in hospitals
-            for registry_value in hospital.values()
-        ).casefold()
+        if _is_registry_group_match(
+            hospitals,
+            normalized_query,
+            identity_query_only=identity_query_only,
+        )
     ]
     summary = _summary(status_items)
     status_items = [
