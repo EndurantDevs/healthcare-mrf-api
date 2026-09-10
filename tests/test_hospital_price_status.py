@@ -265,6 +265,23 @@ async def test_query_status_and_cursor_are_stable():
     assert page["next_cursor"] is None
 
 
+@pytest.mark.asyncio
+async def test_public_identity_query_does_not_match_hidden_source_url():
+    status_api.db.rows = []
+
+    hidden_source_page = await status_api.list_hospital_price_status_page(
+        query="a.example", identity_query_only=True
+    )
+    identity_page = await status_api.list_hospital_price_status_page(
+        query="hospital-000001", identity_query_only=True
+    )
+
+    assert hidden_source_page["items"] == []
+    assert [item["hospital_id"] for item in identity_page["items"]] == [
+        "hospital-000001"
+    ]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
