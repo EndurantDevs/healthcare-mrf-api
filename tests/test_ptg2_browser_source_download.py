@@ -372,7 +372,7 @@ async def test_hospital_proxy_requires_the_terminal_direct_failure_to_be_prebody
         error._ptg2_response_body_started = len(requests) > 1
         raise error
 
-    with pytest.raises(RuntimeError, match="direct failure"):
+    with pytest.raises(RuntimeError, match="direct failure") as failure:
         await hospital_price_source_download.download_hospital_source(
             download,
             "https://hospital.example/cms-hpt.txt",
@@ -381,11 +381,12 @@ async def test_hospital_proxy_requires_the_terminal_direct_failure_to_be_prebody
             "Mozilla/5.0",
         )
     assert len(requests) == 2
+    assert failure.value.status == 403
 
 
 @pytest.mark.parametrize(
     ("proxy_body_started", "expected_message"),
-    ((False, "blocked outside the US"), (True, "proxy unavailable")),
+    [(False, "blocked outside the US"), (True, "proxy unavailable")],
 )
 @pytest.mark.asyncio
 async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
@@ -469,11 +470,11 @@ async def test_hospital_proxy_does_not_route_an_unapproved_host(monkeypatch):
 
 @pytest.mark.parametrize(
     "proxy_url",
-    (
+    [
         "socks5h://10.42.0.1:39081",
         "socks5://user@10.42.0.1:39081",
         "socks5://10.42.0.1:39081/path",
-    ),
+    ],
 )
 @pytest.mark.asyncio
 async def test_hospital_download_rejects_unsafe_proxy_configuration(

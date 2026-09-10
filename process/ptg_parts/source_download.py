@@ -1647,10 +1647,7 @@ async def _download_raw_artifact_browser_once(
                 f"Download for {url} ended at {state.byte_count} bytes, "
                 f"expected {state.total_bytes}"
             )
-        _raise_for_unexpected_artifact_container(
-            head.url if proxy_url else url,
-            path,
-        )
+        _raise_for_unexpected_artifact_container(url, path)
         return _single_get_result(state)
     except BaseException as exc:
         _ensure_download_body_marker(exc, state.byte_count)
