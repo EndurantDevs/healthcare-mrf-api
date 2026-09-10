@@ -1441,7 +1441,19 @@ def _curl_transport_option_map(
         CurlOpt.NOPROXY: "" if proxy_url else "*",
     }
     if proxy_url:
-        option_map[CurlOpt.PROXY] = proxy_url
+        parsed_proxy = urlsplit(validated_socks_proxy_url(proxy_url))
+        proxy_hostname = str(parsed_proxy.hostname)
+        if ":" in proxy_hostname:
+            proxy_hostname = f"[{proxy_hostname}]"
+        option_map.update(
+            {
+                CurlOpt.PROXY: (
+                    f"socks5://{proxy_hostname}:{parsed_proxy.port}"
+                ),
+                CurlOpt.PROXYUSERNAME: parsed_proxy.username,
+                CurlOpt.PROXYPASSWORD: parsed_proxy.password,
+            }
+        )
     if max_bytes is not None:
         option_map[CurlOpt.MAXFILESIZE_LARGE] = max_bytes
     return option_map
@@ -1469,7 +1481,7 @@ def _curl_request_option_map(
 
 
 def validated_socks_proxy_url(value: str) -> str:
-    """Return one bare local-DNS SOCKS URL or fail closed."""
+    """Return one authenticated local-DNS SOCKS URL or fail closed."""
 
     parsed = urlsplit(value)
     try:
@@ -1481,13 +1493,17 @@ def validated_socks_proxy_url(value: str) -> str:
         or parsed.hostname is None
         or port is None
         or not 1 <= port <= 65535
-        or parsed.username is not None
-        or parsed.password is not None
+        or not parsed.username
+        or not parsed.password
+        or re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", parsed.username) is None
+        or re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", parsed.password) is None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
     ):
-        raise RuntimeError("hospital SOCKS proxy must be a bare socks5 URL")
+        raise RuntimeError(
+            "hospital SOCKS proxy must be an authenticated socks5 URL"
+        )
     return value
 
 

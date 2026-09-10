@@ -281,7 +281,7 @@ async def test_browser_download_is_pinned_streamed_and_exact(tmp_path, monkeypat
 async def test_proxied_download_keeps_target_pin_without_direct_only_options(
     tmp_path, monkeypatch
 ):
-    proxy_url = "socks5://10.42.0.1:39081"
+    proxy_url = "socks5://hospital-test:test-token@10.42.0.1:39081"
     response = _Response(
         chunks=(b"PK\x03\x04",),
         primary_ip="10.42.0.1",
@@ -303,7 +303,9 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
     assert session.curl_options[CurlOpt.RESOLVE] == [
         "www.avera.org:443:8.8.8.8,[2001:4860:4860::8888]"
     ]
-    assert session.curl_options[CurlOpt.PROXY] == proxy_url
+    assert session.curl_options[CurlOpt.PROXY] == "socks5://10.42.0.1:39081"
+    assert session.curl_options[CurlOpt.PROXYUSERNAME] == "hospital-test"
+    assert session.curl_options[CurlOpt.PROXYPASSWORD] == "test-token"
     assert session.curl_options[CurlOpt.NOPROXY] == ""
     assert "impersonate" not in session.request[2]
     assert "http_version" not in session.request[2]
@@ -316,7 +318,7 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
 async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     monkeypatch,
 ):
-    proxy_url = "socks5://10.42.0.1:39081"
+    proxy_url = "socks5://hospital-test:test-token@10.42.0.1:39081"
     monkeypatch.setenv("HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY", proxy_url)
     monkeypatch.setenv("HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS", "cdn.hs.uab.edu")
     requests = []
@@ -357,7 +359,7 @@ async def test_hospital_proxy_requires_the_terminal_direct_failure_to_be_prebody
 ):
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY",
-        "socks5://10.42.0.1:39081",
+        "socks5://hospital-test:test-token@10.42.0.1:39081",
     )
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
@@ -394,7 +396,7 @@ async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
 ):
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY",
-        "socks5://10.42.0.1:39081",
+        "socks5://hospital-test:test-token@10.42.0.1:39081",
     )
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
@@ -435,7 +437,7 @@ async def test_hospital_proxy_preserves_only_a_prebody_direct_403(
 async def test_hospital_proxy_does_not_route_an_unapproved_host(monkeypatch):
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY",
-        "socks5://10.42.0.1:39081",
+        "socks5://hospital-test:test-token@10.42.0.1:39081",
     )
     monkeypatch.setenv(
         "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
@@ -472,7 +474,9 @@ async def test_hospital_proxy_does_not_route_an_unapproved_host(monkeypatch):
     "proxy_url",
     [
         "socks5h://10.42.0.1:39081",
+        "socks5://10.42.0.1:39081",
         "socks5://user@10.42.0.1:39081",
+        "socks5://user:bad%2Ftoken@10.42.0.1:39081",
         "socks5://10.42.0.1:39081/path",
     ],
 )
@@ -482,7 +486,7 @@ async def test_hospital_download_rejects_unsafe_proxy_configuration(
 ):
     monkeypatch.setenv("HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY", proxy_url)
 
-    with pytest.raises(RuntimeError, match="must be a bare socks5 URL"):
+    with pytest.raises(RuntimeError, match="must be an authenticated socks5 URL"):
         await hospital_price_source_download.download_hospital_source(
             None,
             "https://hospital.example/cms-hpt.txt",
