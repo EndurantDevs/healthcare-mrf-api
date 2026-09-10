@@ -18,7 +18,8 @@ from process.tennessee_profile_rows import MAX_REPORT_BYTES, parse_report
 SCHEMA_VERSION = "tn-profile-binding/v1"
 SNAPSHOT_SCHEMA = "tn-nppes-retained-snapshot/v1"
 COVERAGE_SCOPE = "all_current_literal_tn_license_occurrences"
-MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+# Leave headroom above the observed complete TN registry estimate (about 59 MiB).
+MAX_SNAPSHOT_BYTES = 96 * 1024 * 1024
 PROFESSIONS = frozenset({"1606", "1907"})
 REGISTRY_COLUMNS = [
     "npi", "taxonomy_occurrence_checksum", "license_number", "license_state", "taxonomy",
