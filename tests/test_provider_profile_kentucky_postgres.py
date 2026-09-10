@@ -80,7 +80,7 @@ async def test_one_snapshot_preserves_both_sources_during_atomic_pointer_rotatio
             current = await state_api.fetch_additional_state_profile_projections(NPI)
             assert len(query_statements) == 2
             for projections, version in ((previous, "old"), (current, "new")):
-                assert [projection["source"]["source_key"] for projection in projections] == list(state_api.STATE_SOURCE_KEYS)
+                assert [projection["source"]["source_key"] for projection in projections] == [state_api.MASSACHUSETTS_SOURCE_KEY, SOURCE_KEY]
                 for projection, prefix in zip(projections, ("ma", "ky")):
                     assert projection["generation_id"] == generation_by_label[f"{prefix}_{version}"]
                     assert projection["categories"]["education"]["items"][0]["value"]["institution"] == f"{prefix.upper()} {version} School"
