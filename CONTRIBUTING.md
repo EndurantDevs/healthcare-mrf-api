@@ -56,6 +56,7 @@ Run the fast Python correctness and inference checks with the pinned developer
 tools:
 
 ```bash
+uv pip install --only-binary=:all: ruff==0.16.6 pylint==4.0.8
 ruff check main.py api db process public_evidence service alembic scripts support tests
 pylint \
   api/billing_search_selector_contract.py \
@@ -71,6 +72,11 @@ pylint \
   process/provider_directory_validated_publication_contract.py \
   public_evidence/evidence_record_token_policy.py
 ```
+
+Install these tools in the activated, runtime-equipped development virtualenv.
+An isolated Pylint tool environment without the application's dependencies
+cannot provide the same inference; CI explicitly exposes its verified runtime
+dependencies to the separate lint environment.
 
 Ruff owns syntax and undefined-name checks across existing Python code. New
 Python files must also pass `ruff check --select I` and `ruff format --check`;
