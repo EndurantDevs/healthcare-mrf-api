@@ -18,14 +18,14 @@ def _do_row(**changes):
 
 
 def _reports(md_rows=None, do_rows=None):
-    reports = {}
+    report_by_profession = {}
     for profession, source_rows in (("1606", [source_row(LicenseNumber="123")] if md_rows is None else md_rows),
                                    ("1907", [_do_row()] if do_rows is None else do_rows)):
         content = report_bytes(source_rows)
-        reports[profession] = {"content": content, "evidence": {
+        report_by_profession[profession] = {"content": content, "evidence": {
             **EVIDENCE, "artifact_id": "synthetic-artifact-" + profession,
             "content_sha256": hashlib.sha256(content).hexdigest()}}
-    return reports
+    return report_by_profession
 
 
 def _candidate(**changes):
@@ -65,9 +65,9 @@ def _save_snapshot(tmp_path, snapshot):
     return {"snapshot_path": path, "snapshot_sha256": hashlib.sha256(content).hexdigest()}
 
 
-def _bind(tmp_path, *, reports=None, candidates=None):
-    reports = _reports() if reports is None else reports
-    return binding.bind_reports(reports, reports_sha256=binding.reports_content_sha256(reports),
+def _bind(tmp_path, *, report_by_profession=None, candidates=None):
+    report_by_profession = _reports() if report_by_profession is None else report_by_profession
+    return binding.bind_reports(report_by_profession, reports_sha256=binding.reports_content_sha256(report_by_profession),
                                 **_save_snapshot(tmp_path, _snapshot(candidates)))
 
 
@@ -77,17 +77,17 @@ def _decision(result, profession="1606"):
 
 
 def test_both_reports_bind_without_changing_assertions_or_source_identity(tmp_path):
-    reports = _reports(md_rows=[source_row(LicenseNumber="123"), source_row(LicenseNumber="123"),
+    report_by_profession = _reports(md_rows=[source_row(LicenseNumber="123"), source_row(LicenseNumber="123"),
                                source_row(LicenseNumber="123", EducationProvider="Synthetic Second School")])
-    inputs_before = copy.deepcopy(reports)
+    inputs_before = copy.deepcopy(report_by_profession)
     original_records, original_facts = [], []
-    for report in reports.values():
+    for report in report_by_profession.values():
         records, facts = parse_report(report["content"], evidence=report["evidence"])
         original_records.extend(records)
         original_facts.extend(facts)
     candidates = [_candidate(), _candidate(), _candidate(taxonomy_occurrence_checksum=18), _do_candidate()]
-    result = _bind(tmp_path, reports=reports, candidates=candidates)
-    assert reports == inputs_before
+    result = _bind(tmp_path, report_by_profession=report_by_profession, candidates=candidates)
+    assert report_by_profession == inputs_before
     assert [record["matched_npi"] for record in result["source_records"]] == [1000000004, 1000000012]
     assert len(_decision(result)["candidate_rows"]) == 3
     assert _decision(result)["candidate_rows"][0] == _decision(result)["candidate_rows"][1]
@@ -103,12 +103,12 @@ def test_both_reports_bind_without_changing_assertions_or_source_identity(tmp_pa
         assert actual["npi"] is not None and actual["published_at"] is None
         assert {**actual, "npi": None} == original
     assert len([fact for fact in result["facts"] if fact["category"] == "education"]) == 3
-    assert result == _bind(tmp_path, reports=reports, candidates=candidates)
+    assert result == _bind(tmp_path, report_by_profession=report_by_profession, candidates=candidates)
 
 
 def test_cross_board_number_resolves_only_with_both_explained_identities(tmp_path):
-    reports = _reports(do_rows=[_do_row(LicenseNumber="123")])
-    result = _bind(tmp_path, reports=reports, candidates=[_candidate(), _do_candidate(license_number="123")])
+    report_by_profession = _reports(do_rows=[_do_row(LicenseNumber="123")])
+    result = _bind(tmp_path, report_by_profession=report_by_profession, candidates=[_candidate(), _do_candidate(license_number="123")])
     records = result["source_records"]
     assert {record["source_record_key"] for record in records} == {"tennessee-tdh:1606:123", "tennessee-tdh:1907:123"}
     assert [record["matched_npi"] for record in records] == [1000000004, 1000000012]
@@ -131,7 +131,7 @@ def test_cross_board_number_resolves_only_with_both_explained_identities(tmp_pat
         _do_candidate(license_number="123", npi=1000000020, joined_npi=1000000020)]),
 ])
 def test_unresolved_cross_board_identity_stays_held(tmp_path, peer_rows, peer_candidates):
-    result = _bind(tmp_path, reports=_reports(do_rows=peer_rows), candidates=[_candidate(), *peer_candidates])
+    result = _bind(tmp_path, report_by_profession=_reports(do_rows=peer_rows), candidates=[_candidate(), *peer_candidates])
     assert all(record["matched_npi"] is None for record in result["source_records"])
     assert all(fact["npi"] is None and fact["published_at"] is None for fact in result["facts"])
     assert len(_decision(result)["candidate_rows"]) == 1 + len(peer_candidates)
@@ -178,21 +178,21 @@ def test_registry_license_is_literal_without_rewriting(tmp_path, license_number)
 @pytest.mark.parametrize("title,suffix,accepted", [("", None, True), ("Jr.", "Jr.", True), ("III", "iii", True), ("VI", "VI", True),
     ("Jr.", "Jr", False), ("M.D.", "M.D.", False), ("DO", None, False), ("Unknown", "Unknown", False)])
 def test_title_is_preserved_and_never_guessed(tmp_path, title, suffix, accepted):
-    reports = _reports(md_rows=[source_row(LicenseNumber="123", Title=title)])
-    result = _bind(tmp_path, reports=reports, candidates=[_candidate(suffix=suffix), _do_candidate()])
+    report_by_profession = _reports(md_rows=[source_row(LicenseNumber="123", Title=title)])
+    result = _bind(tmp_path, report_by_profession=report_by_profession, candidates=[_candidate(suffix=suffix), _do_candidate()])
     assert (_decision(result)["npi"] is not None) is accepted
     assert result["source_records"][0]["raw_payload"]["rows"][0]["fields"]["Title"] == title
 
 
 def test_name_components_allow_only_case_whitespace_and_optional_null(tmp_path):
-    reports = _reports(md_rows=[source_row(LicenseNumber="123", MiddleName="")])
-    result = _bind(tmp_path, reports=reports, candidates=[_candidate(first_name=" ALEX ", middle_name=None), _do_candidate()])
+    report_by_profession = _reports(md_rows=[source_row(LicenseNumber="123", MiddleName="")])
+    result = _bind(tmp_path, report_by_profession=report_by_profession, candidates=[_candidate(first_name=" ALEX ", middle_name=None), _do_candidate()])
     assert _decision(result)["npi"] == 1000000004
 
 
 def test_blank_license_source_holds_are_not_rebound(tmp_path):
-    reports = _reports(md_rows=[source_row(LicenseNumber=""), source_row(LicenseNumber="", FirstName="Other")])
-    result = _bind(tmp_path, reports=reports, candidates=[_candidate(license_number=None), _do_candidate()])
+    report_by_profession = _reports(md_rows=[source_row(LicenseNumber=""), source_row(LicenseNumber="", FirstName="Other")])
+    result = _bind(tmp_path, report_by_profession=report_by_profession, candidates=[_candidate(license_number=None), _do_candidate()])
     md_records = [record for record in result["source_records"] if record["profession_code"] == "1606"]
     assert len({record["source_record_key"] for record in md_records}) == 2
     assert all(record["normalized_payload"]["visibility"] == "held_identity" for record in md_records)
@@ -202,12 +202,12 @@ def test_blank_license_source_holds_are_not_rebound(tmp_path):
 
 
 def test_malformed_source_rows_remain_held_with_original_coordinates(tmp_path):
-    reports = _reports()
+    report_by_profession = _reports()
     content = report_bytes([source_row(LicenseNumber="123")], PRACTICE_HEADERS) + malformed_row(LicenseNumber="123")
-    reports["1606"]["content"] = content
-    reports["1606"]["evidence"]["content_sha256"] = hashlib.sha256(content).hexdigest()
-    original, _ = parse_report(content, evidence=reports["1606"]["evidence"])
-    result = _bind(tmp_path, reports=reports)
+    report_by_profession["1606"]["content"] = content
+    report_by_profession["1606"]["evidence"]["content_sha256"] = hashlib.sha256(content).hexdigest()
+    original, _ = parse_report(content, evidence=report_by_profession["1606"]["evidence"])
+    result = _bind(tmp_path, report_by_profession=report_by_profession)
     actual = result["source_records"][0]
     assert actual["raw_payload"] == original[0]["raw_payload"]
     assert actual["normalized_payload"] == original[0]["normalized_payload"]
@@ -262,30 +262,30 @@ def test_snapshot_preserves_occurrence_order(tmp_path):
 
 @pytest.mark.parametrize("change", ["content", "evidence"])
 def test_independent_reports_pin_rejects_changed_capture(tmp_path, change):
-    reports = _reports()
-    original_pin = binding.reports_content_sha256(reports)
+    report_by_profession = _reports()
+    original_pin = binding.reports_content_sha256(report_by_profession)
     if change == "content":
-        reports["1606"]["content"] = reports["1606"]["content"].replace(b"Alex", b"Other")
-        reports["1606"]["evidence"]["content_sha256"] = hashlib.sha256(reports["1606"]["content"]).hexdigest()
+        report_by_profession["1606"]["content"] = report_by_profession["1606"]["content"].replace(b"Alex", b"Other")
+        report_by_profession["1606"]["evidence"]["content_sha256"] = hashlib.sha256(report_by_profession["1606"]["content"]).hexdigest()
     else:
-        reports["1606"]["evidence"]["artifact_id"] = "changed"
+        report_by_profession["1606"]["evidence"]["artifact_id"] = "changed"
     with pytest.raises(ValueError, match="reports_changed"):
-        binding.bind_reports(reports, reports_sha256=original_pin, **_save_snapshot(tmp_path, _snapshot()))
+        binding.bind_reports(report_by_profession, reports_sha256=original_pin, **_save_snapshot(tmp_path, _snapshot()))
 
 
 def test_caller_changes_cannot_replace_already_pinned_report_inputs(tmp_path, monkeypatch):
-    reports = _reports()
-    originals = copy.deepcopy(reports)
+    report_by_profession = _reports()
+    originals = copy.deepcopy(report_by_profession)
     options = _save_snapshot(tmp_path, _snapshot())
     read_snapshot = binding.read_registry_snapshot
 
     def mutate_inputs(*args, **kwargs):
-        reports["1606"]["content"] = reports["1606"]["content"].replace(b"Alex", b"Other")
-        reports["1606"]["evidence"].update(artifact_id="changed", content_sha256=hashlib.sha256(reports["1606"]["content"]).hexdigest())
+        report_by_profession["1606"]["content"] = report_by_profession["1606"]["content"].replace(b"Alex", b"Other")
+        report_by_profession["1606"]["evidence"].update(artifact_id="changed", content_sha256=hashlib.sha256(report_by_profession["1606"]["content"]).hexdigest())
         return read_snapshot(*args, **kwargs)
 
     monkeypatch.setattr(binding, "read_registry_snapshot", mutate_inputs)
-    result = binding.bind_reports(reports, reports_sha256=binding.reports_content_sha256(reports), **options)
+    result = binding.bind_reports(report_by_profession, reports_sha256=binding.reports_content_sha256(report_by_profession), **options)
     assert result["source_records"][0]["artifact_id"] == originals["1606"]["evidence"]["artifact_id"]
     assert _decision(result)["npi"] == 1000000004
     assert all(fact["source_json"]["content_sha256"] == originals["1606"]["evidence"]["content_sha256"]
@@ -294,30 +294,30 @@ def test_caller_changes_cannot_replace_already_pinned_report_inputs(tmp_path, mo
 
 @pytest.mark.parametrize("pin", [None, "", "f" * 63, "z" * 64])
 def test_independent_pins_are_required(tmp_path, pin):
-    reports = _reports()
+    report_by_profession = _reports()
     options = _save_snapshot(tmp_path, _snapshot())
     with pytest.raises(ValueError, match="reports_pin_invalid"):
-        binding.bind_reports(reports, reports_sha256=pin, **options)
+        binding.bind_reports(report_by_profession, reports_sha256=pin, **options)
     with pytest.raises(ValueError, match="snapshot_pin_invalid"):
         binding.read_registry_snapshot(options["snapshot_path"], snapshot_sha256=pin)
 
 
 def test_both_nonempty_profession_reports_are_required(tmp_path):
-    reports = _reports()
-    reports.pop("1907")
+    report_by_profession = _reports()
+    report_by_profession.pop("1907")
     with pytest.raises(ValueError, match="report_professions_invalid"):
-        binding.reports_content_sha256(reports)
+        binding.reports_content_sha256(report_by_profession)
     with pytest.raises(ValueError, match="report_profession_mismatch"):
-        _bind(tmp_path, reports=_reports(do_rows=[]))
+        _bind(tmp_path, report_by_profession=_reports(do_rows=[]))
     with pytest.raises(ValueError, match="report_profession_mismatch"):
-        _bind(tmp_path, reports=_reports(do_rows=[source_row()]))
+        _bind(tmp_path, report_by_profession=_reports(do_rows=[source_row()]))
 
 
 def test_both_reports_must_belong_to_the_same_import_run(tmp_path):
-    reports = _reports()
-    reports["1907"]["evidence"]["run_id"] = "different-run"
+    report_by_profession = _reports()
+    report_by_profession["1907"]["evidence"]["run_id"] = "different-run"
     with pytest.raises(ValueError, match="report_run_id_mismatch"):
-        _bind(tmp_path, reports=reports)
+        _bind(tmp_path, report_by_profession=report_by_profession)
 
 
 def test_snapshot_file_bound_and_symlink_are_rejected(tmp_path, monkeypatch):

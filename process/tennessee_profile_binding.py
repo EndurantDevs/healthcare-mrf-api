@@ -61,14 +61,14 @@ def _check_pin(pin, name):
 def _report_inputs(reports_by_profession):
     _require(isinstance(reports_by_profession, dict) and set(reports_by_profession) == PROFESSIONS,
              "report_professions_invalid")
-    reports = {}
+    report_by_profession = {}
     for profession, report in reports_by_profession.items():
         _require(isinstance(report, dict) and set(report) == {"content", "evidence"}
                  and isinstance(report["content"], bytes) and 0 < len(report["content"]) <= MAX_REPORT_BYTES
                  and isinstance(report["evidence"], dict), "report_invalid")
         # Bytes are immutable; copy only the small metadata, never parsed batches.
-        reports[profession] = {"content": report["content"], "evidence": copy.deepcopy(report["evidence"])}
-    return reports
+        report_by_profession[profession] = {"content": report["content"], "evidence": copy.deepcopy(report["evidence"])}
+    return report_by_profession
 
 
 def reports_content_sha256(reports_by_profession: dict) -> str:
@@ -77,10 +77,10 @@ def reports_content_sha256(reports_by_profession: dict) -> str:
     Each profession entry has exactly ``content`` (CSV bytes) and ``evidence``
     (the parser's JSON evidence). Recomputing this digest is not capture authority.
     """
-    pins = {profession: {"content_sha256": hashlib.sha256(report["content"]).hexdigest(),
+    pin_by_profession = {profession: {"content_sha256": hashlib.sha256(report["content"]).hexdigest(),
                          "evidence": report["evidence"]}
             for profession, report in _report_inputs(reports_by_profession).items()}
-    return hashlib.sha256(encoded_json(pins)).hexdigest()
+    return hashlib.sha256(encoded_json(pin_by_profession)).hexdigest()
 
 
 def _validate_snapshot_metadata(snapshot):
@@ -144,7 +144,7 @@ def _name(value):
     return " ".join(value.split()).casefold()
 
 
-def _compatible_candidate(identity, candidate):
+def _is_compatible_candidate(identity, candidate):
     if (set(candidate) != set(REGISTRY_COLUMNS) or type(candidate.get("npi")) is not int
             or not is_valid_npi(candidate["npi"]) or type(candidate.get("joined_npi")) is not int
             or candidate["joined_npi"] != candidate["npi"]
@@ -163,50 +163,50 @@ def _compatible_candidate(identity, candidate):
     return True
 
 
-def _decision(record, candidates, source_records):
-    decision = {"method": "exact_tn_license_name_components", "status": "identity_conflict", "npi": None,
+def _decision(source_record, candidates, source_records):
+    decision_by_field = {"method": "exact_tn_license_name_components", "status": "identity_conflict", "npi": None,
                 "candidate_rows": candidates,
-                "source_groups": [{"source_record_key": source["source_record_key"],
-                                   "profession_code": source["profession_code"]} for source in source_records],
+                "source_groups": [{"source_record_key": peer_record["source_record_key"],
+                                   "profession_code": peer_record["profession_code"]} for peer_record in source_records],
                 "registry_license_profession": "not_supplied_by_nppes"}
-    if record["normalized_payload"]["visibility"] == "held_identity":
-        return {**decision, "status": record["match_status"], "reason": record["match_evidence"]["reason"]}
-    identity = record["raw_payload"]["rows"][0]["fields"]
+    if source_record["normalized_payload"]["visibility"] == "held_identity":
+        return {**decision_by_field, "status": source_record["match_status"], "reason": source_record["match_evidence"]["reason"]}
+    identity = source_record["raw_payload"]["rows"][0]["fields"]
     if _name(identity["Title"]) not in SUFFIX_LITERALS:
-        return {**decision, "reason": "source_title_ambiguous"}
-    identities = {}
-    for source in source_records:
-        if source["normalized_payload"]["visibility"] == "held_identity":
-            return {**decision, "reason": "cross_board_identity_unresolved"}
-        peer_identity = source["raw_payload"]["rows"][0]["fields"]
+        return {**decision_by_field, "reason": "source_title_ambiguous"}
+    identity_by_source = {}
+    for peer_record in source_records:
+        if peer_record["normalized_payload"]["visibility"] == "held_identity":
+            return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
+        peer_identity = peer_record["raw_payload"]["rows"][0]["fields"]
         if _name(peer_identity["Title"]) not in SUFFIX_LITERALS:
-            return {**decision, "reason": "cross_board_identity_unresolved"}
-        identities[source["source_record_key"]] = peer_identity
+            return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
+        identity_by_source[peer_record["source_record_key"]] = peer_identity
     name_keys = {tuple(_name(identity[field]) for field in ("FirstName", "MiddleName", "LastName", "Title"))
-                 for identity in identities.values()}
-    if len(name_keys) != len(identities):
-        return {**decision, "reason": "cross_board_identity_unresolved"}
+                 for identity in identity_by_source.values()}
+    if len(name_keys) != len(identity_by_source):
+        return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
     if not candidates:
-        return {**decision, "status": "unmatched", "reason": "no_exact_license_candidates"}
-    npis_by_source = {key: set() for key in identities}
+        return {**decision_by_field, "status": "unmatched", "reason": "no_exact_license_candidates"}
+    npis_by_source = {key: set() for key in identity_by_source}
     candidate_source_keys = []
     # Explain every occurrence using exactly one source identity. A different
     # name is not discarded: only a fully validated peer can account for it.
     for candidate in candidates:
-        matches = [key for key, identity in identities.items() if _compatible_candidate(identity, candidate)]
+        matches = [key for key, identity in identity_by_source.items() if _is_compatible_candidate(identity, candidate)]
         if len(matches) != 1:
-            return {**decision, "reason": "registry_identity_conflict"}
+            return {**decision_by_field, "reason": "registry_identity_conflict"}
         npis_by_source[matches[0]].add(candidate["npi"])
         candidate_source_keys.append(matches[0])
-    decision["candidate_source_record_keys"] = candidate_source_keys
+    decision_by_field["candidate_source_record_keys"] = candidate_source_keys
     if any(len(npis) > 1 for npis in npis_by_source.values()):
-        return {**decision, "status": "ambiguous", "reason": "multiple_matching_npis"}
+        return {**decision_by_field, "status": "ambiguous", "reason": "multiple_matching_npis"}
     if any(not npis for npis in npis_by_source.values()):
-        return {**decision, "reason": "cross_board_identity_unresolved"}
-    source_npis = {key: next(iter(npis)) for key, npis in npis_by_source.items()}
-    if len(set(source_npis.values())) != len(source_npis):
-        return {**decision, "reason": "cross_board_npi_conflict"}
-    return {**decision, "status": "deterministic", "npi": source_npis[record["source_record_key"]],
+        return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
+    npi_by_source = {key: next(iter(npis)) for key, npis in npis_by_source.items()}
+    if len(set(npi_by_source.values())) != len(npi_by_source):
+        return {**decision_by_field, "reason": "cross_board_npi_conflict"}
+    return {**decision_by_field, "status": "deterministic", "npi": npi_by_source[source_record["source_record_key"]],
             "reason": "unique_exact_license_name"}
 
 
@@ -230,27 +230,27 @@ def bind_reports(reports_by_profession: dict, *, reports_sha256: str,
     candidates_by_license = defaultdict(list)
     for candidate in snapshot["registry_rows"]:
         candidates_by_license[candidate["license_number"]].append(candidate)
-    records, facts = [], []
+    retained_source_records, facts = [], []
     for profession in sorted(PROFESSIONS):
         report = reports_by_profession[profession]
         source_records, source_facts = parse_report(report["content"], evidence=report["evidence"])
-        _require(source_records and all(record["profession_code"] == profession for record in source_records),
+        _require(source_records and all(source_record["profession_code"] == profession for source_record in source_records),
                  "report_profession_mismatch")
-        records.extend(source_records)
+        retained_source_records.extend(source_records)
         facts.extend(source_facts)
     groups_by_license = defaultdict(list)
-    for record in records:
-        if record["license_number"] is not None:
-            groups_by_license[record["license_number"]].append(record)
+    for source_record in retained_source_records:
+        if source_record["license_number"] is not None:
+            groups_by_license[source_record["license_number"]].append(source_record)
     npi_by_record = {}
-    for record in records:
-        decision = _decision(record, candidates_by_license.get(record["license_number"], []),
-                             groups_by_license.get(record["license_number"], []))
-        decision.update(reports_sha256=reports_sha256, snapshot_sha256=snapshot_sha256, coverage_scope=COVERAGE_SCOPE)
-        record["match_evidence"]["registry_binding"] = decision
-        record.update(matched_npi=decision["npi"], match_status=decision["status"])
-        npi_by_record[record["record_id"]] = decision["npi"]
+    for source_record in retained_source_records:
+        decision_by_field = _decision(source_record, candidates_by_license.get(source_record["license_number"], []),
+                             groups_by_license.get(source_record["license_number"], []))
+        decision_by_field.update(reports_sha256=reports_sha256, snapshot_sha256=snapshot_sha256, coverage_scope=COVERAGE_SCOPE)
+        source_record["match_evidence"]["registry_binding"] = decision_by_field
+        source_record.update(matched_npi=decision_by_field["npi"], match_status=decision_by_field["status"])
+        npi_by_record[source_record["record_id"]] = decision_by_field["npi"]
     for fact in facts:
         fact["npi"] = npi_by_record[fact["source_record_id"]]
     return {"schema_version": SCHEMA_VERSION, "reports_sha256": reports_sha256, "snapshot_sha256": snapshot_sha256,
-            "coverage_scope": COVERAGE_SCOPE, "source_records": records, "facts": facts}
+            "coverage_scope": COVERAGE_SCOPE, "source_records": retained_source_records, "facts": facts}

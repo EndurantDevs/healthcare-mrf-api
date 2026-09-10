@@ -185,7 +185,7 @@ def test_specialty_composer_change_invalidates_previous_page_generation(monkeypa
     with monkeypatch.context() as previous:
         previous.setattr(composer, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v8")
         old = _compose(projection)
-    assert current["composer_version"] == "provider-profile-composer/v9"
+    assert current["composer_version"] == "provider-profile-composer/v10"
     assert current["source_generations"] == old["source_generations"]
     assert current["generation_id"] != old["generation_id"]
     assert npi_api._provider_profile_generation_error(current, old["generation_id"]).status == 409
