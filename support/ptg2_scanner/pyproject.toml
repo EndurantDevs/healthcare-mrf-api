@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ptg2_address_canon"
 version = "0.1.0"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 description = "HealthPorta address canonicalizer bindings from the PTG2 Rust scanner"
 
 [tool.maturin]

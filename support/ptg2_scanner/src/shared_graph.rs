@@ -2319,7 +2319,9 @@ mod tests {
         assert_eq!(group_to_npi.raw_byte_count, 8194 * 8);
         let owners = fs::read(&summary.owner_spool_path).unwrap();
         let group_b_owner = owners
-            .chunks_exact(25)
+            .as_chunks::<25>()
+            .0
+            .iter()
             .find(|record| {
                 record[0] == Direction::GroupToNpi.id()
                     && u64::from_be_bytes(record[1..9].try_into().unwrap()) == 1

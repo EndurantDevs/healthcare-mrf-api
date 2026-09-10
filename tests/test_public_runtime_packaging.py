@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 import re
 import shlex
+import subprocess
 
 import pytest
 
@@ -84,13 +85,22 @@ def test_documented_container_commands_are_packaged():
 
 def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path):
     dockerfile = (ROOT / "Dockerfile").read_text()
+    lock_script = (ROOT / "scripts/python_locks.py").read_text()
     assert (
-        "python:3.14.6-slim-trixie@sha256:"
-        "b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967"
+        "python:3.14.7-slim-trixie@sha256:"
+        "cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6"
     ) in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
-    assert "python -m pip check" in dockerfile
+    assert (
+        "ghcr.io/astral-sh/uv:0.12.12@sha256:"
+        "73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4"
+    ) in dockerfile
+    assert "uv pip check" in dockerfile
+    assert "uv pip install" in dockerfile
+    assert '"--upgrade"' in lock_script
+    assert not re.search(r"(?:python3? -m|&&) pip ", dockerfile)
+    assert "python3-pip" not in dockerfile
     validate(ROOT)
     for name in {*LOCK_INPUTS, *(name for inputs in LOCK_INPUTS.values() for name in inputs)}:
         (tmp_path / name).write_bytes((ROOT / name).read_bytes())
@@ -98,7 +108,12 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     with pytest.raises(ValueError, match="requirements-runtime.lock is stale"):
         validate(tmp_path)
     names = set(re.findall(r"^([a-z0-9-]+)(?:\[[^]]+\])?==", (ROOT / "requirements-runtime.lock").read_text(), re.M))
-    assert not names & {"pytest", "coverage", "pip-audit", "maturin", "uv", "pytest-xdist"}
+    assert not names & {"pip", "pytest", "coverage", "pip-audit", "maturin", "uv", "pytest-xdist"}
+
+
+def test_native_extension_supports_python_314_and_newer():
+    assert 'requires-python = ">=3.14"' in (ROOT / "support/ptg2_scanner/pyproject.toml").read_text()
+    assert 'features = ["abi3-py314"]' in (ROOT / "support/ptg2_scanner/Cargo.toml").read_text()
 
 
 def test_local_example_has_neutral_database_and_no_shared_operator_token():
@@ -110,3 +125,31 @@ def test_local_example_has_neutral_database_and_no_shared_operator_token():
     assert "HLPRT_DB_PORT" not in value_by_name
     assert value_by_name["HLTHPRT_DB_USER"] == "mrf_api"
     assert value_by_name["HLTHPRT_CONTROL_API_TOKEN"] == ""
+
+
+def test_parallel_mrf_helper_requires_python_314_project_environment(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    helper = checkout / "support" / "run_mrf_parallel.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        (ROOT / "support/run_mrf_parallel.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    monkeypatch.delenv("PYTHON_BIN", raising=False)
+    missing = subprocess.run(
+        [helper], cwd=checkout, capture_output=True, text=True, check=False
+    )
+    assert missing.returncode == 1
+    assert "Python executable not found or not executable: .venv/bin/python" in missing.stderr
+
+    old_python = checkout / "python-3.13"
+    old_python.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+    old_python.chmod(0o755)
+    monkeypatch.setenv("PYTHON_BIN", str(old_python))
+    unsupported = subprocess.run(
+        [helper], cwd=checkout, capture_output=True, text=True, check=False
+    )
+    assert unsupported.returncode == 1
+    assert f"Python 3.14 or newer is required: {old_python}" in unsupported.stderr

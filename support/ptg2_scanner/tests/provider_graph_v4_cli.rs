@@ -874,11 +874,7 @@ fn npi_scope_cli_merges_authenticated_shards_and_refuses_output_reuse() {
     let mut direct: Value =
         serde_json::from_slice(&fs::read(direct_path).expect("read direct graph manifest"))
             .expect("parse direct graph manifest");
-    let mut shards = pattern["shards"]
-        .as_array_mut()
-        .expect("pattern shards")
-        .drain(..)
-        .collect::<Vec<_>>();
+    let mut shards = std::mem::take(pattern["shards"].as_array_mut().expect("pattern shards"));
     shards.append(direct["shards"].as_array_mut().expect("direct shards"));
     let manifest = write_npi_scope_manifest(temporary.path(), "merged", json!(shards));
     let completed = run(&[

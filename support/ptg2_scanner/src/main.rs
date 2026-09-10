@@ -15527,8 +15527,8 @@ fn pg_binary_numeric_text(field: &[u8]) -> io::Result<String> {
         ));
     }
     let mut digits = Vec::with_capacity(digit_count);
-    for digit_bytes in field[8..].chunks_exact(2) {
-        let digit = u16::from_be_bytes([digit_bytes[0], digit_bytes[1]]);
+    for digit_bytes in field[8..].as_chunks::<2>().0 {
+        let digit = u16::from_be_bytes(*digit_bytes);
         if digit > 9999 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -26463,7 +26463,7 @@ fn global_id_from_hex_bytes(value: &[u8]) -> io::Result<GlobalId128> {
         ));
     }
     let mut decoded = [0u8; GLOBAL_ID_BYTES];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_chunks::<2>().0.iter().enumerate() {
         let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

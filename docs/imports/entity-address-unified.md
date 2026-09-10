@@ -188,7 +188,7 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 Entity-address pilots reuse the PTG research harness reporting flow:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
+./.venv/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --dry-run
 ```

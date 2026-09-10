@@ -215,7 +215,7 @@ fn decode_all_required_ids(
         return Err(invalid("required ID lane length is invalid"));
     }
     let mut ids = Vec::with_capacity(row_count);
-    for bytes in lane.chunks_exact(2) {
+    for bytes in lane.as_chunks::<2>().0 {
         let id = u16::from_le_bytes([bytes[0], bytes[1]]);
         if id as usize >= dictionary_len {
             return Err(invalid("dictionary ID is out of range"));
@@ -243,7 +243,7 @@ fn decode_selected_u32(
         return Err(invalid("u32 lane length is invalid"));
     }
     let mut values = vec![0; selected_count];
-    for (bytes, slot) in lane.chunks_exact(4).zip(slots.iter().take(row_count)) {
+    for (bytes, slot) in lane.as_chunks::<4>().0.iter().zip(slots.iter().take(row_count)) {
         let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if let Some(slot) = slot {
             values[*slot] = value;

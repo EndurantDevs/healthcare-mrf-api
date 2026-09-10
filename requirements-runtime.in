@@ -1,2 +1,1 @@
 -r requirements.txt
-pip==26.2.1

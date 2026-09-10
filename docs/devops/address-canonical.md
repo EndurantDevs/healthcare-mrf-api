@@ -10,7 +10,7 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
 2. Run migrations before enabling canonical dual-write:
 
    ```bash
-   ./venv314/bin/python -m alembic upgrade head
+   ./.venv/bin/python -m alembic upgrade head
    ```
 
    If `alembic current` returns no revision on a populated database, do not run
@@ -525,7 +525,7 @@ display string merely to make the count zero.
 Run these after migration and restart:
 
 ```bash
-./venv314/bin/python -m pytest -q \
+./.venv/bin/python -m pytest -q \
   tests/test_address_canonical_unit.py \
   tests/test_address_checksum_schema.py
 
@@ -543,7 +543,7 @@ env HLTHPRT_DB_HOST=127.0.0.1 \
     HLTHPRT_DB_USER=healthcare \
     HLTHPRT_DB_PASSWORD= \
     HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true \
-    ./venv314/bin/python -m pytest -q tests/test_address_canonical_db.py
+    ./.venv/bin/python -m pytest -q tests/test_address_canonical_db.py
 ```
 
 Before enabling a production-sized source, check that the archive table exists:
