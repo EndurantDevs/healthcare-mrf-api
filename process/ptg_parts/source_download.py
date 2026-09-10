@@ -1483,11 +1483,11 @@ def _curl_request_option_map(
 def validated_socks_proxy_url(value: str) -> str:
     """Return one authenticated local-DNS SOCKS URL or fail closed."""
 
-    parsed = urlsplit(value)
     try:
+        parsed = urlsplit(value)
         port = parsed.port
-    except ValueError as exc:
-        raise RuntimeError("hospital SOCKS proxy URL is invalid") from exc
+    except ValueError:
+        raise RuntimeError("hospital SOCKS proxy URL is invalid") from None
     if (
         parsed.scheme != "socks5"
         or parsed.hostname is None

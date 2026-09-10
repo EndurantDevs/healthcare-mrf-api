@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import traceback
 from types import SimpleNamespace
 from typing import Any
 
@@ -314,6 +315,86 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
     }
 
 
+def test_proxy_transport_formats_ipv6_and_rejects_invalid_port():
+    options = source_download._curl_transport_option_map(
+        "www.avera.org",
+        443,
+        ("8.8.8.8",),
+        None,
+        "socks5://hospital-test:test-token@[2001:db8::1]:39081",
+    )
+    assert options[CurlOpt.PROXY] == "socks5://[2001:db8::1]:39081"
+
+    with pytest.raises(RuntimeError, match="proxy URL is invalid"):
+        source_download.validated_socks_proxy_url(
+            "socks5://hospital-test:test-token@10.42.0.1:not-a-port"
+        )
+
+    secret = "must-not-leak"
+    with pytest.raises(RuntimeError, match="proxy URL is invalid") as failure:
+        source_download.validated_socks_proxy_url(
+            f"socks5://hospital-test:{secret}@ho／st:39081"
+        )
+    assert secret not in str(failure.value)
+    assert secret not in "".join(traceback.format_exception(failure.value))
+
+
+@pytest.mark.asyncio
+async def test_proxied_download_rejects_unsupported_http_version(
+    tmp_path, monkeypatch
+):
+    response = _Response(http_version=CurlHttpVersion.V3)
+    _install_transport(monkeypatch, response)
+
+    with pytest.raises(RuntimeError, match="HTTP/1.1 or HTTP/2"):
+        await _download(
+            tmp_path / "artifact.part",
+            browser_profile=None,
+            proxy_url="socks5://hospital-test:test-token@10.42.0.1:39081",
+        )
+
+
+@pytest.mark.asyncio
+async def test_curl_transport_rejects_plain_http(tmp_path):
+    with pytest.raises(UnsafeUrlError, match="requires HTTPS"):
+        await _download(
+            tmp_path / "artifact.part",
+            url="http://www.avera.org/cms-hpt.txt",
+        )
+
+
+@pytest.mark.asyncio
+async def test_proxy_transport_skips_head_and_forces_uncached_download(monkeypatch):
+    request_options = []
+
+    async def request(_url, **options):
+        request_options.append(options)
+        return object()
+
+    async def unexpected_head(*_args, **_options):
+        raise AssertionError("proxied transport must not issue HEAD")
+
+    monkeypatch.setattr(source_download, "_download_raw_request", request)
+    monkeypatch.setattr(source_download, "fetch_head_metadata", unexpected_head)
+    proxy_url = "socks5://hospital-test:test-token@10.42.0.1:39081"
+
+    head = await source_download._download_head_metadata(
+        "https://www.avera.org/cms-hpt.txt",
+        source_download._DownloadTransport(proxy_url=proxy_url),
+    )
+    await source_download.download_raw_artifact_via_proxy(
+        "https://www.avera.org/cms-hpt.txt",
+        proxy_url=proxy_url,
+        store=object(),
+        max_bytes=100,
+    )
+
+    assert head.supports_head is False
+    assert request_options[0]["reuse_raw_artifacts"] is False
+    assert request_options[0]["keep_partial_artifacts"] is False
+    assert request_options[0]["transport"].proxy_url == proxy_url
+
+
 @pytest.mark.asyncio
 async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     monkeypatch,
@@ -351,6 +432,62 @@ async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     assert "proxy_url" not in requests[0]
     assert requests[1]["proxy_url"] == proxy_url
     assert requests[1]["max_bytes"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_hospital_proxy_rejects_invalid_host_allowlist(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY",
+        "socks5://hospital-test:test-token@10.42.0.1:39081",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+        "cdn.hs.uab.edu/path",
+    )
+
+    with pytest.raises(RuntimeError, match="must contain exact hostnames"):
+        await hospital_price_source_download.download_hospital_source(
+            None,
+            "https://cdn.hs.uab.edu/hospital.zip",
+            object(),
+            1024,
+            "Mozilla/5.0",
+        )
+
+
+@pytest.mark.asyncio
+async def test_hospital_proxy_propagates_cancellation(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_SOCKS_PROXY",
+        "socks5://hospital-test:test-token@10.42.0.1:39081",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+        "cdn.hs.uab.edu",
+    )
+    direct_error = TimeoutError("direct route timed out")
+    direct_error._ptg2_response_body_started = False
+
+    async def direct_download(*_args, **_options):
+        raise direct_error
+
+    async def cancelled_proxy(*_args, **_options):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        hospital_price_source_download,
+        "download_raw_artifact_via_proxy",
+        cancelled_proxy,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await hospital_price_source_download.download_hospital_source(
+            direct_download,
+            "https://cdn.hs.uab.edu/hospital.zip",
+            object(),
+            1024,
+            "Mozilla/5.0",
+        )
 
 
 @pytest.mark.asyncio
