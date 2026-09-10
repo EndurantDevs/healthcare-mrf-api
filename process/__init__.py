@@ -180,6 +180,21 @@ from process.serialization import deserialize_job, serialize_job
 control_single_job_start = arq_func(_control_single_job_start, max_tries=1)
 
 
+async def _hospital_price_control_single_job_start(ctx, task=None, **arq_metadata):
+    """Run only the control target assigned to the credential-bearing worker."""
+
+    if not isinstance(task, dict) or (
+        task.get("importer") != "hospital-prices"
+        or task.get("target_module") != "process.hospital_prices"
+        or task.get("target_function") != "process_data"
+        or task.get("call_style", "ctx_task") != "ctx_task"
+        or task.get("run_shutdown", False) is not False
+        or not isinstance(task.get("task"), dict)
+    ):
+        raise ValueError("HospitalPrices control target is not allowed")
+    return await _control_single_job_start(ctx, task, **arq_metadata)
+
+
 class MRF:
     functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
@@ -990,7 +1005,14 @@ class MRFSourceDiscovery:
 
 
 class HospitalPrices:
-    functions = [process_hospital_prices_data, control_single_job_start]
+    functions = [
+        process_hospital_prices_data,
+        arq_func(
+            _hospital_price_control_single_job_start,
+            name="control_single_job_start",
+            max_tries=1,
+        ),
+    ]
     on_startup = db_startup
     max_jobs = 1
     queue_read_limit = 2
