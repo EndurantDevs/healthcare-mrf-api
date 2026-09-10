@@ -33,6 +33,7 @@ from process.serialization import deserialize_job, serialize_job
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
 ATTRIBUTES_QUEUE_NAME = "arq:Attributes"
+_PLAN_PRICE_BATCH_SIZE = 1_000_000
 
 _TABLE_STATE_BY_KEY = {"is_prepared": False}
 _TABLES_LOCK = asyncio.Lock()
@@ -642,8 +643,7 @@ async def process_prices(ctx, task):
 
                 attr_obj_list.append(price_dict)
 
-                if count > 1000000:
-                    total_count += count
+                if count > _PLAN_PRICE_BATCH_SIZE:
                     await redis.enqueue_job(
                         "save_attributes",
                         {

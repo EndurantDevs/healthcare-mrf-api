@@ -346,6 +346,26 @@ async def test_process_prices_covers_age_and_optional_rate_shapes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_process_prices_flushes_large_batch_without_undefined_counter(monkeypatch):
+    _install_download_pipeline(monkeypatch, [_price_row("34"), _price_row("35")])
+    monkeypatch.setattr(process_attributes, "process_rating_areas", AsyncMock())
+    monkeypatch.setattr(process_attributes, "_PLAN_PRICE_BATCH_SIZE", 1)
+    monkeypatch.setattr(process_attributes, "push_objects", AsyncMock())
+    redis = SimpleNamespace(enqueue_job=AsyncMock())
+
+    await process_attributes.process_prices(
+        {"redis": redis, "import_date": "20260721", "context": {}},
+        {
+            "url": "https://example.test/prices.zip",
+            "year": "2026",
+            "context": {"test_mode": False},
+        },
+    )
+
+    redis.enqueue_job.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_builds_indexes_and_swaps_complete_tables(monkeypatch):
     _install_shutdown_model_fakes(monkeypatch)
     status_mock, ddl_mock, time_mock = _install_shutdown_database_fakes(

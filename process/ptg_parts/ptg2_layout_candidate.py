@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
