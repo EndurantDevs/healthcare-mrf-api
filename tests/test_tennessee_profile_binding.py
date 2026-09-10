@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+from datetime import datetime
 
 import pytest
 
@@ -74,6 +75,28 @@ def _bind(tmp_path, *, report_by_profession=None, candidates=None):
 def _decision(result, profession="1606"):
     return next(record["match_evidence"]["registry_binding"] for record in result["source_records"]
                 if record["profession_code"] == profession)
+
+
+def test_datetime_evidence_matches_iso_capture_without_mutating_inputs(tmp_path):
+    reports = _reports()
+    for report in reports.values():
+        report["evidence"]["downloaded_at"] = "2026-09-09T00:00:00+00:00"
+    expected = _bind(tmp_path, report_by_profession=reports)
+    pin = binding.reports_content_sha256(reports)
+    for report in reports.values():
+        report["evidence"]["downloaded_at"] = datetime.fromisoformat(report["evidence"]["downloaded_at"])
+    before = copy.deepcopy(reports)
+    assert binding.reports_content_sha256(reports) == pin
+    assert _bind(tmp_path, report_by_profession=reports) == expected
+    assert reports == before
+
+
+@pytest.mark.parametrize("value", [b"not-json", {"nested": {"set-value"}}, float("nan")])
+def test_non_json_evidence_has_binding_error(value):
+    reports = _reports()
+    reports["1606"]["evidence"]["extra"] = value
+    with pytest.raises(ValueError, match="^tennessee_binding_report_evidence_invalid$"):
+        binding.reports_content_sha256(reports)
 
 
 def test_both_reports_bind_without_changing_assertions_or_source_identity(tmp_path):

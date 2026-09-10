@@ -174,20 +174,25 @@ class SourceProfileStore:
 
     async def retained_counts(self, run_id):
         """Count stored source records and public NPIs, including integrity failures."""
-        self._run_id(run_id)
+        return (await self._retained_counts_by_run([run_id]))[run_id]
+
+    async def _retained_counts_by_run(self, run_ids):
+        run_ids = sorted({self._run_id(run_id) for run_id in run_ids})
+        if not run_ids:
+            return {}
         source_records = self._table(ProviderProfileSourceRecord)
         facts = self._table(ProviderProfileFact)
         artifacts = self._table(ProviderProfileArtifact)
         runs = self._table(ProviderProfileImportRun)
-        count_row = await db.first(text(f"""
+        count_rows = await db.all(text(f"""
             WITH source_counts AS (
-                SELECT count(*) AS retained_source_records,
+                SELECT run_id, count(*) AS retained_source_records,
                    count(*) FILTER (WHERE {self.policy.received_profile_sql}) AS received_profiles,
                    count(*) FILTER (WHERE source_key <> :source_key
                          OR normalized_payload->>'schema_version' IS DISTINCT FROM :schema_version) AS invalid_source_records
-                  FROM {source_records} WHERE run_id = :run_id
+                  FROM {source_records} WHERE run_id = ANY(CAST(:run_ids AS text[])) GROUP BY run_id
             ), fact_counts AS (
-                SELECT count(*) AS retained_facts,
+                SELECT f.run_id, count(*) AS retained_facts,
                    count(DISTINCT f.npi) FILTER (WHERE r.run_id = f.run_id AND r.source_key = :source_key
                        AND r.match_status = 'deterministic' AND r.matched_npi = f.npi
                        AND r.normalized_payload->>'visibility' = 'public'
@@ -209,16 +214,21 @@ class SourceProfileStore:
                         OR ({self.policy.invalid_fact_sql})) AS invalid_facts
                   FROM {facts} f LEFT JOIN {source_records} r ON r.record_id = f.source_record_id
                   LEFT JOIN {runs} source_run ON source_run.run_id = f.run_id
-                 WHERE f.run_id = :run_id
+                 WHERE f.run_id = ANY(CAST(:run_ids AS text[])) GROUP BY f.run_id
+            ), artifact_counts AS (
+                SELECT run_id, count(*) AS foreign_artifacts FROM {artifacts}
+                 WHERE run_id = ANY(CAST(:run_ids AS text[])) AND source_key <> :source_key GROUP BY run_id
             )
-            SELECT source_counts.*, fact_counts.retained_facts, fact_counts.matched_public_providers,
+            SELECT requested.run_id, source_counts.retained_source_records, source_counts.received_profiles,
+                   source_counts.invalid_source_records, fact_counts.retained_facts, fact_counts.matched_public_providers,
                    fact_counts.all_public_providers - fact_counts.matched_public_providers AS portfolio_only_public_providers,
-                   fact_counts.invalid_facts,
-                   (SELECT count(*) FROM {artifacts} WHERE run_id = :run_id
-                        AND source_key <> :source_key) AS foreign_artifacts
-              FROM source_counts CROSS JOIN fact_counts
-        """), run_id=run_id, source_key=self.policy.source_key, schema_version=self.policy.schema_version)
-        return {key: int(count) for key, count in count_row._mapping.items()}
+                   fact_counts.invalid_facts, artifact_counts.foreign_artifacts
+              FROM unnest(CAST(:run_ids AS text[])) AS requested(run_id)
+              LEFT JOIN source_counts USING (run_id) LEFT JOIN fact_counts USING (run_id)
+              LEFT JOIN artifact_counts USING (run_id)
+        """), run_ids=run_ids, source_key=self.policy.source_key, schema_version=self.policy.schema_version)
+        return {count_row._mapping["run_id"]: {key: int(count or 0) for key, count in count_row._mapping.items() if key != "run_id"}
+                for count_row in count_rows}
 
     def _completion_metrics(self, run_by_field, metrics, counts_by_field):
         manifest = self._manifest(run_by_field)
@@ -347,8 +357,7 @@ class SourceProfileStore:
         return sorted(eligible_run_ids), sorted(protected_run_ids)
 
     async def _assert_source_ownership(self, run_ids):
-        for run_id in run_ids:
-            counts_by_field = await self.retained_counts(run_id)
+        for counts_by_field in (await self._retained_counts_by_run(run_ids)).values():
             if any(counts_by_field[key] for key in ("invalid_source_records", "invalid_facts", "foreign_artifacts")):
                 raise RuntimeError(f"{self.policy.error_prefix}_retention_foreign_payload")
 

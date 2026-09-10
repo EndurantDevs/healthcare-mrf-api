@@ -309,6 +309,41 @@ async def _legacy_retained_counts(database, run_id):
     return {**dict(count_row._mapping), "portfolio_only_public_providers": 0}
 
 
+@pytest.mark.parametrize("corruption", ["source_record", "fact", "artifact"])
+async def test_grouped_retention_counts_preserve_integrity_per_run(monkeypatch, corruption):
+    async with _database(monkeypatch) as database:
+        run_ids = []
+        for _ in range(3):
+            run_id = (await _seed_run(database, limit=2))["run_id"]
+            await store.mark_run_failed(run_id, "synthetic history")
+            run_ids.append(run_id)
+        empty_id = uuid.uuid4().hex
+        run_ids.append(empty_id)
+        query = AsyncMock(wraps=database.all)
+        monkeypatch.setattr(database, "all", query)
+        await store._assert_source_ownership(run_ids)
+        assert query.await_count == 1
+        invalid_id = run_ids[1]
+        if corruption == "source_record":
+            await database.status(f"UPDATE {store._table(store.ProviderProfileSourceRecord)} SET source_key='foreign' WHERE run_id=:run_id", run_id=invalid_id)
+        elif corruption == "fact":
+            await database.status(f"UPDATE {store._table(store.ProviderProfileFact)} SET source_json='{{}}' WHERE run_id=:run_id", run_id=invalid_id)
+        else:
+            await database.insert(store.ProviderProfileArtifact.__table__).values(
+                artifact_id=invalid_id, run_id=invalid_id, source_key="foreign", file_name="synthetic.json",
+                source_url="https://example.test/profile", category="education", content_sha256="a" * 64, content_bytes=2).status()
+        counts_by_run = {run_id: await _legacy_retained_counts(database, run_id) for run_id in run_ids}
+        assert await store._store._retained_counts_by_run(run_ids) == counts_by_run
+        query.reset_mock()
+        with pytest.raises(RuntimeError, match="retention_foreign_payload"):
+            await store._assert_source_ownership(run_ids)
+        assert query.await_count == 1
+        assert await store.retained_counts(empty_id) == _counts(0)
+        query.reset_mock()
+        await store._assert_source_ownership([])
+        query.assert_not_called()
+
+
 @pytest.mark.parametrize(("record_changes", "fact_changes", "expected_changes"), [
     ({}, {}, {}),
     ({"source_key": "florida-mqa"}, {}, {"invalid_source_records": 1, "invalid_facts": 1, "matched_public_providers": 1}),

@@ -8,6 +8,7 @@ import copy
 import hashlib
 import re
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from process.kentucky_profile_acquisition import _read_artifact
@@ -68,7 +69,14 @@ def _report_inputs(reports_by_profession):
                  and isinstance(report["content"], bytes) and 0 < len(report["content"]) <= MAX_REPORT_BYTES
                  and isinstance(report["evidence"], dict), "report_invalid")
         # Bytes are immutable; copy only the small metadata, never parsed batches.
-        report_by_profession[profession] = {"content": report["content"], "evidence": copy.deepcopy(report["evidence"])}
+        evidence = copy.deepcopy(report["evidence"])
+        if isinstance(evidence.get("downloaded_at"), datetime):
+            evidence["downloaded_at"] = evidence["downloaded_at"].isoformat()
+        try:
+            encoded_json(evidence)
+        except (TypeError, ValueError):
+            raise ValueError("tennessee_binding_report_evidence_invalid") from None
+        report_by_profession[profession] = {"content": report["content"], "evidence": evidence}
     return report_by_profession
 
 

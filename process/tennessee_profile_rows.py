@@ -224,7 +224,7 @@ def _fact_value(category, raw_fields, observed_on):
 
 def _retained_fact(source_record, evidence, category, raw_fields, value_by_field, flags, row_number):
     fact_type = FACT_TYPES[category]
-    logical_key = stable_hash([source_record["source_record_key"], category, fact_type, raw_fields], domain=SCHEMA_VERSION)
+    logical_key = stable_hash([source_record["source_record_key"], category, fact_type, value_by_field], domain=SCHEMA_VERSION)
     display_fields = ("degree", "institution", "institution_location", "graduation_date", "attendance_start", "attendance_end", "text")
     return {
         "fact_id": stable_hash([source_record["record_id"], logical_key], domain=SCHEMA_VERSION),
@@ -254,16 +254,17 @@ def _profile_facts(source_record, evidence):
             raw_by_field = {field: entry["fields"][field] for field in fields}
             if not any(_text(source_text) for source_text in raw_by_field.values()):
                 continue
-            tuple_key = (category, *raw_by_field.values())
+            value_by_field, flags = _fact_value(category, raw_by_field, observed_on)
+            quality_flags.update(flags)
+            if not value_by_field:
+                continue
+            tuple_key = (category, *sorted(value_by_field.items()))
             if tuple_key in facts_by_tuple:
                 facts_by_tuple[tuple_key]["source_json"]["row_numbers"].append(entry["row_number"])
                 continue
-            value_by_field, flags = _fact_value(category, raw_by_field, observed_on)
-            quality_flags.update(flags)
-            if value_by_field:
-                facts_by_tuple[tuple_key] = _retained_fact(
-                    source_record, evidence, category, raw_by_field, value_by_field, flags, entry["row_number"],
-                )
+            facts_by_tuple[tuple_key] = _retained_fact(
+                source_record, evidence, category, raw_by_field, value_by_field, flags, entry["row_number"],
+            )
     source_record["normalized_payload"]["quality_flags"] = sorted(quality_flags)
     return list(facts_by_tuple.values())
 

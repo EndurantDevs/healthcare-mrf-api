@@ -292,7 +292,8 @@ def _certification_facts(profile, source_record, evidence):
                 "subspecialties": _reported_specialties(board.get("subspecialties")),
             }
             facts.append(_fact(
-                source_record, evidence, "certifications", value_by_field, board, f"{family}[{index}]", [],
+                source_record, evidence, "certifications", value_by_field,
+                {key: board.get(key) for key in ("boardName", "specialties", "subspecialties")}, f"{family}[{index}]", [],
             ))
     return facts
 

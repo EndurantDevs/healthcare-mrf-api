@@ -196,9 +196,20 @@ async def test_symlinked_parent_is_rejected(acquisition_path, manifest_sha256):
 @pytest.mark.parametrize("name,limit", [("manifest.json", "MAX_METADATA_BYTES"),
                                        ("education.response.json", "MAX_RESPONSE_ENVELOPE_BYTES")])
 async def test_envelope_is_bounded_before_decoding(acquisition_path, manifest_sha256, monkeypatch, name, limit):
-    monkeypatch.setattr(retained, limit, 1)
+    read_artifact = retained._read_artifact
+    capped_paths = []
+
+    def read_with_target_cap(path, max_bytes):
+        if path.name == name:
+            assert max_bytes == getattr(retained, limit)
+            capped_paths.append(path.name)
+            max_bytes = 1
+        return read_artifact(path, max_bytes)
+
+    monkeypatch.setattr(retained, "_read_artifact", read_with_target_cap)
     with pytest.raises(ValueError, match="artifact_file_invalid"):
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
+    assert capped_paths == [name]
 
 
 async def test_decoded_body_limit_is_independent(acquisition_path, manifest_sha256, monkeypatch):

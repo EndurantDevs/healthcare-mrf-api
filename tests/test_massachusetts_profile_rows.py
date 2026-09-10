@@ -95,6 +95,22 @@ def test_public_evidence_does_not_spread_unrelated_caller_fields():
     assert all("raw_profile" not in fact["source_json"] for fact in facts)
 
 
+@pytest.mark.parametrize("family", ["abms", "aoa"])
+def test_board_evidence_keeps_public_fields(family):
+    board_by_field = {"boardName": " Example Board ", "specialties": [" Internal Medicine "],
+                      "subspecialties": [" Example Subspecialty "], "unlisted": {"note": "synthetic withheld detail"}}
+    profile_by_field = {**PROFILE, "boardCertifications": {family: [board_by_field]}}
+    source_record, facts = parse(profile_by_field, categories=rows.PROFILE_CATEGORIES)
+    certification = next(fact for fact in facts if fact["category"] == "certifications")
+    assert certification["source_json"]["raw_fields"] == {
+        key: board_by_field[key] for key in ("boardName", "specialties", "subspecialties")
+    }
+    assert "unlisted" not in str(facts) and "synthetic withheld detail" not in str(facts)
+    assert source_record["raw_payload"] == profile_by_field
+    certification["source_json"]["raw_fields"]["specialties"].append("changed")
+    assert source_record["raw_payload"] == profile_by_field
+
+
 def test_captured_cohort_is_trusted_without_taxonomy_prefix_guesses():
     candidate_by_field = {**CANDIDATE, "taxonomy": None, "license_number": " 123456 \t"}
     original = copy.deepcopy(candidate_by_field)

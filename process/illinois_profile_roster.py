@@ -123,14 +123,14 @@ def _profile_identity(identity):
     return (name.casefold(), issued_on) if name and issued_on else None
 
 
-def _relevant_invalid(record, named_records, issued_on):
+def _relevant_invalid(record, named_records, profile_key):
     """A malformed row cannot be silently removed from a potentially matching name."""
     raw = record["originals"][0]["raw_payload"]
     if isinstance(raw, dict):
         if any(raw.get("license_number") == row["identity"]["license_number"] for row in named_records):
             return True
         raw_date = _issue_date(raw.get("original_issue_date"))
-        if raw_date is not None and raw_date != issued_on:
+        if raw_date is not None and raw_date != profile_key[1]:
             return False
     if not isinstance(raw, dict) or any(not isinstance(raw.get(field), str) for field in NAME_FIELDS):
         return True
@@ -141,7 +141,7 @@ def _relevant_invalid(record, named_records, issued_on):
     names = {name}
     if _text(raw["suffix"]) in {"MD", "DO"} and not _text(raw["title"]) and not _text(raw["prefix"]):
         names.add(name + " " + _text(raw["suffix"]).casefold())
-    return any(row["identity"]["display_name"].casefold() in names
+    return profile_key[0] in names or any(row["identity"]["display_name"].casefold() in names
                or (first == row["identity"]["first_name"].casefold()
                    and last == row["identity"]["last_name"].casefold()) for row in named_records)
 
@@ -149,7 +149,7 @@ def _relevant_invalid(record, named_records, issued_on):
 def _candidate_result(profile_key, records):
     named_records = [row for row in records if row["status"] == "eligible"
                      and row["identity"]["display_name"].casefold() == profile_key[0]]
-    malformed_records = [row for row in records if row["status"] == "invalid" and _relevant_invalid(row, named_records, profile_key[1])]
+    malformed_records = [row for row in records if row["status"] == "invalid" and _relevant_invalid(row, named_records, profile_key)]
     if malformed_records:
         return "identity_conflict", "relevant_roster_identity_invalid", None, named_records + malformed_records
     if not named_records:

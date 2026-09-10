@@ -209,6 +209,45 @@ def test_ids_are_stable_across_row_order_and_runs():
     assert {fact["logical_fact_key"] for fact in third_facts} == {fact["logical_fact_key"] for fact in first_facts}
 
 
+@pytest.mark.parametrize(("category", "field"), [
+    ("education", "EducationProvider"), ("education", "DegreeEarned"),
+    ("education", "GraduationDate"), ("training", "OtherTrainingProvider"),
+    ("training", "OtherTrainingEndDate"), ("specialties", "ModifierDescription"),
+])
+def test_normalized_facts_merge_whitespace_and_keep_capture_identity(category, field):
+    original = source_row(GraduationDate="01/01/2030", OtherTrainingEndDate="01/01/1990")
+    value = original[field]
+    variants = [value, value + " ", " " + value, value.replace(" ", "  "),
+                value.replace(" ", "\n"), "\xa0" + value.replace(" ", "\xa0")]
+    source_records, facts = parse_sample([{**original, field: variant} for variant in variants])
+    assert len(facts) == 3 and len({fact["fact_id"] for fact in facts}) == 3
+    fact = next(fact for fact in facts if fact["category"] == category)
+    assert fact["source_json"]["row_numbers"] == list(range(1, len(variants) + 1))
+    assert fact["source_json"]["raw_fields"][field] == value
+    assert [row["fields"][field] for row in source_records[0]["raw_payload"]["rows"]] == variants
+    assert source_records[0]["normalized_payload"]["quality_flags"] == [
+        "graduation_date_in_future", "graduation_year_in_future", "training_period_reversed"]
+    for variant in variants:
+        content = report_bytes([{**original, field: variant}])
+        other_records, other_facts = rows.parse_report(content, evidence={**EVIDENCE, "run_id": "next-capture",
+            "content_sha256": hashlib.sha256(content).hexdigest()})
+        other = next(fact for fact in other_facts if fact["category"] == category)
+        assert other_records[0]["record_id"] != source_records[0]["record_id"]
+        assert other["fact_id"] != fact["fact_id"]
+        assert other["logical_fact_key"] == fact["logical_fact_key"]
+        assert other["value_json"] == fact["value_json"] and other["display"] == fact["display"]
+        assert other["source_json"]["quality_flags"] == fact["source_json"]["quality_flags"]
+
+
+def test_equal_display_dates_with_different_precision_stay_distinct():
+    _, facts = parse_sample([source_row(GraduationDate=value) for value in ["06/15/1998", "1998-06-15"]])
+    education_facts = [fact for fact in facts if fact["category"] == "education"]
+    assert len(education_facts) == 2 and len({fact["logical_fact_key"] for fact in education_facts}) == 2
+    assert education_facts[0]["display"] == education_facts[1]["display"]
+    assert {fact["value_json"]["graduation_date_precision"] for fact in education_facts} == {"day", "source"}
+    assert education_facts[1]["source_json"]["quality_flags"] == ["graduation_date_invalid"]
+
+
 @pytest.mark.parametrize("headers", [HEADERS[:-1], HEADERS + ("Unexpected",), HEADERS[:-1] + (HEADERS[0],),
                                    PRACTICE_HEADERS[:-1], PRACTICE_HEADERS + ("Gender",)])
 def test_changed_header_is_rejected(headers):
