@@ -60,8 +60,10 @@ pub fn decode_u32_le(bytes: &[u8]) -> Result<Vec<u32>, &'static str> {
         return Err("PTG V4 packed u32 page length must be divisible by four");
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("exact u32 chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 

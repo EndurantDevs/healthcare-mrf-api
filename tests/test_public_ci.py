@@ -141,7 +141,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
-        condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
+        condition = "always()" if job_id in {"measurement", "source-validation", "artifact-cleanup"} else "success()"
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
         else:

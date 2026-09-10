@@ -337,7 +337,7 @@ pub fn parse_coverage_scope_id(value: &str) -> io::Result<[u8; COVERAGE_SCOPE_ID
         ));
     }
     let mut scope = [0u8; COVERAGE_SCOPE_ID_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         scope[index] = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
     }
     Ok(scope)
@@ -4456,8 +4456,8 @@ mod tests {
         assert!(dense_stats.spill_bytes > dense_stats.input_bytes);
         let dense_bytes = fs::read(dense_output).unwrap();
         assert!(dense_bytes
-            .chunks_exact(DENSE_ID_RECORD_BYTES)
-            .collect::<Vec<_>>()
+            .as_chunks::<DENSE_ID_RECORD_BYTES>()
+            .0
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
 
@@ -4483,8 +4483,8 @@ mod tests {
         assert!(lex_stats.spill_bytes > lex_stats.input_bytes);
         let lex_bytes = fs::read(lex_output).unwrap();
         assert!(lex_bytes
-            .chunks_exact(4)
-            .collect::<Vec<_>>()
+            .as_chunks::<4>()
+            .0
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
     }
