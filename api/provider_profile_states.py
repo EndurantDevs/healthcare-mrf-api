@@ -25,8 +25,10 @@ from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, _profile_categor
 
 MASSACHUSETTS_SOURCE_KEY = "massachusetts-borim"
 KENTUCKY_SOURCE_KEY = "kentucky-kbml"
-STATE_SOURCE_KEYS = (MASSACHUSETTS_SOURCE_KEY, KENTUCKY_SOURCE_KEY)
+TN_SOURCE_KEY = "tennessee-tdh"
+STATE_SOURCE_KEYS = (MASSACHUSETTS_SOURCE_KEY, KENTUCKY_SOURCE_KEY, TN_SOURCE_KEY)
 KENTUCKY_SCHEMA_VERSION = "ky-kbml-profile/v1"
+TN_SCHEMA_VERSION = "tn-tdh-profile/v1"
 SOURCE_CONTEXT = {
     MASSACHUSETTS_SOURCE_KEY: (
         "Massachusetts education and training are source-reported. Missing training dates do not establish "
@@ -36,11 +38,15 @@ SOURCE_CONTEXT = {
         "Kentucky medical school and graduation year are source-reported. "
         "No postgraduate training, current enrollment or clinical experience is inferred."
     ),
+    TN_SOURCE_KEY: (
+        "Tennessee education, training and specialties are source-reported. Missing training dates do not establish "
+        "current enrollment or completion; clinical experience and board certification are not inferred."
+    ),
 }
 
 
 async def fetch_additional_state_profile_projections(npi: int) -> list[dict]:
-    """Read both state publication pointers, runs and facts in one database snapshot."""
+    """Read state publication pointers, runs and facts in one database snapshot."""
     schema = ProviderProfileSourcePublication.__table__.schema or "mrf"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
         raise RuntimeError("provider_profile_schema_invalid")
@@ -96,6 +102,8 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
     loaded_categories = set(manifest["categories"])
     if source_key == KENTUCKY_SOURCE_KEY:
         _validate_kentucky_publication(fact_rows, descriptor, manifest["categories"])
+    elif source_key == TN_SOURCE_KEY:
+        _validate_tennessee_publication(fact_rows, descriptor, manifest["categories"])
     elif not loaded_categories <= {"education", "training", "certifications", "specialties"}:
         raise RuntimeError("state_profile_categories_invalid")
     grouped = defaultdict(dict)
@@ -110,6 +118,8 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
             raise RuntimeError("state_profile_source_mismatch")
         if source_key == KENTUCKY_SOURCE_KEY:
             _validate_kentucky_fact(npi, generation_id, fact)
+        elif source_key == TN_SOURCE_KEY:
+            _validate_tennessee_fact(npi, generation_id, fact)
         # A profile contains many facts; page evidence must identify each assertion.
         public_record_id = f"{source_by_field['source_key']}:{fact['fact_id']}"
         profile_item = _profile_item({**fact, "source_record_id": public_record_id})
@@ -162,6 +172,35 @@ def _validate_kentucky_fact(npi: int, generation_id: str, fact: Mapping) -> None
     if (
         evidence.get("schema_version") != KENTUCKY_SCHEMA_VERSION or evidence.get("run_id") != generation_id
         or evidence.get("agency") != "Kentucky Board of Medical Licensure" or evidence.get("jurisdiction") != "KY"
+    ):
+        raise RuntimeError("state_profile_source_mismatch")
+
+
+def _validate_tennessee_publication(fact_rows: list[Mapping], descriptor: Mapping, categories: list) -> None:
+    """Bind Tennessee to its complete education, training and specialty scope."""
+    if categories != ["education", "training", "specialties"]:
+        raise RuntimeError("state_profile_categories_invalid")
+    if (
+        descriptor.get("agency") != "Tennessee Department of Health" or descriptor.get("jurisdiction") != "TN"
+        or any(fact_row.get("publication_source_key") != TN_SOURCE_KEY for fact_row in fact_rows)
+        or any(fact_row.get("run_schema_version") != TN_SCHEMA_VERSION for fact_row in fact_rows)
+        or any(fact_row.get("run_jurisdiction") != "TN" for fact_row in fact_rows)
+    ):
+        raise RuntimeError("state_profile_source_mismatch")
+
+
+def _validate_tennessee_fact(npi: int, generation_id: str, fact: Mapping) -> None:
+    """Keep each Tennessee assertion attached to its provider and published generation."""
+    if (fact["category"], fact["fact_type"]) not in {
+        ("education", "education_history"), ("training", "other_training"), ("specialties", "specialty"),
+    }:
+        raise RuntimeError("state_profile_categories_invalid")
+    if fact["run_id"] != generation_id or fact["npi"] != npi:
+        raise RuntimeError("state_profile_publication_invalid")
+    evidence = fact["source_json"]
+    if (
+        evidence.get("schema_version") != TN_SCHEMA_VERSION or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != "Tennessee Department of Health" or evidence.get("jurisdiction") != "TN"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 

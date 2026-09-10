@@ -150,7 +150,9 @@ async def test_both_sources_are_loaded_in_one_snapshot_with_explicit_binding(mon
     ))
     monkeypatch.setattr(state_api, "db", database)
     projections = await state_api.fetch_additional_state_profile_projections(NPI)
-    assert [projection["source"]["source_key"] for projection in projections] == list(state_api.STATE_SOURCE_KEYS)
+    assert [projection["source"]["source_key"] for projection in projections] == [
+        state_api.MASSACHUSETTS_SOURCE_KEY, state_api.KENTUCKY_SOURCE_KEY,
+    ]
     database.all.assert_awaited_once()
     assert database.all.call_args.kwargs == {"npi": NPI, "source_keys": list(state_api.STATE_SOURCE_KEYS)}
     assert "publication.source_key = ANY" in str(database.all.call_args.args[0])

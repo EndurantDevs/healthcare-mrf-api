@@ -92,11 +92,19 @@ def reports_content_sha256(reports_by_profession: dict) -> str:
     return hashlib.sha256(encoded_json(pin_by_profession)).hexdigest()
 
 
-def _validate_snapshot_metadata(snapshot):
+def capture_query(source_schema="mrf"):
+    """Bind the complete occurrence query to one explicit registry schema."""
+    _require(isinstance(source_schema, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", source_schema),
+             "source_schema_invalid")
+    return CAPTURE_QUERY.replace("mrf.", source_schema + ".")
+
+
+def _validate_snapshot_metadata(snapshot, source_schema="mrf"):
+    query_sha256 = hashlib.sha256(capture_query(source_schema).encode("utf-8")).hexdigest()
     _require(snapshot.get("schema_version") == SNAPSHOT_SCHEMA
              and snapshot.get("coverage_scope") == COVERAGE_SCOPE
-             and snapshot.get("source_schema") == "mrf" and snapshot.get("source_state") == "TN"
-             and snapshot.get("query_sha256") == QUERY_SHA256
+             and snapshot.get("source_schema") == source_schema and snapshot.get("source_state") == "TN"
+             and snapshot.get("query_sha256") == query_sha256
              and snapshot.get("columns") == REGISTRY_COLUMNS, "snapshot_scope_invalid")
     _require(snapshot.get("status") == "passed" and snapshot.get("all_rows_received") is True
              and snapshot.get("connection_closed") is True, "snapshot_incomplete")
@@ -110,11 +118,12 @@ def _validate_snapshot_metadata(snapshot):
              and type(transaction.get("backend_pid")) is int and transaction["backend_pid"] > 0,
              "snapshot_transaction_invalid")
     relations = snapshot.get("registry_relations")
-    _require(isinstance(relations, dict) and set(relations) == {"mrf.npi", "mrf.npi_taxonomy", "mrf.nucc_taxonomy"}
+    _require(isinstance(relations, dict) and set(relations) == {
+                 source_schema + "." + name for name in ("npi", "npi_taxonomy", "nucc_taxonomy")}
              and all(type(oid) is int and oid > 0 for oid in relations.values()), "snapshot_relations_invalid")
 
 
-def read_registry_snapshot(path: Path, *, snapshot_sha256: str) -> dict:
+def read_registry_snapshot(path: Path, *, snapshot_sha256: str, source_schema="mrf") -> dict:
     """Validate the supplied canonical envelope, not its truth or freshness.
 
     Capture authority and completeness require independent evidence. This bound
@@ -126,7 +135,7 @@ def read_registry_snapshot(path: Path, *, snapshot_sha256: str) -> dict:
     _check_pin(snapshot_sha256, "snapshot")
     snapshot = _read_artifact(path, MAX_SNAPSHOT_BYTES)
     _require(hashlib.sha256(encoded_json(snapshot)).hexdigest() == snapshot_sha256, "snapshot_changed")
-    _validate_snapshot_metadata(snapshot)
+    _validate_snapshot_metadata(snapshot, source_schema)
     registry_rows = snapshot.get("registry_rows")
     _require(isinstance(registry_rows, list)
              and all(isinstance(candidate, dict) and "license_number" in candidate
@@ -253,7 +262,7 @@ def _decision(source_record, candidates, source_records):
 
 
 def bind_reports(reports_by_profession: dict, *, reports_sha256: str,
-                 snapshot_path: Path, snapshot_sha256: str) -> dict:
+                 snapshot_path: Path, snapshot_sha256: str, source_schema="mrf") -> dict:
     """Reparse both pinned MD/DO reports and return unmodified assertions plus NPI decisions.
 
     Report entries follow ``reports_content_sha256``. Both nonempty profession
@@ -268,7 +277,7 @@ def bind_reports(reports_by_profession: dict, *, reports_sha256: str,
     _require(reports_content_sha256(reports_by_profession) == reports_sha256, "reports_changed")
     _require(reports_by_profession["1606"]["evidence"].get("run_id")
              == reports_by_profession["1907"]["evidence"].get("run_id"), "report_run_id_mismatch")
-    snapshot = read_registry_snapshot(snapshot_path, snapshot_sha256=snapshot_sha256)
+    snapshot = read_registry_snapshot(snapshot_path, snapshot_sha256=snapshot_sha256, source_schema=source_schema)
     candidates_by_license = defaultdict(list)
     for candidate in snapshot["registry_rows"]:
         candidates_by_license[candidate["license_number"]].append(candidate)
