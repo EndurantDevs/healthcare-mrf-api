@@ -74,7 +74,7 @@ def _committed_target_result(
 
     context = control_context.get("context")
     if (
-        target_module not in {"process.npi", "process.massachusetts_profile", "process.kentucky_profile"}
+        target_module not in {"process.npi", "process.massachusetts_profile", "process.kentucky_profile", "process.tennessee_profile"}
         or not isinstance(context, dict)
         or context.get("control_run_terminal_committed") is not True
     ):

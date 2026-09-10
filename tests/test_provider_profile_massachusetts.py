@@ -111,7 +111,7 @@ async def test_loader_optional_relations_and_absent_pointer(monkeypatch):
     assert "JOIN mrf.provider_profile_fact" in statement
     assert "fact.run_id = publication.current_run_id" in statement
     assert "fact.npi = :npi" in statement
-    assert database.all.call_args.kwargs == {"npi": NPI, "source_keys": [SOURCE_KEY, state_api.KENTUCKY_SOURCE_KEY]}
+    assert database.all.call_args.kwargs == {"npi": NPI, "source_keys": list(state_api.STATE_SOURCE_KEYS)}
     assert set(database.scalar.call_args.kwargs) == {"publication", "run", "fact"}
 
 

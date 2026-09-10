@@ -20,6 +20,7 @@ async def test_profile_source_catalog_identifies_only_registered_profile_importe
         "florida-mqa-profile": {"source_key": "florida-mqa", "display_name": "Florida MQA"},
         "massachusetts-borim-profile": {"source_key": "massachusetts-borim", "display_name": "Massachusetts BORIM"},
         "kentucky-kbml-profile": {"source_key": "kentucky-kbml", "display_name": "Kentucky KBML"},
+        "tennessee-tdh-profile": {"source_key": "tennessee-tdh", "display_name": "Tennessee TDH"},
     }
     assert all(entry["enqueue_adapter"] == "arq_single_job" for entry in entries if entry["name"] in profile_by_importer)
     assert all("profile_source" not in entry for entry in entries if entry["name"] in {"npi", "provider-directory-fhir", "ptg"})
