@@ -8,7 +8,7 @@ import tempfile
 from pathlib import PurePath
 
 from aiocsv import AsyncDictReader
-from aiofile import async_open
+from aiofiles import open as async_open
 from arq import create_pool
 
 from db.connection import init_db
@@ -73,7 +73,7 @@ def _report_nucc_sources_discovered(run_id: str, selected_files: list[str]) -> N
 async def _read_nucc_csv_map(tmp_filename: str) -> dict[str, str]:
     """Read the NUCC header and normalize its column names."""
     csv_map = {}
-    async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+    async with async_open(tmp_filename, 'r', encoding='utf-8-sig', newline='') as afp:
         async for header_row in AsyncDictReader(afp, delimiter=","):
             csv_map = {
                 key: re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
@@ -107,7 +107,7 @@ async def _stage_nucc_taxonomy_rows(
     """Parse and stage taxonomy rows, retaining original cancellation and batch points."""
     count = 0
     row_list = []
-    async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+    async with async_open(tmp_filename, 'r', encoding='utf-8-sig', newline='') as afp:
         async for taxonomy_row in AsyncDictReader(afp, delimiter=","):
             if not taxonomy_row['Code']:
                 continue
