@@ -211,6 +211,8 @@ async def acquire_profiles(roots: list[dict], destination: Path, progress, *, re
     response_hash = hashlib.sha256()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         # aiohttp otherwise repeats idempotent requests after connection failures.
+        if type(getattr(session, "_retry_connection", None)) is not bool:
+            raise ValueError("kentucky_profile_retry_control_unavailable")
         session._retry_connection = False
         for index, license_number in enumerate(licenses, 1):
             await progress(index - 1, len(licenses))

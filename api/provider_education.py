@@ -112,7 +112,9 @@ def _source_assertions(fact: Mapping) -> dict:
         "verification_status": fact.get("verification_status"),
     } for source_kind in enriched_fact.get("source_kinds", [])]
     for assertion in assertions:
-        if "quality_flags" in fact and "value" not in assertion:
+        if "value" in assertion:
+            continue
+        if "quality_flags" in fact:
             assertion.setdefault("quality_flags", copy.deepcopy(fact["quality_flags"]))
         assertion.setdefault("value", copy.deepcopy(fact["value"]))
         if fact.get("display") is not None:
@@ -125,7 +127,7 @@ def _source_assertions(fact: Mapping) -> dict:
 
 
 def _matching_groups(facts: list[dict]) -> list[list[dict]]:
-    """Treat exact groups as events before finding reciprocal unique candidates."""
+    """Merge exact events and closed groups of mutually compatible candidates."""
     exact_groups_by_key: dict[tuple, list[dict]] = {}
     for fact in facts:
         exact_key = (_visibility(fact), _value_key(fact["value"]))
@@ -133,10 +135,10 @@ def _matching_groups(facts: list[dict]) -> list[list[dict]]:
     groups = list(exact_groups_by_key.values())
     # ponytail: Pairwise matching is per provider; index school/year if large histories emerge.
     candidates_by_index = {
-        index: [
+        index: {
             other_index for other_index, other in enumerate(groups)
             if other_index != index and _is_compatible(group[0], other[0])
-        ]
+        }
         for index, group in enumerate(groups)
     }
     consumed_indices: set[int] = set()
@@ -144,10 +146,13 @@ def _matching_groups(facts: list[dict]) -> list[list[dict]]:
     for index, group in enumerate(groups):
         if index in consumed_indices:
             continue
-        matches = candidates_by_index.get(index, [])
-        if len(matches) == 1 and candidates_by_index.get(matches[0]) == [index]:
-            consumed_indices.add(matches[0])
-            matched_groups.append([*group, *groups[matches[0]]])
+        member_indices = {index, *candidates_by_index[index]}
+        if all(
+            candidates_by_index[member] == member_indices - {member}
+            for member in member_indices
+        ):
+            consumed_indices.update(member_indices)
+            matched_groups.append([fact for member in sorted(member_indices) for fact in groups[member]])
         else:
             matched_groups.append(group)
         consumed_indices.add(index)
