@@ -2136,7 +2136,7 @@ paths:
           schema:
             type: string
             pattern: '^hospital-[0-9]{6}$'
-          description: Canonical hospital ID returned by the previous page.
+          description: Canonical hospital ID returned by the previous page; reuse only with the same `q` and `published` filters.
         - name: limit
           in: query
           schema:

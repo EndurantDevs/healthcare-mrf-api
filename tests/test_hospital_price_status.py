@@ -124,6 +124,16 @@ def test_status_match_handles_success_and_attempt_statuses():
     assert status_api._is_status_match(published_item_by_field, "published")
 
 
+def test_summary_counts_publication_with_optional_metadata_absent():
+    summary = status_api._summary([{"latest_attempt": None, "publication": {}}])
+
+    assert summary["succeeded"] == 1
+    assert summary["unpublished"] == 0
+    assert summary["template_versions"] == {}
+    assert summary["source_formats"] == {}
+    assert summary["detected_schema_profiles"] == {}
+
+
 @pytest.mark.asyncio
 async def test_registry_load_does_not_block_status_event_loop(monkeypatch):
     event_loop_thread = threading.get_ident()

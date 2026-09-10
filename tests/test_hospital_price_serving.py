@@ -283,6 +283,7 @@ def _query(**overrides):
 @pytest.mark.asyncio
 async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypatch):
     session = _Session()
+    session.native.fact_rows[0]["private_source_locator"] = "private"
     monkeypatch.setattr(serving, "_NATIVE", session.native)
 
     page = await serving.read_hospital_price_page(session, _query())
@@ -301,7 +302,14 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     assert page["items"][0]["negotiated_prices"][0]["negotiated_rate_term"] == (
         "JAN 2026-MAY 2026"
     )
-    assert "charge_key" not in page["items"][0]["negotiated_prices"][0]
+    fact = page["items"][0]["negotiated_prices"][0]
+    assert set(fact) == {
+        "payer_name", "plan_name", "negotiated_rate_term", "negotiated_dollar",
+        "negotiated_percentage", "negotiated_algorithm", "estimated_amount",
+        "methodology", "median_amount", "percentile_10", "percentile_90",
+        "allowed_count", "additional_payer_notes", "comparison_amount",
+    }
+    assert "private_source_locator" not in fact
 
     next_page = await serving.read_hospital_price_page(
         session,
@@ -459,6 +467,18 @@ def test_query_validation_is_exact_and_bounded(overrides):
 def test_facility_search_query_is_closed_and_bounded(values_by_field):
     with pytest.raises(serving.HospitalPriceInvalidRequestError):
         endpoint._facility_search_query(values_by_field)
+
+
+def test_facility_search_defaults_and_unpublished_shape():
+    assert endpoint._facility_search_query({}) == {
+        "query": None,
+        "status": None,
+        "cursor": None,
+        "limit": 50,
+    }
+    item = _private_facility_status_page()["items"][0]
+    item["publication"] = None
+    assert endpoint._public_facility_item(item)["publication"] is None
 
 
 def _private_facility_status_page():
