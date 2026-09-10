@@ -330,13 +330,15 @@ def test_proxy_transport_formats_ipv6_and_rejects_invalid_port():
             "socks5://hospital-test:test-token@10.42.0.1:not-a-port"
         )
 
-    secret = "must-not-leak"
+    credential_marker = "must-not-leak"
     with pytest.raises(RuntimeError, match="proxy URL is invalid") as failure:
         source_download.validated_socks_proxy_url(
-            f"socks5://hospital-test:{secret}@ho／st:39081"
+            f"socks5://hospital-test:{credential_marker}@ho／st:39081"
         )
-    assert secret not in str(failure.value)
-    assert secret not in "".join(traceback.format_exception(failure.value))
+    assert credential_marker not in str(failure.value)
+    assert credential_marker not in "".join(
+        traceback.format_exception(failure.value)
+    )
 
 
 @pytest.mark.asyncio
