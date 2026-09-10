@@ -17,8 +17,8 @@ from process.provider_directory_projection_types import stable_hash
 
 SOURCE_KEY = "tennessee-tdh"
 SCHEMA_VERSION = "tn-tdh-profile/v1"
-MAX_REPORT_BYTES = 64 * 1024 * 1024
-MAX_ROWS = 250_000
+MAX_REPORT_BYTES = 256 * 1024 * 1024
+MAX_ROWS = 500_000
 MAX_FIELD_CHARS = 16_384
 BASE_FIELDS = (
     "Board", "Profession", "Rank", "LastName", "FirstName", "MiddleName", "Title",
@@ -281,7 +281,7 @@ def parse_report(content, *, evidence):
     """
     _require(isinstance(content, bytes) and len(content) <= MAX_REPORT_BYTES, "input_invalid")
     evidence_by_field = _validated_evidence(content, evidence)
-    # ponytail: retain one report up to 64 MiB; stream staging if measured statewide inputs require it.
+    # ponytail: retain up to 256 MiB/500k rows; stream staging if measured worker capacity requires it.
     try:
         header, reader, captured_lines = _csv_reader(content)
         source_records = _group_source_rows(header, reader, captured_lines, evidence_by_field)
