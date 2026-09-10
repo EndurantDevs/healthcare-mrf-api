@@ -9,7 +9,7 @@ import json
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import aiohttp
 import uvloop

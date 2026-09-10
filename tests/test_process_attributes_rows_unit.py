@@ -346,6 +346,29 @@ async def test_process_prices_covers_age_and_optional_rate_shapes(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("row_count", "queued_batches"), [(3, 0), (4, 0), (5, 1), (10, 2)])
+async def test_process_prices_flushes_large_batch_without_undefined_counter(monkeypatch, row_count, queued_batches):
+    """Count each valid row once, including after a flushed batch."""
+
+    _install_download_pipeline(monkeypatch, [_price_row(str(age)) for age in range(34, 34 + row_count)])
+    monkeypatch.setattr(process_attributes, "process_rating_areas", AsyncMock())
+    monkeypatch.setattr(process_attributes, "_PLAN_PRICE_BATCH_SIZE", 4)
+    monkeypatch.setattr(process_attributes, "push_objects", AsyncMock())
+    redis = SimpleNamespace(enqueue_job=AsyncMock())
+
+    await process_attributes.process_prices(
+        {"redis": redis, "import_date": "20260721", "context": {}},
+        {
+            "url": "https://example.test/prices.zip",
+            "year": "2026",
+            "context": {"test_mode": False},
+        },
+    )
+
+    assert redis.enqueue_job.await_count == queued_batches
+
+
+@pytest.mark.asyncio
 async def test_shutdown_builds_indexes_and_swaps_complete_tables(monkeypatch):
     _install_shutdown_model_fakes(monkeypatch)
     status_mock, ddl_mock, time_mock = _install_shutdown_database_fakes(

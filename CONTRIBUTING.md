@@ -52,6 +52,40 @@ Run focused checks for the behavior you change, for example:
 pytest tests/test_healthcheck.py -q
 ```
 
+Run the fast Python correctness and inference checks with the pinned developer
+tools:
+
+```bash
+uv pip install --only-binary=:all: ruff==0.16.6 pylint==4.0.8
+ruff check main.py api db process public_evidence service alembic scripts support tests
+pylint \
+  api/billing_search_selector_contract.py \
+  api/billing_search_transport_contract.py \
+  api/mrf_discovery_catalog_manifest.py \
+  api/plan_pricing_state_scan_contract.py \
+  process/fhir_request_failure_policy.py \
+  process/formulary_fhir/uhc_drug_parser_contract.py \
+  process/formulary_fhir/uhc_drug_transport_contract.py \
+  process/provider_directory_rooted_graph_source_contract.py \
+  process/provider_directory_rooted_graph_twin_admission_contract.py \
+  process/provider_directory_rooted_graph_twin_contract.py \
+  process/provider_directory_validated_publication_contract.py \
+  public_evidence/evidence_record_token_policy.py
+```
+
+Install these tools in the activated, runtime-equipped development virtualenv.
+An isolated Pylint tool environment without the application's dependencies
+cannot provide the same inference; CI explicitly exposes its verified runtime
+dependencies to the separate lint environment.
+
+Ruff owns syntax and undefined-name checks across existing Python code. New
+Python files must also pass `ruff check --select I` and `ruff format --check`;
+this staged policy avoids a repository-wide formatting rewrite. Pylint covers
+the listed security, source, and publication contracts with inference checks
+that produce reliable results against the installed application dependencies.
+The readability budget remains authoritative for naming, function size,
+complexity, and suppression policy.
+
 GitHub CI is the required full-validation gate on the current pull request head.
 Do not run local pre-push suites or hooks. When a push is authorized, use
 `git push --no-verify` to avoid invoking a local pre-push hook.

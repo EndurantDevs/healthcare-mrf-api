@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 import shutil
 import tempfile
@@ -85,7 +86,7 @@ async def _shielded_to_thread(operation: Any, *args: Any) -> Any:
 
 def default_uhc_drug_session_factory(
     timeout: aiohttp.ClientTimeout,
-) -> AsyncContextManager[aiohttp.ClientSession]:
+) -> AbstractAsyncContextManager[aiohttp.ClientSession]:
     """Build the identity-encoding session used by the exact source lane."""
 
     return aiohttp.ClientSession(

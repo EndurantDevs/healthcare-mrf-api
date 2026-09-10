@@ -5,6 +5,7 @@ import gzip
 import importlib
 import io
 import json
+import logging
 import types
 import zipfile
 from unittest.mock import AsyncMock, Mock
@@ -9577,6 +9578,17 @@ def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():
             "label": "allowed-amount-meta.txt",
         },
     ]
+
+
+def test_html_link_candidates_logs_parser_failure(monkeypatch, caplog):
+    def fail_parser(_parser, _html_text):
+        raise ValueError("synthetic parser failure")
+
+    monkeypatch.setattr(discovery._MRFHtmlLinkParser, "feed", fail_parser)
+    with caplog.at_level(logging.DEBUG, logger=discovery.__name__):
+        assert discovery._html_link_candidates("plain text", base_url="https://example.test") == []
+
+    assert "failed to parse HTML links with HTMLParser" in caplog.text
 
 
 def _parse_toc_and_body_reference_fixture() -> list[dict]:

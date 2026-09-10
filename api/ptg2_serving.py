@@ -139,7 +139,7 @@ from api.ptg2_tables import (
 from api.ptg2_types import PTG2ServingTables
 from api.ptg2_db_sidecars import (
     ForwardReadBudget,
-    ForwardReadBudgetExceeded,
+    ForwardReadBudgetExceeded, PTG2ServingBinaryRow,
     lookup_serving_binary_by_code_from_db,
     lookup_code_prefix_rows_from_db,
     lookup_binary_code_batch_from_db,

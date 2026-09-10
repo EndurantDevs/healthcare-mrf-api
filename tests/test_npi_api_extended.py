@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import sanic.exceptions
+from sqlalchemy import column, table
 
 from api.endpoint import npi as npi_module
 from db.models import NPIAddress, NPIData, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIDataTaxonomyGroup
