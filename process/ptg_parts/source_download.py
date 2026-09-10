@@ -1154,6 +1154,7 @@ class _SingleGetDownloadState:
 class _DownloadTransport:
     user_agent: str | None = None
     browser_profile: str | None = None
+    proxy_url: str | None = None
     retained_raw_pin: tuple[str, int] | None = None
 
 
@@ -1428,6 +1429,68 @@ def _curl_resolve_target(hostname: str, port: int, addresses: tuple[str, ...]) -
     return f"{hostname}:{port}:{pinned_addresses}"
 
 
+def _curl_transport_option_map(
+    hostname: str,
+    port: int,
+    pinned_addresses: tuple[str, ...],
+    max_bytes: int | None,
+    proxy_url: str | None,
+) -> dict[Any, Any]:
+    option_map: dict[Any, Any] = {
+        CurlOpt.RESOLVE: [_curl_resolve_target(hostname, port, pinned_addresses)],
+        CurlOpt.NOPROXY: "" if proxy_url else "*",
+    }
+    if proxy_url:
+        option_map[CurlOpt.PROXY] = proxy_url
+    if max_bytes is not None:
+        option_map[CurlOpt.MAXFILESIZE_LARGE] = max_bytes
+    return option_map
+
+
+def _curl_request_option_map(
+    browser_profile: str | None,
+    user_agent: str | None,
+) -> dict[str, Any]:
+    option_map: dict[str, Any] = {
+        "allow_redirects": False,
+        "verify": True,
+        "quote": False,
+        "accept_encoding": "identity",
+        "timeout": (_BROWSER_CONNECT_TIMEOUT_SECONDS, _BROWSER_READ_TIMEOUT_SECONDS),
+    }
+    if browser_profile:
+        option_map.update(
+            impersonate=browser_profile,
+            http_version=CurlHttpVersion.V2_0,
+        )
+    else:
+        option_map["headers"] = {"User-Agent": user_agent or _HTTP_USER_AGENT}
+    return option_map
+
+
+def validated_socks_proxy_url(value: str) -> str:
+    """Return one bare local-DNS SOCKS URL or fail closed."""
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("hospital SOCKS proxy URL is invalid") from exc
+    if (
+        parsed.scheme != "socks5"
+        or parsed.hostname is None
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("hospital SOCKS proxy must be a bare socks5 URL")
+    return value
+
+
 def _is_browser_response_url_match(request_url: str, response_url: str) -> bool:
     requested = urlsplit(request_url)
     returned = urlsplit(response_url)
@@ -1444,6 +1507,7 @@ def _prepare_browser_response(
     pinned_addresses: tuple[str, ...],
     port: int,
     max_bytes: int | None,
+    proxied: bool = False,
 ) -> None:
     status = int(response.status_code)
     state.response_url = str(response.url)
@@ -1454,15 +1518,21 @@ def _prepare_browser_response(
         url, state.response_url
     ):
         raise UnsafeUrlError("browser source redirects require separate validation")
-    response_address = ipaddress.ip_address(str(response.primary_ip))
-    if response_address not in {
-        ipaddress.ip_address(address) for address in pinned_addresses
+    if not proxied:
+        response_address = ipaddress.ip_address(str(response.primary_ip))
+        if response_address not in {
+            ipaddress.ip_address(address) for address in pinned_addresses
+        }:
+            raise UnsafeUrlError("browser source connected to an unpinned address")
+        if int(response.primary_port) != port:
+            raise UnsafeUrlError("browser source connected to an unpinned port")
+        if int(response.http_version) != int(CurlHttpVersion.V2_0):
+            raise RuntimeError("browser source download did not negotiate HTTP/2")
+    elif int(response.http_version) not in {
+        int(CurlHttpVersion.V1_1),
+        int(CurlHttpVersion.V2_0),
     }:
-        raise UnsafeUrlError("browser source connected to an unpinned address")
-    if int(response.primary_port) != port:
-        raise UnsafeUrlError("browser source connected to an unpinned port")
-    if int(response.http_version) != int(CurlHttpVersion.V2_0):
-        raise RuntimeError("browser source download did not negotiate HTTP/2")
+        raise RuntimeError("proxied source download did not negotiate HTTP/1.1 or HTTP/2")
     if status != 200:
         raise _BrowserDownloadStatusError(status)
     content_length = response.headers.get("Content-Length")
@@ -1516,11 +1586,12 @@ async def _consume_browser_response(
     port: int,
     max_bytes: int | None,
     started_at: float,
+    proxied: bool = False,
 ) -> None:
     try:
         _prepare_browser_response(
             response, state=state, url=url, pinned_addresses=pinned_addresses,
-            port=port, max_bytes=max_bytes,
+            port=port, max_bytes=max_bytes, proxied=proxied,
         )
         await _stream_browser_response(
             response, state=state, url=url, max_bytes=max_bytes,
@@ -1544,41 +1615,42 @@ async def _download_raw_artifact_browser_once(
     head: PTG2HeadMetadata,
     max_bytes: int | None,
     started_at: float,
-    browser_profile: str,
+    browser_profile: str | None,
+    proxy_url: str | None = None,
+    user_agent: str | None = None,
 ) -> _SingleGetResult:
-    """Stream one HTTPS artifact with a DNS-pinned browser fingerprint."""
+    """Stream one HTTPS artifact with a DNS-pinned curl transport."""
     if urlsplit(url).scheme != "https":
-        raise UnsafeUrlError("browser source transport requires HTTPS")
+        raise UnsafeUrlError("curl source transport requires HTTPS")
     hostname, port, addresses = await resolve_safe_url(url)
     pinned_addresses = tuple(
         sorted(addresses, key=lambda address: ipaddress.ip_address(address).version)
     )
-    curl_option_map: dict[Any, Any] = {
-        CurlOpt.RESOLVE: [_curl_resolve_target(hostname, port, pinned_addresses)],
-        CurlOpt.NOPROXY: "*",
-    }
-    if max_bytes is not None:
-        curl_option_map[CurlOpt.MAXFILESIZE_LARGE] = max_bytes
+    curl_option_map = _curl_transport_option_map(
+        hostname, port, pinned_addresses, max_bytes, proxy_url
+    )
     _reset_partial_download(path)
     state = _single_get_download_state(path, head)
     try:
+        request_option_map = _curl_request_option_map(browser_profile, user_agent)
         async with AsyncSession(curl_options=curl_option_map) as session:
             async with session.stream(
-                "GET", url, allow_redirects=False, verify=True,
-                impersonate=browser_profile, quote=False,
-                accept_encoding="identity", http_version=CurlHttpVersion.V2_0,
-                timeout=(_BROWSER_CONNECT_TIMEOUT_SECONDS, _BROWSER_READ_TIMEOUT_SECONDS),
+                "GET", url, **request_option_map,
             ) as response:
                 await _consume_browser_response(
                     response, state=state, url=url, pinned_addresses=pinned_addresses,
                     port=port, max_bytes=max_bytes, started_at=started_at,
+                    proxied=bool(proxy_url),
                 )
         if state.total_bytes is not None and state.byte_count != state.total_bytes:
             raise RuntimeError(
                 f"Download for {url} ended at {state.byte_count} bytes, "
                 f"expected {state.total_bytes}"
             )
-        _raise_for_unexpected_artifact_container(url, path)
+        _raise_for_unexpected_artifact_container(
+            head.url if proxy_url else url,
+            path,
+        )
         return _single_get_result(state)
     except BaseException as exc:
         _ensure_download_body_marker(exc, state.byte_count)
@@ -1594,7 +1666,9 @@ async def _download_raw_artifact_browser(
     head: PTG2HeadMetadata,
     max_bytes: int | None,
     started_at: float,
-    browser_profile: str,
+    browser_profile: str | None,
+    proxy_url: str | None = None,
+    user_agent: str | None = None,
 ) -> _SingleGetResult:
     retries = _download_retry_count()
     for attempt in range(retries + 1):
@@ -1602,6 +1676,8 @@ async def _download_raw_artifact_browser(
             return await _download_raw_artifact_browser_once(
                 url=url, path=path, head=head, max_bytes=max_bytes,
                 started_at=started_at, browser_profile=browser_profile,
+                proxy_url=proxy_url,
+                user_agent=user_agent,
             )
         except RequestException as exc:
             if exc.code == CurlECode.FILESIZE_EXCEEDED:
@@ -1614,7 +1690,9 @@ async def _download_raw_artifact_browser(
                 url, exc, attempt,
                 int(getattr(exc, "_ptg2_downloaded_byte_count", 0)),
             )
-    raise RuntimeError(f"Browser download retries exhausted for {_download_progress_target(url)}")
+    raise RuntimeError(
+        f"Browser download retries exhausted for {_download_progress_target(url)}"
+    )
 
 
 async def _download_raw_artifact_single_get(
@@ -1678,7 +1756,38 @@ async def download_raw_artifact(
         url, store=store, reuse_raw_artifacts=reuse_raw_artifacts,
         max_bytes=max_bytes, keep_partial_artifacts=keep_partial_artifacts,
         exact_get_evidence=exact_get_evidence,
-        transport=_DownloadTransport(user_agent, browser_profile),
+        transport=_DownloadTransport(
+            user_agent=user_agent,
+            browser_profile=browser_profile,
+        ),
+    )
+
+
+async def download_raw_artifact_via_proxy(
+    url: str,
+    *,
+    proxy_url: str,
+    store: PTG2ArtifactStore,
+    max_bytes: int,
+    exact_get_evidence: bool = False,
+    user_agent: str | None = None,
+    browser_profile: str | None = None,
+) -> PTG2RawArtifact:
+    """Download one uncached artifact through an explicitly selected proxy."""
+
+    proxy_url = validated_socks_proxy_url(proxy_url)
+    return await _download_raw_request(
+        url,
+        store=store,
+        reuse_raw_artifacts=False,
+        max_bytes=max_bytes,
+        keep_partial_artifacts=False,
+        exact_get_evidence=exact_get_evidence,
+        transport=_DownloadTransport(
+            user_agent=user_agent,
+            browser_profile=browser_profile,
+            proxy_url=proxy_url,
+        ),
     )
 
 
@@ -2009,10 +2118,12 @@ async def _download_raw_to_path(
             url, path, head=head, max_bytes=max_bytes,
             started_at=started_at, digest=failure_digest,
         )
-    if transport.browser_profile:
+    if transport.browser_profile or transport.proxy_url:
         return await _download_raw_artifact_browser(
             url=url, path=path, head=head, max_bytes=max_bytes,
             started_at=started_at, browser_profile=transport.browser_profile,
+            proxy_url=transport.proxy_url,
+            user_agent=transport.user_agent,
         )
     ranged = await _try_ranged_raw_artifact(
         url, path, head=head, max_bytes=max_bytes, started_at=started_at,
@@ -2180,6 +2291,18 @@ def _emit_download_started(
     )
 
 
+async def _download_head_metadata(
+    url: str,
+    transport: _DownloadTransport,
+) -> PTG2HeadMetadata:
+    if transport.proxy_url:
+        return PTG2HeadMetadata(url=url, supports_head=False)
+    return await fetch_head_metadata(
+        url,
+        **_user_agent_kwargs(transport.user_agent),
+    )
+
+
 def _validate_and_publish_raw_download(
     url: str,
     store: PTG2ArtifactStore,
@@ -2224,7 +2347,7 @@ async def _download_raw_artifact_locked(
 ) -> PTG2RawArtifact:
     """Run one raw download after this canonical URL has been serialized."""
     transport = transport or _DownloadTransport()
-    head = await fetch_head_metadata(url, **_user_agent_kwargs(transport.user_agent))
+    head = await _download_head_metadata(url, transport)
     progress_started_at = time.monotonic()
     should_validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
