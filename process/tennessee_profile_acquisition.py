@@ -28,8 +28,14 @@ RESPONSE_SECONDS = 180
 RUN_SECONDS = 480
 REPORTS = (("md", "16", "1606", "Medical Doctor"), ("do", "19", "1907", "Osteopathic Physician"))
 OPTIONAL_FIELDS = ("PersonFlag", "EduFlag", "PracticeFlag", "SAQFlag")
-SELECT_FIELDS = {"Board.BoardCode", "Profession.ProfessionCode", "Rank.RankName", "State.StateCode",
-                 "County.CountyCode", "Status.Status"}
+SELECT_FIELDS = {
+    "Board.BoardCode",
+    "Profession.ProfessionCode",
+    "Rank.RankName",
+    "State.StateCode",
+    "County.CountyCode",
+    "Status.Status",
+}
 
 
 def _require(condition, reason):
@@ -53,8 +59,15 @@ class ReportForms(HTMLParser):
         _require(len(attributes_by_name) == len(attrs), "form_attributes_ambiguous")
         if tag == "form":
             _require(self.current is None, "form_nested")
-            self.current = {"action": attributes_by_name.get("action"), "method": attributes_by_name.get("method"),
-                            "hidden": [], "checkboxes": {}, "options": {}, "buttons": [], "disabled_selects": []}
+            self.current = {
+                "action": attributes_by_name.get("action"),
+                "method": attributes_by_name.get("method"),
+                "hidden": [],
+                "checkboxes": {},
+                "options": {},
+                "buttons": [],
+                "disabled_selects": [],
+            }
             self.forms.append(self.current)
         elif self.current is not None:
             self._control(tag, attributes_by_name)
@@ -62,8 +75,10 @@ class ReportForms(HTMLParser):
     def _control(self, tag, fields):
         name = fields.get("name")
         if tag == "select":
-            _require(self.select is None and name not in self.current["options"] and name in SELECT_FIELDS,
-                     "form_select_changed")
+            _require(
+                self.select is None and name not in self.current["options"] and name in SELECT_FIELDS,
+                "form_select_changed",
+            )
             self.select = name
             self.current["options"][name] = []
             if "disabled" in fields:
@@ -105,45 +120,79 @@ class ReportForms(HTMLParser):
 
 
 def _validated_form(body, board, *, submitted=False):
+    """Validate the exact filter controls and return the original hidden fields."""
     forms = ReportForms(body).forms
-    _require([(form["action"], form["method"]) for form in forms] == [
-        ("/LicensureReports", "post"), ("/LicensureReports/Home/CreateFile", "get")], "form_action_changed")
+    _require(
+        [(form["action"], form["method"]) for form in forms]
+        == [("/LicensureReports", "post"), ("/LicensureReports/Home/CreateFile", "get")],
+        "form_action_changed",
+    )
     form, download = forms
-    _require(set(form["disabled_selects"]) == {"Profession.ProfessionCode", "Rank.RankName", "County.CountyCode"},
-             "form_disabled_filters_changed")
+    _require(
+        set(form["disabled_selects"]) == {"Profession.ProfessionCode", "Rank.RankName", "County.CountyCode"},
+        "form_disabled_filters_changed",
+    )
     _require(not download["options"] and not download["checkboxes"], "download_filters_changed")
     buttons = form["buttons"]
-    _require(len(buttons) == 1 and buttons[0].get("id") == "submit-button"
-             and buttons[0].get("type") == "submit"
-             and not {"form", "formaction", "formmethod", "disabled", "name"}.intersection(buttons[0]), "submit_button_changed")
+    _require(
+        len(buttons) == 1
+        and buttons[0].get("id") == "submit-button"
+        and buttons[0].get("type") == "submit"
+        and not {"form", "formaction", "formmethod", "disabled", "name"}.intersection(buttons[0]),
+        "submit_button_changed",
+    )
     hidden = form["hidden"]
-    _require(len(hidden) == 5 and dict(hidden).keys() == {"__RequestVerificationToken", *OPTIONAL_FIELDS}
-             and bool(dict(hidden)["__RequestVerificationToken"])
-             and all(dict(hidden)[name] == "false" for name in OPTIONAL_FIELDS), "form_hidden_changed")
-    _require(form["checkboxes"] == {name: ("true", submitted and name != "PersonFlag") for name in OPTIONAL_FIELDS},
-             "form_checkbox_changed")
+    _require(
+        len(hidden) == 5
+        and dict(hidden).keys() == {"__RequestVerificationToken", *OPTIONAL_FIELDS}
+        and bool(dict(hidden)["__RequestVerificationToken"])
+        and all(dict(hidden)[name] == "false" for name in OPTIONAL_FIELDS),
+        "form_hidden_changed",
+    )
+    _require(
+        form["checkboxes"] == {name: ("true", submitted and name != "PersonFlag") for name in OPTIONAL_FIELDS},
+        "form_checkbox_changed",
+    )
     options = form["options"]
     _require(options.keys() == SELECT_FIELDS, "form_filters_changed")
     locations = [option for option in options["State.StateCode"] if option["value"] == "100"]
     _require(len(locations) == 1 and locations[0]["text"] == "All Locations", "all_locations_changed")
     _require(sum(option["value"] == board for option in options["Board.BoardCode"]) == 1, "board_changed")
-    _require(options["Status.Status"] == [] and options["Rank.RankName"] == [
-        {"value": "", "selected": True, "text": "Default to all Ranks or select..."}], "unrestricted_filters_changed")
+    _require(
+        options["Status.Status"] == []
+        and options["Rank.RankName"] == [{"value": "", "selected": True, "text": "Default to all Ranks or select..."}],
+        "unrestricted_filters_changed",
+    )
     for name, label in (("Profession.ProfessionCode", "Professions"), ("County.CountyCode", "Counties")):
-        _require(options[name] == [{"value": None, "selected": True, "text": f"Default to all {label} or select..."}],
-                 "default_filter_changed")
+        _require(
+            options[name] == [{"value": None, "selected": True, "text": f"Default to all {label} or select..."}],
+            "default_filter_changed",
+        )
+    _validate_submission_controls(options, download, board, submitted)
+    return hidden
+
+
+def _validate_submission_controls(options, download, board, submitted):
+    """Require the requested selection and download control for this form stage."""
     if submitted:
         for name, selected_value in (("Board.BoardCode", board), ("State.StateCode", "100")):
-            _require([option["value"] for option in options[name] if option["selected"] and option["value"]] == [selected_value],
-                     "submitted_filter_changed")
+            _require(
+                [option["value"] for option in options[name] if option["selected"] and option["value"]]
+                == [selected_value],
+                "submitted_filter_changed",
+            )
         buttons = download["buttons"]
-        _require(download["hidden"] == [("hasFile", "True")] and len(buttons) == 1
-                 and buttons[0].get("id") == "hidden-button" and buttons[0].get("type") == "submit"
-                 and "hidden" in buttons[0]
-                 and not {"form", "formaction", "formmethod", "disabled", "name"}.intersection(buttons[0]), "download_trigger_changed")
+        _require(
+            download["hidden"] == [("hasFile", "True")]
+            and len(buttons) == 1
+            and buttons[0].get("id") == "hidden-button"
+            and buttons[0].get("type") == "submit"
+            and "hidden" in buttons[0]
+            and not {"form", "formaction", "formmethod", "disabled", "name"}.intersection(buttons[0]),
+            "download_trigger_changed",
+        )
     else:
         _require(not download["hidden"] and not download["buttons"], "unexpected_download_trigger")
-    return hidden
 
 
 def _unique_object(pairs):
@@ -153,12 +202,23 @@ def _unique_object(pairs):
 
 def _validated_professions(body, profession, label):
     professions = json.loads(body, object_pairs_hook=_unique_object)
-    _require(isinstance(professions, list) and all(
-        isinstance(entry, dict) and entry.keys() == {"professionCode", "professionName"} and type(entry.get("professionCode")) is int
-        and isinstance(entry.get("professionName"), str) for entry in professions), "professions_invalid")
+    _require(
+        isinstance(professions, list)
+        and all(
+            isinstance(entry, dict)
+            and entry.keys() == {"professionCode", "professionName"}
+            and type(entry.get("professionCode")) is int
+            and isinstance(entry.get("professionName"), str)
+            for entry in professions
+        ),
+        "professions_invalid",
+    )
     codes = [entry["professionCode"] for entry in professions]
-    _require(len(set(codes)) == len(codes) and [entry["professionName"] for entry in professions
-             if str(entry["professionCode"]) == profession] == [label], "profession_changed")
+    _require(
+        len(set(codes)) == len(codes)
+        and [entry["professionName"] for entry in professions if str(entry["professionCode"]) == profession] == [label],
+        "profession_changed",
+    )
 
 
 def _new_file(path):
@@ -190,13 +250,15 @@ async def _stream_response(response, output, receipt_by_field, progress, complet
             if not chunk:
                 _require(response.content.at_eof(), "partial_eof")
                 break
-            retained = chunk[:limit - receipt_by_field["content_bytes"]]
+            retained = chunk[: limit - receipt_by_field["content_bytes"]]
             output.write(retained)
             digest.update(retained)
             receipt_by_field["content_bytes"] += len(retained)
             _require(len(retained) == len(chunk), "response_too_large")
         _require(receipt_by_field["content_bytes"] > 0, "response_empty")
-        _require(expected_length is None or receipt_by_field["content_bytes"] == expected_length, "content_length_mismatch")
+        _require(
+            expected_length is None or receipt_by_field["content_bytes"] == expected_length, "content_length_mismatch"
+        )
         await progress(completed, 8)
         receipt_by_field.update(eof=True, content_length_verified=expected_length is not None, complete=True)
     finally:
@@ -205,26 +267,45 @@ async def _stream_response(response, output, receipt_by_field, progress, complet
 
 async def _fetch_response(session, directory, stage, route, progress, completed, fields=None):
     method, source_url, content_type = route
-    _require((method, source_url) in {("GET", BASE_URL), ("POST", BASE_URL), ("POST", PROFESSIONS_URL),
-                                    ("GET", REPORT_URL)}, "route_invalid")
+    _require(
+        (method, source_url) in {("GET", BASE_URL), ("POST", BASE_URL), ("POST", PROFESSIONS_URL), ("GET", REPORT_URL)},
+        "route_invalid",
+    )
     limit = MAX_REPORT_BYTES if content_type == "text/csv" else MAX_FORM_BYTES
     suffix = {"text/html": "html", "application/json": "json", "text/csv": "csv"}[content_type]
     path = directory / f"{stage}.{suffix}"
-    receipt_by_field = {"stage": stage, "method": method, "source_url": source_url, "filepath": str(path),
-               "downloaded_at": datetime.now(timezone.utc).isoformat(), "status": None, "headers": {},
-               "content_bytes": 0, "content_sha256": hashlib.sha256(b"").hexdigest(),
-               "eof": False, "content_length_verified": False, "complete": False}
+    receipt_by_field = {
+        "stage": stage,
+        "method": method,
+        "source_url": source_url,
+        "filepath": str(path),
+        "downloaded_at": datetime.now(timezone.utc).isoformat(),
+        "status": None,
+        "headers": {},
+        "content_bytes": 0,
+        "content_sha256": hashlib.sha256(b"").hexdigest(),
+        "eof": False,
+        "content_length_verified": False,
+        "complete": False,
+    }
     await progress(completed, 8)
     async with asyncio.timeout(RESPONSE_SECONDS):
         with _new_file(path) as output, _new_file(directory / f"{stage}.receipt.json") as retained_receipt:
             try:
                 async with session.request(method, source_url, data=fields, allow_redirects=False) as response:
-                    receipt_by_field.update(status=response.status, headers={name: response.headers.getall(name, []) for name in (
-                        "Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding")})
+                    receipt_by_field.update(
+                        status=response.status,
+                        headers={
+                            name: response.headers.getall(name, [])
+                            for name in ("Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding")
+                        },
+                    )
                     _require(str(response.url) == source_url, "response_url_changed")
                     _require(response.status == 200, f"http_failure:{response.status}")
                     expected_length = _response_headers(response, content_type, limit)
-                    await _stream_response(response, output, receipt_by_field, progress, completed, limit, expected_length)
+                    await _stream_response(
+                        response, output, receipt_by_field, progress, completed, limit, expected_length
+                    )
             except BaseException as exc:
                 receipt_by_field.update(complete=False, error_type=type(exc).__name__)
                 raise
@@ -238,34 +319,61 @@ async def _fetch_response(session, directory, stage, route, progress, completed,
 
 
 async def _acquire_board(directory, progress, specification, responses):
+    """Acquire one board through its exact form sequence and retain each receipt."""
     label, board, profession, profession_label = specification
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=RESPONSE_SECONDS), cookie_jar=aiohttp.CookieJar(),
-                                     trust_env=False, auto_decompress=False,
-                                     headers={"User-Agent": "Mozilla/5.0", "Referer": BASE_URL,
-                                              "Accept-Encoding": "identity"}) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=RESPONSE_SECONDS),
+        cookie_jar=aiohttp.CookieJar(),
+        trust_env=False,
+        auto_decompress=False,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": BASE_URL, "Accept-Encoding": "identity"},
+    ) as session:
         # aiohttp otherwise repeats idempotent requests after connection failures.
         _require(type(getattr(session, "_retry_connection", None)) is bool, "retry_control_unavailable")
         session._retry_connection = False
-        form = await _fetch_response(session, directory, label + "-form", ("GET", BASE_URL, "text/html"),
-                                     progress, len(responses))
+        form = await _fetch_response(
+            session, directory, label + "-form", ("GET", BASE_URL, "text/html"), progress, len(responses)
+        )
         responses.append(form)
         hidden = _validated_form(Path(form["filepath"]).read_bytes(), board)
-        professions = await _fetch_response(session, directory, label + "-professions",
-                                            ("POST", PROFESSIONS_URL, "application/json"), progress, len(responses),
-                                            [("id", board)])
+        request = ("POST", PROFESSIONS_URL, "application/json")
+        professions = await _fetch_response(
+            session, directory, label + "-professions", request, progress, len(responses), [("id", board)]
+        )
         responses.append(professions)
         _validated_professions(Path(professions["filepath"]).read_bytes(), profession, profession_label)
-        filters = [("Board.BoardCode", board), ("Profession.ProfessionCode", profession), ("Rank.RankName", ""),
-                   ("State.StateCode", "100"), ("EduFlag", "true"), ("SAQFlag", "true"), ("PracticeFlag", "true")]
-        submitted = await _fetch_response(session, directory, label + "-submitted", ("POST", BASE_URL, "text/html"),
-                                          progress, len(responses), filters + hidden)
+        filters = [
+            ("Board.BoardCode", board),
+            ("Profession.ProfessionCode", profession),
+            ("Rank.RankName", ""),
+            ("State.StateCode", "100"),
+            ("EduFlag", "true"),
+            ("SAQFlag", "true"),
+            ("PracticeFlag", "true"),
+        ]
+        submitted = await _fetch_response(
+            session,
+            directory,
+            label + "-submitted",
+            ("POST", BASE_URL, "text/html"),
+            progress,
+            len(responses),
+            filters + hidden,
+        )
         responses.append(submitted)
         _validated_form(Path(submitted["filepath"]).read_bytes(), board, submitted=True)
-        report = await _fetch_response(session, directory, label + "-report", ("GET", REPORT_URL, "text/csv"),
-                                       progress, len(responses))
+        report = await _fetch_response(
+            session, directory, label + "-report", ("GET", REPORT_URL, "text/csv"), progress, len(responses)
+        )
         responses.append(report)
-    return {**report, "profession_code": profession, "profession_label": profession_label,
-            "filters": [[name, value] for name, value in filters + hidden if name != "__RequestVerificationToken"]}
+    return {
+        **report,
+        "profession_code": profession,
+        "profession_label": profession_label,
+        "filters": [
+            [name, field_value] for name, field_value in filters + hidden if name != "__RequestVerificationToken"
+        ],
+    }
 
 
 async def acquire_reports(directory: Path, progress) -> dict:
@@ -281,9 +389,20 @@ async def acquire_reports(directory: Path, progress) -> dict:
     directory = directory.absolute()
     _reject_symlinks(directory)
     _require(directory.is_dir(), "directory_invalid")
-    for name in ["acquisition.json", *(f"{label}-{stage}.{suffix}" for label, *_ in REPORTS
-                 for stage, extension in (("form", "html"), ("professions", "json"), ("submitted", "html"), ("report", "csv"))
-                 for suffix in (extension, "receipt.json"))]:
+    for name in [
+        "acquisition.json",
+        *(
+            f"{label}-{stage}.{suffix}"
+            for label, *_ in REPORTS
+            for stage, extension in (
+                ("form", "html"),
+                ("professions", "json"),
+                ("submitted", "html"),
+                ("report", "csv"),
+            )
+            for suffix in (extension, "receipt.json")
+        ),
+    ]:
         path = directory / name
         _reject_symlinks(path)
         if path.exists():
@@ -293,7 +412,12 @@ async def acquire_reports(directory: Path, progress) -> dict:
         for specification in REPORTS:
             reports[specification[2]] = await _acquire_board(directory, progress, specification, responses)
         await progress(8, 8)
-        manifest_by_field = {"schema_version": ACQUISITION_SCHEMA, "complete": True, "responses": responses, "reports": reports}
+        manifest_by_field = {
+            "schema_version": ACQUISITION_SCHEMA,
+            "complete": True,
+            "responses": responses,
+            "reports": reports,
+        }
         with _new_file(directory / "acquisition.json") as output:
             output.write(encoded_json(manifest_by_field))
             output.flush()

@@ -15,9 +15,16 @@ from tests.test_massachusetts_profile import PREDECESSOR, harness, worker
 
 
 def _completed_parent(harness):
-    parent_by_field = {"run_id": PREDECESSOR, "status": "completed", "source_manifest": worker._source_manifest(
-        {}, harness.cohort, None, categories=worker.LEGACY_CATEGORIES,
-    )}
+    parent_by_field = {
+        "run_id": PREDECESSOR,
+        "status": "completed",
+        "source_manifest": worker._source_manifest(
+            {},
+            harness.cohort,
+            None,
+            categories=worker.LEGACY_CATEGORIES,
+        ),
+    }
     directory = harness.artifact_root / parent_by_field["run_id"]
     (directory / "profiles").mkdir(parents=True)
     worker.acquisition.write_new_json(directory / "cohort.json", harness.cohort)
@@ -28,9 +35,17 @@ def _completed_parent(harness):
         response = harness.responses_by_license[license_number]
         worker.acquisition.write_new_json(directory / "profiles" / f"{license_number}.json", response)
         total_bytes += len(response["body_text"].encode())
-        response_hash.update(worker.acquisition.encoded_json([license_number, response["content_sha256"], response["downloaded_at"]]))
-    metrics_by_field = {"responses": len(harness.cohort["roots"]), "response_bytes": total_bytes, "reused_responses": 0,
-               "responses_sha256": response_hash.hexdigest(), "acquisition_complete": True, "transport_failures": 0}
+        response_hash.update(
+            worker.acquisition.encoded_json([license_number, response["content_sha256"], response["downloaded_at"]])
+        )
+    metrics_by_field = {
+        "responses": len(harness.cohort["roots"]),
+        "response_bytes": total_bytes,
+        "reused_responses": 0,
+        "responses_sha256": response_hash.hexdigest(),
+        "acquisition_complete": True,
+        "transport_failures": 0,
+    }
     artifact = worker._artifact(parent_by_field, directory, metrics_by_field)
     parent_by_field["metrics"] = {**metrics_by_field, "published": True}
     return parent_by_field, artifact, directory
@@ -38,23 +53,72 @@ def _completed_parent(harness):
 
 def _install_parent(monkeypatch, harness, parent, artifact):
     monkeypatch.setattr(worker.store, "read_reprocess_run", AsyncMock(return_value=(parent, artifact)))
-    worker.acquisition.capture_registry_cohort.side_effect = AssertionError("No registry read during retained reprocessing")
-    monkeypatch.setattr(worker.acquisition.aiohttp, "ClientSession", Mock(side_effect=AssertionError("No transport during retained reprocessing")))
+    worker.acquisition.capture_registry_cohort.side_effect = AssertionError(
+        "No registry read during retained reprocessing"
+    )
+    monkeypatch.setattr(
+        worker.acquisition.aiohttp,
+        "ClientSession",
+        Mock(side_effect=AssertionError("No transport during retained reprocessing")),
+    )
+
+
+def _assert_reprocessed_facts(harness, run, expected_count, lineage):
+    """Keep original fact values and timestamps through profile composition."""
+    facts = harness.rows_for(worker.ProviderProfileFact)
+    assert len(facts) == 3 * expected_count
+    assert {fact["category"] for fact in facts} == {"education", "certifications", "specialties"}
+    for fact in facts:
+        assert "reprocessing" not in fact["source_json"]
+        assert fact["source_json"]["downloaded_at"] == "2026-09-08T12:00:00+00:00"
+    assert all(
+        source_record["normalized_payload"]["reprocessing"] == lineage
+        for source_record in harness.rows_for(worker.ProviderProfileSourceRecord)
+    )
+    assert all(
+        source_record["raw_payload"]["languages"] == ["Example Language"]
+        for source_record in harness.rows_for(worker.ProviderProfileSourceRecord)
+    )
+    assert "Example Language" not in str(facts)
+    npi = facts[0]["npi"]
+    projection = _state_projection(
+        npi,
+        [
+            {
+                **fact,
+                "generation_id": run["run_id"],
+                "run_status": "completed",
+                "source_manifest": run["source_manifest"],
+            }
+            for fact in facts
+            if fact["npi"] == npi
+        ],
+    )
+    assert projection["generation_id"] == run["run_id"]
+    assert all(
+        "reprocessing" not in evidence_record and evidence_record["downloaded_at"] == "2026-09-08T12:00:00+00:00"
+        for evidence_record in projection["evidence"]["records"]
+    )
 
 
 @pytest.mark.parametrize("limit", [None, 2, 100])
 async def test_managed_reprocessing_preserves_parent_bytes_and_public_evidence(harness, monkeypatch, limit):
+    """Reprocess all or bounded parents without fetching or changing retained evidence."""
     for response in harness.responses_by_license.values():
         profile = worker.acquisition.decoded_profile(response)
         profile["specialties"] = ["Example Specialty"]
-        profile["boardCertifications"] = {"abms": [{"boardName": "Example Board", "specialties": [], "subspecialties": []}]}
+        profile["boardCertifications"] = {
+            "abms": [{"boardName": "Example Board", "specialties": [], "subspecialties": []}]
+        }
         profile["languages"] = ["Example Language"]
         body = worker.acquisition.encoded_json(profile)
         response.update(body_text=body.decode(), content_sha256=hashlib.sha256(body).hexdigest())
     parent, artifact, directory = _completed_parent(harness)
     before_by_name = {str(path.relative_to(directory)): path.read_bytes() for path in directory.rglob("*.json")}
     _install_parent(monkeypatch, harness, parent, artifact)
-    await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": limit, "reprocess_from": parent["run_id"]})
+    await worker.import_profiles(
+        harness.ctx, {**harness.task, "max_providers": limit, "reprocess_from": parent["run_id"]}
+    )
     run = harness.store_by_name["claim_run"].call_args.args[0]
     assert run["run_id"] != parent["run_id"] and run["source_manifest"]["expected_current_run_id"] == parent["run_id"]
     assert run["source_manifest"]["categories"] == list(worker.PROFILE_CATEGORIES)
@@ -70,23 +134,7 @@ async def test_managed_reprocessing_preserves_parent_bytes_and_public_evidence(h
     metrics = harness.finish.call_args.args[3]
     assert metrics["reused_responses"] == metrics["responses"] == expected_count
     assert harness.requests == []
-    facts = harness.rows_for(worker.ProviderProfileFact)
-    assert len(facts) == 3 * expected_count
-    assert {fact["category"] for fact in facts} == {"education", "certifications", "specialties"}
-    for fact in facts:
-        assert "reprocessing" not in fact["source_json"]
-        assert fact["source_json"]["downloaded_at"] == "2026-09-08T12:00:00+00:00"
-    assert all(source_record["normalized_payload"]["reprocessing"] == lineage
-               for source_record in harness.rows_for(worker.ProviderProfileSourceRecord))
-    assert all(source_record["raw_payload"]["languages"] == ["Example Language"]
-               for source_record in harness.rows_for(worker.ProviderProfileSourceRecord))
-    assert "Example Language" not in str(facts)
-    npi = facts[0]["npi"]
-    projection = _state_projection(npi, [{**fact, "generation_id": run["run_id"], "run_status": "completed",
-                                         "source_manifest": run["source_manifest"]} for fact in facts if fact["npi"] == npi])
-    assert projection["generation_id"] == run["run_id"]
-    assert all("reprocessing" not in evidence_record and evidence_record["downloaded_at"] == "2026-09-08T12:00:00+00:00"
-               for evidence_record in projection["evidence"]["records"])
+    _assert_reprocessed_facts(harness, run, expected_count, lineage)
     assert json.loads((child / "manifest.json").read_bytes())["source_manifest"] == run["source_manifest"]
 
 
@@ -111,7 +159,9 @@ async def test_entire_parent_is_validated_before_claim_even_for_bounded_selectio
         path.symlink_to(directory / "profiles" / f"{selected}.json")
     _install_parent(monkeypatch, harness, parent, artifact)
     with pytest.raises(ValueError, match="massachusetts_profile_"):
-        await worker.import_profiles(harness.ctx, {**harness.task, "max_providers": 1, "reprocess_from": parent["run_id"]})
+        await worker.import_profiles(
+            harness.ctx, {**harness.task, "max_providers": 1, "reprocess_from": parent["run_id"]}
+        )
     harness.store_by_name["claim_run"].assert_not_called()
     assert harness.writes == [] and harness.requests == []
     harness.finish.assert_not_called()
@@ -128,7 +178,9 @@ async def test_changed_envelope_after_preflight_cannot_reach_completion(harness,
         path.write_bytes(worker.acquisition.encoded_json(response))
 
     if phase == "claim":
-        harness.store_by_name["claim_run"].side_effect = lambda _run: change_response(directory / "profiles" / "123.json")
+        harness.store_by_name["claim_run"].side_effect = lambda _run: change_response(
+            directory / "profiles" / "123.json"
+        )
     else:
         original_upsert = harness.upsert
 
@@ -179,15 +231,23 @@ async def test_retained_validation_and_copy_honor_cancellation(harness):
     cohort, preparation = await retained.validate_acquisition(directory, parent, artifact, AsyncMock())
     destination = harness.artifact_root / "copy"
     with pytest.raises(ImportCancelledError):
-        await retained.copy_profiles(cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], progress)
+        await retained.copy_profiles(
+            cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], progress
+        )
     assert list(destination.iterdir()) == []
 
 
-@pytest.mark.parametrize("params", [
-    {"reprocess_from": "../other"}, {"reprocess_from": 1},
-    {"resume_from": "a" * 64, "reprocess_from": "b" * 64},
-    {"reprocessing_from": "a" * 64}, {"test_mode": True}, [],
-])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"reprocess_from": "../other"},
+        {"reprocess_from": 1},
+        {"resume_from": "a" * 64, "reprocess_from": "b" * 64},
+        {"reprocessing_from": "a" * 64},
+        {"test_mode": True},
+        [],
+    ],
+)
 def test_managed_parameters_reject_invalid_mixed_and_ignored_modes(params):
     with pytest.raises(ValueError, match="massachusetts_profile_"):
         worker.validate_request_parameters(params)
@@ -199,13 +259,34 @@ async def test_copy_missing_response_or_existing_destination_never_falls_back(ha
     destination = harness.artifact_root / "copy"
     destination.mkdir()
     with pytest.raises(FileExistsError):
-        await retained.copy_profiles(cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], AsyncMock())
+        await retained.copy_profiles(
+            cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], AsyncMock()
+        )
     (directory / "profiles" / "123.json").unlink()
     with pytest.raises(ValueError, match="retained_response_missing"):
-        await retained.copy_profiles(cohort["roots"], directory / "profiles", harness.artifact_root / "fresh-copy", preparation["hashes_by_license"], AsyncMock())
+        await retained.copy_profiles(
+            cohort["roots"],
+            directory / "profiles",
+            harness.artifact_root / "fresh-copy",
+            preparation["hashes_by_license"],
+            AsyncMock(),
+        )
 
 
-@pytest.mark.parametrize("change", ["symlink", "large", "identity", "metrics", "negative_bytes", "invalid_reuse", "count", "aggregate_bytes", "aggregate_hash"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "symlink",
+        "large",
+        "identity",
+        "metrics",
+        "negative_bytes",
+        "invalid_reuse",
+        "count",
+        "aggregate_bytes",
+        "aggregate_hash",
+    ],
+)
 async def test_parent_artifact_validation_rejects_invalid_completed_receipts(harness, change):
     parent, artifact, directory = _completed_parent(harness)
     path = directory / "manifest.json"
@@ -222,8 +303,10 @@ async def test_parent_artifact_validation_rejects_invalid_completed_receipts(har
             manifest["acquisition"]["acquisition_complete"] = False
         else:
             key, value = {
-                "negative_bytes": ("response_bytes", -1), "invalid_reuse": ("reused_responses", 4),
-                "count": ("responses", 4), "aggregate_bytes": ("response_bytes", 0),
+                "negative_bytes": ("response_bytes", -1),
+                "invalid_reuse": ("reused_responses", 4),
+                "count": ("responses", 4),
+                "aggregate_bytes": ("response_bytes", 0),
                 "aggregate_hash": ("responses_sha256", "f" * 64),
             }[change]
             manifest["acquisition"][key] = value
@@ -256,7 +339,9 @@ async def test_retained_validation_and_copy_enforce_acquisition_byte_cap(harness
         await retained.validate_acquisition(directory, parent, artifact, AsyncMock())
     destination = harness.artifact_root / "oversize-copy"
     with pytest.raises(ValueError, match="acquisition_too_large"):
-        await retained.copy_profiles(cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], AsyncMock())
+        await retained.copy_profiles(
+            cohort["roots"], directory / "profiles", destination, preparation["hashes_by_license"], AsyncMock()
+        )
     assert list(destination.iterdir()) == []
 
 

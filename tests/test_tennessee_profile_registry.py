@@ -100,7 +100,9 @@ async def test_native_snapshot_keeps_all_occurrences_and_locks_relations(monkeyp
             if done == 0:
                 return
             assert done == total == 4
-            await writer.execute(f"INSERT INTO {schema}.npi_taxonomy VALUES (1000000004,22,'999','TN','207R00000X','Y')")
+            await writer.execute(
+                f"INSERT INTO {schema}.npi_taxonomy VALUES (1000000004,22,'999','TN','207R00000X','Y')"
+            )
             await writer.execute("SET lock_timeout='50ms'")
             with pytest.raises(asyncpg.LockNotAvailableError):
                 await writer.execute(f"ALTER TABLE {schema}.npi RENAME TO replacement")

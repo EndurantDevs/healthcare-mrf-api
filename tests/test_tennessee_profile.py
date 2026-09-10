@@ -58,13 +58,18 @@ class ImportHarness:
             if self.fail_report and profession == "1907":
                 raise RuntimeError("synthetic second report failure")
             descriptors_by_profession[profession] = {
-                "filepath": str(path), "content_bytes": len(content),
+                "filepath": str(path),
+                "content_bytes": len(content),
                 "content_sha256": hashlib.sha256(content).hexdigest(),
-                "source_url": worker.acquisition.REPORT_URL, "downloaded_at": "2026-09-09T00:00:00Z",
+                "source_url": worker.acquisition.REPORT_URL,
+                "downloaded_at": "2026-09-09T00:00:00Z",
             }
         await progress(8, 8)
-        return {"complete": True, "reports": descriptors_by_profession,
-                "responses": [{"complete": True, "status": 200, "content_bytes": 100} for _ in range(8)]}
+        return {
+            "complete": True,
+            "reports": descriptors_by_profession,
+            "responses": [{"complete": True, "status": 200, "content_bytes": 100} for _ in range(8)],
+        }
 
     @asynccontextmanager
     async def transaction(self):
@@ -101,7 +106,7 @@ async def test_complete_pair_has_one_bundle_and_shared_record_evidence(harness):
 
     worker.store.claim_run.side_effect = claim
     result = await worker.import_profiles(harness.ctx, harness.task)
-    artifact, = harness.rows_for(worker.ProviderProfileArtifact)
+    (artifact,) = harness.rows_for(worker.ProviderProfileArtifact)
     records = harness.rows_for(worker.ProviderProfileSourceRecord)
     facts = harness.rows_for(worker.ProviderProfileFact)
     assert len(records) == 2 and {record["matched_npi"] for record in records} == {1000000004, 1000000012}
@@ -110,7 +115,9 @@ async def test_complete_pair_has_one_bundle_and_shared_record_evidence(harness):
     assert {fact["source_json"]["artifact_id"] for fact in facts} == {artifact["artifact_id"]}
     path = harness.directory / artifact["run_id"] / artifact["file_name"]
     content = path.read_bytes()
-    assert len(content) == artifact["content_bytes"] and hashlib.sha256(content).hexdigest() == artifact["content_sha256"]
+    assert (
+        len(content) == artifact["content_bytes"] and hashlib.sha256(content).hexdigest() == artifact["content_sha256"]
+    )
     assert json.loads(content) == artifact["metadata_json"]
     assert result["report_responses"] == 2 and result["source_records_by_profession"] == {"1606": 1, "1907": 1}
     harness.finish.assert_awaited_once()
@@ -118,8 +125,17 @@ async def test_complete_pair_has_one_bundle_and_shared_record_evidence(harness):
     worker.store.retain_source_history.assert_awaited_once()
 
 
-@pytest.mark.parametrize("field,value", [("run_id", None), ("run_id", " "), ("sources", []),
-                                        ("professions", ["1606"]), ("max_providers", 1), ("resume_from", "a" * 64)])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("run_id", None),
+        ("run_id", " "),
+        ("sources", []),
+        ("professions", ["1606"]),
+        ("max_providers", 1),
+        ("resume_from", "a" * 64),
+    ],
+)
 async def test_partial_or_unmanaged_scope_is_rejected_before_io(harness, field, value):
     with pytest.raises(ValueError):
         await worker.import_profiles(harness.ctx, {**harness.task, field: value})
@@ -150,10 +166,15 @@ async def test_failed_or_canceled_staging_never_completes_publication(harness, f
     elif failure == "report":
         harness.fail_report = True
     elif failure.startswith("cancel_"):
-        harness.cancel_model = worker.ProviderProfileSourceRecord if failure == "cancel_record" else worker.ProviderProfileFact
+        harness.cancel_model = (
+            worker.ProviderProfileSourceRecord if failure == "cancel_record" else worker.ProviderProfileFact
+        )
     else:
-        harness.fail_model = {"artifact": worker.ProviderProfileArtifact, "record": worker.ProviderProfileSourceRecord,
-                              "fact": worker.ProviderProfileFact}[failure]
+        harness.fail_model = {
+            "artifact": worker.ProviderProfileArtifact,
+            "record": worker.ProviderProfileSourceRecord,
+            "fact": worker.ProviderProfileFact,
+        }[failure]
     with pytest.raises(ImportCancelledError if failure.startswith("cancel_") else RuntimeError):
         await worker.import_profiles(harness.ctx, harness.task)
     harness.finish.assert_not_awaited()
@@ -205,9 +226,10 @@ async def test_parser_cancellation_drains_thread_without_blocking_event_loop(mon
 
 def test_registry_worker_and_committed_result_use_managed_entrypoint():
     from click.testing import CliRunner
+
+    import process
     from api import control_imports, control_workers
     from process import control_lifecycle
-    import process
 
     importer = worker.IMPORTER
     entry = next(entry for entry in control_imports.importer_registry() if entry["name"] == importer)
@@ -221,9 +243,18 @@ def test_registry_worker_and_committed_result_use_managed_entrypoint():
     cli = CliRunner().invoke(process.process_group, [importer])
     assert cli.exit_code == 2 and "managed import API" in cli.output
     committed_by_field = {"published": True, "retained_source_records": 2}
-    assert control_lifecycle._committed_target_result({"context": {
-        "control_run_terminal_committed": True, "_control_committed_result": committed_by_field,
-    }}, target_module="process.tennessee_profile") is committed_by_field
+    assert (
+        control_lifecycle._committed_target_result(
+            {
+                "context": {
+                    "control_run_terminal_committed": True,
+                    "_control_committed_result": committed_by_field,
+                }
+            },
+            target_module="process.tennessee_profile",
+        )
+        is committed_by_field
+    )
 
 
 def test_tennessee_worker_has_report_capacity_and_respects_explicit_override(monkeypatch):
@@ -232,7 +263,8 @@ def test_tennessee_worker_has_report_capacity_and_respects_explicit_override(mon
     spec = control_workers.WorkerSpec("arq:TennesseeTDHProfile", "process.TennesseeTDHProfile", (worker.IMPORTER,))
     monkeypatch.delenv("HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON", raising=False)
     assert control_workers._worker_job_resources(spec) == {
-        "requests": {"cpu": "1", "memory": "4Gi"}, "limits": {"cpu": "4", "memory": "8Gi"},
+        "requests": {"cpu": "1", "memory": "4Gi"},
+        "limits": {"cpu": "4", "memory": "8Gi"},
     }
     resources_by_kind = {"requests": {"memory": "6Gi"}, "limits": {"memory": "12Gi"}}
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON", json.dumps({spec.worker_class: resources_by_kind}))
