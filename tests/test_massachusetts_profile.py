@@ -386,7 +386,7 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
     registration = next(entry for entry in control_imports.importer_registry() if entry["name"] == importer)
     assert registration["family"] == "provider" and registration["depends_on"] == ["npi"]
     assert registration["cancelable"] is True and registration["enqueue_adapter"] == "arq_single_job"
-    assert {parameter["name"] for parameter in registration["params_schema"]} == {"max_providers", "resume_from"}
+    assert {parameter["name"] for parameter in registration["params_schema"]} == {"max_providers", "resume_from", "reprocess_from"}
     adapter = control_imports._SINGLE_JOB_ADAPTERS[importer]
     dispatch_payload = control_imports._adapter_payload(adapter, {
         "run_id": "synthetic-control", "importer": importer, "family": "provider",

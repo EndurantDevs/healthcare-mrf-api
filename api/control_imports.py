@@ -2426,13 +2426,31 @@ async def find_importer_run_by_idempotency_key(
 async def _idempotent_import_run(
     importer: str,
     idempotency_key: str,
+    *,
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if importer == "massachusetts-borim-profile":
+        existing = await find_importer_run_by_idempotency_key(importer, idempotency_key)
+        if ((params or {}).get("reprocess_from") is not None
+                or ((existing or {}).get("params") or {}).get("reprocess_from") is not None):
+            return existing
     if importer in ALL_STATUS_IDEMPOTENCY_IMPORTERS:
         return await find_importer_run_by_idempotency_key(
             importer,
             idempotency_key,
         )
     return await find_active_run_by_idempotency_key(importer, idempotency_key)
+
+
+def _validate_massachusetts_request(importer, params, existing=None):
+    """Do not silently substitute another acquisition mode for a MA request."""
+    if importer != "massachusetts-borim-profile":
+        return
+    from process.massachusetts_profile import validate_request_parameters
+
+    scope = validate_request_parameters(params)
+    if existing is not None and scope != validate_request_parameters(existing.get("params") or {}):
+        raise ValueError("massachusetts_profile_existing_request_mismatch")
 
 
 async def find_earliest_active_run_by_importer(importer: str) -> dict[str, Any] | None:
@@ -3254,6 +3272,31 @@ async def _admit_npi_import_run(
     return None
 
 
+async def _admit_massachusetts_import_run(import_row: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep retained keys bound to their original mode across terminal races."""
+    importer = "massachusetts-borim-profile"
+    params = import_row["params"]
+    async with db.acquire() as connection:
+        await connection.scalar(text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                                lock_key=f"{ImportRun.__table__.schema}.{importer}.admission")
+        if import_row.get("idempotency_key"):
+            owners = await connection.all(select(ImportRun.__table__).where(
+                ImportRun.importer == importer, ImportRun.idempotency_key == import_row["idempotency_key"]))
+            for owner in owners:
+                existing = _normalize_connection_run(owner)
+                if (params.get("reprocess_from") is not None
+                        or (existing.get("params") or {}).get("reprocess_from") is not None
+                        or existing["status"] in ACTIVE_STATUSES):
+                    _validate_massachusetts_request(importer, params, existing)
+                    return existing
+        active_runs = await _active_importer_runs(connection, importer)
+        if active_runs:
+            _validate_massachusetts_request(importer, params, active_runs[0])
+            return active_runs[0]
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
 async def _admit_import_row(
     importer: str,
     import_run_values_by_name: dict[str, Any],
@@ -3270,6 +3313,8 @@ async def _admit_import_row(
         return await _admit_wave_fenced_import_run(import_run_values_by_name)
     if importer == "npi":
         return await _admit_npi_import_run(import_run_values_by_name)
+    if importer == "massachusetts-borim-profile":
+        return await _admit_massachusetts_import_run(import_run_values_by_name)
     await db.execute(insert(ImportRun).values(**import_run_values_by_name))
     return None
 
@@ -3282,6 +3327,7 @@ async def create_import_run(
     importer = str(request_payload_map.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
+    _validate_massachusetts_request(importer, request_payload_map.get("params") if request_payload_map.get("params") is not None else {})
     raw_params_by_name = (
         request_payload_map.get("params")
         if isinstance(request_payload_map.get("params"), dict)
@@ -3377,8 +3423,9 @@ async def create_import_run(
         and importer not in {"provider-directory-fhir", "hospital-prices"}
         and not is_ptg_source_file_admission
     ):
-        replayed_run = await _idempotent_import_run(importer, idempotency_key)
+        replayed_run = await _idempotent_import_run(importer, idempotency_key, params=normalized_params_by_name)
         if replayed_run:
+            _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
             return normalize_run(replayed_run), False
     if (
         importer not in {"provider-directory-fhir", "hospital-prices"}
@@ -3391,6 +3438,7 @@ async def create_import_run(
     ):
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
+            _validate_massachusetts_request(importer, normalized_params_by_name, active_importer)
             return normalize_run(active_importer), False
 
     now = utc_now()
@@ -3453,8 +3501,10 @@ async def create_import_run(
             replayed_run = await _idempotent_import_run(
                 importer,
                 idempotency_key,
+                params=normalized_params_by_name,
             )
             if replayed_run:
+                _validate_massachusetts_request(importer, normalized_params_by_name, replayed_run)
                 if (
                     importer == "hospital-prices"
                     and not _is_exact_hospital_price_replay(

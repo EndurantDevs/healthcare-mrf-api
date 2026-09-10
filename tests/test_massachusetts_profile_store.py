@@ -11,10 +11,13 @@ from unittest.mock import AsyncMock, Mock
 import uuid
 
 import pytest
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from sqlalchemy.orm import registry
+
+from api import control_imports
 from db.connection import Database
 from process import massachusetts_profile_store as store
 from process import provider_profile_source_store as shared_store
@@ -661,3 +664,210 @@ async def test_portfolio_overlap_counts_once_and_is_reported_separately(monkeypa
         result = await store.finish_unpublished_run(run_id, _metrics(3))
         assert result["matched_public_providers"] == 2 and result["portfolio_only_public_providers"] == 1
         assert (await store._read_run(run_id))["metrics"]["portfolio_only_public_providers"] == 1
+
+
+async def _seed_reprocessing_parent(database):
+    parent = await _seed_run(database)
+    await store.publish_run(parent["run_id"], expected_current_run_id=None, metrics=_metrics())
+    artifact_by_field = {"artifact_id": "c" * 64, "run_id": parent["run_id"], "source_key": store.SOURCE_KEY,
+                "file_name": "manifest.json", "source_url": "https://example.test/manifest.json", "category": "profile", "content_sha256": "d" * 64, "content_bytes": 100}
+    await database.insert(store.ProviderProfileArtifact.__table__).values(artifact_by_field).status()
+    return parent, artifact_by_field
+
+
+def _reprocessing_run(parent, artifact, *, limit=2):
+    candidate = _run(limit=limit, predecessor=parent["run_id"], categories=store.PROFILE_CATEGORIES)
+    candidate["source_manifest"].update(reprocess_from=parent["run_id"], reprocessing={
+        "source_run_id": parent["run_id"], "artifact_id": artifact["artifact_id"],
+        "manifest_sha256": artifact["content_sha256"], "response_envelopes_sha256": "e" * 64,
+    })
+    return candidate
+
+
+async def test_completed_current_parent_is_reprocessed_under_frozen_claim_and_completion(monkeypatch):
+    async with _database(monkeypatch) as database:
+        parent, artifact = await _seed_reprocessing_parent(database)
+        original = await store._read_run(parent["run_id"])
+        loaded, loaded_artifact = await store.read_reprocess_run(parent["run_id"], expected_current_run_id=parent["run_id"])
+        assert loaded == original and loaded_artifact["content_sha256"] == artifact["content_sha256"]
+        candidate = _reprocessing_run(parent, artifact)
+        await store.claim_run(candidate)
+        await _seed_payloads(database, candidate["run_id"], 2)
+        with pytest.raises(RuntimeError, match="reprocessing_incomplete"):
+            await store.finish_unpublished_run(candidate["run_id"], _metrics(2))
+        metrics_by_field = {**_metrics(2), "reused_responses": 2, "response_envelopes_sha256": "f" * 64}
+        assert (await store.finish_unpublished_run(candidate["run_id"], metrics_by_field))["published"] is False
+        assert (await store.read_publication())["current_run_id"] == parent["run_id"]
+        assert await store._read_run(parent["run_id"]) == original
+        with pytest.raises(RuntimeError, match="already_completed"):
+            await store.claim_run(candidate)
+
+
+@pytest.mark.parametrize("change", ["cohort", "source", "artifact", "pointer"])
+async def test_reprocessing_rechecks_parent_identity_during_claim(monkeypatch, change):
+    async with _database(monkeypatch) as database:
+        parent, artifact = await _seed_reprocessing_parent(database)
+        candidate = _reprocessing_run(parent, artifact)
+        await store.read_reprocess_run(parent["run_id"], expected_current_run_id=parent["run_id"])
+        if change == "cohort":
+            candidate["source_manifest"]["cohort_sha256"] = "f" * 64
+        elif change == "source":
+            candidate["source_manifest"]["source"]["coverage_scope"] = "different"
+        elif change == "artifact":
+            await database.status(f"UPDATE {store._table(store.ProviderProfileArtifact)} SET content_sha256=:digest", digest="f" * 64)
+        else:
+            next_run = await _seed_run(database, predecessor=parent["run_id"])
+            await store.publish_run(next_run["run_id"], expected_current_run_id=parent["run_id"], metrics=_metrics())
+        with pytest.raises(RuntimeError, match="parent_changed|predecessor_changed"):
+            await store.claim_run(candidate)
+        assert await database.scalar(f"SELECT count(*) FROM {store._table(store.ProviderProfileImportRun)} WHERE run_id=:run_id", run_id=candidate["run_id"]) == 0
+
+
+@pytest.mark.parametrize("state", ["failed", "bounded", "not_current", "missing_artifact", "wrong_artifact"])
+async def test_only_completed_full_current_acquisition_with_owned_artifact_is_eligible(monkeypatch, state):
+    async with _database(monkeypatch) as database:
+        if state in {"failed", "bounded"}:
+            parent = await _seed_run(database, limit=2)
+            if state == "failed":
+                await store.mark_run_failed(parent["run_id"], "synthetic interruption")
+            else:
+                await store.finish_unpublished_run(parent["run_id"], _metrics(2))
+        else:
+            parent, _artifact = await _seed_reprocessing_parent(database)
+            if state == "not_current":
+                next_run = await _seed_run(database, predecessor=parent["run_id"])
+                await store.publish_run(next_run["run_id"], expected_current_run_id=parent["run_id"], metrics=_metrics())
+            elif state == "missing_artifact":
+                await database.status(f"DELETE FROM {store._table(store.ProviderProfileArtifact)}")
+            else:
+                await database.status(f"UPDATE {store._table(store.ProviderProfileArtifact)} SET file_name='other.json'")
+        with pytest.raises(RuntimeError, match="reprocessing_parent_ineligible|predecessor_changed|reprocessing_artifact"):
+            await store.read_reprocess_run(parent["run_id"], expected_current_run_id=parent["run_id"])
+
+
+async def test_failed_reprocessing_never_enters_network_capable_resume(monkeypatch):
+    async with _database(monkeypatch) as database:
+        parent, artifact = await _seed_reprocessing_parent(database)
+        candidate = _reprocessing_run(parent, artifact)
+        await store.claim_run(candidate)
+        await store.mark_run_failed(candidate["run_id"], "synthetic interrupted copy")
+        with pytest.raises(RuntimeError, match="resume_not_eligible"):
+            await store.read_resume_run(candidate["run_id"], max_providers=2, expected_current_run_id=parent["run_id"])
+        assert (await store.read_publication())["current_run_id"] == parent["run_id"]
+
+
+@pytest.mark.parametrize("public_count", [7900, 10000])
+async def test_full_reprocessing_keeps_atomic_publication_and_existing_coverage_guard(monkeypatch, public_count):
+    async with _database(monkeypatch) as database:
+        parent, artifact = await _seed_reprocessing_parent(database)
+        original = await store._read_run(parent["run_id"])
+        candidate = _reprocessing_run(parent, artifact, limit=None)
+        await store.claim_run(candidate)
+        await _seed_payloads(database, candidate["run_id"], 10000)
+        facts_table = store._table(store.ProviderProfileFact)
+        await database.status(f"UPDATE {facts_table} SET public_default=false WHERE run_id=:run_id AND npi > :last_npi",
+                              run_id=candidate["run_id"], last_npi=1000000000 + public_count)
+        metrics_by_field = {**_metrics(), "reused_responses": 10000, "response_envelopes_sha256": "e" * 64}
+        if public_count == 7900:
+            with pytest.raises(RuntimeError, match="volume_drop:matched_public_providers"):
+                await store.publish_run(candidate["run_id"], expected_current_run_id=parent["run_id"], metrics=metrics_by_field)
+            assert (await store.read_publication())["current_run_id"] == parent["run_id"]
+            assert (await store._read_run(candidate["run_id"]))["status"] == "running"
+            expected_published = 0
+        else:
+            assert (await store.publish_run(candidate["run_id"], expected_current_run_id=parent["run_id"], metrics=metrics_by_field))["published"] is True
+            pointer = await store.read_publication()
+            assert pointer["current_run_id"] == candidate["run_id"] and pointer["previous_run_id"] == parent["run_id"]
+            assert (await store._read_run(candidate["run_id"]))["metrics"]["reused_responses"] == 10000
+            expected_published = 10000
+        assert await database.scalar(f"SELECT count(*) FROM {facts_table} WHERE run_id=:run_id AND published_at IS NOT NULL", run_id=candidate["run_id"]) == expected_published
+        assert await store._read_run(parent["run_id"]) == original
+
+
+async def test_retained_control_admission_serializes_key_owners_and_rejects_mode_changes(monkeypatch):
+    async with _database(monkeypatch) as database:
+        table = control_imports.ImportRun.__table__.to_metadata(MetaData(), schema=store.ProviderProfileImportRun.__table__.schema)
+        mapped = registry()
+        model = type("RetainedImportRun", (), {})
+        mapped.map_imperatively(model, table)
+        monkeypatch.setattr(control_imports, "ImportRun", model)
+        monkeypatch.setattr(control_imports, "db", database)
+        try:
+            await database.create_table(table)
+            request_by_field = {"importer": "massachusetts-borim-profile", "status": "queued", "idempotency_key": "retained-key",
+                                "params": {"reprocess_from": "a" * 64, "max_providers": 100}}
+            requests = [{**request_by_field, "run_id": uuid.uuid4().hex} for _ in range(2)]
+            results = await asyncio.gather(*(control_imports._admit_import_row(
+                request["importer"], request, is_ptg_source_file_admission=False) for request in requests))
+            owners = await database.all(select(table))
+            assert len(owners) == 1 and results.count(None) == 1
+            owner_id = owners[0]._mapping["run_id"]
+            assert next(result for result in results if result is not None)["run_id"] == owner_id
+            await database.status(update(table).values(status="succeeded"))
+            replay = await control_imports._admit_massachusetts_import_run({**request_by_field, "run_id": uuid.uuid4().hex})
+            assert replay["run_id"] == owner_id and replay["status"] == "succeeded"
+            with pytest.raises(ValueError, match="existing_request_mismatch"):
+                await control_imports._admit_massachusetts_import_run({**request_by_field, "run_id": uuid.uuid4().hex, "params": {}})
+            assert len(await database.all(select(table))) == 1
+        finally:
+            mapped.dispose()
+
+
+@pytest.mark.parametrize("change", ["mixed", "missing_lineage", "wrong_parent", "wrong_hash", "orphan_lineage"])
+def test_reprocessing_manifest_is_explicit_and_cannot_mix_modes(change):
+    parent = _run()
+    candidate = _reprocessing_run(parent, {"artifact_id": "c" * 64, "content_sha256": "d" * 64})
+    manifest = candidate["source_manifest"]
+    if change == "mixed":
+        manifest["resume_from"] = "f" * 64
+    elif change == "missing_lineage":
+        del manifest["reprocessing"]
+    elif change == "wrong_parent":
+        manifest["reprocessing"]["source_run_id"] = "f" * 64
+    elif change == "wrong_hash":
+        manifest["reprocessing"]["manifest_sha256"] = "bad"
+    else:
+        del manifest["reprocess_from"]
+    with pytest.raises(ValueError, match="reprocessing_manifest_invalid"):
+        store._manifest(candidate)
+
+
+def test_full_reprocessing_requires_frozen_envelope_digest():
+    parent = _run()
+    candidate = _reprocessing_run(parent, {"artifact_id": "c" * 64, "content_sha256": "d" * 64}, limit=None)
+    with pytest.raises(RuntimeError, match="reprocessing_incomplete"):
+        store._completion_metrics(candidate, {**_metrics(), "reused_responses": 10000,
+            "response_envelopes_sha256": "f" * 64}, _counts())
+
+
+async def test_retention_keeps_private_ancestry_under_source_lock(monkeypatch, tmp_path):
+    async with _database(monkeypatch) as database:
+        run_rows = [_run() for _ in range(4)]
+        for index, source_run in enumerate(run_rows):
+            source_run.update(status="completed", metrics={"published": True},
+                       started_at=store._now() - timedelta(days=30 - index))
+        ancestor, parent, current, unrelated = run_rows
+        for source_run, previous in ((parent, ancestor), (current, parent)):
+            source_run["source_manifest"].update(_reprocessing_run(previous, {
+                "artifact_id": "c" * 64, "content_sha256": "d" * 64}, limit=None)["source_manifest"])
+        unrelated["started_at"] = store._now() - timedelta(days=60)
+        for source_run in run_rows:
+            await database.insert(store.ProviderProfileImportRun.__table__).values(source_run).status()
+            await _seed_payloads(database, source_run["run_id"], 1)
+            (tmp_path / source_run["run_id"]).mkdir()
+        await database.insert(store.ProviderProfileSourcePublication.__table__).values(
+            source_key=store.SOURCE_KEY, current_run_id=current["run_id"], previous_run_id=parent["run_id"],
+            published_at=store._now()).status()
+        original_delete = shared_store._delete_retained_payload_rows
+
+        async def delete_locked(run_ids):
+            assert await database.scalar("SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted") > 0
+            return await original_delete(run_ids)
+
+        monkeypatch.setattr(shared_store, "_delete_retained_payload_rows", delete_locked)
+        receipt = await store.retain_source_history(tmp_path)
+        assert receipt["deleted_run_ids"] == [unrelated["run_id"]]
+        assert set(receipt["protected_audit_run_ids"]) == {source_run["run_id"] for source_run in (ancestor, parent, current)}
+        assert all((tmp_path / source_run["run_id"]).is_dir() for source_run in (ancestor, parent, current))
+        assert not (tmp_path / unrelated["run_id"]).exists()
+        assert await store.retained_counts(ancestor["run_id"]) == _counts(1)
