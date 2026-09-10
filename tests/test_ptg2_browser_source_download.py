@@ -612,7 +612,7 @@ async def test_hospital_proxy_does_not_route_an_unapproved_host(monkeypatch):
 @pytest.mark.parametrize(
     "proxy_url",
     [
-        "socks5h://10.42.0.1:39081",
+        "socks5h://hospital-test:test-token@10.42.0.1:39081",
         "socks5://10.42.0.1:39081",
         "socks5://user@10.42.0.1:39081",
         "socks5://user:bad%2Ftoken@10.42.0.1:39081",
