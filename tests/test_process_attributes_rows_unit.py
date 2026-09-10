@@ -346,10 +346,13 @@ async def test_process_prices_covers_age_and_optional_rate_shapes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_prices_flushes_large_batch_without_undefined_counter(monkeypatch):
-    _install_download_pipeline(monkeypatch, [_price_row("34"), _price_row("35")])
+@pytest.mark.parametrize(("row_count", "queued_batches"), [(3, 0), (4, 0), (5, 1), (10, 2)])
+async def test_process_prices_flushes_large_batch_without_undefined_counter(monkeypatch, row_count, queued_batches):
+    """Count each valid row once, including after a flushed batch."""
+
+    _install_download_pipeline(monkeypatch, [_price_row(str(age)) for age in range(34, 34 + row_count)])
     monkeypatch.setattr(process_attributes, "process_rating_areas", AsyncMock())
-    monkeypatch.setattr(process_attributes, "_PLAN_PRICE_BATCH_SIZE", 1)
+    monkeypatch.setattr(process_attributes, "_PLAN_PRICE_BATCH_SIZE", 4)
     monkeypatch.setattr(process_attributes, "push_objects", AsyncMock())
     redis = SimpleNamespace(enqueue_job=AsyncMock())
 
@@ -362,7 +365,7 @@ async def test_process_prices_flushes_large_batch_without_undefined_counter(monk
         },
     )
 
-    redis.enqueue_job.assert_awaited_once()
+    assert redis.enqueue_job.await_count == queued_batches
 
 
 @pytest.mark.asyncio

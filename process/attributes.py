@@ -655,8 +655,6 @@ async def process_prices(ctx, task):
                     )
                     attr_obj_list.clear()
                     count = 0
-                else:
-                    count += 1
                 if test_mode and count >= test_row_limit:
                     break
 
