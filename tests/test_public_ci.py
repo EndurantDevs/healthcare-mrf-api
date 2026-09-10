@@ -76,6 +76,42 @@ def _assert_job_actions(job_id, job, revision) -> None:
     assert has_pinned_checkout or job_id in {"smoke", "source-validation"}
 
 
+def _assert_smoke_job(workflow, workflow_text) -> None:
+    """Require the portable smoke job to use the pinned public toolchain."""
+    job = workflow["jobs"]["smoke"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert "container" not in job
+    assert "services" not in job
+    assert not job.get("continue-on-error")
+    setup = next(step for step in job["steps"] if step.get("name") == "Install Python")
+    assert setup == {
+        "name": "Install Python",
+        "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "with": {"python-version": "3.14.7"},
+    }
+    bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
+    assert bootstrap["run"] == (
+        "printf '%s\\n' 'uv==0.12.12 "
+        "--hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n"
+        "  python -m pip install --disable-pip-version-check --no-deps "
+        "--only-binary=:all: --require-hashes -r /dev/stdin\n"
+        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
+    )
+    commands = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "scripts/ci/public_hygiene.py" in commands
+    assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
+    assert "uv pip install --python .venv/bin/python" in commands
+    assert ".venv/bin/python -m pytest -q" in commands
+    assert "python -m pip install" not in "\n".join(
+        step.get("run", "") for step in job["steps"] if step is not bootstrap
+    )
+    assert "test_process_" in commands or "tests/process/" in commands
+    assert all(
+        token not in workflow_text
+        for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
+    )
+
+
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     assert sorted(path.name for path in workflows.iterdir()) == ["ci.yml"]
@@ -122,35 +158,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         else:
             assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
-    job = workflow["jobs"]["smoke"]
-    assert job["runs-on"] == "ubuntu-latest"
-    assert "container" not in job
-    assert "services" not in job
-    assert not job.get("continue-on-error")
-    setup = next(step for step in job["steps"] if step.get("name") == "Install Python")
-    assert setup == {
-        "name": "Install Python",
-        "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-        "with": {"python-version": "3.14.7"},
-    }
-    bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
-    assert bootstrap["run"] == (
-        "printf '%s\\n' 'uv==0.12.12 "
-        "--hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n"
-        "  python -m pip install --disable-pip-version-check --no-deps "
-        "--only-binary=:all: --require-hashes -r /dev/stdin\n"
-        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
-    )
-    commands = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "scripts/ci/public_hygiene.py" in commands
-    assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
-    assert "uv pip install --python .venv/bin/python" in commands
-    assert ".venv/bin/python -m pytest -q" in commands
-    assert "python -m pip install" not in "\n".join(
-        step.get("run", "") for step in job["steps"] if step is not bootstrap
-    )
-    assert "test_process_" in commands or "tests/process/" in commands
-    assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
+    _assert_smoke_job(workflow, text)
 
 
 def test_dependency_updates_target_the_development_branch():
