@@ -96,9 +96,6 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
     descriptor = manifest["source"]
     if source_key not in STATE_SOURCE_KEYS or descriptor["source_key"] != source_key or descriptor["source_kind"] != "state_regulator":
         raise RuntimeError("state_profile_source_mismatch")
-    source_by_field = {field: descriptor[field] for field in (
-        "source_key", "source_kind", "agency", "jurisdiction", "coverage_scope", "registry_generation",
-    )}
     loaded_categories = set(manifest["categories"])
     if source_key == KENTUCKY_SOURCE_KEY:
         _validate_kentucky_publication(fact_rows, descriptor, manifest["categories"])
@@ -106,6 +103,9 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
         _validate_tennessee_publication(fact_rows, descriptor, manifest["categories"])
     elif not loaded_categories <= {"education", "training", "certifications", "specialties"}:
         raise RuntimeError("state_profile_categories_invalid")
+    source_by_field = {field: descriptor[field] for field in (
+        "source_key", "source_kind", "agency", "jurisdiction", "coverage_scope", "registry_generation",
+    )}
     grouped = defaultdict(dict)
     evidence_records = []
     for fact in fact_rows:
@@ -177,11 +177,15 @@ def _validate_kentucky_fact(npi: int, generation_id: str, fact: Mapping) -> None
 
 
 def _validate_tennessee_publication(fact_rows: list[Mapping], descriptor: Mapping, categories: list) -> None:
-    """Bind Tennessee to its complete education, training and specialty scope."""
+    """Bind Tennessee's complete report scope to its exact registry snapshot."""
     if categories != ["education", "training", "specialties"]:
         raise RuntimeError("state_profile_categories_invalid")
+    snapshot_sha256 = fact_rows[0]["source_manifest"].get("snapshot_sha256")
     if (
         descriptor.get("agency") != "Tennessee Department of Health" or descriptor.get("jurisdiction") != "TN"
+        or descriptor.get("coverage_scope") != "regular_md_do_all_ranks_statuses_locations"
+        or not isinstance(snapshot_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+        or descriptor.get("registry_generation") != snapshot_sha256
         or any(fact_row.get("publication_source_key") != TN_SOURCE_KEY for fact_row in fact_rows)
         or any(fact_row.get("run_schema_version") != TN_SCHEMA_VERSION for fact_row in fact_rows)
         or any(fact_row.get("run_jurisdiction") != "TN" for fact_row in fact_rows)

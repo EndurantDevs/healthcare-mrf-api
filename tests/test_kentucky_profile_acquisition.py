@@ -317,6 +317,26 @@ async def test_replay_preserves_exact_envelopes_and_hashes_every_response_field(
     assert changed["responses_sha256"] == hashlib.sha256(acquisition.encoded_json(first)).hexdigest()
 
 
+async def test_retained_validation_honors_cancellation_before_next_file_or_transport(tmp_path, install_session):
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    acquisition.write_new_json(retained / "C0007.json", _envelope())
+    acquisition.write_new_json(retained / "00042.json", _envelope(content_sha256="0" * 64))
+    originals_by_name = {path.name: path.read_bytes() for path in retained.iterdir()}
+    session = install_session()
+
+    async def cancel_after_first(completed, total):
+        assert total == 2
+        if completed == 1:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.acquire_profiles([{"license_number": number} for number in ("C0007", "00042")],
+                                           tmp_path / "new", cancel_after_first, retained=retained)
+    assert session.requests == [] and not (tmp_path / "new").exists()
+    assert {path.name: path.read_bytes() for path in retained.iterdir()} == originals_by_name
+
+
 @pytest.mark.parametrize("failure", ["changed", "dangling_symlink", "directory", "wrong_query", "truncated", "error"])
 async def test_invalid_retained_response_never_falls_back_to_http(tmp_path, install_session, failure):
     retained = tmp_path / "retained"
@@ -572,6 +592,22 @@ async def test_interrupted_narrowing_keeps_checkpoint_and_refuses_resume(tmp_pat
     assert session.requests == [] and not (tmp_path / "replay").exists()
 
 
+async def test_excess_candidate_surnames_fail_before_any_narrowed_request(tmp_path, install_session):
+    root = _narrowing_root()
+    candidate = root["candidates"][0]
+    root["candidates"] = [{**candidate, "last_name": f"Example {index}"}
+                          for index in range(acquisition.MAX_NARROWED_QUERIES)]
+    assert len(acquisition._candidate_query_scope(root)["queries"]) == acquisition.MAX_NARROWED_QUERIES
+    root["candidates"].append({**candidate, "last_name": "One additional surname"})
+    session = install_session(ProfileResponse(chunks=[b"x" * acquisition.MAX_PROFILE_BYTES, b"x"]))
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError, match="narrowing_query_limit_exceeded"):
+        await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert len(session.requests) == 1
+    assert not (destination / "0.json").exists()
+    assert json.loads((destination / "0.narrowed" / "oversized.json").read_bytes())["complete"] is False
+
+
 async def test_same_text_without_typed_overflow_does_not_narrow(tmp_path, install_session):
     session = install_session(ValueError("kentucky_profile_response_too_large"))
     with pytest.raises(ValueError, match="response_too_large"):
@@ -598,7 +634,10 @@ async def test_narrowed_replay_tampering_fails_before_http(tmp_path, install_ses
     retained = tmp_path / "retained"; retained.mkdir()
     acquisition.write_new_json(retained / "0.json", envelope)
     session = install_session()
-    with pytest.raises(ValueError):
+    expected = {"candidate": "narrowed_response_changed", "queries": "narrowed_response_changed",
+                "url": "response_identity_invalid", "body_hash": "response_changed",
+                "truncation": "truncated_attempt_invalid", "byte_count": "truncated_attempt_invalid"}[change]
+    with pytest.raises(ValueError, match=expected):
         await acquisition.acquire_profiles([root], tmp_path / "new", AsyncMock(), retained=retained)
     assert session.requests == [] and not (tmp_path / "new").exists()
 

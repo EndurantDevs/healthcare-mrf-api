@@ -29,6 +29,7 @@ COVERAGE_SCOPE = "nppes_ky_alphanumeric_physician_license_cohort"
 MAX_PROFILE_BYTES = MAX_HTML_BYTES
 MAX_ACQUISITION_BYTES = 1_000_000_000
 REQUEST_INTERVAL_SECONDS = 2.0
+MAX_NARROWED_QUERIES = 32
 LICENSE_PATTERN = re.compile(r"(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{1,32}", flags=re.ASCII)
 
 
@@ -65,6 +66,8 @@ def _candidate_query_scope(root):
                 or len(surname) > 50 or not surname.isprintable() or any(char in surname for char in "%_[]")):
             raise ValueError("kentucky_profile_narrowing_surname_unsupported")
         indexes_by_surname[surname].append(index)
+    if len(indexes_by_surname) > MAX_NARROWED_QUERIES:
+        raise ValueError("kentucky_profile_narrowing_query_limit_exceeded")
     return {"coverage_scope": NARROWED_SCOPE,
             "candidates_sha256": hashlib.sha256(encoded_json(candidates)).hexdigest(),
             "queries": [{"last_name": surname, "candidate_indexes": indexes_by_surname[surname]}
@@ -288,10 +291,13 @@ def _validate_narrowed(response, root):
         previous_time = receipt["downloaded_at"]
 
 
-def _validate_retained_roots(roots, retained):
+async def _validate_retained_roots(roots, retained, progress):
+    """Validate all retained roots before transport, yielding between bounded files."""
     if retained is None:
         return
-    for root in roots:
+    for index, root in enumerate(roots):
+        await asyncio.sleep(0)
+        await progress(index, len(roots))
         path = retained / f"{root['license_number']}.json"
         partial = retained / f"{root['license_number']}.narrowed"
         if path.exists() or path.is_symlink():
@@ -359,7 +365,7 @@ async def acquire_profiles(roots: list[dict], destination: Path, progress, *, re
         _reject_symlinks(retained)
         if not retained.is_dir():
             raise ValueError("kentucky_profile_retained_directory_invalid")
-    _validate_retained_roots(roots, retained)
+    await _validate_retained_roots(roots, retained, progress)
     destination.mkdir(exist_ok=False)
     reused_count = 0
     narrowed_roots = narrowed_queries = oversized_bytes = 0

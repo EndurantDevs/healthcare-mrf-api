@@ -13,11 +13,13 @@ import pytest
 from api import provider_profile as profile_api
 from api import provider_profile_cms as cms_api
 from api import provider_profile_states as state_api
+from process.tennessee_profile import _source_manifest
 from process.tennessee_profile_rows import SCHEMA_VERSION, SOURCE_KEY, parse_report
 from tests.test_provider_profile_cms import _cms_projection
 from tests.test_provider_profile_kentucky import _row as _kentucky_row
 from tests.test_provider_profile_massachusetts import _legacy_envelope
 from tests.test_provider_profile_massachusetts import _row as _massachusetts_row
+from tests.test_tennessee_profile_binding import _snapshot
 from tests.test_tennessee_profile_rows import EVIDENCE, report_bytes, source_row
 
 NPI = 1000000004
@@ -54,12 +56,13 @@ def _rows(*source_rows, generation=GENERATION):
             "run_jurisdiction": "TN",
             "source_manifest": {
                 "categories": ["education", "training", "specialties"],
+                "snapshot_sha256": "a" * 64,
                 "source": {
                     "source_key": SOURCE_KEY,
                     "source_kind": "state_regulator",
                     "agency": "Tennessee Department of Health",
                     "jurisdiction": "TN",
-                    "coverage_scope": "full_md_do_reports",
+                    "coverage_scope": "regular_md_do_all_ranks_statuses_locations",
                     "registry_generation": "a" * 64,
                 },
             },
@@ -249,6 +252,38 @@ def test_manifest_cannot_relabel_tennessee(field, value):
     row["source_manifest"]["source"][field] = value
     with pytest.raises(RuntimeError, match="source_mismatch"):
         _projection(row)
+
+
+@pytest.mark.parametrize("field", ["coverage_scope", "registry_generation", "snapshot_sha256"])
+@pytest.mark.parametrize("value", [None, "", 123, {}, "b" * 64])
+def test_report_scope_and_snapshot_binding_reject_invalid_values(field, value):
+    row = _rows()[0]
+    manifest = row["source_manifest"]
+    target = manifest if field == "snapshot_sha256" else manifest["source"]
+    target[field] = value
+    with pytest.raises(RuntimeError, match="source_mismatch"):
+        _projection(row)
+
+
+@pytest.mark.parametrize("field", ["coverage_scope", "registry_generation", "snapshot_sha256", "both_hashes"])
+def test_report_scope_and_snapshot_binding_require_present_values(field):
+    row = _rows()[0]
+    manifest = row["source_manifest"]
+    if field == "both_hashes":
+        del manifest["snapshot_sha256"], manifest["source"]["registry_generation"]
+    else:
+        target = manifest if field == "snapshot_sha256" else manifest["source"]
+        del target[field]
+    with pytest.raises(RuntimeError, match="source_mismatch"):
+        _projection(row)
+
+
+def test_reader_accepts_actual_producer_scope_and_snapshot_descriptor():
+    row = _rows()[0]
+    row["source_manifest"] = manifest = _source_manifest({"run_id": "synthetic-control"}, _snapshot(), None)
+    projection = _projection(row)
+    assert projection["source"]["coverage_scope"] == "regular_md_do_all_ranks_statuses_locations"
+    assert projection["source"]["registry_generation"] == manifest["snapshot_sha256"]
 
 
 @pytest.mark.parametrize(

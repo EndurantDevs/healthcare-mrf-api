@@ -175,6 +175,15 @@ def test_bounded_selection_is_order_independent_and_preserves_roots():
     assert worker._selected_roots(cohort, None) == cohort["roots"]
 
 
+def test_persisted_sampling_versions_keep_literal_historical_order():
+    cohort = _cohort(("0", "00000", "00042", "C0007", "C0009", "10", "2"))
+    legacy = worker._selected_roots(cohort, 7, strategy=worker.LEGACY_SAMPLING_STRATEGY)
+    assert [root["license_number"] for root in legacy] == ["C0007", "00000", "10", "0", "2", "00042", "C0009"]
+    current = worker._selected_roots(cohort, 4)
+    assert [root["license_number"] for root in current] == ["0", "C0007", "00000", "10"]
+    assert worker._selected_roots(cohort, None) is cohort["roots"]
+
+
 @pytest.mark.parametrize("limit", [1, 2, 100, 300])
 def test_bounded_sample_includes_lexical_first_then_existing_hash_order(limit):
     cohort = _cohort(tuple(str(number) for number in range(201)))
