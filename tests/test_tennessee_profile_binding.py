@@ -124,7 +124,6 @@ def test_cross_board_number_resolves_only_with_both_explained_identities(tmp_pat
     ([_do_row(LicenseNumber="123", FirstName="Alex", MiddleName="Morgan", LastName="Example")], [_candidate()]),
     ([_do_row(LicenseNumber="123", Title="M.D.")], [_do_candidate(license_number="123", suffix="M.D.")]),
     ([_do_row(LicenseNumber="123"), _do_row(LicenseNumber="123", Status="Expired")], [_do_candidate(license_number="123")]),
-    ([_do_row(LicenseNumber="123")], []),
     ([_do_row(LicenseNumber="123")], [_do_candidate(license_number="123", joined_npi=None)]),
     ([_do_row(LicenseNumber="123")], [_do_candidate(license_number="123", npi=1000000004, joined_npi=1000000004)]),
     ([_do_row(LicenseNumber="123")], [_do_candidate(license_number="123"),
@@ -135,6 +134,46 @@ def test_unresolved_cross_board_identity_stays_held(tmp_path, peer_rows, peer_ca
     assert all(record["matched_npi"] is None for record in result["source_records"])
     assert all(fact["npi"] is None and fact["published_at"] is None for fact in result["facts"])
     assert len(_decision(result)["candidate_rows"]) == 1 + len(peer_candidates)
+
+
+def test_known_different_source_peer_can_remain_unmatched(tmp_path):
+    result = _bind(tmp_path, report_by_profession=_reports(do_rows=[_do_row(LicenseNumber="123")]),
+                   candidates=[_candidate()])
+    assert _decision(result)["npi"] == 1000000004
+    assert _decision(result, "1907")["status"] == "unmatched"
+    assert _decision(result, "1907")["npi"] is None
+    assert len(_decision(result)["source_groups"]) == 2
+    for record in result["source_records"]:
+        assert all(fact["npi"] == record["matched_npi"] and fact["published_at"] is None
+                   for fact in result["facts"] if fact["source_record_id"] == record["record_id"])
+
+
+@pytest.mark.parametrize("changes", [{"MiddleName": "M"}, {"MiddleName": ""}, {"Title": "Jr."}])
+def test_source_peer_name_uncertainty_cannot_be_excluded(tmp_path, changes):
+    peer = _do_row(**{"LicenseNumber": "123", "FirstName": "Alex", "MiddleName": "Morgan", "LastName": "Example", **changes})
+    result = _bind(tmp_path, report_by_profession=_reports(do_rows=[peer]), candidates=[_candidate()])
+    assert all(record["matched_npi"] is None for record in result["source_records"])
+    assert _decision(result)["reason"] == "cross_board_identity_unresolved"
+
+
+@pytest.mark.parametrize("changes,matched", [
+    ({}, True), ({"first_name": "R"}, False), ({"last_name": ""}, False), ({"middle_name": 1}, False),
+    ({"joined_npi": None}, False), ({"joined_taxonomy_code": None}, False), ({"taxonomy_grouping": None}, False),
+    ({"npi": 1000000004, "joined_npi": 1000000004}, False),
+])
+def test_unrelated_license_occurrences_stay_in_evidence(tmp_path, changes, matched):
+    unrelated = _candidate(**{"npi": 1000000020, "joined_npi": 1000000020, "first_name": "Robin",
+        "middle_name": None, "last_name": "Distinct", "taxonomy": "163W00000X",
+        "joined_taxonomy_code": "163W00000X", "taxonomy_grouping": "Nursing Service Providers", **changes})
+    result = _bind(tmp_path, candidates=[_candidate(), unrelated, unrelated, _do_candidate()])
+    decision = _decision(result)
+    assert (decision["npi"] == 1000000004) is matched
+    assert len(decision["candidate_rows"]) == 3 and decision["candidate_rows"].count(unrelated) == 2
+    if matched:
+        assert decision["candidate_source_record_keys"] == ["tennessee-tdh:1606:123", None, None]
+    else:
+        assert decision["reason"] == "registry_identity_conflict"
+    assert _decision(result, "1907")["npi"] == 1000000012
 
 
 @pytest.mark.parametrize("changes", [

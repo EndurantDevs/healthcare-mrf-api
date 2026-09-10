@@ -145,7 +145,7 @@ def _name(value):
     return " ".join(value.split()).casefold()
 
 
-def _is_compatible_candidate(identity, candidate):
+def _has_valid_candidate_metadata(candidate):
     if (set(candidate) != set(REGISTRY_COLUMNS) or type(candidate.get("npi")) is not int
             or not is_valid_npi(candidate["npi"]) or type(candidate.get("joined_npi")) is not int
             or candidate["joined_npi"] != candidate["npi"]
@@ -153,15 +153,41 @@ def _is_compatible_candidate(identity, candidate):
             or candidate.get("license_state") != "TN" or type(candidate.get("entity_type_code")) is not int
             or candidate["entity_type_code"] != 1 or not isinstance(candidate.get("taxonomy"), str)
             or not candidate["taxonomy"].strip() or candidate.get("joined_taxonomy_code") != candidate["taxonomy"]
-            or candidate.get("taxonomy_grouping") != "Allopathic & Osteopathic Physicians"):
+            or not isinstance(candidate.get("taxonomy_grouping"), str) or not candidate["taxonomy_grouping"].strip()):
         return False
-    for source_field, registry_field in (*NAME_FIELDS, ("Title", "suffix")):
-        value = candidate[registry_field]
-        if not (isinstance(value, str) or registry_field in {"middle_name", "suffix"} and value is None):
-            return False
-        if _name(identity[source_field]) != _name(value or ""):
-            return False
     return True
+
+
+def _is_spelled_name(value):
+    return any(len(part) > 1 for part in re.findall(r"[^\W\d_]+", value))
+
+
+def _name_relation(identity, candidate):
+    source_names, candidate_names = [], []
+    for source_field, registry_field in (*NAME_FIELDS, ("Title", "suffix")):
+        value = candidate.get(registry_field)
+        if registry_field not in candidate or not (
+                isinstance(value, str) or registry_field in {"middle_name", "suffix"} and value is None):
+            return "uncertain"
+        source_names.append(_name(identity[source_field]))
+        candidate_names.append(_name(value or ""))
+    if not candidate_names[0] or not candidate_names[2]:
+        return "uncertain"
+    if source_names == candidate_names:
+        return "matching"
+    # Missing components, initials and suffix punctuation cannot exclude a person.
+    if all(_is_spelled_name(names[index]) for names in (source_names, candidate_names) for index in (0, 2)):
+        if any(source_names[index] != candidate_names[index] for index in (0, 2)):
+            return "different"
+        if all(_is_spelled_name(names[1]) for names in (source_names, candidate_names)) and source_names[1] != candidate_names[1]:
+            return "different"
+    return "uncertain"
+
+
+def _is_compatible_candidate(identity, candidate):
+    return (_has_valid_candidate_metadata(candidate)
+            and candidate["taxonomy_grouping"] == "Allopathic & Osteopathic Physicians"
+            and _name_relation(identity, candidate) == "matching")
 
 
 def _decision(source_record, candidates, source_records):
@@ -183,18 +209,22 @@ def _decision(source_record, candidates, source_records):
         if _name(peer_identity["Title"]) not in SUFFIX_LITERALS:
             return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
         identity_by_source[peer_record["source_record_key"]] = peer_identity
-    name_keys = {tuple(_name(identity[field]) for field in ("FirstName", "MiddleName", "LastName", "Title"))
-                 for identity in identity_by_source.values()}
-    if len(name_keys) != len(identity_by_source):
+    if any(_name_relation(identity, {registry_field: peer_identity[source_field]
+                                    for source_field, registry_field in (*NAME_FIELDS, ("Title", "suffix"))}) != "different"
+           for key, peer_identity in identity_by_source.items() if key != source_record["source_record_key"]):
         return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
     if not candidates:
         return {**decision_by_field, "status": "unmatched", "reason": "no_exact_license_candidates"}
     npis_by_source = {key: set() for key in identity_by_source}
     candidate_source_keys = []
-    # Explain every occurrence using exactly one source identity. A different
-    # name is not discarded: only a fully validated peer can account for it.
+    # Retain every occurrence, including unrelated people sharing a bare number.
     for candidate in candidates:
+        if not _has_valid_candidate_metadata(candidate):
+            return {**decision_by_field, "reason": "registry_identity_conflict"}
         matches = [key for key, identity in identity_by_source.items() if _is_compatible_candidate(identity, candidate)]
+        if not matches and all(_name_relation(identity, candidate) == "different" for identity in identity_by_source.values()):
+            candidate_source_keys.append(None)
+            continue
         if len(matches) != 1:
             return {**decision_by_field, "reason": "registry_identity_conflict"}
         npis_by_source[matches[0]].add(candidate["npi"])
@@ -202,11 +232,14 @@ def _decision(source_record, candidates, source_records):
     decision_by_field["candidate_source_record_keys"] = candidate_source_keys
     if any(len(npis) > 1 for npis in npis_by_source.values()):
         return {**decision_by_field, "status": "ambiguous", "reason": "multiple_matching_npis"}
-    if any(not npis for npis in npis_by_source.values()):
-        return {**decision_by_field, "reason": "cross_board_identity_unresolved"}
-    npi_by_source = {key: next(iter(npis)) for key, npis in npis_by_source.items()}
+    npi_by_source = {key: next(iter(npis)) for key, npis in npis_by_source.items() if npis}
     if len(set(npi_by_source.values())) != len(npi_by_source):
         return {**decision_by_field, "reason": "cross_board_npi_conflict"}
+    if any(key is None and candidate["npi"] in npi_by_source.values()
+           for candidate, key in zip(candidates, candidate_source_keys, strict=True)):
+        return {**decision_by_field, "reason": "registry_identity_conflict"}
+    if source_record["source_record_key"] not in npi_by_source:
+        return {**decision_by_field, "status": "unmatched", "reason": "no_exact_license_name_candidate"}
     return {**decision_by_field, "status": "deterministic", "npi": npi_by_source[source_record["source_record_key"]],
             "reason": "unique_exact_license_name"}
 
