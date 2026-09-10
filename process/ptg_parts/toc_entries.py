@@ -48,10 +48,11 @@ _TOC_BODY_ALLOWED_TOKENS = (
     "out of network",
     "outnetwork",
     "outofnetwork",
-    "oon",
 )
 _TOC_BODY_IN_NETWORK_TOKENS = ("in-network", "in network", "innetwork")
-_TOC_BODY_DRUG_TOKENS = ("drug", "ndc", "pharmacy", "rx")
+_TOC_BODY_DRUG_TOKENS = ("drug", "pharmacy")
+_TOC_BODY_ALLOWED_ACRONYM_RE = re.compile(r"(?<![a-z])oon(?![a-z])")
+_TOC_BODY_DRUG_ACRONYM_RE = re.compile(r"(?<![a-z])(?:ndc|rx)(?![a-z])")
 _FLAT_TOC_ALLOWED_SECTION_TOKENS = ("allowed amount", "out-of-network")
 _FLAT_TOC_IN_NETWORK_SECTION_TOKENS = (
     "in-network",
@@ -99,9 +100,13 @@ def _toc_body_source_type(
     default_source_type: str, location: Any, description: Any = None
 ) -> tuple[str, str]:
     searchable, compact = _toc_body_search_text(location, description)
-    if any(token in searchable or token in compact for token in _TOC_BODY_DRUG_TOKENS):
+    if any(
+        token in searchable or token in compact for token in _TOC_BODY_DRUG_TOKENS
+    ) or _TOC_BODY_DRUG_ACRONYM_RE.search(searchable):
         return "payer-drug", PTG2_DOMAIN_DRUG
-    if any(token in searchable or token in compact for token in _TOC_BODY_ALLOWED_TOKENS):
+    if any(
+        token in searchable or token in compact for token in _TOC_BODY_ALLOWED_TOKENS
+    ) or _TOC_BODY_ALLOWED_ACRONYM_RE.search(searchable):
         return "allowed-amounts", PTG2_DOMAIN_ALLOWED_AMOUNT
     if any(token in searchable or token in compact for token in _TOC_BODY_IN_NETWORK_TOKENS):
         return "in-network", PTG2_DOMAIN_IN_NETWORK
