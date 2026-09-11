@@ -189,6 +189,7 @@ fn parse_tall_columns(
         percentile_90,
         allowed_count,
         methodology: find_header(headers, &["standard_charge", "methodology"])?,
+        additional_payer_notes: find_optional_header(headers, &["additional_payer_notes"])?,
     })
 }
 
