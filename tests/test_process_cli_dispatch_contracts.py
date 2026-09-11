@@ -241,6 +241,44 @@ async def test_hospital_price_worker_rejects_missing_or_arbitrary_targets(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("is_marked", [True, False])
+async def test_hospital_price_worker_terminalizes_only_its_queued_run(
+    monkeypatch, is_marked
+):
+    marker = AsyncMock(return_value=is_marked)
+    flusher = AsyncMock()
+    monkeypatch.setattr(process_cli, "mark_control_run", marker)
+    monkeypatch.setattr(process_cli, "_flush_terminal_status_events", flusher)
+    task = {
+        "run_id": " run-hospital ",
+        "importer": "hospital-prices",
+        "target_module": "asyncio",
+        "target_function": "create_subprocess_shell",
+        "task": {},
+    }
+
+    with pytest.raises(ValueError, match="HospitalPrices control target is not allowed"):
+        await process_cli._hospital_price_control_single_job_start({}, task)
+
+    marker.assert_awaited_once_with(
+        "run-hospital",
+        status="failed",
+        phase_detail="hospital price control target rejected",
+        progress_message="target rejected",
+        error={
+            "code": "control_target_rejected",
+            "message": "HospitalPrices control target is not allowed",
+        },
+        expected_importer="hospital-prices",
+        expected_status="queued",
+    )
+    if is_marked:
+        flusher.assert_awaited_once_with("run-hospital")
+    else:
+        flusher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "override",
     [

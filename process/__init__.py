@@ -38,7 +38,11 @@ from process.attributes import (process_attributes, process_benefits,
                                 save_attributes)
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
-from process.control_lifecycle import control_single_job_start as _control_single_job_start
+from process.control_lifecycle import (
+    _flush_terminal_status_events,
+    control_single_job_start as _control_single_job_start,
+    mark_control_run,
+)
 from process.ext.utils import db_startup
 from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
@@ -191,6 +195,22 @@ async def _hospital_price_control_single_job_start(ctx, task=None, **arq_metadat
         or task.get("run_shutdown", False) is not False
         or not isinstance(task.get("task"), dict)
     ):
+        run_id = task.get("run_id") if isinstance(task, dict) else None
+        if type(run_id) is str and (run_id := run_id.strip()):
+            is_marked = await mark_control_run(
+                run_id,
+                status="failed",
+                phase_detail="hospital price control target rejected",
+                progress_message="target rejected",
+                error={
+                    "code": "control_target_rejected",
+                    "message": "HospitalPrices control target is not allowed",
+                },
+                expected_importer="hospital-prices",
+                expected_status="queued",
+            )
+            if is_marked:
+                await _flush_terminal_status_events(run_id)
         raise ValueError("HospitalPrices control target is not allowed")
     return await _control_single_job_start(ctx, task, **arq_metadata)
 
