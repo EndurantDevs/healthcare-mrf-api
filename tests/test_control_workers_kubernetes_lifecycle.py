@@ -67,6 +67,18 @@ def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == (
         "hospital_prices_start_run_hospital"
     )
+    assert env_by_name["HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS"] == (
+        "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net"
+    )
+
+    other_container = control_workers._worker_job_manifest(
+        control_workers._BY_QUEUE["arq:NPI"],
+        {"run_id": "run_npi"},
+        "healthcare-mrf-api:test",
+    )["spec"]["template"]["spec"]["containers"][0]
+    assert "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS" not in {
+        entry["name"] for entry in other_container["env"]
+    }
 
 
 def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_huge():

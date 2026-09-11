@@ -20,7 +20,7 @@ import threading
 import time
 import zipfile
 import zlib
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -28,7 +28,7 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
-from curl_cffi import CurlECode, CurlHttpVersion, CurlOpt, ffi, lib
+from curl_cffi import CurlECode, CurlHttpVersion, CurlOpt
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
 from yarl import URL
@@ -1450,40 +1450,6 @@ def _curl_resolve_target(hostname: str, port: int, addresses: tuple[str, ...]) -
     return f"{hostname}:{port}:{pinned_addresses}"
 
 
-def _curl_connect_to_target(hostname: str, port: int, address: str) -> str:
-    target = (
-        f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
-    )
-    return f"{hostname}:{port}:{target}:{port}"
-
-
-@contextmanager
-def _curl_proxy_connect_options(
-    option_map: dict[Any, Any],
-    hostname: str,
-    port: int,
-    pinned_addresses: tuple[str, ...],
-):
-    """Pin one HTTP CONNECT target for curl-cffi versions without slist support."""
-
-    connect_to = ffi.NULL
-    try:
-        connect_to = lib.curl_slist_append(
-            connect_to,
-            _curl_connect_to_target(
-                hostname, port, pinned_addresses[0]
-            ).encode(),
-        )
-        if connect_to == ffi.NULL:
-            raise MemoryError("could not allocate curl CONNECT_TO rule")
-        option_map[CurlOpt.CONNECT_TO] = connect_to
-        yield option_map
-    finally:
-        option_map.pop(CurlOpt.CONNECT_TO, None)
-        if connect_to != ffi.NULL:
-            lib.curl_slist_free_all(connect_to)
-
-
 def _curl_transport_option_map(
     hostname: str,
     port: int,
@@ -1704,24 +1670,16 @@ async def _download_raw_artifact_browser_once(
     state = _single_get_download_state(path, head)
     try:
         request_option_map = _curl_request_option_map(browser_profile, user_agent)
-        option_context = (
-            _curl_proxy_connect_options(
-                curl_option_map, hostname, port, pinned_addresses
-            )
-            if proxy_url
-            else nullcontext(curl_option_map)
-        )
-        with option_context as pinned_option_map:
-            async with AsyncSession(curl_options=pinned_option_map) as session:
-                async with session.stream(
-                    "GET", url, **request_option_map,
-                ) as response:
-                    await _consume_browser_response(
-                        response, state=state, url=url,
-                        pinned_addresses=pinned_addresses, port=port,
-                        max_bytes=max_bytes, started_at=started_at,
-                        proxied=bool(proxy_url),
-                    )
+        async with AsyncSession(curl_options=curl_option_map) as session:
+            async with session.stream(
+                "GET", url, **request_option_map,
+            ) as response:
+                await _consume_browser_response(
+                    response, state=state, url=url,
+                    pinned_addresses=pinned_addresses, port=port,
+                    max_bytes=max_bytes, started_at=started_at,
+                    proxied=bool(proxy_url),
+                )
         if state.total_bytes is not None and state.byte_count != state.total_bytes:
             raise RuntimeError(
                 f"Download for {url} ended at {state.byte_count} bytes, "
