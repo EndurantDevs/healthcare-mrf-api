@@ -73,7 +73,7 @@ def test_kentucky_only_has_actual_attribution_context_and_original_assertion():
         "availability": "unavailable", "items": [], "total": 0, "returned": 0, "truncated": False,
     }
     assert profile["categories"]["professional_experience"]["items"] == []
-    assert profile["composer_version"] == "provider-profile-composer/v10"
+    assert profile["composer_version"] == "provider-profile-composer/v11"
     evidence, = projection["evidence"]["records"]
     assert evidence["source_record_id"] == f"{SOURCE_KEY}:{row['fact_id']}"
     assert evidence["profile_source_record_id"] == row["source_record_id"]
@@ -214,7 +214,7 @@ def test_pagination_exposes_only_supporting_assertions_and_fences_kentucky_rotat
     after = _compose(_combined_projection(_row(generation="kentucky-next")))
     assert before["generation_id"] != after["generation_id"]
     assert before["categories"]["education"]["items"][0]["item_id"] == after["categories"]["education"]["items"][0]["item_id"]
-    assert before["composer_version"] == after["composer_version"] == "provider-profile-composer/v10"
+    assert before["composer_version"] == after["composer_version"] == "provider-profile-composer/v11"
 
 
 async def test_absent_kentucky_preserves_incumbent_payload_and_generation(monkeypatch):

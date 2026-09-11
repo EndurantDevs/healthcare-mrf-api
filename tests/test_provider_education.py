@@ -78,6 +78,53 @@ def test_correlated_school_and_year_keep_original_richer_value_and_assertions():
     assert [state_fact, cms_fact] == originals
 
 
+def test_evms_alias_corroborates_school_and_year_without_rewriting_source_assertions():
+    state_fact = _fact("state-example", {"institution": "EASTERN VA MED SCHL", "degree": "MD", "graduation_year": 2002, "graduation_date": "2002-05-01", "graduation_date_precision": "day"})
+    cms_fact = _fact("cms-example", {"institution": "EASTERN VIRGINIA MEDICAL SCHOOL", "graduation_year": 2002}, source_kind="cms_doctors")
+    originals = copy.deepcopy([state_fact, cms_fact])
+    first_item, = _compose(_projection(cms_fact))["categories"]["education"]["items"]
+    for facts in permutations(originals):
+        merged, = _compose(_projection(*facts))["categories"]["education"]["items"]
+        assert merged["item_id"] == first_item["item_id"]
+        assert merged["value"] == state_fact["value"]
+        assert merged["corroborated_fields"] == ["institution", "graduation_year"]
+        assert merged["source_record_ids"] == ["cms-example", "state-example"]
+        assert merged["assertion_count"] == len(merged["assertions"]) == 2
+        for fact in facts:
+            assertion = _assertion(merged, fact["source_kinds"][0])
+            for field in ("value", "display", "source_record_ids", "assertion_type", "verification_status"):
+                assert assertion[field] == fact[field]
+    assert [state_fact, cms_fact] == originals
+
+
+@pytest.mark.parametrize("other_details", [
+    {"degree": "DO"},
+    {"graduation_year": 2003, "graduation_date": "2003-05-01"},
+    {"graduation_date": "2002-06-01"},
+    {"institution": "EASTERN VIRGINIA MEDICAL SCHOOL COLLEGE OF DENTISTRY"},
+    {"institution": "EASTERN VA MED SCHL."},
+    {"institution": None},
+])
+def test_evms_alias_keeps_distinct_education_events_and_unknown_institutions(other_details):
+    value_by_field = {"institution": "EASTERN VA MED SCHL", "degree": "MD", "graduation_year": 2002, "graduation_date": "2002-05-01", "graduation_date_precision": "day"}
+    other_value_by_field = {**value_by_field, "institution": "EASTERN VIRGINIA MEDICAL SCHOOL", **other_details}
+    assert len(_canonical(_fact("first", value_by_field), _fact("second", other_value_by_field))) == 2
+
+
+@pytest.mark.parametrize("other_details", [{"degree": "DO"}, {"graduation_date": "2002-06-01"}])
+def test_evms_alias_keeps_ambiguous_cms_year_separate(other_details):
+    value_by_field = {"institution": "EASTERN VA MED SCHL", "degree": "MD", "graduation_date": "2002-05-01", "graduation_date_precision": "day"}
+    facts = [
+        _fact("first", value_by_field),
+        _fact("second", {**value_by_field, "institution": "EASTERN VIRGINIA MEDICAL SCHOOL", **other_details}),
+        _fact("cms-example", {"institution": "EASTERN VIRGINIA MEDICAL SCHOOL", "graduation_year": 2002}, source_kind="cms_doctors"),
+    ]
+    for shuffled in permutations(facts):
+        items = _canonical(*shuffled)
+        assert len(items) == len({item["logical_fact_key"] for item in items}) == 3
+        assert all("corroborated_fields" not in item for item in items)
+
+
 @pytest.mark.parametrize("duplicate_value", [YEAR_VALUE, DATE_VALUE])
 def test_exact_groups_are_one_event_candidate_in_any_order(duplicate_value):
     other_value = DATE_VALUE if duplicate_value == YEAR_VALUE else YEAR_VALUE
@@ -297,12 +344,12 @@ def test_other_education_types_remain_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_corroboration_change_fences_previous_category_pagination(monkeypatch):
-    projection = _projection(_fact("florida", YEAR_DATE_VALUE), _fact("new-york", {**YEAR_DATE_VALUE, "graduation_year": 2001}), _fact("cms", YEAR_VALUE, source_kind="cms_doctors"))
+async def test_school_alias_change_fences_previous_category_pagination(monkeypatch):
+    projection = _projection(_fact("state-example", {"institution": "EASTERN VA MED SCHL", "graduation_year": 2002, "degree": "MD"}), _fact("cms-example", {"institution": "EASTERN VIRGINIA MEDICAL SCHOOL", "graduation_year": 2002}, source_kind="cms_doctors"))
     profile = _compose(projection)
     assert len(profile["categories"]["education"]["items"]) == 1
     with monkeypatch.context() as previous_version:
-        previous_version.setattr(provider_profile_composer_parts, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v9")
+        previous_version.setattr(provider_profile_composer_parts, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v10")
         previous_generation = provider_profile_composer_parts._composed_generation_id(profile["source_generations"])
     assert previous_generation != profile["generation_id"]
     monkeypatch.setattr(npi_api, "fetch_provider_profile_projection", AsyncMock(return_value=projection))

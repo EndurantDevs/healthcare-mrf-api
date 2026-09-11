@@ -109,6 +109,7 @@ _PROFILE_SOURCES = {
     "massachusetts-borim-profile": {"source_key": "massachusetts-borim", "display_name": "Massachusetts BORIM"},
     "kentucky-kbml-profile": {"source_key": "kentucky-kbml", "display_name": "Kentucky KBML"},
     "tennessee-tdh-profile": {"source_key": "tennessee-tdh", "display_name": "Tennessee TDH"},
+    "rhode-island-doh-profile": {"source_key": "rhode-island-doh", "display_name": "Rhode Island DOH"},
 }
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
@@ -171,6 +172,7 @@ _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "massachusetts-borim-profile": ["npi"],
     "kentucky-kbml-profile": ["npi"],
     "tennessee-tdh-profile": ["npi"],
+    "rhode-island-doh-profile": ["npi"],
     "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
@@ -377,6 +379,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.tennessee_profile",
         "target_function": "import_profiles",
     },
+    "rhode-island-doh-profile": {
+        "queue": "arq:RhodeIslandDOHProfile",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.rhode_island_profile",
+        "target_function": "import_profiles",
+    },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",
         "function": "control_single_job_start",
@@ -483,6 +492,7 @@ _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
 
 _CANCELABLE_IMPORTERS = {
     "tennessee-tdh-profile",
+    "rhode-island-doh-profile",
     "massachusetts-borim-profile",
     "kentucky-kbml-profile",
     "ptg",
@@ -801,6 +811,7 @@ def _importer_family(importer: str) -> str:
         "massachusetts-borim-profile",
         "kentucky-kbml-profile",
         "tennessee-tdh-profile",
+        "rhode-island-doh-profile",
         "entity-address-unified",
         "cms-doctors",
         "address-archive-v2-migrate",
