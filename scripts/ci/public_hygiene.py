@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import os
 import re
 import subprocess
 import sys
@@ -77,6 +79,10 @@ PRIVATE_INTEGRATION_FINGERPRINTS = {
     "d8205bea56fce6d160026dffc89bbd8a0655c34296a5ff31886d6e5785270b6b",
     "e3ddb5be56a2a9333debc2676dec9a472954b4c9742424ba849fc5fb466ae141",
     "f3d92f97909c326ce25386f309cae51ed94f7ee1d4c20d1ed1d99f35737fdb39",
+    "f8a6d281d9bd869b0b1eb6872cf82efe5ff25c562f6aad2b2235b32d9fdfede9",
+    "7f660c6d3595a636888e59f27f878b1cc9062e746a3451abdf7d7beb8993fd02",
+    "a27df5f9915bd32881b173376f5a5cc28cebe4064fecd35c2cd011b71a1759e0",
+    "3aa643b46a284528ba24f0a78b57f97c012e60b2f248dd06595dc55f1449c90f",
 }
 PRIVATE_TEXT_FINGERPRINTS = (
     PRIVATE_EXAMPLE_FINGERPRINTS | PRIVATE_INTEGRATION_FINGERPRINTS
@@ -88,6 +94,7 @@ INTEGRATION_IDENTIFIER_SEPARATOR_RE = re.compile(r"[-_./:\\]+")
 PATTERN_EXEMPT_PATHS = {
     "scripts/ci/public_hygiene.py",
 }
+PUBLIC_EVENT_NAMES = {"pull_request", "pull_request_target", "push"}
 
 
 def repository_files(*, include_untracked: bool = False) -> list[Path]:
@@ -127,14 +134,14 @@ def is_binary(path: Path) -> bool:
 def check_paths(paths: list[Path]) -> list[str]:
     """Check tracked paths for prohibited public data."""
     errors: list[str] = []
-    for path in paths:
+    for index, path in enumerate(paths, 1):
         parts = set(path.parts)
         if parts & FORBIDDEN_PATH_PARTS:
-            errors.append(f"forbidden path component: {path}")
+            errors.append(f"forbidden path component: file {index}")
         if path.name in FORBIDDEN_BASENAMES:
-            errors.append(f"forbidden instruction file: {path}")
+            errors.append(f"forbidden instruction file: file {index}")
         if has_private_text_fingerprint(path.as_posix()):
-            errors.append(f"private-path-fingerprint: {path}")
+            errors.append(f"private-path-fingerprint: file {index}")
     return errors
 
 
@@ -169,10 +176,22 @@ def has_private_text_fingerprint(text: str) -> bool:
     return False
 
 
+def check_text(text: str, label: str, *, check_patterns: bool = True) -> list[str]:
+    """Check text using a trusted field label without echoing rejected content."""
+    errors = []
+    if check_patterns:
+        for category, pattern in CONTENT_PATTERNS.items():
+            if pattern.search(text):
+                errors.append(f"{category}: {label}")
+    if has_private_text_fingerprint(text):
+        errors.append(f"private-example-fingerprint: {label}")
+    return errors
+
+
 def check_content(paths: list[Path]) -> list[str]:
     """Check tracked text content for prohibited public data."""
     errors: list[str] = []
-    for path in paths:
+    for index, path in enumerate(paths, 1):
         path_str = path.as_posix()
         if is_binary(path):
             continue
@@ -180,12 +199,75 @@ def check_content(paths: list[Path]) -> list[str]:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        if path_str not in PATTERN_EXEMPT_PATHS:
-            for label, pattern in CONTENT_PATTERNS.items():
-                if pattern.search(text):
-                    errors.append(f"{label}: {path}")
-        if has_private_text_fingerprint(text):
-            errors.append(f"private-example-fingerprint: {path}")
+        errors.extend(check_text(
+            text, f"file {index}", check_patterns=path_str not in PATTERN_EXEMPT_PATHS,
+        ))
+    return errors
+
+
+def event_texts(event_path: Path) -> list[tuple[str, str]]:
+    """Read complete publication metadata, rejecting malformed requested events."""
+    try:
+        event_payload = json.loads(event_path.read_text(encoding="utf-8"))
+        if not isinstance(event_payload, dict):
+            raise ValueError
+        if "pull_request" in event_payload:
+            pull_request = event_payload["pull_request"]
+            text_pairs = [
+                ("PR title", pull_request["title"]),
+                ("PR body", pull_request["body"]),
+                ("PR head ref", pull_request["head"]["ref"]),
+            ]
+        else:
+            commit_list = event_payload["commits"]
+            if not isinstance(commit_list, list) or not commit_list:
+                raise ValueError
+            text_pairs = [("push ref", event_payload["ref"])]
+            text_pairs.extend(
+                (f"push commit {index}", commit["message"])
+                for index, commit in enumerate(commit_list, 1)
+            )
+            if event_payload.get("head_commit") is not None:
+                text_pairs.append(("push head commit", event_payload["head_commit"]["message"]))
+        return validate_event_texts(text_pairs)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        raise ValueError("Publication event metadata is missing or malformed.") from None
+
+
+def validate_event_texts(text_pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Only a PR body may be null or empty in a publication event."""
+    normalized_pairs = []
+    for label, text in text_pairs:
+        if label == "PR body" and text is None:
+            text = ""
+        if not isinstance(text, str) or "\0" in text:
+            raise ValueError
+        if label != "PR body" and not text.strip():
+            raise ValueError
+        if label in {"PR title", "PR head ref", "push ref"} and any(char in text for char in "\r\n"):
+            raise ValueError
+        normalized_pairs.append((label, text))
+    return normalized_pairs
+
+
+def check_event(event_path: Path) -> list[str]:
+    """Apply the same text policy to all publication event fields."""
+    return [error for label, text in event_texts(event_path) for error in check_text(text, label)]
+
+
+def check_metadata(args: argparse.Namespace) -> list[str]:
+    """Check explicitly prepared text and applicable public event metadata."""
+    if not args.event and os.environ.get("GITHUB_EVENT_NAME") in PUBLIC_EVENT_NAMES:
+        raise ValueError("Publication event metadata is missing or malformed.")
+    errors = check_event(args.event) if args.event else []
+    for index, path in enumerate(args.text_file, 1):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError(f"Publication text file {index} cannot be read as UTF-8.") from None
+        if "\0" in text:
+            raise ValueError(f"Publication text file {index} is malformed.")
+        errors.extend(check_text(text, f"publication text {index}"))
     return errors
 
 
@@ -197,6 +279,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="also scan non-ignored untracked files for a local release check",
     )
+    event_default = os.environ.get("GITHUB_EVENT_PATH") if os.environ.get(
+        "GITHUB_EVENT_NAME", "pull_request",
+    ) in PUBLIC_EVENT_NAMES else None
+    parser.add_argument("--event", type=Path, default=event_default, help="public GitHub event JSON")
+    parser.add_argument("--text-file", type=Path, action="append", default=[], help="prepared publication text")
     return parser.parse_args(argv)
 
 
@@ -205,6 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     paths = existing_files(repository_files(include_untracked=args.include_untracked))
     errors = check_paths(paths) + check_content(paths)
+    try:
+        errors.extend(check_metadata(args))
+    except ValueError as error:
+        errors.append(str(error))
     if errors:
         print("Public hygiene check failed:")
         for error in errors:

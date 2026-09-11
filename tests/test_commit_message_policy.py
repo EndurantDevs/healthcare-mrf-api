@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -116,7 +117,7 @@ def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):
         "test(ci): cover workflow dispatch subjects",
     ):
         subprocess.run(
-            ["git", "commit", "--allow-empty", "--quiet", "-m", subject],
+            ["git", "commit", "--allow-empty", "--quiet", "-m", subject, "-m", "Public fixture details."],
             cwd=repository,
             check=True,
         )
@@ -134,3 +135,70 @@ def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):
         "test(ci): cover workflow dispatch subjects",
         "fix(ci): validate protected push subjects",
     ]
+    assert all("\n\nPublic fixture details." in message for message in module.git_messages([f"{base_sha}..HEAD"]))
+
+
+@pytest.mark.parametrize("arguments", [["--message"], ["--last", "1"], ["--range", "HEAD~1..HEAD"]])
+def test_full_messages_are_checked_first(arguments, monkeypatch, capsys):
+    module = load_policy_module()
+    rejected = "synthetic-project"
+    fingerprint = hashlib.sha256(rejected.replace("-", "").encode()).hexdigest()
+    monkeypatch.setitem(module.check_text.__globals__, "PRIVATE_INTEGRATION_FINGERPRINTS", {fingerprint})
+    message = f"fix: preserve public behavior\n\n{rejected}"
+    if arguments == ["--message"]:
+        arguments = ["--message", message]
+    else:
+        monkeypatch.setattr(module, "git_messages", lambda _: [message])
+    assert module.main(arguments) == 1
+    output = capsys.readouterr()
+    assert "private-example-fingerprint" in output.out
+    assert rejected not in output.out + output.err
+
+
+def test_sensitive_subject_is_never_echoed(monkeypatch, capsys):
+    module = load_policy_module()
+    rejected = "synthetic-project"
+    fingerprint = hashlib.sha256(rejected.replace("-", "").encode()).hexdigest()
+    monkeypatch.setitem(module.check_text.__globals__, "PRIVATE_INTEGRATION_FINGERPRINTS", {fingerprint})
+    assert module.main(["--message", rejected]) == 1
+    assert rejected not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("event_kind", ["pull_request", "push", "malformed"])
+def test_cli_events_reject_sensitive_bodies(event_kind, tmp_path, monkeypatch, capsys):
+    module = load_policy_module()
+    rejected = "synthetic-project"
+    fingerprint = hashlib.sha256(rejected.replace("-", "").encode()).hexdigest()
+    monkeypatch.setitem(module.check_text.__globals__, "PRIVATE_INTEGRATION_FINGERPRINTS", {fingerprint})
+    event_payload_map = {
+        "pull_request": {"title": "fix: preserve behavior", "body": rejected, "head": {"ref": "fix/public"}},
+    }
+    if event_kind == "push":
+        event_payload_map = {"ref": "refs/heads/dev", "commits": [{"message": f"fix: preserve behavior\n\n{rejected}"}]}
+    elif event_kind == "malformed":
+        event_payload_map = {"pull_request": {"title": rejected}}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event_payload_map), encoding="utf-8")
+    assert module.main(["--event", str(event_path)]) == 1
+    assert rejected not in capsys.readouterr().out
+
+
+def test_git_failure_diagnostics_are_redacted(monkeypatch, capsys):
+    module = load_policy_module()
+    rejected = "synthetic-project"
+
+    def fail_git_read(_):
+        raise subprocess.CalledProcessError(1, ["git", rejected], output=rejected, stderr=rejected)
+
+    monkeypatch.setattr(module, "git_messages", fail_git_read)
+    assert module.main(["--range", rejected]) == 1
+    output = capsys.readouterr()
+    assert rejected not in output.out + output.err
+
+
+@pytest.mark.parametrize("arguments", [["--last", "0"], ["--last", "-1"], ["--range=--format=%s"]])
+def test_malformed_git_selection_is_rejected(arguments, monkeypatch, capsys):
+    module = load_policy_module()
+    monkeypatch.setattr(module, "git_messages", lambda _: pytest.fail("Invalid selection reached Git"))
+    assert module.main(arguments) == 1
+    assert "Requested" in capsys.readouterr().out

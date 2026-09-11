@@ -11,6 +11,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from ci.public_hygiene import check_text, event_texts
+
 
 ALLOWED_TYPES = {
     "build",
@@ -125,11 +131,16 @@ def event_subjects(event_path: Path) -> list[str]:
     return push_subjects(event_payload)
 
 
+def git_messages(arguments: list[str]) -> list[str]:
+    """Return full messages, including bodies, without ambiguous line splitting."""
+    git_command_parts = ["git", "log", "--format=%B%x00", *arguments]
+    completed = subprocess.run(git_command_parts, check=True, text=True, capture_output=True)
+    return [message.strip() for message in completed.stdout.split("\0") if message.strip()]
+
+
 def git_subjects(arguments: list[str]) -> list[str]:
     """Return subjects from git log for the given revision arguments."""
-    git_command_parts = ["git", "log", "--format=%s", *arguments]
-    completed = subprocess.run(git_command_parts, check=True, text=True, capture_output=True)
-    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return [first_line(message) for message in git_messages(arguments)]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -143,15 +154,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def cli_subjects(args: argparse.Namespace) -> list[str]:
-    """Return all subjects requested by command line options."""
-    subject_list = [first_line(message) for message in args.message]
+    """Check complete publication text before returning subjects for style checks."""
+    if args.last is not None and args.last <= 0:
+        raise ValueError("Requested commit count must be positive.")
+    if args.commit_range is not None and (not args.commit_range or args.commit_range.startswith("-")):
+        raise ValueError("Requested revision range must name commits.")
+    message_list = list(args.message)
+    errors = []
     if args.event:
-        subject_list.extend(event_subjects(args.event))
+        text_pairs = event_texts(args.event)
+        for label, text in text_pairs:
+            errors.extend(check_text(text, label))
+            if label == "PR title" or label.startswith("push commit "):
+                message_list.append(text)
     if args.last:
-        subject_list.extend(git_subjects([f"-n{args.last}"]))
+        message_list.extend(git_messages([f"-n{args.last}"]))
     if args.commit_range:
-        subject_list.extend(git_subjects([args.commit_range]))
-    return [subject for subject in subject_list if subject]
+        message_list.extend(git_messages([args.commit_range]))
+    for index, message in enumerate(message_list, 1):
+        errors.extend(check_text(message, f"commit message {index}"))
+    if errors:
+        raise ValueError("\n".join(errors))
+    return [first_line(message) for message in message_list if first_line(message)]
 
 
 def print_problems(problems_by_subject: list[tuple[str, list[str]]]) -> None:
@@ -167,8 +191,15 @@ def print_problems(problems_by_subject: list[tuple[str, list[str]]]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the commit message policy check."""
-    args = parse_args(argv or sys.argv[1:])
-    subject_list = cli_subjects(args)
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        subject_list = cli_subjects(args)
+    except ValueError as error:
+        print(f"Commit message policy failed:\n{error}")
+        return 1
+    except (OSError, subprocess.CalledProcessError):
+        print("Commit message policy failed: requested messages could not be read.")
+        return 1
     if not subject_list:
         print("No commit subjects found to validate.", file=sys.stderr)
         return 2
