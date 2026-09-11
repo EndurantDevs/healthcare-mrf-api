@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from process.kentucky_profile_acquisition import _read_artifact, _reject_symlinks
@@ -273,11 +275,12 @@ def bind_retained_acquisition(
     capture time. The snapshot pin likewise needs independent capture authority;
     structural consistency and an accepted identity do not authorize publication.
     """
-    # Each acquisition rereads and scans the bounded snapshot. A managed batch
-    # caller should validate and index the snapshot once for the whole batch.
-    snapshot_by_field = read_registry_snapshot(snapshot_path, snapshot_sha256=snapshot_sha256)
-    acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
-    binding_by_field = _registry_match(acquisition_by_field, snapshot_by_field["registry_rows"])
+    return RegistrySnapshot(snapshot_path, snapshot_sha256=snapshot_sha256).bind_retained_acquisition(
+        destination, manifest_sha256=manifest_sha256, acquisition_sha256=acquisition_sha256
+    )
+
+
+def _binding_result(acquisition_by_field, binding_by_field, manifest_sha256, acquisition_sha256, snapshot_sha256):
     binding_by_field.update(
         snapshot_sha256=snapshot_sha256,
         manifest_sha256=manifest_sha256,
@@ -430,26 +433,63 @@ def bind_corroborated_acquisition(
     verified NPI identity nor publication authorization. The strict entry point
     keeps its original matching policy.
     """
-    snapshot_by_field = read_registry_snapshot(snapshot_path, snapshot_sha256=snapshot_sha256)
-    acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
-    nysed_by_field = read_nysed_acquisition(nysed_destination, receipt_sha256=nysed_receipt_sha256)
-    binding_by_field = _corroborated_registry_match(
-        acquisition_by_field, nysed_by_field, snapshot_by_field["registry_rows"]
-    )
-    binding_by_field.update(
-        snapshot_sha256=snapshot_sha256,
+    return RegistrySnapshot(snapshot_path, snapshot_sha256=snapshot_sha256).bind_corroborated_acquisition(
+        destination,
         manifest_sha256=manifest_sha256,
         acquisition_sha256=acquisition_sha256,
-        coverage_scope=COVERAGE_SCOPE,
+        nysed_destination=nysed_destination,
+        nysed_receipt_sha256=nysed_receipt_sha256,
     )
-    source_record = acquisition_by_field["source_record"]
-    source_record.update(matched_npi=binding_by_field["npi"], match_status=binding_by_field["status"])
-    source_record["match_evidence"].update(reason=binding_by_field["reason"], registry_binding=binding_by_field)
-    for fact in acquisition_by_field["facts"]:
-        fact["npi"] = binding_by_field["npi"]
-    return {
-        "outcome": "accepted" if binding_by_field["npi"] is not None else "held",
-        "reason": binding_by_field["reason"],
-        "source_record": source_record,
-        "facts": acquisition_by_field["facts"],
-    }
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)
+class RegistrySnapshot:
+    """Validate one pinned snapshot and retain every literal occurrence for reuse.
+
+    Bind calls use the loaded capture even if its file later changes. The caller
+    must authenticate that capture and choose its lifetime; this is not a source
+    freshness check or publication authority. Returned evidence is independent
+    of the private index, and both matching policies retain their usual guards.
+    """
+
+    _snapshot_sha256: str
+    _rows_by_license: dict
+
+    def __init__(self, path: Path, *, snapshot_sha256: str):
+        snapshot_by_field = read_registry_snapshot(path, snapshot_sha256=snapshot_sha256)
+        rows_by_license = {}
+        for candidate in snapshot_by_field["registry_rows"]:
+            rows_by_license.setdefault(candidate["license_number"], []).append(candidate)
+        object.__setattr__(self, "_snapshot_sha256", snapshot_sha256)
+        object.__setattr__(self, "_rows_by_license", rows_by_license)
+
+    def _candidates(self, acquisition_by_field):
+        license_number = acquisition_by_field["source_record"]["license_number"]
+        return copy.deepcopy(self._rows_by_license.get(license_number, []))
+
+    def bind_retained_acquisition(self, destination: Path, *, manifest_sha256: str, acquisition_sha256: str) -> dict:
+        """Apply strict matching to a freshly validated retained acquisition."""
+        acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
+        binding_by_field = _registry_match(acquisition_by_field, self._candidates(acquisition_by_field))
+        return _binding_result(
+            acquisition_by_field, binding_by_field, manifest_sha256, acquisition_sha256, self._snapshot_sha256
+        )
+
+    def bind_corroborated_acquisition(
+        self,
+        destination: Path,
+        *,
+        manifest_sha256: str,
+        acquisition_sha256: str,
+        nysed_destination: Path,
+        nysed_receipt_sha256: str,
+    ) -> dict:
+        """Apply explicit corroboration with freshly validated NYPP and NYSED evidence."""
+        acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
+        nysed_by_field = read_nysed_acquisition(nysed_destination, receipt_sha256=nysed_receipt_sha256)
+        binding_by_field = _corroborated_registry_match(
+            acquisition_by_field, nysed_by_field, self._candidates(acquisition_by_field)
+        )
+        return _binding_result(
+            acquisition_by_field, binding_by_field, manifest_sha256, acquisition_sha256, self._snapshot_sha256
+        )

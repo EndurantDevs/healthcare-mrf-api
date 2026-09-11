@@ -836,3 +836,166 @@ async def test_blank_middle_keeps_strict_default(source_session, monkeypatch, tm
     assert explicit["source_record"]["match_evidence"]["registry_binding"]["registry_middle_name_relationships"] == [
         "equal"
     ]
+
+
+@pytest.fixture(params=["strict", "corroborated"])
+async def indexed_case(request, source_session, monkeypatch, tmp_path, offline_binding):
+    if request.param == "strict":
+        paired = await _paired_case(
+            source_session,
+            monkeypatch,
+            tmp_path,
+            source_names={"middleName": ""},
+            search_names={"physicianFirstName": "Alex", "physicianLastName": "Example"},
+        )
+        return "bind_retained_acquisition", {key: item for key, item in paired.items() if not key.startswith("nysed_")}
+    return "bind_corroborated_acquisition", await _paired_case(source_session, monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        [],
+        [_candidate(), _candidate(), _candidate(taxonomy_occurrence_checksum=18)],
+        [_candidate(), _candidate(taxonomy=None)],
+        [_candidate(), {"license_number": "654321"}],
+        [_candidate(), _candidate(npi=1000000012, joined_npi=1000000012)],
+        [_candidate(), _candidate(middle_name="M")],
+        [_candidate(), _candidate(last_name="Different")],
+        [_candidate(), _candidate(entity_type_code=2)],
+        [_candidate(), _candidate(taxonomy_grouping="Nursing Service Providers")],
+        [_candidate(license_number=literal) for literal in (None, "", "060654321", " 654321 ", "123456")],
+    ],
+)
+async def test_loaded_snapshot_preserves_one_shot_decisions(indexed_case, tmp_path, monkeypatch, candidates):
+    method, options = indexed_case
+    saved = _save_snapshot(tmp_path, _snapshot(candidates))
+    expected = getattr(binding, method)(**options, **saved)
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    saved["snapshot_path"].unlink()
+
+    def no_reread(*_args, **_kwargs):
+        raise AssertionError("Loaded binding must not reread or validate the registry again")
+
+    monkeypatch.setattr(binding, "read_registry_snapshot", no_reread)
+    for _ in range(3):
+        assert getattr(loaded, method)(**options) == expected
+    exact_candidates = [candidate for candidate in candidates if candidate["license_number"] == "654321"]
+    assert expected["source_record"]["match_evidence"]["registry_binding"]["candidate_rows"] == exact_candidates
+
+
+async def test_loaded_snapshot_result_mutation_cannot_change_later_decisions(indexed_case, tmp_path):
+    method, options = indexed_case
+    rows = [_candidate(), _candidate(taxonomy={"reported": ["unexpected"]})]
+    saved = _save_snapshot(tmp_path, _snapshot(rows))
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    first = getattr(loaded, method)(**options)
+    expected = copy.deepcopy(first)
+    assert first["outcome"] == "held" and first["reason"] == "registry_identity_conflict"
+    decision = first["source_record"]["match_evidence"]["registry_binding"]
+    decision["candidate_rows"][1]["taxonomy"]["reported"].clear()
+    decision["candidate_rows"].clear()
+    decision["snapshot_sha256"] = "0" * 64
+    first["facts"][0]["npi"] = 1000000012
+    first["source_record"]["raw_payload"].clear()
+    assert getattr(loaded, method)(**options) == expected
+    with pytest.raises(AttributeError):
+        loaded._snapshot_sha256 = "0" * 64
+    with pytest.raises(AttributeError):
+        loaded._rows_by_license = {}
+
+
+@pytest.mark.parametrize("artifact", [name for name, _ in binding.ACQUISITION_FILES])
+async def test_loaded_snapshot_revalidates_every_acquisition(indexed_case, tmp_path, artifact):
+    method, options = indexed_case
+    saved = _save_snapshot(tmp_path, _snapshot())
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    expected = getattr(loaded, method)(**options)
+    path = options["destination"] / artifact
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n")
+    with pytest.raises(ValueError, match="acquisition_changed"):
+        getattr(loaded, method)(**options)
+    path.write_bytes(original)
+    assert getattr(loaded, method)(**options) == expected
+
+
+@pytest.mark.parametrize("artifact", ["manifest.json", "request.json", "response.json", "result.json"])
+async def test_loaded_snapshot_revalidates_nysed_evidence(paired_case, tmp_path, artifact):
+    saved = _save_snapshot(tmp_path, _snapshot())
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    assert loaded.bind_corroborated_acquisition(**paired_case)["outcome"] == "accepted"
+    path = paired_case["nysed_destination"] / artifact
+    changed_by_field = json.loads(path.read_bytes())
+    changed_by_field["unexpected"] = True
+    path.write_bytes(encoded_json(changed_by_field))
+    with pytest.raises(ValueError):
+        loaded.bind_corroborated_acquisition(**paired_case)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"all_rows_received": False}, {"row_count": 2}, {"registry_rows": [{"license_number": []}]}],
+)
+def test_loaded_snapshot_requires_full_pinned_validation(tmp_path, changes):
+    saved = _save_snapshot(tmp_path, {**_snapshot(), **changes})
+    with pytest.raises(ValueError, match="snapshot_(incomplete|count_changed|rows_invalid)"):
+        binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+
+
+async def test_loaded_snapshot_keeps_original_capture_when_file_changes(retained_case, tmp_path):
+    session, manifest_sha256, acquisition_sha256 = retained_case
+    options_by_field = {
+        "destination": session.destination,
+        "manifest_sha256": manifest_sha256,
+        "acquisition_sha256": acquisition_sha256,
+    }
+    saved = _save_snapshot(tmp_path, _snapshot())
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    expected = loaded.bind_retained_acquisition(**options_by_field)
+    saved["snapshot_path"].write_bytes(encoded_json(_snapshot([_candidate(entity_type_code=2)])))
+    with pytest.raises(ValueError, match="snapshot_changed"):
+        binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    assert loaded.bind_retained_acquisition(**options_by_field) == expected
+    assert (
+        expected["source_record"]["match_evidence"]["registry_binding"]["snapshot_sha256"] == saved["snapshot_sha256"]
+    )
+
+
+async def test_one_snapshot_binds_different_literal_roots(source_session, tmp_path, monkeypatch, offline_binding):
+    cases = []
+    for license_number, first_name in [("654321", "Alex"), ("000123", "Jordan")]:
+        session = source_session(
+            SourceResponse(_search(physicianFirstName=first_name)),
+            SourceResponse(_education(license_number, firstName=first_name, nationalProviderId="")),
+        )
+        session.destination = tmp_path / license_number
+        await _acquire(session, license_number)
+        _, manifest_sha256, acquisition_sha256 = _pinned_case(session)
+        cases.append(
+            {
+                "destination": session.destination,
+                "manifest_sha256": manifest_sha256,
+                "acquisition_sha256": acquisition_sha256,
+            }
+        )
+    registry_candidates = [
+        _candidate(),
+        _candidate(license_number="000123", first_name="Jordan", npi=1000000012, joined_npi=1000000012),
+    ]
+    saved = _save_snapshot(tmp_path, _snapshot(registry_candidates))
+    reads = []
+    original_reader = binding.read_registry_snapshot
+
+    def counted_read(*args, **kwargs):
+        reads.append(True)
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr(binding, "read_registry_snapshot", counted_read)
+    loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
+    outcomes = [loaded.bind_retained_acquisition(**case) for case in cases]
+    assert [outcome["source_record"]["matched_npi"] for outcome in outcomes] == [1000000004, 1000000012]
+    assert [
+        outcome["source_record"]["match_evidence"]["registry_binding"]["candidate_rows"] for outcome in outcomes
+    ] == [[candidate] for candidate in registry_candidates]
+    assert reads == [True]
