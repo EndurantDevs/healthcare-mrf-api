@@ -179,6 +179,14 @@ impl RootDirectory {
     }
 
     fn open_existing_regular(&self, name: &str) -> io::Result<Option<File>> {
+        self.open_existing_regular_with_sleep(name, thread::sleep)
+    }
+
+    fn open_existing_regular_with_sleep(
+        &self,
+        name: &str,
+        mut sleep: impl FnMut(Duration),
+    ) -> io::Result<Option<File>> {
         let encoded_name = c_string(name, "UHC retained file name")?;
         for attempt in 0..PUBLICATION_LINK_RETRIES {
             let descriptor = unsafe {
@@ -211,7 +219,7 @@ impl RootDirectory {
                 && attempt + 1 < PUBLICATION_LINK_RETRIES
             {
                 drop(file);
-                thread::sleep(PUBLICATION_LINK_RETRY_DELAY);
+                sleep(PUBLICATION_LINK_RETRY_DELAY);
                 continue;
             }
             return Err(invalid_data(format!(
