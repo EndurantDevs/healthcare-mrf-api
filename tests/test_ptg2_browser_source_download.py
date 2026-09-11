@@ -309,6 +309,7 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
     assert session.curl_options[CurlOpt.PROXYUSERNAME] == "hospital-test"
     assert session.curl_options[CurlOpt.PROXYPASSWORD] == "test-token"
     assert session.curl_options[CurlOpt.NOPROXY] == ""
+    assert CurlOpt.CONNECT_TO not in session.curl_options
     assert "impersonate" not in session.request[2]
     assert "http_version" not in session.request[2]
     assert session.request[2]["headers"] == {
@@ -317,7 +318,7 @@ async def test_proxied_download_keeps_target_pin_without_direct_only_options(
 
 
 @pytest.mark.asyncio
-async def test_proxied_download_connects_to_the_validated_origin_ip(
+async def test_proxied_download_preserves_the_validated_origin_hostname(
     tmp_path, monkeypatch
 ):
     requests = []
@@ -352,7 +353,7 @@ async def test_proxied_download_connects_to_the_validated_origin_ip(
         server.close()
         await server.wait_closed()
 
-    assert requests == ["CONNECT 8.8.8.8:443 HTTP/1.1"]
+    assert requests == ["CONNECT hospital.example:443 HTTP/1.1"]
 
 
 @pytest.mark.parametrize(

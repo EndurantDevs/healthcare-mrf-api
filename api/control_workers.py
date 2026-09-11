@@ -885,12 +885,12 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
-def _worker_job_container(
+def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
-    image: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    """Build the container and volume records for one worker Job."""
+) -> tuple[list[dict[str, Any]], str]:
+    """Build the explicit environment for one worker Job."""
+
     env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
@@ -918,7 +918,25 @@ def _worker_job_container(
                 "value": "68719476736",
             }
         )
+    if spec.worker_class == "process.HospitalPrices":
+        env_list.append(
+            {
+                "name": "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+                "value": "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net",
+            }
+        )
     env_list.extend(_worker_job_secret_env(spec.worker_class))
+    return env_list, run_id
+
+
+def _worker_job_container(
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+    image: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Build the container and volume records for one worker Job."""
+
+    env_list, run_id = _worker_job_environment(spec, launch_request)
 
     container_dict: dict[str, Any] = {
         "name": "worker",
