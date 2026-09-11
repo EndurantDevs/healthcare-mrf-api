@@ -344,16 +344,17 @@ fn parse_tall_payer(
             || payer.allowed_count.is_some());
     if !payer_has_charge(&payer) {
         if columns.profile == CmsProfile::V2 {
-            validate_charge_free_csv_payer(&payer)?;
+            validate_charge_free_csv_payer(&payer, generic_notes)?;
             return Ok(None);
         }
-        if charge_free_v3_statistics && validate_charge_free_csv_payer(&payer).is_ok() {
+        if charge_free_v3_statistics && validate_charge_free_csv_payer(&payer, generic_notes).is_ok() {
             return Ok(None);
         }
     }
+    // Tall generic notes can explain payer charges even with an extra payer-notes column.
     let payer = validate_csv_payer(
         payer,
-        generic_notes.filter(|_| columns.additional_payer_notes.is_none()),
+        generic_notes,
         true,
         columns.profile,
         columns.requires_estimated_amount,
@@ -430,7 +431,7 @@ fn parse_wide_payers(
             )),
         };
         if !payer_has_charge(&parsed) {
-            validate_charge_free_csv_payer(&parsed)?;
+            validate_charge_free_csv_payer(&parsed, None)?;
             continue;
         }
         payers.push(validate_csv_payer(
