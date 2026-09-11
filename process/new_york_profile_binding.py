@@ -17,20 +17,39 @@ from process.provider_directory_projection_json import decoded_json_object
 
 SNAPSHOT_SCHEMA = "ny-nppes-retained-snapshot/v1"
 COVERAGE_SCOPE = "all_current_literal_ny_license_occurrences"
-MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+# Bound complete state snapshots separately from individual source responses.
+MAX_SNAPSHOT_BYTES = 384 * 1024 * 1024
 # Reviewed SELECT: literal NY only, nullable NPI/NUCC joins, ordered by npi/checksum.
 QUERY_SHA256 = "ccecd6458b1cc71617f5f3404ef300debd9bb976e20827e0940f12400c0c0b7d"
 REGISTRY_COLUMNS = [
-    "npi", "taxonomy_occurrence_checksum", "license_number", "license_state", "taxonomy",
-    "primary_taxonomy_switch", "joined_npi", "entity_type_code", "first_name", "middle_name",
-    "last_name", "suffix", "joined_taxonomy_code", "taxonomy_grouping",
+    "npi",
+    "taxonomy_occurrence_checksum",
+    "license_number",
+    "license_state",
+    "taxonomy",
+    "primary_taxonomy_switch",
+    "joined_npi",
+    "entity_type_code",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "suffix",
+    "joined_taxonomy_code",
+    "taxonomy_grouping",
 ]
-NAME_FIELDS = (("firstName", "first_name"), ("middleName", "middle_name"),
-               ("lastName", "last_name"), ("suffix", "suffix"))
+NAME_FIELDS = (
+    ("firstName", "first_name"),
+    ("middleName", "middle_name"),
+    ("lastName", "last_name"),
+    ("suffix", "suffix"),
+)
 ACQUISITION_FILES = (
-    ("manifest.json", MAX_METADATA_BYTES), ("result.json", MAX_METADATA_BYTES),
-    ("search.request.json", MAX_METADATA_BYTES), ("search.response.json", MAX_RESPONSE_ENVELOPE_BYTES),
-    ("education.request.json", MAX_METADATA_BYTES), ("education.response.json", MAX_RESPONSE_ENVELOPE_BYTES),
+    ("manifest.json", MAX_METADATA_BYTES),
+    ("result.json", MAX_METADATA_BYTES),
+    ("search.request.json", MAX_METADATA_BYTES),
+    ("search.response.json", MAX_RESPONSE_ENVELOPE_BYTES),
+    ("education.request.json", MAX_METADATA_BYTES),
+    ("education.response.json", MAX_RESPONSE_ENVELOPE_BYTES),
 )
 
 
@@ -60,7 +79,10 @@ def acquisition_content_sha256(destination: Path) -> str:
 
 
 def _validated_acquisition(destination, manifest_sha256, acquisition_sha256):
-    _require(isinstance(acquisition_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", acquisition_sha256), "acquisition_pin_invalid")
+    _require(
+        isinstance(acquisition_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", acquisition_sha256),
+        "acquisition_pin_invalid",
+    )
     content_sha256, responses_by_name = _acquisition_content(destination)
     _require(content_sha256 == acquisition_sha256, "acquisition_changed")
     acquisition_by_field = read_acquisition(destination, manifest_sha256=manifest_sha256)
@@ -69,38 +91,56 @@ def _validated_acquisition(destination, manifest_sha256, acquisition_sha256):
     search_response = responses_by_name["search.response.json"]
     # Match the transport envelopes actually replayed, even if files change and
     # are restored between the original byte digest and the final byte check.
-    _require(source_record["artifact_id"] == hashlib.sha256(encoded_json(profile_response)).hexdigest()
-             and all(source_record["match_evidence"]["license_search"][field] == search_response.get(field)
-                     for field in ("source_url", "request_sha256", "content_sha256", "downloaded_at")),
-             "acquisition_replay_changed")
+    _require(
+        source_record["artifact_id"] == hashlib.sha256(encoded_json(profile_response)).hexdigest()
+        and all(
+            source_record["match_evidence"]["license_search"][field] == search_response.get(field)
+            for field in ("source_url", "request_sha256", "content_sha256", "downloaded_at")
+        ),
+        "acquisition_replay_changed",
+    )
     _require(acquisition_content_sha256(destination) == acquisition_sha256, "acquisition_changed")
     return acquisition_by_field
 
 
 def _validate_snapshot_metadata(snapshot_by_field):
-    _require(snapshot_by_field.get("schema_version") == SNAPSHOT_SCHEMA
-             and snapshot_by_field.get("coverage_scope") == COVERAGE_SCOPE
-             and snapshot_by_field.get("source_schema") == "mrf"
-             and snapshot_by_field.get("source_state") == "NY"
-             and snapshot_by_field.get("query_sha256") == QUERY_SHA256
-             and snapshot_by_field.get("columns") == REGISTRY_COLUMNS, "snapshot_scope_invalid")
-    _require(snapshot_by_field.get("status") == "passed"
-             and snapshot_by_field.get("all_rows_received") is True
-             and snapshot_by_field.get("connection_closed") is True, "snapshot_incomplete")
+    _require(
+        snapshot_by_field.get("schema_version") == SNAPSHOT_SCHEMA
+        and snapshot_by_field.get("coverage_scope") == COVERAGE_SCOPE
+        and snapshot_by_field.get("source_schema") == "mrf"
+        and snapshot_by_field.get("source_state") == "NY"
+        and snapshot_by_field.get("query_sha256") == QUERY_SHA256
+        and snapshot_by_field.get("columns") == REGISTRY_COLUMNS,
+        "snapshot_scope_invalid",
+    )
+    _require(
+        snapshot_by_field.get("status") == "passed"
+        and snapshot_by_field.get("all_rows_received") is True
+        and snapshot_by_field.get("connection_closed") is True,
+        "snapshot_incomplete",
+    )
     transaction_by_field = snapshot_by_field.get("snapshot")
-    _require(isinstance(transaction_by_field, dict)
-             and transaction_by_field.get("read_only") == "on"
-             and transaction_by_field.get("isolation") == "repeatable read"
-             and isinstance(transaction_by_field.get("snapshot_id"), str)
-             and re.fullmatch(r"[0-9]+:[0-9]+:(?:[0-9]+(?:,[0-9]+)*)?", transaction_by_field["snapshot_id"])
-             and all(isinstance(transaction_by_field.get(field), str) and transaction_by_field[field].strip()
-                     for field in ("snapshot_started_at", "server_version", "database_name"))
-             and type(transaction_by_field.get("backend_pid")) is int
-             and transaction_by_field["backend_pid"] > 0, "snapshot_transaction_invalid")
+    _require(
+        isinstance(transaction_by_field, dict)
+        and transaction_by_field.get("read_only") == "on"
+        and transaction_by_field.get("isolation") == "repeatable read"
+        and isinstance(transaction_by_field.get("snapshot_id"), str)
+        and re.fullmatch(r"[0-9]+:[0-9]+:(?:[0-9]+(?:,[0-9]+)*)?", transaction_by_field["snapshot_id"])
+        and all(
+            isinstance(transaction_by_field.get(field), str) and transaction_by_field[field].strip()
+            for field in ("snapshot_started_at", "server_version", "database_name")
+        )
+        and type(transaction_by_field.get("backend_pid")) is int
+        and transaction_by_field["backend_pid"] > 0,
+        "snapshot_transaction_invalid",
+    )
     relations_by_name = snapshot_by_field.get("registry_relations")
-    _require(isinstance(relations_by_name, dict)
-             and set(relations_by_name) == {"mrf.npi", "mrf.npi_taxonomy", "mrf.nucc_taxonomy"}
-             and all(type(oid) is int and oid > 0 for oid in relations_by_name.values()), "snapshot_relations_invalid")
+    _require(
+        isinstance(relations_by_name, dict)
+        and set(relations_by_name) == {"mrf.npi", "mrf.npi_taxonomy", "mrf.nucc_taxonomy"}
+        and all(type(oid) is int and oid > 0 for oid in relations_by_name.values()),
+        "snapshot_relations_invalid",
+    )
 
 
 def read_registry_snapshot(path: Path, *, snapshot_sha256: str) -> dict:
@@ -110,26 +150,39 @@ def read_registry_snapshot(path: Path, *, snapshot_sha256: str) -> dict:
     hashes prove retained structure, not source truth, freshness or NY coverage.
     The inherited file bound does not establish that a full NY snapshot fits.
     """
-    _require(isinstance(snapshot_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256), "snapshot_pin_invalid")
+    _require(
+        isinstance(snapshot_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256), "snapshot_pin_invalid"
+    )
     snapshot_by_field = _read_artifact(path, MAX_SNAPSHOT_BYTES)
     _require(hashlib.sha256(encoded_json(snapshot_by_field)).hexdigest() == snapshot_sha256, "snapshot_changed")
     _validate_snapshot_metadata(snapshot_by_field)
     registry_rows = snapshot_by_field.get("registry_rows")
     # Missing or nontext license values could conceal a requested root. Missing
     # enrichment remains visible and makes that literal root fail identity checks.
-    _require(isinstance(registry_rows, list)
-             and all(isinstance(candidate, dict) and "license_number" in candidate
-                     and (candidate["license_number"] is None or isinstance(candidate["license_number"], str))
-                     and set(candidate) <= set(REGISTRY_COLUMNS) for candidate in registry_rows), "snapshot_rows_invalid")
-    _require(type(snapshot_by_field.get("expected_source_row_count")) is int
-             and type(snapshot_by_field.get("row_count")) is int
-             and snapshot_by_field["expected_source_row_count"] == snapshot_by_field["row_count"] == len(registry_rows),
-             "snapshot_count_changed")
+    _require(
+        isinstance(registry_rows, list)
+        and all(
+            isinstance(candidate, dict)
+            and "license_number" in candidate
+            and (candidate["license_number"] is None or isinstance(candidate["license_number"], str))
+            and set(candidate) <= set(REGISTRY_COLUMNS)
+            for candidate in registry_rows
+        ),
+        "snapshot_rows_invalid",
+    )
+    _require(
+        type(snapshot_by_field.get("expected_source_row_count")) is int
+        and type(snapshot_by_field.get("row_count")) is int
+        and snapshot_by_field["expected_source_row_count"] == snapshot_by_field["row_count"] == len(registry_rows),
+        "snapshot_count_changed",
+    )
     registry_bytes = encoded_json(registry_rows)
-    _require(type(snapshot_by_field.get("registry_rows_bytes")) is int
-             and snapshot_by_field["registry_rows_bytes"] == len(registry_bytes)
-             and snapshot_by_field.get("registry_rows_sha256") == hashlib.sha256(registry_bytes).hexdigest(),
-             "snapshot_rows_changed")
+    _require(
+        type(snapshot_by_field.get("registry_rows_bytes")) is int
+        and snapshot_by_field["registry_rows_bytes"] == len(registry_bytes)
+        and snapshot_by_field.get("registry_rows_sha256") == hashlib.sha256(registry_bytes).hexdigest(),
+        "snapshot_rows_changed",
+    )
     previous_occurrence = None
     for candidate in registry_rows:
         # Invalid occurrence keys remain candidate conflicts, never exclusions.
@@ -147,8 +200,9 @@ def _has_matching_names(identity_by_field, candidate):
             return False
         registry_name = candidate[registry_field]
         # Present NULL optional names are unreported; missing columns are not.
-        if not (isinstance(registry_name, str)
-                or registry_field in {"middle_name", "suffix"} and registry_name is None):
+        if not (
+            isinstance(registry_name, str) or registry_field in {"middle_name", "suffix"} and registry_name is None
+        ):
             return False
         if _text(registry_name).casefold() != _text(identity_by_field[source_field]).casefold():
             return False
@@ -157,26 +211,38 @@ def _has_matching_names(identity_by_field, candidate):
 
 def _compatible_candidate(identity_by_field, candidate):
     taxonomy = candidate.get("taxonomy")
-    return (type(candidate.get("npi")) is int and is_valid_npi(candidate["npi"])
-            and type(candidate.get("joined_npi")) is int and candidate["joined_npi"] == candidate["npi"]
-            and type(candidate.get("taxonomy_occurrence_checksum")) is int
-            and candidate.get("license_state") == "NY"
-            and type(candidate.get("entity_type_code")) is int and candidate["entity_type_code"] == 1
-            and isinstance(taxonomy, str) and bool(taxonomy.strip())
-            and candidate.get("joined_taxonomy_code") == taxonomy
-            and candidate.get("taxonomy_grouping") == "Allopathic & Osteopathic Physicians"
-            and _has_matching_names(identity_by_field, candidate))
+    return (
+        type(candidate.get("npi")) is int
+        and is_valid_npi(candidate["npi"])
+        and type(candidate.get("joined_npi")) is int
+        and candidate["joined_npi"] == candidate["npi"]
+        and type(candidate.get("taxonomy_occurrence_checksum")) is int
+        and candidate.get("license_state") == "NY"
+        and type(candidate.get("entity_type_code")) is int
+        and candidate["entity_type_code"] == 1
+        and isinstance(taxonomy, str)
+        and bool(taxonomy.strip())
+        and candidate.get("joined_taxonomy_code") == taxonomy
+        and candidate.get("taxonomy_grouping") == "Allopathic & Osteopathic Physicians"
+        and _has_matching_names(identity_by_field, candidate)
+    )
 
 
 def _registry_match(acquisition_by_field, registry_rows):
     source_record = acquisition_by_field["source_record"]
     identity_by_field = source_record["raw_payload"]["data"]["phyInfo"]
     # Select literal licenses before examining entity, taxonomy, joins or names.
-    candidates = [candidate for candidate in registry_rows
-                  if candidate["license_number"] == source_record["license_number"]]
-    binding_by_field = {"method": "exact_ny_license_name_components", "candidate_rows": candidates,
-                        "npi": None, "status": "identity_conflict", "source_npi": identity_by_field["nationalProviderId"],
-                        "registry_license_profession": "not_supplied_by_nppes"}
+    candidates = [
+        candidate for candidate in registry_rows if candidate["license_number"] == source_record["license_number"]
+    ]
+    binding_by_field = {
+        "method": "exact_ny_license_name_components",
+        "candidate_rows": candidates,
+        "npi": None,
+        "status": "identity_conflict",
+        "source_npi": identity_by_field["nationalProviderId"],
+        "registry_license_profession": "not_supplied_by_nppes",
+    }
     if acquisition_by_field["identity_review_required"]:
         return {**binding_by_field, "reason": "search_header_name_disagreement"}
     if not candidates:
@@ -193,8 +259,9 @@ def _registry_match(acquisition_by_field, registry_rows):
     return {**binding_by_field, "npi": matched_npi, "status": "deterministic", "reason": "unique_exact_license_name"}
 
 
-def bind_retained_acquisition(destination: Path, *, manifest_sha256: str, acquisition_sha256: str,
-                              snapshot_path: Path, snapshot_sha256: str) -> dict:
+def bind_retained_acquisition(
+    destination: Path, *, manifest_sha256: str, acquisition_sha256: str, snapshot_path: Path, snapshot_sha256: str
+) -> dict:
     """Return an offline identity decision, preserving all fact provenance.
 
     Acquisition bytes must match a digest independently retained at trusted
@@ -206,13 +273,20 @@ def bind_retained_acquisition(destination: Path, *, manifest_sha256: str, acquis
     snapshot_by_field = read_registry_snapshot(snapshot_path, snapshot_sha256=snapshot_sha256)
     acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
     binding_by_field = _registry_match(acquisition_by_field, snapshot_by_field["registry_rows"])
-    binding_by_field.update(snapshot_sha256=snapshot_sha256, manifest_sha256=manifest_sha256,
-                            acquisition_sha256=acquisition_sha256,
-                            coverage_scope=COVERAGE_SCOPE)
+    binding_by_field.update(
+        snapshot_sha256=snapshot_sha256,
+        manifest_sha256=manifest_sha256,
+        acquisition_sha256=acquisition_sha256,
+        coverage_scope=COVERAGE_SCOPE,
+    )
     source_record = acquisition_by_field["source_record"]
     source_record.update(matched_npi=binding_by_field["npi"], match_status=binding_by_field["status"])
     source_record["match_evidence"].update(reason=binding_by_field["reason"], registry_binding=binding_by_field)
     for fact in acquisition_by_field["facts"]:
         fact["npi"] = binding_by_field["npi"]
-    return {"outcome": "accepted" if binding_by_field["npi"] is not None else "held",
-            "reason": binding_by_field["reason"], "source_record": source_record, "facts": acquisition_by_field["facts"]}
+    return {
+        "outcome": "accepted" if binding_by_field["npi"] is not None else "held",
+        "reason": binding_by_field["reason"],
+        "source_record": source_record,
+        "facts": acquisition_by_field["facts"],
+    }

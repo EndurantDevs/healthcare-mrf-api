@@ -13,26 +13,54 @@ from tests.test_new_york_profile_retained import _body
 
 
 def _candidate(**changes):
-    return {"npi": 1000000004, "taxonomy_occurrence_checksum": 17, "license_number": "654321",
-            "license_state": "NY", "taxonomy": "207R00000X", "primary_taxonomy_switch": "Y",
-            "joined_npi": 1000000004, "entity_type_code": 1, "first_name": "Alex", "middle_name": None,
-            "last_name": "Example", "suffix": None, "joined_taxonomy_code": "207R00000X",
-            "taxonomy_grouping": "Allopathic & Osteopathic Physicians", **changes}
+    return {
+        "npi": 1000000004,
+        "taxonomy_occurrence_checksum": 17,
+        "license_number": "654321",
+        "license_state": "NY",
+        "taxonomy": "207R00000X",
+        "primary_taxonomy_switch": "Y",
+        "joined_npi": 1000000004,
+        "entity_type_code": 1,
+        "first_name": "Alex",
+        "middle_name": None,
+        "last_name": "Example",
+        "suffix": None,
+        "joined_taxonomy_code": "207R00000X",
+        "taxonomy_grouping": "Allopathic & Osteopathic Physicians",
+        **changes,
+    }
 
 
 def _snapshot(registry_rows=None):
     registry_rows = [_candidate()] if registry_rows is None else registry_rows
     registry_bytes = encoded_json(registry_rows)
-    return {"schema_version": binding.SNAPSHOT_SCHEMA, "coverage_scope": binding.COVERAGE_SCOPE,
-            "source_schema": "mrf", "source_state": "NY", "query_sha256": binding.QUERY_SHA256,
-            "columns": list(binding.REGISTRY_COLUMNS), "status": "passed", "all_rows_received": True,
-            "connection_closed": True, "snapshot": {"read_only": "on", "isolation": "repeatable read",
-                "snapshot_id": "100:101:", "backend_pid": 123, "snapshot_started_at": "2026-09-09 00:00:00+00",
-                "server_version": "18", "database_name": "synthetic"},
-            "registry_relations": {"mrf.npi": 11, "mrf.npi_taxonomy": 12, "mrf.nucc_taxonomy": 13},
-            "expected_source_row_count": len(registry_rows), "row_count": len(registry_rows),
-            "registry_rows_bytes": len(registry_bytes), "registry_rows_sha256": hashlib.sha256(registry_bytes).hexdigest(),
-            "registry_rows": registry_rows}
+    return {
+        "schema_version": binding.SNAPSHOT_SCHEMA,
+        "coverage_scope": binding.COVERAGE_SCOPE,
+        "source_schema": "mrf",
+        "source_state": "NY",
+        "query_sha256": binding.QUERY_SHA256,
+        "columns": list(binding.REGISTRY_COLUMNS),
+        "status": "passed",
+        "all_rows_received": True,
+        "connection_closed": True,
+        "snapshot": {
+            "read_only": "on",
+            "isolation": "repeatable read",
+            "snapshot_id": "100:101:",
+            "backend_pid": 123,
+            "snapshot_started_at": "2026-09-09 00:00:00+00",
+            "server_version": "18",
+            "database_name": "synthetic",
+        },
+        "registry_relations": {"mrf.npi": 11, "mrf.npi_taxonomy": 12, "mrf.nucc_taxonomy": 13},
+        "expected_source_row_count": len(registry_rows),
+        "row_count": len(registry_rows),
+        "registry_rows_bytes": len(registry_bytes),
+        "registry_rows_sha256": hashlib.sha256(registry_bytes).hexdigest(),
+        "registry_rows": registry_rows,
+    }
 
 
 def _save_snapshot(tmp_path, snapshot_by_field):
@@ -57,8 +85,9 @@ def _pinned_case(session):
 def _bind(retained_case, tmp_path, registry_rows=None):
     session, manifest_sha256, acquisition_sha256 = retained_case
     snapshot_options = _save_snapshot(tmp_path, _snapshot(registry_rows))
-    return binding.bind_retained_acquisition(session.destination, manifest_sha256=manifest_sha256,
-                                             acquisition_sha256=acquisition_sha256, **snapshot_options)
+    return binding.bind_retained_acquisition(
+        session.destination, manifest_sha256=manifest_sha256, acquisition_sha256=acquisition_sha256, **snapshot_options
+    )
 
 
 async def test_binding_preserves_duplicates_and_fact_provenance(retained_case, tmp_path):
@@ -76,7 +105,10 @@ async def test_binding_preserves_duplicates_and_fact_provenance(retained_case, t
     for field in original["source_record"]:
         if field not in {"matched_npi", "match_status", "match_evidence"}:
             assert source_record[field] == original["source_record"][field]
-    assert source_record["match_evidence"]["license_search"] == original["source_record"]["match_evidence"]["license_search"]
+    assert (
+        source_record["match_evidence"]["license_search"]
+        == original["source_record"]["match_evidence"]["license_search"]
+    )
     expected_facts = copy.deepcopy(original["facts"])
     for fact in expected_facts:
         fact["npi"] = 1000000004
@@ -86,15 +118,36 @@ async def test_binding_preserves_duplicates_and_fact_provenance(retained_case, t
     assert len(session.requests) == 2
 
 
-@pytest.mark.parametrize("changes", [
-    {"npi": 1234567890}, {"npi": "1000000004"}, {"joined_npi": None}, {"joined_npi": 1000000012},
-    {"joined_npi": True}, {"taxonomy_occurrence_checksum": None}, {"taxonomy_occurrence_checksum": True},
-    {"license_state": "MA"}, {"entity_type_code": 2}, {"entity_type_code": True}, {"entity_type_code": None},
-    {"taxonomy": ""}, {"taxonomy": None}, {"joined_taxonomy_code": None}, {"joined_taxonomy_code": "Other"},
-    {"taxonomy_grouping": "Other"}, {"taxonomy_grouping": None}, {"first_name": "A"},
-    {"first_name": "Example", "last_name": "Alex"}, {"first_name": None}, {"last_name": None},
-    {"middle_name": "Morgan"}, {"suffix": "Jr"}, {"middle_name": False}, {"suffix": 0},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"npi": 1234567890},
+        {"npi": "1000000004"},
+        {"joined_npi": None},
+        {"joined_npi": 1000000012},
+        {"joined_npi": True},
+        {"taxonomy_occurrence_checksum": None},
+        {"taxonomy_occurrence_checksum": True},
+        {"license_state": "MA"},
+        {"entity_type_code": 2},
+        {"entity_type_code": True},
+        {"entity_type_code": None},
+        {"taxonomy": ""},
+        {"taxonomy": None},
+        {"joined_taxonomy_code": None},
+        {"joined_taxonomy_code": "Other"},
+        {"taxonomy_grouping": "Other"},
+        {"taxonomy_grouping": None},
+        {"first_name": "A"},
+        {"first_name": "Example", "last_name": "Alex"},
+        {"first_name": None},
+        {"last_name": None},
+        {"middle_name": "Morgan"},
+        {"suffix": "Jr"},
+        {"middle_name": False},
+        {"suffix": 0},
+    ],
+)
 async def test_conflicting_candidate_is_not_filtered_away(retained_case, tmp_path, changes):
     candidates = [_candidate(), _candidate(**changes)]
     bound = _bind(retained_case, tmp_path, candidates)
@@ -104,8 +157,19 @@ async def test_conflicting_candidate_is_not_filtered_away(retained_case, tmp_pat
     assert all(fact["npi"] is None for fact in bound["facts"])
 
 
-@pytest.mark.parametrize("field", ["first_name", "middle_name", "last_name", "suffix", "joined_npi",
-                                   "joined_taxonomy_code", "entity_type_code", "taxonomy_occurrence_checksum"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "first_name",
+        "middle_name",
+        "last_name",
+        "suffix",
+        "joined_npi",
+        "joined_taxonomy_code",
+        "entity_type_code",
+        "taxonomy_occurrence_checksum",
+    ],
+)
 async def test_missing_candidate_columns_hold_the_literal_root(retained_case, tmp_path, field):
     incomplete = _candidate()
     del incomplete[field]
@@ -116,7 +180,11 @@ async def test_missing_candidate_columns_hold_the_literal_root(retained_case, tm
 
 @pytest.mark.parametrize("middle,suffix", [(None, None), ("", ""), ("  ", " ")])
 async def test_present_optional_blank_names_and_case_match(retained_case, tmp_path, middle, suffix):
-    bound = _bind(retained_case, tmp_path, [_candidate(first_name=" ALEX ", last_name="example", middle_name=middle, suffix=suffix)])
+    bound = _bind(
+        retained_case,
+        tmp_path,
+        [_candidate(first_name=" ALEX ", last_name="example", middle_name=middle, suffix=suffix)],
+    )
     assert bound["outcome"] == "accepted"
 
 
@@ -132,13 +200,24 @@ async def test_other_literal_formats_are_retained_without_binding(retained_case,
     candidates = [_candidate(license_number=license_number)]
     snapshot_by_field = _snapshot(candidates)
     options = _save_snapshot(tmp_path, snapshot_by_field)
-    assert binding.read_registry_snapshot(options["snapshot_path"], snapshot_sha256=options["snapshot_sha256"]) == snapshot_by_field
+    assert (
+        binding.read_registry_snapshot(options["snapshot_path"], snapshot_sha256=options["snapshot_sha256"])
+        == snapshot_by_field
+    )
     bound = _bind(retained_case, tmp_path, candidates)
     assert bound["outcome"] == "held" and bound["reason"] == "no_exact_license_candidates"
 
 
-@pytest.mark.parametrize("source_npi,expected", [("", "accepted"), ("1000000004", "accepted"),
-    ("1000000012", "held"), ("1234567890", "held"), ("not-an-npi", "held")])
+@pytest.mark.parametrize(
+    "source_npi,expected",
+    [
+        ("", "accepted"),
+        ("1000000004", "accepted"),
+        ("1000000012", "held"),
+        ("1234567890", "held"),
+        ("not-an-npi", "held"),
+    ],
+)
 async def test_explicit_source_npi_must_agree(source_session, tmp_path, source_npi, expected):
     session = source_session(SourceResponse(_search()), SourceResponse(_education(nationalProviderId=source_npi)))
     await _acquire(session)
@@ -148,8 +227,13 @@ async def test_explicit_source_npi_must_agree(source_session, tmp_path, source_n
         assert bound["reason"] == "source_npi_identity_conflict" and all(fact["npi"] is None for fact in bound["facts"])
 
 
-@pytest.mark.parametrize("registry_rows", [[_candidate(), _candidate(taxonomy_grouping=None)],
-    [_candidate(), _candidate(npi=1000000012, joined_npi=1000000012)]])
+@pytest.mark.parametrize(
+    "registry_rows",
+    [
+        [_candidate(), _candidate(taxonomy_grouping=None)],
+        [_candidate(), _candidate(npi=1000000012, joined_npi=1000000012)],
+    ],
+)
 async def test_source_npi_cannot_bypass_candidate_conflicts(source_session, tmp_path, registry_rows):
     session = source_session(SourceResponse(_search()), SourceResponse(_education()))
     await _acquire(session)
@@ -157,8 +241,10 @@ async def test_source_npi_cannot_bypass_candidate_conflicts(source_session, tmp_
 
 
 async def test_known_middle_suffix_and_search_disagreement_stay_held(source_session, tmp_path):
-    session = source_session(SourceResponse(_search(physicianFirstName="Example", physicianLastName="Alex")),
-                             SourceResponse(_education(middleName="Morgan", suffix="Jr")))
+    session = source_session(
+        SourceResponse(_search(physicianFirstName="Example", physicianLastName="Alex")),
+        SourceResponse(_education(middleName="Morgan", suffix="Jr")),
+    )
     await _acquire(session)
     bound = _bind(_pinned_case(session), tmp_path, [_candidate(middle_name="Morgan", suffix="Jr")])
     assert bound["outcome"] == "held" and bound["reason"] == "search_header_name_disagreement"
@@ -166,8 +252,9 @@ async def test_known_middle_suffix_and_search_disagreement_stay_held(source_sess
     assert bound["facts"][0]["source_json"]["quality_flags"] == ["search_header_name_disagreement"]
 
 
-@pytest.mark.parametrize("candidate", [_candidate(), _candidate(middle_name="M", suffix="Jr"),
-                                       _candidate(middle_name="Morgan", suffix="Jr")])
+@pytest.mark.parametrize(
+    "candidate", [_candidate(), _candidate(middle_name="M", suffix="Jr"), _candidate(middle_name="Morgan", suffix="Jr")]
+)
 async def test_known_optional_components_require_exact_match(source_session, tmp_path, candidate):
     session = source_session(SourceResponse(_search()), SourceResponse(_education(middleName="Morgan", suffix="Jr")))
     await _acquire(session)
@@ -175,13 +262,28 @@ async def test_known_optional_components_require_exact_match(source_session, tmp
     assert (bound["outcome"] == "accepted") is (candidate["middle_name"] == "Morgan")
 
 
-@pytest.mark.parametrize("changes", [
-    {"schema_version": "other"}, {"coverage_scope": "physicians_only"}, {"source_state": "MA"},
-    {"source_schema": "other"}, {"query_sha256": "0" * 64}, {"columns": ["npi", "license_number"]},
-    {"status": "failed"}, {"all_rows_received": False}, {"all_rows_received": 1}, {"connection_closed": False},
-    {"snapshot": {}}, {"registry_relations": {}}, {"expected_source_row_count": 2}, {"row_count": True},
-    {"registry_rows_bytes": 1}, {"registry_rows_sha256": "0" * 64}, {"registry_rows": []},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema_version": "other"},
+        {"coverage_scope": "physicians_only"},
+        {"source_state": "MA"},
+        {"source_schema": "other"},
+        {"query_sha256": "0" * 64},
+        {"columns": ["npi", "license_number"]},
+        {"status": "failed"},
+        {"all_rows_received": False},
+        {"all_rows_received": 1},
+        {"connection_closed": False},
+        {"snapshot": {}},
+        {"registry_relations": {}},
+        {"expected_source_row_count": 2},
+        {"row_count": True},
+        {"registry_rows_bytes": 1},
+        {"registry_rows_sha256": "0" * 64},
+        {"registry_rows": []},
+    ],
+)
 def test_pinned_incomplete_or_wrong_scope_snapshots_fail(tmp_path, changes):
     snapshot_by_field = {**_snapshot(), **changes}
     options = _save_snapshot(tmp_path, snapshot_by_field)
@@ -189,9 +291,19 @@ def test_pinned_incomplete_or_wrong_scope_snapshots_fail(tmp_path, changes):
         binding.read_registry_snapshot(options["snapshot_path"], snapshot_sha256=options["snapshot_sha256"])
 
 
-@pytest.mark.parametrize("changes", [{"read_only": "off"}, {"isolation": "read committed"},
-    {"snapshot_id": ""}, {"backend_pid": True}, {"backend_pid": 0}, {"database_name": ""},
-    {"server_version": None}, {"snapshot_started_at": ""}])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"read_only": "off"},
+        {"isolation": "read committed"},
+        {"snapshot_id": ""},
+        {"backend_pid": True},
+        {"backend_pid": 0},
+        {"database_name": ""},
+        {"server_version": None},
+        {"snapshot_started_at": ""},
+    ],
+)
 def test_snapshot_transaction_metadata_is_required(tmp_path, changes):
     snapshot_by_field = _snapshot()
     snapshot_by_field["snapshot"].update(changes)
@@ -200,8 +312,17 @@ def test_snapshot_transaction_metadata_is_required(tmp_path, changes):
         binding.read_registry_snapshot(options["snapshot_path"], snapshot_sha256=options["snapshot_sha256"])
 
 
-@pytest.mark.parametrize("rows", [[None], [{}], [{"license_number": "654321", "profession_code": "060"}],
-    [{"license_number": 654321}], [{"license_number": ["654321"]}], [{"license_number": True}]])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [None],
+        [{}],
+        [{"license_number": "654321", "profession_code": "060"}],
+        [{"license_number": 654321}],
+        [{"license_number": ["654321"]}],
+        [{"license_number": True}],
+    ],
+)
 def test_uninterpretable_rows_cannot_hide_a_license(tmp_path, rows):
     options = _save_snapshot(tmp_path, _snapshot(rows))
     with pytest.raises(ValueError, match="snapshot_rows_invalid"):
@@ -273,6 +394,7 @@ async def test_network_plan_npi_never_fills_header(source_session, tmp_path, mon
         raise AssertionError("Offline binding cannot open a source session")
 
     from process import new_york_profile_acquisition as acquisition
+
     monkeypatch.setattr(acquisition.aiohttp, "ClientSession", no_session)
     bound = _bind(pinned_case, tmp_path)
     assert bound["outcome"] == "accepted" and bound["source_record"]["matched_npi"] == 1000000004
@@ -315,7 +437,11 @@ async def test_replay_must_consume_pinned_response(retained_case, tmp_path, monk
     original_bytes = response_path.read_bytes()
 
     def replace_during_replay(destination, **options):
-        content = _education(nationalProviderId="", licenseDate="2000-01-01") if stage == "education" else _search(statusCode="I")
+        content = (
+            _education(nationalProviderId="", licenseDate="2000-01-01")
+            if stage == "education"
+            else _search(statusCode="I")
+        )
         try:
             _body(destination, stage, content)
             return actual_read(destination, **options)
@@ -338,13 +464,20 @@ async def test_acquisition_requires_external_content_pin(retained_case, tmp_path
 async def test_nonsingleton_search_remains_held(source_session, tmp_path, total):
     session = source_session(SourceResponse(_search(total=total)))
     result = await _acquire(session)
-    assert result == {"outcome": "held", "reason": "search_not_singleton", "reported_total": total,
-                      "source_record": None, "facts": []}
+    assert result == {
+        "outcome": "held",
+        "reason": "search_not_singleton",
+        "reported_total": total,
+        "source_record": None,
+        "facts": [],
+    }
     retained_bytes_by_name = {path.name: path.read_bytes() for path in session.destination.iterdir()}
     with pytest.raises(ValueError, match="acquisition_file_invalid"):
         binding.bind_retained_acquisition(
-            session.destination, manifest_sha256=hashlib.sha256(retained_bytes_by_name["manifest.json"]).hexdigest(),
-            acquisition_sha256="0" * 64, **_save_snapshot(tmp_path, _snapshot()),
+            session.destination,
+            manifest_sha256=hashlib.sha256(retained_bytes_by_name["manifest.json"]).hexdigest(),
+            acquisition_sha256="0" * 64,
+            **_save_snapshot(tmp_path, _snapshot()),
         )
     assert len(session.requests) == 1
     assert {path.name: path.read_bytes() for path in session.destination.iterdir()} == retained_bytes_by_name
