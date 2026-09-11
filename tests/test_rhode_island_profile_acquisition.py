@@ -41,6 +41,11 @@ def synthetic_schema_fingerprint(monkeypatch):
     monkeypatch.setattr(acquisition, "SCHEMA_SCRIPT_SHA256", hashlib.sha256(schema_script.encode()).hexdigest())
 
 
+def test_schema_allows_unrelated_self_closing_tags():
+    page = b'<br/><img alt="Example"/>' + _page() + b"<hr/>"
+    assert acquisition.verify_page(page, "MD00001") == acquisition.RECORD_URL + "?id=MD00001"
+
+
 def _profile(license_number="MD00001"):
     profile_by_field = dict.fromkeys(PROFILE_FIELDS, "")
     profile_by_field.update(

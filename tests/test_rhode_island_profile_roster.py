@@ -163,6 +163,7 @@ def test_unobserved_encoding_or_nul_is_rejected(payload):
         ("content_sha256", "0" * 64),
         ("source_url", "https://example.test"),
         ("downloaded_at", "2026-09-09"),
+        ("downloaded_at", "not-a-timestamp"),
         ("artifact_id", ""),
     ],
 )

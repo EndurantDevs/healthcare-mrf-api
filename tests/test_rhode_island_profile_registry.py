@@ -4,9 +4,12 @@ import asyncio
 import copy
 import hashlib
 import json
-from unittest.mock import AsyncMock
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from sqlalchemy.engine import make_url
 
 from process import rhode_island_profile_registry as registry
 from process.massachusetts_profile_acquisition import encoded_json, write_new_json
@@ -257,3 +260,123 @@ async def test_empty_complete_cursor_stays_empty():
     captured = await registry._registry_rows(RegistryCursor([]), "synthetic", 0, AsyncMock())
     assert captured["registry_rows"] == [] and captured["row_count"] == 0
     assert captured["registry_rows_sha256"] == hashlib.sha256(b"[]").hexdigest()
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+async def test_owned_connection_uses_database_url_and_timeouts(monkeypatch, initialized):
+    url = make_url("postgresql+asyncpg://synthetic:example@localhost/registry_test")
+    engine = SimpleNamespace(url=url)
+    database = SimpleNamespace(engine=engine if initialized else None)
+
+    async def initialize():
+        database.engine = engine
+
+    database.connect = AsyncMock(side_effect=initialize)
+    open_connection = AsyncMock(return_value=object())
+    monkeypatch.setattr(registry, "db", database)
+    monkeypatch.setattr(registry.asyncpg, "connect", open_connection)
+    assert await registry._open_connection() is open_connection.return_value
+    assert database.connect.await_count == (0 if initialized else 1)
+    open_connection.assert_awaited_once_with(
+        dsn="postgresql://synthetic:example@localhost/registry_test",
+        timeout=10,
+        server_settings={"statement_timeout": "90000", "lock_timeout": "5000"},
+    )
+
+
+def snapshot_connection(candidates):
+    captured = snapshot(candidates)
+    connection = SimpleNamespace(active=False, closed=False)
+
+    @asynccontextmanager
+    async def transaction(**options):
+        assert options == {"isolation": "repeatable_read", "readonly": True}
+        connection.active = True
+        try:
+            yield
+        finally:
+            connection.active = False
+
+    async def read_count(query):
+        assert connection.active
+        assert query == "SELECT count(*) FROM (" + registry.capture_query() + ") AS occurrences"
+        return len(candidates)
+
+    async def read_rows(query, *, prefetch):
+        assert connection.active and query == registry.capture_query() and prefetch == 500
+        for candidate_by_field in candidates:
+            yield candidate_by_field
+
+    async def close(*, timeout):
+        assert timeout == 10 and not connection.active
+        connection.closed = True
+
+    connection.transaction = transaction
+    connection.fetchrow = AsyncMock(return_value=captured["snapshot"])
+    connection.fetchval = AsyncMock(side_effect=read_count)
+    connection.cursor = read_rows
+    connection.fetch = AsyncMock(
+        return_value=[{"name": name, "oid": oid} for name, oid in captured["registry_relations"].items()]
+    )
+    connection.close = AsyncMock(side_effect=close)
+    connection.is_closed = lambda: connection.closed
+    connection.terminate = Mock(side_effect=lambda: setattr(connection, "closed", True))
+    return connection
+
+
+async def test_capture_retains_eof_progress_and_replayable_snapshot(monkeypatch, tmp_path):
+    candidates = [candidate(taxonomy_occurrence_checksum=index) for index in range(501)]
+    connection = snapshot_connection(candidates)
+    monkeypatch.setattr(registry, "_open_connection", AsyncMock(return_value=connection))
+    progress = AsyncMock()
+    captured = await registry.capture_registry_snapshot("mrf", progress)
+    assert captured == snapshot(candidates)
+    assert progress.await_args_list == [call(0, 0), call(500, 501), call(501, 501)]
+    assert connection.fetchrow.await_args_list == [call(registry.SNAPSHOT_SQL), call(registry.SNAPSHOT_SQL)]
+    connection.fetch.assert_awaited_once_with(
+        "SELECT name, to_regclass(name)::oid::bigint AS oid FROM unnest($1::text[]) name",
+        ["mrf.npi", "mrf.npi_taxonomy", "mrf.nucc_taxonomy"],
+    )
+    connection.close.assert_awaited_once_with(timeout=10)
+    connection.terminate.assert_not_called()
+    assert connection.closed and not connection.active
+    retained = retained_snapshot(tmp_path, captured)
+    assert (
+        registry.read_registry_snapshot(retained["snapshot_path"], snapshot_sha256=retained["snapshot_sha256"])
+        == captured
+    )
+
+
+@pytest.mark.parametrize("failure", ["connect", "snapshot", "count", "cancel", "close"])
+async def test_capture_failure_never_leaks_owned_connection(monkeypatch, failure):
+    connection = snapshot_connection([candidate()])
+    open_connection = AsyncMock(return_value=connection)
+    monkeypatch.setattr(registry, "_open_connection", open_connection)
+    progress = AsyncMock()
+    expected_exception, reason = ValueError, "snapshot_changed"
+    if failure == "connect":
+        open_connection.side_effect = RuntimeError("synthetic_connect_failure")
+        expected_exception, reason = RuntimeError, "synthetic_connect_failure"
+    elif failure == "snapshot":
+        metadata = snapshot()["snapshot"]
+        connection.fetchrow.side_effect = [metadata, {**metadata, "snapshot_id": "101:102:"}]
+    elif failure == "count":
+        connection.fetchval.side_effect = None
+        connection.fetchval.return_value = registry.MAX_REGISTRY_ROWS + 1
+        reason = "count_invalid"
+    elif failure == "cancel":
+        progress.side_effect = [None, asyncio.CancelledError()]
+        expected_exception, reason = asyncio.CancelledError, None
+    else:
+        connection.close.side_effect = TimeoutError("synthetic_close_timeout")
+        expected_exception, reason = TimeoutError, "synthetic_close_timeout"
+    with pytest.raises(expected_exception, match=reason):
+        await registry.capture_registry_snapshot("mrf", progress)
+    assert not connection.active
+    if failure == "connect":
+        connection.close.assert_not_awaited()
+        connection.terminate.assert_not_called()
+    else:
+        connection.close.assert_awaited_once_with(timeout=10)
+        assert connection.closed
+        assert connection.terminate.call_count == (1 if failure == "close" else 0)

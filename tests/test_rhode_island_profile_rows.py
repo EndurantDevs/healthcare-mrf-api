@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -52,6 +53,18 @@ def evidence(payload, license_number="MD00001"):
 def parse(values, license_number="MD00001"):
     payload = json.dumps(values).encode()
     return rows.parse_profile(payload, license_number=license_number, evidence=evidence(payload, license_number))
+
+
+def test_datetime_evidence_and_blank_specialty_preserve_other_facts():
+    values = occurrence(Specialty_Name=" \t ")
+    payload = json.dumps(values).encode()
+    observed_at = datetime(2026, 9, 9, tzinfo=timezone.utc)
+    metadata = {**evidence(payload), "downloaded_at": observed_at}
+    record, facts = rows.parse_profile(payload, license_number="MD00001", evidence=metadata)
+    assert record["raw_payload"]["values"] == values
+    assert {fact["category"] for fact in facts} == {"education", "privileges"}
+    assert all(fact["source_json"]["downloaded_at"] == observed_at.isoformat() for fact in facts)
+    assert metadata["downloaded_at"] is observed_at
 
 
 @pytest.mark.parametrize("license_number", ["MD00001", "DO00001"])
