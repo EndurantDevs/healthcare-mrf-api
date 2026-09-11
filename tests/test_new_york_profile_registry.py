@@ -10,13 +10,17 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 from sqlalchemy.engine import make_url
 
-from process import new_york_profile_registry as registry
 from process import new_york_profile_binding as binding
+from process import new_york_profile_registry as registry
 from process.massachusetts_profile_acquisition import encoded_json
 from tests.test_new_york_profile_binding import (
     _candidate as candidate,
-    _snapshot as snapshot,
+)
+from tests.test_new_york_profile_binding import (
     _save_snapshot as retained_snapshot,
+)
+from tests.test_new_york_profile_binding import (
+    _snapshot as snapshot,
 )
 
 

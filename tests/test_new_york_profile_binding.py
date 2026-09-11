@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import copy
 import base64
+import copy
 import hashlib
 import json
 import socket
@@ -9,19 +9,23 @@ from pathlib import Path
 
 import pytest
 
-from process import new_york_profile_binding as binding
 from process import new_york_nysed_profile as nysed
 from process import new_york_nysed_profile_acquisition as nysed_acquisition
+from process import new_york_profile_binding as binding
 from process.new_york_profile_acquisition import encoded_json
 from process.new_york_profile_retained import read_acquisition
-from tests.test_new_york_profile_acquisition import SourceResponse, _acquire, _education, _search, source_session
-from tests.test_new_york_profile_retained import _body
 from tests.test_new_york_nysed_profile import (
     PUBLIC_HEADER,
-    SourceResponse as NysedResponse,
-    SourceSession as NysedSession,
     _profile_body,
 )
+from tests.test_new_york_nysed_profile import (
+    SourceResponse as NysedResponse,
+)
+from tests.test_new_york_nysed_profile import (
+    SourceSession as NysedSession,
+)
+from tests.test_new_york_profile_acquisition import SourceResponse, _acquire, _education, _search, source_session
+from tests.test_new_york_profile_retained import _body
 
 
 def _candidate(**changes):
