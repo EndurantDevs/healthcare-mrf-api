@@ -125,6 +125,7 @@ from process.florida_mqa_profile import florida_mqa_profile
 from process.massachusetts_profile import massachusetts_borim_profile
 from process.kentucky_profile import kentucky_kbml_profile
 from process.tennessee_profile import tennessee_tdh_profile
+from process.rhode_island_profile import rhode_island_doh_profile
 from process.places_zcta import main as initiate_places_zcta
 from process.places_zcta import process_data as process_places_zcta_data
 from process.places_zcta import shutdown as places_zcta_shutdown
@@ -737,6 +738,18 @@ class TennesseeTDHProfile:
     max_jobs = 1
     queue_read_limit = 1
     queue_name = "arq:TennesseeTDHProfile"
+    job_timeout = 24 * 60 * 60
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class RhodeIslandDOHProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RhodeIslandDOHProfile"
     job_timeout = 24 * 60 * 60
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -2022,6 +2035,7 @@ process_group.add_command(florida_mqa_profile, name="florida-mqa-profile")
 process_group.add_command(massachusetts_borim_profile, name="massachusetts-borim-profile")
 process_group.add_command(kentucky_kbml_profile, name="kentucky-kbml-profile")
 process_group.add_command(tennessee_tdh_profile, name="tennessee-tdh-profile")
+process_group.add_command(rhode_island_doh_profile, name="rhode-island-doh-profile")
 process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(lodes, name="lodes")
