@@ -1,6 +1,7 @@
 # Contributing
 
-Work from the repo root in an activated virtualenv. Keep changes focused.
+Work from the repo root in an activated virtualenv. Keep changes focused and
+preserve unrelated work.
 
 ## Contributor License Agreement
 
@@ -26,13 +27,27 @@ not authorize a stable release. The public default branch remains `main`.
 Use `type/short-slug` names: `feature/<slug>`, `fix/<slug>`,
 `docs/<slug>`, `test/<slug>`, or `chore/<slug>`.
 
-## Coding Agent Contributions
+## Public content
 
-Coding agents follow the same branch, validation, and release process described
-here. Preserve unrelated work and obtain an explicit human request before a
-stable release. Keep public code, logs, examples, and documentation free of
-credentials, personal data, and internal operational details; use synthetic
-test fixtures.
+Review every outgoing file, branch name, commit message, pull request title and
+description, comment, review, log, and release note before publishing. Describe
+the public problem, behavior, and validation without naming private projects,
+repositories, configuration paths or values, internal URLs, hosts, deployment
+details, credentials, or personal data. Use synthetic examples and public
+references; do not copy private runbooks or encode private names in examples or
+tests.
+
+Prepare publication text locally and check the exact text before submitting it:
+
+```bash
+uv run --locked python scripts/ci/public_hygiene.py --text-file /path/to/prepared-text.md
+uv run --locked python scripts/check_commit_messages.py --range origin/dev..HEAD
+```
+
+Repeat `--text-file` for additional titles, descriptions, comments, or branch
+names. The check supplements review; CI runs after publication and cannot undo
+disclosure. Keep any supporting private validation details in private records.
+Public package names and documented public interfaces remain appropriate.
 
 ## Commit Messages
 
@@ -41,7 +56,7 @@ rollbacks, reviews, and deploy audits. See `docs/commit-messages.md` for the
 allowed types and examples, and run this before pushing hand-written commits:
 
 ```bash
-python3 scripts/check_commit_messages.py --last 1
+uv run --locked python scripts/check_commit_messages.py --range origin/dev..HEAD
 ```
 
 ## Tests and Smoke Runs

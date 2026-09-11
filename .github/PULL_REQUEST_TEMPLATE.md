@@ -17,4 +17,6 @@
 
 ## Public Repo Hygiene
 
-- [ ] No private runbooks, agent instructions, tokens, or internal hostnames added.
+- [ ] Reviewed files, branch names, full commit messages, title, description, and
+      comments for private project names, configuration, internal links, and secrets.
+- [ ] Checked prepared publication text with `scripts/ci/public_hygiene.py --text-file`.

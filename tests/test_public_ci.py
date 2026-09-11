@@ -114,7 +114,7 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
 
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
-    assert sorted(path.name for path in workflows.iterdir()) == ["ci.yml"]
+    assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
@@ -159,6 +159,38 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
             assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
     _assert_smoke_job(workflow, text)
+
+
+def test_stale_artifact_cleanup_is_main_only_and_pinned():
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/artifact-cleanup.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert workflow.get("on", workflow.get(True)) == {
+        "schedule": [{"cron": "47 2 * * *"}], "workflow_dispatch": None,
+    }
+    assert workflow["permissions"] == {
+        "contents": "read", "pull-requests": "read", "actions": "write",
+    }
+    assert workflow["concurrency"] == {
+        "group": "public-artifact-cleanup", "cancel-in-progress": False,
+    }
+    assert set(workflow["jobs"]) == {"stale-cleanup"}
+    job = workflow["jobs"]["stale-cleanup"]
+    assert job["if"] == (
+        "github.repository == 'EndurantDevs/healthcare-mrf-api' "
+        "&& github.ref == 'refs/heads/main'"
+    )
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 30
+    assert job["steps"] == [
+        {"name": "Check out trusted artifact lifecycle",
+         "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+         "with": {"repository": "EndurantDevs/endurant-ci",
+                  "ref": "88930b1a4c1926edfe4a0dd9dbba041058e59795", "path": "ci",
+                  "persist-credentials": False}},
+        {"name": "Delete only obsolete authenticated artifacts",
+         "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
+         "run": "python3 ci/scripts/artifact_cleanup.py --stale"},
+    ]
 
 
 def test_dependency_updates_target_the_development_branch():

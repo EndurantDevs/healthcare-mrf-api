@@ -681,14 +681,53 @@ mod tests {
             .is_symlink());
     }
 
+    fn assert_publication_link_retry_boundary(root: &RootDirectory, raw_name: &str, alias: &Path) {
+        let mut delays = 0;
+        let error = root
+            .open_existing_regular_with_sleep(raw_name, |delay| {
+                assert_eq!(delay, Duration::from_millis(50));
+                delays += 1;
+            })
+            .expect_err("persistent publication alias must exhaust the retry budget");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(delays, 1_500);
+        assert_eq!(fs::metadata(alias).expect("alias metadata").nlink(), 2);
+        assert_eq!(retained_files(&root.path), vec![raw_name]);
+
+        delays = 0;
+        let settled = root
+            .open_existing_regular_with_sleep(raw_name, |delay| {
+                assert_eq!(delay, Duration::from_millis(50));
+                delays += 1;
+                if delays == 1_500 {
+                    fs::remove_file(alias).expect("settle final permitted publication retry");
+                }
+            })
+            .expect("accept publication on the final attempt")
+            .expect("retained raw exists");
+        assert_eq!(delays, 1_500);
+        assert_eq!(settled.metadata().expect("settled metadata").nlink(), 1);
+    }
+
     #[test]
     fn rejects_aliased_or_group_writable_retained_artifacts() {
         let linked_fixture = Fixture::new(FIXTURE);
         fs::write(linked_fixture.raw_path(), FIXTURE).expect("preseed raw artifact");
         let alias = linked_fixture._directory.path().join("raw-alias.json");
         fs::hard_link(linked_fixture.raw_path(), &alias).expect("hard-link retained raw");
+        let root = RootDirectory::open(&linked_fixture.output).expect("open retained root");
+        let raw_name = raw_file_name(&linked_fixture.sha256);
+        assert_publication_link_retry_boundary(&root, &raw_name, &alias);
+        fs::hard_link(linked_fixture.raw_path(), &alias).expect("restore retained raw alias");
+        let second_alias = linked_fixture
+            ._directory
+            .path()
+            .join("raw-second-alias.json");
+        fs::hard_link(&alias, &second_alias).expect("add non-publication alias");
         assert!(retain_uhc_artifact(&linked_fixture.request(4)).is_err());
-        assert_eq!(fs::metadata(&alias).expect("alias metadata").nlink(), 2);
+        assert_eq!(fs::metadata(&alias).expect("alias metadata").nlink(), 3);
+        assert_eq!(retained_files(&linked_fixture.output), vec![raw_name]);
+        assert_eq!(fs::read(&alias).expect("retained raw bytes"), FIXTURE);
 
         let writable_fixture = Fixture::new(FIXTURE);
         retain_uhc_artifact(&writable_fixture.request(4)).expect("initial retain");
