@@ -279,7 +279,29 @@ def parse_profile(body, *, license_number, evidence):
     return source_record, _profile_facts(source_record, text_by_field, provenance_by_field, observed_on)
 
 
-def _validated_response(response_by_field, descriptor):
+def _response_headers(headers, *, no_content):
+    _require(
+        isinstance(headers, list)
+        and all(
+            isinstance(pair, list) and len(pair) == 2 and all(isinstance(part, str) for part in pair)
+            for pair in headers
+        ),
+        "headers_invalid",
+    )
+    if not no_content:
+        _validated_headers(headers)
+        return
+    content_types = [text for name, text in headers if name.lower() == "content-type"]
+    encodings = [text for name, text in headers if name.lower() == "content-encoding"]
+    _require(len(content_types) <= 1 and len(encodings) <= 1, "headers_ambiguous")
+    _require(
+        all(text.split(";", 1)[0].strip().lower() == "application/json" for text in content_types)
+        and all(text.strip().lower() == "identity" for text in encodings),
+        "headers_invalid",
+    )
+
+
+def _validated_response(response_by_field, descriptor, *, expected_status=200):
     _require(
         response_by_field.get("schema_version") == SCHEMA_VERSION
         and response_by_field.get("source_key") == SOURCE_KEY
@@ -292,30 +314,22 @@ def _validated_response(response_by_field, descriptor):
         and "error_type" not in response_by_field
         and not response_by_field.get("redacted_key_echo")
         and type(response_by_field.get("status")) is int
-        and response_by_field["status"] == 200,
+        and response_by_field["status"] == expected_status,
         "response_incomplete",
     )
-    headers = response_by_field.get("headers")
-    _require(
-        isinstance(headers, list)
-        and all(
-            isinstance(pair, list) and len(pair) == 2 and all(isinstance(part, str) for part in pair)
-            for pair in headers
-        ),
-        "headers_invalid",
-    )
-    _validated_headers(headers)
+    _response_headers(response_by_field.get("headers"), no_content=expected_status == 204)
     try:
         body = base64.b64decode(response_by_field["body_base64"], validate=True)
     except (KeyError, TypeError, ValueError, binascii.Error) as error:
         raise ValueError("new_york_nysed_body_invalid") from error
     _require(
-        0 < len(body) <= MAX_RESPONSE_BYTES
+        (0 <= len(body) <= MAX_RESPONSE_BYTES if expected_status == 204 else 0 < len(body) <= MAX_RESPONSE_BYTES)
         and type(response_by_field.get("received_bytes")) is int
         and response_by_field["received_bytes"] == len(body)
         and response_by_field.get("content_sha256") == hashlib.sha256(body).hexdigest(),
         "body_changed",
     )
+    _require(expected_status != 204 or body == b"", "no_content_body_not_empty")
     return body
 
 
@@ -334,13 +348,19 @@ def acquisition_result(manifest_by_field, response_by_field):
     return {"outcome": "acquired", "source_record": source_record, "facts": facts}
 
 
-def read_acquisition(destination: Path, *, receipt_sha256: str):
-    """Replay bytes pinned by a receipt independently retained at acquisition time."""
+def held_acquisition_result(manifest_by_field, response_by_field):
+    """Retain an empty 204 as no profile returned, without a licensing conclusion."""
+    descriptor = request_descriptor(manifest_by_field["license_number"])
+    _validated_response(response_by_field, descriptor, expected_status=204)
+    return {"outcome": "held", "reason": "no_profile_returned", "source_record": None, "facts": []}
+
+
+def _retained_acquisition(destination, receipt_sha256, expected_outcome):
     _require(isinstance(receipt_sha256, str) and re.fullmatch(r"[a-f0-9]{64}", receipt_sha256), "receipt_pin_invalid")
     receipt = _read_artifact(destination / "result.json", MAX_METADATA_BYTES)
     _require(
         _hash(receipt) == receipt_sha256
-        and receipt.get("outcome") == "acquired"
+        and receipt.get("outcome") == expected_outcome
         and receipt.get("schema_version") == SCHEMA_VERSION,
         "receipt_changed_or_failed",
     )
@@ -371,8 +391,27 @@ def read_acquisition(destination: Path, *, receipt_sha256: str):
         <= _timestamp(receipt.get("completed_at")),
         "chronology_invalid",
     )
+    return manifest_by_field, response_by_field, receipt
+
+
+def read_acquisition(destination: Path, *, receipt_sha256: str):
+    """Replay acquired bytes pinned by an independently retained receipt."""
+    manifest_by_field, response_by_field, receipt = _retained_acquisition(destination, receipt_sha256, "acquired")
     acquired = acquisition_result(manifest_by_field, response_by_field)
     _require(
         type(receipt.get("fact_count")) is int and receipt["fact_count"] == len(acquired["facts"]), "fact_count_changed"
     )
     return {**acquired, "receipt_sha256": receipt_sha256}
+
+
+def read_held_acquisition(destination: Path, *, receipt_sha256: str):
+    """Replay only a pinned complete empty 204; it does not prove lack of licensure."""
+    manifest_by_field, response_by_field, receipt = _retained_acquisition(destination, receipt_sha256, "held")
+    held = held_acquisition_result(manifest_by_field, response_by_field)
+    _require(
+        type(receipt.get("fact_count")) is int
+        and receipt["fact_count"] == 0
+        and receipt.get("reason") == held["reason"],
+        "held_result_changed",
+    )
+    return {**held, "receipt_sha256": receipt_sha256}

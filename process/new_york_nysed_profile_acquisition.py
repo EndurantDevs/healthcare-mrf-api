@@ -23,6 +23,7 @@ from process.new_york_nysed_profile import (
     SOURCE_KEY,
     _require,
     acquisition_result,
+    held_acquisition_result,
     request_descriptor,
 )
 
@@ -97,16 +98,22 @@ async def _acquire_profile(destination, manifest_by_field, descriptor, api_key):
         _require(type(getattr(session, "_retry_connection", None)) is bool, "retry_control_unavailable")
         session._retry_connection = False
         response_by_field = await _fetch_profile(session, destination, descriptor, api_key)
-    acquired = acquisition_result(manifest_by_field, response_by_field)
+    acquired = (
+        held_acquisition_result(manifest_by_field, response_by_field)
+        if response_by_field["status"] == 204
+        else acquisition_result(manifest_by_field, response_by_field)
+    )
     receipt_by_field = {
         "schema_version": SCHEMA_VERSION,
-        "outcome": "acquired",
+        "outcome": acquired["outcome"],
         "completed_at": _now(),
         "manifest_sha256": _hash(manifest_by_field),
         "request_sha256": _hash(descriptor),
         "response_sha256": _hash(response_by_field),
         "fact_count": len(acquired["facts"]),
     }
+    if acquired["outcome"] == "held":
+        receipt_by_field["reason"] = acquired["reason"]
     write_new_json(destination / "result.json", receipt_by_field)
     return {**acquired, "receipt_sha256": _hash(receipt_by_field)}
 

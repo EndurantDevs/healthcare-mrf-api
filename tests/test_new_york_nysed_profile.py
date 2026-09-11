@@ -446,3 +446,173 @@ async def test_symlink_attempt_is_rejected(source_session, tmp_path):
     with pytest.raises(ValueError, match="symlink"):
         await _acquire(session)
     assert not list(real_directory.iterdir()) and not session.requests
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [],
+        [("Content-Type", "application/json")],
+        [("Content-Type", "application/json; charset=utf-8"), ("Content-Encoding", "identity")],
+    ],
+)
+async def test_empty_204_retains_explicit_held_outcome(source_session, headers):
+    session = source_session(SourceResponse(raw=b"", status=204, headers=headers))
+    acquired = await _acquire(session, "000000")
+    assert acquired == {
+        "outcome": "held",
+        "reason": "no_profile_returned",
+        "source_record": None,
+        "facts": [],
+        "receipt_sha256": acquired["receipt_sha256"],
+    }
+    assert profile.read_held_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
+    receipt = _artifact(session, "result.json")
+    assert receipt["outcome"] == "held" and receipt["reason"] == "no_profile_returned" and receipt["fact_count"] == 0
+    response = _artifact(session, "response.json")
+    assert response["status"] == 204 and response["complete"] is True and response["received_bytes"] == 0
+    assert response["body_base64"] == "" and response["content_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert session.closed and len(session.requests) == 1
+    assert all(PUBLIC_HEADER.encode() not in path.read_bytes() for path in session.destination.iterdir())
+    with pytest.raises(ValueError, match="receipt_changed_or_failed"):
+        profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"])
+
+
+async def test_acquired_200_is_not_held(source_session):
+    session = source_session(SourceResponse())
+    acquired = await _acquire(session)
+    with pytest.raises(ValueError, match="receipt_changed_or_failed"):
+        profile.read_held_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"])
+    assert profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
+
+
+@pytest.mark.parametrize(
+    "response",
+    [SourceResponse(raw=b"", status=status, headers=[]) for status in (200, 403, 404, 500, 503)]
+    + [
+        SourceResponse(raw=b"unexpected", status=204, headers=[]),
+        SourceResponse(raw=b"", status=204, headers=[("Content-Type", "text/html")]),
+        SourceResponse(raw=b"", status=204, headers=[("Content-Encoding", "gzip")]),
+        SourceResponse(
+            raw=b"", status=204, headers=[("Content-Type", "application/json"), ("content-type", "application/json")]
+        ),
+        SourceResponse(
+            raw=b"", status=204, headers=[("Content-Encoding", "identity"), ("content-encoding", "identity")]
+        ),
+        SourceResponse(status=204, headers=[], chunks=[TimeoutError("synthetic failure")]),
+    ],
+)
+async def test_unproven_negative_responses_remain_failures(source_session, response):
+    session = source_session(response)
+    with pytest.raises(ValueError, match="acquisition_failed"):
+        await _acquire(session)
+    assert _artifact(session, "result.json")["outcome"] == "failed"
+    assert session.closed and len(session.requests) == 1
+
+
+@pytest.fixture
+async def held_case(source_session):
+    session = source_session(SourceResponse(raw=b"", status=204, headers=[]))
+    return session, await _acquire(session)
+
+
+@pytest.mark.parametrize("artifact", ["manifest.json", "request.json", "response.json", "result.json"])
+async def test_held_replay_requires_original_artifact_pins(held_case, artifact):
+    session, acquired = held_case
+    changed_by_field = _artifact(session, artifact)
+    changed_by_field["changed"] = True
+    (session.destination / artifact).write_bytes(profile.encoded_json(changed_by_field))
+    with pytest.raises(ValueError):
+        profile.read_held_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"])
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("complete", False),
+        ("error_type", "TimeoutError"),
+        ("redacted_key_echo", True),
+        ("status", 200),
+        ("status", 404),
+        ("status", 403),
+        ("status", 500),
+        ("status", "204"),
+        ("received_bytes", 1),
+        ("received_bytes", False),
+        ("body_base64", "!"),
+        ("content_sha256", "0" * 64),
+        ("source_key", "unexpected"),
+        ("schema_version", "unexpected"),
+        ("request_sha256", "0" * 64),
+        ("source_url", "https://example.org/changed"),
+        ("downloaded_at", "2000-01-01T00:00:00+00:00"),
+        ("downloaded_at", "2030-01-01T00:00:00+00:00"),
+        ("downloaded_at", "2026-01-01T00:00:00"),
+        ("headers", None),
+    ],
+)
+async def test_held_replay_validates_transport_semantics(held_case, field, replacement):
+    session, _ = held_case
+    response_by_field = _artifact(session, "response.json")
+    response_by_field[field] = replacement
+    (session.destination / "response.json").write_bytes(profile.encoded_json(response_by_field))
+    receipt_by_field = _artifact(session, "result.json")
+    receipt_by_field["response_sha256"] = profile._hash(response_by_field)
+    (session.destination / "result.json").write_bytes(profile.encoded_json(receipt_by_field))
+    with pytest.raises(ValueError):
+        profile.read_held_acquisition(session.destination, receipt_sha256=profile._hash(receipt_by_field))
+
+
+async def test_held_replay_rejects_nonempty_body(held_case):
+    session, _ = held_case
+    response_by_field = _artifact(session, "response.json")
+    response_by_field.update(
+        body_base64=base64.b64encode(b"{}").decode(), received_bytes=2, content_sha256=hashlib.sha256(b"{}").hexdigest()
+    )
+    (session.destination / "response.json").write_bytes(profile.encoded_json(response_by_field))
+    receipt_by_field = _artifact(session, "result.json")
+    receipt_by_field["response_sha256"] = profile._hash(response_by_field)
+    (session.destination / "result.json").write_bytes(profile.encoded_json(receipt_by_field))
+    with pytest.raises(ValueError, match="no_content_body_not_empty"):
+        profile.read_held_acquisition(session.destination, receipt_sha256=profile._hash(receipt_by_field))
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("reason", "unlicensed"),
+        ("fact_count", 1),
+        ("fact_count", False),
+        ("outcome", "acquired"),
+        ("completed_at", "2000-01-01T00:00:00+00:00"),
+        ("request_sha256", "0" * 64),
+    ],
+)
+async def test_held_replay_rejects_changed_receipt(held_case, field, replacement):
+    session, _ = held_case
+    receipt_by_field = _artifact(session, "result.json")
+    receipt_by_field[field] = replacement
+    (session.destination / "result.json").write_bytes(profile.encoded_json(receipt_by_field))
+    with pytest.raises(ValueError):
+        profile.read_held_acquisition(session.destination, receipt_sha256=profile._hash(receipt_by_field))
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("license_number", "123456"),
+        ("profession_code", "040"),
+        ("source_key", "unexpected"),
+        ("started_at", "2030-01-01T00:00:00+00:00"),
+    ],
+)
+async def test_held_replay_checks_manifest_identity(held_case, field, replacement):
+    session, _ = held_case
+    manifest_by_field = _artifact(session, "manifest.json")
+    manifest_by_field[field] = replacement
+    (session.destination / "manifest.json").write_bytes(profile.encoded_json(manifest_by_field))
+    receipt_by_field = _artifact(session, "result.json")
+    receipt_by_field["manifest_sha256"] = profile._hash(manifest_by_field)
+    (session.destination / "result.json").write_bytes(profile.encoded_json(receipt_by_field))
+    with pytest.raises(ValueError):
+        profile.read_held_acquisition(session.destination, receipt_sha256=profile._hash(receipt_by_field))
