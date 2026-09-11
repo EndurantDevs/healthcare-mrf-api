@@ -927,6 +927,7 @@ async def mark_control_run(
     database_state_committed: bool = False,
     database_heartbeat_at: object = None,
     database_finished_at: object = None,
+    expected_state: tuple[str, str] | None = None,
 ):
     """Persist and publish one authoritative control-run lifecycle transition."""
 
@@ -993,6 +994,11 @@ async def mark_control_run(
     )
     if should_update_database:
         stmt = update(ImportRun).where(ImportRun.run_id == run_id)
+        if expected_state is not None:
+            stmt = stmt.where(
+                ImportRun.importer == expected_state[0],
+                ImportRun.status == expected_state[1],
+            )
         if status == "running":
             stmt = stmt.where(
                 ImportRun.status.notin_(

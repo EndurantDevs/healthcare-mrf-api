@@ -374,6 +374,37 @@ async def test_mark_control_run_always_persists_terminal_update(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mark_control_run_can_bind_preterminal_owner(monkeypatch):
+    db_updates = []
+
+    async def fake_update(stmt):
+        db_updates.append(stmt)
+        return 1
+
+    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "write_live_progress",
+        lambda **_payload: True,
+    )
+
+    await control_lifecycle.mark_control_run(
+        "run_hospital",
+        status="failed",
+        phase_detail="target rejected",
+        progress_message="failed",
+        error={"code": "control_target_rejected"},
+        expected_state=("hospital-prices", "queued"),
+    )
+
+    statement = db_updates[0]
+    compiled = statement.compile()
+    assert "import_run.importer" in str(statement.whereclause)
+    assert "hospital-prices" in compiled.params.values()
+    assert "queued" in compiled.params.values()
+
+
+@pytest.mark.asyncio
 async def test_mark_control_run_fails_closed_without_exactly_one_row(
     monkeypatch,
 ):
