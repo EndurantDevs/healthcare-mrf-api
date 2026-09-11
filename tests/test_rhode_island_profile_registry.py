@@ -264,7 +264,7 @@ async def test_empty_complete_cursor_stays_empty():
 
 @pytest.mark.parametrize("initialized", [False, True])
 async def test_owned_connection_uses_database_url_and_timeouts(monkeypatch, initialized):
-    url = make_url("postgresql+asyncpg://synthetic:example@localhost/registry_test")
+    url = make_url("postgresql+asyncpg://synthetic@localhost/registry_test")
     engine = SimpleNamespace(url=url)
     database = SimpleNamespace(engine=engine if initialized else None)
 
@@ -278,7 +278,7 @@ async def test_owned_connection_uses_database_url_and_timeouts(monkeypatch, init
     assert await registry._open_connection() is open_connection.return_value
     assert database.connect.await_count == (0 if initialized else 1)
     open_connection.assert_awaited_once_with(
-        dsn="postgresql://synthetic:example@localhost/registry_test",
+        dsn="postgresql://synthetic@localhost/registry_test",
         timeout=10,
         server_settings={"statement_timeout": "90000", "lock_timeout": "5000"},
     )
