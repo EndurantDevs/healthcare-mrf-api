@@ -191,7 +191,7 @@ def test_massachusetts_only_has_actual_source_generation_and_no_florida_claim():
     assert profile["categories"]["training"]["availability"] == "not_reported"
     assert profile["categories"]["professional_experience"]["items"] == []
     assert "Florida" not in str(profile)
-    assert profile["composer_version"] == "provider-profile-composer/v10"
+    assert profile["composer_version"] == "provider-profile-composer/v11"
 
 
 @pytest.mark.parametrize("same_date", [True, False])
