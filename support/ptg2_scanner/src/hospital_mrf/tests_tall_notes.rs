@@ -69,6 +69,10 @@ fn tall_explicit_blank_notes_do_not_fall_back_to_generic_notes() {
             );
         }
     }
+}
+
+#[test]
+fn tall_generic_explanations_remain_valid_with_explicit_header() {
     for (field, value, error) in [
         ("count", "0", "count 0 requires explanatory notes"),
         (
@@ -80,12 +84,69 @@ fn tall_explicit_blank_notes_do_not_fall_back_to_generic_notes() {
         let mut records = tall_explicit_note_records(&fixture_tall_csv(), "Generic note", "");
         let column = csv_fixture_index(&records[2], field);
         records[3][column] = value.to_owned();
-        assert_import_error(
+        let rows = run_fixture(
             InputFormat::TallCsv,
             &csv_fixture_bytes(&records),
-            DEFAULT_MAX_FANOUT_ROWS,
-            error,
+            false,
         );
+        assert_eq!(
+            std::str::from_utf8(&rows["charge"])
+                .unwrap().trim_end().split('\t').nth(9),
+            Some("Generic note")
+        );
+        assert_eq!(
+            std::str::from_utf8(&rows["payer_charge"])
+                .unwrap().trim_end().split('\t').nth(15),
+            Some("\\N")
+        );
+        let generic = csv_fixture_index(&records[2], "additional_generic_notes");
+        records[3][generic].clear();
+        assert_historical_csv_error(InputFormat::TallCsv, &records, error);
+    }
+}
+
+#[test]
+fn tall_charge_free_generic_notes_satisfy_explanations_with_explicit_header() {
+    for (fixture, methodology_value, count_value, error) in [
+        (
+            fixture_tall_csv(),
+            "fee schedule",
+            Some("0"),
+            "plan_name must be a non-empty string",
+        ),
+        (
+            fixture_tall_csv(),
+            "other",
+            Some("1 through 10"),
+            "plan_name must be a non-empty string",
+        ),
+        (
+            fixture_v2_csv(InputFormat::TallCsv, "2.0.0"),
+            "other",
+            None,
+            "methodology other requires explanatory notes",
+        ),
+    ] {
+        let mut records = tall_explicit_note_records(&fixture, "No remittances", "");
+        for field in [
+            "plan_name", "negotiated_dollar", "negotiated_percentage", "estimated_amount",
+        ] {
+            if let Some(column) = records[2].iter().position(|header| header.contains(field)) {
+                records[3][column].clear();
+            }
+        }
+        let methodology = csv_fixture_index(&records[2], "standard_charge | methodology");
+        records[3][methodology] = methodology_value.to_owned();
+        if let Some(count_value) = count_value {
+            let count = csv_fixture_index(&records[2], "count");
+            records[3][count] = count_value.to_owned();
+        }
+        let rows = run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false);
+        assert!(rows["payer_charge"].is_empty());
+        assert!(std::str::from_utf8(&rows["charge"]).unwrap().contains("No remittances"));
+        let generic = csv_fixture_index(&records[2], "additional_generic_notes");
+        records[3][generic].clear();
+        assert_historical_csv_error(InputFormat::TallCsv, &records, error);
     }
 }
 
