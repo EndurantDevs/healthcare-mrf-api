@@ -33,9 +33,13 @@ HIDDEN_RUNTIME_ALIASES = {
 ROUTE_QUERY_PARAM_ADDITIONS = {
     ("get", "/hospital-prices/facilities"): {
         "cursor",
+        "include_metadata",
         "limit",
         "published",
         "q",
+    },
+    ("get", "/hospital-prices/facilities/{hospital_id}/payer-plans"): {
+        "version_id", "cursor", "limit",
     },
     # The taxonomy filter helper parses these outside the decorated route's AST.
     ("get", "/nucc/all"): {"code", "q"},
