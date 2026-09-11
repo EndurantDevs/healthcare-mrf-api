@@ -1,9 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import copy
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -41,7 +43,7 @@ class GetSession:
         return response
 
 
-async def acquired(tmp_path, monkeypatch):
+def mock_source_transport(monkeypatch):
     from process import rhode_island_profile_cohort as cohort_source
 
     session = Session(responses())
@@ -52,10 +54,221 @@ async def acquired(tmp_path, monkeypatch):
         return await acquisition._acquire_pair(GetSession(license_number), license_number, destination, run_id)
 
     monkeypatch.setattr(acquisition, "acquire_profile", profile)
+
+
+async def acquired(tmp_path, monkeypatch):
+    mock_source_transport(monkeypatch)
     monkeypatch.setattr(worker, "raise_if_cancelled", AsyncMock())
     monkeypatch.setattr(worker, "_progress", lambda *args: None)
     cohort, profiles, metrics = await worker._acquire({}, {"run_id": "managed"}, run_row(), tmp_path)
     return cohort, profiles, metrics, worker._artifact(run_row(), cohort, profiles, metrics)
+
+
+@pytest.fixture
+def managed_storage(monkeypatch):
+    """Record transaction commits and rollbacks at the worker boundary."""
+    retained = SimpleNamespace(
+        rows=[],
+        staged=None,
+        events=[],
+        progress=[],
+        cancel_at=None,
+        fail_at=None,
+        incumbent="b" * 64,
+        publication="b" * 64,
+    )
+
+    async def upsert(model, records, identity):
+        if model is worker.ProviderProfileFact and retained.fail_at == "facts":
+            raise RuntimeError("fact_write_failed")
+        destination = retained.rows if retained.staged is None else retained.staged
+        destination.extend((model, copy.deepcopy(record)) for record in records)
+
+    @asynccontextmanager
+    async def transaction():
+        assert retained.staged is None
+        retained.staged = []
+        try:
+            yield
+        except BaseException:
+            retained.events.append("rollback")
+            raise
+        else:
+            retained.rows.extend(retained.staged)
+            retained.events.append("commit")
+        finally:
+            retained.staged = None
+
+    monkeypatch.setattr(worker, "_upsert_rows", upsert)
+    monkeypatch.setattr(worker.db, "transaction", transaction)
+    return retained
+
+
+@pytest.fixture
+def managed_worker(tmp_path, monkeypatch, managed_storage, synthetic_schema_fingerprint):
+    retained = managed_storage
+    mock_source_transport(monkeypatch)
+    monkeypatch.setenv("HLTHPRT_RI_DOH_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(worker, "ensure_tables", AsyncMock())
+    monkeypatch.setattr(worker, "enqueue_live_progress", lambda **progress: retained.progress.append(progress))
+
+    async def cancelled(ctx, task):
+        if retained.cancel_at == "after_records" and retained.staged:
+            raise asyncio.CancelledError()
+        if retained.cancel_at == "after_retaining" and any(p["phase"] == "retaining" for p in retained.progress):
+            raise asyncio.CancelledError()
+
+    async def capture(schema, progress):
+        await progress(1, 1)
+        return snapshot()
+
+    async def complete(ctx, task, run, metrics):
+        assert store.claim_run.await_count == 1
+        assert store.update_run.await_args.args == (run["run_id"], {"status": "validating", "metrics": metrics})
+        assert len([row for model, row in retained.rows if model is worker.ProviderProfileSourceRecord]) == 2
+        if retained.fail_at == "completion":
+            raise RuntimeError("publication_refused")
+        retained.publication = run["run_id"]
+        retained.events.append("published")
+        return {"published": True, "retained_source_records": 2}
+
+    monkeypatch.setattr(worker, "raise_if_cancelled", cancelled)
+    monkeypatch.setattr(worker.registry, "capture_registry_snapshot", capture)
+    monkeypatch.setattr(type(store), "read_publication", AsyncMock(return_value={"current_run_id": retained.incumbent}))
+    for name in ("claim_run", "update_run", "mark_run_failed", "retain_source_history"):
+        monkeypatch.setattr(type(store), name, AsyncMock())
+    monkeypatch.setattr(type(worker.completion), "reconcile_failed_control_runs", AsyncMock())
+    monkeypatch.setattr(type(worker.completion), "complete_run", AsyncMock(side_effect=complete))
+    return retained
+
+
+@pytest.mark.parametrize("retention_error", [False, True])
+async def test_managed_completion_survives_cleanup_error(tmp_path, managed_worker, retention_error, caplog):
+    retained = managed_worker
+    if retention_error:
+        store.retain_source_history.side_effect = OSError("history_cleanup_failed")
+    result = await worker.import_profiles({}, {"run_id": "managed"})
+    assert result == {"published": True, "retained_source_records": 2}
+    assert retained.events == ["commit", "published"]
+    assert retained.publication != retained.incumbent
+    directory = tmp_path / "artifacts" / retained.publication
+    assert json.loads((directory / "snapshot.json").read_text()) == snapshot()
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["source_manifest"]["expected_current_run_id"] == retained.incumbent
+    assert set(manifest["profiles"]) == {"MD00001", "DO00001"}
+    assert [progress["phase"] for progress in retained.progress] == [
+        "registry snapshot",
+        "acquiring",
+        "acquiring",
+        "retaining",
+    ]
+    assert all(progress["run_id"] == "managed" and progress["total"] > 0 for progress in retained.progress)
+    store.mark_run_failed.assert_not_awaited()
+    store.retain_source_history.assert_awaited_once_with(tmp_path / "artifacts")
+    assert ("history_cleanup_failed" in caplog.text) is retention_error
+
+
+@pytest.mark.parametrize("checkpoint", ["after_records", "after_retaining"])
+async def test_managed_cancellation_preserves_publication(managed_worker, checkpoint):
+    retained = managed_worker
+    retained.cancel_at = checkpoint
+    with pytest.raises(asyncio.CancelledError):
+        await worker.import_profiles({}, {"run_id": "managed"})
+    assert retained.publication == retained.incumbent and retained.staged is None
+    rows = [row for model, row in retained.rows if model is not worker.ProviderProfileArtifact]
+    if checkpoint == "after_records":
+        assert rows == [] and retained.events == ["rollback"]
+    else:
+        assert rows and retained.events == ["commit"]
+    store.mark_run_failed.assert_awaited_once()
+    assert isinstance(store.mark_run_failed.await_args.args[1], asyncio.CancelledError)
+    worker.completion.complete_run.assert_not_awaited()
+    store.retain_source_history.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["facts", "completion"])
+async def test_managed_failure_preserves_publication(managed_worker, failure):
+    retained = managed_worker
+    retained.fail_at = failure
+    message = "fact_write_failed" if failure == "facts" else "publication_refused"
+    with pytest.raises(RuntimeError, match=message):
+        await worker.import_profiles({}, {"run_id": "managed"})
+    assert retained.publication == retained.incumbent and retained.staged is None
+    rows = [row for model, row in retained.rows if model is not worker.ProviderProfileArtifact]
+    if failure == "facts":
+        assert rows == [] and retained.events == ["rollback"]
+        worker.completion.complete_run.assert_not_awaited()
+    else:
+        assert rows and retained.events == ["commit"]
+        worker.completion.complete_run.assert_awaited_once()
+    store.mark_run_failed.assert_awaited_once()
+    assert str(store.mark_run_failed.await_args.args[1]) == message
+    store.retain_source_history.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "fault,error",
+    [
+        ("incomplete", "receipt_incomplete"),
+        ("identity", "capture_identity_changed"),
+        ("descriptor", "capture_changed"),
+        ("receipt_size", "receipt_too_large"),
+        ("total_size", "capture_too_large"),
+    ],
+)
+async def test_managed_capture_refusal_preserves_publication(managed_worker, monkeypatch, fault, error):
+    retained = managed_worker
+    original_profile, original_acquire = acquisition.acquire_profile, worker._acquire
+
+    async def changed_profile(license_number, destination, *, run_id):
+        result = await original_profile(license_number, destination, run_id=run_id)
+        path = destination / "record.json"
+        receipt = json.loads(path.read_text())
+        if fault == "incomplete":
+            receipt["eof"] = False
+        elif fault == "identity":
+            receipt["source_url"] = receipt["source_url"].replace("MD00001", "DO00001")
+            receipt["response_url"] = receipt["source_url"]
+        elif fault == "receipt_size":
+            monkeypatch.setattr(acquisition, "MAX_RESPONSE_BYTES", 16)
+        path.write_text(json.dumps(receipt))
+        return result
+
+    async def changed_acquire(*args):
+        assert store.claim_run.await_count == 1
+        cohort, profiles, metrics = await original_acquire(*args)
+        if fault == "descriptor":
+            profiles["MD00001"]["downloaded_at"] = "2026-01-01T00:00:00+00:00"
+        return cohort, profiles, metrics
+
+    monkeypatch.setattr(acquisition, "acquire_profile", changed_profile)
+    monkeypatch.setattr(worker, "_acquire", changed_acquire)
+    if fault == "total_size":
+        monkeypatch.setattr(worker, "MAX_CAPTURE_BYTES", 0)
+    with pytest.raises(ValueError, match=error):
+        await worker.import_profiles({}, {"run_id": "managed"})
+    assert retained.publication == retained.incumbent
+    assert all(model is worker.ProviderProfileArtifact for model, _ in retained.rows)
+    store.mark_run_failed.assert_awaited_once()
+    worker.completion.complete_run.assert_not_awaited()
+    store.retain_source_history.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fault", ["artifact_root", "registry_schema"])
+async def test_managed_configuration_refused_before_claim(managed_worker, monkeypatch, fault):
+    if fault == "artifact_root":
+        monkeypatch.setenv("HLTHPRT_RI_DOH_ARTIFACT_ROOT", " ")
+        error = "artifact_root_invalid"
+    else:
+        monkeypatch.setattr(worker.NPIData.__table__, "schema", "other_schema")
+        error = "registry_schema_mismatch"
+    with pytest.raises(ValueError, match=error):
+        await worker.import_profiles({}, {"run_id": "managed"})
+    assert managed_worker.publication == managed_worker.incumbent
+    assert managed_worker.rows == [] and managed_worker.progress == []
+    store.claim_run.assert_not_awaited()
+    store.mark_run_failed.assert_not_awaited()
+    worker.completion.complete_run.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -199,6 +412,94 @@ async def test_completion_requires_exact_bundle_retention_and_full_inventory(
     assert store._bundle_counts(run_row(), [invalid])["invalid_bundle_artifacts"] == 1
 
 
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("unexpected", None, "manifest_invalid"),
+        ("license_types", ["MD"], "complete_pair_required"),
+        ("max_providers", 1, "complete_pair_required"),
+        ("snapshot_sha256", "changed", "snapshot_invalid"),
+        ("snapshot_row_count", True, "snapshot_invalid"),
+        ("control_run_id", " ", "managed_run_required"),
+    ],
+)
+def test_retained_manifest_refuses_changed_scope_or_identity(field, value, error):
+    run = run_row()
+    run["source_manifest"][field] = value
+    with pytest.raises(ValueError, match=error):
+        store._manifest(run)
+
+
+def test_retained_manifest_preserves_prior_pointer_and_registry_generation():
+    run = run_row()
+    manifest = run["source_manifest"]
+    manifest["expected_current_run_id"] = "b" * 64
+    assert store._manifest(run) == manifest
+    manifest["source"]["registry_generation"] = "c" * 64
+    with pytest.raises(ValueError, match="manifest_source_invalid"):
+        store._manifest(run)
+
+
+@pytest.mark.parametrize("artifact_count", [0, 2])
+async def test_retained_bundle_requires_one_manifest(
+    tmp_path, monkeypatch, synthetic_schema_fingerprint, artifact_count
+):
+    _, _, _, artifact = await acquired(tmp_path, monkeypatch)
+    assert store._bundle_counts(run_row(), [artifact])["invalid_bundle_artifacts"] == 0
+    assert store._bundle_counts(run_row(), [artifact] * artifact_count) == {
+        "invalid_bundle_artifacts": 1,
+        "bundle_metrics": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("run_id",), "b" * 64),
+        (("cohort", "rosters"), {}),
+        (("cohort", "rosters", "MD", "preview", "content_sha256"), "changed"),
+        (("profiles", "MD00001", "source_url"), "https://example.org/changed"),
+        (("profiles", "MD00001", "schema_page", "downloaded_at"), "not-a-timestamp"),
+        (("acquisition", "responses"), 3),
+        (("acquisition", "cohort_sha256"), "c" * 64),
+    ],
+)
+async def test_rehashed_bundle_refuses_changed_retained_evidence(
+    tmp_path, monkeypatch, synthetic_schema_fingerprint, path, value
+):
+    _, _, _, artifact = await acquired(tmp_path, monkeypatch)
+    assert store._bundle_counts(run_row(), [artifact])["invalid_bundle_artifacts"] == 0
+    invalid = copy.deepcopy(artifact)
+    parent = invalid["metadata_json"]
+    for field in path[:-1]:
+        parent = parent[field]
+    parent[path[-1]] = value
+    invalid["content_sha256"] = worker._hash(invalid["metadata_json"])
+    invalid["content_bytes"] = len(worker.encoded_json(invalid["metadata_json"]))
+    assert store._bundle_counts(run_row(), [invalid]) == {
+        "invalid_bundle_artifacts": 1,
+        "bundle_metrics": None,
+    }
+    assert store._bundle_counts(run_row(), [artifact])["invalid_bundle_artifacts"] == 0
+
+
+def test_publication_accepts_complete_refresh_at_volume_boundary():
+    incumbent_metrics_by_field = {
+        "md_source_records": 7500,
+        "do_source_records": 1000,
+        "matched_public_providers": 100,
+        "received_profiles": 8500,
+    }
+    store._publication_volume(incumbent_metrics_by_field, incumbent_metrics_by_field)
+    current_metrics_by_field = {key: value * 4 // 5 for key, value in incumbent_metrics_by_field.items()}
+    store._publication_volume(current_metrics_by_field, incumbent_metrics_by_field)
+    for key in incumbent_metrics_by_field:
+        with pytest.raises(RuntimeError, match="publication_volume_drop:" + key):
+            store._publication_volume(
+                current_metrics_by_field | {key: current_metrics_by_field[key] - 1}, incumbent_metrics_by_field
+            )
+
+
 def test_publication_refuses_preview_or_source_volume_drop():
     metrics_by_field = {
         "md_source_records": 6447,
@@ -227,8 +528,8 @@ def test_managed_registry_entrypoint_and_terminal_commit():
     assert (
         adapter["target_module"] == "process.rhode_island_profile" and adapter["target_function"] == "import_profiles"
     )
-    spec = next(entry for entry in control_workers.worker_registry() if worker.IMPORTER in entry["importers"])
-    assert spec["queue"] == adapter["queue"] == process.RhodeIslandDOHProfile.queue_name
+    spec = next(spec for spec in control_workers._WORKERS if worker.IMPORTER in spec.importers)
+    assert spec.queue == adapter["queue"] == process.RhodeIslandDOHProfile.queue_name
     assert process.RhodeIslandDOHProfile.max_jobs == process.RhodeIslandDOHProfile.functions[0].max_tries == 1
     cli = CliRunner().invoke(process.process_group, [worker.IMPORTER])
     assert cli.exit_code == 2 and "managed import API" in cli.output
