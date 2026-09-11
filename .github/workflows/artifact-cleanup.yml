@@ -1,0 +1,30 @@
+name: Public artifact cleanup
+'on':
+  schedule:
+    - cron: '47 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write
+concurrency:
+  group: public-artifact-cleanup
+  cancel-in-progress: false
+jobs:
+  stale-cleanup:
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted artifact lifecycle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: EndurantDevs/endurant-ci
+          ref: 88930b1a4c1926edfe4a0dd9dbba041058e59795
+          path: ci
+          persist-credentials: false
+      - name: Delete only obsolete authenticated artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 ci/scripts/artifact_cleanup.py --stale

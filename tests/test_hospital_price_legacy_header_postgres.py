@@ -20,6 +20,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
@@ -71,6 +72,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in model_sql
+    assert HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in model_sql
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
     assert (
@@ -507,6 +509,11 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         await _run_migration(engine, _load_migration(
             CSV_SHORT_V2_MIGRATION_PATH.with_name(
                 "20260907220000_hospital_price_missing_plan.py"
+            )
+        ), "upgrade")
+        await _run_migration(engine, _load_migration(
+            CSV_SHORT_V2_MIGRATION_PATH.with_name(
+                "20260911100000_hospital_price_tall_notes.py"
             )
         ), "upgrade")
         await _prove_current_headers(database_url, quoted)

@@ -247,6 +247,7 @@ mod python_api {
         m.add_function(wrap_pyfunction!(decode_u32_le_py, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_selector_sha256, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_selector_page, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_decode_payer_plan_keys, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         Ok(())

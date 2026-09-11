@@ -2117,6 +2117,10 @@ paths:
         project IDs are retained in `alias_hospital_ids`. Publication metadata
         is null until that facility has a last-known-good packed dataset.
         Source URLs and import-attempt details are never returned.
+        With `include_metadata=true`, metadata reports the same publication's
+        source header and only an explicitly bound physical address. An unresolved
+        binding is not a missing hospital: it means a physical address cannot be
+        assigned safely. Source license states describe the file, not an address.
       parameters:
         - name: q
           in: query
@@ -2131,6 +2135,12 @@ paths:
             type: string
             enum: ['true', 'false']
           description: Restrict results by last-known-good publication presence.
+        - name: include_metadata
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+          description: Opt in to source-version-bound header and physical address evidence. Omitted or false preserves the original response shape.
         - name: cursor
           in: query
           schema:
@@ -2174,6 +2184,36 @@ paths:
                             pattern: '^hospital-[0-9]{6}$'
                         name:
                           type: string
+                        metadata:
+                          type: object
+                          additionalProperties: false
+                          required: [source_hospital_name, source_location_count, source_license_states, location_binding_status, source_location_ordinal, location_name, hospital_address]
+                          properties:
+                            source_hospital_name:
+                              type: string
+                              nullable: true
+                            source_location_count:
+                              type: integer
+                              minimum: 1
+                              nullable: true
+                            source_license_states:
+                              type: array
+                              items:
+                                type: string
+                                pattern: '^[A-Z]{2}$'
+                            location_binding_status:
+                              type: string
+                              enum: [bound, unresolved, unpublished]
+                            source_location_ordinal:
+                              type: integer
+                              minimum: 0
+                              nullable: true
+                            location_name:
+                              type: string
+                              nullable: true
+                            hospital_address:
+                              type: string
+                              nullable: true
                         publication:
                           type: object
                           nullable: true
@@ -2214,6 +2254,114 @@ paths:
           description: Invalid query, cursor, filter, or pagination input
         '503':
           description: Hospital-price catalog serving is unavailable
+  /hospital-prices/facilities/{hospital_id}/payer-plans:
+    get:
+      operationId: getHospitalPayerPlans
+      summary: Discover observed exact payer and plan pairs
+      description: |
+        Enumerates exact payer/plan pairs observed together in one published
+        packed version without reading price facts. Null plans remain explicit
+        and can be selected in prices with `plan_missing=true`. Pages are bounded
+        to one selector block and may contain fewer than limit items while still
+        having a next cursor. Continue until next_cursor is null. Reuse the exact
+        version_id when reading prices. No source URLs are exposed.
+        Legacy packed versions return one exact pair per page using their
+        original interleaved selector ordinals, without scanning price facts.
+      parameters:
+        - name: hospital_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^hospital-[0-9]{6}$'
+        - name: version_id
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{96}$'
+          description: Opaque facility-and-version-bound continuation. Restart after HTTP 409 when the current publication changes.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: Source-hidden payer/plan discovery page
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `private, no-store`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hospital_id, version, pagination, items]
+                properties:
+                  hospital_id:
+                    type: string
+                    pattern: '^hospital-[0-9]{6}$'
+                  version:
+                    type: object
+                    required: [version_id, source_format, schema_version]
+                    properties:
+                      version_id:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
+                      source_format:
+                        type: string
+                        enum: [json, csv-tall, csv-wide]
+                      schema_version:
+                        type: string
+                  pagination:
+                    type: object
+                    required: [unit, limit, scanned, next_cursor]
+                    properties:
+                      unit:
+                        type: string
+                        enum: [payer_plans]
+                      limit:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                      scanned:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+                      next_cursor:
+                        type: string
+                        nullable: true
+                        pattern: '^[A-Za-z0-9_-]{96}$'
+                  items:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      required: [payer_name, plan_name, plan_missing]
+                      properties:
+                        payer_name:
+                          type: string
+                        plan_name:
+                          type: string
+                          nullable: true
+                        plan_missing:
+                          type: boolean
+        '400':
+          description: Invalid or cross-resource cursor or query
+        '404':
+          description: Unknown, unpublished, or unbound requested version
+        '409':
+          description: Current publication changed; restart pagination
+        '503':
+          description: Packed serving is unavailable or invalid
   /hospital-prices/facilities/{hospital_id}/prices:
     get:
       operationId: getHospitalPrices

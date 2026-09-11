@@ -21,6 +21,8 @@ from api.hospital_price_serving import read_hospital_price_page
 from api.hospital_price_serving import validate_hospital_price_query
 from api.hospital_price_request import validate_hospital_price_plan
 from api.hospital_price_status import list_hospital_price_status_page
+from api.hospital_price_payer_plans import read_hospital_payer_plan_page
+from api.hospital_price_request import validate_hospital_payer_plan_query
 
 
 blueprint = Blueprint(
@@ -32,7 +34,8 @@ logger = logging.getLogger(__name__)
 _QUERY_FIELDS = frozenset(
     {"code_type", "code", "payer_name", "plan_name", "plan_missing", "version_id", "cursor", "limit"}
 )
-_FACILITY_QUERY_FIELDS = frozenset({"q", "published", "cursor", "limit"})
+_FACILITY_QUERY_FIELDS = frozenset({"q", "published", "cursor", "limit", "include_metadata"})
+_PAYER_PLAN_QUERY_FIELDS = frozenset({"version_id", "cursor", "limit"})
 _FACILITY_CURSOR_PATTERN = re.compile(r"hospital-[0-9]{6}\Z")
 _FACILITY_LIMIT_PATTERN = re.compile(r"[1-9][0-9]{0,2}\Z")
 _MAX_FACILITY_LIMIT = 200
@@ -87,6 +90,8 @@ def _query_values(
 
 
 def _facility_search_query(values_by_field: dict[str, str]) -> dict[str, object]:
+    if values_by_field.get("include_metadata") not in {None, "true", "false"}:
+        raise HospitalPriceInvalidRequestError("hospital facility metadata selector is invalid")
     query = values_by_field.get("q")
     if query is not None and (
         not query or query != query.strip() or len(query) > 256
@@ -107,7 +112,7 @@ def _facility_search_query(values_by_field: dict[str, str]) -> dict[str, object]
         raise HospitalPriceInvalidRequestError("hospital facility limit is invalid")
     if limit > _MAX_FACILITY_LIMIT:
         raise HospitalPriceInvalidRequestError("hospital facility limit is invalid")
-    return {
+    search_by_field = {
         "query": query,
         "status": (
             "succeeded"
@@ -119,6 +124,9 @@ def _facility_search_query(values_by_field: dict[str, str]) -> dict[str, object]
         "cursor": cursor,
         "limit": limit,
     }
+    if values_by_field.get("include_metadata") == "true":
+        search_by_field["include_metadata"] = True
+    return search_by_field
 
 
 def _public_facility_item(status_item: dict[str, Any]) -> dict[str, object]:
@@ -136,12 +144,15 @@ def _public_facility_item(status_item: dict[str, Any]) -> dict[str, object]:
             "charge_count": publication.get("charge_count"),
             "payer_charge_count": publication.get("payer_charge_count"),
         }
-    return {
+    public_by_field = {
         "hospital_id": status_item["hospital_id"],
         "alias_hospital_ids": status_item["alias_hospital_ids"],
         "name": status_item["name"],
         "publication": publication_by_field,
     }
+    if "metadata" in status_item:
+        public_by_field["metadata"] = status_item["metadata"]
+    return public_by_field
 
 
 def _json_response(payload: dict[str, object], *, status: int):
@@ -225,6 +236,21 @@ async def get_hospital_prices(request: Any, hospital_id: str):
         return _json_response(
             await read_hospital_price_page(_get_session(request), query),
             status=200,
+        )
+    except Exception as failure:
+        return _failure_response(failure)
+
+
+@blueprint.get("/facilities/<hospital_id>/payer-plans", name="hospital_prices.payer_plans")
+async def get_hospital_payer_plans(request: Any, hospital_id: str):
+    """Discover observed exact payer/plan pairs in one published version."""
+
+    try:
+        query = validate_hospital_payer_plan_query(
+            hospital_id, **_query_values(request, _PAYER_PLAN_QUERY_FIELDS)
+        )
+        return _json_response(
+            await read_hospital_payer_plan_page(_get_session(request), query), status=200
         )
     except Exception as failure:
         return _failure_response(failure)
