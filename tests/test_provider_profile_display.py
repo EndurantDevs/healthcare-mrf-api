@@ -285,7 +285,7 @@ def test_composer_formats_fhir_facts_for_people():
     )
 
     assert profile is not None
-    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v10"
+    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v11"
     assert profile["composer_version"] == PROFILE_COMPOSER_VERSION
     expected_displays_by_category = {
         "certifications": ["Doctor of Medicine (MD)"],

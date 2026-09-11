@@ -15,6 +15,9 @@ from datetime import date
 from api.provider_language_merge import _apply_provenance, _provenance_sets
 
 
+_INSTITUTION_ALIASES = {"eastern va med schl": "eastern virginia medical school"}
+
+
 def _text_key(value: object) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value)).casefold().split())
 
@@ -23,7 +26,9 @@ def _institution_key(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = _text_key(value)
-    return None if normalized in {"", "other", "unknown", "n/a", "not reported"} else normalized
+    if normalized in {"", "other", "unknown", "n/a", "not reported"}:
+        return None
+    return _INSTITUTION_ALIASES.get(normalized, normalized)
 
 
 def _date_year(value: Mapping) -> int | None:

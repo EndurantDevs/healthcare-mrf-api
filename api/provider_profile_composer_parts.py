@@ -19,7 +19,7 @@ from api.provider_profile_public_facts import (
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
 from process.provider_profile_reported_range import normalize_projected_state_facts
 
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v10"
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v11"
 
 
 def _empty_profile(npi: int) -> dict[str, Any]:
