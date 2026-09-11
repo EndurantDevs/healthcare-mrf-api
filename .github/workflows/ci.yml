@@ -48,6 +48,8 @@ jobs:
       && 'Repository checks (metadata only)' || 'Repository checks' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs:
+    - python-quality
     defaults:
       run:
         shell: bash
@@ -57,7 +59,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -121,7 +123,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -144,7 +146,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -176,7 +178,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -247,6 +249,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -257,7 +260,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -291,6 +294,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -301,7 +305,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -322,6 +326,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -332,13 +337,21 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         rust: 'true'
+    - name: Install verified Rust validation tools
+      run: 'tools_directory="$RUNNER_TEMP/healthcare-rust-tools"
+
+        python "$CI_ROOT/scripts/healthcare/install_rust_tools.py" "$tools_directory"
+
+        printf ''%s\n'' "$tools_directory" >> "$GITHUB_PATH"
+
+        '
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" rust
 
@@ -365,6 +378,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -375,7 +389,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -408,6 +422,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -418,7 +433,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -439,6 +454,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     services:
       redis:
@@ -455,7 +471,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -511,7 +527,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -603,7 +619,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Resolve exact source event
@@ -661,14 +677,14 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+      CI_REVISION: 900defb8ec00867b84f876e5fbc294258baf523d
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
     - name: Check out trusted image publisher
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Authenticate DEV image input
@@ -734,7 +750,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+        ref: 900defb8ec00867b84f876e5fbc294258baf523d
         path: ci
         persist-credentials: false
     - name: Remove validated CI intermediates
@@ -755,7 +771,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: eb148c0a7f1665a6ba63f52bf49e762feaec01f6
+  CI_REVISION: 900defb8ec00867b84f876e5fbc294258baf523d
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
