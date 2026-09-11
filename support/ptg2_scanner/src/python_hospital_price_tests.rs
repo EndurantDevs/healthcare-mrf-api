@@ -1,4 +1,50 @@
 #[test]
+fn python_hospital_payer_plan_keys_keep_pairs_and_missing_plans() {
+    use crate::hospital_price_selector_block::{
+        encode_selector_page, selector_key_sha256, HospitalPriceSelectorEntry,
+        HospitalPriceSelectorKey, HospitalPriceSelectorKind,
+    };
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let decode = module.getattr("hospital_price_decode_payer_plan_keys").unwrap();
+        let mut entries = vec![
+            HospitalPriceSelectorEntry {
+                key: HospitalPriceSelectorKey::PayerPlan {
+                    payer_name: "Synthetic payer".to_owned(), plan_name: None,
+                }, refs: vec![0, 2],
+            },
+            HospitalPriceSelectorEntry {
+                key: HospitalPriceSelectorKey::PayerPlan {
+                    payer_name: "Synthetic payer".to_owned(), plan_name: Some("Synthetic plan".to_owned()),
+                }, refs: vec![1],
+            },
+        ];
+        let payload = encode_selector_page(HospitalPriceSelectorKind::PayerPlanToFact, 0, 1, &entries).unwrap();
+        let page = decode.call1((PyBytes::new(py, &payload),)).unwrap();
+        let items = page.get_item("items").unwrap();
+        assert_eq!(items.len().unwrap(), 2);
+        entries.sort_unstable_by_key(|entry| selector_key_sha256(&entry.key));
+        for (index, entry) in entries.iter().enumerate() {
+            let item = items.get_item(index).unwrap();
+            assert_eq!(item.get_item("key_sha256").unwrap().extract::<Vec<u8>>().unwrap(), selector_key_sha256(&entry.key));
+            let HospitalPriceSelectorKey::PayerPlan { payer_name, plan_name } = &entry.key else { panic!("expected payer key"); };
+            assert_eq!(item.get_item("payer_name").unwrap().extract::<String>().unwrap(), *payer_name);
+            assert_eq!(item.get_item("plan_name").unwrap().extract::<Option<String>>().unwrap(), *plan_name);
+        }
+        assert!(decode.call1((PyBytes::new(py, b"invalid"),)).is_err());
+        let continuation = encode_selector_page(HospitalPriceSelectorKind::PayerPlanToFact, 1, 2, &entries[..1]).unwrap();
+        assert!(decode.call1((PyBytes::new(py, &continuation),)).is_err());
+        let code = HospitalPriceSelectorEntry { key: HospitalPriceSelectorKey::Code {
+            code_type: "CPT".to_owned(), code: "12345".to_owned(),
+        }, refs: vec![0] };
+        let wrong_kind = encode_selector_page(HospitalPriceSelectorKind::CodeToCharge, 0, 1, &[code]).unwrap();
+        assert!(decode.call1((PyBytes::new(py, &wrong_kind),)).is_err());
+    });
+}
+
+#[test]
 fn python_hospital_price_selector_is_canonical_and_bounded() {
     Python::initialize();
     Python::attach(|py| {

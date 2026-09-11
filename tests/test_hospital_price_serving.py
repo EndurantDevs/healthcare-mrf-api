@@ -468,6 +468,7 @@ def test_query_validation_is_exact_and_bounded(overrides):
         {"cursor": "bad"},
         {"limit": "0"},
         {"limit": "201"},
+        {"include_metadata": "1"},
     ],
 )
 def test_facility_search_query_is_closed_and_bounded(values_by_field):
@@ -485,6 +486,10 @@ def test_facility_search_defaults_and_unpublished_shape():
     item = _private_facility_status_page()["items"][0]
     item["publication"] = None
     assert endpoint._public_facility_item(item)["publication"] is None
+    assert endpoint._facility_search_query({"include_metadata": "false"}) == endpoint._facility_search_query({})
+    assert endpoint._facility_search_query({"include_metadata": "true"})["include_metadata"] is True
+    item["metadata"] = {"location_binding_status": "unpublished"}
+    assert endpoint._public_facility_item(item)["metadata"] == item["metadata"]
 
 
 def _private_facility_status_page():
