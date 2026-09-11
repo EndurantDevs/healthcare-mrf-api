@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -93,54 +91,17 @@ def validate_subject(subject: str) -> list[str]:
     commit_type = match.group("type")
     summary = match.group("summary")
     if commit_type not in ALLOWED_TYPES:
-        problems.append(f"unsupported type '{commit_type}'")
+        problems.append("unsupported commit type")
     if vague_summary_key(summary) in VAGUE_SUMMARIES:
         problems.append("summary is too vague")
     return problems
-
-
-def push_subjects(payload: dict[str, Any]) -> list[str]:
-    """Return commit subjects from a GitHub push event payload."""
-    raw_commits = payload.get("commits")
-    commit_list = raw_commits if isinstance(raw_commits, list) else []
-    subject_list = [
-        first_line(str(commit.get("message", "")))
-        for commit in commit_list
-        if isinstance(commit, dict)
-    ]
-    if not subject_list and isinstance(payload.get("head_commit"), dict):
-        subject_list.append(first_line(str(payload["head_commit"].get("message", ""))))
-    return [subject for subject in subject_list if subject]
-
-
-def pull_request_subjects(payload: dict[str, Any]) -> list[str]:
-    """Return the title from a GitHub pull request event payload."""
-    pull_request = payload.get("pull_request")
-    if not isinstance(pull_request, dict):
-        return []
-    title = str(pull_request.get("title", "")).strip()
-    return [title] if title else []
-
-
-def event_subjects(event_path: Path) -> list[str]:
-    """Return subjects to validate from a GitHub event JSON file."""
-    event_payload = json.loads(event_path.read_text(encoding="utf-8"))
-    subject_list = pull_request_subjects(event_payload)
-    if subject_list:
-        return subject_list
-    return push_subjects(event_payload)
 
 
 def git_messages(arguments: list[str]) -> list[str]:
     """Return full messages, including bodies, without ambiguous line splitting."""
     git_command_parts = ["git", "log", "--format=%B%x00", *arguments]
     completed = subprocess.run(git_command_parts, check=True, text=True, capture_output=True)
-    return [message.strip() for message in completed.stdout.split("\0") if message.strip()]
-
-
-def git_subjects(arguments: list[str]) -> list[str]:
-    """Return subjects from git log for the given revision arguments."""
-    return [first_line(message) for message in git_messages(arguments)]
+    return [message.strip() for message in completed.stdout.split("\0")[:-1]]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -184,7 +145,7 @@ def cli_subjects(args: argparse.Namespace) -> list[tuple[str, str]]:
         errors.extend(check_text(message, label))
     if errors:
         raise ValueError("\n".join(errors))
-    return [(label, first_line(message)) for label, message in message_pairs if first_line(message)]
+    return [(label, first_line(message)) for label, message in message_pairs]
 
 
 def print_problems(problems_by_label: list[tuple[str, list[str]]]) -> None:

@@ -91,8 +91,8 @@ TEXT_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 PRIVATE_TEXT_WINDOW_MAX = 3
 INTEGRATION_IDENTIFIER_SEPARATOR_RE = re.compile(r"[-_./:\\]+")
 
-PATTERN_EXEMPT_PATHS = {
-    "scripts/ci/public_hygiene.py",
+PATTERN_EXEMPTIONS = {
+    "scripts/ci/public_hygiene.py": {"agentic-development-reference"},
 }
 PUBLIC_EVENT_NAMES = {"pull_request", "pull_request_target", "push"}
 
@@ -176,13 +176,14 @@ def has_private_text_fingerprint(text: str) -> bool:
     return False
 
 
-def check_text(text: str, label: str, *, check_patterns: bool = True) -> list[str]:
+def check_text(
+    text: str, label: str, *, exempt_patterns: frozenset[str] | set[str] = frozenset()
+) -> list[str]:
     """Check text using a trusted field label without echoing rejected content."""
     errors = []
-    if check_patterns:
-        for category, pattern in CONTENT_PATTERNS.items():
-            if pattern.search(text):
-                errors.append(f"{category}: {label}")
+    for category, pattern in CONTENT_PATTERNS.items():
+        if category not in exempt_patterns and pattern.search(text):
+            errors.append(f"{category}: {label}")
     if has_private_text_fingerprint(text):
         errors.append(f"private-example-fingerprint: {label}")
     return errors
@@ -199,9 +200,13 @@ def check_content(paths: list[Path]) -> list[str]:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        errors.extend(check_text(
-            text, f"file {index}", check_patterns=path_str not in PATTERN_EXEMPT_PATHS,
-        ))
+        errors.extend(
+            check_text(
+                text,
+                f"file {index}",
+                exempt_patterns=PATTERN_EXEMPTIONS.get(path_str, frozenset()),
+            )
+        )
     return errors
 
 
@@ -290,8 +295,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run the public repository hygiene checks."""
     args = parse_args(argv)
-    paths = existing_files(repository_files(include_untracked=args.include_untracked))
-    errors = check_paths(paths) + check_content(paths)
+    paths = repository_files(include_untracked=args.include_untracked)
+    errors = check_paths(paths) + check_content(existing_files(paths))
     try:
         errors.extend(check_metadata(args))
     except ValueError as error:

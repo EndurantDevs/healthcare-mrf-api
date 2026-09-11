@@ -97,28 +97,46 @@ class PublicHygieneTests(unittest.TestCase):
         self.assertFalse(PUBLIC_HYGIENE.has_private_text_fingerprint(allowed))
 
     def test_only_checker_implementation_is_exempt(self) -> None:
+        self_category = "agent" + "ic-development-reference"
         self.assertEqual(
-            PUBLIC_HYGIENE.PATTERN_EXEMPT_PATHS,
-            {"scripts/ci/public_hygiene.py"},
+            PUBLIC_HYGIENE.PATTERN_EXEMPTIONS,
+            {"scripts/ci/public_hygiene.py": {self_category}},
         )
         self.assertNotIn(
             ".github/workflows/ci.yml",
-            PUBLIC_HYGIENE.PATTERN_EXEMPT_PATHS,
+            PUBLIC_HYGIENE.PATTERN_EXEMPTIONS,
         )
 
     def test_checker_exemption_still_applies_private_fingerprints(self) -> None:
         checker_path = Path("scripts/ci/public_hygiene.py")
         protected_text = synthetic_example(SYNTHETIC_FRAGMENT_GROUPS[0], "_")
+        credential_text = (
+            "ghp_"
+            + "a" * 20
+            + "\npostgresql://user:"
+            + "credential@example.test/db\n"
+            + "pass"
+            + "word='credential'"
+        )
         with mock.patch.object(
             PUBLIC_HYGIENE,
             "is_binary",
             return_value=False,
-        ), mock.patch.object(Path, "read_text", return_value=protected_text):
+        ), mock.patch.object(
+            Path,
+            "read_text",
+            return_value="agent" + f"ic {protected_text}\n{credential_text}",
+        ):
             errors = PUBLIC_HYGIENE.check_content([checker_path])
 
         self.assertEqual(
             errors,
-            ["private-example-fingerprint: file 1"],
+            [
+                "github-token: file 1",
+                "database-url-with-password: file 1",
+                "password-assignment: file 1",
+                "private-example-fingerprint: file 1",
+            ],
         )
 
     def test_repository_files_defaults_to_tracked_files(self) -> None:
@@ -176,6 +194,12 @@ class PublicHygieneTests(unittest.TestCase):
                 PUBLIC_HYGIENE.existing_files([missing, existing]),
                 [existing],
             )
+
+    def test_deleted_tracked_path_names_are_still_checked(self) -> None:
+        missing = Path(sorted(PUBLIC_HYGIENE.FORBIDDEN_PATH_PARTS)[0]) / "deleted.txt"
+        with mock.patch.object(PUBLIC_HYGIENE, "repository_files", return_value=[missing]), \
+                mock.patch.dict(PUBLIC_HYGIENE.os.environ, {}, clear=True):
+            self.assertEqual(PUBLIC_HYGIENE.main([]), 1)
 
     def test_tracked_test_source_passes_the_content_gate(self) -> None:
         path = Path("tests/test_public_hygiene.py")

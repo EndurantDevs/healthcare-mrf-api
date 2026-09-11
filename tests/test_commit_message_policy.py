@@ -43,43 +43,12 @@ def test_accepts_clear_commit_subjects(subject):
         "fix(API): handle timeout",
         "fix(api): handle timeout.",
         "fix(api) handle timeout",
+        "fix: " + "x" * 100,
     ],
 )
 def test_rejects_unclear_commit_subjects(subject):
     module = load_policy_module()
     assert module.validate_subject(subject)
-
-
-def test_reads_push_event_subjects(tmp_path):
-    module = load_policy_module()
-    event_path = tmp_path / "push.json"
-    event_path.write_text(
-        json.dumps(
-            {
-                "commits": [
-                    {"message": "fix(api): handle timeout\n\nBody text."},
-                    {"message": "docs: explain commit style"},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert module.event_subjects(event_path) == [
-        "fix(api): handle timeout",
-        "docs: explain commit style",
-    ]
-
-
-def test_reads_pull_request_title(tmp_path):
-    module = load_policy_module()
-    event_path = tmp_path / "pull_request.json"
-    event_path.write_text(
-        json.dumps({"pull_request": {"title": "ci(commit): add message gate"}}),
-        encoding="utf-8",
-    )
-
-    assert module.event_subjects(event_path) == ["ci(commit): add message gate"]
 
 
 def test_main_accepts_direct_message(capsys):
@@ -101,6 +70,13 @@ def test_main_rejects_unclear_message(capsys):
     assert "update stuff" not in output
 
 
+def test_main_rejects_empty_direct_message(capsys):
+    module = load_policy_module()
+
+    assert module.main(["--message", ""]) == 1
+    assert "subject is empty" in capsys.readouterr().out
+
+
 def test_event_style_errors_report_trusted_label(tmp_path, capsys):
     module = load_policy_module()
     event_path = tmp_path / "pull_request.json"
@@ -112,6 +88,16 @@ def test_event_style_errors_report_trusted_label(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "PR title" in output
     assert "update stuff" not in output
+
+
+def test_unsupported_type_diagnostic_is_redacted(capsys):
+    module = load_policy_module()
+    rejected = "sampleprivateclient"
+
+    assert module.main(["--message", f"{rejected}: preserve behavior"]) == 1
+    output = capsys.readouterr().out
+    assert "unsupported commit type" in output
+    assert rejected not in output
 
 
 def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):
@@ -146,12 +132,22 @@ def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):
                 capture_output=True,
             ).stdout.strip()
 
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "--allow-empty-message", "--quiet", "-m", ""],
+        cwd=repository,
+        check=True,
+    )
+
     monkeypatch.chdir(repository)
-    assert module.git_subjects([f"{base_sha}..HEAD"]) == [
+    assert [module.first_line(message) for message in module.git_messages([f"{base_sha}..HEAD"])] == [
+        "",
         "test(ci): cover workflow dispatch subjects",
         "fix(ci): validate protected push subjects",
     ]
-    assert all("\n\nPublic fixture details." in message for message in module.git_messages([f"{base_sha}..HEAD"]))
+    assert all(
+        "\n\nPublic fixture details." in message
+        for message in module.git_messages([f"{base_sha}..HEAD"])[1:]
+    )
 
 
 @pytest.mark.parametrize("arguments", [["--message"], ["--last", "1"], ["--range", "HEAD~1..HEAD"]])
