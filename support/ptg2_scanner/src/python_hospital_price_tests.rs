@@ -129,14 +129,14 @@ fn python_hospital_payer_plan_keys_keep_pairs_and_missing_plans() {
             assert_eq!(item.get_item("payer_name").unwrap().extract::<String>().unwrap(), *payer_name);
             assert_eq!(item.get_item("plan_name").unwrap().extract::<Option<String>>().unwrap(), *plan_name);
         }
-        assert!(decode.call1((PyBytes::new(py, b"invalid"),)).is_err());
+        assert!(decode.call1((PyBytes::new(py, b"invalid"),)).unwrap_err().is_instance_of::<PyValueError>(py));
         let continuation = encode_selector_page(HospitalPriceSelectorKind::PayerPlanToFact, 1, 2, &entries[..1]).unwrap();
-        assert!(decode.call1((PyBytes::new(py, &continuation),)).is_err());
+        assert!(decode.call1((PyBytes::new(py, &continuation),)).unwrap_err().is_instance_of::<PyValueError>(py));
         let code = HospitalPriceSelectorEntry { key: HospitalPriceSelectorKey::Code {
             code_type: "CPT".to_owned(), code: "12345".to_owned(),
         }, refs: vec![0] };
         let wrong_kind = encode_selector_page(HospitalPriceSelectorKind::CodeToCharge, 0, 1, &[code]).unwrap();
-        assert!(decode.call1((PyBytes::new(py, &wrong_kind),)).is_err());
+        assert!(decode.call1((PyBytes::new(py, &wrong_kind),)).unwrap_err().is_instance_of::<PyValueError>(py));
     });
 }
 

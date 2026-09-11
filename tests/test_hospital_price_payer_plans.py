@@ -154,6 +154,14 @@ def test_dictionary_decoder_shape_fails_closed(decoded):
         discovery._validated_dictionary_keys(_record(), decoded, 2)
 
 
+@pytest.mark.parametrize("field", ["payer_name", "plan_name"])
+def test_dictionary_missing_field_fails_closed(field):
+    decoded = _dictionary()
+    del decoded["items"][0][field]
+    with pytest.raises(discovery.HospitalPriceServingUnavailableError, match="hospital payer-plan key is invalid"):
+        discovery._validated_dictionary_keys(_record(), decoded, 2)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

@@ -77,7 +77,7 @@ def _validated_dictionary_keys(
     for key in keys:
         for name in ("payer_name", "plan_name"):
             field_text = key.get(name)
-            if name == "plan_name" and field_text is None:
+            if name == "plan_name" and name in key and field_text is None:
                 continue
             if (
                 type(field_text) is not str
