@@ -95,7 +95,23 @@ def test_main_rejects_unclear_message(capsys):
     exit_code = module.main(["--message", "update stuff"])
 
     assert exit_code
-    assert "policy failed" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "policy failed" in output
+    assert "commit message 1" in output
+    assert "update stuff" not in output
+
+
+def test_event_style_errors_report_trusted_label(tmp_path, capsys):
+    module = load_policy_module()
+    event_path = tmp_path / "pull_request.json"
+    event_path.write_text(json.dumps({"pull_request": {
+        "title": "update stuff", "body": "Public details.", "head": {"ref": "fix/public"},
+    }}), encoding="utf-8")
+
+    assert module.main(["--event", str(event_path)]) == 1
+    output = capsys.readouterr().out
+    assert "PR title" in output
+    assert "update stuff" not in output
 
 
 def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):

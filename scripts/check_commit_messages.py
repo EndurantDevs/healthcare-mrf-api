@@ -153,36 +153,45 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def cli_subjects(args: argparse.Namespace) -> list[str]:
-    """Check complete publication text before returning subjects for style checks."""
+def cli_subjects(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Check complete publication text and retain trusted subject labels."""
     if args.last is not None and args.last <= 0:
         raise ValueError("Requested commit count must be positive.")
     if args.commit_range is not None and (not args.commit_range or args.commit_range.startswith("-")):
         raise ValueError("Requested revision range must name commits.")
-    message_list = list(args.message)
+    message_pairs = [
+        (f"commit message {index}", message)
+        for index, message in enumerate(args.message, 1)
+    ]
     errors = []
     if args.event:
         text_pairs = event_texts(args.event)
         for label, text in text_pairs:
             errors.extend(check_text(text, label))
             if label == "PR title" or label.startswith("push commit "):
-                message_list.append(text)
+                message_pairs.append((label, text))
     if args.last:
-        message_list.extend(git_messages([f"-n{args.last}"]))
+        message_pairs.extend(
+            (f"commit message {index}", message)
+            for index, message in enumerate(git_messages([f"-n{args.last}"]), 1)
+        )
     if args.commit_range:
-        message_list.extend(git_messages([args.commit_range]))
-    for index, message in enumerate(message_list, 1):
-        errors.extend(check_text(message, f"commit message {index}"))
+        message_pairs.extend(
+            (f"commit message {index}", message)
+            for index, message in enumerate(git_messages([args.commit_range]), 1)
+        )
+    for label, message in message_pairs:
+        errors.extend(check_text(message, label))
     if errors:
         raise ValueError("\n".join(errors))
-    return [first_line(message) for message in message_list if first_line(message)]
+    return [(label, first_line(message)) for label, message in message_pairs if first_line(message)]
 
 
-def print_problems(problems_by_subject: list[tuple[str, list[str]]]) -> None:
+def print_problems(problems_by_label: list[tuple[str, list[str]]]) -> None:
     """Print validation failures in a CI-friendly format."""
     print("Commit message policy failed:")
-    for subject, problems in problems_by_subject:
-        print(f"  {subject}")
+    for label, problems in problems_by_label:
+        print(f"  {label}")
         for problem in problems:
             print(f"    - {problem}")
     print("\nExpected: type(scope): imperative summary")
@@ -193,26 +202,26 @@ def main(argv: list[str] | None = None) -> int:
     """Run the commit message policy check."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        subject_list = cli_subjects(args)
+        labeled_subjects = cli_subjects(args)
     except ValueError as error:
         print(f"Commit message policy failed:\n{error}")
         return 1
     except (OSError, subprocess.CalledProcessError):
         print("Commit message policy failed: requested messages could not be read.")
         return 1
-    if not subject_list:
+    if not labeled_subjects:
         print("No commit subjects found to validate.", file=sys.stderr)
         return 2
 
     subject_problem_pairs = [
-        (subject, problems)
-        for subject in subject_list
+        (label, problems)
+        for label, subject in labeled_subjects
         if (problems := validate_subject(subject))
     ]
     if subject_problem_pairs:
         print_problems(subject_problem_pairs)
         return 1
-    print(f"Commit message policy OK ({len(subject_list)} subject(s)).")
+    print(f"Commit message policy OK ({len(labeled_subjects)} subject(s)).")
     return 0
 
 
