@@ -8,7 +8,6 @@ from pathlib import Path
 
 from alembic import op
 
-
 revision = "20260911100000_hospital_price_tall_notes"
 down_revision = "20260909120000_fhir_request_failure_budget"
 branch_labels = None
