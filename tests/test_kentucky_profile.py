@@ -184,6 +184,11 @@ def test_persisted_sampling_versions_keep_literal_historical_order():
     assert worker._selected_roots(cohort, None) is cohort["roots"]
 
 
+def test_unknown_sampling_version_is_rejected():
+    with pytest.raises(ValueError, match="sampling_strategy_invalid"):
+        worker._selected_roots(_cohort(), 1, strategy="unknown/v1")
+
+
 @pytest.mark.parametrize("limit", [1, 2, 100, 300])
 def test_bounded_sample_includes_lexical_first_then_existing_hash_order(limit):
     cohort = _cohort(tuple(str(number) for number in range(201)))

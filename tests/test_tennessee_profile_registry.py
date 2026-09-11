@@ -6,7 +6,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import asyncpg
 import pytest
@@ -26,6 +26,32 @@ class RegistryCursor:
         assert prefetch == 500
         for candidate in self.candidates:
             yield candidate
+
+
+async def test_open_connection_initializes_the_shared_database(monkeypatch):
+    database = SimpleNamespace(engine=None)
+
+    async def connect_database():
+        database.engine = SimpleNamespace(url=make_url("postgresql://example@localhost/test"))
+
+    database.connect = AsyncMock(side_effect=connect_database)
+    connection = object()
+    connect = AsyncMock(return_value=connection)
+    monkeypatch.setattr(registry, "db", database)
+    monkeypatch.setattr(registry.asyncpg, "connect", connect)
+
+    assert await registry._open_connection() is connection
+    database.connect.assert_awaited_once_with()
+    connect.assert_awaited_once()
+
+
+async def test_registry_capture_reports_each_full_cursor_page():
+    candidate = _candidate()
+    progress = AsyncMock()
+    result = await registry._registry_rows(RegistryCursor([candidate] * 501), "synthetic", 501, progress)
+
+    assert result["row_count"] == 501
+    progress.assert_has_awaits([call(500, 501), call(501, 501)])
 
 
 @pytest.mark.parametrize("failure", ["count", "row_size", "total_size", "order", "cancel"])

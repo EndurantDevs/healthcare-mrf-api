@@ -6,7 +6,7 @@ import hashlib
 import importlib
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -187,6 +187,10 @@ def test_manifest_requires_complete_fixed_fields(manifest):
         tennessee.store._manifest({"source_manifest": manifest})
 
 
+def test_report_descriptor_requires_a_mapping():
+    assert tennessee._has_valid_report(None) is False
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -332,6 +336,12 @@ def test_bundle_requires_one_artifact_and_both_pinned_reports(change):
     assert tennessee.store._bundle_counts(_run(), artifacts)["invalid_bundle_artifacts"] == 1
 
 
+def test_bundle_rejects_a_foreign_artifact_source():
+    artifact = _artifact()
+    artifact["source_key"] = "foreign-source"
+    assert tennessee.store._bundle_counts(_run(), [artifact])["invalid_bundle_artifacts"] == 1
+
+
 @pytest.mark.parametrize(
     ("field", "changed"),
     [
@@ -358,6 +368,16 @@ async def test_retention_keeps_corrupt_payload_but_accepts_already_pruned_audit(
         await tennessee.store._assert_source_ownership([_run()["run_id"]])
     probe.return_value = {**counts, "retained_source_records": 0, "retained_facts": 0, "retained_artifacts": 0}
     await tennessee.store._assert_source_ownership([_run()["run_id"]])
+
+
+async def test_retention_checks_pruned_and_intact_runs(monkeypatch):
+    pruned = {**_counts(), "retained_source_records": 0, "retained_facts": 0, "retained_artifacts": 0}
+    probe = AsyncMock(side_effect=[pruned, _counts()])
+    monkeypatch.setattr(tennessee.TennesseeProfileStore, "retained_counts", probe)
+
+    await tennessee.store._assert_source_ownership(["1" * 64, "2" * 64])
+
+    probe.assert_has_awaits([call("1" * 64), call("2" * 64)])
 
 
 def _native_fact(candidate, artifact, record_id, npi, profession):
