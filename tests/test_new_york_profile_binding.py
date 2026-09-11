@@ -546,6 +546,117 @@ def _corroborated_bind(paired_case, tmp_path, registry_rows=None):
     return binding.bind_corroborated_acquisition(**paired_case, **_save_snapshot(tmp_path, _snapshot(registry_rows)))
 
 
+@pytest.mark.parametrize("degree_date", ["May 20, 2001", "December 31, 2099", "Not reported"])
+async def test_nysed_binding_preserves_own_assertions(
+    source_session, monkeypatch, tmp_path, offline_binding, degree_date
+):
+    paired = await _paired_case(source_session, monkeypatch, tmp_path, nysed_fields={"schoolDegreeDate": degree_date})
+    original = nysed.read_acquisition(paired["nysed_destination"], receipt_sha256=paired["nysed_receipt_sha256"])
+    nypp = read_acquisition(paired["destination"], manifest_sha256=paired["manifest_sha256"])
+    bytes_by_path = {
+        path: path.read_bytes() for key in ("destination", "nysed_destination") for path in paired[key].iterdir()
+    }
+    snapshot = _save_snapshot(tmp_path, _snapshot())
+    nypp_bound = binding.bind_corroborated_acquisition(**paired, **snapshot)
+    bound = binding.bind_nysed_acquisition(**paired, **snapshot)
+    assert bound["outcome"] == "accepted" and bound["reason"] == "unique_exact_license_corroborated_name"
+    expected = copy.deepcopy(original["facts"])
+    for fact in expected:
+        fact["npi"] = 1000000004
+    assert bound["facts"] == expected
+    assert {fact["category"] for fact in bound["facts"]} == {"education", "licenses"}
+    assert all(fact["verification_status"] == "not_independently_verified" for fact in bound["facts"])
+    assert all(fact["published_at"] is None for fact in bound["facts"])
+    nysed_record = bound["source_record"]
+    for field in set(nysed_record) - {"matched_npi", "match_status", "match_evidence"}:
+        assert nysed_record[field] == original["source_record"][field]
+    assert nysed_record["matched_npi"] == 1000000004 and nysed_record["match_status"] == "deterministic"
+    decision = nysed_record["match_evidence"]["registry_binding"]
+    assert decision["bound_source_key"] == nysed.SOURCE_KEY
+    assert decision["source_npi_source_key"] == nypp["source_record"]["source_key"]
+    assert decision["nysed_corroboration"]["receipt_sha256"] == paired["nysed_receipt_sha256"]
+    assert decision["nypp_corroboration"]["record_id"] == nypp["source_record"]["record_id"]
+    assert decision["nypp_corroboration"]["artifact_id"] == nypp["source_record"]["artifact_id"]
+    assert decision["nypp_corroboration"]["quality_flags"] == ["search_header_name_disagreement"]
+    assert decision["nypp_corroboration"]["license_search"] == nypp["source_record"]["match_evidence"]["license_search"]
+    assert {
+        key: field_value
+        for key, field_value in decision.items()
+        if key not in {"bound_source_key", "source_npi_source_key", "nypp_corroboration"}
+    } == (nypp_bound["source_record"]["match_evidence"]["registry_binding"])
+    assert binding.bind_corroborated_acquisition(**paired, **snapshot) == nypp_bound
+    assert {path: path.read_bytes() for path in bytes_by_path} == bytes_by_path
+
+
+@pytest.mark.parametrize(
+    "changes,rows,reason",
+    [
+        ({}, [_candidate(middle_name="M")], "unique_exact_license_corroborated_name"),
+        ({}, [_candidate(middle_name="Morgan")], "unique_exact_license_corroborated_name"),
+        ({}, [_candidate(), _candidate()], "unique_exact_license_corroborated_name"),
+        ({}, [], "no_exact_license_candidates"),
+        ({}, [_candidate(license_number="060654321")], "no_exact_license_candidates"),
+        ({}, [_candidate(), _candidate(entity_type_code=2)], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(joined_npi=None)], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(taxonomy_grouping="Nursing Service Providers")], "registry_identity_conflict"),
+        ({}, [_candidate(), {"license_number": "654321"}], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(first_name="Other")], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(last_name="Other")], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(suffix="Jr")], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(middle_name="Martha")], "registry_identity_conflict"),
+        ({}, [_candidate(), _candidate(npi=1000000012, joined_npi=1000000012)], "multiple_matching_npis"),
+        ({"source_names": {"nationalProviderId": "1000000012"}}, None, "source_npi_identity_conflict"),
+        ({"source_names": {"nationalProviderId": "invalid"}}, None, "source_npi_identity_conflict"),
+        ({"search_names": {"physicianFirstName": "Other"}}, None, "search_header_name_disagreement"),
+        ({"nysed_fields": {"name": "OTHER ALEX MORGAN"}}, None, "nysed_identity_conflict"),
+        ({"nysed_fields": {"license_number": "123456"}}, None, "nysed_identity_conflict"),
+    ],
+)
+async def test_nysed_binding_uses_complete_pair_identity(
+    source_session, monkeypatch, tmp_path, offline_binding, changes, rows, reason
+):
+    paired = await _paired_case(source_session, monkeypatch, tmp_path, **changes)
+    snapshot = _save_snapshot(tmp_path, _snapshot(rows))
+    nypp_bound = binding.bind_corroborated_acquisition(**paired, **snapshot)
+    bound = binding.bind_nysed_acquisition(**paired, **snapshot)
+    assert bound["reason"] == nypp_bound["reason"] == reason
+    assert bound["outcome"] == nypp_bound["outcome"]
+    assert bound["source_record"]["matched_npi"] == nypp_bound["source_record"]["matched_npi"]
+    original = nysed.read_acquisition(paired["nysed_destination"], receipt_sha256=paired["nysed_receipt_sha256"])
+    expected = copy.deepcopy(original["facts"])
+    for fact in expected:
+        fact["npi"] = bound["source_record"]["matched_npi"]
+    assert bound["facts"] == expected
+    assert bound["source_record"]["source_key"] == nysed.SOURCE_KEY
+
+
+@pytest.mark.parametrize("field", ["manifest_sha256", "acquisition_sha256", "nysed_receipt_sha256", "snapshot_sha256"])
+async def test_nysed_binding_requires_all_pins(paired_case, tmp_path, field):
+    arguments_by_field = {**paired_case, **_save_snapshot(tmp_path, _snapshot()), field: "0" * 64}
+    with pytest.raises(ValueError):
+        binding.bind_nysed_acquisition(**arguments_by_field)
+
+
+async def test_nysed_binding_rejects_no_profile(paired_case, monkeypatch, tmp_path):
+    session = NysedSession(NysedResponse(raw=b"", status=204))
+    monkeypatch.setattr(nysed_acquisition.aiohttp, "ClientSession", lambda **_options: session)
+    destination = tmp_path.resolve() / "no-profile"
+    acquired = await nysed_acquisition.acquire_license(
+        "654321", destination, run_id="synthetic-no-profile", api_key=PUBLIC_HEADER
+    )
+    held = nysed.read_held_acquisition(destination, receipt_sha256=acquired["receipt_sha256"])
+    assert held["outcome"] == "held" and held["source_record"] is None and held["facts"] == []
+    arguments_by_field = {
+        **paired_case,
+        **_save_snapshot(tmp_path, _snapshot()),
+        "nysed_destination": destination,
+        "nysed_receipt_sha256": acquired["receipt_sha256"],
+    }
+    with pytest.raises(ValueError, match="receipt_changed_or_failed"):
+        binding.bind_nysed_acquisition(**arguments_by_field)
+    assert nysed.read_held_acquisition(destination, receipt_sha256=acquired["receipt_sha256"]) == held
+
+
 @pytest.mark.parametrize(
     "middle,relationship",
     [
@@ -838,7 +949,7 @@ async def test_blank_middle_keeps_strict_default(source_session, monkeypatch, tm
     ]
 
 
-@pytest.fixture(params=["strict", "corroborated"])
+@pytest.fixture(params=["strict", "corroborated", "nysed"])
 async def indexed_case(request, source_session, monkeypatch, tmp_path, offline_binding):
     if request.param == "strict":
         paired = await _paired_case(
@@ -849,7 +960,8 @@ async def indexed_case(request, source_session, monkeypatch, tmp_path, offline_b
             search_names={"physicianFirstName": "Alex", "physicianLastName": "Example"},
         )
         return "bind_retained_acquisition", {key: item for key, item in paired.items() if not key.startswith("nysed_")}
-    return "bind_corroborated_acquisition", await _paired_case(source_session, monkeypatch, tmp_path)
+    method = "bind_nysed_acquisition" if request.param == "nysed" else "bind_corroborated_acquisition"
+    return method, await _paired_case(source_session, monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -921,16 +1033,17 @@ async def test_loaded_snapshot_revalidates_every_acquisition(indexed_case, tmp_p
 
 
 @pytest.mark.parametrize("artifact", ["manifest.json", "request.json", "response.json", "result.json"])
-async def test_loaded_snapshot_revalidates_nysed_evidence(paired_case, tmp_path, artifact):
+@pytest.mark.parametrize("method", ["bind_corroborated_acquisition", "bind_nysed_acquisition"])
+async def test_loaded_snapshot_revalidates_nysed_evidence(paired_case, tmp_path, artifact, method):
     saved = _save_snapshot(tmp_path, _snapshot())
     loaded = binding.RegistrySnapshot(saved["snapshot_path"], snapshot_sha256=saved["snapshot_sha256"])
-    assert loaded.bind_corroborated_acquisition(**paired_case)["outcome"] == "accepted"
+    assert getattr(loaded, method)(**paired_case)["outcome"] == "accepted"
     path = paired_case["nysed_destination"] / artifact
     changed_by_field = json.loads(path.read_bytes())
     changed_by_field["unexpected"] = True
     path.write_bytes(encoded_json(changed_by_field))
     with pytest.raises(ValueError):
-        loaded.bind_corroborated_acquisition(**paired_case)
+        getattr(loaded, method)(**paired_case)
 
 
 @pytest.mark.parametrize(

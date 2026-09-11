@@ -442,6 +442,31 @@ def bind_corroborated_acquisition(
     )
 
 
+def bind_nysed_acquisition(
+    destination: Path,
+    *,
+    manifest_sha256: str,
+    acquisition_sha256: str,
+    snapshot_path: Path,
+    snapshot_sha256: str,
+    nysed_destination: Path,
+    nysed_receipt_sha256: str,
+) -> dict:
+    """Bind NYSED's own facts through the same explicitly corroborated source pair.
+
+    Both sources must contain acquired profiles. A no-profile response remains
+    on its source's held replay path; this method cannot fabricate a record.
+    Binding does not establish independent NPI verification or publication.
+    """
+    return RegistrySnapshot(snapshot_path, snapshot_sha256=snapshot_sha256).bind_nysed_acquisition(
+        destination,
+        manifest_sha256=manifest_sha256,
+        acquisition_sha256=acquisition_sha256,
+        nysed_destination=nysed_destination,
+        nysed_receipt_sha256=nysed_receipt_sha256,
+    )
+
+
 @dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)
 class RegistrySnapshot:
     """Validate one pinned snapshot and retain every literal occurrence for reuse.
@@ -485,11 +510,49 @@ class RegistrySnapshot:
         nysed_receipt_sha256: str,
     ) -> dict:
         """Apply explicit corroboration with freshly validated NYPP and NYSED evidence."""
+        acquisition_by_field, _, binding_by_field = self._corroborated_pair(
+            destination, manifest_sha256, acquisition_sha256, nysed_destination, nysed_receipt_sha256
+        )
+        return _binding_result(
+            acquisition_by_field, binding_by_field, manifest_sha256, acquisition_sha256, self._snapshot_sha256
+        )
+
+    def _corroborated_pair(
+        self, destination, manifest_sha256, acquisition_sha256, nysed_destination, nysed_receipt_sha256
+    ):
         acquisition_by_field = _validated_acquisition(destination, manifest_sha256, acquisition_sha256)
         nysed_by_field = read_nysed_acquisition(nysed_destination, receipt_sha256=nysed_receipt_sha256)
         binding_by_field = _corroborated_registry_match(
             acquisition_by_field, nysed_by_field, self._candidates(acquisition_by_field)
         )
+        return acquisition_by_field, nysed_by_field, binding_by_field
+
+    def bind_nysed_acquisition(
+        self,
+        destination: Path,
+        *,
+        manifest_sha256: str,
+        acquisition_sha256: str,
+        nysed_destination: Path,
+        nysed_receipt_sha256: str,
+    ) -> dict:
+        """Return NYSED facts only after revalidating both captures and their identity proof."""
+        acquisition_by_field, nysed_by_field, binding_by_field = self._corroborated_pair(
+            destination, manifest_sha256, acquisition_sha256, nysed_destination, nysed_receipt_sha256
+        )
+        source_record = acquisition_by_field["source_record"]
+        binding_by_field.update(
+            bound_source_key=nysed_by_field["source_record"]["source_key"],
+            source_npi_source_key=source_record["source_key"],
+            nypp_corroboration={
+                **{
+                    field: source_record[field]
+                    for field in ("source_key", "record_id", "artifact_id", "license_number")
+                },
+                "quality_flags": source_record["normalized_payload"]["quality_flags"],
+                "license_search": source_record["match_evidence"]["license_search"],
+            },
+        )
         return _binding_result(
-            acquisition_by_field, binding_by_field, manifest_sha256, acquisition_sha256, self._snapshot_sha256
+            nysed_by_field, binding_by_field, manifest_sha256, acquisition_sha256, self._snapshot_sha256
         )
