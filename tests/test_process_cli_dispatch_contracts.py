@@ -249,7 +249,7 @@ async def test_hospital_price_worker_terminalizes_only_its_queued_run(
     flusher = AsyncMock()
     monkeypatch.setattr(process_cli, "mark_control_run", marker)
     monkeypatch.setattr(process_cli, "_flush_terminal_status_events", flusher)
-    task = {
+    task_by_field = {
         "run_id": " run-hospital ",
         "importer": "hospital-prices",
         "target_module": "asyncio",
@@ -258,7 +258,7 @@ async def test_hospital_price_worker_terminalizes_only_its_queued_run(
     }
 
     with pytest.raises(ValueError, match="HospitalPrices control target is not allowed"):
-        await process_cli._hospital_price_control_single_job_start({}, task)
+        await process_cli._hospital_price_control_single_job_start({}, task_by_field)
 
     marker.assert_awaited_once_with(
         "run-hospital",
@@ -269,8 +269,7 @@ async def test_hospital_price_worker_terminalizes_only_its_queued_run(
             "code": "control_target_rejected",
             "message": "HospitalPrices control target is not allowed",
         },
-        expected_importer="hospital-prices",
-        expected_status="queued",
+        expected_state=("hospital-prices", "queued"),
     )
     if is_marked:
         flusher.assert_awaited_once_with("run-hospital")

@@ -394,8 +394,7 @@ async def test_mark_control_run_can_bind_preterminal_owner(monkeypatch):
         phase_detail="target rejected",
         progress_message="failed",
         error={"code": "control_target_rejected"},
-        expected_importer="hospital-prices",
-        expected_status="queued",
+        expected_state=("hospital-prices", "queued"),
     )
 
     statement = db_updates[0]

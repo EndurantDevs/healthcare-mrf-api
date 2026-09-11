@@ -206,8 +206,7 @@ async def _hospital_price_control_single_job_start(ctx, task=None, **arq_metadat
                     "code": "control_target_rejected",
                     "message": "HospitalPrices control target is not allowed",
                 },
-                expected_importer="hospital-prices",
-                expected_status="queued",
+                expected_state=("hospital-prices", "queued"),
             )
             if is_marked:
                 await _flush_terminal_status_events(run_id)
