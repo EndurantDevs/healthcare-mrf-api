@@ -85,6 +85,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:FloridaMQAProfile", "process.FloridaMQAProfile", ("florida-mqa-profile",)),
     WorkerSpec("arq:MassachusettsBORIMProfile", "process.MassachusettsBORIMProfile", ("massachusetts-borim-profile",)),
     WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",)),
+    WorkerSpec("arq:TennesseeTDHProfile", "process.TennesseeTDHProfile", ("tennessee-tdh-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),
     WorkerSpec("arq:PlacesZcta", "process.PlacesZcta", ("places-zcta",)),
@@ -1143,28 +1144,31 @@ def _worker_job_pod_security_context(
     return security_context_dict
 
 
-def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    profile = _worker_job_resource_profile(spec, payload or {})
+def _worker_job_resources(spec: WorkerSpec, payload_by_field: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = _worker_job_resource_profile(spec, payload_by_field or {})
     if profile:
         return profile
+    if spec.worker_class == "process.TennesseeTDHProfile":
+        return {"requests": {"cpu": "1", "memory": "4Gi"},
+                "limits": {"cpu": "4", "memory": "8Gi"}}
     if spec.worker_class in {"process.MassachusettsBORIMProfile", "process.KentuckyKBMLProfile"}:
         return {"requests": {"cpu": "500m", "memory": "512Mi"},
                 "limits": {"cpu": "4", "memory": "4Gi"}}
     requests_dict = {
-        key: value
-        for key, value in {
+        key: resource_value
+        for key, resource_value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_REQUEST", "").strip(),
             "memory": os.getenv("HLTHPRT_WORKER_JOB_MEMORY_REQUEST", "").strip(),
         }.items()
-        if value
+        if resource_value
     }
     limits_dict = {
-        key: value
-        for key, value in {
+        key: resource_value
+        for key, resource_value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_LIMIT", "").strip(),
             "memory": os.getenv("HLTHPRT_WORKER_JOB_MEMORY_LIMIT", "").strip(),
         }.items()
-        if value
+        if resource_value
     }
     resource_dict: dict[str, Any] = {}
     if requests_dict:
