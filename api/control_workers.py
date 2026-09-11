@@ -918,6 +918,13 @@ def _worker_job_container(
                 "value": "68719476736",
             }
         )
+    if spec.worker_class == "process.HospitalPrices":
+        env_list.append(
+            {
+                "name": "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+                "value": "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net",
+            }
+        )
     env_list.extend(_worker_job_secret_env(spec.worker_class))
 
     container_dict: dict[str, Any] = {
