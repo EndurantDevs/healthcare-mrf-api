@@ -371,8 +371,8 @@ async def test_retention_keeps_corrupt_payload_but_accepts_already_pruned_audit(
 
 
 async def test_retention_checks_pruned_and_intact_runs(monkeypatch):
-    pruned = {**_counts(), "retained_source_records": 0, "retained_facts": 0, "retained_artifacts": 0}
-    probe = AsyncMock(side_effect=[pruned, _counts()])
+    pruned_count_map = {**_counts(), "retained_source_records": 0, "retained_facts": 0, "retained_artifacts": 0}
+    probe = AsyncMock(side_effect=[pruned_count_map, _counts()])
     monkeypatch.setattr(tennessee.TennesseeProfileStore, "retained_counts", probe)
 
     await tennessee.store._assert_source_ownership(["1" * 64, "2" * 64])
