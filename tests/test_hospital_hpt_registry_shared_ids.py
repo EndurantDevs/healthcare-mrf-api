@@ -126,6 +126,67 @@ def test_rice_legal_name_alias_preserves_ids_and_locator_closure():
         assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
+def test_silver_lake_alias_and_facility_selectors_preserve_boundaries():
+    """Collapse the duplicate LTACH ID without merging its psychiatric unit."""
+    locator_url = "https://www.silverlakehospital.org/cms-hpt.txt"
+    ltach_url = (
+        "https://www.silverlakehospital.org/price-transparency/"
+        "272315199-1104144641_silver-lake-hospital_standardcharges.csv"
+    )
+    dual_diagnosis_url = (
+        "https://www.silverlakehospital.org/price-transparency/"
+        "272315199-1376294207_silver-lake-hospital_standardcharges.csv"
+    )
+    cohort = tuple(
+        hospital
+        for hospital in registry.load_hospital_hpt_registry()
+        if hospital["cms_hpt_url"] == locator_url
+    )
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in cohort}
+    assert set(hospital_by_id) == {
+        "hospital-003648",
+        "hospital-005795",
+        "hospital-007366",
+    }
+    assert hospital_by_id["hospital-003648"]["alias_of"] == "hospital-005795"
+    assert hospital_by_id["hospital-003648"]["locator_mrf_url"] == ltach_url
+    assert hospital_by_id["hospital-005795"]["locator_mrf_url"] == ltach_url
+    assert hospital_by_id["hospital-007366"]["locator_mrf_url"] == dual_diagnosis_url
+    assert registry.hospital_hpt_group_ids("hospital-003648") == (
+        "hospital-005795",
+        "hospital-003648",
+    )
+    assert registry.hospital_hpt_group_ids("hospital-005795") == (
+        "hospital-005795",
+        "hospital-003648",
+    )
+    assert registry.hospital_hpt_group_ids("hospital-007366") == ("hospital-007366",)
+
+    records = (
+        locator.HospitalHptLocatorRecord("Silver Lake Hospital LTACH", ltach_url),
+        locator.HospitalHptLocatorRecord("Silver Lake Hospital Dual Diagnosis", dual_diagnosis_url),
+    )
+    match = locator.match_hospital_hpt_locator(cohort, locator_url, records)
+    assert [(binding.hospital_id, binding.record_index) for binding in match.bindings] == [
+        ("hospital-003648", 0),
+        ("hospital-005795", 0),
+        ("hospital-007366", 1),
+    ]
+    assert match.content_targets == (ltach_url, dual_diagnosis_url)
+    assert not match.unmatched_hospital_ids
+    assert not match.ambiguous_hospital_ids
+    assert not match.unmatched_record_indexes
+    assert not match.ambiguous_record_indexes
+
+    assert {
+        hospital["hospital_id"]
+        for hospital in registry.selected_hospital_hpt_registry({"hospital_id": "hospital-005795"})
+    } == {"hospital-003648", "hospital-005795"}
+    assert registry.selected_hospital_hpt_registry({"hospital_id": "hospital-007366"}) == (
+        hospital_by_id["hospital-007366"],
+    )
+
+
 def test_ohio_valley_alias_preserves_ids_and_locator_closure():
     """Group the reviewed Ohio identity without merging neighboring hospitals."""
     group = ("hospital-004819", "hospital-004818")
