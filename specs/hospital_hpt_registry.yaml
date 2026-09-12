@@ -18320,7 +18320,8 @@ hospitals:
 - hospital_id: hospital-005482
   name: Rockville General
   cms_hpt_url: https://echn.org/cms-hpt.txt
-  locator_name: MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL
+  locator_name: Rockville General
+  fallback_mrf_url: https://hartfordhealthcare.org/file%20library/price%20data/393859332_manchester-memorial-hospital_standardcharges.csv
 - hospital_id: hospital-005483
   name: ROCKY MTN HOSP FOR CHILDREN
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
