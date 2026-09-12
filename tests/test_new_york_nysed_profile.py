@@ -387,6 +387,24 @@ async def test_unreported_education_acquisition_and_replay(source_session, missi
     assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
 
 
+@pytest.mark.parametrize("field", ["address", "additionalQualifications"])
+@pytest.mark.parametrize("missing", [False, True])
+async def test_unreported_descriptive_metadata_preserves_facts_and_replay(source_session, field, missing):
+    source = _profile_body(**{field: None})
+    if missing:
+        del source[field]
+    session = source_session(SourceResponse(source))
+    acquired = await _acquire(session)
+    _, expected_facts = _parse(_profile_body())
+    assert len(session.requests) == 1 and session.closed
+    assert acquired["outcome"] == "acquired"
+    assert acquired["source_record"]["raw_payload"] == source
+    assert [fact["value_json"] for fact in acquired["facts"]] == [fact["value_json"] for fact in expected_facts]
+    assert [fact["category"] for fact in acquired["facts"]] == ["education", "licenses"]
+    assert profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
+    assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
+
+
 @pytest.mark.parametrize(
     "response",
     [

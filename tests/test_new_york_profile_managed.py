@@ -200,12 +200,15 @@ async def test_full_mixed_cohort_preserves_sources_holds_and_support(managed_cas
         ("OTHER ALEX", None, "nysed_identity_conflict"),
     ],
 )
-async def test_unreported_support_education_preserves_identity_guards(
-    managed_case, legal_name, expected_npi, expected_reason
+@pytest.mark.parametrize("optional_metadata", [None, "address", "additionalQualifications"])
+async def test_unreported_support_fields_preserve_identity_guards(
+    managed_case, legal_name, expected_npi, expected_reason, optional_metadata
 ):
     state = managed_case([{"license": "111111"}])
     profile_by_field = _profile_body("111111", name=legal_name, schoolName=None)
     del profile_by_field["schoolDegreeDate"]
+    if optional_metadata is not None:
+        profile_by_field[optional_metadata]["value"] = None
     state.sessions[1].response = NysedResponse(profile_by_field)
 
     metrics_by_field = await worker.import_profiles({}, TASK)

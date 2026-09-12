@@ -37,7 +37,13 @@ TEXT_LABELS = {
     "licenseNumber": "License Number",
 }
 EDUCATION_FIELDS = ("schoolName", "schoolDegreeDate")
-OPTIONAL_TEXT_FIELDS = (*EDUCATION_FIELDS, "dateOfLicensure", "registeredThroughDate")
+OPTIONAL_TEXT_FIELDS = (
+    *EDUCATION_FIELDS,
+    "dateOfLicensure",
+    "registeredThroughDate",
+    "address",
+    "additionalQualifications",
+)
 UNREPORTED = {"", "none", "n/a", "unknown", "not reported", "not available", "not applicable"}
 MONTHS = (
     "January",
