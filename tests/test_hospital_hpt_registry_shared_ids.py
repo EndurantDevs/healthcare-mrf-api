@@ -49,6 +49,15 @@ AVERA_LOCATION_NAMES = (
     "St. Michael's Hospital Avera",
     "Wagner Community Memorial Hospital Avera",
 )
+SILVER_LAKE_LOCATOR = "https://www.silverlakehospital.org/cms-hpt.txt"
+SILVER_LAKE_LTACH_MRF = (
+    "https://www.silverlakehospital.org/price-transparency/"
+    "272315199-1104144641_silver-lake-hospital_standardcharges.csv"
+)
+SILVER_LAKE_DUAL_DIAGNOSIS_MRF = (
+    "https://www.silverlakehospital.org/price-transparency/"
+    "272315199-1376294207_silver-lake-hospital_standardcharges.csv"
+)
 
 
 def test_shared_ids_expand_as_one_canonical_group(tmp_path, monkeypatch):
@@ -126,30 +135,23 @@ def test_rice_legal_name_alias_preserves_ids_and_locator_closure():
         assert registry.hospital_hpt_group_ids(hospital_id) == (hospital_id,)
 
 
-def test_silver_lake_alias_and_facility_selectors_preserve_boundaries():
+def test_silver_lake_alias_preserves_facility_boundaries():
     """Collapse the duplicate LTACH ID without merging its psychiatric unit."""
-    locator_url = "https://www.silverlakehospital.org/cms-hpt.txt"
-    ltach_url = (
-        "https://www.silverlakehospital.org/price-transparency/"
-        "272315199-1104144641_silver-lake-hospital_standardcharges.csv"
-    )
-    dual_diagnosis_url = (
-        "https://www.silverlakehospital.org/price-transparency/"
-        "272315199-1376294207_silver-lake-hospital_standardcharges.csv"
-    )
-    cohort = tuple(
+    cohort_hospitals = tuple(
         hospital
         for hospital in registry.load_hospital_hpt_registry()
-        if hospital["cms_hpt_url"] == locator_url
+        if hospital["cms_hpt_url"] == SILVER_LAKE_LOCATOR
     )
-    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in cohort}
+    hospital_by_id = {
+        hospital["hospital_id"]: hospital for hospital in cohort_hospitals
+    }
     assert set(hospital_by_id) == {
         "hospital-003648",
         "hospital-005795",
         "hospital-007366",
     }
     assert hospital_by_id["hospital-003648"]["alias_of"] == "hospital-005795"
-    assert all("locator_mrf_url" not in hospital for hospital in cohort)
+    assert all("locator_mrf_url" not in hospital for hospital in cohort_hospitals)
     assert registry.hospital_hpt_group_ids("hospital-003648") == (
         "hospital-005795",
         "hospital-003648",
@@ -160,29 +162,49 @@ def test_silver_lake_alias_and_facility_selectors_preserve_boundaries():
     )
     assert registry.hospital_hpt_group_ids("hospital-007366") == ("hospital-007366",)
 
-    records = (
-        locator.HospitalHptLocatorRecord("Silver Lake Hospital LTACH", ltach_url),
-        locator.HospitalHptLocatorRecord("Silver Lake Hospital Dual Diagnosis", dual_diagnosis_url),
+    assert {
+        hospital["hospital_id"]
+        for hospital in registry.selected_hospital_hpt_registry(
+            {"hospital_id": "hospital-005795"}
+        )
+    } == {"hospital-003648", "hospital-005795"}
+    assert registry.selected_hospital_hpt_registry(
+        {"hospital_id": "hospital-007366"}
+    ) == (hospital_by_id["hospital-007366"],)
+
+
+def test_silver_lake_locator_closes_both_facility_records():
+    """Match each publisher record without relying on a pinned file URL."""
+    cohort_hospitals = tuple(
+        hospital
+        for hospital in registry.load_hospital_hpt_registry()
+        if hospital["cms_hpt_url"] == SILVER_LAKE_LOCATOR
     )
-    match = locator.match_hospital_hpt_locator(cohort, locator_url, records)
+
+    locator_records = (
+        locator.HospitalHptLocatorRecord(
+            "Silver Lake Hospital LTACH", SILVER_LAKE_LTACH_MRF
+        ),
+        locator.HospitalHptLocatorRecord(
+            "Silver Lake Hospital Dual Diagnosis", SILVER_LAKE_DUAL_DIAGNOSIS_MRF
+        ),
+    )
+    match = locator.match_hospital_hpt_locator(
+        cohort_hospitals, SILVER_LAKE_LOCATOR, locator_records
+    )
     assert [(binding.hospital_id, binding.record_index) for binding in match.bindings] == [
         ("hospital-003648", 0),
         ("hospital-005795", 0),
         ("hospital-007366", 1),
     ]
-    assert match.content_targets == (ltach_url, dual_diagnosis_url)
+    assert match.content_targets == (
+        SILVER_LAKE_LTACH_MRF,
+        SILVER_LAKE_DUAL_DIAGNOSIS_MRF,
+    )
     assert not match.unmatched_hospital_ids
     assert not match.ambiguous_hospital_ids
     assert not match.unmatched_record_indexes
     assert not match.ambiguous_record_indexes
-
-    assert {
-        hospital["hospital_id"]
-        for hospital in registry.selected_hospital_hpt_registry({"hospital_id": "hospital-005795"})
-    } == {"hospital-003648", "hospital-005795"}
-    assert registry.selected_hospital_hpt_registry({"hospital_id": "hospital-007366"}) == (
-        hospital_by_id["hospital-007366"],
-    )
 
 
 def test_ohio_valley_alias_preserves_ids_and_locator_closure():
