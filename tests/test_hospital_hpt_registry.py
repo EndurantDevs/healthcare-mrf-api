@@ -96,7 +96,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_899
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_718
+    assert sum("locator_name" in entry for entry in hospitals) == 1_710
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 150
     assert "alias_of" not in hospital_by_id["hospital-001271"]
@@ -197,6 +197,49 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     )
     assert candidate.locator_url == hospital["cms_hpt_url"]
     assert candidate.observation_id == "synthetic-observation"
+
+
+def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
+    """Bind each shared-file facility to its own published location."""
+    name_by_hospital_id = {
+        "hospital-005748": "Sheltering Arms Institute",
+        "hospital-005526": "SAI OP",
+        "hospital-002523": "HANOVER SAI OP",
+        "hospital-000932": "BON AIR SAI OP",
+        "hospital-005391": "REYNOLDS SAI OP",
+        "hospital-003424": "LABURNUM SAI OP",
+        "hospital-004255": "MIDTOWN SAI OP",
+        "hospital-001217": "CHESTER SAI OP",
+        "hospital-003083": "HULL STREET SAI OP",
+    }
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(name_by_hospital_id)}
+    )
+    assert {
+        hospital["hospital_id"]: hospital["name"] for hospital in hospitals
+    } == name_by_hospital_id
+    assert all("locator_name" not in hospital for hospital in hospitals)
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        "https://shelteringarmsinstitute.com/cms-hpt.txt",
+        "synthetic-locator",
+        "synthetic-observation",
+        hospitals,
+        (HospitalHptLocatorRecord(
+            "Sheltering Arms Institute", "https://files.example/previous.csv"
+        ),),
+    ),))
+    assert all(
+        candidate.initial_error_code is None
+        and candidate.locator_name == name_by_hospital_id[candidate.hospital_id]
+        for candidate in candidates
+    )
+    store, _native = store_module()
+    locations = tuple(enumerate(name_by_hospital_id.values()))
+    assert store._location_ordinals(candidates, locations) == {
+        hospital_id: ordinal
+        for ordinal, hospital_id in enumerate(name_by_hospital_id)
+    }
 
 
 @pytest.mark.parametrize("hospital_id,name,locator_url,location_names,ordinal", (
