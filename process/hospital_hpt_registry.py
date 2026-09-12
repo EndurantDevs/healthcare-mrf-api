@@ -18,9 +18,9 @@ from process.hospital_hpt_locator import hospital_mrf_selector
 HOSPITAL_HPT_REGISTRY_PATH = (
     Path(__file__).resolve().parents[1] / "specs/hospital_hpt_registry.yaml"
 )
-EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_365
+EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_366
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "a8c3755c7d756522fc96487eb9a2499790e12a9e70a567ca6e1e3c5ef7f6d390"
+    "b6634a415c224e291971b05f1734836199eae9c4a9c065120d704d0066c2f430"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})

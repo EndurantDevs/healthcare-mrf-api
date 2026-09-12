@@ -12213,6 +12213,7 @@ hospitals:
 - hospital_id: hospital-003648
   name: LTACH
   cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
+  alias_of: hospital-005795
   locator_name: Silver Lake Hospital LTACH
 - hospital_id: hospital-003649
   name: Lubbock Heart & Surgical Hospital
@@ -24621,3 +24622,6 @@ hospitals:
 - hospital_id: hospital-007365
   name: "Hale County Hospital"
   cms_hpt_url: https://www.halecountyhospital.com/cms-hpt.txt
+- hospital_id: hospital-007366
+  name: "Silver Lake Hospital Dual Diagnosis"
+  cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
