@@ -29,6 +29,8 @@ COVERAGE_SCOPE = "nppes_ky_alphanumeric_physician_license_cohort"
 MAX_PROFILE_BYTES = MAX_HTML_BYTES
 MAX_ACQUISITION_BYTES = 1_000_000_000
 REQUEST_INTERVAL_SECONDS = 2.0
+HTTP_ATTEMPTS = 3
+RETRYABLE_HTTP_STATUSES = {500, 502, 503, 504}
 MAX_NARROWED_QUERIES = 32
 LICENSE_PATTERN = re.compile(r"(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{1,32}", flags=re.ASCII)
 
@@ -44,6 +46,14 @@ def source_url(license_number: str, *, last_name: str = "") -> str:
     return LOOKUP_URL + "?" + urlencode({
         "AGY": "5", "FLD1": last_name, "FLD2": license_number, "FLD3": "0", "FLD4": "0", "TYPE": "",
     })
+
+
+class ProfileHTTPStatusError(ValueError):
+    """A received HTTP status, distinct from uncertain transport failures."""
+
+    def __init__(self, status):
+        super().__init__(f"kentucky_profile_http_failure:{status}")
+        self.status = status
 
 
 class ProfileResponseTooLarge(ValueError):
@@ -224,7 +234,7 @@ async def fetch_profile(session, license_number: str, *, last_name: str = "") ->
     url = source_url(license_number, last_name=last_name)
     async with session.get(url, allow_redirects=False) as response:
         if response.status != 200:
-            raise ValueError(f"kentucky_profile_http_failure:{response.status}")
+            raise ProfileHTTPStatusError(response.status)
         content_type = response.headers.get("Content-Type")
         if str(content_type or "").split(";", 1)[0].strip().lower() != "text/html":
             raise ValueError("kentucky_profile_content_type_invalid")
@@ -297,7 +307,7 @@ async def _validate_retained_roots(roots, retained, progress):
         return
     for index, root in enumerate(roots):
         await asyncio.sleep(0)
-        await progress(index, len(roots))
+        await progress(index, len(roots), phase="checking_retained")
         path = retained / f"{root['license_number']}.json"
         partial = retained / f"{root['license_number']}.narrowed"
         if path.exists() or path.is_symlink():
@@ -305,6 +315,7 @@ async def _validate_retained_roots(roots, retained, progress):
         elif partial.exists() or partial.is_symlink():
             _reject_symlinks(partial)
             raise ValueError("kentucky_profile_narrowed_checkpoint_incomplete")
+    await progress(len(roots), len(roots), phase="checking_retained")
 
 
 async def _checkpoint_query(root, query, directory, fetch, account):
@@ -384,12 +395,17 @@ async def acquire_profiles(roots: list[dict], destination: Path, progress, *, re
             raise ValueError("kentucky_profile_retry_control_unavailable")
         session._retry_connection = False
         async def fetch(license_number, last_name=""):
-            """Honor cancellation and spacing before each distinct source query."""
-            await progress(index - 1, len(licenses))
-            elapsed = asyncio.get_running_loop().time() - state_by_field["last_request_started"]
-            await asyncio.sleep(max(0.0, REQUEST_INTERVAL_SECONDS - elapsed))
-            state_by_field["last_request_started"] = asyncio.get_running_loop().time()
-            return await fetch_profile(session, license_number, **({"last_name": last_name} if last_name else {}))
+            """Retry only transient statuses, checking cancellation and spacing each time."""
+            for attempt in range(HTTP_ATTEMPTS):
+                elapsed = asyncio.get_running_loop().time() - state_by_field["last_request_started"]
+                await asyncio.sleep(max(0.0, REQUEST_INTERVAL_SECONDS - elapsed))
+                await progress(index - 1, len(licenses))
+                state_by_field["last_request_started"] = asyncio.get_running_loop().time()
+                try:
+                    return await fetch_profile(session, license_number, **({"last_name": last_name} if last_name else {}))
+                except ProfileHTTPStatusError as error:
+                    if error.status not in RETRYABLE_HTTP_STATUSES or attempt + 1 == HTTP_ATTEMPTS:
+                        raise
 
         for index, root in enumerate(roots, 1):
             await progress(index - 1, len(licenses))
