@@ -12420,6 +12420,7 @@ hospitals:
 - hospital_id: hospital-003709
   name: MANCHESTER MEMORIAL HOSPITAL
   cms_hpt_url: https://echn.org/cms-hpt.txt
+  fallback_mrf_url: https://hartfordhealthcare.org/file%20library/price%20data/393859332_manchester-memorial-hospital_standardcharges.csv
 - hospital_id: hospital-003710
   name: MANGUM CITY HOSPITAL AUTHORITY
   cms_hpt_url: https://mangumregional.net/cms-hpt.txt
