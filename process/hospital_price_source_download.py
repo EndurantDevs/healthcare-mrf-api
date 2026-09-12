@@ -20,7 +20,7 @@ _RUNTIME_USER_AGENT = "Python/3.12 aiohttp/3.11"
 _AVERA_BROWSER_PROFILE = "chrome136"
 _HOSPITAL_PROXY_ENV = "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY"
 _PROXY_HOSTS_ENV = "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS"
-_PROXY_MAX_BYTES = 512 * 1024**2
+_PROXY_SINGLE_GET_MAX_BYTES = 512 * 1024**2
 
 
 def _browser_profile(url: str) -> str | None:
@@ -139,16 +139,16 @@ async def download_hospital_source(
         if not proxy_url or not _is_proxyable_failure(exc):
             raise
         direct_error = exc
-    # ponytail: proxy transfers restart; raise this cap after range resume exists.
     try:
         return await download_raw_artifact_via_proxy(
             url,
             proxy_url=proxy_url,
             store=store,
-            max_bytes=min(max_bytes, _PROXY_MAX_BYTES),
+            max_bytes=max_bytes,
             exact_get_evidence=exact_get_evidence,
             user_agent=None if browser_profile else user_agent,
             browser_profile=browser_profile,
+            single_get_max_bytes=min(max_bytes, _PROXY_SINGLE_GET_MAX_BYTES),
         )
     except (ImportCancelledError, asyncio.CancelledError):
         raise

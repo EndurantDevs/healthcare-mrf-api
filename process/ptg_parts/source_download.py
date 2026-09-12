@@ -352,6 +352,7 @@ def _validate_range_response(
     expected_end: int,
     expected_total: int,
     expected_etag: str,
+    require_response_etag: bool = False,
 ) -> None:
     if response.status != 206:
         raise _UnsafeRangeResponseError(
@@ -365,7 +366,12 @@ def _validate_range_response(
         expected_total=expected_total,
     )
     response_etag = response.headers.get("ETag")
-    if response_etag and response_etag != expected_etag:
+    etag_mismatch = (
+        response_etag != expected_etag
+        if require_response_etag
+        else bool(response_etag and response_etag != expected_etag)
+    )
+    if etag_mismatch:
         raise _UnsafeRangeResponseError(
             f"Range download for {url} changed ETag from {expected_etag!r} to {response_etag!r}"
         )
@@ -515,6 +521,9 @@ async def _open_validated_request(
     session: aiohttp.ClientSession,
     method: str,
     url: str,
+    *,
+    validated_redirects: bool = True,
+    force_tls_verification: bool = False,
     **kwargs,
 ) -> aiohttp.ClientResponse:
     current_url = str(url)
@@ -523,7 +532,10 @@ async def _open_validated_request(
     for _ in range(_MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
         request_options_map = dict(kwargs)
-        request_options_map.update(_request_ssl_kwargs(current_url))
+        if force_tls_verification:
+            request_options_map["ssl"] = True
+        else:
+            request_options_map.update(_request_ssl_kwargs(current_url))
         response = await session.request(
             current_method,
             URL(current_url, encoded=True)
@@ -532,7 +544,7 @@ async def _open_validated_request(
             allow_redirects=False,
             **request_options_map,
         )
-        if response.status not in _REDIRECT_STATUSES:
+        if response.status not in _REDIRECT_STATUSES or not validated_redirects:
             await assert_safe_url(str(response.url))
             return response
         location = response.headers.get("Location")
@@ -826,7 +838,10 @@ async def _probe_http_range_support(
     url: str,
     etag: str | None = None,
     user_agent: str | None = None,
+    proxy_url: str | None = None,
 ) -> tuple[bool, int | None, str | None, str | None]:
+    if proxy_url is not None and urlsplit(url).scheme != "https":
+        raise UnsafeUrlError("proxied range transport requires HTTPS")
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
     validator = etag if _is_strong_etag(etag) else None
@@ -834,9 +849,23 @@ async def _probe_http_range_support(
     if validator:
         headers_by_name["If-Match"] = validator
     try:
-        async with _download_session(timeout, user_agent) as session:
-            async with _validated_request(session, "GET", url, headers=headers_by_name) as response:
+        async with _download_session_for_transport(
+            timeout, user_agent, proxy_url
+        ) as session:
+            async with _validated_request(
+                session,
+                "GET",
+                url,
+                headers=headers_by_name,
+                validated_redirects=proxy_url is None,
+                force_tls_verification=proxy_url is not None,
+                **_proxy_request_kwargs(proxy_url),
+            ) as response:
                 if response.status != 206:
+                    return False, None, None, None
+                if not _is_identity_content_encoding(
+                    response.headers.get("Content-Encoding")
+                ):
                     return False, None, None, None
                 content_range = response.headers.get("Content-Range") or ""
                 match = _CONTENT_RANGE_PATTERN.fullmatch(content_range.strip())
@@ -845,7 +874,11 @@ async def _probe_http_range_support(
                 range_start = int(match.group(1))
                 range_end = int(match.group(2))
                 range_total = int(match.group(3))
-                if (range_start, range_end) != (0, 0) or len(await response.content.read()) != 1:
+                probe_size = await _range_probe_size(
+                    response,
+                    bounded=proxy_url is not None,
+                )
+                if (range_start, range_end) != (0, 0) or probe_size != 1:
                     return False, None, None, None
                 response_etag = response.headers.get("ETag")
                 if validator and response_etag and response_etag != validator:
@@ -854,6 +887,22 @@ async def _probe_http_range_support(
                 return True, range_total, strong_validator, str(response.url)
     except Exception:
         return False, None, None, None
+
+
+async def _range_probe_size(
+    response: aiohttp.ClientResponse,
+    *,
+    bounded: bool,
+) -> int:
+    """Return the probe body size without draining an untrusted proxy response."""
+    if not bounded:
+        return len(await response.content.read())
+    byte_count = 0
+    async for chunk in response.content.iter_chunked(2):
+        byte_count += len(chunk)
+        if byte_count > 1:
+            break
+    return byte_count
 
 
 @dataclass
@@ -874,6 +923,7 @@ class _RangeDownloadContext:
     progress: RangeDownloadProgress
     lock: asyncio.Lock
     semaphore: asyncio.Semaphore
+    response_body_started: bool = False
 
     async def _record_chunk(self, chunk_bytes: int) -> None:
         async with self.lock:
@@ -934,6 +984,7 @@ class _RangeDownloadContext:
         response: aiohttp.ClientResponse,
         *,
         start: int,
+        end: int,
         transfer: _RangeTransfer,
     ) -> None:
         offset = start
@@ -942,6 +993,12 @@ class _RangeDownloadContext:
             async for chunk in response.content.iter_chunked(1024 * 1024):
                 if not chunk:
                     continue
+                self.response_body_started = True
+                if offset + len(chunk) - 1 > end:
+                    raise _UnsafeRangeResponseError(
+                        f"Range download for {self.url} exceeded bytes "
+                        f"{start}-{end}"
+                    )
                 os.pwrite(descriptor, chunk, offset)
                 offset += len(chunk)
                 transfer.received_bytes += len(chunk)
@@ -954,6 +1011,9 @@ class _RangeDownloadContext:
         self,
         session: aiohttp.ClientSession,
         byte_range: tuple[int, int],
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        require_response_etag: bool = False,
     ) -> None:
         start, end = byte_range
         headers_by_name = {
@@ -968,7 +1028,14 @@ class _RangeDownloadContext:
                 "GET",
                 self.url,
                 headers=headers_by_name,
+                **dict(request_options or {}),
             ) as response:
+                if require_response_etag and not _is_identity_content_encoding(
+                    response.headers.get("Content-Encoding")
+                ):
+                    raise _UnsafeRangeResponseError(
+                        f"Range download for {self.url} returned encoded content"
+                    )
                 _validate_range_response(
                     response,
                     url=self.url,
@@ -976,10 +1043,12 @@ class _RangeDownloadContext:
                     expected_end=end,
                     expected_total=self.total_bytes,
                     expected_etag=self.etag,
+                    require_response_etag=require_response_etag,
                 )
                 await self._stream_response(
                     response,
                     start=start,
+                    end=end,
                     transfer=transfer,
                 )
                 expected_length = end - start + 1
@@ -999,12 +1068,20 @@ class _RangeDownloadContext:
         self,
         session: aiohttp.ClientSession,
         byte_range: tuple[int, int],
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        require_response_etag: bool = False,
     ) -> None:
         async with self.semaphore:
             retries = _download_retry_count()
             for attempt in range(retries + 1):
                 try:
-                    await self._fetch_range(session, byte_range)
+                    await self._fetch_range(
+                        session,
+                        byte_range,
+                        request_options=request_options,
+                        require_response_etag=require_response_etag,
+                    )
                     return
                 except Exception as exc:
                     if attempt >= retries:
@@ -1085,21 +1162,36 @@ async def _run_range_download_tasks(
     context: _RangeDownloadContext,
     pending_ranges: list[tuple[int, int]],
     user_agent: str | None = None,
+    proxy_url: str | None = None,
 ) -> None:
+    if proxy_url is not None and urlsplit(context.url).scheme != "https":
+        raise UnsafeUrlError("proxied range transport requires HTTPS")
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-    async with _download_session(timeout, user_agent) as session:
+    request_options = _proxy_request_kwargs(proxy_url)
+    if proxy_url:
+        request_options["validated_redirects"] = False
+        request_options["force_tls_verification"] = True
+    async with _download_session_for_transport(
+        timeout, user_agent, proxy_url
+    ) as session:
         range_tasks = [
             asyncio.create_task(
-                context._bounded_fetch(session, byte_range)
+                context._bounded_fetch(
+                    session,
+                    byte_range,
+                    request_options=request_options,
+                    require_response_etag=proxy_url is not None,
+                )
             )
             for byte_range in pending_ranges
         ]
         try:
             await asyncio.gather(*range_tasks)
-        except BaseException:
+        except BaseException as exc:
             for range_task in range_tasks:
                 range_task.cancel()
             await asyncio.gather(*range_tasks, return_exceptions=True)
+            _ensure_download_body_marker(exc, int(context.response_body_started))
             raise
 
 
@@ -1112,6 +1204,7 @@ async def _download_raw_artifact_ranges(
     max_bytes: int | None,
     started_at: float,
     user_agent: str | None = None,
+    proxy_url: str | None = None,
 ) -> None:
     """Download a raw artifact through bounded byte ranges."""
 
@@ -1123,7 +1216,12 @@ async def _download_raw_artifact_ranges(
         max_bytes=max_bytes,
         started_at=started_at,
     )
-    await _run_range_download_tasks(context, pending_ranges, user_agent)
+    await _run_range_download_tasks(
+        context,
+        pending_ranges,
+        user_agent,
+        proxy_url,
+    )
     context.sidecar_path.unlink(missing_ok=True)
     _emit_download_progress(
         url=url,
@@ -1155,6 +1253,7 @@ class _DownloadTransport:
     user_agent: str | None = None
     browser_profile: str | None = None
     proxy_url: str | None = None
+    proxy_single_get_max_bytes: int | None = None
     retained_raw_pin: tuple[str, int] | None = None
 
 
@@ -1528,6 +1627,37 @@ def validated_http_proxy_url(value: str) -> str:
     return value
 
 
+def _proxy_request_kwargs(proxy_url: str | None) -> dict[str, Any]:
+    if proxy_url is None:
+        return {}
+    parsed = urlsplit(validated_http_proxy_url(proxy_url))
+    proxy_hostname = str(parsed.hostname)
+    if ":" in proxy_hostname:
+        proxy_hostname = f"[{proxy_hostname}]"
+    return {
+        "proxy": f"http://{proxy_hostname}:{parsed.port}",
+        "proxy_auth": aiohttp.BasicAuth(str(parsed.username), str(parsed.password)),
+    }
+
+
+def _download_session_for_transport(
+    timeout: aiohttp.ClientTimeout,
+    user_agent: str | None,
+    proxy_url: str | None,
+) -> aiohttp.ClientSession:
+    if proxy_url is None:
+        return _download_session(timeout, user_agent)
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        headers={
+            "Accept-Encoding": "identity",
+            "User-Agent": user_agent or _HTTP_USER_AGENT,
+        },
+        auto_decompress=False,
+        max_field_size=64 * 1024,
+    )
+
+
 def _is_browser_response_url_match(request_url: str, response_url: str) -> bool:
     requested = urlsplit(request_url)
     returned = urlsplit(response_url)
@@ -1809,6 +1939,7 @@ async def download_raw_artifact_via_proxy(
     exact_get_evidence: bool = False,
     user_agent: str | None = None,
     browser_profile: str | None = None,
+    single_get_max_bytes: int | None = None,
 ) -> PTG2RawArtifact:
     """Download one uncached artifact through an explicitly selected proxy."""
 
@@ -1824,6 +1955,7 @@ async def download_raw_artifact_via_proxy(
             user_agent=user_agent,
             browser_profile=browser_profile,
             proxy_url=proxy_url,
+            proxy_single_get_max_bytes=single_get_max_bytes,
         ),
     )
 
@@ -2083,6 +2215,46 @@ def _download_local_raw_artifact(
     )
 
 
+async def _probe_ranged_artifact_identity(
+    url: str,
+    *,
+    head: PTG2HeadMetadata,
+    exact_get_evidence: bool,
+    user_agent: str | None,
+    proxy_url: str | None = None,
+) -> tuple[int, str] | None:
+    """Return a validated range length and ETag when ranges are eligible."""
+    range_total = head.content_length
+    if (
+        exact_get_evidence
+        or not _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
+        or (
+            proxy_url is None
+            and (
+                not range_total
+                or range_total < _range_download_min_bytes()
+            )
+        )
+    ):
+        return None
+    head_etag = head.etag if _is_strong_etag(head.etag) else None
+    proxy_kwargs = {"proxy_url": proxy_url} if proxy_url else {}
+    range_supported, probed_total, probed_etag, _ = await _probe_http_range_support(
+        url,
+        head_etag,
+        **_user_agent_kwargs(user_agent),
+        **proxy_kwargs,
+    )
+    if (
+        not range_supported
+        or not probed_total
+        or probed_total < _range_download_min_bytes()
+        or not _is_strong_etag(probed_etag)
+    ):
+        return None
+    return probed_total, str(probed_etag)
+
+
 async def _try_ranged_raw_artifact(
     url: str,
     path: Path,
@@ -2092,33 +2264,42 @@ async def _try_ranged_raw_artifact(
     started_at: float,
     exact_get_evidence: bool,
     user_agent: str | None,
+    proxy_url: str | None = None,
 ) -> _SingleGetResult | None:
-    range_total = head.content_length
-    if (
-        exact_get_evidence
-        or not _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
-        or not range_total
-        or range_total < _range_download_min_bytes()
-    ):
-        return None
-    head_etag = head.etag if _is_strong_etag(head.etag) else None
-    range_supported, probed_total, probed_etag, _ = await _probe_http_range_support(
-        url, head_etag, **_user_agent_kwargs(user_agent),
+    """Download a range-capable artifact or defer to the full-GET path."""
+    probed_identity = await _probe_ranged_artifact_identity(
+        url,
+        head=head,
+        exact_get_evidence=exact_get_evidence,
+        user_agent=user_agent,
+        proxy_url=proxy_url,
     )
-    if not range_supported or not probed_total or not _is_strong_etag(probed_etag):
+    if probed_identity is None:
         return None
+    probed_total, probed_etag = probed_identity
     if max_bytes is not None and probed_total > max_bytes:
         raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
+    has_completed_range_download = False
+    proxy_kwargs = {"proxy_url": proxy_url} if proxy_url else {}
     try:
         await _download_raw_artifact_ranges(
             url=url, partial_path=path, total_bytes=probed_total,
             etag=probed_etag, max_bytes=max_bytes, started_at=started_at,
             **_user_agent_kwargs(user_agent),
+            **proxy_kwargs,
         )
+        has_completed_range_download = True
         _raise_for_unexpected_artifact_container(url, path)
     except UnsafeUrlError:
         raise
     except Exception as exc:
+        if proxy_url is not None:
+            _ensure_download_body_marker(
+                exc,
+                int(has_completed_range_download),
+            )
+            _reset_partial_download(path)
+            raise
         logger.warning(
             "Falling back to a full PTG2 download after unsafe or failed ranges for %s: %s",
             url,
@@ -2155,19 +2336,31 @@ async def _download_raw_to_path(
             url, path, head=head, max_bytes=max_bytes,
             started_at=started_at, digest=failure_digest,
         )
+    if not transport.browser_profile:
+        ranged = await _try_ranged_raw_artifact(
+            url,
+            path,
+            head=head,
+            max_bytes=max_bytes,
+            started_at=started_at,
+            exact_get_evidence=exact_get_evidence,
+            user_agent=transport.user_agent,
+            proxy_url=transport.proxy_url,
+        )
+        if ranged is not None:
+            return ranged
     if transport.browser_profile or transport.proxy_url:
+        single_get_max_bytes = max_bytes
+        if transport.proxy_single_get_max_bytes is not None:
+            single_get_max_bytes = transport.proxy_single_get_max_bytes
+            if max_bytes is not None:
+                single_get_max_bytes = min(single_get_max_bytes, max_bytes)
         return await _download_raw_artifact_browser(
-            url=url, path=path, head=head, max_bytes=max_bytes,
+            url=url, path=path, head=head, max_bytes=single_get_max_bytes,
             started_at=started_at, browser_profile=transport.browser_profile,
             proxy_url=transport.proxy_url,
             user_agent=transport.user_agent,
         )
-    ranged = await _try_ranged_raw_artifact(
-        url, path, head=head, max_bytes=max_bytes, started_at=started_at,
-        exact_get_evidence=exact_get_evidence, user_agent=transport.user_agent,
-    )
-    if ranged is not None:
-        return ranged
     return await _download_raw_artifact_single_get(
         url=url, path=path, head=head, max_bytes=max_bytes,
         started_at=started_at, allow_resume=not exact_get_evidence,
