@@ -3167,7 +3167,6 @@ hospitals:
 - hospital_id: hospital-000932
   name: BON AIR SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-000933
   name: Bon Secours Community Hospital
@@ -4122,7 +4121,6 @@ hospitals:
 - hospital_id: hospital-001217
   name: CHESTER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-001218
   name: Chestnut Hill Mental Health Center, Inc.
@@ -8456,7 +8454,6 @@ hospitals:
 - hospital_id: hospital-002523
   name: HANOVER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-002524
   name: Hansford County Hospital District
@@ -10361,7 +10358,6 @@ hospitals:
 - hospital_id: hospital-003083
   name: HULL STREET SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003084
   name: Humboldt County Memorial Hospital
@@ -11481,7 +11477,6 @@ hospitals:
 - hospital_id: hospital-003424
   name: LABURNUM SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003425
   name: Lackey Memorial Hospital
@@ -14256,7 +14251,6 @@ hospitals:
 - hospital_id: hospital-004255
   name: MIDTOWN SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-004256
   name: Midwest Medical Center
@@ -14805,6 +14799,7 @@ hospitals:
 - hospital_id: hospital-004418
   name: Mt Graham Regional Medical Center
   cms_hpt_url: https://www.mtgraham.org/cms-hpt.txt
+  alias_of: hospital-004360
 - hospital_id: hospital-004419
   name: Mt. Ascutney Hospital and Health Center
   cms_hpt_url: https://www.mtascutneyhospital.org/cms-hpt.txt
@@ -18023,7 +18018,6 @@ hospitals:
 - hospital_id: hospital-005391
   name: REYNOLDS SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005392
   name: Rhode Island Hospital
@@ -18326,7 +18320,8 @@ hospitals:
 - hospital_id: hospital-005482
   name: Rockville General
   cms_hpt_url: https://echn.org/cms-hpt.txt
-  locator_name: MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL
+  locator_name: Rockville General
+  fallback_mrf_url: https://hartfordhealthcare.org/file%20library/price%20data/393859332_manchester-memorial-hospital_standardcharges.csv
 - hospital_id: hospital-005483
   name: ROCKY MTN HOSP FOR CHILDREN
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
@@ -18471,7 +18466,6 @@ hospitals:
 - hospital_id: hospital-005526
   name: SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005527
   name: Saint Agnes Medical Center

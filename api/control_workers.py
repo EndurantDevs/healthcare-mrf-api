@@ -925,7 +925,7 @@ def _worker_job_environment(
         env_list.append(
             {
                 "name": "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
-                "value": "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net",
+                "value": "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,shelteringarmsinstitute.com",
             }
         )
     env_list.extend(_worker_job_secret_env(spec.worker_class))
