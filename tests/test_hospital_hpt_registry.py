@@ -53,6 +53,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
     "hospital-005086": "Philadelphia Post-Acute Partners LLC",
+    "hospital-005115": "Phoebe Putney",
     "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005482": "Rockville General",
@@ -96,7 +97,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 6_899
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_710
+    assert sum("locator_name" in entry for entry in hospitals) == 1_711
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 152
     assert "alias_of" not in hospital_by_id["hospital-001271"]
