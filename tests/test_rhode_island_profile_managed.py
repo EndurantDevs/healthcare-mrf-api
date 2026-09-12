@@ -338,6 +338,41 @@ async def test_roster_identity_change_refuses_retention(tmp_path, monkeypatch, s
         worker._retain_roster(record, cohort["roots"][0], artifact)
 
 
+@pytest.mark.parametrize(
+    ("field", "roster_name", "profile_name", "matches"),
+    [(field, "O\\'Example", "O'Example", True) for field in ("First", "Middle", "Last")]
+    + [
+        ("Last", "O\\'Example", "O\\'Example", True),
+        ("Last", "O\\\\'Example", "O\\\\'Example", True),
+        ("Last", "O\\'Example", "O'Other", False),
+        ("Last", "O\\'Example", "OExample", False),
+        ("Last", "O\\\\'Example", "O'Example", False),
+        ("Last", "O'Example", "O\\'Example", False),
+    ],
+)
+async def test_roster_apostrophe_escape_comparison_preserves_originals(
+    tmp_path, monkeypatch, synthetic_schema_fingerprint, field, roster_name, profile_name, matches
+):
+    cohort, profiles, metrics, artifact = await acquired(tmp_path, monkeypatch)
+    license_number, body, evidence = next(worker._profile_inputs(cohort, profiles, tmp_path, artifact))
+    record, _ = acquisition.parse_profile(body, license_number=license_number, evidence=evidence)
+    root = cohort["roots"][0]
+    root["originals"][0]["raw_payload"][field] = roster_name
+    record["raw_payload"]["values"][worker.PROFILE_FIELDS.index(field + "_Name")] = profile_name
+    original = copy.deepcopy(record)
+    originals = copy.deepcopy(root["originals"])
+    if matches:
+        worker._retain_roster(record, root, artifact)
+        assert record["raw_payload"]["roster_occurrences"] == originals
+    else:
+        with pytest.raises(ValueError, match="roster_identity_changed"):
+            worker._retain_roster(record, root, artifact)
+        assert record == original
+    assert root["originals"] == originals
+    assert record["raw_payload"]["values"] == original["raw_payload"]["values"]
+    assert record["matched_npi"] is None and record["match_evidence"] == original["match_evidence"]
+
+
 @pytest.mark.parametrize("failure", [ValueError("source_failed"), __import__("asyncio").CancelledError()])
 async def test_claim_precedes_http_and_failure_never_completes(tmp_path, monkeypatch, failure):
     monkeypatch.setenv("HLTHPRT_RI_DOH_ARTIFACT_ROOT", str(tmp_path))

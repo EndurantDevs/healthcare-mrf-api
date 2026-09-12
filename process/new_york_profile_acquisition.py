@@ -104,7 +104,10 @@ def _search_result(body):
     result_by_field = response_by_field["data"]
     _require(isinstance(result_by_field, dict) and type(result_by_field.get("pageNumber")) is int
              and result_by_field["pageNumber"] == 1 and type(result_by_field.get("numberOfResults")) is int
-             and result_by_field["numberOfResults"] >= 0 and isinstance(result_by_field.get("physicians"), list)
+             and result_by_field["numberOfResults"] >= 0 and "physicians" in result_by_field, "search_incomplete")
+    if result_by_field["numberOfResults"] == 0 and result_by_field["physicians"] is None:
+        return None, 0
+    _require(isinstance(result_by_field["physicians"], list)
              and len(result_by_field["physicians"]) == min(10, result_by_field["numberOfResults"]), "search_incomplete")
     if result_by_field["numberOfResults"] != 1:
         return None, result_by_field["numberOfResults"]

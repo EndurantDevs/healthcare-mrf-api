@@ -15,6 +15,7 @@ import pytest
 from process import new_york_profile as worker
 from process import new_york_profile_store as profile_store
 from process.control_cancel import ImportCancelledError
+from tests.test_live_progress import _merge_nested_profile_snapshots
 from tests.test_new_york_nysed_profile import (
     PUBLIC_HEADER,
     _profile_body,
@@ -135,7 +136,7 @@ def managed_case(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_NYPP_DEADLINE_SECONDS", "120")
     monkeypatch.setenv("HLTHPRT_NYPP_MAX_BUNDLE_BYTES", str(512 * 1024 * 1024))
     monkeypatch.setattr(worker, "ensure_tables", AsyncMock())
-    monkeypatch.setattr(worker, "_progress", lambda *args: None)
+    monkeypatch.setattr(worker, "enqueue_live_progress", lambda **kwargs: None)
     monkeypatch.setattr(worker.acquisition, "REQUEST_INTERVAL_SECONDS", 0)
     state = SimpleNamespace(claimed=False, failed=[], writes=[], published=None, cancel=False, run=None)
 
@@ -199,6 +200,43 @@ async def test_complete_cohort_is_not_limited_to_one_hundred(managed_case):
     assert result["responses"] == 102 and result["held_attempts"] == 101
     assert state.run["source_manifest"]["full_cohort_licenses"] == 102
     assert not state.pending
+
+
+async def test_null_empty_search_retains_hold_without_nysed_or_provider_rows(managed_case):
+    state = managed_case([{"license": "111111", "total": 0}, {"license": "222222", "nysed_held": True}])
+    response = _search(0)
+    response["data"]["physicians"] = None
+    state.sessions[0].responses[0] = SourceResponse(response)
+    result = await worker.import_profiles({}, TASK)
+    assert result["responses"] == 2 and result["held_attempts"] == result["acquired_profiles"] == 1
+    assert not state.pending and len(state.sessions[0].requests) == 1
+    assert not (state.directory / "nysed" / "111111").exists()
+    bundle = json.loads((state.directory / "manifest.json").read_bytes())
+    descriptor = bundle["profiles"]["111111"]
+    assert descriptor["acquisition_outcome"] == "held" and descriptor["reported_total"] == 0
+    assert descriptor["record_id"] is None and descriptor["facts"] == {}
+    assert set(bundle["acquisition"]["nysed_support"]) == {"222222"}
+    records = [row for model, rows, _ in state.writes if model == worker.ProviderProfileSourceRecord for row in rows]
+    assert len(records) == 1 and records[0]["license_number"] == "222222"
+    facts = [row for model, rows, _ in state.writes if model == worker.ProviderProfileFact for row in rows]
+    assert len(facts) == 1 and facts[0]["source_record_id"] == records[0]["record_id"]
+    captured = json.loads((state.directory / "profiles" / "111111" / "search.response.json").read_bytes())
+    assert captured["content_sha256"] == hashlib.sha256(worker.encoded_json(response)).hexdigest()
+
+
+async def test_first_search_failure_resets_registry_progress_to_unprocessed_licenses(managed_case, monkeypatch):
+    state = managed_case([{"license": "111111"}])
+    state.sessions[0].responses[0] = SourceResponse(_search(), status=500)
+    observations = []
+    monkeypatch.setattr(worker, "enqueue_live_progress", lambda **event: observations.append(event))
+    worker._progress(TASK, "registry snapshot", 2, 2)
+    with pytest.raises(ValueError, match="http_failure"):
+        await worker.import_profiles({}, TASK)
+    assert len(observations) == 2 and observations[0]["pct"] == 100
+    merged = _merge_nested_profile_snapshots(TASK["run_id"], observations)
+    assert merged[-1]["phase"] == "retaining" and merged[-1]["unit"] == "license"
+    assert merged[-1]["done"] == merged[-1]["pct"] == 0 and merged[-1]["total"] == 1
+    assert state.failed and not state.published and not state.writes
 
 
 async def test_budget_counts_all_retained_files(managed_case, monkeypatch):

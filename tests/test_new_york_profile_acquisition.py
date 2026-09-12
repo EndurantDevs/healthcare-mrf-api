@@ -136,14 +136,27 @@ async def test_exact_license_acquisition_retains_requests_bytes_and_unbound_fact
     assert result["source_record"]["match_evidence"]["license_search"]["content_sha256"] == hashlib.sha256(search.body).hexdigest()
 
 
-@pytest.mark.parametrize("total", [0, 2, 11])
-async def test_non_singleton_search_is_held_without_fetch_or_empty_publication(source_session, total):
-    session = source_session(SourceResponse(_search(total)))
+@pytest.mark.parametrize("total,has_null_physicians", [(0, False), (0, True), (2, False), (11, False)])
+async def test_non_singleton_search_is_held_without_fetch_or_empty_publication(source_session, total, has_null_physicians):
+    response = _search(total)
+    if has_null_physicians:
+        response["data"]["physicians"] = None
+    session = source_session(SourceResponse(response))
     result = await _acquire(session)
     assert result == {"outcome": "held", "reason": "search_not_singleton", "reported_total": total,
                       "source_record": None, "facts": []}
     assert len(session.requests) == 1 and _artifact(session, "result.json")["outcome"] == "held"
     assert not (session.destination / "education.request.json").exists()
+    assert base64.b64decode(_artifact(session, "search.response.json")["body_base64"]) == acquisition.encoded_json(response)
+
+
+async def test_missing_physicians_cannot_become_a_completed_empty_search(source_session):
+    response = _search(0)
+    del response["data"]["physicians"]
+    session = source_session(SourceResponse(response))
+    with pytest.raises(ValueError, match="search_incomplete"):
+        await _acquire(session)
+    assert len(session.requests) == 1 and _artifact(session, "result.json")["outcome"] == "failed"
 
 
 async def test_disagreeing_search_header_names_remain_unbound_and_explicit(source_session):
@@ -194,7 +207,13 @@ async def test_json_failure_never_becomes_completed_empty_search(source_session,
 
 
 @pytest.mark.parametrize("changes", [{"pageNumber": True}, {"pageNumber": 2}, {"numberOfResults": True},
-                                   {"numberOfResults": -1}, {"numberOfResults": 2}, {"physicians": []}, {"physicians": None}])
+                                   {"numberOfResults": -1}, {"numberOfResults": 2}, {"physicians": []}, {"physicians": None},
+                                   {"numberOfResults": 0, "physicians": None, "pageNumber": True},
+                                   {"numberOfResults": 0, "physicians": None, "pageNumber": 2},
+                                   {"numberOfResults": False, "physicians": None},
+                                   {"numberOfResults": "0", "physicians": None},
+                                   {"numberOfResults": -1, "physicians": None},
+                                   {"numberOfResults": 0, "physicians": {}}])
 async def test_inconsistent_counts_and_pages_are_failures(source_session, changes):
     response = _search()
     response["data"].update(changes)
