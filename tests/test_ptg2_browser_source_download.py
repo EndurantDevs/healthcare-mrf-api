@@ -403,6 +403,48 @@ async def test_proxy_range_probe_is_bounded_and_authenticated(monkeypatch):
     assert response.released
 
 
+@pytest.mark.parametrize(
+    ("response_headers", "response_chunks"),
+    [
+        (
+            {
+                "Content-Range": "bytes 0-0/4",
+                "Content-Encoding": "gzip",
+            },
+            [b"a"],
+        ),
+        ({"Content-Range": "bytes 0-0/4"}, [b"a", b"b"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_range_probe_rejects_encoded_or_oversized_body(
+    monkeypatch, response_headers, response_chunks
+):
+    response = _AiohttpResponse(
+        status=206,
+        url="https://hospital.example/file.csv",
+        headers=response_headers,
+        chunks=response_chunks,
+    )
+    session = _AiohttpSession(response)
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+
+    assert await source_download._probe_http_range_support(
+        "https://hospital.example/file.csv",
+        proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+    ) == (False, None, None, None)
+    assert response.released
+
+
 @pytest.mark.asyncio
 async def test_exported_proxy_range_helper_rejects_plain_http_before_network(
     tmp_path, monkeypatch
@@ -416,6 +458,12 @@ async def test_exported_proxy_range_helper_rejects_plain_http_before_network(
         unexpected_session,
     )
     ptg = importlib.import_module("process.ptg")
+
+    with pytest.raises(UnsafeUrlError, match="requires HTTPS"):
+        await source_download._probe_http_range_support(
+            "http://hospital.example/file.csv",
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+        )
 
     with pytest.raises(UnsafeUrlError, match="requires HTTPS"):
         await ptg._download_raw_artifact_ranges(
@@ -527,6 +575,71 @@ async def test_proxy_ranges_resume_failed_chunks_with_stable_etag(
     )
     assert all(options["ssl"] is True for _, _, options in session.calls)
     assert not source_download._range_sidecar_path(path).exists()
+
+
+@pytest.mark.parametrize(
+    ("response_headers", "response_chunks", "expected_error"),
+    [
+        (
+            {
+                "Content-Range": "bytes 0-0/1",
+                "Content-Encoding": "gzip",
+                "ETag": '"stable"',
+            },
+            [b"a"],
+            "returned encoded content",
+        ),
+        (
+            {"Content-Range": "bytes 0-0/1", "ETag": '"stable"'},
+            [b"ab"],
+            "exceeded bytes 0-0",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_ranges_reject_encoded_or_oversized_chunks(
+    tmp_path,
+    monkeypatch,
+    response_headers,
+    response_chunks,
+    expected_error,
+):
+    url = "https://hospital.example/file.csv"
+    session = _AiohttpSession(
+        _AiohttpResponse(
+            status=206,
+            url=url,
+            headers=response_headers,
+            chunks=response_chunks,
+        )
+    )
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+    monkeypatch.setattr(source_download, "_range_download_chunk_bytes", lambda: 1)
+    monkeypatch.setattr(source_download, "_range_download_tasks", lambda: 1)
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 0)
+
+    with pytest.raises(
+        source_download._UnsafeRangeResponseError,
+        match=expected_error,
+    ):
+        await source_download._download_raw_artifact_ranges(
+            url=url,
+            partial_path=tmp_path / "artifact.part",
+            total_bytes=1,
+            etag='"stable"',
+            max_bytes=1,
+            started_at=0,
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+        )
 
 
 @pytest.mark.asyncio
@@ -777,6 +890,10 @@ def test_proxy_transport_formats_ipv6_and_rejects_invalid_port():
         "http://hospital-test:test-token@[2001:db8::1]:39081",
     )
     assert options[CurlOpt.PROXY] == "http://[2001:db8::1]:39081"
+    proxy_options = source_download._proxy_request_kwargs(
+        "http://hospital-test:test-token@[2001:db8::1]:39081"
+    )
+    assert proxy_options["proxy"] == "http://[2001:db8::1]:39081"
 
     with pytest.raises(RuntimeError, match="proxy URL is invalid"):
         source_download.validated_http_proxy_url(
