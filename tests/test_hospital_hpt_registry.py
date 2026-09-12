@@ -201,7 +201,7 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
 
 def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
     """Bind each shared-file facility to its own published location."""
-    names = {
+    name_by_hospital_id = {
         "hospital-005748": "Sheltering Arms Institute",
         "hospital-005526": "SAI OP",
         "hospital-002523": "HANOVER SAI OP",
@@ -213,9 +213,11 @@ def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
         "hospital-003083": "HULL STREET SAI OP",
     }
     hospitals = registry.selected_hospital_hpt_registry(
-        {"hospital_ids": list(names)}
+        {"hospital_ids": list(name_by_hospital_id)}
     )
-    assert {hospital["hospital_id"]: hospital["name"] for hospital in hospitals} == names
+    assert {
+        hospital["hospital_id"]: hospital["name"] for hospital in hospitals
+    } == name_by_hospital_id
     assert all("locator_name" not in hospital for hospital in hospitals)
     acquisition = acquisition_module()
     candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
@@ -229,13 +231,14 @@ def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
     ),))
     assert all(
         candidate.initial_error_code is None
-        and candidate.locator_name == names[candidate.hospital_id]
+        and candidate.locator_name == name_by_hospital_id[candidate.hospital_id]
         for candidate in candidates
     )
     store, _native = store_module()
-    locations = tuple(enumerate(names.values()))
+    locations = tuple(enumerate(name_by_hospital_id.values()))
     assert store._location_ordinals(candidates, locations) == {
-        hospital_id: ordinal for ordinal, hospital_id in enumerate(names)
+        hospital_id: ordinal
+        for ordinal, hospital_id in enumerate(name_by_hospital_id)
     }
 
 
