@@ -55,7 +55,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-005086": "Philadelphia Post-Acute Partners LLC",
     "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
-    "hospital-005482": "MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL",
+    "hospital-005482": "Rockville General",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006733": "Union Hospital Terre Haute",
     "hospital-006345": "Summa Rehab Hospital, LLC",
@@ -98,7 +98,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_710
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 150
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 151
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -319,6 +319,50 @@ def test_reviewed_johnson_publisher_fallback_preserves_singleton_identity():
     assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (
         hospital["hospital_id"], hospital["name"], hospital["name"],
     )
+
+
+def test_echn_shared_file_binds_manchester_and_rockville_separately():
+    """Reuse one ECHN file while publishing each facility's own location."""
+    hospital_ids = ("hospital-003709", "hospital-005482")
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(hospital_ids)}
+    )
+    locator_url = "https://echn.org/cms-hpt.txt"
+    shared_url = (
+        "https://hartfordhealthcare.org/file%20library/price%20data/"
+        "393859332_manchester-memorial-hospital_standardcharges.csv"
+    )
+    assert tuple(hospital["hospital_id"] for hospital in hospitals) == hospital_ids
+    assert hospitals[0] == {
+        "hospital_id": hospital_ids[0],
+        "name": "MANCHESTER MEMORIAL HOSPITAL",
+        "cms_hpt_url": locator_url,
+    }
+    assert hospitals[1] == {
+        "hospital_id": hospital_ids[1],
+        "name": "Rockville General",
+        "cms_hpt_url": locator_url,
+        "locator_name": "Rockville General",
+        "fallback_mrf_url": shared_url,
+    }
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", hospitals,
+        (
+            HospitalHptLocatorRecord("MANCHESTER MEMORIAL HOSPITAL", shared_url),
+            HospitalHptLocatorRecord(
+                "MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL", shared_url
+            ),
+        ),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert {candidate.source_url for candidate in candidates} == {shared_url}
+    assert all(candidate.initial_error_code is None for candidate in candidates)
+    store, _native = store_module()
+    assert store._location_ordinals(candidates, (
+        (0, "Manchester Memorial Hospital"),
+        (1, "Rockville General"),
+    )) == {hospital_ids[0]: 0, hospital_ids[1]: 1}
 
 
 @pytest.mark.parametrize("signature", ("synthetic%2fvalue", "synthetic%2Fvalue"))
