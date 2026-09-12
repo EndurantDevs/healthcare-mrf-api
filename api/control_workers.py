@@ -925,7 +925,12 @@ def _worker_job_environment(
         env_list.append(
             {
                 "name": "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
-                "value": "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,shelteringarmsinstitute.com",
+                "value": (
+                    "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,"
+                    "shelteringarmsinstitute.com,bilh.org,ajh.org,bidmilton.org,"
+                    "bidneedham.org,bidplymouth.org,bidmc.org,exeterhospital.org,"
+                    "mountauburnhospital.org,nebh.org,winchesterhospital.org"
+                ),
             }
         )
     env_list.extend(_worker_job_secret_env(spec.worker_class))

@@ -68,7 +68,10 @@ def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
         "hospital_prices_start_run_hospital"
     )
     assert env_by_name["HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS"] == (
-        "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,shelteringarmsinstitute.com"
+        "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,"
+        "shelteringarmsinstitute.com,bilh.org,ajh.org,bidmilton.org,"
+        "bidneedham.org,bidplymouth.org,bidmc.org,exeterhospital.org,"
+        "mountauburnhospital.org,nebh.org,winchesterhospital.org"
     )
 
     other_container = control_workers._worker_job_manifest(
