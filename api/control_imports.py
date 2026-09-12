@@ -110,6 +110,7 @@ _PROFILE_SOURCES = {
     "kentucky-kbml-profile": {"source_key": "kentucky-kbml", "display_name": "Kentucky KBML"},
     "tennessee-tdh-profile": {"source_key": "tennessee-tdh", "display_name": "Tennessee TDH"},
     "rhode-island-doh-profile": {"source_key": "rhode-island-doh", "display_name": "Rhode Island DOH"},
+    "new-york-nypp-profile": {"source_key": "new-york-nypp", "display_name": "New York Physician Profile"},
 }
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
@@ -173,6 +174,7 @@ _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "kentucky-kbml-profile": ["npi"],
     "tennessee-tdh-profile": ["npi"],
     "rhode-island-doh-profile": ["npi"],
+    "new-york-nypp-profile": ["npi"],
     "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
@@ -386,6 +388,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.rhode_island_profile",
         "target_function": "import_profiles",
     },
+    "new-york-nypp-profile": {
+        "queue": "arq:NewYorkNYPPProfile",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.new_york_profile",
+        "target_function": "import_profiles",
+    },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",
         "function": "control_single_job_start",
@@ -491,6 +500,7 @@ _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
 }
 
 _CANCELABLE_IMPORTERS = {
+    "new-york-nypp-profile",
     "tennessee-tdh-profile",
     "rhode-island-doh-profile",
     "massachusetts-borim-profile",
@@ -812,6 +822,7 @@ def _importer_family(importer: str) -> str:
         "kentucky-kbml-profile",
         "tennessee-tdh-profile",
         "rhode-island-doh-profile",
+        "new-york-nypp-profile",
         "entity-address-unified",
         "cms-doctors",
         "address-archive-v2-migrate",

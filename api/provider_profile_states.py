@@ -27,10 +27,27 @@ MASSACHUSETTS_SOURCE_KEY = "massachusetts-borim"
 KENTUCKY_SOURCE_KEY = "kentucky-kbml"
 TN_SOURCE_KEY = "tennessee-tdh"
 RI_SOURCE_KEY = "rhode-island-doh"
-STATE_SOURCE_KEYS = (MASSACHUSETTS_SOURCE_KEY, KENTUCKY_SOURCE_KEY, TN_SOURCE_KEY, RI_SOURCE_KEY)
+NYPP_SOURCE_KEY = "new-york-nypp"
+NYSED_SOURCE_KEY = "new-york-nysed"
+STATE_SOURCE_KEYS = (
+    MASSACHUSETTS_SOURCE_KEY, KENTUCKY_SOURCE_KEY, TN_SOURCE_KEY, RI_SOURCE_KEY, NYPP_SOURCE_KEY, NYSED_SOURCE_KEY,
+)
 KENTUCKY_SCHEMA_VERSION = "ky-kbml-profile/v1"
 TN_SCHEMA_VERSION = "tn-tdh-profile/v1"
 RI_SCHEMA_VERSION = "ri-doh-profile/v1"
+NEW_YORK_SOURCES = {
+    NYPP_SOURCE_KEY: {
+        "schema_version": "ny-nypp-education/v1",
+        "agency": "New York State Department of Health",
+        "fact_types": {"education": "education_history", "training": "postgraduate_training",
+                       "certifications": "board_certification"},
+    },
+    NYSED_SOURCE_KEY: {
+        "schema_version": "ny-nysed-physician/v1",
+        "agency": "New York State Education Department",
+        "fact_types": {"education": "education_history", "licenses": "state_licensure_record"},
+    },
+}
 SOURCE_CONTEXT = {
     MASSACHUSETTS_SOURCE_KEY: (
         "Massachusetts education and training are source-reported. Missing training dates do not establish "
@@ -47,6 +64,16 @@ SOURCE_CONTEXT = {
     RI_SOURCE_KEY: (
         "Rhode Island medical education, specialties and hospital staff privileges are source-reported. "
         "Training, clinical experience, board certification and current hospital employment are not inferred."
+    ),
+    NYPP_SOURCE_KEY: (
+        "New York physician profile education, training and certifications are source-reported. "
+        "Missing dates do not establish current enrollment, completion or certification validity; "
+        "degrees and clinical experience are not inferred. Coverage follows supported NPPES-derived license roots."
+    ),
+    NYSED_SOURCE_KEY: (
+        "New York education and license registration details are source-reported. Registration dates do not "
+        "establish clinical experience, current practice or license expiration; degrees are not inferred. "
+        "Coverage follows supported NPPES-derived license roots."
     ),
 }
 
@@ -117,6 +144,8 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
         evidence = fact["source_json"]
         if evidence["source_key"] != source_by_field["source_key"] or evidence["source_record_id"] != fact["source_record_id"]:
             raise RuntimeError("state_profile_source_mismatch")
+        if source_key in NEW_YORK_SOURCES:
+            _validate_new_york_fact(npi, generation_id, fact, source_key)
         if source_key == KENTUCKY_SOURCE_KEY:
             _validate_kentucky_fact(npi, generation_id, fact)
         elif source_key == TN_SOURCE_KEY:
@@ -154,6 +183,9 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
 def _validate_state_publication(fact_rows: list[Mapping], descriptor: Mapping, categories: list) -> None:
     """Apply the publication scope required by the source's projection."""
     source_key = descriptor["source_key"]
+    if source_key in NEW_YORK_SOURCES:
+        _validate_new_york_publication(fact_rows, descriptor, categories, source_key)
+        return
     if source_key == KENTUCKY_SOURCE_KEY:
         _validate_kentucky_publication(fact_rows, descriptor, categories)
     elif source_key == TN_SOURCE_KEY:
@@ -257,6 +289,41 @@ def _validate_rhode_island_fact(npi: int, generation_id: str, fact: Mapping) -> 
     if (
         evidence.get("schema_version") != RI_SCHEMA_VERSION or evidence.get("run_id") != generation_id
         or evidence.get("agency") != "Rhode Island Department of Health" or evidence.get("jurisdiction") != "RI"
+    ):
+        raise RuntimeError("state_profile_source_mismatch")
+
+
+def _validate_new_york_publication(
+    fact_rows: list[Mapping], descriptor: Mapping, categories: list, source_key: str,
+) -> None:
+    """Keep each New York publication within its declared registry-derived cohort."""
+    source = NEW_YORK_SOURCES[source_key]
+    if categories != list(source["fact_types"]):
+        raise RuntimeError("state_profile_categories_invalid")
+    snapshot_sha256 = fact_rows[0]["source_manifest"].get("snapshot_sha256")
+    if (
+        descriptor.get("agency") != source["agency"] or descriptor.get("jurisdiction") != "NY"
+        or descriptor.get("coverage_scope") != "supported_nppes_derived_ny_physician_license_roots"
+        or not isinstance(snapshot_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+        or descriptor.get("registry_generation") != snapshot_sha256
+        or any(fact_row.get("publication_source_key") != source_key for fact_row in fact_rows)
+        or any(fact_row.get("run_schema_version") != source["schema_version"] for fact_row in fact_rows)
+        or any(fact_row.get("run_jurisdiction") != "NY" for fact_row in fact_rows)
+    ):
+        raise RuntimeError("state_profile_source_mismatch")
+
+
+def _validate_new_york_fact(npi: int, generation_id: str, fact: Mapping, source_key: str) -> None:
+    """Bind public New York assertions without rewriting their captured evidence."""
+    source = NEW_YORK_SOURCES[source_key]
+    if source["fact_types"].get(fact["category"]) != fact["fact_type"]:
+        raise RuntimeError("state_profile_categories_invalid")
+    if fact["run_id"] != generation_id or fact["npi"] != npi:
+        raise RuntimeError("state_profile_publication_invalid")
+    evidence = fact["source_json"]
+    if (
+        evidence.get("schema_version") != source["schema_version"] or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != source["agency"] or evidence.get("jurisdiction") != "NY"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 

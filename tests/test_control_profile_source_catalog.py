@@ -22,6 +22,7 @@ async def test_profile_source_catalog_identifies_only_registered_profile_importe
         "kentucky-kbml-profile": {"source_key": "kentucky-kbml", "display_name": "Kentucky KBML"},
         "tennessee-tdh-profile": {"source_key": "tennessee-tdh", "display_name": "Tennessee TDH"},
         "rhode-island-doh-profile": {"source_key": "rhode-island-doh", "display_name": "Rhode Island DOH"},
+        "new-york-nypp-profile": {"source_key": "new-york-nypp", "display_name": "New York Physician Profile"},
     }
     assert all(entry["enqueue_adapter"] == "arq_single_job" for entry in entries if entry["name"] in profile_by_importer)
     assert all("profile_source" not in entry for entry in entries if entry["name"] in {"npi", "provider-directory-fhir", "ptg"})

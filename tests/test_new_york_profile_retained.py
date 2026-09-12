@@ -20,8 +20,13 @@ def _change(destination, name, **changes):
 
 def _body(destination, stage, payload):
     body = encoded_json(payload)
-    _change(destination, f"{stage}.response.json", body_base64=base64.b64encode(body).decode("ascii"),
-            content_sha256=hashlib.sha256(body).hexdigest(), received_bytes=len(body))
+    _change(
+        destination,
+        f"{stage}.response.json",
+        body_base64=base64.b64encode(body).decode("ascii"),
+        content_sha256=hashlib.sha256(body).hexdigest(),
+        received_bytes=len(body),
+    )
 
 
 @pytest.fixture
@@ -60,14 +65,24 @@ async def test_complete_profile_without_education_is_reparsed(source_session):
     assert live["facts"] == [] and live["source_record"] is not None
 
 
-@pytest.mark.parametrize("changes", [
-    {"schema_version": "other"}, {"source_key": "other"}, {"license_number": "12345"},
-    {"license_number": "123456"}, {"run_id": ""}, {"run_id": "different-valid-run"},
-    {"session_id": "x"}, {"session_id": "0" * 32},
-    {"started_at": "invalid"}, {"started_at": "2020-01-01T00:00:00"},
-    {"started_at": "2000-01-01T00:00:00+00:00"},
-    {"started_at": "2999-01-01T00:00:00+00:00"}, {"unexpected": True},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema_version": "other"},
+        {"source_key": "other"},
+        {"license_number": "12345"},
+        {"license_number": "123456"},
+        {"run_id": ""},
+        {"run_id": "different-valid-run"},
+        {"session_id": "x"},
+        {"session_id": "0" * 32},
+        {"started_at": "invalid"},
+        {"started_at": "2020-01-01T00:00:00"},
+        {"started_at": "2000-01-01T00:00:00+00:00"},
+        {"started_at": "2999-01-01T00:00:00+00:00"},
+        {"unexpected": True},
+    ],
+)
 async def test_changed_manifest_cannot_rebind_retained_evidence(acquisition_path, manifest_sha256, changes):
     _change(acquisition_path, "manifest.json", **changes)
     with pytest.raises(ValueError):
@@ -81,31 +96,66 @@ async def test_missing_invalid_or_wrong_manifest_pin_is_rejected(acquisition_pat
 
 
 @pytest.mark.parametrize("stage", ["search", "education"])
-@pytest.mark.parametrize("changes", [
-    {"method": "PUT"}, {"source_url": "https://example.test/"}, {"body_text": "{}"},
-    {"allow_redirects": True}, {"allow_redirects": 0}, {"headers": {}}, {"unexpected": True},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"method": "PUT"},
+        {"source_url": "https://example.test/"},
+        {"body_text": "{}"},
+        {"allow_redirects": True},
+        {"allow_redirects": 0},
+        {"headers": {}},
+        {"unexpected": True},
+    ],
+)
 async def test_changed_request_is_rejected_even_with_recomputed_hash(acquisition_path, manifest_sha256, stage, changes):
     _change(acquisition_path, f"{stage}.request.json", **changes)
     request = json.loads((acquisition_path / f"{stage}.request.json").read_bytes())
-    _change(acquisition_path, f"{stage}.response.json", request_sha256=hashlib.sha256(encoded_json(request)).hexdigest())
+    _change(
+        acquisition_path, f"{stage}.response.json", request_sha256=hashlib.sha256(encoded_json(request)).hexdigest()
+    )
     with pytest.raises(ValueError, match="request_changed"):
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
 
 
 @pytest.mark.parametrize("stage", ["search", "education"])
-@pytest.mark.parametrize("changes", [
-    {"schema_version": "other"}, {"source_key": "other"}, {"source_url": "https://example.test/"},
-    {"request_sha256": "0" * 64}, {"complete": False}, {"complete": 1}, {"error_type": "TimeoutError"},
-    {"status": 500}, {"status": True}, {"downloaded_at": None}, {"downloaded_at": "2020-01-01"},
-    {"received_bytes": 1}, {"received_bytes": True}, {"content_sha256": "0" * 64},
-    {"body_base64": "!"}, {"body_base64": "é"}, {"body_base64": ""}, {"body_base64": None},
-    {"headers": None}, {"headers": [["Content-Type"]]}, {"headers": [["Content-Type", 1]]},
-    {"headers": []}, {"headers": [["Content-Type", "text/html"]]},
-    {"headers": [["Content-Type", "application/json"], ["Content-Encoding", "gzip"]]},
-    {"headers": [["Content-Type", "application/json"], ["content-type", "text/html"]]},
-    {"headers": [["Content-Type", "application/json"], ["Content-Encoding", "identity"], ["content-encoding", "gzip"]]},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema_version": "other"},
+        {"source_key": "other"},
+        {"source_url": "https://example.test/"},
+        {"request_sha256": "0" * 64},
+        {"complete": False},
+        {"complete": 1},
+        {"error_type": "TimeoutError"},
+        {"status": 500},
+        {"status": True},
+        {"downloaded_at": None},
+        {"downloaded_at": "2020-01-01"},
+        {"received_bytes": 1},
+        {"received_bytes": True},
+        {"content_sha256": "0" * 64},
+        {"body_base64": "!"},
+        {"body_base64": "é"},
+        {"body_base64": ""},
+        {"body_base64": None},
+        {"headers": None},
+        {"headers": [["Content-Type"]]},
+        {"headers": [["Content-Type", 1]]},
+        {"headers": []},
+        {"headers": [["Content-Type", "text/html"]]},
+        {"headers": [["Content-Type", "application/json"], ["Content-Encoding", "gzip"]]},
+        {"headers": [["Content-Type", "application/json"], ["content-type", "text/html"]]},
+        {
+            "headers": [
+                ["Content-Type", "application/json"],
+                ["Content-Encoding", "identity"],
+                ["content-encoding", "gzip"],
+            ]
+        },
+    ],
+)
 async def test_response_tampering_and_partial_evidence_are_rejected(acquisition_path, manifest_sha256, stage, changes):
     _change(acquisition_path, f"{stage}.response.json", **changes)
     with pytest.raises(ValueError):
@@ -119,11 +169,19 @@ async def test_chronology_is_checked_between_stages(acquisition_path, manifest_s
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
 
 
-@pytest.mark.parametrize("changes", [
-    {"outcome": "held"}, {"outcome": "failed"}, {"identity_review_required": True},
-    {"identity_review_required": 0}, {"physician_id": "91002"}, {"fact_count": 0},
-    {"fact_count": True}, {"npi": 1000000004},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"outcome": "held"},
+        {"outcome": "failed"},
+        {"identity_review_required": True},
+        {"identity_review_required": 0},
+        {"physician_id": "91002"},
+        {"fact_count": 0},
+        {"fact_count": True},
+        {"npi": 1000000004},
+    ],
+)
 async def test_terminal_summary_is_not_authority_for_records_or_flags(acquisition_path, manifest_sha256, changes):
     _change(acquisition_path, "result.json", **changes)
     with pytest.raises(ValueError):
@@ -158,8 +216,13 @@ async def test_json_error_envelope_cannot_become_an_empty_success(acquisition_pa
 @pytest.mark.parametrize("stage", ["search", "education"])
 @pytest.mark.parametrize("body", [b'{"status":200,"status":400}', b'{"status":NaN}', b"\xff"])
 async def test_strict_source_json_is_checked_after_byte_hashes(acquisition_path, manifest_sha256, stage, body):
-    _change(acquisition_path, f"{stage}.response.json", body_base64=base64.b64encode(body).decode("ascii"),
-            content_sha256=hashlib.sha256(body).hexdigest(), received_bytes=len(body))
+    _change(
+        acquisition_path,
+        f"{stage}.response.json",
+        body_base64=base64.b64encode(body).decode("ascii"),
+        content_sha256=hashlib.sha256(body).hexdigest(),
+        received_bytes=len(body),
+    )
     with pytest.raises((ValueError, RuntimeError)):
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
 
@@ -171,8 +234,17 @@ async def test_reparse_rejects_different_header_identity(acquisition_path, manif
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
 
 
-@pytest.mark.parametrize("name", ["manifest.json", "result.json", "search.request.json", "search.response.json",
-                                 "education.request.json", "education.response.json"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "manifest.json",
+        "result.json",
+        "search.request.json",
+        "search.response.json",
+        "education.request.json",
+        "education.response.json",
+    ],
+)
 async def test_missing_or_symlinked_artifacts_are_not_read(acquisition_path, manifest_sha256, name):
     path = acquisition_path / name
     original = path.read_bytes()
@@ -193,8 +265,9 @@ async def test_symlinked_parent_is_rejected(acquisition_path, manifest_sha256):
         retained.read_acquisition(alias, manifest_sha256=manifest_sha256)
 
 
-@pytest.mark.parametrize("name,limit", [("manifest.json", "MAX_METADATA_BYTES"),
-                                       ("education.response.json", "MAX_RESPONSE_ENVELOPE_BYTES")])
+@pytest.mark.parametrize(
+    "name,limit", [("manifest.json", "MAX_METADATA_BYTES"), ("education.response.json", "MAX_RESPONSE_ENVELOPE_BYTES")]
+)
 async def test_envelope_is_bounded_before_decoding(acquisition_path, manifest_sha256, monkeypatch, name, limit):
     read_artifact = retained._read_artifact
     capped_paths = []
@@ -216,3 +289,161 @@ async def test_decoded_body_limit_is_independent(acquisition_path, manifest_sha2
     monkeypatch.setattr(retained, "MAX_PROFILE_BYTES", 1)
     with pytest.raises(ValueError, match="body_changed"):
         retained.read_acquisition(acquisition_path, manifest_sha256=manifest_sha256)
+
+
+@pytest.fixture
+async def held_path(source_session):
+    session = source_session(SourceResponse(_search(2)))
+    await _acquire(session)
+    return session.destination
+
+
+def _held_pins(destination):
+    return {
+        "manifest_sha256": hashlib.sha256((destination / "manifest.json").read_bytes()).hexdigest(),
+        "acquisition_sha256": retained.held_acquisition_content_sha256(destination),
+    }
+
+
+@pytest.mark.parametrize("total", [0, 2, 11])
+async def test_held_replay_matches_actual_acquisition_without_profile_or_inventory_claim(source_session, total):
+    session = source_session(SourceResponse(_search(total)))
+    acquired = await _acquire(session)
+    pins = _held_pins(session.destination)
+    assert (
+        retained.read_held_acquisition(session.destination, **pins)
+        == acquired
+        == {
+            "outcome": "held",
+            "reason": "search_not_singleton",
+            "reported_total": total,
+            "source_record": None,
+            "facts": [],
+        }
+    )
+    assert {path.name for path in session.destination.iterdir()} == set(retained.HELD_FILES)
+    assert len(session.requests) == 1
+    with pytest.raises(ValueError, match="not_acquired"):
+        retained.read_acquisition(session.destination, manifest_sha256=pins["manifest_sha256"])
+
+
+@pytest.mark.parametrize("name", retained.HELD_FILES)
+async def test_every_held_file_is_pinned_as_original_bytes(held_path, name):
+    pins = _held_pins(held_path)
+    path = held_path / name
+    path.write_bytes(path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="acquisition_changed"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize("digest", [None, 1, "", "a" * 63, "A" * 64, "g" * 64, "0" * 64])
+async def test_held_replay_requires_independent_complete_acquisition_pin(held_path, digest):
+    pins = _held_pins(held_path)
+    pins["acquisition_sha256"] = digest
+    with pytest.raises(ValueError, match="acquisition_(pin_invalid|changed)"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize("name", retained.HELD_FILES)
+async def test_held_inventory_rejects_missing_and_symlinked_files(held_path, name):
+    pins = _held_pins(held_path)
+    path = held_path / name
+    target = held_path.parent / "synthetic-target.json"
+    target.write_bytes(path.read_bytes())
+    path.unlink()
+    with pytest.raises(ValueError, match="held_inventory_invalid"):
+        retained.read_held_acquisition(held_path, **pins)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize("name", ["education.request.json", "education.response.json", "unexpected.json"])
+async def test_held_inventory_cannot_mix_education_or_extra_evidence(held_path, name):
+    pins = _held_pins(held_path)
+    (held_path / name).write_bytes(b"{}")
+    with pytest.raises(ValueError, match="held_inventory_invalid"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize(
+    "name,changes",
+    [
+        ("search.request.json", {"body_text": "{}"}),
+        ("search.request.json", {"source_url": "https://example.test/"}),
+        ("search.request.json", {"allow_redirects": True}),
+        ("search.response.json", {"source_key": "other"}),
+        ("search.response.json", {"source_url": "https://example.test/"}),
+        ("search.response.json", {"request_sha256": "0" * 64}),
+        ("search.response.json", {"complete": False}),
+        ("search.response.json", {"error_type": "TimeoutError"}),
+        ("search.response.json", {"status": 404}),
+        ("search.response.json", {"status": True}),
+        ("search.response.json", {"headers": [["Content-Type", "text/html"]]}),
+        ("search.response.json", {"received_bytes": True}),
+        ("search.response.json", {"content_sha256": "0" * 64}),
+        ("search.response.json", {"body_base64": "!"}),
+        ("search.response.json", {"downloaded_at": "2000-01-01T00:00:00+00:00"}),
+        ("search.response.json", {"downloaded_at": "2999-01-01"}),
+        ("result.json", {"outcome": "acquired"}),
+        ("result.json", {"outcome": "failed"}),
+        ("result.json", {"reason": "no_matching_npi"}),
+        ("result.json", {"reported_total": 0}),
+        ("result.json", {"reported_total": True}),
+        ("result.json", {"fact_count": True}),
+        ("result.json", {"npi": 1000000004}),
+        ("result.json", {"complete_physician_inventory": True}),
+    ],
+)
+async def test_rehashed_held_evidence_still_requires_exact_semantics(held_path, name, changes):
+    _change(held_path, name, **changes)
+    with pytest.raises(ValueError):
+        retained.read_held_acquisition(held_path, **_held_pins(held_path))
+
+
+@pytest.mark.parametrize(
+    "search",
+    [
+        _search(),
+        {"status": 400, "error": None, "errorMessage": None, "data": None},
+        {
+            "status": 200,
+            "error": None,
+            "errorMessage": None,
+            "data": {"pageNumber": 1, "numberOfResults": 11, "physicians": []},
+        },
+    ],
+)
+async def test_held_replay_rejects_singleton_error_or_incomplete_search(held_path, search):
+    _body(held_path, "search", search)
+    with pytest.raises(ValueError):
+        retained.read_held_acquisition(held_path, **_held_pins(held_path))
+
+
+async def test_held_manifest_remains_independently_pinned(held_path):
+    pins = _held_pins(held_path)
+    _change(held_path, "manifest.json", run_id="another-synthetic-run")
+    pins["acquisition_sha256"] = retained.held_acquisition_content_sha256(held_path)
+    with pytest.raises(ValueError, match="manifest_changed"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+async def test_held_replay_detects_inventory_change_during_validation(held_path, monkeypatch):
+    pins = _held_pins(held_path)
+    validate = retained._validated_response
+
+    def change_after_read(*args):
+        _change(held_path, "result.json", reported_total=11)
+        return validate(*args)
+
+    monkeypatch.setattr(retained, "_validated_response", change_after_read)
+    with pytest.raises(ValueError, match="acquisition_changed"):
+        retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize("name", retained.HELD_FILES)
+async def test_held_files_are_bounded_before_decoding(held_path, monkeypatch, name):
+    pins = _held_pins(held_path)
+    monkeypatch.setitem(retained.HELD_FILES, name, 1)
+    with pytest.raises(ValueError, match="held_artifact_invalid"):
+        retained.read_held_acquisition(held_path, **pins)

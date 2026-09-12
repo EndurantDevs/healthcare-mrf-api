@@ -29,6 +29,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | LODES workplace demand | `python main.py start lodes` | shutdown publish in worker | LEHD workplace demand by ZCTA with tract-to-ZIP crosswalk validation |
 | Medicare enrollment | `python main.py start medicare-enrollment` | shutdown publish in worker | county-canonical Medicare enrollment with ZIP allocation |
 | CMS doctors | `python main.py start cms-doctors` | shutdown publish in worker | Medicare doctors and clinicians practice-location coverage |
+| New York physician profiles | managed import API: `new-york-nypp-profile`, empty parameters | atomic publication in `process.NewYorkNYPPProfile` | physician education, postgraduate training, and reported board certifications |
 | Facility anchors | `python main.py start facility-anchors` | shutdown publish in worker | HRSA FQHC and CMS hospital anchor coverage |
 | Pharmacy economics | `python main.py start pharmacy-economics` | shutdown publish in worker | SDUD + NADAC + FUL state/NDC economics reference |
 | Entity address unified | `python main.py start entity-address-unified` | shutdown publish in worker | unified address/entity materialization from imported provider/facility sources |
@@ -60,6 +61,22 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - [Facility anchors import](./facility-anchors.md)
 - [Pharmacy economics import](./pharmacy-economics.md)
 - [Entity address unified import](./entity-address-unified.md)
+
+## New York Physician Profiles
+
+The managed importer acquires every supported New York physician license root from a complete NPPES registry snapshot. It retains unmatched records and ambiguous searches; coverage is registry-derived, not a state physician census. NYSED Medicine verification supports identity corroboration and remains separately identified retained evidence.
+
+Configure these values before starting an import:
+
+| Environment variable | Meaning |
+| --- | --- |
+| `HLTHPRT_NYSED_PUBLIC_API_KEY` | Request header required by the public NYSED verification service |
+| `HLTHPRT_NYPP_MAX_RETAINED_BYTES` | Positive byte budget for files retained by the attempt |
+| `HLTHPRT_NYPP_MAX_BUNDLE_BYTES` | Positive byte budget for the publication metadata inventory |
+| `HLTHPRT_NYPP_DEADLINE_SECONDS` | Positive elapsed-time budget in seconds |
+| `HLTHPRT_NYPP_ARTIFACT_ROOT` | Optional retained-file directory; defaults to `/work/new-york-nypp` |
+
+The required budgets have no defaults. Size worker memory and storage for the registry snapshot, metadata inventory, serialization overhead, and retained history. The worker timeout covers the configured deadline plus five minutes; an external job deadline must also allow startup and cleanup. Budget exhaustion, cancellation, or incomplete acquisition leaves the previous publication in place. Provider limits and partial-source parameters are rejected.
 
 ## Shared Operational Rules
 - Use `--test` where supported before large imports.
