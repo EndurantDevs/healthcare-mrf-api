@@ -186,6 +186,8 @@ def _progress(task, phase, done, total):
         importer=IMPORTER,
         status="running",
         phase=phase,
+        stage_id=phase,
+        stage_ordinal=("registry snapshot", "retaining").index(phase),
         unit="record" if phase == "registry snapshot" else "license",
         done=done,
         total=total,
@@ -387,6 +389,7 @@ def _append_profile(profiles, metrics_by_field, license_number, descriptor, supp
 
 
 async def _run_claimed(ctx, task, run, cohort, directory, api_key, budget):
+    _progress(task, "retaining", 0, len(cohort["roots"]))
     (directory / "profiles").mkdir(mode=0o700)
     (directory / "nysed").mkdir(mode=0o700)
     loaded = RegistrySnapshot(directory / "snapshot.json", snapshot_sha256=run["source_manifest"]["snapshot_sha256"])

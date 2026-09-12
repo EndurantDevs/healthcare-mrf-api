@@ -110,7 +110,8 @@ def _source_manifest(task, cohort, expected_current_run_id, *, categories=PROFIL
 def _progress(task, run_id, phase, done, total):
     enqueue_live_progress(
         run_id=task.get("run_id"), importer="kentucky-kbml-profile", status="running",
-        phase=phase, unit="license", done=done, total=total, pct=100 * done / total if total else 0,
+        phase=phase, stage_id=phase, stage_ordinal=("checking_retained", "acquiring", "retaining").index(phase),
+        unit="license", done=done, total=total, pct=100 * done / total if total else 0,
         message=f"Kentucky profiles: {phase} {done}/{total}",
         metrics={"provider_profile_run_id": run_id, "coverage_scope": acquisition.COVERAGE_SCOPE},
     )
@@ -120,11 +121,11 @@ async def _acquire(ctx, task, run_row, cohort, directory, retained):
     manifest = run_row["source_manifest"]
     roots = _selected_roots(cohort, manifest["max_providers"], strategy=manifest.get("sampling_strategy", LEGACY_SAMPLING_STRATEGY))
 
-    async def progress(done, total):
+    async def progress(done, total, *, phase="acquiring"):
         """Check every request checkpoint for cancellation and throttle visible updates."""
         await raise_if_cancelled(ctx, task)
         if done % 50 == 0 or done == total:
-            _progress(task, run_row["run_id"], "acquiring", done, total)
+            _progress(task, run_row["run_id"], phase, done, total)
 
     metrics = await acquisition.acquire_profiles(roots, directory / "profiles", progress, retained=retained)
     return roots, {**metrics, "acquisition_complete": True, "transport_failures": 0,

@@ -325,8 +325,8 @@ async def test_retained_validation_honors_cancellation_before_next_file_or_trans
     originals_by_name = {path.name: path.read_bytes() for path in retained.iterdir()}
     session = install_session()
 
-    async def cancel_after_first(completed, total):
-        assert total == 2
+    async def cancel_after_first(completed, total, *, phase):
+        assert total == 2 and phase == "checking_retained"
         if completed == 1:
             raise asyncio.CancelledError()
 
@@ -423,6 +423,67 @@ async def test_transport_failure_has_no_retry_and_preserves_prior_response(tmp_p
     assert [path.name for path in destination.iterdir()] == ["C0007.json"]
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_transient_http_status_retries_same_query_and_retains_only_success(tmp_path, install_session, status):
+    failed = ProfileResponse(status=status)
+    session = install_session(failed, ProfileResponse())
+    destination = tmp_path / "new"
+    metrics = await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert session.requests == [(acquisition.source_url("C0007"), {"allow_redirects": False})] * 2
+    assert failed.chunks_read == 0 and session.closed
+    response = acquisition.read_response(destination / "C0007.json", "C0007")
+    assert response["body_text"].encode() == _html() and response["status"] == 200
+    assert metrics["responses"] == 1 and metrics["response_bytes"] == len(_html())
+    assert metrics["responses_sha256"] == hashlib.sha256(acquisition.encoded_json(response)).hexdigest()
+
+
+async def test_transient_http_exhaustion_stops_at_three_attempts(tmp_path, install_session):
+    failures = [ProfileResponse(status=500) for _ in range(3)]
+    session = install_session(ProfileResponse(_html("00042")), *failures, ProfileResponse())
+    destination = tmp_path / "new"
+    with pytest.raises(acquisition.ProfileHTTPStatusError, match="kentucky_profile_http_failure:500") as caught:
+        await acquisition.acquire_profiles([{"license_number": "00042"}, {"license_number": "C0007"}], destination, AsyncMock())
+    assert caught.value.status == 500 and len(session.requests) == 4 and session.closed
+    assert session.requests[1:] == [(acquisition.source_url("C0007"), {"allow_redirects": False})] * 3
+    assert all(response.chunks_read == 0 for response in failures)
+    assert [path.name for path in destination.iterdir()] == ["00042.json"]
+    assert acquisition.read_response(destination / "00042.json", "00042")["body_text"].encode() == _html("00042")
+
+
+@pytest.mark.parametrize("response", [*(ProfileResponse(status=status) for status in (302, 403, 404, 429, 501, 505)),
+                                     ProfileResponse(content_type="application/json"), ProfileResponse(b"Service unavailable"),
+                                     ProfileResponse(_html("C007"))])
+async def test_terminal_http_or_invalid_body_is_not_retried_by_acquisition(tmp_path, install_session, response):
+    session = install_session(response, ProfileResponse())
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert len(session.requests) == 1 and session.closed and list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("during_spacing", [False, True])
+async def test_cancellation_before_http_retry_stops_without_another_request(tmp_path, install_session, monkeypatch, during_spacing):
+    session = install_session(ProfileResponse(status=500), ProfileResponse())
+    destination = tmp_path / "new"
+    cancellation = SimpleNamespace(requested=False)
+
+    async def request_cancellation(_delay):
+        cancellation.requested = bool(session.requests)
+
+    if during_spacing:
+        monkeypatch.setattr(acquisition, "asyncio", SimpleNamespace(
+            sleep=request_cancellation, get_running_loop=asyncio.get_running_loop,
+        ))
+
+    async def cancel_retry(_completed, _total):
+        if session.requests and (not during_spacing or cancellation.requested):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, cancel_retry)
+    assert len(session.requests) == 1 and session.closed and list(destination.iterdir()) == []
+
+
 @pytest.mark.parametrize("control", ["absent", None, 0, "false"])
 async def test_retry_control_unavailable_fails_before_requests(tmp_path, install_session, control):
     session = install_session(ProfileResponse())
@@ -485,9 +546,13 @@ async def test_total_cap_counts_replay_and_stops_before_overflow(tmp_path, insta
     assert len(session.requests) == 1
 
 
-async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, install_session, monkeypatch):
+@pytest.mark.parametrize("transient_failure", [False, True])
+async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, install_session, monkeypatch, transient_failure):
     licenses = ["C0007", "00042", "00043"]
-    session = install_session(*(ProfileResponse(_html(number)) for number in licenses))
+    responses = [ProfileResponse(_html(number)) for number in licenses]
+    if transient_failure:
+        responses.insert(0, ProfileResponse(status=500))
+    session = install_session(*responses)
     clock = SimpleNamespace(now=100.0)
     request_starts = []
     original_get = session.get
@@ -505,7 +570,7 @@ async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, ins
         sleep=advance_clock, get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now),
     ))
     await acquisition.acquire_profiles([{"license_number": number} for number in licenses], tmp_path / "new", AsyncMock())
-    assert request_starts == [100.0, 102.0, 104.0]
+    assert request_starts == ([100.0, 102.0, 104.0, 106.0] if transient_failure else [100.0, 102.0, 104.0])
 
 
 def _narrowed_html(surname, *, returned_license="0", found=True, year="2001"):
@@ -532,6 +597,24 @@ def _narrowed_envelope(root, bodies):
             "license_number": "0", "query_scope": scope, "oversized_attempt": attempt_by_field,
             "responses": [_envelope("0", body=body, source_url=acquisition.source_url("0", last_name=query["last_name"]))
                           for query, body in zip(scope["queries"], bodies, strict=True)]}
+
+
+async def test_narrowed_query_uses_same_bounded_status_retry(tmp_path, install_session, monkeypatch):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    root = _narrowing_root()
+    root["candidates"] = root["candidates"][:1]
+    prefix, body = b"x" * 2001, _narrowed_html("Example")
+    failed = ProfileResponse(status=500)
+    session = install_session(ProfileResponse(chunks=[prefix]), failed, ProfileResponse(body))
+    destination = tmp_path / "new"
+    metrics = await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert session.requests == [(acquisition.source_url("0"), {"allow_redirects": False}),
+                                *[(acquisition.source_url("0", last_name="Example"), {"allow_redirects": False})] * 2]
+    response = acquisition.read_response(destination / "0.json", "0", candidates=root["candidates"])
+    assert failed.chunks_read == 0 and session.closed
+    assert response["responses"][0]["body_text"].encode() == body
+    assert metrics["response_bytes"] == len(prefix) + len(body) and metrics["narrowed_queries"] == 1
+    assert metrics["retained_http_responses"] == 2 and not (destination / "0.narrowed/1.failed.json").exists()
 
 
 async def test_oversized_root_retains_all_four_queries_and_replays_without_http(tmp_path, install_session, monkeypatch):

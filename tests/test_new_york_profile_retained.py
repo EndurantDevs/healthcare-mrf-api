@@ -305,10 +305,14 @@ def _held_pins(destination):
     }
 
 
-@pytest.mark.parametrize("total", [0, 2, 11])
-async def test_held_replay_matches_actual_acquisition_without_profile_or_inventory_claim(source_session, total):
-    session = source_session(SourceResponse(_search(total)))
+@pytest.mark.parametrize("total,has_null_physicians", [(0, False), (0, True), (2, False), (11, False)])
+async def test_held_replay_matches_actual_acquisition_without_profile_or_inventory_claim(source_session, total, has_null_physicians):
+    response = _search(total)
+    if has_null_physicians:
+        response["data"]["physicians"] = None
+    session = source_session(SourceResponse(response))
     acquired = await _acquire(session)
+    original_by_name = {path.name: path.read_bytes() for path in session.destination.iterdir()}
     pins = _held_pins(session.destination)
     assert (
         retained.read_held_acquisition(session.destination, **pins)
@@ -325,6 +329,21 @@ async def test_held_replay_matches_actual_acquisition_without_profile_or_invento
     assert len(session.requests) == 1
     with pytest.raises(ValueError, match="not_acquired"):
         retained.read_acquisition(session.destination, manifest_sha256=pins["manifest_sha256"])
+    assert {path.name: path.read_bytes() for path in session.destination.iterdir()} == original_by_name
+
+
+async def test_failed_empty_search_receipt_cannot_be_reclassified_as_held(source_session):
+    response = _search(0)
+    response["data"]["physicians"] = None
+    session = source_session(SourceResponse(response))
+    await _acquire(session)
+    (session.destination / "result.json").write_bytes(encoded_json({
+        "outcome": "failed", "error_type": "ValueError", "reason": "new_york_acquisition_search_incomplete",
+    }))
+    original_by_name = {path.name: path.read_bytes() for path in session.destination.iterdir()}
+    with pytest.raises(ValueError, match="result_changed"):
+        retained.read_held_acquisition(session.destination, **_held_pins(session.destination))
+    assert {path.name: path.read_bytes() for path in session.destination.iterdir()} == original_by_name
 
 
 @pytest.mark.parametrize("name", retained.HELD_FILES)

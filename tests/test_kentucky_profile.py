@@ -8,11 +8,13 @@ import hashlib
 import importlib
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import live_progress
 from process.control_cancel import ImportCancelledError
 from tests.test_kentucky_profile_rows import CANDIDATE, FIELDS, response_html
 
@@ -223,13 +225,15 @@ async def test_artifact_accounts_for_not_found_without_inventing_facts(harness):
     assert len(harness.rows_for(worker.ProviderProfileFact)) == 2
 
 
-@pytest.mark.parametrize("failure", [ValueError("synthetic transport failure"), asyncio.CancelledError("synthetic transport failure")])
-async def test_acquisition_failure_keeps_checkpoint_without_finishing(harness, failure):
+@pytest.mark.parametrize("failure, attempts", [(ValueError("synthetic transport failure"), 1),
+                                             (asyncio.CancelledError("synthetic transport failure"), 1),
+                                             (worker.acquisition.ProfileHTTPStatusError(500), 3)])
+async def test_acquisition_failure_keeps_checkpoint_without_finishing(harness, failure, attempts):
     harness.responses_by_license["C0007"] = failure
-    with pytest.raises(type(failure), match="synthetic transport failure"):
+    with pytest.raises(type(failure), match=str(failure)):
         await worker.import_profiles(harness.ctx, harness.task)
     run_id = harness.store_by_name["claim_run"].call_args.args[0]["run_id"]
-    assert harness.requests == ["00042", "C0007"]
+    assert harness.requests == ["00042", *["C0007"] * attempts]
     assert worker.acquisition.read_response(harness.artifact_root / run_id / "profiles" / "00042.json", "00042") == harness.responses_by_license["00042"]
     assert not (harness.artifact_root / run_id / "manifest.json").exists()
     assert harness.writes == []
@@ -463,6 +467,46 @@ async def test_resume_uses_frozen_cohort_and_exact_bytes_in_new_directory(harnes
         _, new_facts = worker._source_rows(root, harness.responses_by_license[root["license_number"]], artifact, 1)
         assert old_facts[0]["logical_fact_key"] == new_facts[0]["logical_fact_key"]
         assert old_facts[0]["fact_id"] != new_facts[0]["fact_id"]
+
+
+async def test_resume_reports_retained_validation_before_acquisition(harness, monkeypatch):
+    previous_run, retained_directory = _retained_run(harness, limit=None)
+    missing_license = harness.cohort["roots"][-1]["license_number"]
+    (retained_directory / "profiles" / f"{missing_license}.json").unlink()
+    bytes_by_name = {path.name: path.read_bytes() for path in (retained_directory / "profiles").iterdir()}
+    monkeypatch.setattr(worker.store, "read_resume_run", AsyncMock(return_value=previous_run))
+    observations = []
+    merged_events = []
+
+    def observe(**event):
+        merged_event_by_field = dict(event)
+        live_progress._merge_previous_progress(merged_event_by_field, merged_events[-1] if merged_events else {}, now=datetime.now(UTC))
+        assert (merged_event_by_field["phase"], merged_event_by_field["done"]) == (event["phase"], event["done"])
+        merged_events.append(merged_event_by_field)
+        run_id = event["metrics"]["provider_profile_run_id"]
+        destination = harness.artifact_root / run_id / "profiles"
+        observations.append((event["phase"], event["done"], event["total"], len(list(destination.glob("*.json")))))
+        if event["phase"] == "checking_retained":
+            assert harness.requests == [] and not destination.exists()
+        elif event["phase"] == "acquiring":
+            assert event["done"] == len(list(destination.glob("*.json")))
+
+    worker.enqueue_live_progress.side_effect = observe
+    await worker.import_profiles(harness.ctx, {**harness.task, "resume_from": previous_run["run_id"]})
+
+    phases = [phase for phase, *_ in observations]
+    acquisition_start = phases.index("acquiring")
+    assert all(phase == "checking_retained" for phase in phases[:acquisition_start])
+    assert observations[acquisition_start - 1] == ("checking_retained", 3, 3, 0)
+    assert observations[acquisition_start] == ("acquiring", 0, 3, 0)
+    assert [observation for observation in observations if observation[0] == "acquiring"][-1] == ("acquiring", 3, 3, 3)
+    assert harness.requests == [missing_license]
+    assert {path.name: path.read_bytes() for path in (retained_directory / "profiles").iterdir()} == bytes_by_name
+    metrics = harness.finish.call_args.args[3]
+    assert metrics["responses"] == 3 and metrics["reused_responses"] == 2
+    delayed_validation_by_field = dict(merged_events[acquisition_start - 1])
+    live_progress._merge_previous_progress(delayed_validation_by_field, merged_events[-1], now=datetime.now(UTC))
+    assert (delayed_validation_by_field["phase"], delayed_validation_by_field["done"]) == ("retaining", 3)
 
 
 async def test_changed_resume_cohort_is_refused_before_new_claim(harness, monkeypatch):
