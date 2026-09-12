@@ -342,6 +342,8 @@ async def test_roster_identity_change_refuses_retention(tmp_path, monkeypatch, s
     ("field", "roster_name", "profile_name", "matches"),
     [(field, "O\\'Example", "O'Example", True) for field in ("First", "Middle", "Last")]
     + [
+        ("Last", "O\\'Example", "O\\'Example", True),
+        ("Last", "O\\\\'Example", "O\\\\'Example", True),
         ("Last", "O\\'Example", "O'Other", False),
         ("Last", "O\\'Example", "OExample", False),
         ("Last", "O\\\\'Example", "O'Example", False),

@@ -232,8 +232,9 @@ def _retain_roster(record, root, artifact):
     roster = root["originals"][0]["raw_payload"]
     for source, profile in (("First", "First_Name"), ("Middle", "Middle_Name"), ("Last", "Last_Name")):
         # The roster CSV may escape apostrophes; retain its literal value below.
-        roster_name = roster[source].replace("\\'", "'")
-        if " ".join(roster_name.split()).casefold() != " ".join(profile_by_field[profile].split()).casefold():
+        roster_name = " ".join(roster[source].split()).casefold()
+        profile_name = " ".join(profile_by_field[profile].split()).casefold()
+        if roster_name != profile_name and roster_name.replace("\\'", "'") != profile_name:
             raise ValueError("rhode_island_profile_roster_identity_changed")
     record["raw_payload"]["roster_occurrences"] = root["originals"]
     record["normalized_payload"].update(
