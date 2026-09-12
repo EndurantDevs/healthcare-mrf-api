@@ -174,10 +174,9 @@ def _candidate_io(request):
     }
 
 
-def _report(storage_generation="shared_blocks_v3", *, rate_limit=2.0):
-    """Build a valid report with current or historical request pacing."""
+def _validated_report_aggregate(plan):
+    """Validate synthetic responses matching every planned source occurrence."""
 
-    plan = _plan()
     partition_results = tuple(
         contract.build_partitioned_candidate_audit_result(
             request=request,
@@ -191,10 +190,17 @@ def _report(storage_generation="shared_blocks_v3", *, rate_limit=2.0):
         )
         for request in plan.requests
     )
-    aggregate = contract.validate_partitioned_candidate_audit_results(
+    return contract.validate_partitioned_candidate_audit_results(
         plan,
         partition_results,
     )
+
+
+def _report(storage_generation="shared_blocks_v3", *, rate_limit=2.0):
+    """Build a valid report with current or historical request pacing."""
+
+    plan = _plan()
+    aggregate = _validated_report_aggregate(plan)
     request_count = plan.request_count
     metrics = audit.PartitionedAuditHttpMetrics(
         planned_request_count=request_count,
