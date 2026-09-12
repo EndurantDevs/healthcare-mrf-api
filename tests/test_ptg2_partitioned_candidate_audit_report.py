@@ -175,6 +175,8 @@ def _candidate_io(request):
 
 
 def _report(storage_generation="shared_blocks_v3", *, rate_limit=2.0):
+    """Build a valid report with current or historical request pacing."""
+
     plan = _plan()
     partition_results = tuple(
         contract.build_partitioned_candidate_audit_result(
