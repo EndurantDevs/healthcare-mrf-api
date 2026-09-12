@@ -432,7 +432,7 @@ async def run_partitioned_candidate_audit(
     progress_callback: PartitionProgressCallback | None = None,
     failure_callback: PartitionFailureCallback | None = None,
 ) -> dict[str, Any]:
-    """Execute every exact partition once at two request starts per second."""
+    """Execute every exact partition once at the configured request-start rate."""
 
     plan = build_candidate_audit_partition_plan(
         audit_target=audit_target,

@@ -908,7 +908,7 @@ release. Do not delete shared PostgreSQL tables or block rows directly.
   selected occurrence challenges and its served-sample validation, ran every
   exact max-100 partition once on `aiohttp`/`uvloop`, and recorded matching
   planned, actual, and completed request counts, zero failed requests, zero
-  retries, at most two starts per second, and zero request-local repeated-work
+  retries, at most 50 starts per second with two requests in flight, and zero request-local repeated-work
   ledger counters.
 - Cold first-page p95 is at or below 40 ms separately for matched-positive,
   negative, and deterministic-random requests.
