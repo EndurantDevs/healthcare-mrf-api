@@ -43,7 +43,7 @@ def _profile_body(license_number="654321", **changes):
     }
 
 
-def _parse(profile_by_field, license_number="654321"):
+def _parse(profile_by_field, license_number="654321", *, evidence_changes=None):
     body = profile.encoded_json(profile_by_field)
     evidence_by_field = {
         "run_id": "synthetic-run",
@@ -52,6 +52,7 @@ def _parse(profile_by_field, license_number="654321"):
         "downloaded_at": "2026-09-11T00:00:00+00:00",
         "content_sha256": hashlib.sha256(body).hexdigest(),
     }
+    evidence_by_field.update(evidence_changes or {})
     return profile.parse_profile(body, license_number=license_number, evidence=evidence_by_field)
 
 
@@ -173,6 +174,33 @@ def test_source_facts_preserve_meanings():
 def test_invalid_body_type_is_rejected(body):
     with pytest.raises(ValueError, match="body_invalid"):
         profile.parse_profile(body, license_number="654321", evidence={})
+
+
+@pytest.mark.parametrize(
+    "changes,error",
+    [
+        ({"run_id": ""}, "evidence_invalid"),
+        ({"content_sha256": "0" * 64}, "evidence_mismatch"),
+        ({"source_url": profile.request_descriptor("123456")["source_url"]}, "evidence_mismatch"),
+        ({"downloaded_at": "not-a-date"}, "timestamp_invalid"),
+        ({"downloaded_at": "2026-09-11T00:00:00+01:00"}, "timestamp_invalid"),
+    ],
+)
+def test_valid_body_requires_matching_evidence(changes, error):
+    with pytest.raises(ValueError, match=f"^new_york_nysed_{error}$"):
+        _parse(_profile_body(), evidence_changes=changes)
+
+
+@pytest.mark.asyncio
+async def test_installed_aiohttp_disables_implicit_retry(monkeypatch, tmp_path):
+    async def stop_before_request(session, *_args):
+        assert isinstance(session, acquisition.aiohttp.ClientSession)
+        assert session._retry_connection is False
+        raise RuntimeError("synthetic stop before request")
+
+    monkeypatch.setattr(acquisition, "_fetch_profile", stop_before_request)
+    with pytest.raises(RuntimeError, match="^synthetic stop before request$"):
+        await acquisition._acquire_profile(tmp_path, {}, profile.request_descriptor("654321"), PUBLIC_HEADER)
 
 
 @pytest.mark.parametrize("month", ["March", "May", "June", "September", "December"])
