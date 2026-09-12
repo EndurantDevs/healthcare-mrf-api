@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import traceback
 from types import SimpleNamespace
 from typing import Any
@@ -16,11 +17,16 @@ from curl_cffi import CurlHttpVersion, CurlOpt
 
 from process import hospital_price_source_download
 from process.ptg_parts import source_download
+from process.ptg_parts.artifacts import PTG2ArtifactStore
 from process.ptg_parts.domain import PTG2HeadMetadata
 from process.url_security import UnsafeUrlError
 from tests.hospital_price_control_support import (
     acquisition_module as _acquisition_module,
 )
+from tests.ptg2_source_download_security_support import (
+    _Response as _AiohttpResponse,
+)
+from tests.ptg2_source_download_security_support import _Session as _AiohttpSession
 
 
 class _Response:
@@ -356,6 +362,337 @@ async def test_proxied_download_preserves_the_validated_origin_hostname(
     assert requests == ["CONNECT hospital.example:443 HTTP/1.1"]
 
 
+@pytest.mark.asyncio
+async def test_proxy_range_probe_is_bounded_and_authenticated(monkeypatch):
+    url = "https://hospital.example/file.csv"
+    response = _AiohttpResponse(
+        status=206,
+        url=url,
+        headers={"Content-Range": "bytes 0-0/4", "ETag": '"stable"'},
+        chunks=[b"a"],
+    )
+    session = _AiohttpSession(response)
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setenv(
+        source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV,
+        "hospital.example",
+    )
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+
+    assert await source_download._probe_http_range_support(
+        url,
+        user_agent="Hospital importer/1.0",
+        proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+    ) == (True, 4, '"stable"', url)
+    assert len(session.calls) == 1
+    _, _, options = session.calls[0]
+    assert options["headers"] == {"Range": "bytes=0-0"}
+    assert options["proxy"] == "http://127.0.0.1:39081"
+    assert options["proxy_auth"].login == "hospital-test"
+    assert options["proxy_auth"].password == "test-token"
+    assert options["allow_redirects"] is False
+    assert options["ssl"] is True
+    assert response.released
+
+
+@pytest.mark.asyncio
+async def test_exported_proxy_range_helper_rejects_plain_http_before_network(
+    tmp_path, monkeypatch
+):
+    def unexpected_session(*_args):
+        raise AssertionError("plain HTTP must fail before proxy range I/O")
+
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        unexpected_session,
+    )
+    ptg = importlib.import_module("process.ptg")
+
+    with pytest.raises(UnsafeUrlError, match="requires HTTPS"):
+        await ptg._download_raw_artifact_ranges(
+            url="http://hospital.example/file.csv",
+            partial_path=tmp_path / "artifact.part",
+            total_bytes=1,
+            etag='"stable"',
+            max_bytes=1,
+            started_at=0,
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+        )
+
+
+@pytest.mark.asyncio
+async def test_proxy_range_transport_preserves_origin_connect_hostname(monkeypatch):
+    requests = []
+    proxy_headers = []
+
+    async def proxy(reader, writer):
+        requests.append((await reader.readline()).decode().rstrip())
+        while (line := await reader.readline()) != b"\r\n":
+            proxy_headers.append(line.decode().rstrip())
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    proxy_port = server.sockets[0].getsockname()[1]
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    try:
+        assert not (await source_download._probe_http_range_support(
+            "https://hospital.example/file.csv",
+            proxy_url=(
+                f"http://hospital-test:test-token@127.0.0.1:{proxy_port}"
+            ),
+        ))[0]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert requests == ["CONNECT hospital.example:443 HTTP/1.1"]
+    assert any(
+        header.lower().startswith("proxy-authorization: basic ")
+        for header in proxy_headers
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_ranges_resume_failed_chunks_with_stable_etag(
+    tmp_path, monkeypatch
+):
+    url = "https://hospital.example/file.csv"
+    artifact_bytes = b"abcd"
+    attempts_by_range = {}
+
+    def respond(_method, _url, options):
+        byte_range = options["headers"]["Range"]
+        start, end = map(int, byte_range.removeprefix("bytes=").split("-"))
+        attempts_by_range[byte_range] = attempts_by_range.get(byte_range, 0) + 1
+        chunk = artifact_bytes[start : end + 1]
+        if byte_range == "bytes=2-3" and attempts_by_range[byte_range] == 1:
+            chunk = chunk[:1]
+        return _AiohttpResponse(
+            status=206,
+            url=url,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(artifact_bytes)}",
+                "ETag": '"stable"',
+            },
+            chunks=[chunk],
+        )
+
+    session = _AiohttpSession(respond)
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+    monkeypatch.setattr(source_download, "_range_download_chunk_bytes", lambda: 2)
+    monkeypatch.setattr(source_download, "_range_download_tasks", lambda: 1)
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 1)
+    monkeypatch.setattr(source_download, "_download_retry_delay_seconds", lambda: 0)
+    path = tmp_path / "artifact.part"
+
+    await source_download._download_raw_artifact_ranges(
+        url=url,
+        partial_path=path,
+        total_bytes=len(artifact_bytes),
+        etag='"stable"',
+        max_bytes=len(artifact_bytes),
+        started_at=0,
+        proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+    )
+
+    assert path.read_bytes() == artifact_bytes
+    assert attempts_by_range == {"bytes=0-1": 1, "bytes=2-3": 2}
+    assert all(
+        options["headers"]["If-Match"] == '"stable"'
+        for _, _, options in session.calls
+    )
+    assert all(options["ssl"] is True for _, _, options in session.calls)
+    assert not source_download._range_sidecar_path(path).exists()
+
+
+@pytest.mark.asyncio
+async def test_proxy_range_timeout_after_body_is_preserved_over_direct_403(
+    tmp_path, monkeypatch
+):
+    url = "https://hospital.example/file.csv"
+    response = _AiohttpResponse(
+        status=206,
+        url=url,
+        headers={
+            "Content-Range": "bytes 0-1/2",
+            "ETag": '"stable"',
+        },
+    )
+
+    class PartialTimeoutContent:
+        async def iter_chunked(self, _size):
+            yield b"a"
+            raise aiohttp.ServerTimeoutError("range timed out")
+
+    response.content = PartialTimeoutContent()
+    session = _AiohttpSession(response)
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+    monkeypatch.setattr(source_download, "_range_download_chunk_bytes", lambda: 2)
+    monkeypatch.setattr(source_download, "_range_download_tasks", lambda: 1)
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 0)
+
+    with pytest.raises(aiohttp.ServerTimeoutError) as failure:
+        await source_download._download_raw_artifact_ranges(
+            url=url,
+            partial_path=tmp_path / "artifact.part",
+            total_bytes=2,
+            etag='"stable"',
+            max_bytes=2,
+            started_at=0,
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+        )
+
+    assert failure.value._ptg2_response_body_started is True
+    assert not source_download.is_prebody_connect_or_timeout(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_hospital_proxy_keeps_postbody_range_failure_over_direct_403(
+    monkeypatch,
+):
+    url = "https://hospital.example/file.csv"
+    proxy_failure = aiohttp.ServerTimeoutError("range timed out")
+    proxy_failure._ptg2_response_body_started = True
+
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_PROXY",
+        "http://hospital-test:test-token@127.0.0.1:39081",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+        "hospital.example",
+    )
+    direct_error = RuntimeError("blocked outside the US")
+    direct_error.status = 403
+    direct_error._ptg2_response_body_started = False
+
+    async def direct_download(*_args, **_options):
+        raise direct_error
+
+    async def proxy_download(*_args, **_options):
+        raise proxy_failure
+
+    monkeypatch.setattr(
+        hospital_price_source_download,
+        "download_raw_artifact_via_proxy",
+        proxy_download,
+    )
+
+    with pytest.raises(aiohttp.ServerTimeoutError) as hospital_failure:
+        await hospital_price_source_download.download_hospital_source(
+            direct_download,
+            url,
+            object(),
+            2,
+            "Hospital importer/1.0",
+        )
+    assert hospital_failure.value is proxy_failure
+
+
+@pytest.mark.asyncio
+async def test_proxy_range_malformed_zip_preserves_body_marker(
+    tmp_path, monkeypatch
+):
+    url = "https://hospital.example/file.zip"
+    artifact_bytes = b"not a zip"
+
+    def respond(_method, _url, options):
+        start, end = map(
+            int,
+            options["headers"]["Range"].removeprefix("bytes=").split("-"),
+        )
+        return _AiohttpResponse(
+            status=206,
+            url=url,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(artifact_bytes)}",
+                "ETag": '"stable"',
+            },
+            chunks=[artifact_bytes[start : end + 1]],
+        )
+
+    session = _AiohttpSession(respond)
+
+    async def safe(_url):
+        return None
+
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    monkeypatch.setattr(
+        source_download,
+        "_download_session_for_transport",
+        lambda *_args: session,
+    )
+    monkeypatch.setattr(source_download, "_range_download_min_bytes", lambda: 1)
+    monkeypatch.setattr(
+        source_download,
+        "_range_download_chunk_bytes",
+        lambda: len(artifact_bytes),
+    )
+
+    with pytest.raises(
+        source_download._UnexpectedArtifactContainerError,
+        match="not a readable ZIP container",
+    ) as failure:
+        await source_download.download_raw_artifact_via_proxy(
+            url,
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+            store=PTG2ArtifactStore(tmp_path / "store"),
+            max_bytes=len(artifact_bytes),
+        )
+
+    assert failure.value._ptg2_response_body_started is True
+
+
+def test_proxy_ranges_require_the_observed_etag_on_every_chunk():
+    response = SimpleNamespace(
+        status=206,
+        headers={"Content-Range": "bytes 0-0/1"},
+    )
+    with pytest.raises(source_download._UnsafeRangeResponseError, match="changed ETag"):
+        source_download._validate_range_response(
+            response,
+            url="https://hospital.example/file.csv",
+            expected_start=0,
+            expected_end=0,
+            expected_total=1,
+            expected_etag='"stable"',
+            require_response_etag=True,
+        )
+
+
 @pytest.mark.parametrize(
     "code",
     [
@@ -514,6 +851,48 @@ async def test_proxy_transport_skips_head_and_forces_uncached_download(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_proxy_nonrange_fallback_keeps_the_single_get_cap(
+    tmp_path, monkeypatch
+):
+    browser_requests = []
+
+    async def no_ranges(*_args, **_options):
+        return None
+
+    async def browser_download(**options):
+        browser_requests.append(options)
+        return object()
+
+    monkeypatch.setattr(
+        source_download,
+        "_try_ranged_raw_artifact",
+        no_ranges,
+    )
+    monkeypatch.setattr(
+        source_download,
+        "_download_raw_artifact_browser",
+        browser_download,
+    )
+
+    downloaded_artifact = await source_download._download_raw_to_path(
+        "https://hospital.example/file.csv",
+        tmp_path / "artifact.part",
+        head=PTG2HeadMetadata(url="https://hospital.example/file.csv"),
+        max_bytes=1000,
+        started_at=0,
+        exact_get_evidence=False,
+        transport=source_download._DownloadTransport(
+            proxy_url="http://hospital-test:test-token@127.0.0.1:39081",
+            proxy_single_get_max_bytes=100,
+        ),
+        failure_digest=hashlib.sha256(),
+    )
+
+    assert downloaded_artifact is not None
+    assert browser_requests[0]["max_bytes"] == 100
+
+
+@pytest.mark.asyncio
 async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     monkeypatch,
 ):
@@ -522,6 +901,7 @@ async def test_hospital_download_falls_back_once_to_configured_us_proxy(
     monkeypatch.setenv("HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS", "cdn.hs.uab.edu")
     requests = []
     downloaded = object()
+    max_bytes = 1024 * 1024**2
 
     async def download(_url, **options):
         requests.append(options)
@@ -543,13 +923,14 @@ async def test_hospital_download_falls_back_once_to_configured_us_proxy(
         download,
         "https://cdn.hs.uab.edu/static/hospital.zip",
         object(),
-        1024,
+        max_bytes,
         "Mozilla/5.0",
     ) is downloaded
     assert len(requests) == 2
     assert "proxy_url" not in requests[0]
     assert requests[1]["proxy_url"] == proxy_url
-    assert requests[1]["max_bytes"] == 1024
+    assert requests[1]["max_bytes"] == max_bytes
+    assert requests[1]["single_get_max_bytes"] == 512 * 1024**2
 
 
 @pytest.mark.parametrize(
