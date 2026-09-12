@@ -149,9 +149,7 @@ def test_silver_lake_alias_and_facility_selectors_preserve_boundaries():
         "hospital-007366",
     }
     assert hospital_by_id["hospital-003648"]["alias_of"] == "hospital-005795"
-    assert hospital_by_id["hospital-003648"]["locator_mrf_url"] == ltach_url
-    assert hospital_by_id["hospital-005795"]["locator_mrf_url"] == ltach_url
-    assert hospital_by_id["hospital-007366"]["locator_mrf_url"] == dual_diagnosis_url
+    assert all("locator_mrf_url" not in hospital for hospital in cohort)
     assert registry.hospital_hpt_group_ids("hospital-003648") == (
         "hospital-005795",
         "hospital-003648",

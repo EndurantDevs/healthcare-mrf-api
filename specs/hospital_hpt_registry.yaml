@@ -19368,7 +19368,6 @@ hospitals:
 - hospital_id: hospital-005795
   name: Silver Lake Hospital LTACH
   cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
-  locator_mrf_url: https://www.silverlakehospital.org/price-transparency/272315199-1104144641_silver-lake-hospital_standardcharges.csv
 - hospital_id: hospital-005796
   name: Silver Oaks Behavioral Hospital
   cms_hpt_url: https://silveroaksbehavioralhospital.com/cms-hpt.txt
@@ -24626,4 +24625,3 @@ hospitals:
 - hospital_id: hospital-007366
   name: "Silver Lake Hospital Dual Diagnosis"
   cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
-  locator_mrf_url: https://www.silverlakehospital.org/price-transparency/272315199-1376294207_silver-lake-hospital_standardcharges.csv
