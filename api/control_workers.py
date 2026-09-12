@@ -87,6 +87,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",)),
     WorkerSpec("arq:TennesseeTDHProfile", "process.TennesseeTDHProfile", ("tennessee-tdh-profile",)),
     WorkerSpec("arq:RhodeIslandDOHProfile", "process.RhodeIslandDOHProfile", ("rhode-island-doh-profile",)),
+    WorkerSpec("arq:NewYorkNYPPProfile", "process.NewYorkNYPPProfile", ("new-york-nypp-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),
     WorkerSpec("arq:PlacesZcta", "process.PlacesZcta", ("places-zcta",)),
