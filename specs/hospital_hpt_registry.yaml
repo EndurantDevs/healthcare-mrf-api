@@ -17113,6 +17113,7 @@ hospitals:
 - hospital_id: hospital-005115
   name: Phoebe Putney Memorial Hospital & North Campus
   cms_hpt_url: https://phoebehealth.com/cms-hpt.txt
+  locator_name: Phoebe Putney
 - hospital_id: hospital-005116
   name: Phoebe Putney North Campus
   cms_hpt_url: https://phoebehealth.com/cms-hpt.txt
