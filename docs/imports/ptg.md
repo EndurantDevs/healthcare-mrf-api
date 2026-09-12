@@ -836,7 +836,7 @@ capacity.
 The contention run lasts at least 30 minutes with every configured build and
 audit lane active. It includes at least 3,000 requests and 1 request/second of
 normal API traffic plus every exact V4 audit partition, paced at no more than
-two request starts per second per audit.
+50 request starts per second per audit.
 Audit evidence separately reconciles the server-side occurrence, persisted
 sample, unique block, witness-entry, logical-payload, and candidate-projection
 counts, with zero repeated-work counters. It must use

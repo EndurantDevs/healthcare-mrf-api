@@ -48,7 +48,7 @@ def test_strict_ptg_docs_define_bounded_candidate_audit_contract():
         assert "1,000" in text
         assert "10,001" not in text
         assert re.search(r"(?:at most 100|max-100)", text, re.IGNORECASE)
-        assert re.search(r"two (?:request starts|requests) per second", text, re.I)
+        assert re.search(r"50 (?:request starts|requests) per second", text, re.I)
         assert re.search(r"(?:zero redirects|redirects[^.]*exactly 0)", text, re.I)
         assert re.search(
             r"(?:zero in-attempt retries|in-attempt retries[^.]*exactly 0)",
