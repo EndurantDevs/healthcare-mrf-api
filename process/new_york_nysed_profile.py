@@ -36,6 +36,8 @@ TEXT_LABELS = {
     "schoolDegreeDate": "Degree Date",
     "licenseNumber": "License Number",
 }
+EDUCATION_FIELDS = ("schoolName", "schoolDegreeDate")
+OPTIONAL_TEXT_FIELDS = (*EDUCATION_FIELDS, "dateOfLicensure", "registeredThroughDate")
 UNREPORTED = {"", "none", "n/a", "unknown", "not reported", "not available", "not applicable"}
 MONTHS = (
     "January",
@@ -85,17 +87,31 @@ def request_descriptor(license_number):
 def _wrapped_field(profile_by_field, field, label, value_type):
     wrapped = profile_by_field.get(field)
     _require(
-        isinstance(wrapped, dict) and wrapped.get("label") == label and isinstance(wrapped.get("value"), value_type),
+        isinstance(wrapped, dict)
+        and wrapped.get("label") == label
+        and "value" in wrapped
+        and isinstance(wrapped["value"], value_type),
         "field_schema_invalid",
     )
     return wrapped["value"]
+
+
+def _optional_text(profile_by_field, field, label):
+    if field not in profile_by_field:
+        return ""
+    return _wrapped_field(profile_by_field, field, label, (str, type(None))) or ""
 
 
 def _validated_profile(body, license_number):
     _require(isinstance(body, bytes) and 0 < len(body) <= MAX_RESPONSE_BYTES, "body_invalid")
     request_descriptor(license_number)
     profile_by_field = decoded_json_object(body)
-    text_by_field = {field: _wrapped_field(profile_by_field, field, label, str) for field, label in TEXT_LABELS.items()}
+    text_by_field = {
+        field: _optional_text(profile_by_field, field, label)
+        if field in OPTIONAL_TEXT_FIELDS
+        else _wrapped_field(profile_by_field, field, label, str)
+        for field, label in TEXT_LABELS.items()
+    }
     _require(
         profile_by_field.get("professionCode") == PROFESSION_CODE
         and text_by_field["profession"] == "Medicine (060)"
@@ -218,7 +234,7 @@ def _profile_facts(source_record, text_by_field, evidence, observed_on):
                 "education",
                 "education_history",
                 education_value,
-                {field: profile_by_field[field] for field in ("schoolName", "schoolDegreeDate")},
+                {field: profile_by_field[field] for field in EDUCATION_FIELDS if field in profile_by_field},
                 education_flags,
             )
         )
@@ -249,6 +265,7 @@ def _profile_facts(source_record, text_by_field, evidence, observed_on):
             {
                 field: profile_by_field[field]
                 for field in ("profession", "licenseNumber", "status", "dateOfLicensure", "registeredThroughDate")
+                if field in profile_by_field
             },
             license_flags,
         )

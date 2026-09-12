@@ -193,6 +193,59 @@ async def test_full_mixed_cohort_preserves_sources_holds_and_support(managed_cas
     assert all(PUBLIC_HEADER.encode() not in path.read_bytes() for path in state.directory.rglob("*.json"))
 
 
+@pytest.mark.parametrize(
+    "legal_name,expected_npi,expected_reason",
+    [
+        ("EXAMPLE ALEX", 1000000004, "unique_exact_license_corroborated_name"),
+        ("OTHER ALEX", None, "nysed_identity_conflict"),
+    ],
+)
+async def test_unreported_support_education_preserves_identity_guards(
+    managed_case, legal_name, expected_npi, expected_reason
+):
+    state = managed_case([{"license": "111111"}])
+    profile_by_field = _profile_body("111111", name=legal_name, schoolName=None)
+    del profile_by_field["schoolDegreeDate"]
+    state.sessions[1].response = NysedResponse(profile_by_field)
+
+    metrics_by_field = await worker.import_profiles({}, TASK)
+
+    assert metrics_by_field["acquired_profiles"] == metrics_by_field["facts"] == 1
+    assert not state.pending and not state.failed and all(session.closed for session in state.sessions)
+    bundle_by_field = json.loads((state.directory / "manifest.json").read_bytes())
+    support_by_field = bundle_by_field["acquisition"]["nysed_support"]["111111"]
+    assert support_by_field["receipt"]["outcome"] == "acquired" and support_by_field["receipt"]["fact_count"] == 1
+    acquisition_by_field = worker.nysed.read_acquisition(
+        state.directory / "nysed" / "111111", receipt_sha256=support_by_field["receipt_sha256"]
+    )
+    assert acquisition_by_field["source_record"]["raw_payload"] == profile_by_field
+    assert [fact["category"] for fact in acquisition_by_field["facts"]] == ["licenses"]
+    assert support_by_field["source_identity"]["legal_name"] == legal_name
+    source_records = [
+        retained_row
+        for model, retained_rows, _ in state.writes
+        if model == worker.ProviderProfileSourceRecord
+        for retained_row in retained_rows
+    ]
+    assert len(source_records) == 1 and source_records[0]["matched_npi"] == expected_npi
+    facts = [
+        retained_row
+        for model, retained_rows, _ in state.writes
+        if model == worker.ProviderProfileFact
+        for retained_row in retained_rows
+    ]
+    assert len(facts) == 1 and facts[0]["npi"] == expected_npi
+    binding_by_field = source_records[0]["match_evidence"]["registry_binding"]
+    assert binding_by_field["reason"] == expected_reason
+    corroboration_by_field = binding_by_field["nysed_corroboration"]
+    assert corroboration_by_field["receipt_sha256"] == support_by_field["receipt_sha256"]
+    assert all(
+        corroboration_by_field[field] == original_value
+        for field, original_value in support_by_field["source_identity"].items()
+    )
+    assert corroboration_by_field["header_legal_name_matches"] is (expected_npi is not None)
+
+
 async def test_complete_cohort_is_not_limited_to_one_hundred(managed_case):
     cases = [{"license": str(100000 + index), **({"total": 0} if index else {})} for index in range(102)]
     state = managed_case(cases)

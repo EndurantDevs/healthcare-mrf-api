@@ -215,6 +215,56 @@ def test_education_sentinels_are_not_facts(reported):
     assert [fact["category"] for fact in facts] == ["licenses"]
 
 
+@pytest.mark.parametrize("missing_school", [False, True])
+@pytest.mark.parametrize("missing_date", [False, True])
+def test_unreported_education_preserves_profile_without_education_fact(missing_school, missing_date):
+    source = _profile_body(schoolName=None, schoolDegreeDate=None)
+    for field, missing in (("schoolName", missing_school), ("schoolDegreeDate", missing_date)):
+        if missing:
+            del source[field]
+    record, facts = _parse(source)
+    assert record["raw_payload"] == source
+    assert record["matched_npi"] is None and record["match_status"] == "unmatched"
+    assert [fact["category"] for fact in facts] == ["licenses"]
+    assert facts[0]["value_json"]["license_status"] == "Registered"
+
+
+@pytest.mark.parametrize("field", profile.EDUCATION_FIELDS)
+@pytest.mark.parametrize("missing", [False, True])
+def test_partial_education_retains_only_reported_fields(field, missing):
+    source = _profile_body(**{field: None})
+    if missing:
+        del source[field]
+    record, facts = _parse(source)
+    education = facts[0]
+    assert record["raw_payload"] == source and education["category"] == "education"
+    assert ("institution" in education["value_json"]) == (field != "schoolName")
+    assert ("graduation_year" in education["value_json"]) == (field != "schoolDegreeDate")
+    assert education["source_json"]["raw_fields"] == {
+        name: source[name] for name in profile.EDUCATION_FIELDS if name in source
+    }
+
+
+@pytest.mark.parametrize(
+    "field,normalized_field",
+    [("dateOfLicensure", "date_of_licensure"), ("registeredThroughDate", "registered_through_date")],
+)
+@pytest.mark.parametrize("missing", [False, True])
+def test_unreported_license_dates_preserve_reported_facts(field, normalized_field, missing):
+    source = _profile_body(**{field: None})
+    if missing:
+        del source[field]
+    record, facts = _parse(source)
+    assert record["raw_payload"] == source
+    assert facts[0]["value_json"]["institution"] == "Example Medical School"
+    license_fact = facts[1]
+    assert normalized_field not in license_fact["value_json"]
+    assert not license_fact["source_json"]["quality_flags"]
+    assert (field in license_fact["source_json"]["raw_fields"]) is not missing
+    if not missing:
+        assert license_fact["source_json"]["raw_fields"][field] == source[field]
+
+
 @pytest.mark.parametrize("reported", ["February 30, 2001", "Spring 2001", "05/06/2001"])
 def test_unrecognized_dates_remain_source_text(reported):
     _, facts = _parse(_profile_body(schoolDegreeDate=reported))
@@ -232,7 +282,15 @@ def test_future_degree_is_not_completed_training():
 
 @pytest.mark.parametrize("field", list(profile.TEXT_LABELS))
 def test_wrong_field_label_or_type_is_rejected(field):
-    for mutation in ({"label": "Unexpected", "value": "text"}, {"label": profile.TEXT_LABELS[field], "value": None}):
+    mutations = [
+        {"label": "Unexpected", "value": "text"},
+        {"label": profile.TEXT_LABELS[field], "value": 123},
+        {"label": profile.TEXT_LABELS[field]},
+        None,
+    ]
+    if field not in profile.OPTIONAL_TEXT_FIELDS:
+        mutations.append({"label": profile.TEXT_LABELS[field], "value": None})
+    for mutation in mutations:
         source = _profile_body()
         source[field] = mutation
         with pytest.raises(ValueError, match="schema_invalid"):
@@ -308,6 +366,24 @@ async def test_acquisition_and_pinned_replay(source_session, license_number):
         assert artifact.stat().st_mode & 0o777 == 0o600
     assert _artifact(session, "request.json")["additional_header_names"] == ["x-oapi-key"]
     assert set(_artifact(session, "request.json")["headers"]) == {"Accept", "Accept-Encoding"}
+    assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
+
+
+@pytest.mark.parametrize("missing_license_dates", [False, True])
+async def test_unreported_education_acquisition_and_replay(source_session, missing_license_dates):
+    source = _profile_body(schoolName=None)
+    del source["schoolDegreeDate"]
+    if missing_license_dates:
+        source["dateOfLicensure"]["value"] = None
+        del source["registeredThroughDate"]
+    session = source_session(SourceResponse(source))
+    acquired = await _acquire(session)
+    assert len(session.requests) == 1 and session.closed
+    assert acquired["outcome"] == "acquired"
+    assert acquired["source_record"]["raw_payload"] == source
+    assert [fact["category"] for fact in acquired["facts"]] == ["licenses"]
+    assert _artifact(session, "result.json")["fact_count"] == 1
+    assert profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
     assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
 
 
