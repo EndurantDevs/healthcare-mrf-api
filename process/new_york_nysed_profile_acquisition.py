@@ -13,6 +13,7 @@ from pathlib import Path
 
 import aiohttp
 
+from process.control_cancel import ImportCancelledError
 from process.kentucky_profile_acquisition import _reject_symlinks
 from process.massachusetts_profile_acquisition import encoded_json, write_new_json
 from process.massachusetts_profile_rows import _hash
@@ -25,6 +26,12 @@ from process.new_york_nysed_profile import (
     acquisition_result,
     held_acquisition_result,
     request_descriptor,
+)
+from process.new_york_nysed_profile_retries import (
+    TIMEOUT_DELAYS,
+    timeout_filename,
+    timeout_history,
+    validate_timeout_response,
 )
 
 
@@ -87,7 +94,24 @@ async def _fetch_profile(session, destination, descriptor, api_key):
     return _retain_response(destination, descriptor, response_by_field, chunks, True, api_key)
 
 
-async def _acquire_profile(destination, manifest_by_field, descriptor, api_key):
+async def _fetch_with_timeout_recovery(session, destination, descriptor, api_key, checkpoint=None):
+    prior_responses = []
+    for attempt in range(len(TIMEOUT_DELAYS) + 1):
+        if checkpoint is not None:
+            await checkpoint()
+        response_by_field = await _fetch_profile(session, destination, descriptor, api_key)
+        if response_by_field["status"] != 408 or attempt == len(TIMEOUT_DELAYS):
+            return response_by_field, prior_responses
+        validate_timeout_response(response_by_field, descriptor)
+        # Persist the original bytes before removing the canonical path or waiting.
+        write_new_json(destination / timeout_filename(attempt + 1), response_by_field)
+        (destination / "response.json").unlink()
+        prior_responses.append(response_by_field)
+        await asyncio.sleep(TIMEOUT_DELAYS[attempt])
+    raise AssertionError("timeout attempt bound exhausted")
+
+
+async def _acquire_profile(destination, manifest_by_field, descriptor, api_key, checkpoint=None):
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=60),
         cookie_jar=aiohttp.DummyCookieJar(),
@@ -97,7 +121,9 @@ async def _acquire_profile(destination, manifest_by_field, descriptor, api_key):
         # aiohttp otherwise repeats idempotent requests after connection failures.
         _require(type(getattr(session, "_retry_connection", None)) is bool, "retry_control_unavailable")
         session._retry_connection = False
-        response_by_field = await _fetch_profile(session, destination, descriptor, api_key)
+        response_by_field, prior_responses = await _fetch_with_timeout_recovery(
+            session, destination, descriptor, api_key, checkpoint
+        )
     acquired = (
         held_acquisition_result(manifest_by_field, response_by_field)
         if response_by_field["status"] == 204
@@ -114,11 +140,15 @@ async def _acquire_profile(destination, manifest_by_field, descriptor, api_key):
     }
     if acquired["outcome"] == "held":
         receipt_by_field["reason"] = acquired["reason"]
+    if prior_responses:
+        receipt_by_field["timeout_retries"] = timeout_history(prior_responses)
     write_new_json(destination / "result.json", receipt_by_field)
     return {**acquired, "receipt_sha256": _hash(receipt_by_field)}
 
 
-async def acquire_license(license_number: str, destination: Path, *, run_id: str, api_key: str) -> dict:
+async def acquire_license(
+    license_number: str, destination: Path, *, run_id: str, api_key: str, checkpoint=None
+) -> dict:
     """Use a fresh directory and an explicit public application header value."""
     descriptor = request_descriptor(license_number)
     _require(isinstance(api_key, str) and re.fullmatch(r"[!-~]{1,512}", api_key), "api_key_invalid")
@@ -141,7 +171,7 @@ async def acquire_license(license_number: str, destination: Path, *, run_id: str
     write_new_json(destination / "manifest.json", manifest_by_field)
     write_new_json(destination / "request.json", descriptor)
     try:
-        return await _acquire_profile(destination, manifest_by_field, descriptor, api_key)
+        return await _acquire_profile(destination, manifest_by_field, descriptor, api_key, checkpoint)
     except BaseException as error:
         error_type = type(error).__name__
         write_new_json(
@@ -150,6 +180,8 @@ async def acquire_license(license_number: str, destination: Path, *, run_id: str
         )
         if isinstance(error, asyncio.CancelledError):
             raise asyncio.CancelledError() from None
+        if isinstance(error, ImportCancelledError):
+            raise ImportCancelledError("New York profile import cancelled") from None
         if isinstance(error, KeyboardInterrupt):
             raise KeyboardInterrupt() from None
         if isinstance(error, SystemExit):
