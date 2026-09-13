@@ -396,6 +396,7 @@ async def test_native_catalog_promotion_requires_the_exact_validated_stage_relat
 
 @pytest.mark.asyncio
 async def test_native_catalog_promotion_preserves_destination_owner_and_grants():
+    """Replace content without changing the local owner or reader privileges."""
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
     reader_role = "cc_reader_" + uuid4().hex
@@ -425,34 +426,7 @@ async def test_native_catalog_promotion_preserves_destination_owner_and_grants()
                 require_import_idle=_idle,
             )
         async with engine.connect() as connection:
-            assert (
-                await connection.scalar(
-                    text(
-                        "SELECT owner_role.rolname FROM pg_catalog.pg_class AS relation "
-                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
-                        "JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=relation.relowner "
-                        "WHERE namespace.nspname=:schema_name AND relation.relname='code_catalog'"
-                    ),
-                    {"schema_name": schema_name},
-                )
-                == "postgres"
-            )
-            assert (
-                await connection.scalar(
-                    text("SELECT pg_catalog.has_table_privilege(:role_name, :relation_name, 'SELECT')"),
-                    {"role_name": reader_role, "relation_name": f"{schema_name}.code_catalog"},
-                )
-                is True
-            )
-            assert (
-                await connection.scalar(
-                    text(
-                        "SELECT pg_catalog.has_column_privilege(:role_name, :relation_name, 'display_name', 'UPDATE')"
-                    ),
-                    {"role_name": reader_role, "relation_name": f"{schema_name}.code_catalog"},
-                )
-                is True
-            )
+            await _assert_reader_access(connection, schema_name, reader_role)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
@@ -618,9 +592,39 @@ async def test_native_catalog_stage_rejects_access_grants_from_the_restored_rela
         await engine.dispose()
 
 
+async def _install_unsupported_relation_state(connection, schema_name, publication_name, unsupported_state):
+    """Attach one concrete unsupported database feature to the restored test relation."""
+    if unsupported_state == "trigger":
+        await connection.execute(
+            text(
+                f'CREATE FUNCTION "{schema_name}".cc_trigger() RETURNS trigger LANGUAGE plpgsql '
+                "AS $$ BEGIN RETURN NEW; END $$"
+            )
+        )
+        await connection.execute(
+            text(
+                f'CREATE TRIGGER cc_trigger BEFORE INSERT ON "{schema_name}".code_catalog_stage '
+                f'FOR EACH ROW EXECUTE FUNCTION "{schema_name}".cc_trigger()'
+            )
+        )
+    elif unsupported_state == "rule":
+        await connection.execute(
+            text(f'CREATE RULE cc_no_delete AS ON DELETE TO "{schema_name}".code_catalog_stage DO INSTEAD NOTHING')
+        )
+    elif unsupported_state == "replica":
+        await connection.execute(text(f'ALTER TABLE "{schema_name}".code_catalog_stage REPLICA IDENTITY FULL'))
+    elif unsupported_state == "policy":
+        await connection.execute(text(f'CREATE POLICY cc_policy ON "{schema_name}".code_catalog_stage USING (true)'))
+    else:
+        await connection.execute(
+            text(f'CREATE PUBLICATION "{publication_name}" FOR TABLE "{schema_name}".code_catalog_stage')
+        )
+
+
 @pytest.mark.parametrize("unsupported_state", ["trigger", "rule", "replica", "policy", "publication"])
 @pytest.mark.asyncio
 async def test_native_catalog_stage_rejects_unsupported_relation_state(unsupported_state: str):
+    """Fail closed for database metadata that an OID-changing swap cannot preserve."""
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
     source_schema_name = "code_catalog_source_" + uuid4().hex
@@ -636,36 +640,7 @@ async def test_native_catalog_stage_rejects_unsupported_relation_state(unsupport
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         source_capture = await _capture(sessions, source_schema_name)
         async with engine.begin() as connection:
-            if unsupported_state == "trigger":
-                await connection.execute(
-                    text(
-                        f'CREATE FUNCTION "{schema_name}".cc_trigger() RETURNS trigger LANGUAGE plpgsql '
-                        "AS $$ BEGIN RETURN NEW; END $$"
-                    )
-                )
-                await connection.execute(
-                    text(
-                        f'CREATE TRIGGER cc_trigger BEFORE INSERT ON "{schema_name}".code_catalog_stage '
-                        f'FOR EACH ROW EXECUTE FUNCTION "{schema_name}".cc_trigger()'
-                    )
-                )
-            elif unsupported_state == "rule":
-                await connection.execute(
-                    text(
-                        f'CREATE RULE cc_no_delete AS ON DELETE TO "{schema_name}".code_catalog_stage '
-                        "DO INSTEAD NOTHING"
-                    )
-                )
-            elif unsupported_state == "replica":
-                await connection.execute(text(f'ALTER TABLE "{schema_name}".code_catalog_stage REPLICA IDENTITY FULL'))
-            elif unsupported_state == "policy":
-                await connection.execute(
-                    text(f'CREATE POLICY cc_policy ON "{schema_name}".code_catalog_stage USING (true)')
-                )
-            else:
-                await connection.execute(
-                    text(f'CREATE PUBLICATION "{publication_name}" FOR TABLE "{schema_name}".code_catalog_stage')
-                )
+            await _install_unsupported_relation_state(connection, schema_name, publication_name, unsupported_state)
         async with sessions() as session, session.begin():
             with pytest.raises(CodeCatalogSnapshotError, match="unsupported"):
                 await validate_code_catalog_restored_stage(
@@ -680,6 +655,36 @@ async def test_native_catalog_stage_rejects_unsupported_relation_state(unsupport
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema_name}" CASCADE'))
         await engine.dispose()
+
+
+async def _assert_reader_access(connection, schema_name, reader_role):
+    """Verify destination ownership and both table and column reader privileges."""
+    assert (
+        await connection.scalar(
+            text(
+                "SELECT owner_role.rolname FROM pg_catalog.pg_class AS relation "
+                "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+                "JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=relation.relowner "
+                "WHERE namespace.nspname=:schema_name AND relation.relname='code_catalog'"
+            ),
+            {"schema_name": schema_name},
+        )
+        == "postgres"
+    )
+    assert (
+        await connection.scalar(
+            text("SELECT pg_catalog.has_table_privilege(:role_name, :relation_name, 'SELECT')"),
+            {"role_name": reader_role, "relation_name": f"{schema_name}.code_catalog"},
+        )
+        is True
+    )
+    assert (
+        await connection.scalar(
+            text("SELECT pg_catalog.has_column_privilege(:role_name, :relation_name, 'display_name', 'UPDATE')"),
+            {"role_name": reader_role, "relation_name": f"{schema_name}.code_catalog"},
+        )
+        is True
+    )
 
 
 async def _idle(session) -> None:
