@@ -17,9 +17,9 @@ from sqlalchemy import text
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 CONTRACT = "entity_address_unified.postgres.v1"
-RECEIPT_VERSION = "entity_address_archive_receipt.v1"
+RECEIPT_VERSION = "entity_address_archive_receipt.v2"
 STAGE_INTEGRITY_CONTRACT = "entity_address_unified.stage.postgres.v1"
-STAGE_INTEGRITY_RECEIPT_VERSION = "entity_address_stage_integrity_receipt.v1"
+STAGE_INTEGRITY_RECEIPT_VERSION = "entity_address_stage_integrity_receipt.v2"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHUNK_ROWS = 4096
@@ -57,6 +57,7 @@ class EntityAddressArchiveReceipt:
     tables: tuple[EntityAddressArchiveTableReceipt, ...]
     schema_sha256: str
     content_sha256: str
+    main_input_sha256: str
 
     def as_dict(self) -> dict[str, Any]:
         """Return a bounded receipt without OIDs, schema names, or publication claims."""
@@ -66,6 +67,7 @@ class EntityAddressArchiveReceipt:
             "tables": [table.as_dict() for table in self.tables],
             "schema_sha256": self.schema_sha256,
             "content_sha256": self.content_sha256,
+            "main_input_sha256": self.main_input_sha256,
         }
 
 
@@ -76,6 +78,7 @@ class EntityAddressStageIntegrityReceipt:
     tables: tuple[EntityAddressArchiveTableReceipt, ...]
     schema_sha256: str
     content_sha256: str
+    main_input_sha256: str
 
     def as_dict(self) -> dict[str, Any]:
         """Return the durable local receipt bound to derived stage names."""
@@ -86,6 +89,7 @@ class EntityAddressStageIntegrityReceipt:
             "tables": [table.as_dict() for table in self.tables],
             "schema_sha256": self.schema_sha256,
             "content_sha256": self.content_sha256,
+            "main_input_sha256": self.main_input_sha256,
         }
 
 
@@ -277,25 +281,59 @@ def _reject_schema_qualified_expressions(schema_name: str, *catalog_groups: list
         raise EntityAddressArchiveReceiptError("entity-address archive schema expression is unsupported")
 
 
-async def _schema_identity(session, relation_oid: int, schema_name: str, table_name: str) -> str:
+def _normalized_catalog_names(value: Any, names_by_stage: Mapping[str, str]) -> Any:
+    """Replace only trusted derived stage names with their logical relation names."""
+
+    if isinstance(value, str):
+        normalized = value
+        for stage_name, logical_name in names_by_stage.items():
+            normalized = normalized.replace(stage_name, logical_name)
+        return normalized
+    if isinstance(value, list):
+        return [_normalized_catalog_names(item, names_by_stage) for item in value]
+    if isinstance(value, dict):
+        return {key: _normalized_catalog_names(item, names_by_stage) for key, item in value.items()}
+    return value
+
+
+async def _schema_identity(
+    session,
+    relation_oid: int,
+    schema_name: str,
+    table_name: str,
+    *,
+    names_by_stage: Mapping[str, str] | None = None,
+) -> str:
     columns = await _catalog_columns(session, relation_oid)
     constraints = await _catalog_constraints(session, relation_oid, schema_name)
     indexes = await _catalog_indexes(session, relation_oid)
     if not columns:
         raise EntityAddressArchiveReceiptError("entity-address archive relation has no columns")
+    if names_by_stage:
+        columns, constraints, indexes = (
+            _normalized_catalog_names(entries, names_by_stage) for entries in (columns, constraints, indexes)
+        )
     _reject_schema_qualified_expressions(schema_name, columns, constraints, indexes)
     return _canonical_digest(
         {"table_name": table_name, "columns": columns, "constraints": constraints, "indexes": indexes}
     )
 
 
-async def _row_identity(session, schema_name: str, table_name: str) -> tuple[int, str]:
-    """Fold sorted row hashes in bounded chunks without materializing source rows."""
+async def _projected_row_identity(
+    session,
+    schema_name: str,
+    table_name: str,
+    *,
+    row_json_sql: str,
+    parameters: Mapping[str, Any] | None = None,
+) -> tuple[int, str]:
+    """Fold sorted projected-row hashes without materializing source rows."""
+
     chunk_rows_result = await session.stream(
         text(
             f"""
             WITH row_hashes AS MATERIALIZED (
-                SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.to_jsonb(row_value)::text, 'UTF8')), 'hex') AS row_sha256
+                SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(({row_json_sql})::text, 'UTF8')), 'hex') AS row_sha256
                   FROM {_quoted(schema_name)}.{_quoted(table_name)} AS row_value
             ), ordered AS (
                 SELECT row_sha256, pg_catalog.row_number() OVER (ORDER BY row_sha256 COLLATE \"C\") - 1 AS ordinal
@@ -308,7 +346,7 @@ async def _row_identity(session, schema_name: str, table_name: str) -> tuple[int
              ORDER BY chunk_ordinal
             """
         ),
-        {"chunk_rows": _CHUNK_ROWS},
+        {"chunk_rows": _CHUNK_ROWS, **dict(parameters or {})},
     )
     digest = hashlib.sha256(b"entity-address-row-chunks/v1\0")
     total_rows, expected_ordinal = 0, 0
@@ -332,6 +370,51 @@ async def _row_identity(session, schema_name: str, table_name: str) -> tuple[int
     return total_rows, digest.hexdigest()
 
 
+async def _row_identity(session, schema_name: str, table_name: str) -> tuple[int, str]:
+    """Capture the complete canonical row identity."""
+
+    return await _projected_row_identity(
+        session,
+        schema_name,
+        table_name,
+        row_json_sql="pg_catalog.to_jsonb(row_value)",
+    )
+
+
+async def _main_input_identity(session, schema_name: str, table_name: str) -> tuple[int, str]:
+    """Ignore only geo outputs and normalize alias generations per main row."""
+
+    alias_prefix = entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX
+    normalized_version_sql = (
+        "CASE WHEN LEFT(row_value.base_address_version, LENGTH(:alias_prefix)) = :alias_prefix "
+        "AND SUBSTRING(row_value.base_address_version FROM LENGTH(:alias_prefix) + 1) ~ '^[0-9]+$' "
+        "THEN 'entity-address-alias-generation:*' ELSE row_value.base_address_version END"
+    )
+    row_json_sql = (
+        "pg_catalog.to_jsonb(row_value) - 'geo_evidence_source_id' - 'geo_identity_coherent' "
+        "- 'geo_point_coherent' - 'geo_assurance_version' "
+        f"|| pg_catalog.jsonb_build_object('base_address_version', {normalized_version_sql})"
+    )
+    return await _projected_row_identity(
+        session,
+        schema_name,
+        table_name,
+        row_json_sql=row_json_sql,
+        parameters={"alias_prefix": alias_prefix},
+    )
+
+
+def _content_identity(tables: tuple[EntityAddressArchiveTableReceipt, ...], main_input_sha256: str) -> str:
+    """Bind the main normalized input identity into a receipt's content hash."""
+
+    return _canonical_digest(
+        {
+            "tables": [table.as_dict() for table in tables],
+            "main_input_sha256": main_input_sha256,
+        }
+    )
+
+
 async def capture_entity_address_archive_receipt(session, *, schema_name: str) -> EntityAddressArchiveReceipt:
     """Capture a semantic receipt for exactly the reviewed seven-table family."""
     schema = _schema_name(schema_name)
@@ -347,14 +430,21 @@ async def capture_entity_address_archive_receipt(session, *, schema_name: str) -
             EntityAddressArchiveTableReceipt(model.__name__, model.__tablename__, schema_sha256, row_count, row_sha256)
         )
     tables = tuple(table_receipts)
+    main_input_rows, main_input_sha256 = await _main_input_identity(
+        session,
+        schema,
+        entity_address_unified.EntityAddressUnified.__tablename__,
+    )
+    if main_input_rows != tables[0].row_count:
+        raise EntityAddressArchiveReceiptError("entity-address archive main input receipt is invalid")
     schema_sha256 = _canonical_digest(
         [
             {"model_name": table.model_name, "table_name": table.table_name, "schema_sha256": table.schema_sha256}
             for table in tables
         ]
     )
-    content_sha256 = _canonical_digest([table.as_dict() for table in tables])
-    return EntityAddressArchiveReceipt(tables, schema_sha256, content_sha256)
+    content_sha256 = _content_identity(tables, main_input_sha256)
+    return EntityAddressArchiveReceipt(tables, schema_sha256, content_sha256, main_input_sha256)
 
 
 def _validated_stage_table_names_by_source(stage_table_names_by_source: Mapping[str, str]) -> dict[str, str]:
@@ -390,23 +480,37 @@ async def capture_entity_address_stage_integrity_receipt(
         tuple(table_names[model.__tablename__] for model in models),
     )
     table_receipts = []
+    logical_name_by_stage = {stage_name: logical_name for logical_name, stage_name in table_names.items()}
     for model in models:
         table_name = table_names[model.__tablename__]
         relation_oid = await _relation_oid(session, schema, table_name)
-        schema_sha256 = await _schema_identity(session, relation_oid, schema, table_name)
+        schema_sha256 = await _schema_identity(
+            session,
+            relation_oid,
+            schema,
+            model.__tablename__,
+            names_by_stage=logical_name_by_stage,
+        )
         row_count, row_sha256 = await _row_identity(session, schema, table_name)
         table_receipts.append(
             EntityAddressArchiveTableReceipt(model.__name__, table_name, schema_sha256, row_count, row_sha256)
         )
     tables = tuple(table_receipts)
+    main_input_rows, main_input_sha256 = await _main_input_identity(
+        session,
+        schema,
+        table_names[entity_address_unified.EntityAddressUnified.__tablename__],
+    )
+    if main_input_rows != tables[0].row_count:
+        raise EntityAddressArchiveReceiptError("entity-address stage main input receipt is invalid")
     schema_sha256 = _canonical_digest(
         [
             {"model_name": table.model_name, "table_name": table.table_name, "schema_sha256": table.schema_sha256}
             for table in tables
         ]
     )
-    content_sha256 = _canonical_digest([table.as_dict() for table in tables])
-    return EntityAddressStageIntegrityReceipt(tables, schema_sha256, content_sha256)
+    content_sha256 = _content_identity(tables, main_input_sha256)
+    return EntityAddressStageIntegrityReceipt(tables, schema_sha256, content_sha256, main_input_sha256)
 
 
 def validate_entity_address_stage_integrity_receipt(
@@ -420,10 +524,13 @@ def validate_entity_address_stage_integrity_receipt(
     receipt_value = receipt.as_dict() if isinstance(receipt, EntityAddressStageIntegrityReceipt) else receipt
     if (
         not isinstance(receipt_value, Mapping)
-        or set(receipt_value) != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256"}
+        or set(receipt_value)
+        != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256", "main_input_sha256"}
         or receipt_value["contract"] != STAGE_INTEGRITY_CONTRACT
         or receipt_value["receipt_version"] != STAGE_INTEGRITY_RECEIPT_VERSION
         or not isinstance(receipt_value["tables"], list)
+        or not isinstance(receipt_value["main_input_sha256"], str)
+        or _SHA256.fullmatch(receipt_value["main_input_sha256"]) is None
     ):
         raise EntityAddressArchiveReceiptError("entity-address stage integrity receipt is invalid")
     expected_identities = tuple((model.__name__, table_names[model.__tablename__]) for model in _models())
@@ -449,7 +556,8 @@ def validate_entity_address_stage_integrity_receipt(
                 for entry in entries
             ]
         ),
-        _canonical_digest([entry.as_dict() for entry in entries]),
+        _content_identity(tuple(entries), receipt_value["main_input_sha256"]),
+        receipt_value["main_input_sha256"],
     )
     if (
         receipt_value["schema_sha256"] != validated.schema_sha256
@@ -466,10 +574,13 @@ def validate_entity_address_archive_receipt(
     receipt_value = receipt.as_dict() if isinstance(receipt, EntityAddressArchiveReceipt) else receipt
     if (
         not isinstance(receipt_value, Mapping)
-        or set(receipt_value) != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256"}
+        or set(receipt_value)
+        != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256", "main_input_sha256"}
         or receipt_value["contract"] != CONTRACT
         or receipt_value["receipt_version"] != RECEIPT_VERSION
         or not isinstance(receipt_value["tables"], list)
+        or not isinstance(receipt_value["main_input_sha256"], str)
+        or _SHA256.fullmatch(receipt_value["main_input_sha256"]) is None
     ):
         raise EntityAddressArchiveReceiptError("entity-address archive receipt is invalid")
     expected_identities = tuple((model.__name__, model.__tablename__) for model in _models())
@@ -495,7 +606,8 @@ def validate_entity_address_archive_receipt(
                 for entry in entries
             ]
         ),
-        _canonical_digest([entry.as_dict() for entry in entries]),
+        _content_identity(tuple(entries), receipt_value["main_input_sha256"]),
+        receipt_value["main_input_sha256"],
     )
     if (
         receipt_value["schema_sha256"] != validated.schema_sha256

@@ -11,6 +11,7 @@ assurance, and builds indexes for a fresh import.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import re
 from collections.abc import Awaitable, Callable
@@ -136,14 +137,9 @@ async def prepare_completed_entity_address_snapshot_adoption(
     *,
     db_schema: str,
     import_date: str,
+    preserve_unversioned_base_rows: bool = False,
 ) -> PreparedEntityAddressSnapshotAdoption:
-    """Perform the bounded, non-cutover work for a restored completed result.
-
-    A logical restore may rebuild indexes locally.  This preparation never
-    calls the fresh-import worker, reindexes a second time, derives addresses,
-    or mutates live tables.  The final alias check in the atomic cutover still
-    detects any change after this validation.
-    """
+    """Perform bounded, non-cutover work for one restored completed result."""
 
     normalized_schema, normalized_import_date = _validated_snapshot_destination(
         db_schema=db_schema,
@@ -174,11 +170,11 @@ async def prepare_completed_entity_address_snapshot_adoption(
         context=cutover_context_map,
         phase="entity-address snapshot analyzing restored main table",
     )
-    publish_validation = await entity_address_unified._validate_publish_integrity(
+    publish_validation = await _validate_adoption_stage(
         normalized_schema,
         stage_cls.__tablename__,
         support_stage_class_map,
-        test_mode=False,
+        preserve_unversioned_base_rows=preserve_unversioned_base_rows,
     )
     return PreparedEntityAddressSnapshotAdoption(
         db_schema=normalized_schema,
@@ -191,6 +187,83 @@ async def prepare_completed_entity_address_snapshot_adoption(
         context=cutover_context_map,
         publish_validation=publish_validation,
     )
+
+
+async def _validate_adoption_stage(
+    db_schema: str,
+    stage_table: str,
+    support_stage_class_map: dict[type, type],
+    *,
+    preserve_unversioned_base_rows: bool,
+) -> dict[str, int | dict[str, int]]:
+    """Choose the native validation projection for the restored contract."""
+
+    if preserve_unversioned_base_rows:
+        return await _validate_preserved_base_version_stage(
+            db_schema,
+            stage_table,
+            support_stage_class_map,
+        )
+    return await entity_address_unified._validate_publish_integrity(
+        db_schema,
+        stage_table,
+        support_stage_class_map,
+        test_mode=False,
+    )
+
+
+def _base_version_validation_view_sql(
+    db_schema: str,
+    stage_table: str,
+    validation_table: str,
+    destination_alias_version: str,
+) -> str:
+    """Project allowed unversioned rows as current only during native validation."""
+
+    selected_columns = []
+    for column in entity_address_unified.EntityAddressUnified.__table__.columns:
+        if column.name == "base_address_version":
+            selected_columns.append(
+                "CASE WHEN base_address_version IS NULL "
+                f"OR base_address_version = '{entity_address_unified.BASE_ADDRESS_VERSION}' "
+                f"THEN '{destination_alias_version}' ELSE base_address_version END "
+                "AS base_address_version"
+            )
+        else:
+            selected_columns.append(column.name)
+    return (
+        f"CREATE VIEW {db_schema}.{validation_table} AS SELECT "
+        f"{', '.join(selected_columns)} FROM {db_schema}.{stage_table}"
+    )
+
+
+async def _validate_preserved_base_version_stage(
+    db_schema: str,
+    stage_table: str,
+    support_stage_class_map: dict[type, type],
+) -> dict[str, int | dict[str, int]]:
+    """Run native integrity checks without rewriting allowed unversioned rows."""
+
+    alias_generation = await entity_address_unified._address_alias_generation(db_schema)
+    destination_alias_version = f"{entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
+    table_digest = hashlib.sha256(stage_table.encode("ascii")).hexdigest()[:16]
+    validation_table = f"entity_address_snapshot_validation_{table_digest}"
+    view_sql = _base_version_validation_view_sql(
+        db_schema,
+        stage_table,
+        validation_table,
+        destination_alias_version,
+    )
+    async with entity_address_unified.db.transaction():
+        await entity_address_unified.db.status(view_sql)
+        validation = await entity_address_unified._validate_publish_integrity(
+            db_schema,
+            validation_table,
+            support_stage_class_map,
+            test_mode=False,
+        )
+        await entity_address_unified.db.status(f"DROP VIEW {db_schema}.{validation_table}")
+    return validation
 
 
 async def adopt_prepared_entity_address_snapshot(

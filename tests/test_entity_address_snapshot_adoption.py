@@ -152,6 +152,53 @@ async def test_restore_setting_failure_propagates_and_rolls_back_nested_operatio
 
 
 @pytest.mark.asyncio
+async def test_borrowed_tuning_restores_only_successfully_applied_settings():
+    """A denied optional setting cannot turn successful borrowed work into rollback."""
+
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("begin")
+        try:
+            yield
+        except RuntimeError:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+
+    async def apply_setting(statement):
+        events.append(statement)
+        if statement.startswith("SET LOCAL temp_file_limit"):
+            raise RuntimeError('permission denied to set parameter "temp_file_limit"')
+
+    database = SimpleNamespace(
+        _transaction_binding=Mock(return_value=object()),
+        scalar=AsyncMock(side_effect=["4MB", "-1"]),
+        status=AsyncMock(side_effect=apply_setting),
+        transaction=transaction,
+    )
+    logger = Mock()
+    async with cutover_contract.entity_address_tuned_transaction(
+        database,
+        [("work_mem", "64MB"), ("temp_file_limit", "32GB")],
+        native._sql_literal,
+        logger,
+    ):
+        events.append("operation")
+
+    assert [call.args[0] for call in database.status.await_args_list] == [
+        "SET LOCAL work_mem = '64MB';",
+        "SET LOCAL temp_file_limit = '32GB';",
+        "SET LOCAL work_mem = '4MB';",
+    ]
+    assert events.count("rollback") == 1
+    assert events[-3:] == ["operation", "SET LOCAL work_mem = '4MB';", "commit"]
+    logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_unbound_publish_validation_keeps_parallel_operations(monkeypatch):
     operation_counter_map = {"active": 0, "peak": 0}
 

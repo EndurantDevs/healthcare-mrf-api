@@ -81,12 +81,8 @@ class SourcePublicationSession:
                 "source_count": parameters["source_set_count"],
                 "raw_container_sha256_digest": parameters["source_set_digest"],
             }
-            persisted_source_set_by_field = (
-                self.persisted_source_set or expected_source_set_by_field
-            )
-            return QueryResult(
-                [{"snapshot_source_set": persisted_source_set_by_field}]
-            )
+            persisted_source_set_by_field = self.persisted_source_set or expected_source_set_by_field
+            return QueryResult([{"snapshot_source_set": persisted_source_set_by_field}])
         if self._is_expected_insert(sql):
             return QueryResult()
         raise AssertionError(f"unexpected SQL: {sql}")
@@ -98,9 +94,7 @@ class SourcePublicationSession:
             "ptg2_v3_snapshot_plan_scope",
             "ptg2_v3_snapshot_source",
         )
-        return "INSERT INTO" in sql and any(
-            table_name in sql for table_name in expected_tables
-        )
+        return "INSERT INTO" in sql and any(table_name in sql for table_name in expected_tables)
 
 
 class TransactionDatabase:
@@ -184,9 +178,7 @@ def source_session(
     plans=None,
 ) -> SourcePublicationSession:
     """Build one deterministic source-publication session."""
-    expected_plans = plans or [
-        {"plan_id": "plan", "plan_market_type": "group"}
-    ]
+    expected_plans = plans or [{"plan_id": "plan", "plan_market_type": "group"}]
     return SourcePublicationSession(
         scope={
             "plan_id": "plan",
@@ -329,6 +321,7 @@ def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace
         activation=activation,
         events=transaction_events,
         projection_dirty=projection_dirty,
+        session=session,
     )
 
 

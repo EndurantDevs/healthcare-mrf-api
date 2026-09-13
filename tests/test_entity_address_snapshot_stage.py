@@ -148,6 +148,7 @@ def _receipt() -> dict:
         receipt.EntityAddressArchiveTableReceipt(model.__name__, model.__tablename__, "a" * 64, 0, "b" * 64)
         for model in receipt._models()
     )
+    main_input_sha256 = "c" * 64
     return receipt.EntityAddressArchiveReceipt(
         tables,
         receipt._canonical_digest(
@@ -156,7 +157,8 @@ def _receipt() -> dict:
                 for table in tables
             ]
         ),
-        receipt._canonical_digest([table.as_dict() for table in tables]),
+        receipt._content_identity(tables, main_input_sha256),
+        main_input_sha256,
     ).as_dict()
 
 
@@ -167,6 +169,57 @@ def test_stage_receipt_accepts_only_the_model_derived_seven_table_family():
 
     assert observed.as_dict() == value
     assert len(observed.tables) == 7
+
+
+@pytest.mark.parametrize("mutation", ["old_version", "missing_main_input"])
+def test_archive_receipt_rejects_pre_invariant_contracts(mutation: str) -> None:
+    """Require the v2 main-input identity rather than accepting old receipts."""
+
+    value = _receipt()
+    if mutation == "old_version":
+        value["receipt_version"] = "entity_address_archive_receipt.v1"
+    else:
+        value.pop("main_input_sha256")
+    with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="receipt is invalid"):
+        receipt.validate_entity_address_archive_receipt(value)
+
+
+@pytest.mark.parametrize("mutation", ["old_version", "missing_main_input"])
+def test_stage_integrity_receipt_rejects_pre_invariant_contracts(mutation: str) -> None:
+    """Require the v2 main-input identity on destination-local stage receipts."""
+
+    archive_value = _receipt()
+    stage_name_by_source = {table["table_name"]: table["table_name"] + "_20260913" for table in archive_value["tables"]}
+    stage_tables = tuple(
+        receipt.EntityAddressArchiveTableReceipt(
+            table["model_name"],
+            stage_name_by_source[table["table_name"]],
+            table["schema_sha256"],
+            table["row_count"],
+            table["row_sha256"],
+        )
+        for table in archive_value["tables"]
+    )
+    stage_value = receipt.EntityAddressStageIntegrityReceipt(
+        stage_tables,
+        receipt._canonical_digest(
+            [
+                {"model_name": table.model_name, "table_name": table.table_name, "schema_sha256": table.schema_sha256}
+                for table in stage_tables
+            ]
+        ),
+        receipt._content_identity(stage_tables, archive_value["main_input_sha256"]),
+        archive_value["main_input_sha256"],
+    ).as_dict()
+    if mutation == "old_version":
+        stage_value["receipt_version"] = "entity_address_stage_integrity_receipt.v1"
+    else:
+        stage_value.pop("main_input_sha256")
+    with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="receipt is invalid"):
+        receipt.validate_entity_address_stage_integrity_receipt(
+            stage_value,
+            stage_table_names=stage_name_by_source,
+        )
 
 
 def test_stage_ownership_token_is_closed_to_the_uuid_model_family():

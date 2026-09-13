@@ -27,8 +27,9 @@ async def run_publish_validation_operations(database: Any, *operations):
     return await asyncio.gather(*(operation() for operation in operations))
 
 
-async def apply_transaction_sql_settings(database: Any, settings, quote_literal, logger) -> None:
+async def apply_transaction_sql_settings(database: Any, settings, quote_literal, logger) -> tuple[str, ...]:
     """Apply each local SQL setting inside a savepoint without escaping the caller transaction."""
+    applied_setting_names = []
     for name, value in settings:
         try:
             async with database.transaction():
@@ -37,6 +38,9 @@ async def apply_transaction_sql_settings(database: Any, settings, quote_literal,
             if "permission denied to set parameter" not in str(exc).lower():
                 raise
             logger.warning("Skipping unprivileged entity-address SQL setting %s=%s: %s", name, value, exc)
+        else:
+            applied_setting_names.append(name)
+    return tuple(applied_setting_names)
 
 
 @asynccontextmanager
@@ -44,6 +48,8 @@ async def preserve_transaction_sql_settings(
     database: Any,
     setting_names,
     quote_literal,
+    *,
+    applied_setting_names: set[str] | None = None,
 ):
     """Restore a borrowed transaction's settings after one nested operation."""
 
@@ -57,6 +63,8 @@ async def preserve_transaction_sql_settings(
     async with database.transaction():
         yield
         for setting_name, setting_value in previous_settings:
+            if applied_setting_names is not None and setting_name not in applied_setting_names:
+                continue
             await database.status(f"SET LOCAL {setting_name} = {quote_literal(setting_value)};")
 
 
@@ -70,17 +78,20 @@ async def entity_address_tuned_transaction(
     """Apply statement tuning without leaking it into a borrowed transaction."""
 
     setting_names = [name for name, _value in settings]
+    applied_setting_names: set[str] = set()
     async with preserve_transaction_sql_settings(
         database,
         setting_names,
         quote_literal,
+        applied_setting_names=applied_setting_names,
     ):
-        await apply_transaction_sql_settings(
+        applied_settings = await apply_transaction_sql_settings(
             database,
             settings,
             quote_literal,
             logger,
         )
+        applied_setting_names.update(applied_settings)
         yield
 
 
