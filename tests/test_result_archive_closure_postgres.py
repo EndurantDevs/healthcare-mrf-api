@@ -40,6 +40,7 @@ _RELATION_SUPPORT_COLUMNS = {
     "ptg2_v3_audit_occurrence": "snapshot_key bigint",
     "ptg2_v3_layout_fingerprint": "snapshot_key bigint",
     "ptg2_v3_code": "snapshot_key bigint",
+    "ptg2_v3_provider_set": "snapshot_key bigint",
     "ptg2_v3_provider_group": "snapshot_key bigint",
     "ptg2_artifact_manifest": "artifact_id text, snapshot_id text",
     "ptg2_artifact_blob_chunk": "artifact_id text",
