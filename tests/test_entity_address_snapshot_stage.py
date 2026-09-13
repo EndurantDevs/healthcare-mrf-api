@@ -195,11 +195,11 @@ async def test_stage_receipt_pins_the_closed_family_and_rejects_unsafe_relations
         def mappings(self):
             return _Rows(self._row)
 
-    for row in (
+    for catalog_row in (
         {"oid": 1, "relkind": b"v", "relpersistence": b"p", "relrowsecurity": False, "relforcerowsecurity": False},
         {"oid": 1, "relkind": b"r", "relpersistence": b"p", "relrowsecurity": True, "relforcerowsecurity": False},
     ):
-        catalog_session = SimpleNamespace(execute=AsyncMock(return_value=_Result(row)))
+        catalog_session = SimpleNamespace(execute=AsyncMock(return_value=_Result(catalog_row)))
         with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="relation is unavailable"):
             await receipt._relation_oid(catalog_session, "address_stage", "entity_address_unified")
 
