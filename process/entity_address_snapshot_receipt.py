@@ -19,6 +19,8 @@ entity_address_unified = importlib.import_module("process.entity_address_unified
 
 CONTRACT = "entity_address_unified.postgres.v1"
 RECEIPT_VERSION = "entity_address_archive_receipt.v1"
+STAGE_INTEGRITY_CONTRACT = "entity_address_unified.stage.postgres.v1"
+STAGE_INTEGRITY_RECEIPT_VERSION = "entity_address_stage_integrity_receipt.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHUNK_ROWS = 4096
@@ -62,6 +64,26 @@ class EntityAddressArchiveReceipt:
         return {
             "contract": CONTRACT,
             "receipt_version": RECEIPT_VERSION,
+            "tables": [table.as_dict() for table in self.tables],
+            "schema_sha256": self.schema_sha256,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class EntityAddressStageIntegrityReceipt:
+    """Destination-local identity for the seven prepared stage relations."""
+
+    tables: tuple[EntityAddressArchiveTableReceipt, ...]
+    schema_sha256: str
+    content_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the durable local receipt bound to derived stage names."""
+
+        return {
+            "contract": STAGE_INTEGRITY_CONTRACT,
+            "receipt_version": STAGE_INTEGRITY_RECEIPT_VERSION,
             "tables": [table.as_dict() for table in self.tables],
             "schema_sha256": self.schema_sha256,
             "content_sha256": self.content_sha256,
@@ -120,13 +142,17 @@ async def _normalize_receipt_session(session, schema_name: str) -> None:
         await session.execute(text(setting))
 
 
-async def _lock_model_family(session, schema_name: str, models: tuple[type, ...]) -> None:
-    """Pin the closed family before inspecting either schema or row contents."""
-    relations = ", ".join(
-        f"{_quoted(schema_name)}.{_quoted(model.__tablename__)}"
-        for model in sorted(models, key=lambda item: item.__tablename__)
-    )
+async def _lock_relation_family(session, schema_name: str, table_names: tuple[str, ...]) -> None:
+    """Pin the named closed family before inspecting schema or row contents."""
+
+    relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in sorted(table_names))
     await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
+
+
+async def _lock_model_family(session, schema_name: str, models: tuple[type, ...]) -> None:
+    """Pin the portable model family before inspecting schema or row contents."""
+
+    await _lock_relation_family(session, schema_name, tuple(model.__tablename__ for model in models))
 
 
 async def _relation_oid(session, schema_name: str, table_name: str) -> int:
@@ -330,6 +356,108 @@ async def capture_entity_address_archive_receipt(session, *, schema_name: str) -
     )
     content_sha256 = _canonical_digest([table.as_dict() for table in tables])
     return EntityAddressArchiveReceipt(tables, schema_sha256, content_sha256)
+
+
+def _validated_stage_table_names_by_source(stage_table_names_by_source: Mapping[str, str]) -> dict[str, str]:
+    """Require one safe destination name for every portable model relation."""
+
+    expected_names = tuple(model.__tablename__ for model in _models())
+    if not isinstance(stage_table_names_by_source, Mapping) or set(stage_table_names_by_source) != set(expected_names):
+        raise EntityAddressArchiveReceiptError("entity-address stage integrity relation family is invalid")
+    table_names_by_source = {table_name: stage_table_names_by_source[table_name] for table_name in expected_names}
+    if any(
+        not isinstance(table_name, str) or _IDENTIFIER.fullmatch(table_name) is None
+        for table_name in table_names_by_source.values()
+    ) or len(set(table_names_by_source.values())) != len(table_names_by_source):
+        raise EntityAddressArchiveReceiptError("entity-address stage integrity relation family is invalid")
+    return table_names_by_source
+
+
+async def capture_entity_address_stage_integrity_receipt(
+    session,
+    *,
+    schema_name: str,
+    stage_table_names: Mapping[str, str],
+) -> EntityAddressStageIntegrityReceipt:
+    """Capture the prepared destination family under its physical stage names."""
+
+    schema = _schema_name(schema_name)
+    table_names = _validated_stage_table_names_by_source(stage_table_names)
+    await _normalize_receipt_session(session, schema)
+    models = _models()
+    await _lock_relation_family(
+        session,
+        schema,
+        tuple(table_names[model.__tablename__] for model in models),
+    )
+    table_receipts = []
+    for model in models:
+        table_name = table_names[model.__tablename__]
+        relation_oid = await _relation_oid(session, schema, table_name)
+        schema_sha256 = await _schema_identity(session, relation_oid, schema, table_name)
+        row_count, row_sha256 = await _row_identity(session, schema, table_name)
+        table_receipts.append(
+            EntityAddressArchiveTableReceipt(model.__name__, table_name, schema_sha256, row_count, row_sha256)
+        )
+    tables = tuple(table_receipts)
+    schema_sha256 = _canonical_digest(
+        [
+            {"model_name": table.model_name, "table_name": table.table_name, "schema_sha256": table.schema_sha256}
+            for table in tables
+        ]
+    )
+    content_sha256 = _canonical_digest([table.as_dict() for table in tables])
+    return EntityAddressStageIntegrityReceipt(tables, schema_sha256, content_sha256)
+
+
+def validate_entity_address_stage_integrity_receipt(
+    receipt: Mapping[str, Any] | EntityAddressStageIntegrityReceipt,
+    *,
+    stage_table_names: Mapping[str, str],
+) -> EntityAddressStageIntegrityReceipt:
+    """Validate a durable local receipt against the trusted derived stage names."""
+
+    table_names = _validated_stage_table_names_by_source(stage_table_names)
+    receipt_value = receipt.as_dict() if isinstance(receipt, EntityAddressStageIntegrityReceipt) else receipt
+    if (
+        not isinstance(receipt_value, Mapping)
+        or set(receipt_value) != {"contract", "receipt_version", "tables", "schema_sha256", "content_sha256"}
+        or receipt_value["contract"] != STAGE_INTEGRITY_CONTRACT
+        or receipt_value["receipt_version"] != STAGE_INTEGRITY_RECEIPT_VERSION
+        or not isinstance(receipt_value["tables"], list)
+    ):
+        raise EntityAddressArchiveReceiptError("entity-address stage integrity receipt is invalid")
+    expected_identities = tuple((model.__name__, table_names[model.__tablename__]) for model in _models())
+    if len(receipt_value["tables"]) != len(expected_identities):
+        raise EntityAddressArchiveReceiptError("entity-address stage integrity receipt is invalid")
+    entries = []
+    for entry, identity in zip(receipt_value["tables"], expected_identities, strict=False):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"model_name", "table_name", "schema_sha256", "row_count", "row_sha256"}
+            or (entry["model_name"], entry["table_name"]) != identity
+            or type(entry["row_count"]) is not int
+            or entry["row_count"] < 0
+            or any(_SHA256.fullmatch(str(entry[key])) is None for key in ("schema_sha256", "row_sha256"))
+        ):
+            raise EntityAddressArchiveReceiptError("entity-address stage integrity receipt is invalid")
+        entries.append(EntityAddressArchiveTableReceipt(**dict(entry)))
+    validated = EntityAddressStageIntegrityReceipt(
+        tuple(entries),
+        _canonical_digest(
+            [
+                {"model_name": entry.model_name, "table_name": entry.table_name, "schema_sha256": entry.schema_sha256}
+                for entry in entries
+            ]
+        ),
+        _canonical_digest([entry.as_dict() for entry in entries]),
+    )
+    if (
+        receipt_value["schema_sha256"] != validated.schema_sha256
+        or receipt_value["content_sha256"] != validated.content_sha256
+    ):
+        raise EntityAddressArchiveReceiptError("entity-address stage integrity receipt is invalid")
+    return validated
 
 
 def validate_entity_address_archive_receipt(

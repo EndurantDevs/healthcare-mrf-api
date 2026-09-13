@@ -26,8 +26,11 @@ from process.entity_address_snapshot_ownership import (
 from process.entity_address_snapshot_receipt import (
     EntityAddressArchiveReceipt,
     EntityAddressArchiveReceiptError,
+    EntityAddressStageIntegrityReceipt,
     capture_entity_address_archive_receipt,
+    capture_entity_address_stage_integrity_receipt,
     validate_entity_address_archive_receipt,
+    validate_entity_address_stage_integrity_receipt,
 )
 
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
@@ -47,6 +50,7 @@ class PreparedEntityAddressSnapshotRestore:
     import_date: str
     stage_relation_oids: tuple[tuple[str, int], ...]
     semantic_receipt: EntityAddressArchiveReceipt
+    stage_integrity: EntityAddressStageIntegrityReceipt
     prepared: adoption.PreparedEntityAddressSnapshotAdoption
     context: dict[str, Any]
     native_validation: dict[str, Any]
@@ -62,6 +66,7 @@ class PreparedEntityAddressSnapshotRestore:
                 {"table_name": table_name, "oid": oid} for table_name, oid in self.stage_relation_oids
             ],
             "semantic_receipt": self.semantic_receipt.as_dict(),
+            "stage_integrity": self.stage_integrity.as_dict(),
             "context": _json_object(self.context, "context"),
             "native_validation": _json_object(self.native_validation, "native_validation"),
         }
@@ -425,12 +430,18 @@ async def finalize_entity_address_archive_restore(
             db_schema=normalized_schema,
             import_date=normalized_date,
         )
+    stage_integrity = await capture_entity_address_stage_integrity_receipt(
+        session,
+        schema_name=normalized_schema,
+        stage_table_names=stage_names,
+    )
     return PreparedEntityAddressSnapshotRestore(
         ownership=validated_owner,
         db_schema=normalized_schema,
         import_date=normalized_date,
         stage_relation_oids=stage_oids,
         semantic_receipt=validated_receipt,
+        stage_integrity=stage_integrity,
         prepared=prepared,
         context=_json_object(prepared.context, "context"),
         native_validation=_json_object(prepared.publish_validation, "native_validation"),
@@ -520,7 +531,15 @@ def _rehydrated_native_validation(value: Any, context: Mapping[str, Any]) -> dic
 
 def _validated_rehydration_state(
     stored: Mapping[str, Any],
-) -> tuple[str, str, tuple[tuple[str, int], ...], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    str,
+    str,
+    dict[str, str],
+    tuple[tuple[str, int], ...],
+    EntityAddressStageIntegrityReceipt,
+    dict[str, Any],
+    dict[str, Any],
+]:
     """Validate durable restore fields and return only the pinned local activation state."""
 
     required_fields = {
@@ -529,6 +548,7 @@ def _validated_rehydration_state(
         "import_date",
         "stage_relation_oids",
         "semantic_receipt",
+        "stage_integrity",
         "context",
         "native_validation",
     }
@@ -553,9 +573,16 @@ def _validated_rehydration_state(
         stored["semantic_receipt"]
     ):
         raise EntityAddressSnapshotRestoreError("entity-address restore semantic receipt is invalid")
+    try:
+        stage_integrity = validate_entity_address_stage_integrity_receipt(
+            stored["stage_integrity"],
+            stage_table_names=stage_names,
+        )
+    except EntityAddressArchiveReceiptError as error:
+        raise EntityAddressSnapshotRestoreError(str(error)) from error
     context = _rehydrated_context(stored["context"])
     native_validation = _rehydrated_native_validation(stored["native_validation"], context)
-    return normalized_schema, normalized_date, stage_oids, context, native_validation
+    return normalized_schema, normalized_date, stage_names, stage_oids, stage_integrity, context, native_validation
 
 
 async def rehydrate_entity_address_archive_restore(
@@ -563,12 +590,33 @@ async def rehydrate_entity_address_archive_restore(
     *,
     stored: Mapping[str, Any],
 ) -> adoption.PreparedEntityAddressSnapshotAdoption:
-    """Rebuild only the immutable native cutover plan after rechecking local fences."""
+    """Recheck the prepared stage before rebuilding its native cutover plan.
+
+    Callers must complete this potentially full-table receipt scan before asking
+    the native publisher to acquire serving-relation cutover locks. The retained
+    stage SHARE locks then keep the verified rows and schema stable through the
+    caller-owned activation transaction.
+    """
 
     _require_caller_transaction(session)
-    normalized_schema, normalized_date, stage_oids, context, native_validation = _validated_rehydration_state(stored)
+    (
+        normalized_schema,
+        normalized_date,
+        stage_names,
+        stage_oids,
+        stage_integrity,
+        context,
+        native_validation,
+    ) = _validated_rehydration_state(stored)
     await _lock_stored_stage_relations(session, db_schema=normalized_schema, stage_oids=stage_oids)
     await _verify_stored_stage_oids(session, db_schema=normalized_schema, stage_oids=stage_oids)
+    actual_stage_integrity = await capture_entity_address_stage_integrity_receipt(
+        session,
+        schema_name=normalized_schema,
+        stage_table_names=stage_names,
+    )
+    if actual_stage_integrity.as_dict() != stage_integrity.as_dict():
+        raise EntityAddressSnapshotRestoreError("entity-address restore stage integrity differs")
     (
         stage_cls,
         support_stage_class_map,
