@@ -27,17 +27,19 @@ MAX_METADATA_BYTES = 64 * 1024
 TEXT_LABELS = {
     "profession": "Profession",
     "name": "Name",
-    "address": "Address",
     "status": "Status",
     "dateOfLicensure": "Date of Licensure",
-    "additionalQualifications": "Additional Qualifications",
     "registeredThroughDate": "Registered through Date",
     "schoolName": "Medical School",
     "schoolDegreeDate": "Degree Date",
     "licenseNumber": "License Number",
 }
 EDUCATION_FIELDS = ("schoolName", "schoolDegreeDate")
-OPTIONAL_TEXT_FIELDS = (*EDUCATION_FIELDS, "dateOfLicensure", "registeredThroughDate")
+OPTIONAL_TEXT_FIELDS = (
+    *EDUCATION_FIELDS,
+    "dateOfLicensure",
+    "registeredThroughDate",
+)
 UNREPORTED = {"", "none", "n/a", "unknown", "not reported", "not available", "not applicable"}
 MONTHS = (
     "January",
@@ -119,18 +121,6 @@ def _validated_profile(body, license_number):
         "identity_mismatch",
     )
     _require(text_by_field["name"].strip().casefold() not in UNREPORTED, "name_missing")
-    _wrapped_field(profile_by_field, "additionalLicenses", "Additional Licenses", list)
-    privileges = _wrapped_field(profile_by_field, "privileges", "Additional Qualifications", list)
-    _require(all(isinstance(privilege, str) for privilege in privileges), "privileges_schema_invalid")
-    _require(
-        all(
-            isinstance(profile_by_field.get(field), list)
-            for field in ("enforcementActions", "certificateOfAuthorizations")
-        )
-        and isinstance(profile_by_field.get("noEnforcementActionsFoundMessage"), str)
-        and type(profile_by_field.get("index")) is int,
-        "profile_schema_invalid",
-    )
     return profile_by_field, text_by_field
 
 

@@ -33,6 +33,11 @@ def _profile_body(license_number="654321", **changes):
     text_by_field.update(changes)
     return {
         **{field: {"label": label, "value": text_by_field[field]} for field, label in profile.TEXT_LABELS.items()},
+        "address": {"label": "Address", "value": text_by_field["address"]},
+        "additionalQualifications": {
+            "label": "Additional Qualifications",
+            "value": text_by_field["additionalQualifications"],
+        },
         "professionCode": "060",
         "enforcementActions": [],
         "index": 0,
@@ -305,13 +310,9 @@ def test_wrong_field_label_or_type_is_rejected(field):
         ("profession", {"label": "Profession", "value": "Pharmacy (040)"}),
         ("licenseNumber", {"label": "License Number", "value": "123456"}),
         ("name", {"label": "Name", "value": "None"}),
-        ("index", True),
-        ("privileges", {"label": "Additional Qualifications", "value": [None]}),
-        ("enforcementActions", {}),
-        ("certificateOfAuthorizations", None),
     ],
 )
-def test_wrong_identity_or_container_is_rejected(field, replacement):
+def test_wrong_identity_is_rejected(field, replacement):
     source = _profile_body()
     source[field] = replacement
     with pytest.raises(ValueError):
@@ -383,6 +384,38 @@ async def test_unreported_education_acquisition_and_replay(source_session, missi
     assert acquired["source_record"]["raw_payload"] == source
     assert [fact["category"] for fact in acquired["facts"]] == ["licenses"]
     assert _artifact(session, "result.json")["fact_count"] == 1
+    assert profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
+    assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("address", {"label": "Address", "value": None}),
+        ("additionalQualifications", {"label": "Additional Qualifications", "value": None}),
+        ("additionalLicenses", {"items": []}),
+        ("privileges", {"label": "Additional Qualifications", "value": [None]}),
+        ("enforcementActions", {}),
+        ("certificateOfAuthorizations", "None"),
+        ("noEnforcementActionsFoundMessage", []),
+        ("index", True),
+    ],
+)
+@pytest.mark.parametrize("representation", ["absent", "null", "changed"])
+async def test_unused_metadata_preserves_facts_and_replay(source_session, field, replacement, representation):
+    source = _profile_body()
+    if representation == "absent":
+        del source[field]
+    else:
+        source[field] = None if representation == "null" else replacement
+    session = source_session(SourceResponse(source))
+    acquired = await _acquire(session)
+    _, expected_facts = _parse(_profile_body())
+    assert len(session.requests) == 1 and session.closed
+    assert acquired["outcome"] == "acquired"
+    assert acquired["source_record"]["raw_payload"] == source
+    assert [fact["value_json"] for fact in acquired["facts"]] == [fact["value_json"] for fact in expected_facts]
+    assert [fact["category"] for fact in acquired["facts"]] == ["education", "licenses"]
     assert profile.read_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
     assert base64.b64decode(_artifact(session, "response.json")["body_base64"]) == session.response.body
 
