@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 serving = importlib.import_module("process.entity_address_snapshot_serving")
+
+
+def _session(*, active: bool = True):
+    return SimpleNamespace(
+        execute=AsyncMock(),
+        in_transaction=lambda: active,
+    )
 
 
 def _geo_signature(schema_name: str) -> tuple[tuple[str, int, int], ...]:
@@ -39,7 +47,7 @@ def _install_observation_results(monkeypatch: pytest.MonkeyPatch, schema_name: s
 
 @pytest.mark.asyncio
 async def test_queue_capture_uses_fixed_bounds_and_writer_lock_order(monkeypatch: pytest.MonkeyPatch):
-    session = AsyncMock()
+    session = _session()
     _install_observation_results(monkeypatch, "mrf")
 
     captured = await serving.capture_entity_address_observed_serving(session, schema_name="mrf")
@@ -59,7 +67,7 @@ async def test_queue_capture_uses_fixed_bounds_and_writer_lock_order(monkeypatch
 
 @pytest.mark.asyncio
 async def test_worker_observation_does_not_inherit_queue_timeouts(monkeypatch: pytest.MonkeyPatch):
-    session = AsyncMock()
+    session = _session()
     _install_observation_results(monkeypatch, "mrf")
 
     await serving.observe_entity_address_serving(
@@ -72,3 +80,23 @@ async def test_worker_observation_does_not_inherit_queue_timeouts(monkeypatch: p
     assert statements[0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
     assert statements[1] == serving.address_alias_sql.alias_advisory_xact_lock_sql()
     assert not any("timeout" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_observation_requires_caller_transaction_before_sql():
+    session = _session(active=False)
+
+    with pytest.raises(ValueError, match="requires a caller transaction"):
+        await serving.capture_entity_address_observed_serving(session, schema_name="mrf")
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_observation_rejects_oversize_schema_before_sql():
+    session = _session()
+
+    with pytest.raises(ValueError, match="safe schema name"):
+        await serving.capture_entity_address_observed_serving(session, schema_name="a" * 64)
+
+    session.execute.assert_not_awaited()
