@@ -7,6 +7,11 @@ the caller's existing destination transaction.  It deliberately does not copy
 logical snapshots, source pins, current pointers, frozen-source bindings, or
 candidate attestations.  The caller creates the destination candidate from its
 own evidence, then obtains a fresh local attestation before activation.
+
+``staging_schema_name`` is a syntactic identifier boundary, not an ownership
+claim.  The caller must establish that the schema was created for this restore
+and that its archive receipt names the selected closure before calling this
+function.
 """
 
 from __future__ import annotations
@@ -233,7 +238,38 @@ async def _copy_rekeyed_table(
         ),
         {"source_snapshot_key": int(source_snapshot_key), "destination_snapshot_key": int(destination_snapshot_key)},
     )
-    expected_columns = ", ".join(_quote_ident(column) for column in non_key_columns) or "1"
+    await _assert_rekeyed_table_matches(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        table_name=table_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+        non_key_columns=non_key_columns,
+    )
+
+
+async def _assert_rekeyed_table_matches(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    table_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+    non_key_columns: tuple[str, ...] | None = None,
+) -> None:
+    """Reject a rekeyed relation unless its exact source and local rows agree."""
+
+    destination_columns = await _table_columns(session, schema_name=schema_name, table_name=table_name)
+    staging_columns = await _table_columns(session, schema_name=staging_schema_name, table_name=table_name)
+    if destination_columns != staging_columns:
+        raise ResultArchiveAdoptionError(f"archive adoption {table_name} column contract differs from staging")
+    compared_columns = non_key_columns or tuple(column for column in destination_columns if column != "snapshot_key")
+    schema = _quote_ident(schema_name)
+    staging = _quote_ident(staging_schema_name)
+    table = _quote_ident(table_name)
+    expected_columns = ", ".join(_quote_ident(column) for column in compared_columns) or "1"
     difference_result = await session.execute(
         text(
             f"""
@@ -258,10 +294,9 @@ async def _copy_rekeyed_table(
         raise ResultArchiveAdoptionError(f"archive adoption {table_name} conflicts with destination rows")
 
 
-async def _copy_staged_blocks(
+async def _validate_staged_blocks(
     session: Any, *, schema_name: str, staging_schema_name: str, max_staged_block_rows: int
 ) -> None:
-    schema = _quote_ident(schema_name)
     staging = _quote_ident(staging_schema_name)
     count_result = await session.execute(text(f"SELECT COUNT(*) FROM {staging}.ptg2_v3_block"))
     if int(count_result.scalar() or 0) > max_staged_block_rows:
@@ -280,6 +315,52 @@ async def _copy_staged_blocks(
     )
     if bool(invalid_result.scalar()):
         raise ResultArchiveAdoptionError("archive adoption staging CAS metadata is invalid")
+
+
+async def _assert_staged_blocks_match_local(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+) -> None:
+    """Require every staged CAS object to be already identical locally."""
+
+    schema = _quote_ident(schema_name)
+    staging = _quote_ident(staging_schema_name)
+    conflict_result = await session.execute(
+        text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {staging}.ptg2_v3_block AS staged
+                  LEFT JOIN {schema}.ptg2_v3_block AS local USING (block_hash)
+                 WHERE local.block_hash IS NULL
+                    OR ROW(local.format_version, local.object_kind, local.codec,
+                           local.entry_count, local.raw_byte_count,
+                           local.stored_byte_count, local.payload)
+                       IS DISTINCT FROM
+                       ROW(staged.format_version, staged.object_kind, staged.codec,
+                           staged.entry_count, staged.raw_byte_count,
+                           staged.stored_byte_count, staged.payload)
+            )
+            """
+        )
+    )
+    if bool(conflict_result.scalar()):
+        raise ResultArchiveAdoptionError("archive adoption CAS hash collides with different destination content")
+
+
+async def _copy_staged_blocks(
+    session: Any, *, schema_name: str, staging_schema_name: str, max_staged_block_rows: int
+) -> None:
+    await _validate_staged_blocks(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        max_staged_block_rows=max_staged_block_rows,
+    )
+    schema = _quote_ident(schema_name)
+    staging = _quote_ident(staging_schema_name)
     await session.execute(
         text(
             f"""
@@ -293,26 +374,11 @@ async def _copy_staged_blocks(
             """
         )
     )
-    conflict_result = await session.execute(
-        text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {staging}.ptg2_v3_block AS staged
-                  JOIN {schema}.ptg2_v3_block AS local USING (block_hash)
-                 WHERE ROW(local.format_version, local.object_kind, local.codec,
-                           local.entry_count, local.raw_byte_count,
-                           local.stored_byte_count, local.payload)
-                       IS DISTINCT FROM
-                       ROW(staged.format_version, staged.object_kind, staged.codec,
-                           staged.entry_count, staged.raw_byte_count,
-                           staged.stored_byte_count, staged.payload)
-            )
-            """
-        )
+    await _assert_staged_blocks_match_local(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
     )
-    if bool(conflict_result.scalar()):
-        raise ResultArchiveAdoptionError("archive adoption CAS hash collides with different destination content")
 
 
 async def _prepare_staged_map_root(
@@ -354,6 +420,121 @@ async def _copy_staged_layout_rows(
             source_snapshot_key=source_snapshot_key,
             destination_snapshot_key=destination_snapshot_key,
         )
+
+
+async def _assert_staged_layout_rows_match_local(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Compare the rekeyed staged closure before reusing a sealed layout."""
+
+    for table_name in _REKEYED_TABLES:
+        await _assert_rekeyed_table_matches(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            table_name=table_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key,
+        )
+
+
+async def _reused_mapping_digest(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+    support_digest: bytes,
+    layout_manifest: Mapping[str, Any],
+    max_staged_block_rows: int,
+) -> bytes:
+    """Authenticate staged physical content before binding a reused local key."""
+
+    staged_summary = await summarize_persisted_v4_snapshot_maps(
+        session,
+        schema_name=staging_schema_name,
+        snapshot_key=source_snapshot_key,
+    )
+    local_summary = await summarize_persisted_v4_snapshot_maps(
+        session,
+        schema_name=schema_name,
+        snapshot_key=destination_snapshot_key,
+    )
+    if staged_summary != local_summary:
+        raise ResultArchiveAdoptionError("archive adoption reused map summary differs from staging")
+    mapping_digest = await _assert_reused_layout_metadata(
+        session,
+        schema_name=schema_name,
+        destination_snapshot_key=destination_snapshot_key,
+        support_digest=support_digest,
+        layout_manifest=layout_manifest,
+        staged_mapping_digest=staged_summary.map_digest,
+    )
+    await _validate_staged_blocks(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        max_staged_block_rows=max_staged_block_rows,
+    )
+    await _assert_staged_blocks_match_local(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+    )
+    await _assert_staged_layout_rows_match_local(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    return mapping_digest
+
+
+async def _assert_reused_layout_metadata(
+    session: Any,
+    *,
+    schema_name: str,
+    destination_snapshot_key: int,
+    support_digest: bytes,
+    layout_manifest: Mapping[str, Any],
+    staged_mapping_digest: bytes,
+) -> bytes:
+    """Require a sealed local root to retain the staging layout identity."""
+
+    local_layout = await _one(
+        session,
+        f"""
+        SELECT layout.generation, layout.state, layout.support_digest,
+               layout.mapping_digest, layout.layout_manifest,
+               map_root.state AS map_root_state, map_root.map_digest AS map_root_digest
+          FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_layout AS layout
+          JOIN {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_root AS map_root
+            ON map_root.snapshot_key = layout.snapshot_key
+         WHERE layout.snapshot_key = :destination_snapshot_key
+         FOR KEY SHARE OF layout, map_root
+        """,
+        {"destination_snapshot_key": destination_snapshot_key},
+        "reused destination layout",
+    )
+    mapping_digest = bytes(local_layout.get("mapping_digest") or b"")
+    if (
+        local_layout.get("generation") != PTG2_V4_SHARED_GENERATION
+        or local_layout.get("state") != "sealed"
+        or local_layout.get("map_root_state") != "complete"
+        or bytes(local_layout.get("support_digest") or b"") != support_digest
+        or mapping_digest != staged_mapping_digest
+        or bytes(local_layout.get("map_root_digest") or b"") != mapping_digest
+        or local_layout.get("layout_manifest") != layout_manifest
+    ):
+        raise ResultArchiveAdoptionError("archive adoption reused layout metadata differs from staging")
+    return mapping_digest
 
 
 async def _seal_destination_layout(
@@ -490,6 +671,34 @@ async def _bind_prepared_snapshot(
     )
 
 
+async def _prepare_reused_destination_layout(
+    session: Any,
+    *,
+    preparation: _NewLayoutPreparation,
+    destination_snapshot_id: str,
+) -> PreparedResultArchiveLayout:
+    """Authenticate and bind an existing canonical layout to a local candidate."""
+
+    mapping_digest = await _reused_mapping_digest(
+        session,
+        schema_name=preparation.schema_name,
+        staging_schema_name=preparation.staging_schema_name,
+        source_snapshot_key=preparation.source_snapshot_key,
+        destination_snapshot_key=preparation.destination_snapshot_key,
+        support_digest=preparation.support_digest,
+        layout_manifest=preparation.layout_manifest,
+        max_staged_block_rows=preparation.max_staged_block_rows,
+    )
+    return await _bind_prepared_snapshot(
+        session,
+        schema_name=preparation.schema_name,
+        snapshot_id=destination_snapshot_id,
+        snapshot_key=preparation.destination_snapshot_key,
+        source_snapshot_key=preparation.source_snapshot_key,
+        mapping_digest=mapping_digest,
+    )
+
+
 async def prepare_result_archive_layout(
     session: Any,
     *,
@@ -518,28 +727,26 @@ async def prepare_result_archive_layout(
         destination_snapshot_id=destination_snapshot,
         build_token=token,
     )
+    preparation = _NewLayoutPreparation(
+        destination_schema,
+        staging_schema,
+        source_key,
+        reservation.snapshot_key,
+        token,
+        support_digest,
+        layout_manifest,
+        int(max_staged_block_rows),
+    )
     if reservation.reused:
-        return await _bind_prepared_snapshot(
+        return await _prepare_reused_destination_layout(
             session,
-            schema_name=destination_schema,
-            snapshot_id=destination_snapshot,
-            snapshot_key=reservation.snapshot_key,
-            source_snapshot_key=source_key,
-            mapping_digest=b"",
+            preparation=preparation,
+            destination_snapshot_id=destination_snapshot,
         )
 
     sealed_key, mapping_digest = await _prepare_new_destination_layout(
         session,
-        preparation=_NewLayoutPreparation(
-            destination_schema,
-            staging_schema,
-            source_key,
-            reservation.snapshot_key,
-            token,
-            support_digest,
-            layout_manifest,
-            int(max_staged_block_rows),
-        ),
+        preparation=preparation,
     )
     return await _bind_prepared_snapshot(
         session,
