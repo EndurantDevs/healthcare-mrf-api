@@ -226,6 +226,109 @@ async def _assert_retained_catalog(engine, schema_name: str) -> None:
         )
 
 
+async def _catalog_state(connection, schema_name: str, table_name: str):
+    """Return stable relation identity and one synthetic row value."""
+
+    relation_oid = await connection.scalar(
+        text(
+            "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+            "WHERE namespace.nspname=:schema_name AND relation.relname=:table_name"
+        ),
+        {"schema_name": schema_name, "table_name": table_name},
+    )
+    row_count = await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}"."{table_name}"'))
+    pos_code = await connection.scalar(
+        text(f'SELECT code FROM "{schema_name}"."{table_name}" WHERE code_system=\'POS\'')
+    )
+    return relation_oid, row_count, pos_code
+
+
+@pytest.mark.asyncio
+async def test_native_catalog_idle_fence_failure_keeps_relations():
+    """Reject a non-idle cutover before either owned relation is renamed."""
+
+    engine = create_async_engine(_dsn())
+    schema_name = "code_catalog_archive_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+            await _create_catalog(connection, schema_name, "code_catalog")
+            await _create_catalog(connection, schema_name, "code_catalog_stage")
+            await _insert_rows(connection, schema_name, "code_catalog", _rows(suffix="_old"))
+            await _insert_rows(connection, schema_name, "code_catalog_stage", _rows())
+            live_before = await _catalog_state(connection, schema_name, "code_catalog")
+            stage_before = await _catalog_state(connection, schema_name, "code_catalog_stage")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        incumbent = await _capture(sessions, schema_name)
+        stage = await _validated_stage(engine, sessions, schema_name)
+
+        async def reject_import_idle(_session) -> None:
+            raise RuntimeError("synthetic import is not idle")
+
+        async with sessions() as session, session.begin():
+            with pytest.raises(RuntimeError, match="not idle"):
+                await promote_code_catalog_restored_stage(
+                    session,
+                    schema_name=schema_name,
+                    stage_table_name="code_catalog_stage",
+                    retained_table_name="code_catalog_previous",
+                    incumbent_capture=incumbent,
+                    expected_stage_capture=stage,
+                    require_import_idle=reject_import_idle,
+                )
+        async with engine.connect() as connection:
+            assert await _catalog_state(connection, schema_name, "code_catalog") == live_before
+            assert await _catalog_state(connection, schema_name, "code_catalog_stage") == stage_before
+            assert await connection.scalar(text(f"SELECT to_regclass('{schema_name}.code_catalog_previous')")) is None
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_catalog_preexisting_retained_keeps_relations():
+    """Refuse a reused retained name without touching live, stage, or predecessor."""
+
+    engine = create_async_engine(_dsn())
+    schema_name = "code_catalog_archive_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+            await _create_catalog(connection, schema_name, "code_catalog")
+            await _create_catalog(connection, schema_name, "code_catalog_stage")
+            await _create_catalog(connection, schema_name, "code_catalog_previous")
+            await _insert_rows(connection, schema_name, "code_catalog", _rows(suffix="_old"))
+            await _insert_rows(connection, schema_name, "code_catalog_stage", _rows())
+            await _insert_rows(connection, schema_name, "code_catalog_previous", _rows(suffix="_retained"))
+            live_before = await _catalog_state(connection, schema_name, "code_catalog")
+            stage_before = await _catalog_state(connection, schema_name, "code_catalog_stage")
+            retained_before = await _catalog_state(connection, schema_name, "code_catalog_previous")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        incumbent = await _capture(sessions, schema_name)
+        stage = await _validated_stage(engine, sessions, schema_name)
+        async with sessions() as session, session.begin():
+            with pytest.raises(CodeCatalogSnapshotError, match="retained table already exists"):
+                await promote_code_catalog_restored_stage(
+                    session,
+                    schema_name=schema_name,
+                    stage_table_name="code_catalog_stage",
+                    retained_table_name="code_catalog_previous",
+                    incumbent_capture=incumbent,
+                    expected_stage_capture=stage,
+                    require_import_idle=_idle,
+                )
+        async with engine.connect() as connection:
+            assert await _catalog_state(connection, schema_name, "code_catalog") == live_before
+            assert await _catalog_state(connection, schema_name, "code_catalog_stage") == stage_before
+            assert await _catalog_state(connection, schema_name, "code_catalog_previous") == retained_before
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_native_catalog_promotion_refuses_foreign_key_dependents_without_mutation():
     engine = create_async_engine(_dsn())

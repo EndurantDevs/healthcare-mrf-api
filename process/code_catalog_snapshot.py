@@ -586,6 +586,11 @@ async def promote_code_catalog_restored_stage(
     at ``retained_table_name``; this primitive never drops a predecessor.  The
     expected stage capture must be the exact OID and receipt returned by local
     validation, and both live and stage must be owned by the cutover role.
+
+    The caller must use new stage and retained table names for every completed
+    cycle.  PostgreSQL keeps index and constraint names when either table is
+    renamed, so reusing a prior stage or retained name can make later local
+    preparation collide even after the live table name is available again.
     """
     schema = _identifier(schema_name, field="schema")
     table_name = _table_name()
