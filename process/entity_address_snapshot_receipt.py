@@ -104,61 +104,77 @@ def _json_scalar(value: object) -> str:
     raise TypeError(f"unsupported entity-address archive schema value: {type(value).__name__}")
 
 
-async def _normalize_receipt_session(session) -> None:
-    """Set only transaction-local textual encodings used by ``to_jsonb``."""
+async def _normalize_receipt_session(session, schema_name: str) -> None:
+    """Start a repeatable capture before any relation or catalog access."""
     if not session.in_transaction():
         raise EntityAddressArchiveReceiptError("entity-address archive receipt requires a caller transaction")
     for setting in (
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
         "SET LOCAL TimeZone TO 'UTC'",
         "SET LOCAL DateStyle TO 'ISO, YMD'",
         "SET LOCAL IntervalStyle TO 'iso_8601'",
         "SET LOCAL extra_float_digits TO 3",
         "SET LOCAL bytea_output TO 'hex'",
         "SET LOCAL work_mem TO '64MB'",
+        f"SET LOCAL search_path TO {_quoted(schema_name)}, pg_catalog",
     ):
         await session.execute(text(setting))
 
 
+async def _lock_model_family(session, schema_name: str, models: tuple[type, ...]) -> None:
+    """Pin the closed family before inspecting either schema or row contents."""
+    relations = ", ".join(
+        f"{_quoted(schema_name)}.{_quoted(model.__tablename__)}"
+        for model in sorted(models, key=lambda item: item.__tablename__)
+    )
+    await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
+
+
 async def _relation_oid(session, schema_name: str, table_name: str) -> int:
     row = (
-        await session.execute(
-            text(
-                "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
-                "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
-                "WHERE namespace.nspname=:schema_name AND relation.relname=:table_name"
-            ),
-            {"schema_name": schema_name, "table_name": table_name},
+        (
+            await session.execute(
+                text(
+                    "SELECT relation.oid, relation.relkind, relation.relpersistence, relation.relrowsecurity, relation.relforcerowsecurity FROM pg_catalog.pg_class AS relation "
+                    "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+                    "WHERE namespace.nspname=:schema_name AND relation.relname=:table_name"
+                ),
+                {"schema_name": schema_name, "table_name": table_name},
+            )
         )
-    ).scalar_one_or_none()
-    if not isinstance(row, int) or row <= 0:
+        .mappings()
+        .one_or_none()
+    )
+    if (
+        row is None
+        or not isinstance(row["oid"], int)
+        or row["oid"] <= 0
+        or row["relkind"] not in {"r", b"r"}
+        or row["relpersistence"] not in {"p", b"p"}
+        or row["relrowsecurity"]
+        or row["relforcerowsecurity"]
+    ):
         raise EntityAddressArchiveReceiptError("entity-address archive relation is unavailable")
-    return row
+    return row["oid"]
 
 
-def _schema_independent(value: object, schema_name: str) -> object:
-    """Remove only this safe relation schema from catalog-rendered expressions."""
-    if isinstance(value, str):
-        return value.replace(f'"{schema_name}".', '"<archive-schema>".').replace(schema_name + ".", "<archive-schema>.")
-    if isinstance(value, list):
-        return [_schema_independent(entry, schema_name) for entry in value]
-    if isinstance(value, dict):
-        return {key: _schema_independent(entry, schema_name) for key, entry in value.items()}
-    return value
-
-
-async def _schema_identity(session, relation_oid: int, schema_name: str, table_name: str) -> str:
-    columns = [
+async def _catalog_columns(session, relation_oid: int) -> list[dict[str, Any]]:
+    """Read stable column identity without relation OIDs."""
+    return [
         dict(catalog_row)
         for catalog_row in (
             await session.execute(
                 text(
                     "SELECT attribute.attnum, attribute.attname, "
                     "pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS type, "
-                    "attribute.attnotnull, attribute.attgenerated::text, attribute.attidentity::text, "
+                    "attribute.attnotnull, attribute.attgenerated::text, collation_namespace.nspname AS collation_schema, "
+                    "collation_name.collname AS collation_name, attribute.attidentity::text, "
                     "pg_catalog.pg_get_expr(default_value.adbin, default_value.adrelid, true) AS default_expression "
                     "FROM pg_catalog.pg_attribute AS attribute "
                     "LEFT JOIN pg_catalog.pg_attrdef AS default_value "
                     "ON default_value.adrelid=attribute.attrelid AND default_value.adnum=attribute.attnum "
+                    "LEFT JOIN pg_catalog.pg_collation AS collation_name ON collation_name.oid=attribute.attcollation "
+                    "LEFT JOIN pg_catalog.pg_namespace AS collation_namespace ON collation_namespace.oid=collation_name.collnamespace "
                     "WHERE attribute.attrelid=:relation_oid AND attribute.attnum>0 AND NOT attribute.attisdropped "
                     "ORDER BY attribute.attnum"
                 ),
@@ -166,43 +182,86 @@ async def _schema_identity(session, relation_oid: int, schema_name: str, table_n
             )
         ).mappings()
     ]
-    constraints = [
+
+
+async def _catalog_constraints(session, relation_oid: int, schema_name: str) -> list[dict[str, Any]]:
+    """Read structural constraints, including portable foreign-key identity."""
+    return [
         dict(catalog_row)
         for catalog_row in (
             await session.execute(
                 text(
-                    "SELECT contype, pg_catalog.pg_get_constraintdef(oid, true) AS definition "
-                    "FROM pg_catalog.pg_constraint WHERE conrelid=:relation_oid "
-                    "ORDER BY contype, pg_catalog.pg_get_constraintdef(oid, true)"
+                    "SELECT constraint_row.contype, constraint_row.condeferrable, constraint_row.condeferred, constraint_row.convalidated, "
+                    "constraint_row.conkey::text AS key_columns, constraint_row.confkey::text AS referenced_columns, "
+                    "referenced_relation.relname AS referenced_table, referenced_namespace.nspname=:schema_name AS referenced_in_archive_schema, "
+                    "pg_catalog.pg_get_expr(constraint_row.conbin, constraint_row.conrelid, true) AS check_expression "
+                    "FROM pg_catalog.pg_constraint AS constraint_row LEFT JOIN pg_catalog.pg_class AS referenced_relation "
+                    "ON referenced_relation.oid=constraint_row.confrelid LEFT JOIN pg_catalog.pg_namespace AS referenced_namespace "
+                    "ON referenced_namespace.oid=referenced_relation.relnamespace WHERE constraint_row.conrelid=:relation_oid "
+                    "ORDER BY constraint_row.contype, constraint_row.conkey::text, constraint_row.confkey::text, referenced_relation.relname"
                 ),
-                {"relation_oid": relation_oid},
+                {"relation_oid": relation_oid, "schema_name": schema_name},
             )
         ).mappings()
     ]
+
+
+async def _catalog_indexes(session, relation_oid: int) -> list[dict[str, Any]]:
+    """Read index shape with named collation and operator-class identities."""
     indexes = [
         dict(catalog_row)
         for catalog_row in (
             await session.execute(
                 text(
-                    "SELECT index_row.indisunique, index_row.indisprimary, index_row.indimmediate, "
+                    "SELECT index_row.indisunique, index_row.indisprimary, index_row.indimmediate, index_row.indisvalid, index_row.indnkeyatts, index_row.indnatts, "
                     "access_method.amname AS method, pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid, true) AS predicate, "
                     "pg_catalog.pg_get_expr(index_row.indexprs, index_row.indrelid, true) AS expressions, "
-                    "index_row.indkey::text AS keys, index_row.indoption::text AS options "
+                    "index_row.indkey::text AS keys, index_row.indoption::text AS options, "
+                    "(SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object("
+                    "'position', key_position.position, 'attribute_number', index_row.indkey[key_position.position], "
+                    "'collation_schema', collation_namespace.nspname, 'collation_name', collation_name.collname, "
+                    "'opclass_schema', opclass_namespace.nspname, 'opclass_name', opclass_name.opcname) ORDER BY key_position.position) "
+                    "FROM pg_catalog.generate_subscripts(index_row.indkey, 1) AS key_position(position) "
+                    "LEFT JOIN pg_catalog.pg_collation AS collation_name ON collation_name.oid=index_row.indcollation[key_position.position] "
+                    "LEFT JOIN pg_catalog.pg_namespace AS collation_namespace ON collation_namespace.oid=collation_name.collnamespace "
+                    "LEFT JOIN pg_catalog.pg_opclass AS opclass_name ON opclass_name.oid=index_row.indclass[key_position.position] "
+                    "LEFT JOIN pg_catalog.pg_namespace AS opclass_namespace ON opclass_namespace.oid=opclass_name.opcnamespace) AS key_attributes "
                     "FROM pg_catalog.pg_index AS index_row JOIN pg_catalog.pg_class AS index_relation "
                     "ON index_relation.oid=index_row.indexrelid JOIN pg_catalog.pg_am AS access_method "
                     "ON access_method.oid=index_relation.relam WHERE index_row.indrelid=:relation_oid "
-                    "ORDER BY index_row.indisprimary DESC, index_row.indisunique DESC, access_method.amname, index_row.indkey::text"
+                    "ORDER BY index_row.indisprimary DESC, index_row.indisunique DESC, access_method.amname, index_row.indkey::text, index_row.indoption::text"
                 ),
                 {"relation_oid": relation_oid},
             )
         ).mappings()
     ]
+    return sorted(
+        indexes, key=lambda entry: json.dumps(entry, sort_keys=True, separators=(",", ":"), default=_json_scalar)
+    )
+
+
+def _reject_schema_qualified_expressions(schema_name: str, *catalog_groups: list[dict[str, Any]]) -> None:
+    """Fail closed rather than rewriting schema names embedded in SQL text."""
+    expressions = []
+    for entries, keys in zip(
+        catalog_groups,
+        (("default_expression",), ("check_expression",), ("predicate", "expressions")),
+        strict=True,
+    ):
+        expressions.extend(entry.get(key) for entry in entries for key in keys)
+    if any(isinstance(expression, str) and schema_name in expression for expression in expressions):
+        raise EntityAddressArchiveReceiptError("entity-address archive schema expression is unsupported")
+
+
+async def _schema_identity(session, relation_oid: int, schema_name: str, table_name: str) -> str:
+    columns = await _catalog_columns(session, relation_oid)
+    constraints = await _catalog_constraints(session, relation_oid, schema_name)
+    indexes = await _catalog_indexes(session, relation_oid)
     if not columns:
         raise EntityAddressArchiveReceiptError("entity-address archive relation has no columns")
+    _reject_schema_qualified_expressions(schema_name, columns, constraints, indexes)
     return _canonical_digest(
-        _schema_independent(
-            {"table_name": table_name, "columns": columns, "constraints": constraints, "indexes": indexes}, schema_name
-        )
+        {"table_name": table_name, "columns": columns, "constraints": constraints, "indexes": indexes}
     )
 
 
@@ -252,9 +311,11 @@ async def _row_identity(session, schema_name: str, table_name: str) -> tuple[int
 async def capture_entity_address_archive_receipt(session, *, schema_name: str) -> EntityAddressArchiveReceipt:
     """Capture a semantic receipt for exactly the reviewed seven-table family."""
     schema = _schema_name(schema_name)
-    await _normalize_receipt_session(session)
+    await _normalize_receipt_session(session, schema)
+    models = _models()
+    await _lock_model_family(session, schema, models)
     table_receipts = []
-    for model in _models():
+    for model in models:
         relation_oid = await _relation_oid(session, schema, model.__tablename__)
         schema_sha256 = await _schema_identity(session, relation_oid, schema, model.__tablename__)
         row_count, row_sha256 = await _row_identity(session, schema, model.__tablename__)
