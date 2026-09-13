@@ -10,7 +10,9 @@ from process.ptg_graph_resource_admission import V4GraphResourceAdmissionError
 def test_resource_admission_is_terminal_with_numeric_evidence(grouped):
     error = V4GraphResourceAdmissionError(
         "resource_admission: estimated peak bytes 8192 exceeds configured limit 4096",
-        input_bytes=100, factor_edges=200, factor_owners=10,
+        input_bytes=100,
+        factor_edges=200,
+        factor_owners=10,
         options={"max_factor_edges": 1000, "max_estimated_model_bytes": 4096},
     )
     wrapped = ExceptionGroup("worker failures", [error]) if grouped else error
@@ -18,9 +20,13 @@ def test_resource_admission_is_terminal_with_numeric_evidence(grouped):
     assert payload["code"] == "ptg_graph_resource_admission"
     assert payload["retryable"] is False
     assert payload["resource_admission"] == {
-        "version": 1, "input_factor_bytes": 100, "factor_edge_count": 200,
-        "factor_owner_count": 10, "max_factor_edges": 1000,
-        "max_estimated_model_bytes": 4096, "estimated_peak_bytes": 8192,
+        "version": 1,
+        "input_factor_bytes": 100,
+        "factor_edge_count": 200,
+        "factor_owner_count": 10,
+        "max_factor_edges": 1000,
+        "max_estimated_model_bytes": 4096,
+        "estimated_peak_bytes": 8192,
     }
 
 
@@ -33,17 +39,24 @@ def test_generic_error_with_resource_text_keeps_generic_classification():
 def test_resource_evidence_excludes_invalid_numeric_values():
     error = V4GraphResourceAdmissionError(
         "resource_admission: factor edge count exceeds configured limit",
-        input_bytes=-1, factor_edges=True,
+        input_bytes=-1,
+        factor_edges=True,
         options={"max_factor_edges": "unknown", "max_estimated_model_bytes": None},
     )
     assert error.resource_admission == {"version": 1}
 
 
-@pytest.mark.parametrize("worker,suffix", [
-    ("process.PTGLarge", "LARGE"), ("process.PTGHuge", "HUGE"),
-    ("process.PTGNormal", None), ("process.PTGSmall", None), ("", None),
-    ("unrecognized.PTGLarge", None),
-])
+@pytest.mark.parametrize(
+    "worker,suffix",
+    [
+        ("process.PTGLarge", "LARGE"),
+        ("process.PTGHuge", "HUGE"),
+        ("process.PTGNormal", None),
+        ("process.PTGSmall", None),
+        ("", None),
+        ("unrecognized.PTGLarge", None),
+    ],
+)
 def test_admission_policy_is_isolated_to_configured_worker(monkeypatch, worker, suffix):
     from process.ptg_parts.ptg2_v4_graph_compiler import _resource_admission_option_defaults
 

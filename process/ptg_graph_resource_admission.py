@@ -12,8 +12,12 @@ class V4GraphResourceAdmissionError(RuntimeError):
     """The compiler rejected graph allocation under its active resource policy."""
 
     def __init__(
-        self, message: str, *, input_bytes: int | None = None,
-        factor_edges: int | None = None, factor_owners: int | None = None,
+        self,
+        message: str,
+        *,
+        input_bytes: int | None = None,
+        factor_edges: int | None = None,
+        factor_owners: int | None = None,
         options: Mapping[str, int] | None = None,
     ) -> None:
         super().__init__(message)
@@ -32,8 +36,7 @@ class V4GraphResourceAdmissionError(RuntimeError):
             evidence_by_name["estimated_peak_bytes"] = int(matched[1])
         self.resource_admission: dict[str, Any] = {
             "version": 1,
-            **{key: value for key, value in evidence_by_name.items()
-               if type(value) is int and value >= 0},
+            **{key: value for key, value in evidence_by_name.items() if type(value) is int and value >= 0},
         }
 
 
