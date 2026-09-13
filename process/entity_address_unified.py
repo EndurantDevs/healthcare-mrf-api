@@ -38,6 +38,8 @@ from process.control_lifecycle import mark_control_run
 from process.entity_address_cutover_contract import (
     EntityAddressCutoverCallbacks,
     apply_transaction_sql_settings,
+    entity_address_cutover_transaction,
+    entity_address_tuned_transaction,
     postgres_sqlstate,
     require_caller_owned_cutover_transaction,
     run_publish_validation_operations,
@@ -838,8 +840,9 @@ def _runtime_config_metrics(context: dict) -> dict:
 async def _status_with_entity_address_tuning(statement: str) -> int | None:
     transaction_binding = getattr(db, "_transaction_binding", None)
     if callable(transaction_binding) and transaction_binding() is not None:
-        await _apply_entity_address_transaction_settings()
-        rowcount = await db.status(statement)
+        settings = _entity_address_sql_settings()
+        async with entity_address_tuned_transaction(db, settings, _sql_literal, logger):
+            rowcount = await db.status(statement)
         return _coerce_rowcount(rowcount)
     settings = _entity_address_sql_settings()
     acquire = getattr(db, "acquire", None)
@@ -2380,17 +2383,14 @@ async def _run_entity_address_cutover(
     callbacks: EntityAddressCutoverCallbacks | None = None,
     require_caller_owned_transaction: bool = False,
 ) -> None:
-    lock_timeout = (
-        _env_sql_setting(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT",
-            DEFAULT_CUTOVER_LOCK_TIMEOUT,
-        )
-        or DEFAULT_CUTOVER_LOCK_TIMEOUT
-    )
+    """Atomically publish an address stage with local semantic fences."""
+
+    lock_timeout = _env_sql_setting(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", DEFAULT_CUTOVER_LOCK_TIMEOUT
+    ) or DEFAULT_CUTOVER_LOCK_TIMEOUT
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
-    async with db.transaction():
-        await db.status(f"SET LOCAL lock_timeout = {_sql_literal(lock_timeout)};")
+    async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal, logger):
         await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
         expected_alias_generation = int(context.get("address_alias_generation") or 0)
         current_alias_generation = await _address_alias_generation(db_schema)

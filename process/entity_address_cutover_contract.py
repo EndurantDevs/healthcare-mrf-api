@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +37,82 @@ async def apply_transaction_sql_settings(database: Any, settings, quote_literal,
             if "permission denied to set parameter" not in str(exc).lower():
                 raise
             logger.warning("Skipping unprivileged entity-address SQL setting %s=%s: %s", name, value, exc)
+
+
+@asynccontextmanager
+async def preserve_transaction_sql_settings(
+    database: Any,
+    setting_names,
+    quote_literal,
+    logger,
+):
+    """Restore a borrowed transaction's settings after one nested operation."""
+
+    previous_settings = []
+    for setting_name in setting_names:
+        setting_value = await database.scalar(
+            "SELECT current_setting(:setting_name)",
+            setting_name=setting_name,
+        )
+        previous_settings.append((setting_name, str(setting_value)))
+    async with database.transaction():
+        yield
+        await apply_transaction_sql_settings(
+            database,
+            previous_settings,
+            quote_literal,
+            logger,
+        )
+
+
+@asynccontextmanager
+async def entity_address_tuned_transaction(
+    database: Any,
+    settings,
+    quote_literal,
+    logger,
+):
+    """Apply statement tuning without leaking it into a borrowed transaction."""
+
+    setting_names = [name for name, _value in settings]
+    async with preserve_transaction_sql_settings(
+        database,
+        setting_names,
+        quote_literal,
+        logger,
+    ):
+        await apply_transaction_sql_settings(
+            database,
+            settings,
+            quote_literal,
+            logger,
+        )
+        yield
+
+
+@asynccontextmanager
+async def entity_address_cutover_transaction(
+    database: Any,
+    lock_timeout: str,
+    quote_literal,
+    logger,
+):
+    """Apply a required cutover timeout and preserve a borrowed caller setting."""
+
+    transaction_binding = getattr(database, "_transaction_binding", None)
+    if not callable(transaction_binding) or transaction_binding() is None:
+        async with database.transaction():
+            await database.status(f"SET LOCAL lock_timeout = {quote_literal(lock_timeout)};")
+            yield
+        return
+    async with preserve_transaction_sql_settings(
+        database,
+        ["lock_timeout"],
+        quote_literal,
+        logger,
+    ):
+        await database.status(f"SET LOCAL lock_timeout = {quote_literal(lock_timeout)};")
+        yield
 
 
 def require_caller_owned_cutover_transaction(database: Any) -> None:

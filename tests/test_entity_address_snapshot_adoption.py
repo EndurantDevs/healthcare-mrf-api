@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -72,19 +73,41 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
 
 @pytest.mark.asyncio
 async def test_bound_sql_phase_preserves_settings_without_opening_an_engine_connection(monkeypatch):
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def tuned_transaction(database, settings, _quote_literal, _logger):
+        assert database is bound_database
+        assert settings == native._entity_address_sql_settings()
+        events.append("scope entered")
+        await apply_settings()
+        yield
+        events.append("scope exited")
+
+    async def apply_settings(*_args):
+        events.append("settings applied")
+
+    async def status(_statement):
+        events.append("statement run")
+        return 4
+
     bound_database = SimpleNamespace(
         _transaction_binding=Mock(return_value=object()),
         acquire=Mock(),
-        status=AsyncMock(return_value=4),
+        status=AsyncMock(side_effect=status),
     )
-    apply_settings = AsyncMock()
     monkeypatch.setattr(native, "db", bound_database)
-    monkeypatch.setattr(native, "_apply_entity_address_transaction_settings", apply_settings)
+    monkeypatch.setattr(native, "entity_address_tuned_transaction", tuned_transaction)
 
     rowcount = await native._status_with_entity_address_tuning("ANALYZE synthetic.stage")
 
     assert rowcount == 4
-    apply_settings.assert_awaited_once_with()
+    assert events == [
+        "scope entered",
+        "settings applied",
+        "statement run",
+        "scope exited",
+    ]
     bound_database.status.assert_awaited_once_with("ANALYZE synthetic.stage")
     bound_database.acquire.assert_not_called()
 
