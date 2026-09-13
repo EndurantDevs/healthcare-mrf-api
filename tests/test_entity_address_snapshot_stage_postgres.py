@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+import re
 import subprocess
 from uuid import uuid4
 
@@ -19,17 +20,33 @@ source = importlib.import_module("process.entity_address_snapshot_source")
 _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN"
 _DUMP_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_DUMP"
 _RESTORE_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_RESTORE"
+_LOCAL_DATABASE_PATTERN = re.compile(r"^hc_entity_address_stage_[0-9a-f]{32}$")
+_CI_DATABASE = "ptg2_v3_lifecycle_test_ci_runner"
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
-def _native_5440_connection() -> tuple[str, dict[str, str]]:
+def _is_owned_native_test_database(url) -> bool:
+    """Accept only the dedicated CI database or a UUID-scoped local database."""
+
+    database_name = str(url.database or "")
+    host = str(url.host or "")
+    port = url.port
+    if not url.drivername.startswith("postgresql") or not url.username:
+        return False
+    if host not in _LOCAL_HOSTS:
+        return False
+    if port == 5440:
+        return bool(_LOCAL_DATABASE_PATTERN.fullmatch(database_name))
+    return port in (None, 5432) and database_name == _CI_DATABASE
+
+
+def _native_test_connection() -> tuple[str, dict[str, str]]:
     raw_dsn = os.environ.get(_DSN_ENV, "")
     if not raw_dsn:
         pytest.skip(f"{_DSN_ENV} is not set")
     url = make_url(raw_dsn)
-    if url.port != 5440:
-        pytest.fail(f"{_DSN_ENV} must identify the isolated PostgreSQL 5440 test service")
-    if not url.database or not url.host or not url.username:
-        pytest.fail(f"{_DSN_ENV} is incomplete")
+    if not _is_owned_native_test_database(url):
+        pytest.fail(f"{_DSN_ENV} must identify the dedicated native archive test database")
     environment = os.environ.copy()
     environment.update(
         PGHOST=url.host,
@@ -60,9 +77,23 @@ async def _create_model_family(connection, schema_name: str) -> None:
     await connection.run_sync(metadata.create_all)
 
 
+@pytest.mark.parametrize(
+    ("dsn", "expected"),
+    [
+        ("postgresql://postgres@127.0.0.1:5440/hc_entity_address_stage_0123456789abcdef0123456789abcdef", True),
+        ("postgresql://postgres@localhost:5432/ptg2_v3_lifecycle_test_ci_runner", True),
+        ("postgresql://postgres@127.0.0.1:5440/ptg2_v3_lifecycle_test_ci_runner", False),
+        ("postgresql://postgres@127.0.0.1:5432/another_database", False),
+        ("postgresql://postgres@database:5432/ptg2_v3_lifecycle_test_ci_runner", False),
+    ],
+)
+def test_native_test_database_guard(dsn: str, expected: bool) -> None:
+    assert _is_owned_native_test_database(make_url(dsn)) is expected
+
+
 @pytest.mark.asyncio
 async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path: Path):
-    async_dsn, tool_environment = _native_5440_connection()
+    async_dsn, tool_environment = _native_test_connection()
     pg_dump = _native_tool(_DUMP_ENV)
     pg_restore = _native_tool(_RESTORE_ENV)
     engine = create_async_engine(async_dsn)
