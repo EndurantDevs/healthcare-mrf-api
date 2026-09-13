@@ -37,6 +37,24 @@ def _session_factory(*sessions):
     return scope
 
 
+def _recording_session_factory(*sessions, exits: list[tuple[object, BaseException | None]]):
+    remaining = iter(sessions)
+
+    @asynccontextmanager
+    async def scope():
+        session = next(remaining)
+        failure = None
+        try:
+            yield session
+        except BaseException as exception:
+            failure = exception
+            raise
+        finally:
+            exits.append((session, failure))
+
+    return scope
+
+
 def test_stage_schema_is_derived_only_from_a_uuid_dataset_owner():
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
 
@@ -95,3 +113,25 @@ async def test_stage_export_rejects_non_uuid_owner_before_opening_any_session():
         )
 
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stage_export_callback_failure_releases_pins_but_retains_owned_stage_for_the_caller():
+    dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+    live, clone, stage = _session("00000003-0000001B-1"), _session(), _session("00000004-0000001C-1")
+    exits: list[tuple[object, BaseException | None]] = []
+    failure = RuntimeError("native dump failed")
+
+    async def fail_archive_copy(_capture):
+        raise failure
+
+    with pytest.raises(RuntimeError, match="native dump failed"):
+        await source.stage_and_export_entity_address_archive_source(
+            _recording_session_factory(live, clone, stage, exits=exits),
+            schema_name="mrf",
+            dataset_id=dataset_id,
+            archive_copy=fail_archive_copy,
+        )
+
+    assert exits == [(clone, None), (live, None), (stage, failure)]
+    assert not any("DROP SCHEMA" in str(call.args[0]) for call in clone.execute.await_args_list)
