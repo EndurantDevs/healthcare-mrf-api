@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -132,10 +133,11 @@ async def _publish_finalizer_artifacts(
         )
         publication_result, _elapsed_seconds, _timeline = await finalizer_lifecycle._publish_finalizer(request)
         manifest = publication_result.publication.manifest()
+        assert not any(work_directory.iterdir())
     finally:
         artifacts.cleanup()
-        assert not any(work_directory.iterdir())
-        work_directory.rmdir()
+        with suppress(OSError):
+            work_directory.rmdir()
     return manifest
 
 

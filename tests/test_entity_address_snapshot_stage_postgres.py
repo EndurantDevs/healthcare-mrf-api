@@ -60,7 +60,7 @@ def _native_test_connection() -> tuple[str, dict[str, str]]:
     environment = os.environ.copy()
     environment.update(
         PGHOST=url.host,
-        PGPORT=str(url.port),
+        PGPORT=str(url.port or 5432),
         PGUSER=url.username,
         PGDATABASE=url.database,
     )
@@ -557,11 +557,13 @@ def test_native_test_database_guard(dsn: str, expected: bool) -> None:
     assert _is_owned_native_test_database(make_url(dsn)) is expected
 
 
-def test_native_test_connection_preserves_an_authenticated_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("port_suffix", ["", ":5432"])
+def test_native_test_connection_preserves_an_authenticated_dsn(monkeypatch, port_suffix: str) -> None:
     fixture_secret = "synthetic-dsn-secret"
+    monkeypatch.setenv("PGPORT", "5544")
     monkeypatch.setenv(
         _DSN_ENV,
-        f"postgresql://postgres:{fixture_secret}@postgres:5432/{_CI_DATABASE}",
+        f"postgresql://postgres:{fixture_secret}@postgres{port_suffix}/{_CI_DATABASE}",
     )
 
     async_dsn, environment = _native_test_connection()
@@ -569,6 +571,7 @@ def test_native_test_connection_preserves_an_authenticated_dsn(monkeypatch: pyte
     assert fixture_secret in async_dsn
     assert "***" not in async_dsn
     assert environment["PGPASSWORD"] == fixture_secret
+    assert environment["PGPORT"] == "5432"
 
 
 @pytest.mark.asyncio
