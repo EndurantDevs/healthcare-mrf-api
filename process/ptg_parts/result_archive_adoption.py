@@ -464,7 +464,10 @@ async def _copy_staged_layout_rows(
     source_snapshot_key: int,
     destination_snapshot_key: int,
 ) -> None:
-    finalizer_indexes = tuple(_REKEYED_TABLES.index(table_name) for table_name in _FINALIZER_MAP_TABLES)
+    try:
+        finalizer_indexes = tuple(_REKEYED_TABLES.index(table_name) for table_name in _FINALIZER_MAP_TABLES)
+    except ValueError as exc:
+        raise ResultArchiveAdoptionError("archive adoption is missing a finalizer relation") from exc
     first_finalizer_table = finalizer_indexes[0]
     last_finalizer_table = finalizer_indexes[-1]
     if finalizer_indexes != tuple(range(first_finalizer_table, last_finalizer_table + 1)):
