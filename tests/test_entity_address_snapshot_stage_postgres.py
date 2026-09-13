@@ -7,6 +7,7 @@ import importlib
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -456,6 +457,47 @@ def _dump_stage_capture(capture, *, dataset_id, stage_schema: str, dump_path: Pa
     assert dump.returncode == 0, dump.stderr
 
 
+@dataclass(frozen=True)
+class _NativeStageArchiveAssertion:
+    """Dump one stage and verify its immutable source rows before live DDL."""
+
+    dataset_id: object
+    stage_schema: str
+    dump_path: Path
+    pg_dump: str
+    tool_environment: dict[str, str]
+    sessions: object
+    live_schema: str
+    live_table_name: str
+
+    async def __call__(self, capture) -> None:
+        _dump_stage_capture(
+            capture,
+            dataset_id=self.dataset_id,
+            stage_schema=self.stage_schema,
+            dump_path=self.dump_path,
+            pg_dump=self.pg_dump,
+            environment=self.tool_environment,
+        )
+        async with self.sessions() as observer:
+            base_versions = tuple(
+                (
+                    await observer.execute(
+                        text(
+                            f'SELECT base_address_version FROM "{self.stage_schema}".'
+                            '"entity_address_unified" ORDER BY location_key'
+                        )
+                    )
+                ).scalars()
+            )
+        assert base_versions == (
+            source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
+            None,
+            source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
+        )
+        await _rename_live_sentinel(self.sessions, self.live_schema, self.live_table_name)
+
+
 async def _rename_live_sentinel(sessions, live_schema: str, table_name: str) -> None:
     """Prove that copying the owned stage leaves the live relation writable."""
 
@@ -548,35 +590,16 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         async with sessions() as session, session.begin():
             await _seed_receipt_family(session, live_schema, reversed_rows=False)
         queued_serving = await _capture_observed_serving(sessions, live_schema)
-
-        async def archive_copy(capture):
-            """Dump the stage and prove it no longer locks live relations."""
-
-            _dump_stage_capture(
-                capture,
-                dataset_id=dataset_id,
-                stage_schema=stage_schema,
-                dump_path=dump_path,
-                pg_dump=pg_dump,
-                environment=tool_environment,
-            )
-            async with sessions() as observer:
-                base_versions = tuple(
-                    (
-                        await observer.execute(
-                            text(
-                                f'SELECT base_address_version FROM "{stage_schema}"."entity_address_unified" '
-                                "ORDER BY location_key"
-                            )
-                        )
-                    ).scalars()
-                )
-            assert base_versions == (
-                source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
-                None,
-                source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
-            )
-            await _rename_live_sentinel(sessions, live_schema, relations[0].table_name)
+        archive_copy = _NativeStageArchiveAssertion(
+            dataset_id=dataset_id,
+            stage_schema=stage_schema,
+            dump_path=dump_path,
+            pg_dump=pg_dump,
+            tool_environment=tool_environment,
+            sessions=sessions,
+            live_schema=live_schema,
+            live_table_name=relations[0].table_name,
+        )
 
         manifest, source_receipt, source_alias_receipt = await source.export_entity_address_archive_with_receipt(
             sessions,

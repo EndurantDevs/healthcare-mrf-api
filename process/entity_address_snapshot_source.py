@@ -15,7 +15,7 @@ import asyncio
 import importlib
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -93,6 +93,68 @@ class EntityAddressArchiveStageManifest:
     dataset_id: UUID
     schema_name: str
     relations: tuple[EntityAddressArchiveRelation, ...]
+
+
+@dataclass
+class _EntityAddressExportEvidence:
+    """Collect source and stage receipts across the owned export lifecycle."""
+
+    session_factory: Any
+    schema_name: str
+    dataset_id: UUID
+    archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]]
+    ownership: Any
+    archive_receipts: list[EntityAddressArchiveReceipt] = field(default_factory=list)
+    alias_receipts: list[EntityAddressAliasSemanticReceipt] = field(default_factory=list)
+    owned_stages: list[Any] = field(default_factory=list)
+
+    async def record_created_stage(self, session) -> None:
+        """Retain exact ownership only after this export creates its stage."""
+
+        self.owned_stages.append(
+            await self.ownership.capture_created_entity_address_archive_stage(
+                session,
+                dataset_id=self.dataset_id,
+            )
+        )
+
+    async def capture_stage_and_copy(self, capture: EntityAddressArchiveStageCapture) -> None:
+        """Hash the pinned stage before forwarding it to the native dump."""
+
+        async with self.session_factory() as session, session.begin():
+            self.archive_receipts.append(
+                await capture_entity_address_archive_receipt(
+                    session,
+                    schema_name=capture.schema_name,
+                )
+            )
+        await self.archive_copy(capture)
+
+    async def capture_source_aliases(self, session, _capture: EntityAddressArchiveSourceCapture) -> None:
+        """Hash active source aliases while the serving observation remains pinned."""
+
+        self.alias_receipts.append(
+            await capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=self.schema_name,
+            )
+        )
+
+    def bound_receipts(
+        self,
+        manifest: EntityAddressArchiveStageManifest,
+    ) -> tuple[
+        EntityAddressArchiveStageManifest,
+        EntityAddressArchiveReceipt,
+        EntityAddressAliasSemanticReceipt,
+    ]:
+        """Return exactly one archive receipt and one alias receipt."""
+
+        if len(self.archive_receipts) != 1:
+            raise RuntimeError("entity-address archive stage receipt is unavailable")
+        if len(self.alias_receipts) != 1:
+            raise RuntimeError("entity-address archive alias receipt is unavailable")
+        return manifest, self.archive_receipts[0], self.alias_receipts[0]
 
 
 def entity_address_archive_relations() -> tuple[EntityAddressArchiveRelation, ...]:
@@ -338,29 +400,13 @@ async def export_entity_address_archive_with_receipt(
     """
 
     ownership = importlib.import_module("process.entity_address_snapshot_ownership")
-    captured_receipts = []
-    captured_alias_receipts = []
-    owned_stages = []
-
-    async def _record_created_stage(session) -> None:
-        owned_stages.append(
-            await ownership.capture_created_entity_address_archive_stage(session, dataset_id=dataset_id)
-        )
-
-    async def _capture_and_copy(capture: EntityAddressArchiveStageCapture) -> None:
-        async with session_factory() as session, session.begin():
-            captured_receipts.append(
-                await capture_entity_address_archive_receipt(session, schema_name=capture.schema_name)
-            )
-        await archive_copy(capture)
-
-    async def _capture_alias_receipt(session, _capture: EntityAddressArchiveSourceCapture) -> None:
-        captured_alias_receipts.append(
-            await capture_entity_address_alias_semantic_receipt(
-                session,
-                schema_name=schema_name,
-            )
-        )
+    evidence = _EntityAddressExportEvidence(
+        session_factory=session_factory,
+        schema_name=schema_name,
+        dataset_id=dataset_id,
+        archive_copy=archive_copy,
+        ownership=ownership,
+    )
 
     try:
         manifest = await export_entity_address_archive_stage(
@@ -368,18 +414,14 @@ async def export_entity_address_archive_with_receipt(
             schema_name=schema_name,
             dataset_id=dataset_id,
             queued_serving_capture=queued_serving_capture,
-            archive_copy=_capture_and_copy,
-            stage_created=_record_created_stage,
-            source_captured=_capture_alias_receipt,
+            archive_copy=evidence.capture_stage_and_copy,
+            stage_created=evidence.record_created_stage,
+            source_captured=evidence.capture_source_aliases,
         )
     finally:
-        if owned_stages:
-            await _cleanup_owned_archive_stage(session_factory, ownership, owned_stages[0])
-    if len(captured_receipts) != 1:
-        raise RuntimeError("entity-address archive stage receipt is unavailable")
-    if len(captured_alias_receipts) != 1:
-        raise RuntimeError("entity-address archive alias receipt is unavailable")
-    return manifest, captured_receipts[0], captured_alias_receipts[0]
+        if evidence.owned_stages:
+            await _cleanup_owned_archive_stage(session_factory, ownership, evidence.owned_stages[0])
+    return evidence.bound_receipts(manifest)
 
 
 async def _cleanup_owned_archive_stage(session_factory, ownership, owner) -> None:
