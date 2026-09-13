@@ -7,6 +7,7 @@ import importlib
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -20,8 +21,10 @@ from sqlalchemy.schema import MetaData
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
+alias_receipt = importlib.import_module("process.entity_address_snapshot_alias")
 ownership = importlib.import_module("process.entity_address_snapshot_ownership")
 restore = importlib.import_module("process.entity_address_snapshot_restore")
+models = importlib.import_module("db.models")
 _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN"
 _DUMP_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_DUMP"
 _RESTORE_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_RESTORE"
@@ -100,6 +103,231 @@ async def _create_alias_validation_relations(connection, schema_name: str) -> No
     await connection.execute(
         text(f'CREATE TABLE "{schema_name}"."address_alias_v1" (source_address_key uuid, revoked_at timestamptz)')
     )
+
+
+async def _create_alias_receipt_relations(connection, schema_name: str) -> None:
+    """Create the exact model-owned alias tables inspected by the receipt."""
+
+    await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+    metadata = MetaData(schema=schema_name)
+    for model in (models.AddressAliasStateV1, models.AddressAliasV1):
+        model.__table__.to_metadata(metadata, schema=schema_name)
+    await connection.run_sync(metadata.create_all)
+
+
+async def _seed_alias_receipt_relations(
+    connection,
+    schema_name: str,
+    *,
+    generation: int,
+    history_variant: str,
+    add_revoked_history: bool,
+) -> None:
+    """Seed one shared active mapping with independently variable local history."""
+
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."address_alias_state_v1" '
+            "(singleton, schema_version, active_ruleset_version, generation, updated_at) "
+            "VALUES (true, :schema_version, :ruleset_version, :generation, "
+            "CAST(:updated_at AS timestamptz))"
+        ),
+        {
+            "schema_version": alias_receipt.address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION,
+            "ruleset_version": alias_receipt.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION,
+            "generation": generation,
+            "updated_at": datetime(2026, 1, 1 if history_variant == "source" else 2, tzinfo=timezone.utc),
+        },
+    )
+    await _insert_active_alias(connection, schema_name, history_variant)
+    if add_revoked_history:
+        await _insert_revoked_alias_history(connection, schema_name)
+
+
+async def _insert_active_alias(connection, schema_name: str, history_variant: str) -> None:
+    active_alias_by_field = {
+        "source_address_key": "00000000-0000-0000-0000-000000000101",
+        "source_identity_key": "synthetic-source-identity",
+        "target_address_key": "00000000-0000-0000-0000-000000000202",
+        "target_identity_key": "synthetic-target-identity",
+        "alias_kind": alias_receipt.address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+        "ruleset_version": alias_receipt.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION,
+        "target_strict_source_bits": 5,
+        "target_strict_source_count": 2,
+        "candidate_count": 1,
+        "shadow_run_id": f"00000000-0000-0000-0000-0000000003{1 if history_variant == 'source' else 2:02d}",
+        "apply_run_id": f"00000000-0000-0000-0000-0000000004{1 if history_variant == 'source' else 2:02d}",
+        "reviewed_candidate_digest": ("a" if history_variant == "source" else "b") * 64,
+        "applied_at": datetime(2026, 2, 1 if history_variant == "source" else 2, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 2, 1 if history_variant == "source" else 2, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 2, 1 if history_variant == "source" else 2, 1, tzinfo=timezone.utc),
+    }
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."address_alias_v1" '
+            "(source_address_key, source_identity_key, target_address_key, target_identity_key, "
+            "alias_kind, ruleset_version, target_strict_source_bits, target_strict_source_count, "
+            "candidate_count, shadow_run_id, apply_run_id, reviewed_candidate_digest, "
+            "applied_at, created_at, updated_at) VALUES ("
+            "CAST(:source_address_key AS uuid), :source_identity_key, CAST(:target_address_key AS uuid), "
+            ":target_identity_key, :alias_kind, :ruleset_version, :target_strict_source_bits, "
+            ":target_strict_source_count, :candidate_count, CAST(:shadow_run_id AS uuid), "
+            "CAST(:apply_run_id AS uuid), :reviewed_candidate_digest, CAST(:applied_at AS timestamptz), "
+            "CAST(:created_at AS timestamptz), CAST(:updated_at AS timestamptz))"
+        ),
+        active_alias_by_field,
+    )
+
+
+async def _insert_revoked_alias_history(connection, schema_name: str) -> None:
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."address_alias_v1" '
+            "(source_address_key, source_identity_key, target_address_key, target_identity_key, "
+            "alias_kind, ruleset_version, target_strict_source_bits, target_strict_source_count, "
+            "candidate_count, shadow_run_id, apply_run_id, reviewed_candidate_digest, applied_at, "
+            "revoked_at, revoked_reason, revoked_by, revoke_run_id, created_at, updated_at) VALUES ("
+            "'00000000-0000-0000-0000-000000000501'::uuid, 'old-source', "
+            "'00000000-0000-0000-0000-000000000502'::uuid, 'old-target', :alias_kind, "
+            ":ruleset_version, 3, 2, 1, '00000000-0000-0000-0000-000000000503'::uuid, "
+            "'00000000-0000-0000-0000-000000000504'::uuid, :digest, "
+            "TIMESTAMPTZ '2025-01-01 00:00:00+00', TIMESTAMPTZ '2025-02-01 00:00:00+00', "
+            "'synthetic revoke', 'synthetic reviewer', "
+            "'00000000-0000-0000-0000-000000000505'::uuid, "
+            "TIMESTAMPTZ '2025-01-01 00:00:00+00', TIMESTAMPTZ '2025-02-01 00:00:00+00')"
+        ),
+        {
+            "alias_kind": alias_receipt.address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+            "ruleset_version": alias_receipt.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION,
+            "digest": "c" * 64,
+        },
+    )
+
+
+async def _capture_alias_receipt(sessions, schema_name: str):
+    async with sessions() as session, session.begin():
+        return await alias_receipt.capture_entity_address_alias_semantic_receipt(
+            session,
+            schema_name=schema_name,
+        )
+
+
+async def _change_active_alias_semantics(sessions, schema_name: str) -> None:
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'UPDATE "{schema_name}"."address_alias_v1" '
+                "SET target_identity_key = 'changed-target' WHERE revoked_at IS NULL"
+            )
+        )
+
+
+async def _revoke_active_alias(sessions, schema_name: str) -> None:
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'UPDATE "{schema_name}"."address_alias_v1" SET '
+                "target_identity_key = 'synthetic-target-identity', "
+                "revoked_at = TIMESTAMPTZ '2026-03-01 00:00:00+00', "
+                "revoked_reason = 'synthetic revoke', revoked_by = 'synthetic reviewer', "
+                "revoke_run_id = '00000000-0000-0000-0000-000000000601'::uuid "
+                "WHERE revoked_at IS NULL"
+            )
+        )
+
+
+def _assert_alias_semantics_mismatch(expected_receipt, actual_receipt) -> None:
+    assert actual_receipt.active_alias_sha256 != expected_receipt.active_alias_sha256
+    with pytest.raises(
+        alias_receipt.EntityAddressSnapshotAliasError,
+        match="active alias semantics differ",
+    ):
+        alias_receipt.require_matching_entity_address_alias_semantics(
+            expected_receipt,
+            actual_receipt,
+        )
+
+
+async def _drop_alias_receipt_schemas(engine, *schema_names: str) -> None:
+    async with engine.begin() as connection:
+        for schema_name in schema_names:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        remaining_schema_count = await connection.scalar(
+            text("SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname = ANY(:schema_names)"),
+            {"schema_names": list(schema_names)},
+        )
+        assert remaining_schema_count == 0
+
+
+async def _assert_alias_capture_requires_transaction(sessions, schema_name: str) -> None:
+    async with sessions() as session:
+        with pytest.raises(
+            alias_receipt.EntityAddressSnapshotAliasError,
+            match="requires a caller transaction",
+        ):
+            await alias_receipt.capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=schema_name,
+            )
+
+
+async def _assert_unsupported_alias_versions(engine, sessions, schema_name: str) -> None:
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(f'UPDATE "{schema_name}"."address_alias_state_v1" SET schema_version = :unsupported'),
+            {"unsupported": alias_receipt.address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION + 1},
+        )
+        with pytest.raises(
+            alias_receipt.EntityAddressSnapshotAliasError,
+            match="schema version is unsupported",
+        ):
+            await alias_receipt.capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=schema_name,
+            )
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(f'UPDATE "{schema_name}"."address_alias_state_v1" SET schema_version = :supported'),
+            {"supported": alias_receipt.address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION},
+        )
+        await connection.execute(
+            text(
+                f'UPDATE "{schema_name}"."address_alias_v1" SET ruleset_version = :unsupported WHERE revoked_at IS NULL'
+            ),
+            {"unsupported": alias_receipt.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION + 1},
+        )
+    async with sessions() as session, session.begin():
+        with pytest.raises(
+            alias_receipt.EntityAddressSnapshotAliasError,
+            match="active alias version is unsupported",
+        ):
+            await alias_receipt.capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=schema_name,
+            )
+
+
+async def _assert_unsupported_alias_shape(engine, sessions, schema_name: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema_name}"."address_alias_v1" SET ruleset_version = :supported WHERE revoked_at IS NULL'
+            ),
+            {"supported": alias_receipt.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION},
+        )
+        await connection.execute(
+            text(f'ALTER TABLE "{schema_name}"."address_alias_v1" ADD COLUMN unsupported_shape text')
+        )
+    async with sessions() as session, session.begin():
+        with pytest.raises(
+            alias_receipt.EntityAddressSnapshotAliasError,
+            match="relation shape is unsupported",
+        ):
+            await alias_receipt.capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=schema_name,
+            )
 
 
 async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
@@ -368,6 +596,92 @@ async def test_native_stage_receipt_is_portable_and_detects_drift():
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{restored_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_active_alias_receipt_portability_and_drift():
+    """Only active mapping semantics, not local counters or history, define equality."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=1)
+    source_schema = "address_alias_receipt_source_" + uuid4().hex
+    restored_schema = "address_alias_receipt_restored_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await _create_alias_receipt_relations(connection, source_schema)
+            await _create_alias_receipt_relations(connection, restored_schema)
+            await _seed_alias_receipt_relations(
+                connection,
+                source_schema,
+                generation=3,
+                history_variant="source",
+                add_revoked_history=False,
+            )
+            await _seed_alias_receipt_relations(
+                connection,
+                restored_schema,
+                generation=91,
+                history_variant="restored",
+                add_revoked_history=True,
+            )
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        source_alias_receipt = await _capture_alias_receipt(sessions, source_schema)
+        restored_alias_receipt = await _capture_alias_receipt(sessions, restored_schema)
+
+        assert source_alias_receipt.local_generation == 3
+        assert restored_alias_receipt.local_generation == 91
+        assert source_alias_receipt.active_alias_count == 1
+        assert source_alias_receipt.portable_identity() == restored_alias_receipt.portable_identity()
+        assert (
+            alias_receipt.validate_entity_address_alias_semantic_receipt(source_alias_receipt.as_dict())
+            == source_alias_receipt
+        )
+        assert (
+            alias_receipt.require_matching_entity_address_alias_semantics(
+                source_alias_receipt,
+                restored_alias_receipt,
+            )
+            == restored_alias_receipt
+        )
+
+        await _change_active_alias_semantics(sessions, restored_schema)
+        changed_receipt = await _capture_alias_receipt(sessions, restored_schema)
+        _assert_alias_semantics_mismatch(source_alias_receipt, changed_receipt)
+
+        await _revoke_active_alias(sessions, restored_schema)
+        revoked_receipt = await _capture_alias_receipt(sessions, restored_schema)
+        assert revoked_receipt.active_alias_count == 0
+        _assert_alias_semantics_mismatch(source_alias_receipt, revoked_receipt)
+    finally:
+        await _drop_alias_receipt_schemas(engine, source_schema, restored_schema)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_active_alias_receipt_rejects_unsupported_model_shape_and_state_version():
+    """Receipt capture fails closed on schema drift and unsupported alias policy."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=1)
+    schema_name = "address_alias_receipt_invalid_" + uuid4().hex
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await _create_alias_receipt_relations(connection, schema_name)
+            await _seed_alias_receipt_relations(
+                connection,
+                schema_name,
+                generation=1,
+                history_variant="source",
+                add_revoked_history=False,
+            )
+
+        await _assert_alias_capture_requires_transaction(sessions, schema_name)
+        await _assert_unsupported_alias_versions(engine, sessions, schema_name)
+        await _assert_unsupported_alias_shape(engine, sessions, schema_name)
+    finally:
+        await _drop_alias_receipt_schemas(engine, schema_name)
         await engine.dispose()
 
 
