@@ -191,7 +191,12 @@ async def _rename_live_sentinel(sessions, live_schema: str, table_name: str) -> 
 async def _assert_live_sentinel(connection, schema_name: str, table_name: str) -> None:
     """Require that a relation still carries the pre-stage sentinel value."""
 
-    assert await connection.scalar(text(f'SELECT location_key FROM "{schema_name}"."{table_name}"')) == "live-sentinel"
+    assert (
+        await connection.scalar(
+            text(f'SELECT location_key FROM "{schema_name}"."{table_name}" WHERE entity_id = \'owned\'')
+        )
+        == "live-sentinel"
+    )
 
 
 async def _assert_stage_share_pins_block_ddl(sessions, schema_name: str, table_name: str) -> None:
@@ -598,6 +603,7 @@ async def test_native_restore_finalization_rehydrates_pinned_stage():
                 import_date="20260913",
             )
             stored = prepared_restore.as_dict()
+            assert stored["stage_integrity"] == prepared_restore.stage_integrity.as_dict()
         await _assert_rehydrated_restore_state(
             sessions,
             destination_schema=destination_schema,
@@ -605,6 +611,149 @@ async def test_native_restore_finalization_rehydrates_pinned_stage():
             stored=stored,
             incumbent_relation_oid=incumbent_relation_oid,
         )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{destination_schema}" CASCADE'))
+        await engine.dispose()
+
+
+def _prepared_main_stage(prepared_restore) -> tuple[str, int]:
+    return next(
+        (table_name, oid)
+        for table_name, oid in prepared_restore.stage_relation_oids
+        if table_name.startswith("entity_address_unified_")
+    )
+
+
+async def _insert_prepared_stage_row(session, destination_schema: str, main_stage_name: str) -> None:
+    table_ref = f'"{destination_schema}"."{main_stage_name}"'
+    await session.execute(
+        text(
+            f"INSERT INTO {table_ref} "
+            "(entity_type, entity_id, location_key, checksum, type, base_address_version) "
+            "VALUES ('synthetic', 'third', 'third', 3, 'primary', :base_address_version)"
+        ),
+        {"base_address_version": source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0"},
+    )
+
+
+async def _update_prepared_stage_row(session, destination_schema: str, main_stage_name: str) -> None:
+    table_ref = f'"{destination_schema}"."{main_stage_name}"'
+    await session.execute(text(f"UPDATE {table_ref} SET checksum = checksum + 1 WHERE location_key = 'first'"))
+
+
+async def _delete_prepared_stage_row(session, destination_schema: str, main_stage_name: str) -> None:
+    table_ref = f'"{destination_schema}"."{main_stage_name}"'
+    await session.execute(text(f"DELETE FROM {table_ref} WHERE location_key = 'second'"))
+
+
+async def _alter_prepared_stage_schema(session, destination_schema: str, main_stage_name: str) -> None:
+    table_ref = f'"{destination_schema}"."{main_stage_name}"'
+    await session.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN stage_integrity_tamper text"))
+
+
+async def _drop_prepared_stage_index(session, destination_schema: str, main_stage_name: str) -> None:
+    index_name = await session.scalar(
+        text(
+            "SELECT index_relation.relname FROM pg_catalog.pg_index AS index_meta "
+            "JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index_meta.indexrelid "
+            "WHERE index_meta.indrelid = to_regclass(:table_reference) "
+            "AND index_meta.indisprimary IS FALSE ORDER BY index_relation.relname LIMIT 1"
+        ),
+        {"table_reference": f"{destination_schema}.{main_stage_name}"},
+    )
+    assert isinstance(index_name, str)
+    await session.execute(text(f'DROP INDEX "{destination_schema}"."{index_name}"'))
+
+
+async def _mutate_prepared_stage(session, destination_schema: str, prepared_restore, mutation: str) -> None:
+    main_stage_name, _main_stage_oid = _prepared_main_stage(prepared_restore)
+    operations_by_mutation = {
+        "insert": _insert_prepared_stage_row,
+        "update": _update_prepared_stage_row,
+        "delete": _delete_prepared_stage_row,
+        "schema": _alter_prepared_stage_schema,
+        "index": _drop_prepared_stage_index,
+    }
+    await operations_by_mutation[mutation](session, destination_schema, main_stage_name)
+
+
+async def _finalize_restore_fixture(engine, sessions, destination_schema: str):
+    owner, expected_receipt, incumbent_relation_oid = await _prepare_nonempty_restore_fixture(
+        engine,
+        sessions,
+        destination_schema,
+        uuid4(),
+    )
+    async with sessions() as session, session.begin():
+        prepared_restore = await restore.finalize_entity_address_archive_restore(
+            session,
+            owner=owner,
+            semantic_receipt=expected_receipt,
+            db_schema=destination_schema,
+            import_date="20260913",
+        )
+        stored = prepared_restore.as_dict()
+    return prepared_restore, stored, incumbent_relation_oid
+
+
+async def _assert_prepared_stage_oid(session, destination_schema: str, prepared_restore) -> None:
+    main_stage_name, main_stage_oid = _prepared_main_stage(prepared_restore)
+    assert (
+        await session.scalar(
+            text("SELECT to_regclass(:table_reference)::oid"),
+            {"table_reference": f"{destination_schema}.{main_stage_name}"},
+        )
+        == main_stage_oid
+    )
+
+
+async def _assert_incumbent_unchanged(engine, destination_schema: str, incumbent_relation_oid: int) -> None:
+    async with engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                text(
+                    "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
+                    "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                    "WHERE namespace.nspname = :schema_name AND relation.relname = 'entity_address_unified'"
+                ),
+                {"schema_name": destination_schema},
+            )
+            == incumbent_relation_oid
+        )
+        assert (
+            await connection.scalar(
+                text(
+                    f'SELECT location_key FROM "{destination_schema}"."entity_address_unified" '
+                    "WHERE entity_id = 'incumbent'"
+                )
+            )
+            == "live-sentinel"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("insert", "update", "delete", "schema", "index"))
+async def test_native_rehydration_rejects_same_oid_stage_mutation(mutation: str):
+    """Rows, schema, and indexes cannot drift after durable preparation."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    destination_schema = "address_restore_integrity_" + uuid4().hex
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        prepared_restore, stored, incumbent_relation_oid = await _finalize_restore_fixture(
+            engine,
+            sessions,
+            destination_schema,
+        )
+        async with sessions() as session, session.begin():
+            await _mutate_prepared_stage(session, destination_schema, prepared_restore, mutation)
+            await _assert_prepared_stage_oid(session, destination_schema, prepared_restore)
+        async with sessions() as session, session.begin():
+            with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="stage integrity differs"):
+                await restore.rehydrate_entity_address_archive_restore(session, stored=stored)
+        await _assert_incumbent_unchanged(engine, destination_schema, incumbent_relation_oid)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{destination_schema}" CASCADE'))
