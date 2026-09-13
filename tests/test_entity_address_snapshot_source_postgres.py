@@ -9,7 +9,9 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.schema import MetaData
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 
@@ -22,7 +24,7 @@ def _dsn() -> str:
 
 
 @pytest.mark.asyncio
-async def test_native_capture_holds_seven_model_relations_until_rollback(tmp_path):
+async def test_native_capture_holds_real_model_relations_until_transaction_end(tmp_path):
     engine = create_async_engine(_dsn())
     schema_name = "address_archive_" + uuid4().hex
     schema = f'"{schema_name}"'
@@ -30,9 +32,13 @@ async def test_native_capture_holds_seven_model_relations_until_rollback(tmp_pat
     try:
         async with engine.begin() as connection:
             await connection.execute(text(f"CREATE SCHEMA {schema}"))
-            for relation in relations:
-                await connection.execute(text(f'CREATE TABLE {schema}."{relation.table_name}" (id bigint PRIMARY KEY)'))
-                await connection.execute(text(f'INSERT INTO {schema}."{relation.table_name}" VALUES (1)'))
+            metadata = MetaData(schema=schema_name)
+            for model in (
+                source.entity_address_unified.EntityAddressUnified,
+                *source.entity_address_unified.SUPPORT_TABLE_MODELS,
+            ):
+                model.__table__.to_metadata(metadata, schema=schema_name)
+            await connection.run_sync(metadata.create_all)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
 
         async def archive_copy(capture):
@@ -52,16 +58,19 @@ async def test_native_capture_holds_seven_model_relations_until_rollback(tmp_pat
                 check=False,
                 env=os.environ.copy(),
                 text=True,
+                timeout=30,
             )
             assert dump.returncode == 0, dump.stderr
             async with sessions() as contender:
                 await contender.execute(text("SET lock_timeout = '100ms'"))
-                with pytest.raises(Exception):
+                with pytest.raises(DBAPIError) as rename_error:
                     await contender.execute(text(f'ALTER TABLE {schema}."{relations[0].table_name}" RENAME TO blocked'))
+                assert rename_error.value.orig.sqlstate == "55P03"
             async with sessions() as contender:
                 await contender.execute(text("SET lock_timeout = '100ms'"))
-                with pytest.raises(Exception):
+                with pytest.raises(DBAPIError) as drop_error:
                     await contender.execute(text(f'DROP TABLE {schema}."{relations[1].table_name}"'))
+                assert drop_error.value.orig.sqlstate == "55P03"
 
         manifest = await source.export_entity_address_archive_source(
             sessions,
