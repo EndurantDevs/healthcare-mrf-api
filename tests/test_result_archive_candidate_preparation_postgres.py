@@ -417,6 +417,7 @@ async def native_candidate(monkeypatch):
         frozen_input,
     )
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", fixture.destination_name)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
     try:
         await _install_schema(database, schema_name=fixture.stage_name, include_candidate_sources=False)
         await _install_schema(database, schema_name=fixture.destination_name, include_candidate_sources=True)
