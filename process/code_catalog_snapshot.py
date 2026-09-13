@@ -272,7 +272,7 @@ async def _relation_access(session: AsyncSession, relation_oid: int) -> _Relatio
                 text(
                     "SELECT NULL::text AS column_name, grantee_role.rolname AS grantee_name, "
                     "acl.privilege_type, acl.is_grantable, grantor_role.rolname AS grantor_name, "
-                    "acl.grantee=relation.relowner AS grantee_is_owner, acl.grantee=0 AS grantee_is_public "
+                    "acl.grantee=0 AS grantee_is_public "
                     "FROM pg_catalog.pg_class AS relation "
                     "CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, "
                     "pg_catalog.acldefault('r', relation.relowner))) AS acl "
@@ -281,7 +281,7 @@ async def _relation_access(session: AsyncSession, relation_oid: int) -> _Relatio
                     "WHERE relation.oid=:relation_oid "
                     "UNION ALL "
                     "SELECT attribute.attname, grantee_role.rolname, acl.privilege_type, acl.is_grantable, "
-                    "grantor_role.rolname, acl.grantee=relation.relowner, acl.grantee=0 "
+                    "grantor_role.rolname, acl.grantee=0 "
                     "FROM pg_catalog.pg_class AS relation "
                     "JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid=relation.oid "
                     "CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) AS acl "
@@ -297,8 +297,6 @@ async def _relation_access(session: AsyncSession, relation_oid: int) -> _Relatio
     )
     grants = []
     for row in grant_rows:
-        if row["grantee_is_owner"]:
-            continue
         grantee_name = None if row["grantee_is_public"] else row["grantee_name"]
         privilege_type = str(row["privilege_type"])
         column_name = row["column_name"]
@@ -370,6 +368,10 @@ async def _apply_relation_access(
     current_role = await session.scalar(text("SELECT current_user"))
     if current_role != access.owner_name:
         raise CodeCatalogSnapshotError("code-catalog incumbent is not owned by the local cutover role")
+    owner = await _quoted_role(session, access.owner_name)
+    await session.execute(
+        text(f"REVOKE ALL PRIVILEGES ON TABLE {_quoted(schema_name)}.{_quoted(table_name)} FROM {owner}")
+    )
     for grant in access.grants:
         grantee = await _quoted_role(session, grant.grantee_name)
         column = "" if grant.column_name is None else f" ({_quoted(grant.column_name)})"
