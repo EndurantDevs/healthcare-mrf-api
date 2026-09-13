@@ -66,13 +66,13 @@ def test_stage_schema_is_derived_only_from_a_uuid_dataset_owner():
 
 
 @pytest.mark.asyncio
-async def test_stage_export_clones_only_the_pinned_model_family_then_dumps_only_the_clone():
+async def test_stage_export_clones_pinned_family():
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     stage_schema = source.entity_address_archive_stage_schema(dataset_id)
     live, clone, stage = _session("00000003-0000001B-1"), _session(), _session("00000004-0000001C-1")
     copied = AsyncMock()
 
-    manifest = await source.stage_and_export_entity_address_archive_source(
+    manifest = await source.export_entity_address_archive_stage(
         _session_factory(live, clone, stage),
         schema_name="mrf",
         dataset_id=dataset_id,
@@ -105,7 +105,7 @@ async def test_stage_export_rejects_non_uuid_owner_before_opening_any_session():
     factory = AsyncMock()
 
     with pytest.raises(ValueError, match="UUID"):
-        await source.stage_and_export_entity_address_archive_source(
+        await source.export_entity_address_archive_stage(
             factory,
             schema_name="mrf",
             dataset_id="550e8400-e29b-41d4-a716-446655440000",
@@ -116,7 +116,7 @@ async def test_stage_export_rejects_non_uuid_owner_before_opening_any_session():
 
 
 @pytest.mark.asyncio
-async def test_stage_export_callback_failure_releases_pins_but_retains_owned_stage_for_the_caller():
+async def test_stage_callback_failure_releases_pins():
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     live, clone, stage = _session("00000003-0000001B-1"), _session(), _session("00000004-0000001C-1")
     exits: list[tuple[object, BaseException | None]] = []
@@ -126,7 +126,7 @@ async def test_stage_export_callback_failure_releases_pins_but_retains_owned_sta
         raise failure
 
     with pytest.raises(RuntimeError, match="native dump failed"):
-        await source.stage_and_export_entity_address_archive_source(
+        await source.export_entity_address_archive_stage(
             _recording_session_factory(live, clone, stage, exits=exits),
             schema_name="mrf",
             dataset_id=dataset_id,
