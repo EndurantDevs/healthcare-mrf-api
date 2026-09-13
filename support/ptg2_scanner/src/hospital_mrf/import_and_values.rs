@@ -321,6 +321,16 @@ fn positive_decimal(value: &str, field: &str) -> io::Result<String> {
     Ok(canonical)
 }
 
+fn nonnegative_decimal(value: &str, field: &str) -> io::Result<String> {
+    let Some(canonical) = canonical_decimal_text(value.trim()) else {
+        return Err(invalid(format!("{field} must be an exact decimal number")));
+    };
+    if canonical.starts_with('-') {
+        return Err(invalid(format!("{field} must be zero or greater")));
+    }
+    Ok(canonical)
+}
+
 fn optional_decimal(value: &str, field: &str) -> io::Result<Option<String>> {
     match optional_text(value) {
         Some(value) => positive_decimal(&value, field).map(Some),

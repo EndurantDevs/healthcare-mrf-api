@@ -109,6 +109,88 @@ fn cms_json_v2_profiles_emit_legacy_metadata_and_estimated_amount() {
 }
 
 #[test]
+fn cms_json_v2_string_zero_drug_units_emit_legacy_zero() {
+    for version in ["2.2.0", "2.2.1"] {
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&fixture_v2_json(version)).unwrap();
+        payload["standard_charge_information"][0]["code_information"][0]["type"] =
+            json!("LOCAL");
+        payload["standard_charge_information"][0]["drug_information"]["unit"] = json!(".0");
+        let rows = run_fixture(
+            InputFormat::Json,
+            &serde_json::to_vec(&payload).unwrap(),
+            false,
+        );
+        assert!(String::from_utf8(rows["service"].clone())
+            .unwrap()
+            .contains("\t0\tML\n"));
+    }
+}
+
+#[test]
+fn zero_drug_units_keep_v3_and_csv_profiles_strict() {
+    let mut v2: serde_json::Value =
+        serde_json::from_slice(&fixture_v2_json("2.2.0")).unwrap();
+    v2["standard_charge_information"][0]["code_information"][0]["type"] = json!("LOCAL");
+    v2["standard_charge_information"][0]["drug_information"]["unit"] = json!("-0.1");
+    assert_import_error(
+        InputFormat::Json,
+        &serde_json::to_vec(&v2).unwrap(),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "drug unit must be zero or greater",
+    );
+    v2["standard_charge_information"][0]["drug_information"]["unit"] = json!("unknown");
+    assert_import_error(
+        InputFormat::Json,
+        &serde_json::to_vec(&v2).unwrap(),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "drug unit must be an exact decimal number",
+    );
+
+    let mut v3: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+    v3["standard_charge_information"][0]["drug_information"] =
+        json!({"unit": 1.5, "type": "ML"});
+    let rows = run_fixture(
+        InputFormat::Json,
+        &serde_json::to_vec(&v3).unwrap(),
+        false,
+    );
+    assert!(String::from_utf8(rows["service"].clone())
+        .unwrap()
+        .contains("\t1.5\tML\n"));
+
+    v3["standard_charge_information"][0]["drug_information"] =
+        json!({"unit": 0, "type": "ML"});
+    assert_import_error(
+        InputFormat::Json,
+        &serde_json::to_vec(&v3).unwrap(),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "drug unit must be greater than zero",
+    );
+    v3["standard_charge_information"][0]["drug_information"]["unit"] = json!(".0");
+    assert_import_error(
+        InputFormat::Json,
+        &serde_json::to_vec(&v3).unwrap(),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "CMS JSON v3 drug unit must be a number",
+    );
+
+    for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+        let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.2.0"));
+        let unit_index = csv_fixture_index(&records[2], "drug_unit_of_measurement");
+        let type_index = csv_fixture_index(&records[2], "drug_type_of_measurement");
+        records[3][unit_index] = ".0".to_owned();
+        records[3][type_index] = "ML".to_owned();
+        assert_import_error(
+            format,
+            &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "drug unit must be greater than zero",
+        );
+    }
+}
+
+#[test]
 fn cms_json_profiles_reject_mixed_shapes_and_profile_specific_values() {
     let mut v3_shape: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
     v3_shape["version"] = json!("2.2.1");

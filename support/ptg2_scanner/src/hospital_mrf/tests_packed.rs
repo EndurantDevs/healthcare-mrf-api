@@ -31,6 +31,70 @@ fn import_packed_json(
     import_packed(InputFormat::Json, payload, max_output_bytes)
 }
 
+fn assert_packed_json_import_error(payload: &[u8], expected: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let input_path = directory.path().join("input.json");
+    fs::write(&input_path, payload).unwrap();
+    let output_directory = directory.path().join("output");
+    fs::create_dir(&output_directory).unwrap();
+    let error = import_hospital_mrf_with_output_mode(
+        InputFormat::Json,
+        VERSION_ID,
+        &input_path,
+        &output_directory,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            TEST_MAX_OUTPUT_BYTES,
+        ),
+        HospitalMrfOutputMode::Packed,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains(expected),
+        "expected {expected:?} in {error}"
+    );
+    assert_eq!(fs::read_dir(output_directory).unwrap().count(), 0);
+}
+
+#[test]
+fn packed_v2_string_zero_round_trips_and_v3_cleanup_is_atomic() {
+    let mut v2: serde_json::Value =
+        serde_json::from_slice(&fixture_v2_json("2.2.0")).unwrap();
+    v2["standard_charge_information"][0]["code_information"][0]["type"] = json!("LOCAL");
+    v2["standard_charge_information"][0]["drug_information"]["unit"] = json!(".0");
+    let (directory, summary) = import_packed_json(
+        &serde_json::to_vec(&v2).unwrap(),
+        TEST_MAX_OUTPUT_BYTES,
+    );
+    assert_eq!(summary.schema_version, "2.2.0");
+    let payloads = super::packed_output_tests::payloads(
+        &directory.path().join("output/service_block.copy"),
+    );
+    let services = payloads
+        .iter()
+        .flat_map(|payload| {
+            crate::hospital_price_service_block::decode_service_block(payload).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].drug_unit.as_deref(), Some("0"));
+    assert_eq!(services[0].drug_type.as_deref(), Some("ML"));
+    assert_eq!(services[0].codes.len(), 1);
+    assert_eq!(services[0].codes[0].code_type, "LOCAL");
+    assert_eq!(services[0].charges.len(), 1);
+
+    for (unit, expected) in [
+        (json!(0), "drug unit must be greater than zero"),
+        (json!(".0"), "CMS JSON v3 drug unit must be a number"),
+    ] {
+        let mut v3: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        v3["standard_charge_information"][0]["drug_information"] =
+            json!({"unit": unit, "type": "ML"});
+        assert_packed_json_import_error(&serde_json::to_vec(&v3).unwrap(), expected);
+    }
+}
+
 #[test]
 fn packed_v2_facts_keep_estimated_and_comparison_amounts_distinct() {
     let mut payload: serde_json::Value =
@@ -135,26 +199,10 @@ fn packed_csv_v2_tall_and_wide_keep_estimated_facts_identical() {
 }
 
 fn assert_packed_nul_rejected(payload: &serde_json::Value) {
-    let directory = tempfile::tempdir().unwrap();
-    let input_path = directory.path().join("input.json");
-    fs::write(&input_path, serde_json::to_vec(payload).unwrap()).unwrap();
-    let output_directory = directory.path().join("output");
-    fs::create_dir(&output_directory).unwrap();
-    let error = import_hospital_mrf_with_output_mode(
-        InputFormat::Json,
-        VERSION_ID,
-        &input_path,
-        &output_directory,
-        HospitalMrfLimits::new(
-            DEFAULT_MAX_FANOUT_ROWS,
-            TEST_MAX_DECOMPRESSED_BYTES,
-            TEST_MAX_OUTPUT_BYTES,
-        ),
-        HospitalMrfOutputMode::Packed,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("contains NUL"));
-    assert_eq!(fs::read_dir(output_directory).unwrap().count(), 0);
+    assert_packed_json_import_error(
+        &serde_json::to_vec(payload).unwrap(),
+        "contains NUL",
+    );
 }
 
 #[test]
