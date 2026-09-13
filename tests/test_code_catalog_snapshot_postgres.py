@@ -461,6 +461,43 @@ async def test_native_catalog_promotion_preserves_destination_owner_and_grants()
 
 
 @pytest.mark.asyncio
+async def test_native_catalog_promotion_preserves_restricted_owner_grants():
+    engine = create_async_engine(_dsn())
+    schema_name = "code_catalog_archive_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+            await _create_catalog(connection, schema_name, "code_catalog")
+            await _create_catalog(connection, schema_name, "code_catalog_stage")
+            await _insert_rows(connection, schema_name, "code_catalog", _rows(suffix="_old"))
+            await _insert_rows(connection, schema_name, "code_catalog_stage", _rows())
+            await connection.execute(text(f'REVOKE INSERT, UPDATE ON TABLE "{schema_name}".code_catalog FROM postgres'))
+            await connection.execute(
+                text(f'GRANT UPDATE (display_name) ON TABLE "{schema_name}".code_catalog TO postgres')
+            )
+            expected_acl = await _relation_acl(connection, schema_name, "code_catalog")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        incumbent = await _capture(sessions, schema_name)
+        stage = await _validated_stage(engine, sessions, schema_name)
+        async with sessions() as session, session.begin():
+            await promote_code_catalog_restored_stage(
+                session,
+                schema_name=schema_name,
+                stage_table_name="code_catalog_stage",
+                retained_table_name="code_catalog_previous",
+                incumbent_capture=incumbent,
+                expected_stage_capture=stage,
+                require_import_idle=_idle,
+            )
+        async with engine.connect() as connection:
+            assert await _relation_acl(connection, schema_name, "code_catalog") == expected_acl
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_native_catalog_promotion_rejects_a_different_destination_owner_without_mutation():
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
@@ -647,3 +684,28 @@ async def test_native_catalog_stage_rejects_unsupported_relation_state(unsupport
 
 async def _idle(session) -> None:
     return None
+
+
+async def _relation_acl(connection, schema_name: str, table_name: str):
+    rows = await connection.execute(
+        text(
+            "SELECT NULL::name, grantee_role.rolname, acl.privilege_type, acl.is_grantable "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+            "CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, "
+            "pg_catalog.acldefault('r', relation.relowner))) AS acl "
+            "LEFT JOIN pg_catalog.pg_roles AS grantee_role ON grantee_role.oid=acl.grantee "
+            "WHERE namespace.nspname=:schema_name AND relation.relname=:table_name "
+            "UNION ALL "
+            "SELECT attribute.attname, grantee_role.rolname, acl.privilege_type, acl.is_grantable "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+            "JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid=relation.oid "
+            "CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) AS acl "
+            "LEFT JOIN pg_catalog.pg_roles AS grantee_role ON grantee_role.oid=acl.grantee "
+            "WHERE namespace.nspname=:schema_name AND relation.relname=:table_name "
+            "AND attribute.attnum>0 AND NOT attribute.attisdropped ORDER BY 1 NULLS FIRST, 2, 3, 4"
+        ),
+        {"schema_name": schema_name, "table_name": table_name},
+    )
+    return tuple(rows)
