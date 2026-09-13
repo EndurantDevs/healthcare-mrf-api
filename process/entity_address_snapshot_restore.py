@@ -285,6 +285,39 @@ def _stage_sequence_name(table_name: str, stage_table_name: str, sequence_name: 
     return expected_name
 
 
+async def _lock_owned_restore_relations(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
+    """Pin the token-named owner tables before rechecking and changing their defaults."""
+
+    table_names = ", ".join(
+        f"{_quoted(owner.schema_name)}.{_quoted(table_name)}" for table_name, _ in owner.relation_oids
+    )
+    await session.execute(text(f"LOCK TABLE {table_names} IN ACCESS EXCLUSIVE MODE"))
+
+
+async def _reset_restored_evidence_sequence(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
+    """Advance the verified local evidence sequence past data-only restored identifiers."""
+
+    evidence_table_name = entity_address_unified.EntityAddressEvidence.__tablename__
+    evidence_relation_oid = dict(owner.relation_oids).get(evidence_table_name)
+    expected_sequence_name = f"{evidence_table_name}_evidence_id_seq"
+    if not isinstance(evidence_relation_oid, int) or await _owned_sequence_names(session, evidence_relation_oid) != (
+        expected_sequence_name,
+    ):
+        raise EntityAddressSnapshotRestoreError("entity-address restore evidence sequence is invalid")
+    sequence_reference = f"{owner.schema_name}.{expected_sequence_name}"
+    table_reference = f"{_quoted(owner.schema_name)}.{_quoted(evidence_table_name)}"
+    sequence_value = await session.scalar(
+        text(
+            f"SELECT pg_catalog.setval(to_regclass(:sequence_reference), "
+            f"GREATEST(COALESCE((SELECT MAX(evidence_id) FROM {table_reference}), 1), 1), "
+            f"EXISTS (SELECT 1 FROM {table_reference}))"
+        ),
+        {"sequence_reference": sequence_reference},
+    )
+    if not isinstance(sequence_value, int) or sequence_value < 1:
+        raise EntityAddressSnapshotRestoreError("entity-address restore evidence sequence is unavailable")
+
+
 async def _move_owned_relations(
     session: Any,
     *,
@@ -365,8 +398,10 @@ async def finalize_entity_address_archive_restore(
 
     _require_caller_transaction(session)
     try:
-        validated_owner = await verify_entity_address_archive_stage_ownership(session, owner=owner)
+        validated_owner = validate_entity_address_archive_stage_ownership(owner)
         validated_receipt = validate_entity_address_archive_receipt(semantic_receipt)
+        await _lock_owned_restore_relations(session, validated_owner)
+        validated_owner = await verify_entity_address_archive_stage_ownership(session, owner=validated_owner)
     except (EntityAddressArchiveOwnershipError, EntityAddressArchiveReceiptError) as error:
         raise EntityAddressSnapshotRestoreError(str(error)) from error
     normalized_schema, normalized_date, stage_names = _stage_plan(
@@ -376,6 +411,7 @@ async def finalize_entity_address_archive_restore(
     if normalized_schema == validated_owner.schema_name:
         raise EntityAddressSnapshotRestoreError("entity-address restore destination must differ from owned schema")
     await _actual_receipt(session, schema_name=validated_owner.schema_name, expected=validated_receipt)
+    await _reset_restored_evidence_sequence(session, validated_owner)
     stage_oids = await _move_owned_relations(
         session,
         owner=validated_owner,

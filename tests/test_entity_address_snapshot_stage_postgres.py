@@ -263,6 +263,8 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
     try:
         await _seed_live_sentinel(engine, live_schema, relations)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session, session.begin():
+            await _seed_receipt_family(session, live_schema, reversed_rows=False)
 
         async def archive_copy(capture):
             """Dump the stage and prove it no longer locks live relations."""
@@ -499,6 +501,26 @@ async def _prepare_nonempty_restore_fixture(engine, sessions, destination_schema
     return owner, expected_receipt, incumbent_relation_oid
 
 
+async def _assert_rehydrated_evidence_sequence(session, destination_schema: str, prepared_restore) -> None:
+    """Require the stage-local evidence sequence to advance beyond restored explicit IDs."""
+
+    evidence_stage_name = next(
+        table_name
+        for table_name, _ in prepared_restore.stage_relation_oids
+        if table_name.startswith("entity_address_evidence_")
+    )
+    highest_evidence_id = await session.scalar(
+        text(f'SELECT MAX(evidence_id) FROM "{destination_schema}"."{evidence_stage_name}"')
+    )
+    next_evidence_id = await session.scalar(
+        text("SELECT nextval(to_regclass(:sequence_reference))"),
+        {"sequence_reference": f"{destination_schema}.{evidence_stage_name}_evidence_id_seq"},
+    )
+    assert isinstance(highest_evidence_id, int)
+    assert isinstance(next_evidence_id, int)
+    assert next_evidence_id > highest_evidence_id
+
+
 async def _assert_rehydrated_restore_state(
     sessions,
     *,
@@ -537,6 +559,7 @@ async def _assert_rehydrated_restore_state(
             )
             == 2
         )
+        await _assert_rehydrated_evidence_sequence(session, destination_schema, prepared_restore)
         await _assert_stage_share_pins_block_ddl(
             sessions, destination_schema, prepared_restore.stage_relation_oids[0][0]
         )
