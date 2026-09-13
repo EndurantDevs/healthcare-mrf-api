@@ -3,26 +3,26 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import os
 import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.models._legacy import Base
+from process.ptg_parts import result_archive_closure as archive_closure
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock, shared_block_hash
 from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import encode_v4_snapshot_map_pack
-from process.ptg_parts import result_archive_closure as archive_closure
 from process.ptg_parts.result_archive_closure import (
     ResultArchiveClosureError,
     select_result_archive_closure,
 )
-
 
 _RELATION_SUPPORT_COLUMNS = {
     "ptg2_import_run": "import_run_id text",
@@ -33,6 +33,8 @@ _RELATION_SUPPORT_COLUMNS = {
     "ptg2_v3_snapshot_source": "snapshot_id text, source_trace_set_hash text",
     "ptg2_v3_candidate_audit_attestation": "snapshot_id text",
     "ptg2_v3_audit_occurrence": "snapshot_key bigint",
+    "ptg2_v3_layout_fingerprint": "snapshot_key bigint",
+    "ptg2_v3_provider_group": "snapshot_key bigint",
     "ptg2_artifact_manifest": "artifact_id text, snapshot_id text",
     "ptg2_artifact_blob_chunk": "artifact_id text",
     "ptg2_source_trace_set": "source_trace_set_hash text, source_trace_hashes text[]",
@@ -40,6 +42,12 @@ _RELATION_SUPPORT_COLUMNS = {
     "ptg2_source_file_version": "source_file_version_id text, source_identity_hash text, content_hash text",
     "ptg2_source_identity": "source_identity_hash text",
     "ptg2_content_identity": "content_hash text",
+    "ptg2_provider_tax_identity_manifest": "snapshot_key bigint",
+    "ptg2_provider_tax_identity": "snapshot_key bigint",
+    "ptg2_provider_group_tax_identity": "snapshot_key bigint",
+    "ptg2_provider_tax_identity_source_manifest": "snapshot_key bigint",
+    "ptg2_provider_tax_identity_source_binding": "snapshot_key bigint",
+    "ptg2_provider_group_tax_identity_source": "snapshot_key bigint",
     "ptg2_v4_npi_scope": "snapshot_key bigint",
     "ptg2_v4_provider_component": "snapshot_key bigint",
     "ptg2_v4_pattern": "snapshot_key bigint",
@@ -55,6 +63,51 @@ _NATIVE_DDL_ONLY_TABLES = {
     "ptg2_v4_provider_set_npi_prefix",
     "ptg2_v4_provider_graph_diagnostic",
     "ptg2_v4_inferred_taxonomy_candidate",
+    "ptg2_provider_tax_identity_manifest",
+    "ptg2_provider_tax_identity",
+    "ptg2_provider_group_tax_identity",
+    "ptg2_provider_tax_identity_source_manifest",
+    "ptg2_provider_tax_identity_source_binding",
+    "ptg2_provider_group_tax_identity_source",
+}
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_NATIVE_DDL_BY_TABLE = {
+    "ptg2_v3_layout_fingerprint": (
+        "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "PRIMARY KEY (semantic_fingerprint)",
+    ),
+    "ptg2_v3_snapshot_block": (
+        "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)",
+    ),
+    "ptg2_v3_provider_group": (
+        "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "PRIMARY KEY (snapshot_key, provider_group_key)",
+    ),
+    "ptg2_provider_tax_identity_manifest": (
+        "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "PRIMARY KEY (snapshot_key)",
+    ),
+    "ptg2_provider_tax_identity": (
+        "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "PRIMARY KEY (snapshot_key, tin_key)",
+    ),
+    "ptg2_provider_group_tax_identity": (
+        "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "PRIMARY KEY (\n                    snapshot_key,\n                    provider_group_global_id_128\n                )",
+    ),
+    "ptg2_provider_tax_identity_source_manifest": (
+        "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "PRIMARY KEY (snapshot_key)",
+    ),
+    "ptg2_provider_tax_identity_source_binding": (
+        "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "PRIMARY KEY (snapshot_key, source_key)",
+    ),
+    "ptg2_provider_group_tax_identity_source": (
+        "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "PRIMARY KEY (\n                    snapshot_key,\n                    source_key,\n                    provider_group_global_id_128\n                )",
+    ),
 }
 
 
@@ -153,6 +206,12 @@ async def _create_schema_tables(connection, schema: str) -> None:
                     object_kind text NOT NULL, codec text NOT NULL, entry_count bigint NOT NULL,
                     raw_byte_count bigint NOT NULL, stored_byte_count bigint NOT NULL, payload bytea NOT NULL
                 );
+                CREATE TABLE {schema}.ptg2_v3_snapshot_block (
+                    snapshot_key bigint NOT NULL, object_kind text NOT NULL,
+                    block_key bigint NOT NULL, fragment_no integer NOT NULL,
+                    entry_count bigint NOT NULL, block_hash bytea NOT NULL,
+                    PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+                );
                 CREATE TABLE {schema}.ptg2_v4_snapshot_map_pack (
                     snapshot_key bigint NOT NULL, object_kind text NOT NULL, pack_no integer NOT NULL,
                     coordinate_count integer NOT NULL, entry_count bigint NOT NULL,
@@ -183,6 +242,24 @@ def _model_columns_by_table() -> dict[str, set[str]]:
     """Expose current model column names keyed by physical table name."""
 
     return {table.name: set(table.columns.keys()) for table in Base.metadata.tables.values()}
+
+
+def test_added_relations_match_current_model_and_native_ddl_keys() -> None:
+    """Keep archive predicates tied to the deployed physical table contracts."""
+
+    model_columns = _model_columns_by_table()
+    for table_name in {
+        "ptg2_v3_layout_fingerprint",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_provider_group",
+        "ptg2_v4_npi_scope",
+    }:
+        assert "snapshot_key" in model_columns[table_name]
+    for table_name, (relative_path, primary_key) in _NATIVE_DDL_BY_TABLE.items():
+        source = (_REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+        assert table_name in source
+        assert "snapshot_key bigint NOT NULL" in source
+        assert primary_key in source
 
 
 async def _seed(engine, schema: str) -> tuple[str, set[bytes]]:
@@ -286,7 +363,47 @@ async def _seed_map_blocks(connection, schema: str, hashes: set[bytes]) -> tuple
         text(f"INSERT INTO {schema}.ptg2_v3_block VALUES (:hash, 2, 'unrelated_v1', 'none', 1, 1, 1, :payload)"),
         {"hash": b"z" * 32, "payload": b"z"},
     )
+    await _seed_relational_price_mappings(connection, schema, hashes)
     return map_payload_bytes, finalizer_payload_bytes
+
+
+async def _seed_relational_price_mappings(connection, schema: str, hashes: set[bytes]) -> None:
+    """Add the two V4 relational price kinds and synthetic non-members."""
+
+    relational_block = SharedBlock("price_atoms_v3", 0, 0, 1, "none", 1, b"p")
+    relational_membership_block = SharedBlock("price_set_atom_memberships_v3", 0, 0, 1, "none", 1, b"m")
+    unrelated_relational_block = SharedBlock("price_atoms_v3", 1, 0, 1, "none", 1, b"q")
+    unsupported_mapping_block = SharedBlock("legacy_mapping_v1", 0, 0, 1, "none", 1, b"r")
+    for block in (
+        relational_block,
+        relational_membership_block,
+        unrelated_relational_block,
+        unsupported_mapping_block,
+    ):
+        await connection.execute(
+            text(f"INSERT INTO {schema}.ptg2_v3_block VALUES (:hash, 2, :kind, 'none', 1, 1, 1, :payload)"),
+            {"hash": block.block_hash, "kind": block.object_kind, "payload": block.payload},
+        )
+    await connection.execute(
+        text(f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (71, 'price_atoms_v3', 0, 0, 1, :hash)"),
+        {"hash": relational_block.block_hash},
+    )
+    await connection.execute(
+        text(f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (72, 'price_atoms_v3', 0, 0, 1, :hash)"),
+        {"hash": unrelated_relational_block.block_hash},
+    )
+    await connection.execute(
+        text(
+            f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (71, 'price_set_atom_memberships_v3', 0, 0, 1, :hash)"
+        ),
+        {"hash": relational_membership_block.block_hash},
+    )
+    await connection.execute(
+        text(f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (71, 'legacy_mapping_v1', 0, 0, 1, :hash)"),
+        {"hash": unsupported_mapping_block.block_hash},
+    )
+    hashes.add(relational_block.block_hash)
+    hashes.add(relational_membership_block.block_hash)
 
 
 async def _seed_root_receipts(
@@ -336,7 +453,34 @@ async def test_native_archive_closure_selects_only_decoded_blocks() -> None:
             )
     assert set(closure.block_hashes) == expected_hashes
     assert b"z" * 32 not in closure.block_hashes
-    assert any(item.table_name == "ptg2_v3_block" for item in closure.relations)
+    assert (
+        shared_block_hash(
+            format_version=2,
+            object_kind="price_set_atom_memberships_v3",
+            codec="none",
+            payload=b"m",
+        )
+        in closure.block_hashes
+    )
+    assert (
+        shared_block_hash(
+            format_version=2,
+            object_kind="price_atoms_v3",
+            codec="none",
+            payload=b"q",
+        )
+        not in closure.block_hashes
+    )
+    assert (
+        shared_block_hash(
+            format_version=2,
+            object_kind="legacy_mapping_v1",
+            codec="none",
+            payload=b"r",
+        )
+        not in closure.block_hashes
+    )
+    assert any(relation.table_name == "ptg2_v3_block" for relation in closure.relations)
 
 
 @pytest.mark.asyncio
@@ -478,6 +622,9 @@ async def test_every_archive_relation_uses_current_model_columns_and_parses() ->
         "ptg2_snapshot": {"snapshot_id", "import_run_id"},
         "ptg2_v3_snapshot_binding": {"snapshot_id", "snapshot_key"},
         "ptg2_v3_snapshot_layout": {"snapshot_key"},
+        "ptg2_v3_layout_fingerprint": {"snapshot_key"},
+        "ptg2_v3_snapshot_block": {"snapshot_key"},
+        "ptg2_v3_provider_group": {"snapshot_key"},
         "ptg2_v4_snapshot_map_root": {"snapshot_key"},
         "ptg2_v4_snapshot_map_pack": {"snapshot_key"},
         "ptg2_v4_finalizer_map_root": {"snapshot_key"},
@@ -507,3 +654,63 @@ async def test_every_archive_relation_uses_current_model_columns_and_parses() ->
                     text(f"EXPLAIN SELECT 1 FROM {schema}.{relation.table_name} WHERE {relation.predicate_sql}"),
                     {"snapshot_id": "synthetic-result-closure", "snapshot_key": 71, "block_hashes": (b"x" * 32,)},
                 )
+
+
+@pytest.mark.asyncio
+async def test_new_snapshot_key_relations_include_only_selected_snapshot_rows() -> None:
+    """New closure tables select the sealed layout key, never a whole table."""
+
+    expected_tables = {
+        "ptg2_v3_layout_fingerprint",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_provider_group",
+        "ptg2_v4_npi_scope",
+        "ptg2_provider_tax_identity_manifest",
+        "ptg2_provider_tax_identity",
+        "ptg2_provider_group_tax_identity",
+        "ptg2_provider_tax_identity_source_manifest",
+        "ptg2_provider_tax_identity_source_binding",
+        "ptg2_provider_group_tax_identity_source",
+    }
+    relations_by_table = {relation.table_name: relation for relation in archive_closure._relations("synthetic_schema")}
+    assert expected_tables <= set(relations_by_table)
+    assert all(
+        relations_by_table[table_name].predicate_sql == "snapshot_key = :snapshot_key"
+        for table_name in expected_tables - {"ptg2_v3_snapshot_block"}
+    )
+    assert relations_by_table["ptg2_v3_snapshot_block"].predicate_sql == (
+        "snapshot_key = :snapshot_key AND object_kind IN ('price_atoms_v3', 'price_set_atom_memberships_v3')"
+    )
+    async with _database() as (engine, schema_name, schema):
+        async with engine.begin() as connection:
+            await _create_relation_predicate_support(connection, schema)
+            for table_name in expected_tables - {"ptg2_v3_snapshot_block"}:
+                await connection.exec_driver_sql(f"INSERT INTO {schema}.{table_name} (snapshot_key) VALUES (71), (72)")
+            await connection.execute(
+                text(
+                    f"INSERT INTO {schema}.ptg2_v3_snapshot_block "
+                    "VALUES (71, 'price_atoms_v3', 0, 0, 0, :first_hash), "
+                    "(72, 'price_atoms_v3', 0, 0, 0, :second_hash)"
+                ),
+                {"first_hash": b"a" * 32, "second_hash": b"b" * 32},
+            )
+            await connection.execute(
+                text(
+                    f"INSERT INTO {schema}.ptg2_v3_snapshot_block "
+                    "VALUES (71, 'legacy_mapping_v1', 0, 0, 0, :legacy_hash)"
+                ),
+                {"legacy_hash": b"c" * 32},
+            )
+            for table_name in expected_tables:
+                relation = {
+                    returned_relation.table_name: returned_relation
+                    for returned_relation in archive_closure._relations(schema_name)
+                }[table_name]
+                selected_keys = await connection.execute(
+                    text(
+                        f"SELECT snapshot_key FROM {schema}.{table_name} "
+                        f"WHERE {relation.predicate_sql} ORDER BY snapshot_key"
+                    ),
+                    {"snapshot_key": 71},
+                )
+                assert selected_keys.scalars().all() == [71]

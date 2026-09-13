@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -47,12 +47,13 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
     monkeypatch.setattr(native, "_validate_publish_integrity", validate)
 
     prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
-        db_schema="mrf",
-        import_date="20260913",
+        db_schema=" mrf ",
+        import_date=" 20260913 ",
     )
 
     assert len(native.SUPPORT_TABLE_MODELS) == 6
     assert ensured_tables == [swap.stage_cls.__tablename__ for swap in swaps]
+    assert prepared.db_schema == "mrf"
     assert prepared.context == {"address_alias_generation": 9, "stage_persistence": "p"}
     assert prepared.publish_validation == {"bridge_orphans": {}}
     run_phase.assert_awaited_once_with(
@@ -66,6 +67,75 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
         support_stage_class_map,
         test_mode=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("db_schema", "import_date"),
+    [
+        ("mrf; DROP SCHEMA mrf", "20260913"),
+        ("mrf", "run-20260913"),
+        ("mrf", "x" * 64),
+        ("x" * 64, "20260913"),
+        ("mrf", None),
+    ],
+)
+def test_prepared_result_stage_rejects_unsafe_destination_identifiers_before_db_work(
+    monkeypatch,
+    db_schema,
+    import_date,
+):
+    make_class = Mock()
+    cutover_plan = Mock()
+    database = Mock()
+    monkeypatch.setattr(native, "make_class", make_class)
+    monkeypatch.setattr(native, "_entity_address_cutover_plan", cutover_plan)
+    monkeypatch.setattr(native, "db", database)
+
+    with pytest.raises(ValueError):
+        adoption._prepared_full_result_stage(
+            db_schema=db_schema,
+            import_date=import_date,
+        )
+
+    make_class.assert_not_called()
+    cutover_plan.assert_not_called()
+    assert database.mock_calls == []
+
+
+def test_prepared_result_has_exact_safe_stage_tables(monkeypatch):
+    stage_name_by_model: dict[type, str] = {}
+    plan_call_map: dict[str, object] = {}
+
+    def make_stage(model, suffix):
+        table_name = f"{model.__tablename__}_{suffix}"
+        stage_name_by_model[model] = table_name
+        return SimpleNamespace(__tablename__=table_name)
+
+    def cutover_plan(schema, stage_cls, support_stage_class_map, **_kwargs):
+        plan_call_map.update(
+            schema=schema,
+            stage_cls=stage_cls,
+            support_stage_class_map=support_stage_class_map,
+        )
+        return [], [], [], []
+
+    monkeypatch.setattr(native, "make_class", make_stage)
+    monkeypatch.setattr(native, "_entity_address_cutover_plan", cutover_plan)
+
+    stage_cls, support_stage_class_map, *_ = adoption._prepared_full_result_stage(
+        db_schema=" mrf ",
+        import_date=" 20260913 ",
+    )
+
+    expected_names = {
+        f"{model.__tablename__}_20260913" for model in (native.EntityAddressUnified, *native.SUPPORT_TABLE_MODELS)
+    }
+    actual_names = {stage_cls.__tablename__, *(stage.__tablename__ for stage in support_stage_class_map.values())}
+    assert len(native.SUPPORT_TABLE_MODELS) == 6
+    assert actual_names == expected_names
+    assert len(actual_names) == 7
+    assert set(stage_name_by_model.values()) == expected_names
+    assert plan_call_map["schema"] == "mrf"
 
 
 @pytest.mark.asyncio
