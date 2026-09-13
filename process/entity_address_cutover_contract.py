@@ -44,7 +44,6 @@ async def preserve_transaction_sql_settings(
     database: Any,
     setting_names,
     quote_literal,
-    logger,
 ):
     """Restore a borrowed transaction's settings after one nested operation."""
 
@@ -57,12 +56,8 @@ async def preserve_transaction_sql_settings(
         previous_settings.append((setting_name, str(setting_value)))
     async with database.transaction():
         yield
-        await apply_transaction_sql_settings(
-            database,
-            previous_settings,
-            quote_literal,
-            logger,
-        )
+        for setting_name, setting_value in previous_settings:
+            await database.status(f"SET LOCAL {setting_name} = {quote_literal(setting_value)};")
 
 
 @asynccontextmanager
@@ -79,7 +74,6 @@ async def entity_address_tuned_transaction(
         database,
         setting_names,
         quote_literal,
-        logger,
     ):
         await apply_transaction_sql_settings(
             database,
@@ -95,7 +89,6 @@ async def entity_address_cutover_transaction(
     database: Any,
     lock_timeout: str,
     quote_literal,
-    logger,
 ):
     """Apply a required cutover timeout and preserve a borrowed caller setting."""
 
@@ -109,7 +102,6 @@ async def entity_address_cutover_transaction(
         database,
         ["lock_timeout"],
         quote_literal,
-        logger,
     ):
         await database.status(f"SET LOCAL lock_timeout = {quote_literal(lock_timeout)};")
         yield

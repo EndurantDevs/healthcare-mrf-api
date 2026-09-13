@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
+cutover_contract = importlib.import_module("process.entity_address_cutover_contract")
 native = importlib.import_module("process.entity_address_unified")
 
 
@@ -110,6 +111,44 @@ async def test_bound_sql_phase_preserves_settings_without_opening_an_engine_conn
     ]
     bound_database.status.assert_awaited_once_with("ANALYZE synthetic.stage")
     bound_database.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restore_setting_failure_propagates_and_rolls_back_nested_operation():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("transaction entered")
+        try:
+            yield
+        except RuntimeError:
+            events.append("transaction rolled back")
+            raise
+
+    async def fail_restore(_statement):
+        raise RuntimeError("restore rejected")
+
+    database = SimpleNamespace(
+        scalar=AsyncMock(return_value="7s"),
+        status=AsyncMock(side_effect=fail_restore),
+        transaction=transaction,
+    )
+
+    with pytest.raises(RuntimeError, match="restore rejected"):
+        async with cutover_contract.preserve_transaction_sql_settings(
+            database,
+            ["statement_timeout"],
+            native._sql_literal,
+        ):
+            events.append("operation ran")
+
+    assert events == [
+        "transaction entered",
+        "operation ran",
+        "transaction rolled back",
+    ]
+    database.status.assert_awaited_once_with("SET LOCAL statement_timeout = '7s';")
 
 
 @pytest.mark.asyncio

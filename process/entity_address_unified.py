@@ -2390,7 +2390,7 @@ async def _run_entity_address_cutover(
     ) or DEFAULT_CUTOVER_LOCK_TIMEOUT
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
-    async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal, logger):
+    async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal):
         await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
         expected_alias_generation = int(context.get("address_alias_generation") or 0)
         current_alias_generation = await _address_alias_generation(db_schema)
