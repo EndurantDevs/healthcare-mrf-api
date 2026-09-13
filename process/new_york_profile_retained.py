@@ -19,6 +19,7 @@ from process.new_york_profile_acquisition import (
     SEARCH_URL,
     SOURCE_KEY,
     _education_result,
+    _held_search_reason,
     _request,
     _require,
     _search_fields,
@@ -156,7 +157,7 @@ def held_acquisition_content_sha256(destination: Path) -> str:
 
 
 def read_held_acquisition(destination: Path, *, manifest_sha256: str, acquisition_sha256: str) -> dict:
-    """Replay a pinned no-match or ambiguous search, never a complete physician inventory."""
+    """Replay a pinned held search, never a complete physician inventory."""
     _require(
         isinstance(acquisition_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", acquisition_sha256),
         "acquisition_pin_invalid",
@@ -177,7 +178,7 @@ def read_held_acquisition(destination: Path, *, manifest_sha256: str, acquisitio
         _utc_timestamp(manifest_by_field["started_at"]) <= _utc_timestamp(response["downloaded_at"]),
         "chronology_invalid",
     )
-    summary_by_field = {"outcome": "held", "reason": "search_not_singleton", "reported_total": total, "fact_count": 0}
+    summary_by_field = {"outcome": "held", "reason": _held_search_reason(total), "reported_total": total, "fact_count": 0}
     _require(encoded_json(artifacts_by_name["result.json"]) == encoded_json(summary_by_field), "result_changed")
     _require(held_acquisition_content_sha256(destination) == acquisition_sha256, "acquisition_changed")
     return {key: value for key, value in summary_by_field.items() if key != "fact_count"} | {

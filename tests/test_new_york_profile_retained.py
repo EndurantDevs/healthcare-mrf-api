@@ -466,3 +466,13 @@ async def test_held_files_are_bounded_before_decoding(held_path, monkeypatch, na
     monkeypatch.setitem(retained.HELD_FILES, name, 1)
     with pytest.raises(ValueError, match="held_artifact_invalid"):
         retained.read_held_acquisition(held_path, **pins)
+
+
+@pytest.mark.parametrize("field", ["physicianFirstName", "physicianLastName"])
+async def test_incomplete_identity_replay_requires_exact_held_reason(source_session, field):
+    session = source_session(SourceResponse(_search(**{field: " "})))
+    acquired = await _acquire(session)
+    assert retained.read_held_acquisition(session.destination, **_held_pins(session.destination)) == acquired
+    _change(session.destination, "result.json", reason="search_not_singleton")
+    with pytest.raises(ValueError, match="result_changed"):
+        retained.read_held_acquisition(session.destination, **_held_pins(session.destination))

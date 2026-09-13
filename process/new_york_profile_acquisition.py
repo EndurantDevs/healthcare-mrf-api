@@ -117,9 +117,14 @@ def _search_result(body):
     _require(isinstance(physician_by_field, dict)
              and all(isinstance(physician_by_field.get(field), str) for field in text_fields)
              and all(isinstance(physician_by_field.get(field), list) for field in ("medicalPractice", "practiceLocations")), "search_identity_invalid")
-    _require(re.fullmatch(r"[1-9][0-9]{0,11}", physician_by_field["physicianID"])
-             and physician_by_field["physicianFirstName"].strip() and physician_by_field["physicianLastName"].strip(), "search_identity_invalid")
+    _require(re.fullmatch(r"[1-9][0-9]{0,11}", physician_by_field["physicianID"]), "search_identity_invalid")
+    if not physician_by_field["physicianFirstName"].strip() or not physician_by_field["physicianLastName"].strip():
+        return None, 1
     return physician_by_field, 1
+
+
+def _held_search_reason(total):
+    return "search_identity_incomplete" if total == 1 else "search_not_singleton"
 
 
 async def _acquire_education(session, destination, manifest):
@@ -128,7 +133,7 @@ async def _acquire_education(session, destination, manifest):
     body, search_response = await _fetch_response(session, destination, "search", search_request)
     physician_by_field, total = _search_result(body)
     if physician_by_field is None:
-        return {"outcome": "held", "reason": "search_not_singleton", "reported_total": total,
+        return {"outcome": "held", "reason": _held_search_reason(total), "reported_total": total,
                 "source_record": None, "facts": []}
     physician_id = physician_by_field["physicianID"]
     await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
