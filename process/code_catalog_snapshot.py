@@ -232,7 +232,7 @@ async def _require_no_dependent_views(session: AsyncSession, relation_oid: int) 
         raise CodeCatalogSnapshotError("code-catalog replacement has dependent views")
 
 
-async def _relation_absent(session: AsyncSession, schema_name: str, table_name: str) -> bool:
+async def _is_relation_absent(session: AsyncSession, schema_name: str, table_name: str) -> bool:
     return (
         await session.scalar(
             text(
@@ -290,7 +290,7 @@ async def promote_code_catalog_restored_stage(
         )
     )
     await require_import_idle(session)
-    if not await _relation_absent(session, schema, retained_table):
+    if not await _is_relation_absent(session, schema, retained_table):
         raise CodeCatalogSnapshotError("code-catalog retained table already exists")
     live_capture = await _table_receipt(session, schema, table_name)
     if live_capture != incumbent_capture:

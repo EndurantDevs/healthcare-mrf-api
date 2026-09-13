@@ -131,6 +131,7 @@ async def _capture(sessions, schema_name: str):
 
 @pytest.mark.asyncio
 async def test_native_catalog_capture_stage_validation_and_retained_atomic_promotion():
+    """Promote all code systems together while retaining the exact previous catalog."""
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
     source_schema_name = "code_catalog_source_" + uuid4().hex
@@ -171,26 +172,30 @@ async def test_native_catalog_capture_stage_validation_and_retained_atomic_promo
             )
             assert promoted == stage
             assert idle_calls == [True]
-        async with engine.connect() as connection:
-            assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}".code_catalog')) == 3
-            assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}".code_catalog_previous')) == 3
-            assert (
-                await connection.scalar(
-                    text(f"SELECT code FROM \"{schema_name}\".code_catalog WHERE code_system='POS'")
-                )
-                == "21"
-            )
-            assert (
-                await connection.scalar(
-                    text(f"SELECT code FROM \"{schema_name}\".code_catalog_previous WHERE code_system='POS'")
-                )
-                == "21_old"
-            )
+        await _assert_retained_catalog(engine, schema_name)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema_name}" CASCADE'))
         await engine.dispose()
+
+
+async def _assert_retained_catalog(engine, schema_name: str) -> None:
+    """Check serving and predecessor data separately after the cutover commits."""
+
+    async with engine.connect() as connection:
+        assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}".code_catalog')) == 3
+        assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}".code_catalog_previous')) == 3
+        assert (
+            await connection.scalar(text(f"SELECT code FROM \"{schema_name}\".code_catalog WHERE code_system='POS'"))
+            == "21"
+        )
+        assert (
+            await connection.scalar(
+                text(f"SELECT code FROM \"{schema_name}\".code_catalog_previous WHERE code_system='POS'")
+            )
+            == "21_old"
+        )
 
 
 @pytest.mark.asyncio
