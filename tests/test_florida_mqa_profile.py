@@ -2283,3 +2283,19 @@ def test_compact_evidence_excludes_unrequested_and_restricted_records():
     assert evidence["sources"]["state_regulator"]["records"] == [
         {"source_record_id": "education-record", "artifact_id": "one"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_normalization_announces_source_before_completing_it(monkeypatch, tmp_path):
+    """Long source work must not retain the preceding matching-stage label."""
+    _, progress_events, _, _ = _configure_duplicate_import_runtime(monkeypatch)
+    await florida_mqa_profile_module.import_florida_mqa_profile(
+        source_keys=["profile_master"], artifact_root=tmp_path, control_run_id="progress-run",
+    )
+    normalization_start = next(
+        event for event in progress_events
+        if event.get("message") == "Normalizing Florida practitioner license"
+    )
+    assert normalization_start["phase"] == "normalizing"
+    assert normalization_start["file_index"] == 1
+    assert normalization_start["counters"] == {"file_rows_processed": 0}
