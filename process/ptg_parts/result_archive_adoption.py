@@ -65,6 +65,11 @@ _REKEYED_TABLES = (
     "ptg2_provider_tax_identity_source_binding",
     "ptg2_provider_group_tax_identity_source",
 )
+_FINALIZER_MAP_TABLES = (
+    "ptg2_v4_finalizer_map_root",
+    "ptg2_v4_finalizer_map_pack",
+    "ptg2_v4_finalizer_map_target",
+)
 
 
 class ResultArchiveAdoptionError(RuntimeError):
@@ -119,6 +124,21 @@ async def _one(session: Any, statement: str, parameters: Mapping[str, Any], labe
     if len(rows) != 1:
         raise ResultArchiveAdoptionError(f"archive adoption {label} is missing or ambiguous")
     return rows[0]
+
+
+async def _one_or_none(
+    session: Any,
+    statement: str,
+    parameters: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any] | None:
+    """Load one optional guarded row while rejecting a malformed duplicate."""
+
+    result = await session.execute(text(statement), dict(parameters))
+    rows = [_mapping(row) for row in result]
+    if len(rows) > 1:
+        raise ResultArchiveAdoptionError(f"archive adoption {label} is ambiguous")
+    return rows[0] if rows else None
 
 
 async def _staged_layout(session: Any, *, staging_schema: str, source_snapshot_key: int) -> dict[str, Any]:
@@ -411,7 +431,21 @@ async def _copy_staged_layout_rows(
     source_snapshot_key: int,
     destination_snapshot_key: int,
 ) -> None:
-    for table_name in _REKEYED_TABLES:
+    if not all(table_name in _REKEYED_TABLES for table_name in _FINALIZER_MAP_TABLES):
+        for table_name in _REKEYED_TABLES:
+            await _copy_rekeyed_table(
+                session,
+                schema_name=schema_name,
+                staging_schema_name=staging_schema_name,
+                table_name=table_name,
+                source_snapshot_key=source_snapshot_key,
+                destination_snapshot_key=destination_snapshot_key,
+            )
+        return
+
+    first_finalizer_table = _REKEYED_TABLES.index(_FINALIZER_MAP_TABLES[0])
+    last_finalizer_table = _REKEYED_TABLES.index(_FINALIZER_MAP_TABLES[-1])
+    for table_name in _REKEYED_TABLES[:first_finalizer_table]:
         await _copy_rekeyed_table(
             session,
             schema_name=schema_name,
@@ -420,6 +454,217 @@ async def _copy_staged_layout_rows(
             source_snapshot_key=source_snapshot_key,
             destination_snapshot_key=destination_snapshot_key,
         )
+    await _copy_finalizer_map_rows(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    for table_name in _REKEYED_TABLES[last_finalizer_table + 1 :]:
+        await _copy_rekeyed_table(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            table_name=table_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key,
+        )
+
+
+async def _copy_finalizer_map_rows(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Rekey a packed finalizer root without bypassing its building-state guards."""
+
+    source_root = await _staged_finalizer_root(
+        session,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+    )
+    if source_root is None:
+        await _copy_empty_finalizer_map_rows(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key,
+        )
+        return
+    if source_root.get("state") != "complete":
+        raise ResultArchiveAdoptionError("archive adoption finalizer root is not complete")
+    await _copy_completed_finalizer_map_rows(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+
+
+async def _staged_finalizer_root(
+    session: Any,
+    *,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+) -> dict[str, Any] | None:
+    """Lock and return the optional finalizer root from the restored closure."""
+
+    return await _one_or_none(
+        session,
+        f"""
+        SELECT state, contract, map_format
+          FROM {_quote_ident(staging_schema_name)}.ptg2_v4_finalizer_map_root
+         WHERE snapshot_key = :source_snapshot_key
+         FOR KEY SHARE
+        """,
+        {"source_snapshot_key": source_snapshot_key},
+        "staging finalizer root",
+    )
+
+
+async def _copy_empty_finalizer_map_rows(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Copy the legacy empty finalizer family through ordinary rekeying."""
+
+    for table_name in _FINALIZER_MAP_TABLES:
+        await _copy_rekeyed_table(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            table_name=table_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key,
+        )
+
+
+async def _copy_completed_finalizer_map_rows(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Replay an authenticated finalizer family in its required state order."""
+
+    await _insert_building_finalizer_root(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    for table_name in _FINALIZER_MAP_TABLES[1:]:
+        await _copy_rekeyed_table(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            table_name=table_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key,
+        )
+    await _complete_finalizer_root_from_staging(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    await _assert_rekeyed_table_matches(
+        session,
+        schema_name=schema_name,
+        staging_schema_name=staging_schema_name,
+        table_name=_FINALIZER_MAP_TABLES[0],
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+
+
+async def _insert_building_finalizer_root(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Create the guarded destination root using only source root identity fields."""
+
+    insert_result = await session.execute(
+        text(
+            f"""
+            INSERT INTO {_quote_ident(schema_name)}.ptg2_v4_finalizer_map_root
+                (snapshot_key, state, contract, map_format, created_at)
+            SELECT :destination_snapshot_key, 'building', contract, map_format, created_at
+              FROM {_quote_ident(staging_schema_name)}.ptg2_v4_finalizer_map_root
+             WHERE snapshot_key = :source_snapshot_key
+               AND state = 'complete'
+            RETURNING snapshot_key
+            """
+        ),
+        {
+            "source_snapshot_key": source_snapshot_key,
+            "destination_snapshot_key": destination_snapshot_key,
+        },
+    )
+    if insert_result.scalar() != destination_snapshot_key:
+        raise ResultArchiveAdoptionError("archive adoption finalizer root could not enter building state")
+
+
+async def _complete_finalizer_root_from_staging(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Apply the immutable source completion receipt after its children exist."""
+
+    completion_result = await session.execute(
+        text(
+            f"""
+            UPDATE {_quote_ident(schema_name)}.ptg2_v4_finalizer_map_root AS destination
+               SET state = source.state,
+                   map_digest = source.map_digest,
+                   canonical_mapping_digest = source.canonical_mapping_digest,
+                   canonical_byte_count = source.canonical_byte_count,
+                   target_identity_digest = source.target_identity_digest,
+                   object_kind_count = source.object_kind_count,
+                   map_pack_count = source.map_pack_count,
+                   coordinate_count = source.coordinate_count,
+                   entry_count = source.entry_count,
+                   logical_byte_count = source.logical_byte_count,
+                   stored_map_byte_count = source.stored_map_byte_count,
+                   target_block_count = source.target_block_count,
+                   completed_at = source.completed_at
+              FROM {_quote_ident(staging_schema_name)}.ptg2_v4_finalizer_map_root AS source
+             WHERE destination.snapshot_key = :destination_snapshot_key
+               AND destination.state = 'building'
+               AND source.snapshot_key = :source_snapshot_key
+               AND source.state = 'complete'
+            RETURNING destination.snapshot_key
+            """
+        ),
+        {
+            "source_snapshot_key": source_snapshot_key,
+            "destination_snapshot_key": destination_snapshot_key,
+        },
+    )
+    if completion_result.scalar() != destination_snapshot_key:
+        raise ResultArchiveAdoptionError("archive adoption finalizer root could not complete")
 
 
 async def _assert_staged_layout_rows_match_local(

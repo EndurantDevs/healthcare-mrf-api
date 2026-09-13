@@ -4,20 +4,30 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import uuid
 from pathlib import Path
 
 import pytest
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
+from api.ptg2_shared_blocks import fetch_shared_blocks
 from db.connection import Database
 from db.migration_ptg2_frozen_source_file_binding import install_frozen_source_file_binding
 from db.models._legacy import Base
+from process.ptg_parts import ptg2_v4_finalizer_publish as finalizer_publish
 from process.ptg_parts import result_archive_adoption as adoption
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+    has_valid_finalizer_map,
+)
+from scripts.research import ptg2_packed_finalizer_abba_lifecycle as finalizer_lifecycle
+from scripts.research.ptg2_packed_finalizer_abba_artifacts import generate_artifacts
 from tests import test_ptg2_v4_postgres_e2e as v4_e2e
+from tests.test_ptg2_packed_finalizer_wrapper_postgres import _tiny_shape
 
 _FIXTURE_REKEYED_TABLES = frozenset(
     {
@@ -146,6 +156,11 @@ async def _seed_logical_closure_dependencies(
         schema=schema,
         source_snapshot_key=source_snapshot_key,
     )
+    await _seed_source_audit_witness(
+        database,
+        schema=schema,
+        source_snapshot_key=source_snapshot_key,
+    )
     await _seed_allowed_amount_rows(database, schema=schema)
 
 
@@ -201,6 +216,48 @@ async def _seed_staged_code(
         unrelated_code_id=b"d" * 16,
         coverage_id=b"v" * 32,
     )
+
+
+async def _seed_source_audit_witness(
+    database: Database,
+    *,
+    schema: str,
+    source_snapshot_key: int,
+) -> None:
+    """Seed selected and unrelated model-shaped source-audit records."""
+
+    for snapshot_key, marker in (
+        (source_snapshot_key, b"s"),
+        (source_snapshot_key + 1000, b"u"),
+    ):
+        witness_payload = marker + b"-audit-witness"
+        await database.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_source_audit_witness
+                (snapshot_key, contract, selection_method, source_set_digest,
+                 sample_digest, queryable_occurrence_population_count,
+                 provider_population_count, occurrence_witness_count,
+                 provider_witness_count, payload_sha256, payload)
+            VALUES (:snapshot_key, 'synthetic_audit_v1', 'synthetic',
+                    :source_digest, :sample_digest, 1, 0, 1, 0,
+                    :payload_digest, :payload)
+            """,
+            snapshot_key=snapshot_key,
+            source_digest=marker * 32,
+            sample_digest=(marker + b"d") * 16,
+            payload_digest=(marker + b"p") * 16,
+            payload=witness_payload,
+        )
+        await database.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_source_audit_witness_part
+                (snapshot_key, part_number, part_sha256, payload)
+            VALUES (:snapshot_key, 1, :part_digest, :payload)
+            """,
+            snapshot_key=snapshot_key,
+            part_digest=(marker + b"q") * 16,
+            payload=marker + b"-audit-part",
+        )
 
 
 async def _seed_allowed_amount_rows(database: Database, *, schema: str) -> None:
@@ -294,7 +351,145 @@ async def _seed_full_preparation_catalog(
         schema_name=schema_name,
         source_snapshot_key=source_snapshot_key,
     )
+    await _publish_native_finalizer_fixture(
+        database,
+        schema_name=schema_name,
+        source_snapshot_key=source_snapshot_key,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
     return source_snapshot_key
+
+
+async def _publish_native_finalizer_fixture(
+    database: Database,
+    *,
+    schema_name: str,
+    source_snapshot_key: int,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Attach a producer-created packed finalizer map to the sealed source layout."""
+
+    source_build_token, finalizer_build_token = await _enter_finalizer_build(
+        database,
+        schema_name=schema_name,
+        source_snapshot_key=source_snapshot_key,
+    )
+    manifest = await _publish_finalizer_artifacts(
+        database,
+        schema_name=schema_name,
+        source_snapshot_key=source_snapshot_key,
+        finalizer_build_token=finalizer_build_token,
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    await _seal_finalizer_fixture(
+        database,
+        schema_name=schema_name,
+        source_snapshot_key=source_snapshot_key,
+        source_build_token=source_build_token,
+        manifest=manifest,
+    )
+
+
+async def _enter_finalizer_build(
+    database: Database,
+    *,
+    schema_name: str,
+    source_snapshot_key: int,
+) -> tuple[str, str]:
+    """Reopen the disposable native layout for its producer-backed finalizer."""
+
+    schema = _quoted(schema_name)
+    source_build_token = await database.scalar(
+        f"SELECT build_token FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key",
+        snapshot_key=source_snapshot_key,
+    )
+    finalizer_build_token = f"receiver-finalizer-{uuid.uuid4().hex[:16]}"
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_v3_snapshot_layout
+           SET state = 'building', build_token = :build_token
+         WHERE snapshot_key = :snapshot_key
+        """,
+        build_token=finalizer_build_token,
+        snapshot_key=source_snapshot_key,
+    )
+    return str(source_build_token), finalizer_build_token
+
+
+async def _publish_finalizer_artifacts(
+    database: Database,
+    *,
+    schema_name: str,
+    source_snapshot_key: int,
+    finalizer_build_token: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> dict[str, object]:
+    """Run the production finalizer producer against generated tiny artifacts."""
+
+    work_directory = tmp_path / f"finalizer-work-{uuid.uuid4().hex[:8]}"
+    artifacts = generate_artifacts(tmp_path / f"finalizer-artifacts-{uuid.uuid4().hex[:8]}", _tiny_shape())
+    work_directory.mkdir()
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216")
+    monkeypatch.setattr(finalizer_lifecycle, "db", database)
+    monkeypatch.setattr(finalizer_publish, "db", database)
+    try:
+        request = finalizer_lifecycle.ArmRequest(
+            "receiver",
+            True,
+            schema_name,
+            source_snapshot_key,
+            finalizer_build_token,
+            work_directory,
+            artifacts,
+        )
+        publication_result, _elapsed_seconds, _timeline = await finalizer_lifecycle._publish_finalizer(request)
+        manifest = publication_result.publication.manifest()
+    finally:
+        artifacts.cleanup()
+        assert not any(work_directory.iterdir())
+        work_directory.rmdir()
+    return manifest
+
+
+async def _seal_finalizer_fixture(
+    database: Database,
+    *,
+    schema_name: str,
+    source_snapshot_key: int,
+    source_build_token: str,
+    manifest: dict[str, object],
+) -> None:
+    """Attach the producer receipt and verify it through the native map reader."""
+
+    schema = _quoted(schema_name)
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_v3_snapshot_layout
+           SET state = 'sealed', build_token = :source_build_token,
+               layout_manifest = jsonb_set(
+                   layout_manifest, '{{serving_index}}',
+                   COALESCE(layout_manifest->'serving_index', '{{}}'::jsonb)
+                       || jsonb_build_object('finalizer_mapping', CAST(:manifest AS jsonb))
+               )
+         WHERE snapshot_key = :snapshot_key
+        """,
+        source_build_token=source_build_token,
+        manifest=json.dumps(manifest, sort_keys=True),
+        snapshot_key=source_snapshot_key,
+    )
+    async with database.transaction() as session:
+        assert await has_valid_finalizer_map(
+            session,
+            schema_name=schema_name,
+            snapshot_key=source_snapshot_key,
+            layout_manifest={"serving_index": {"finalizer_mapping": manifest}},
+        )
 
 
 async def _create_destination_catalog(database: Database, *, schema_name: str, snapshot_id: str, monkeypatch) -> None:
@@ -374,6 +569,36 @@ async def _assert_full_family_boundary(
         )
         > 0
     )
+    await _assert_logical_closure_boundary(
+        database,
+        stage=stage,
+        destination=destination,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    await _assert_rekeyed_table_contract(
+        database,
+        destination_schema_name=destination_schema_name,
+    )
+    await _assert_destination_finalizer_reader(
+        database,
+        stage_schema_name=stage.strip('"'),
+        destination_schema_name=destination_schema_name,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+
+
+async def _assert_logical_closure_boundary(
+    database: Database,
+    *,
+    stage: str,
+    destination: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Separate logical snapshot evidence from rekeyed physical relations."""
+
     assert (
         await database.scalar(
             f"SELECT COUNT(*) FROM {stage}.ptg2_frozen_source_file_binding WHERE internal_run_id = 'ptg2:source-file'"
@@ -399,6 +624,37 @@ async def _assert_full_family_boundary(
     )
     assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_v3_code WHERE code_key = 8") == 0
     assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_frozen_source_file_binding") == 0
+    for table_name in _MODEL_CLOSURE_TABLES[1:3]:
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_key = :snapshot_key",
+                snapshot_key=source_snapshot_key,
+            )
+            == 1
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_key = :snapshot_key",
+                snapshot_key=source_snapshot_key + 1000,
+            )
+            == 1
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {destination}.{table_name} WHERE snapshot_key = :snapshot_key",
+                snapshot_key=destination_snapshot_key,
+            )
+            == 1
+        )
+
+
+async def _assert_rekeyed_table_contract(
+    database: Database,
+    *,
+    destination_schema_name: str,
+) -> None:
+    """Require the destination fixture to expose every current physical family."""
+
     for table_name in adoption._REKEYED_TABLES:
         assert (
             await database.scalar(
@@ -412,6 +668,137 @@ async def _assert_full_family_boundary(
             )
             > 0
         )
+
+
+async def _assert_destination_finalizer_reader(
+    database: Database,
+    *,
+    stage_schema_name: str,
+    destination_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Read producer receipts and packed finalizer payloads through destination APIs."""
+
+    source_schema = _quoted(stage_schema_name)
+    destination_schema = _quoted(destination_schema_name)
+    await _assert_finalizer_receipts_match(
+        database,
+        source_schema=source_schema,
+        destination_schema=destination_schema,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    await _assert_finalizer_maps_are_populated(
+        database,
+        source_schema=source_schema,
+        destination_schema=destination_schema,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    await _assert_destination_finalizer_payload_reads(
+        database,
+        destination_schema=destination_schema,
+        destination_schema_name=destination_schema_name,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+
+
+async def _assert_finalizer_receipts_match(
+    database: Database,
+    *,
+    source_schema: str,
+    destination_schema: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Require the destination root to preserve every producer completion receipt."""
+
+    finalizer_fields = (
+        "map_digest, canonical_mapping_digest, canonical_byte_count, "
+        "target_identity_digest, object_kind_count, map_pack_count, "
+        "coordinate_count, entry_count, logical_byte_count, "
+        "stored_map_byte_count, target_block_count"
+    )
+    source_receipt = await database.first(
+        f"SELECT {finalizer_fields} FROM {source_schema}.ptg2_v4_finalizer_map_root WHERE snapshot_key = :snapshot_key",
+        snapshot_key=source_snapshot_key,
+    )
+    destination_receipt = await database.first(
+        f"SELECT {finalizer_fields} FROM {destination_schema}.ptg2_v4_finalizer_map_root "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=destination_snapshot_key,
+    )
+    assert source_receipt is not None
+    assert destination_receipt == source_receipt
+
+
+async def _assert_finalizer_maps_are_populated(
+    database: Database,
+    *,
+    source_schema: str,
+    destination_schema: str,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Reject a fixture that merely carries an empty finalizer table family."""
+
+    for schema, snapshot_key in (
+        (source_schema, source_snapshot_key),
+        (destination_schema, destination_snapshot_key),
+    ):
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            > 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            > 0
+        )
+
+
+async def _assert_destination_finalizer_payload_reads(
+    database: Database,
+    *,
+    destination_schema: str,
+    destination_schema_name: str,
+    destination_snapshot_key: int,
+) -> None:
+    """Validate the copied map and every finalizer object kind via native readers."""
+
+    async with database.transaction() as session:
+        layout_manifest = (
+            await session.execute(
+                text(
+                    f"SELECT layout_manifest FROM {destination_schema}.ptg2_v3_snapshot_layout "
+                    "WHERE snapshot_key = :snapshot_key"
+                ),
+                {"snapshot_key": destination_snapshot_key},
+            )
+        ).scalar_one()
+        assert await has_valid_finalizer_map(
+            session,
+            schema_name=destination_schema_name,
+            snapshot_key=destination_snapshot_key,
+            layout_manifest=layout_manifest,
+        )
+        for object_kind in PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS:
+            blocks = await fetch_shared_blocks(
+                session,
+                schema_name=destination_schema_name,
+                snapshot_key=destination_snapshot_key,
+                object_kind=object_kind,
+                block_keys=(0,),
+                require_all=True,
+            )
+            assert tuple(blocks) == (0,)
+            assert len(blocks[0]) == 1
 
 
 async def _prepare_layout(
