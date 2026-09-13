@@ -147,7 +147,7 @@ async def _table_receipt(
 
 async def _require_supported_relation_state(session: AsyncSession, relation_oid: int) -> None:
     """Reject relation state that an OID-changing cutover cannot preserve safely."""
-    state = (
+    relation_state = (
         (
             await session.execute(
                 text(
@@ -173,18 +173,18 @@ async def _require_supported_relation_state(session: AsyncSession, relation_oid:
         .mappings()
         .one_or_none()
     )
-    if state is None or str(state["replica_identity"]) != "d":
+    if relation_state is None or str(relation_state["replica_identity"]) != "d":
         raise CodeCatalogSnapshotError("code-catalog relation has unsupported replica identity")
-    unsupported = {
-        "triggers": state["has_triggers"],
-        "rules": state["has_rules"],
-        "policies": state["has_policies"],
-        "security labels": state["has_security_labels"],
-        "publication membership": state["is_published"],
+    unsupported_by_kind = {
+        "triggers": relation_state["has_triggers"],
+        "rules": relation_state["has_rules"],
+        "policies": relation_state["has_policies"],
+        "security labels": relation_state["has_security_labels"],
+        "publication membership": relation_state["is_published"],
     }
-    present = tuple(name for name, value in unsupported.items() if value)
-    if present:
-        raise CodeCatalogSnapshotError(f"code-catalog relation has unsupported {', '.join(present)}")
+    present_kinds = tuple(name for name, value in unsupported_by_kind.items() if value)
+    if present_kinds:
+        raise CodeCatalogSnapshotError(f"code-catalog relation has unsupported {', '.join(present_kinds)}")
 
 
 def _index_signature(index: Mapping[str, Any]) -> str:
@@ -196,13 +196,13 @@ async def _matches_model_schema_variant(
     schema_name: str,
     capture: CodeCatalogCapture,
     *,
-    normalized_descriptions: bool,
+    has_normalized_descriptions: bool,
 ) -> bool:
     baseline_table = "ccmb_" + uuid4().hex
     metadata = MetaData()
     baseline = CodeCatalog.__table__.to_metadata(metadata, schema=None, name=baseline_table)
     baseline._prefixes.append("TEMPORARY")
-    if normalized_descriptions:
+    if has_normalized_descriptions:
         baseline.c.display_name.type = SQLText()
         baseline.c.short_description.type = SQLText()
     connection = await session.connection()
@@ -244,29 +244,20 @@ async def _matches_model_schema_variant(
 
 async def _require_model_schema(session: AsyncSession, schema_name: str, capture: CodeCatalogCapture) -> None:
     """Require the model schema, including the importer-normalized text variant."""
-    for normalized_descriptions in (False, True):
+    for has_normalized_descriptions in (False, True):
         if await _matches_model_schema_variant(
             session,
             schema_name,
             capture,
-            normalized_descriptions=normalized_descriptions,
+            has_normalized_descriptions=has_normalized_descriptions,
         ):
             return
     raise CodeCatalogSnapshotError("code-catalog relation does not match the local model schema")
 
 
-async def _relation_access(session: AsyncSession, relation_oid: int) -> _RelationAccess:
-    owner_name = await session.scalar(
-        text(
-            "SELECT owner_role.rolname FROM pg_catalog.pg_class AS relation "
-            "JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=relation.relowner "
-            "WHERE relation.oid=:relation_oid"
-        ),
-        {"relation_oid": relation_oid},
-    )
-    if not isinstance(owner_name, str) or not owner_name:
-        raise CodeCatalogSnapshotError("code-catalog relation owner is unavailable")
-    grant_rows = (
+async def _catalog_grant_rows(session: AsyncSession, relation_oid: int):
+    """Read the exact table and column ACL entries under the caller's relation lock."""
+    return (
         (
             await session.execute(
                 text(
@@ -295,28 +286,43 @@ async def _relation_access(session: AsyncSession, relation_oid: int) -> _Relatio
         .mappings()
         .all()
     )
-    grants = []
-    for row in grant_rows:
-        grantee_name = None if row["grantee_is_public"] else row["grantee_name"]
-        privilege_type = str(row["privilege_type"])
-        column_name = row["column_name"]
-        allowed = _TABLE_PRIVILEGES if column_name is None else _COLUMN_PRIVILEGES
-        if (
-            (grantee_name is not None and not isinstance(grantee_name, str))
-            or privilege_type not in allowed
-            or not isinstance(row["grantor_name"], str)
-            or row["grantor_name"] != owner_name
-        ):
-            raise CodeCatalogSnapshotError("code-catalog relation has unsupported grant state")
-        grants.append(
-            _AccessGrant(
-                None if column_name is None else _identifier(column_name, field="grant column"),
-                grantee_name,
-                privilege_type,
-                bool(row["is_grantable"]),
-                row["grantor_name"],
-            )
-        )
+
+
+def _validated_access_grant(row: Mapping[str, Any], owner_name: str) -> _AccessGrant:
+    """Accept only locally replayable privileges granted by the relation owner."""
+    grantee_name = None if row["grantee_is_public"] else row["grantee_name"]
+    privilege_type = str(row["privilege_type"])
+    column_name = row["column_name"]
+    allowed_privileges = _TABLE_PRIVILEGES if column_name is None else _COLUMN_PRIVILEGES
+    if (
+        (grantee_name is not None and not isinstance(grantee_name, str))
+        or privilege_type not in allowed_privileges
+        or not isinstance(row["grantor_name"], str)
+        or row["grantor_name"] != owner_name
+    ):
+        raise CodeCatalogSnapshotError("code-catalog relation has unsupported grant state")
+    return _AccessGrant(
+        None if column_name is None else _identifier(column_name, field="grant column"),
+        grantee_name,
+        privilege_type,
+        bool(row["is_grantable"]),
+        row["grantor_name"],
+    )
+
+
+async def _relation_access(session: AsyncSession, relation_oid: int) -> _RelationAccess:
+    """Capture the local owner and canonical ACL set for exact cutover preservation."""
+    owner_name = await session.scalar(
+        text(
+            "SELECT owner_role.rolname FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=relation.relowner "
+            "WHERE relation.oid=:relation_oid"
+        ),
+        {"relation_oid": relation_oid},
+    )
+    if not isinstance(owner_name, str) or not owner_name:
+        raise CodeCatalogSnapshotError("code-catalog relation owner is unavailable")
+    grants = [_validated_access_grant(row, owner_name) for row in await _catalog_grant_rows(session, relation_oid)]
     return _RelationAccess(
         owner_name,
         tuple(
@@ -535,6 +541,34 @@ async def _require_current_role_owns_relation(session: AsyncSession, relation_oi
         raise CodeCatalogSnapshotError("code-catalog restored stage is not owned by the local role")
 
 
+async def _validated_cutover_access(
+    session: AsyncSession,
+    schema: str,
+    table_name: str,
+    stage_table: str,
+    incumbent_capture: CodeCatalogCapture,
+    expected_stage_capture: CodeCatalogCapture,
+) -> tuple[CodeCatalogCapture, _RelationAccess]:
+    """Recheck both locked relations and obtain only replayable local access grants."""
+    live_capture = await _table_receipt(session, schema, table_name)
+    if live_capture != incumbent_capture:
+        raise CodeCatalogSnapshotError("code-catalog incumbent changed before promotion")
+    await _require_supported_relation_state(session, live_capture.relation_oid)
+    await _require_no_foreign_key_dependents(session, live_capture.relation_oid)
+    await _require_no_dependent_views(session, live_capture.relation_oid)
+    stage_capture = await _table_receipt(session, schema, stage_table, semantic_table_name=table_name)
+    if stage_capture != expected_stage_capture:
+        raise CodeCatalogSnapshotError("code-catalog restored stage changed before promotion")
+    await _require_current_role_owns_relation(session, stage_capture.relation_oid)
+    await _require_stage_has_no_acl(session, stage_capture.relation_oid)
+    await _require_supported_relation_state(session, stage_capture.relation_oid)
+    await _require_model_schema(session, schema, stage_capture)
+    await _require_no_foreign_key_dependents(session, stage_capture.relation_oid)
+    incumbent_access = await _relation_access(session, live_capture.relation_oid)
+    await _require_current_role_owns_access(session, incumbent_access)
+    return stage_capture, incumbent_access
+
+
 async def promote_code_catalog_restored_stage(
     session: AsyncSession,
     *,
@@ -575,22 +609,9 @@ async def promote_code_catalog_restored_stage(
     await require_import_idle(session)
     if not await _is_relation_absent(session, schema, retained_table):
         raise CodeCatalogSnapshotError("code-catalog retained table already exists")
-    live_capture = await _table_receipt(session, schema, table_name)
-    if live_capture != incumbent_capture:
-        raise CodeCatalogSnapshotError("code-catalog incumbent changed before promotion")
-    await _require_supported_relation_state(session, live_capture.relation_oid)
-    await _require_no_foreign_key_dependents(session, live_capture.relation_oid)
-    await _require_no_dependent_views(session, live_capture.relation_oid)
-    stage_capture = await _table_receipt(session, schema, stage_table, semantic_table_name=table_name)
-    if stage_capture != expected_stage_capture:
-        raise CodeCatalogSnapshotError("code-catalog restored stage changed before promotion")
-    await _require_current_role_owns_relation(session, stage_capture.relation_oid)
-    await _require_stage_has_no_acl(session, stage_capture.relation_oid)
-    await _require_supported_relation_state(session, stage_capture.relation_oid)
-    await _require_model_schema(session, schema, stage_capture)
-    await _require_no_foreign_key_dependents(session, stage_capture.relation_oid)
-    incumbent_access = await _relation_access(session, live_capture.relation_oid)
-    await _require_current_role_owns_access(session, incumbent_access)
+    stage_capture, incumbent_access = await _validated_cutover_access(
+        session, schema, table_name, stage_table, incumbent_capture, expected_stage_capture
+    )
     await session.execute(
         text(f"ALTER TABLE {_quoted(schema)}.{_quoted(table_name)} RENAME TO {_quoted(retained_table)}")
     )
