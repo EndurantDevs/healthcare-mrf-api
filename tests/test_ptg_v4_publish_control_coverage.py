@@ -24,6 +24,8 @@ from tests.ptg_v4_publish_control_support import (
     assignment,
     installed_source_activation_transaction,
     prepared_layout_arguments,
+)
+from tests.ptg_v4_publish_control_support import (
     source_session as _source_session,
 )
 
@@ -310,8 +312,8 @@ async def test_source_pointer_cas_covers_noop_success_and_conflict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_source_pointer_wrappers_lock_before_activation(monkeypatch) -> None:
-    """Resolve the configured schema and fence the snapshot before activation."""
+async def test_source_pointer_wrapper_uses_transactional_activation(monkeypatch) -> None:
+    """Resolve the configured schema and delegate to transactional activation."""
 
     evidence = installed_source_activation_transaction(monkeypatch)
     activation_result = await source_pointers.activate_ptg2_source_candidate(
@@ -319,14 +321,18 @@ async def test_source_pointer_wrappers_lock_before_activation(monkeypatch) -> No
         snapshot_id=" Snapshot ",
     )
     assert activation_result == {"status": "promoted"}
-    assert evidence.writable_lock.await_args.kwargs == {
+    assert evidence.activation.await_args.kwargs == {
         "schema_name": "tenant",
+        "source_key": "source",
         "snapshot_id": "Snapshot",
+        "expected_current_snapshot_id": None,
+        "expected_audit_only_attestation_digest": None,
+        "rollback_owner_id": None,
     }
-    assert evidence.activation.await_args.kwargs["source_key"] == "source"
-    dirty_statement, dirty_parameters = evidence.session.execute.await_args.args
-    assert "ptg2_legacy_global_pointer_projection_queue" in str(dirty_statement)
-    assert dirty_parameters == {"source_key": "source"}
+    assert evidence.projection_dirty.await_args.kwargs == {
+        "schema_name": "tenant",
+        "source_key": "source",
+    }
     assert evidence.events == [
         "transaction-begin",
         "activate",
