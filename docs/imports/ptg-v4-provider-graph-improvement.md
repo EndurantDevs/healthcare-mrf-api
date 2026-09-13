@@ -554,3 +554,21 @@ or reconciled attempts.
 
 V3 retirement, documentation consolidation, and retained-snapshot cleanup are
 explicitly deferred for one to two months and require a separate approval.
+
+### Worker-specific graph admission
+
+The compiler retains the global
+`HLTHPRT_PTG2_V4_GRAPH_MAX_ESTIMATED_MODEL_BYTES` and
+`HLTHPRT_PTG2_V4_GRAPH_MAX_FACTOR_EDGES` limits. Operators may configure the same
+names with `_LARGE` or `_HUGE` suffixes for workers whose
+`HLTHPRT_ACTIVE_WORKER_CLASS` is exactly `process.PTGLarge` or `process.PTGHuge`.
+An absent override falls back to the global policy. A selected override must be
+a positive decimal integer; an invalid override fails before compilation.
+Other worker classes retain the global limits.
+
+A larger factor limit does not disable memory admission. The compiler charges
+raw and dense relationship capacity, owner storage, member dictionary
+cardinality, input artifacts, derived projections, and scratch buffers. Dense
+member cardinalities are charged separately because a referenced group can
+exist without a corresponding NPI owner. Worker memory reservations and runtime
+limits must cover the chosen model budget and other process memory.
