@@ -1,5 +1,7 @@
 """Progress reflects consumed rows and completed writes, never mere time."""
 
+import asyncio
+
 import pytest
 
 from process import provider_profile_live_progress as progress
@@ -16,11 +18,12 @@ def _rows(values, events):
     )
 
 
-def test_normalization_reports_start_and_throttled_consumed_rows(monkeypatch):
+@pytest.mark.asyncio
+async def test_normalization_reports_start_and_throttled_consumed_rows(monkeypatch):
     ticks = iter([0.0, 5.0, 10.0, 11.0, 20.0])
-    monkeypatch.setattr(progress.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(progress, "monotonic", lambda: next(ticks))
     events = []
-    assert list(_rows(["one", "two", "three", "four"], events)) == [
+    assert [row async for row in _rows(["one", "two", "three", "four"], events)] == [
         "one",
         "two",
         "three",
@@ -33,18 +36,20 @@ def test_normalization_reports_start_and_throttled_consumed_rows(monkeypatch):
     assert events[0]["message"] == "Normalizing Example source"
 
 
-def test_unfinished_row_does_not_report_progress(monkeypatch):
-    monkeypatch.setattr(progress.time, "monotonic", lambda: 1000.0)
+@pytest.mark.asyncio
+async def test_unfinished_row_does_not_report_progress(monkeypatch):
+    monkeypatch.setattr(progress, "monotonic", lambda: 1000.0)
     events = []
     rows = _rows(["one", "two"], events)
-    assert next(rows) == "one"
-    rows.close()
+    assert await anext(rows) == "one"
+    await rows.aclose()
     assert len(events) == 1
     assert events[0]["counters"] == {"file_rows_processed": 0}
 
 
-def test_source_read_failure_is_not_hidden_or_reported_as_completion(monkeypatch):
-    monkeypatch.setattr(progress.time, "monotonic", lambda: 0.0)
+@pytest.mark.asyncio
+async def test_source_read_failure_is_not_hidden_or_reported_as_completion(monkeypatch):
+    monkeypatch.setattr(progress, "monotonic", lambda: 0.0)
 
     def broken_source():
         yield "one"
@@ -52,6 +57,36 @@ def test_source_read_failure_is_not_hidden_or_reported_as_completion(monkeypatch
 
     events = []
     with pytest.raises(OSError, match="source read failed"):
-        list(_rows(broken_source(), events))
+        async for row in _rows(broken_source(), events):
+            assert row == "one"
     assert len(events) == 1
     assert events[0]["pct"] < 100
+
+
+@pytest.mark.asyncio
+async def test_filtered_scan_runs_queued_progress_before_scan_finishes(monkeypatch):
+    ticks = iter([0.0, 10.0, 11.0])
+    monkeypatch.setattr(progress, "monotonic", lambda: next(ticks))
+    published_counts = []
+
+    async def publish(event):
+        published_counts.append(event["counters"]["file_rows_processed"])
+
+    def enqueue(**event):
+        asyncio.create_task(publish(event))
+
+    rows = progress.normalization_rows(
+        ["filtered-one", "filtered-two"],
+        title="Example source",
+        file_name="example.txt",
+        file_index=1,
+        file_count=1,
+        report=enqueue,
+    )
+    async for row in rows:
+        if row == "filtered-one":
+            assert published_counts == [0]
+            continue
+        assert published_counts == [0, 1]
+        continue
+    assert published_counts == [0, 1]

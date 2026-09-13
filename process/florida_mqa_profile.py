@@ -4281,6 +4281,9 @@ def _source_ratio_guard_reasons(
     """Compare each source independently so one large file cannot hide a drop."""
     reasons: list[str] = []
     for source_key in sorted(candidate_source_metrics):
+        # This report covers the previous month's newly licensed/closed pharmacies.
+        if source_key == "pharmacy_pharmacist":
+            continue
         candidate = candidate_source_metrics[source_key]
         previous = previous_source_metrics.get(source_key)
         if not isinstance(candidate, Mapping) or not isinstance(previous, Mapping):
@@ -5074,7 +5077,7 @@ async def import_florida_mqa_profile(
                 raise RuntimeError(
                     f"florida_mqa_schema_changed:{profile_source.key}:{','.join(missing)}"
                 )
-            for row_number, raw_row, source_row, header in normalization_rows(
+            async for row_number, raw_row, source_row, header in normalization_rows(
                 _iter_rows(path, profile_source, parser_metrics=source_metric_by_key),
                 title=profile_source.title,
                 file_name=profile_source.filename,
