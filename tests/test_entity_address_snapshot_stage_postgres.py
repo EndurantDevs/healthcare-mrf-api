@@ -19,6 +19,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
 
+from api import ptg2_geo_projection as geo_projection
+
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 alias_receipt = importlib.import_module("process.entity_address_snapshot_alias")
@@ -346,6 +348,29 @@ async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
 
     async with engine.begin() as connection:
         await _create_model_family(connection, live_schema)
+        alias_metadata = MetaData(schema=live_schema)
+        for model in (models.AddressAliasStateV1, models.AddressAliasV1):
+            model.__table__.to_metadata(alias_metadata, schema=live_schema)
+        await connection.run_sync(alias_metadata.create_all)
+        await connection.execute(
+            text(
+                f'INSERT INTO "{live_schema}"."address_alias_state_v1" '
+                "(singleton, schema_version, active_ruleset_version, generation, updated_at) "
+                "VALUES (true, 2, 1, 0, TIMESTAMPTZ '2026-01-01 00:00:00+00')"
+            )
+        )
+        for table_name in ("npi_address", "mrf_address", "doctor_clinician_address", "geo_zip_lookup"):
+            await connection.execute(text(f'CREATE TABLE "{live_schema}"."{table_name}" (value integer)'))
+        await connection.execute(text("CREATE SCHEMA IF NOT EXISTS tiger"))
+        await connection.execute(text("CREATE TABLE IF NOT EXISTS tiger.zip_state (value integer)"))
+        await connection.execute(text("CREATE TABLE IF NOT EXISTS tiger.zcta5 (value integer)"))
+        await connection.execute(
+            text(
+                f'CREATE TABLE "{live_schema}"."entity_address_geo_assurance_state" ('
+                "singleton boolean PRIMARY KEY, active_geo_assurance_version smallint, "
+                "active_table_oid oid, active_relation_signature jsonb)"
+            )
+        )
         await connection.execute(
             text(
                 f'INSERT INTO "{live_schema}"."{relations[0].table_name}" '
@@ -353,6 +378,19 @@ async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
                 "VALUES ('synthetic', 'owned', 'live-sentinel', 1, 'primary')"
             )
         )
+        await connection.execute(
+            text(
+                f'INSERT INTO "{live_schema}"."entity_address_geo_assurance_state" '
+                "(singleton, active_geo_assurance_version, active_table_oid, active_relation_signature) "
+                f"SELECT true, 1, to_regclass('{live_schema}.entity_address_unified')::oid, "
+                f"{geo_projection.projection_relation_signature_sql(live_schema)}"
+            )
+        )
+
+
+async def _capture_observed_serving(sessions, schema_name: str):
+    async with sessions() as session, session.begin():
+        return await source.capture_entity_address_observed_serving(session, schema_name=schema_name)
 
 
 async def _seed_receipt_family(connection, schema_name: str, *, reversed_rows: bool, additional_rows: int = 0) -> None:
@@ -509,6 +547,7 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with sessions() as session, session.begin():
             await _seed_receipt_family(session, live_schema, reversed_rows=False)
+        queued_serving = await _capture_observed_serving(sessions, live_schema)
 
         async def archive_copy(capture):
             """Dump the stage and prove it no longer locks live relations."""
@@ -521,16 +560,34 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
                 pg_dump=pg_dump,
                 environment=tool_environment,
             )
+            async with sessions() as observer:
+                base_versions = tuple(
+                    (
+                        await observer.execute(
+                            text(
+                                f'SELECT base_address_version FROM "{stage_schema}"."entity_address_unified" '
+                                "ORDER BY location_key"
+                            )
+                        )
+                    ).scalars()
+                )
+            assert base_versions == (
+                source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
+                None,
+                source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
+            )
             await _rename_live_sentinel(sessions, live_schema, relations[0].table_name)
 
-        manifest, source_receipt = await source.export_entity_address_archive_with_receipt(
+        manifest, source_receipt, source_alias_receipt = await source.export_entity_address_archive_with_receipt(
             sessions,
             schema_name=live_schema,
             dataset_id=dataset_id,
+            queued_serving_capture=queued_serving.as_dict(),
             archive_copy=archive_copy,
         )
         assert manifest.schema_name == stage_schema
         assert manifest.relations == relations
+        assert source_alias_receipt.active_alias_count == 0
         async with engine.begin() as connection:
             await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
             assert (
@@ -546,6 +603,67 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         async with engine.connect() as connection:
             await _assert_live_sentinel(connection, stage_schema, relations[0].table_name)
             await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_identity", ("serving", "alias", "geo"))
+async def test_queued_serving_identity_rejects_source_drift(changed_identity: str):
+    """A queued export cannot silently follow later serving authority."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live_schema = "address_queued_serving_" + uuid4().hex
+    dataset_id = uuid4()
+    stage_schema = source.entity_address_archive_stage_schema(dataset_id)
+    relations = source.entity_address_archive_relations()
+    copied = AsyncMock()
+    try:
+        await _seed_live_sentinel(engine, live_schema, relations)
+        queued_serving = await _capture_observed_serving(sessions, live_schema)
+        async with engine.begin() as connection:
+            if changed_identity == "serving":
+                table_name = relations[5].table_name
+                prior_table_name = f"{table_name}_prior"
+                await connection.execute(
+                    text(f'ALTER TABLE "{live_schema}"."{table_name}" RENAME TO "{prior_table_name}"')
+                )
+                await connection.execute(
+                    text(
+                        f'CREATE TABLE "{live_schema}"."{table_name}" '
+                        f'(LIKE "{live_schema}"."{prior_table_name}" INCLUDING ALL)'
+                    )
+                )
+                await connection.execute(text(f'DROP TABLE "{live_schema}"."{prior_table_name}"'))
+            elif changed_identity == "alias":
+                await connection.execute(
+                    text(f'UPDATE "{live_schema}"."address_alias_state_v1" SET generation = generation + 1')
+                )
+            else:
+                await connection.execute(text(f'TRUNCATE TABLE "{live_schema}"."npi_address"'))
+
+        with pytest.raises(RuntimeError, match="queued serving identity changed|geo assurance is not active"):
+            await source.export_entity_address_archive_with_receipt(
+                sessions,
+                schema_name=live_schema,
+                dataset_id=dataset_id,
+                queued_serving_capture=queued_serving.as_dict(),
+                archive_copy=copied,
+            )
+        copied.assert_not_awaited()
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT oid FROM pg_namespace WHERE nspname = :schema_name"),
+                    {"schema_name": stage_schema},
+                )
+                is None
+            )
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
@@ -760,9 +878,14 @@ async def test_native_owned_export_cleans_its_clone_on_failure(monkeypatch, fail
         monkeypatch.setattr(source, "capture_entity_address_archive_receipt", AsyncMock(side_effect=failure))
     try:
         await _seed_live_sentinel(engine, live_schema, source.entity_address_archive_relations())
+        queued_serving = await _capture_observed_serving(sessions, live_schema)
         with pytest.raises(type(failure)):
             await source.export_entity_address_archive_with_receipt(
-                sessions, schema_name=live_schema, dataset_id=dataset_id, archive_copy=copied
+                sessions,
+                schema_name=live_schema,
+                dataset_id=dataset_id,
+                queued_serving_capture=queued_serving,
+                archive_copy=copied,
             )
         assert copied.await_count == (0 if failure_stage == "receipt" else 1)
         async with engine.begin() as connection:
@@ -792,6 +915,7 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
     copied = AsyncMock()
     try:
         await _seed_live_sentinel(engine, live_schema, source.entity_address_archive_relations())
+        queued_serving = await _capture_observed_serving(sessions, live_schema)
         async with engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{stage_schema}"'))
             incumbent_oid = await connection.scalar(
@@ -801,7 +925,11 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
 
         with pytest.raises(DBAPIError):
             await source.export_entity_address_archive_with_receipt(
-                sessions, schema_name=live_schema, dataset_id=dataset_id, archive_copy=copied
+                sessions,
+                schema_name=live_schema,
+                dataset_id=dataset_id,
+                queued_serving_capture=queued_serving,
+                archive_copy=copied,
             )
         copied.assert_not_awaited()
         async with engine.begin() as connection:

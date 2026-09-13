@@ -16,13 +16,24 @@ import importlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any, Mapping
 from uuid import UUID
 
 from sqlalchemy import text
 
+from process.entity_address_snapshot_alias import (
+    EntityAddressAliasSemanticReceipt,
+    capture_entity_address_alias_semantic_receipt,
+)
 from process.entity_address_snapshot_receipt import (
     EntityAddressArchiveReceipt,
     capture_entity_address_archive_receipt,
+)
+from process.entity_address_snapshot_serving import (
+    EntityAddressObservedServingCapture,
+    capture_entity_address_observed_serving,
+    observe_entity_address_serving,
+    validate_entity_address_observed_serving_capture,
 )
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -51,6 +62,7 @@ class EntityAddressArchiveSourceCapture:
     schema_name: str
     relations: tuple[EntityAddressArchiveRelation, ...]
     postgres_snapshot: str
+    observed_serving: EntityAddressObservedServingCapture | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +131,14 @@ def entity_address_archive_stage_schema(dataset_id: UUID) -> str:
     return _STAGE_SCHEMA_PREFIX + dataset_id.hex
 
 
-async def _capture_relations(
+async def _export_postgres_snapshot(session) -> str:
+    snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
+    if not isinstance(snapshot, str) or not _SNAPSHOT_TOKEN.fullmatch(snapshot):
+        raise RuntimeError("entity-address archive source did not export a PostgreSQL snapshot")
+    return snapshot
+
+
+async def _capture_stage_relations(
     session,
     *,
     schema: str,
@@ -129,13 +148,15 @@ async def _capture_relations(
     for relation in relations:
         table_ref = f"{_quoted_identifier(schema)}.{_quoted_identifier(relation.table_name)}"
         await session.execute(text(f"LOCK TABLE {table_ref} IN SHARE MODE"))
-    snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
-    if not isinstance(snapshot, str) or not _SNAPSHOT_TOKEN.fullmatch(snapshot):
-        raise RuntimeError("entity-address archive source did not export a PostgreSQL snapshot")
-    return snapshot
+    return await _export_postgres_snapshot(session)
 
 
-async def capture_entity_address_archive_source(session, *, schema_name: str) -> EntityAddressArchiveSourceCapture:
+async def capture_entity_address_archive_source(
+    session,
+    *,
+    schema_name: str,
+    queued_serving_capture: Mapping[str, Any] | EntityAddressObservedServingCapture | None = None,
+) -> EntityAddressArchiveSourceCapture:
     """Lock the closed model family and export a snapshot for native ``pg_dump``.
 
     The caller must own an open transaction and keep it open until the archive
@@ -145,8 +166,22 @@ async def capture_entity_address_archive_source(session, *, schema_name: str) ->
 
     schema = _schema_name(schema_name)
     relations = entity_address_archive_relations()
-    snapshot = await _capture_relations(session, schema=schema, relations=relations)
-    return EntityAddressArchiveSourceCapture(_CONTRACT, schema, relations, snapshot)
+    if queued_serving_capture is None:
+        snapshot = await _capture_stage_relations(session, schema=schema, relations=relations)
+        return EntityAddressArchiveSourceCapture(_CONTRACT, schema, relations, snapshot)
+    queued = validate_entity_address_observed_serving_capture(
+        queued_serving_capture,
+        schema_name=schema,
+    )
+    observed = await observe_entity_address_serving(
+        session,
+        schema_name=schema,
+        apply_queue_bounds=False,
+    )
+    if observed != queued:
+        raise RuntimeError("entity-address queued serving identity changed")
+    snapshot = await _export_postgres_snapshot(session)
+    return EntityAddressArchiveSourceCapture(_CONTRACT, schema, relations, snapshot, observed)
 
 
 async def _clone_entity_address_evidence_sequence(session, *, stage_schema: str) -> None:
@@ -200,7 +235,7 @@ async def _capture_entity_address_archive_stage(
 
     schema = entity_address_archive_stage_schema(dataset_id)
     relations = entity_address_archive_relations()
-    snapshot = await _capture_relations(session, schema=schema, relations=relations)
+    snapshot = await _capture_stage_relations(session, schema=schema, relations=relations)
     return EntityAddressArchiveStageCapture(
         _CONTRACT,
         dataset_id,
@@ -215,6 +250,7 @@ async def export_entity_address_archive_source(
     *,
     schema_name: str,
     archive_copy: Callable[[EntityAddressArchiveSourceCapture], Awaitable[None]],
+    queued_serving_capture: Mapping[str, Any] | EntityAddressObservedServingCapture | None = None,
 ) -> EntityAddressArchiveSourceManifest:
     """Run ``archive_copy`` while a pinned source generation remains available.
 
@@ -226,7 +262,11 @@ async def export_entity_address_archive_source(
     """
 
     async with session_factory() as session, session.begin():
-        capture = await capture_entity_address_archive_source(session, schema_name=schema_name)
+        capture = await capture_entity_address_archive_source(
+            session,
+            schema_name=schema_name,
+            queued_serving_capture=queued_serving_capture,
+        )
         await archive_copy(capture)
     return EntityAddressArchiveSourceManifest(capture.contract, capture.schema_name, capture.relations)
 
@@ -237,7 +277,9 @@ async def export_entity_address_archive_stage(
     schema_name: str,
     dataset_id: UUID,
     archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]],
+    queued_serving_capture: Mapping[str, Any] | EntityAddressObservedServingCapture | None = None,
     stage_created: Callable[[object], Awaitable[None]] | None = None,
+    source_captured: Callable[[object, EntityAddressArchiveSourceCapture], Awaitable[None]] | None = None,
 ) -> EntityAddressArchiveStageManifest:
     """Clone and dump the exact family without passing live names to ``pg_dump``.
 
@@ -251,7 +293,10 @@ async def export_entity_address_archive_stage(
         source_capture = await capture_entity_address_archive_source(
             source_session,
             schema_name=schema_name,
+            queued_serving_capture=queued_serving_capture,
         )
+        if source_captured is not None:
+            await source_captured(source_session, source_capture)
         async with session_factory() as clone_session, clone_session.begin():
             await _clone_entity_address_archive_source(
                 clone_session,
@@ -276,8 +321,13 @@ async def export_entity_address_archive_with_receipt(
     *,
     schema_name: str,
     dataset_id: UUID,
+    queued_serving_capture: Mapping[str, Any] | EntityAddressObservedServingCapture,
     archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]],
-) -> tuple[EntityAddressArchiveStageManifest, EntityAddressArchiveReceipt]:
+) -> tuple[
+    EntityAddressArchiveStageManifest,
+    EntityAddressArchiveReceipt,
+    EntityAddressAliasSemanticReceipt,
+]:
     """Bind the native receipt and dump to the same pinned, committed clone.
 
     Receipt capture starts a fresh transaction while the existing stage pin
@@ -289,6 +339,7 @@ async def export_entity_address_archive_with_receipt(
 
     ownership = importlib.import_module("process.entity_address_snapshot_ownership")
     captured_receipts = []
+    captured_alias_receipts = []
     owned_stages = []
 
     async def _record_created_stage(session) -> None:
@@ -303,20 +354,32 @@ async def export_entity_address_archive_with_receipt(
             )
         await archive_copy(capture)
 
+    async def _capture_alias_receipt(session, _capture: EntityAddressArchiveSourceCapture) -> None:
+        captured_alias_receipts.append(
+            await capture_entity_address_alias_semantic_receipt(
+                session,
+                schema_name=schema_name,
+            )
+        )
+
     try:
         manifest = await export_entity_address_archive_stage(
             session_factory,
             schema_name=schema_name,
             dataset_id=dataset_id,
+            queued_serving_capture=queued_serving_capture,
             archive_copy=_capture_and_copy,
             stage_created=_record_created_stage,
+            source_captured=_capture_alias_receipt,
         )
     finally:
         if owned_stages:
             await _cleanup_owned_archive_stage(session_factory, ownership, owned_stages[0])
     if len(captured_receipts) != 1:
         raise RuntimeError("entity-address archive stage receipt is unavailable")
-    return manifest, captured_receipts[0]
+    if len(captured_alias_receipts) != 1:
+        raise RuntimeError("entity-address archive alias receipt is unavailable")
+    return manifest, captured_receipts[0], captured_alias_receipts[0]
 
 
 async def _cleanup_owned_archive_stage(session_factory, ownership, owner) -> None:
@@ -344,10 +407,13 @@ __all__ = [
     "EntityAddressArchiveSourceManifest",
     "EntityAddressArchiveStageCapture",
     "EntityAddressArchiveStageManifest",
+    "EntityAddressObservedServingCapture",
     "capture_entity_address_archive_source",
+    "capture_entity_address_observed_serving",
     "entity_address_archive_stage_schema",
     "entity_address_archive_relations",
     "export_entity_address_archive_source",
     "export_entity_address_archive_stage",
     "export_entity_address_archive_with_receipt",
+    "validate_entity_address_observed_serving_capture",
 ]
