@@ -17,6 +17,7 @@ from sqlalchemy.schema import MetaData
 
 
 source = importlib.import_module("process.entity_address_snapshot_source")
+receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN"
 _DUMP_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_DUMP"
 _RESTORE_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_RESTORE"
@@ -88,6 +89,40 @@ async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
                 "VALUES ('synthetic', 'owned', 'live-sentinel', 1, 'primary')"
             )
         )
+
+
+async def _seed_receipt_family(connection, schema_name: str, *, reversed_rows: bool, additional_rows: int = 0) -> None:
+    rows = [("first", 1), ("second", 2)] + [(f"chunk-{ordinal:05d}", ordinal + 3) for ordinal in range(additional_rows)]
+    if reversed_rows:
+        rows.reverse()
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."entity_address_unified" '
+            "(entity_type, entity_id, location_key, checksum, type) "
+            "VALUES (:entity_type, :entity_id, :location_key, :checksum, 'primary')"
+        ),
+        [
+            {"entity_type": "synthetic", "entity_id": location_key, "location_key": location_key, "checksum": checksum}
+            for location_key, checksum in rows
+        ],
+    )
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."entity_address_evidence" '
+            "(evidence_id, location_key, entity_type, entity_id, source_id, source_run_id, observed_at) "
+            "VALUES (1, 'first', 'synthetic', 'first', 1, 'synthetic-run', TIMESTAMPTZ '2026-01-02 03:04:05+00')"
+        )
+    )
+
+
+async def _capture_receipt(sessions, schema_name: str, timezone: str):
+    async with sessions() as session:
+        await session.execute(
+            text("SELECT pg_catalog.set_config('TimeZone', :timezone, false)"), {"timezone": timezone}
+        )
+        await session.commit()
+        async with session.begin():
+            return await receipt.capture_entity_address_archive_receipt(session, schema_name=schema_name)
 
 
 def _dump_stage_capture(capture, *, dataset_id, stage_schema: str, dump_path: Path, pg_dump: str, environment) -> None:
@@ -215,4 +250,88 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_stage_receipt_is_order_and_session_setting_independent_and_detects_drift():
+    """The fixed seven-table receipt catches row and schema changes after restore."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=1)
+    source_schema = "address_receipt_source_" + uuid4().hex
+    restored_schema = "address_receipt_restored_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await _create_model_family(connection, source_schema)
+            await _create_model_family(connection, restored_schema)
+            await _seed_receipt_family(connection, source_schema, reversed_rows=False)
+            await _seed_receipt_family(connection, restored_schema, reversed_rows=True)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        source_receipt = await _capture_receipt(sessions, source_schema, "America/Los_Angeles")
+        restored_receipt = await _capture_receipt(sessions, restored_schema, "Asia/Tokyo")
+        assert source_receipt.as_dict() == restored_receipt.as_dict()
+
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(f'UPDATE "{restored_schema}"."entity_address_unified" SET checksum=3 WHERE location_key=\'first\'')
+            )
+        assert (
+            await _capture_receipt(sessions, restored_schema, "UTC")
+        ).content_sha256 != source_receipt.content_sha256
+
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(f'UPDATE "{restored_schema}"."entity_address_unified" SET checksum=1 WHERE location_key=\'first\'')
+            )
+        assert (await _capture_receipt(sessions, restored_schema, "UTC")).as_dict() == source_receipt.as_dict()
+
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    f'INSERT INTO "{restored_schema}"."entity_address_unified" '
+                    "(entity_type, entity_id, location_key, checksum, type) "
+                    "VALUES ('synthetic', 'third', 'third', 3, 'primary')"
+                )
+            )
+        assert (
+            await _capture_receipt(sessions, restored_schema, "UTC")
+        ).content_sha256 != source_receipt.content_sha256
+
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(f'ALTER TABLE "{restored_schema}"."entity_address_unified" ADD COLUMN archive_tamper text')
+            )
+        assert (await _capture_receipt(sessions, restored_schema, "UTC")).schema_sha256 != source_receipt.schema_sha256
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema}" CASCADE'))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{restored_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_stage_receipt_preserves_order_independence_across_chunk_boundary():
+    """Rows on both sides of the 4096-row digest boundary remain canonical."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=1)
+    source_schema = "address_receipt_chunks_" + uuid4().hex
+    restored_schema = "address_receipt_chunks_" + uuid4().hex
+    try:
+        async with engine.begin() as connection:
+            await _create_model_family(connection, source_schema)
+            await _create_model_family(connection, restored_schema)
+            await _seed_receipt_family(connection, source_schema, reversed_rows=False, additional_rows=4097)
+            await _seed_receipt_family(connection, restored_schema, reversed_rows=True, additional_rows=4097)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        source_receipt = await _capture_receipt(sessions, source_schema, "America/Los_Angeles")
+        restored_receipt = await _capture_receipt(sessions, restored_schema, "Asia/Tokyo")
+
+        assert source_receipt.as_dict() == restored_receipt.as_dict()
+        assert source_receipt.tables[0].row_count == 4099
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema}" CASCADE'))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{restored_schema}" CASCADE'))
         await engine.dispose()

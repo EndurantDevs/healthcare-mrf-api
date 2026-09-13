@@ -12,6 +12,7 @@ import pytest
 
 
 source = importlib.import_module("process.entity_address_snapshot_source")
+receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 
 
 def _session(snapshot: str | None = None):
@@ -135,3 +136,87 @@ async def test_stage_callback_failure_releases_pins():
 
     assert exits == [(clone, None), (live, None), (stage, failure)]
     assert not any("DROP SCHEMA" in str(call.args[0]) for call in clone.execute.await_args_list)
+
+
+def _receipt() -> dict:
+    tables = tuple(
+        receipt.EntityAddressArchiveTableReceipt(model.__name__, model.__tablename__, "a" * 64, 0, "b" * 64)
+        for model in receipt._models()
+    )
+    return receipt.EntityAddressArchiveReceipt(
+        tables,
+        receipt._canonical_digest(
+            [
+                {"model_name": table.model_name, "table_name": table.table_name, "schema_sha256": table.schema_sha256}
+                for table in tables
+            ]
+        ),
+        receipt._canonical_digest([table.as_dict() for table in tables]),
+    ).as_dict()
+
+
+def test_stage_receipt_accepts_only_the_model_derived_seven_table_family():
+    value = _receipt()
+
+    observed = receipt.validate_entity_address_archive_receipt(value)
+
+    assert observed.as_dict() == value
+    assert len(observed.tables) == 7
+
+
+@pytest.mark.asyncio
+async def test_stage_receipt_pins_the_closed_family_and_rejects_unsafe_relations():
+    session = SimpleNamespace(execute=AsyncMock())
+
+    await receipt._lock_model_family(session, "address_stage", receipt._models())
+
+    statement = str(session.execute.await_args.args[0])
+    assert statement == (
+        'LOCK TABLE "address_stage"."entity_address_evidence", '
+        '"address_stage"."entity_address_medication_bridge", '
+        '"address_stage"."entity_address_network_bridge", '
+        '"address_stage"."entity_address_plan_bridge", '
+        '"address_stage"."entity_address_procedure_bridge", '
+        '"address_stage"."entity_address_unified", '
+        '"address_stage"."facility_anchor_npi_candidate" IN SHARE MODE'
+    )
+
+    class _Rows:
+        def __init__(self, row):
+            self._row = row
+
+        def one_or_none(self):
+            return self._row
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def mappings(self):
+            return _Rows(self._row)
+
+    for row in (
+        {"oid": 1, "relkind": b"v", "relpersistence": b"p", "relrowsecurity": False, "relforcerowsecurity": False},
+        {"oid": 1, "relkind": b"r", "relpersistence": b"p", "relrowsecurity": True, "relforcerowsecurity": False},
+    ):
+        catalog_session = SimpleNamespace(execute=AsyncMock(return_value=_Result(row)))
+        with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="relation is unavailable"):
+            await receipt._relation_oid(catalog_session, "address_stage", "entity_address_unified")
+
+
+@pytest.mark.parametrize("tamper", ["content", "schema", "row_count", "table_order", "extra_table"])
+def test_stage_receipt_rejects_tampered_or_nonclosed_model_family(tamper: str):
+    value = _receipt()
+    if tamper == "content":
+        value["content_sha256"] = "c" * 64
+    elif tamper == "schema":
+        value["tables"][0]["schema_sha256"] = "c" * 64
+    elif tamper == "row_count":
+        value["tables"][0]["row_count"] = -1
+    elif tamper == "table_order":
+        value["tables"][0], value["tables"][1] = value["tables"][1], value["tables"][0]
+    else:
+        value["tables"].append(dict(value["tables"][0]))
+
+    with pytest.raises(receipt.EntityAddressArchiveReceiptError):
+        receipt.validate_entity_address_archive_receipt(value)
