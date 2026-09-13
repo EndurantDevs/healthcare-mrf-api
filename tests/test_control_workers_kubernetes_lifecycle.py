@@ -71,7 +71,8 @@ def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
         "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,"
         "shelteringarmsinstitute.com,bilh.org,ajh.org,bidmilton.org,"
         "bidneedham.org,bidplymouth.org,bidmc.org,exeterhospital.org,"
-        "mountauburnhospital.org,nebh.org,winchesterhospital.org"
+        "mountauburnhospital.org,nebh.org,winchesterhospital.org,"
+        "www.northwell.edu"
     )
 
     other_container = control_workers._worker_job_manifest(
