@@ -254,7 +254,7 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_native_stage_receipt_is_order_and_session_setting_independent_and_detects_drift():
+async def test_native_stage_receipt_is_portable_and_detects_drift():
     """The fixed seven-table receipt catches row and schema changes after restore."""
 
     async_dsn, _ = _native_test_connection()
