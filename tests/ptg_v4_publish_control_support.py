@@ -281,14 +281,7 @@ def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace
         transaction_events.append(event_name)
         return value
 
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=lambda *_args, **_kwargs: record_event(
-                "projection-dirty",
-                QueryResult(),
-            )
-        )
-    )
+    session = SimpleNamespace()
 
     @asynccontextmanager
     async def transaction():
@@ -296,7 +289,6 @@ def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace
         yield session
         transaction_events.append("transaction-commit")
 
-    writable_lock = AsyncMock()
     activation = AsyncMock(
         side_effect=lambda *_args, **_kwargs: record_event(
             "activate",
@@ -311,12 +303,22 @@ def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace
     )
     monkeypatch.setattr(source_pointers, "resolve_ptg2_schema", lambda: "tenant")
     monkeypatch.setattr(source_pointers.db, "transaction", transaction)
+    projection_dirty = AsyncMock(side_effect=lambda *_args, **_kwargs: record_event("projection-dirty"))
     monkeypatch.setattr(source_pointers, "_acquire_source_pointer_gc_lock", AsyncMock())
-    monkeypatch.setattr(source_pointers, "lock_writable_snapshot", writable_lock)
     monkeypatch.setattr(
         source_pointers,
-        "_activate_ptg2_source_candidate_in_transaction",
+        "_completed_reviewed_candidate_activation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_activate_uncompleted_candidate",
         activation,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "mark_legacy_global_projection_dirty",
+        projection_dirty,
     )
     monkeypatch.setattr(
         source_pointers,
@@ -326,8 +328,7 @@ def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace
     return SimpleNamespace(
         activation=activation,
         events=transaction_events,
-        session=session,
-        writable_lock=writable_lock,
+        projection_dirty=projection_dirty,
     )
 
 
