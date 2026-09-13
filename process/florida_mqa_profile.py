@@ -48,6 +48,11 @@ from db.models import (
     db,
 )
 from process.live_progress import enqueue_live_progress
+from process.provider_profile_live_progress import (
+    normalization_completed,
+    normalization_rows,
+    projection_batches,
+)
 from process.provider_profile_reported_range import normalize_reported_range
 
 PROFILE_SCHEMA_VERSION = "provider-profile/v1"
@@ -3944,6 +3949,7 @@ async def _publish_projection_swap(
             continue
         await db.insert(stage_table).values(row_batch).status()
         inserted_count += len(row_batch)
+        projection_batches(inserted_count, report=enqueue_live_progress)
     if inserted_count == 0:
         raise RuntimeError("provider_profile_stage_empty")
 
@@ -5068,10 +5074,13 @@ async def import_florida_mqa_profile(
                 raise RuntimeError(
                     f"florida_mqa_schema_changed:{profile_source.key}:{','.join(missing)}"
                 )
-            for row_number, raw_row, source_row, header in _iter_rows(
-                path,
-                profile_source,
-                parser_metrics=source_metric_by_key,
+            for row_number, raw_row, source_row, header in normalization_rows(
+                _iter_rows(path, profile_source, parser_metrics=source_metric_by_key),
+                title=profile_source.title,
+                file_name=profile_source.filename,
+                file_index=source_index,
+                file_count=len(selected_keys),
+                report=enqueue_live_progress,
             ):
                 source_metric_by_key["rows"] += 1
                 if header != header_seen:
@@ -5295,24 +5304,9 @@ async def import_florida_mqa_profile(
                 [run_row_by_key],
                 "run_id",
             )
-            enqueue_live_progress(
-                phase="normalizing",
-                pct=36 + int(49 * source_index / len(selected_keys)),
-                message=f"Normalized {profile_source.title}",
-                file_index=source_index,
-                file_count=len(selected_keys),
-                file_name=profile_source.filename,
-                counters={
-                    "counter_semantics": "physical_input",
-                    "source_records": source_record_count,
-                    "facts": fact_count,
-                    "matched_records": matched_record_count,
-                    "non_projectable_records": non_projectable_record_count,
-                    "physical_source_records": source_record_count,
-                    "physical_facts": fact_count,
-                    "physical_matched_records": matched_record_count,
-                    "physical_non_projectable_records": non_projectable_record_count,
-                },
+            normalization_completed(
+                profile_source, source_index, len(selected_keys),
+                run_row_by_key["metrics"], enqueue_live_progress,
             )
 
         await _upsert_rows(ProviderProfileSourceRecord, source_records, "record_id")
