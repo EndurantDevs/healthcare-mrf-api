@@ -212,6 +212,17 @@ async def _capture_alias_receipt(sessions, schema_name: str):
         )
 
 
+async def _capture_alias_receipt_with_work_mem(sessions, schema_name: str):
+    async with sessions() as session, session.begin():
+        await session.execute(text("SET LOCAL work_mem TO '4MB'"))
+        captured_receipt = await alias_receipt.capture_entity_address_alias_semantic_receipt(
+            session,
+            schema_name=schema_name,
+        )
+        effective_work_mem = await session.scalar(text("SHOW work_mem"))
+        return captured_receipt, effective_work_mem
+
+
 async def _change_active_alias_semantics(sessions, schema_name: str) -> None:
     async with sessions() as session, session.begin():
         await session.execute(
@@ -626,9 +637,13 @@ async def test_active_alias_receipt_portability_and_drift():
                 add_revoked_history=True,
             )
         sessions = async_sessionmaker(engine, expire_on_commit=False)
-        source_alias_receipt = await _capture_alias_receipt(sessions, source_schema)
+        source_alias_receipt, effective_work_mem = await _capture_alias_receipt_with_work_mem(
+            sessions,
+            source_schema,
+        )
         restored_alias_receipt = await _capture_alias_receipt(sessions, restored_schema)
 
+        assert effective_work_mem == "64MB"
         assert source_alias_receipt.local_generation == 3
         assert restored_alias_receipt.local_generation == 91
         assert source_alias_receipt.active_alias_count == 1
@@ -656,6 +671,22 @@ async def test_active_alias_receipt_portability_and_drift():
     finally:
         await _drop_alias_receipt_schemas(engine, source_schema, restored_schema)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_active_alias_receipt_rejects_oversize_schema_before_sql():
+    """PostgreSQL-truncated identifiers never reach the database session."""
+
+    session = AsyncMock()
+    with pytest.raises(
+        alias_receipt.EntityAddressSnapshotAliasError,
+        match="schema is invalid",
+    ):
+        await alias_receipt.capture_entity_address_alias_semantic_receipt(
+            session,
+            schema_name="a" * 64,
+        )
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

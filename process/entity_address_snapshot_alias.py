@@ -21,6 +21,7 @@ RECEIPT_VERSION = "entity_address_alias_semantic_receipt.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHUNK_ROWS = 4096
+_DIGEST_WORK_MEM = "64MB"
 _STATE_TABLE = address_alias_sql.ADDRESS_ALIAS_STATE_TABLE
 _ALIAS_TABLE = address_alias_sql.ADDRESS_ALIAS_TABLE
 _SEMANTIC_COLUMNS = (
@@ -102,7 +103,7 @@ class EntityAddressAliasSemanticReceipt:
 
 
 def _schema_name(value: object) -> str:
-    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None or len(value.encode("utf-8")) > 63:
         raise EntityAddressSnapshotAliasError("entity-address alias receipt schema is invalid")
     return value
 
@@ -336,6 +337,12 @@ async def _require_supported_active_aliases(
         raise EntityAddressSnapshotAliasError("entity-address active alias version is unsupported")
 
 
+async def _set_digest_work_mem(session: Any) -> None:
+    """Reserve one fixed, transaction-local sort budget for the full active-set scan."""
+
+    await session.execute(text(f"SET LOCAL work_mem TO '{_DIGEST_WORK_MEM}'"))
+
+
 async def capture_entity_address_alias_semantic_receipt(
     session: Any,
     *,
@@ -362,6 +369,7 @@ async def capture_entity_address_alias_semantic_receipt(
     )
     schema_version, ruleset_version, generation = await _alias_state(session, schema)
     await _require_supported_active_aliases(session, schema, ruleset_version)
+    await _set_digest_work_mem(session)
     active_alias_count, active_alias_sha256 = await _active_alias_identity(session, schema)
     return EntityAddressAliasSemanticReceipt(
         alias_schema_version=schema_version,
