@@ -44,6 +44,14 @@ async def test_capture_rejects_unsafe_schema_without_touching_the_database():
 
 
 @pytest.mark.asyncio
+async def test_capture_rejects_oversize_schema_without_touching_the_database():
+    session = AsyncMock()
+    with pytest.raises(ValueError, match="safe schema name"):
+        await source.capture_entity_address_archive_source(session, schema_name="a" * 64)
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_export_returns_manifest_only_after_awaiting_copy_in_held_transaction():
     session = AsyncMock()
 

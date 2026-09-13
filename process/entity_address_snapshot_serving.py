@@ -86,7 +86,7 @@ def _schema_name(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("entity-address observed serving requires a schema name")
     normalized = entity_address_unified._validate_schema_name(value)
-    if _IDENTIFIER.fullmatch(normalized) is None:
+    if _IDENTIFIER.fullmatch(normalized) is None or len(normalized.encode("utf-8")) > 63:
         raise ValueError("entity-address observed serving requires a safe schema name")
     return normalized
 
@@ -299,6 +299,8 @@ async def observe_entity_address_serving(
 ) -> EntityAddressObservedServingCapture:
     """Lock in writer order and observe the exact active source-local identity."""
 
+    if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
+        raise ValueError("entity-address observed serving requires a caller transaction")
     schema = _schema_name(schema_name)
     # READ COMMITTED intentionally takes its first data snapshot only after a
     # contended advisory lock is granted.  REPEATABLE READ would freeze a stale

@@ -114,7 +114,7 @@ def _schema_name(schema_name: str) -> str:
     if not isinstance(schema_name, str):
         raise ValueError("entity-address archive source requires a schema name")
     normalized = entity_address_unified._validate_schema_name(schema_name)
-    if not _IDENTIFIER.fullmatch(normalized):
+    if not _IDENTIFIER.fullmatch(normalized) or len(normalized.encode("utf-8")) > 63:
         raise ValueError("entity-address archive source requires a safe schema name")
     return normalized
 
