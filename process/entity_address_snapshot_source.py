@@ -227,12 +227,12 @@ async def stage_and_export_entity_address_archive_source(
                 source_capture=source_capture,
                 stage_schema=stage_schema,
             )
-        async with session_factory() as stage_session, stage_session.begin():
-            capture = await _capture_entity_address_archive_stage(
-                stage_session,
-                dataset_id=dataset_id,
-            )
-            await archive_copy(capture)
+    async with session_factory() as stage_session, stage_session.begin():
+        capture = await _capture_entity_address_archive_stage(
+            stage_session,
+            dataset_id=dataset_id,
+        )
+        await archive_copy(capture)
     return EntityAddressArchiveStageManifest(
         capture.contract, capture.dataset_id, capture.schema_name, capture.relations
     )

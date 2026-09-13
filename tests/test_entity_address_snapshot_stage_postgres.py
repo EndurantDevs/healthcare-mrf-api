@@ -23,6 +23,7 @@ _RESTORE_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_RESTORE"
 _LOCAL_DATABASE_PATTERN = re.compile(r"^hc_entity_address_stage_[0-9a-f]{32}$")
 _CI_DATABASE = "ptg2_v3_lifecycle_test_ci_runner"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_CI_HOSTS = _LOCAL_HOSTS | {"postgres"}
 
 
 def _is_owned_native_test_database(url) -> bool:
@@ -33,11 +34,9 @@ def _is_owned_native_test_database(url) -> bool:
     port = url.port
     if not url.drivername.startswith("postgresql") or not url.username:
         return False
-    if host not in _LOCAL_HOSTS:
-        return False
     if port == 5440:
-        return bool(_LOCAL_DATABASE_PATTERN.fullmatch(database_name))
-    return port in (None, 5432) and database_name == _CI_DATABASE
+        return host in _LOCAL_HOSTS and bool(_LOCAL_DATABASE_PATTERN.fullmatch(database_name))
+    return host in _CI_HOSTS and port in (None, 5432) and database_name == _CI_DATABASE
 
 
 def _native_test_connection() -> tuple[str, dict[str, str]]:
@@ -56,7 +55,7 @@ def _native_test_connection() -> tuple[str, dict[str, str]]:
     )
     if url.password is not None:
         environment["PGPASSWORD"] = url.password
-    return str(url.set(drivername="postgresql+asyncpg")), environment
+    return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False), environment
 
 
 def _native_tool(name: str) -> str:
@@ -82,6 +81,7 @@ async def _create_model_family(connection, schema_name: str) -> None:
     [
         ("postgresql://postgres@127.0.0.1:5440/hc_entity_address_stage_0123456789abcdef0123456789abcdef", True),
         ("postgresql://postgres@localhost:5432/ptg2_v3_lifecycle_test_ci_runner", True),
+        ("postgresql://postgres@postgres:5432/ptg2_v3_lifecycle_test_ci_runner", True),
         ("postgresql://postgres@127.0.0.1:5440/ptg2_v3_lifecycle_test_ci_runner", False),
         ("postgresql://postgres@127.0.0.1:5432/another_database", False),
         ("postgresql://postgres@database:5432/ptg2_v3_lifecycle_test_ci_runner", False),
@@ -89,6 +89,20 @@ async def _create_model_family(connection, schema_name: str) -> None:
 )
 def test_native_test_database_guard(dsn: str, expected: bool) -> None:
     assert _is_owned_native_test_database(make_url(dsn)) is expected
+
+
+def test_native_test_connection_preserves_an_authenticated_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    password = "synthetic-password"
+    monkeypatch.setenv(
+        _DSN_ENV,
+        f"postgresql://postgres:{password}@postgres:5432/{_CI_DATABASE}",
+    )
+
+    async_dsn, environment = _native_test_connection()
+
+    assert password in async_dsn
+    assert "***" not in async_dsn
+    assert environment["PGPASSWORD"] == password
 
 
 @pytest.mark.asyncio
@@ -133,6 +147,14 @@ async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path
                 timeout=30,
             )
             assert dump.returncode == 0, dump.stderr
+            renamed_live_table = "renamed_while_stage_is_pinned"
+            async with sessions() as contender, contender.begin():
+                await contender.execute(
+                    text(f'ALTER TABLE "{live_schema}"."{relations[0].table_name}" RENAME TO "{renamed_live_table}"')
+                )
+                await contender.execute(
+                    text(f'ALTER TABLE "{live_schema}"."{renamed_live_table}" RENAME TO "{relations[0].table_name}"')
+                )
 
         manifest = await source.stage_and_export_entity_address_archive_source(
             sessions,
