@@ -28,12 +28,18 @@ _RELATION_SUPPORT_COLUMNS = {
     "ptg2_import_run": "import_run_id text",
     "ptg2_import_job": "import_run_id text",
     "ptg2_source_catalog": "import_run_id text",
+    "ptg2_frozen_source_file_binding": "internal_run_id text",
+    "ptg2_allowed_amount_plan": "snapshot_id text",
+    "ptg2_allowed_amount_item": "snapshot_id text",
+    "ptg2_allowed_amount_payment": "snapshot_id text",
+    "ptg2_allowed_amount_provider_payment": "snapshot_id text",
     "ptg2_v3_snapshot_scope": "snapshot_id text",
     "ptg2_v3_snapshot_plan_scope": "snapshot_id text",
     "ptg2_v3_snapshot_source": "snapshot_id text, source_trace_set_hash text",
     "ptg2_v3_candidate_audit_attestation": "snapshot_id text",
     "ptg2_v3_audit_occurrence": "snapshot_key bigint",
     "ptg2_v3_layout_fingerprint": "snapshot_key bigint",
+    "ptg2_v3_code": "snapshot_key bigint",
     "ptg2_v3_provider_group": "snapshot_key bigint",
     "ptg2_artifact_manifest": "artifact_id text, snapshot_id text",
     "ptg2_artifact_blob_chunk": "artifact_id text",
@@ -69,44 +75,64 @@ _NATIVE_DDL_ONLY_TABLES = {
     "ptg2_provider_tax_identity_source_manifest",
     "ptg2_provider_tax_identity_source_binding",
     "ptg2_provider_group_tax_identity_source",
+    "ptg2_frozen_source_file_binding",
 }
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _NATIVE_DDL_BY_TABLE = {
     "ptg2_v3_layout_fingerprint": (
         "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (semantic_fingerprint)",
     ),
     "ptg2_v3_snapshot_block": (
         "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)",
+    ),
+    "ptg2_v3_code": (
+        "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "snapshot_key bigint NOT NULL",
+        "PRIMARY KEY (snapshot_key, code_key)",
     ),
     "ptg2_v3_provider_group": (
         "alembic/versions/20260712120000_ptg2_v3_shared_schema.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key, provider_group_key)",
     ),
     "ptg2_provider_tax_identity_manifest": (
         "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key)",
     ),
     "ptg2_provider_tax_identity": (
         "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key, tin_key)",
     ),
     "ptg2_provider_group_tax_identity": (
         "alembic/versions/20260727100000_ptg2_provider_tax_identity.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (\n                    snapshot_key,\n                    provider_group_global_id_128\n                )",
     ),
     "ptg2_provider_tax_identity_source_manifest": (
         "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key)",
     ),
     "ptg2_provider_tax_identity_source_binding": (
         "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (snapshot_key, source_key)",
     ),
     "ptg2_provider_group_tax_identity_source": (
         "alembic/versions/20260806100000_ptg2_tax_identity_source.py",
+        "snapshot_key bigint NOT NULL",
         "PRIMARY KEY (\n                    snapshot_key,\n                    source_key,\n                    provider_group_global_id_128\n                )",
+    ),
+    "ptg2_frozen_source_file_binding": (
+        "db/migration_ptg2_frozen_source_file_binding.py",
+        "internal_run_id varchar(96) NOT NULL UNIQUE",
+        "internal_run_id = 'ptg2:' || source_file_import_id",
     ),
 }
 
@@ -251,15 +277,16 @@ def test_added_relations_match_current_model_and_native_ddl_keys() -> None:
     for table_name in {
         "ptg2_v3_layout_fingerprint",
         "ptg2_v3_snapshot_block",
+        "ptg2_v3_code",
         "ptg2_v3_provider_group",
         "ptg2_v4_npi_scope",
     }:
         assert "snapshot_key" in model_columns[table_name]
-    for table_name, (relative_path, primary_key) in _NATIVE_DDL_BY_TABLE.items():
+    for table_name, (relative_path, scope_column, identity_constraint) in _NATIVE_DDL_BY_TABLE.items():
         source = (_REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
         assert table_name in source
-        assert "snapshot_key bigint NOT NULL" in source
-        assert primary_key in source
+        assert scope_column in source
+        assert identity_constraint in source
 
 
 async def _seed(engine, schema: str) -> tuple[str, set[bytes]]:
@@ -556,6 +583,90 @@ async def test_native_archive_closure_rejects_map_payload_length_mismatch_before
 
 
 @pytest.mark.asyncio
+async def test_native_archive_closure_rejects_same_length_target_payload_corruption() -> None:
+    """A selected target's unchanged length cannot bypass CAS validation."""
+
+    async with _database() as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema)
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(
+                f"UPDATE {schema}.ptg2_v3_block "
+                "SET payload = set_byte(payload, 0, get_byte(payload, 0) # 1) "
+                "WHERE object_kind = 'graph_locator_v1'"
+            )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            with pytest.raises(ResultArchiveClosureError, match="target block hash is inconsistent"):
+                await select_result_archive_closure(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_id=snapshot_id,
+                    retention_pin={"pin_id": "synthetic-pin", "repeatable_read_token": "synthetic-read"},
+                )
+
+
+@pytest.mark.asyncio
+async def test_native_archive_closure_rejects_same_length_map_payload_corruption() -> None:
+    """A selected map payload is authenticated before coordinates are trusted."""
+
+    async with _database() as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema)
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(
+                f"UPDATE {schema}.ptg2_v3_block "
+                "SET payload = set_byte(payload, 0, get_byte(payload, 0) # 1) "
+                "WHERE object_kind = 'snapshot_coordinate_map_v1'"
+            )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            with pytest.raises(ResultArchiveClosureError, match="map pack hash is inconsistent"):
+                await select_result_archive_closure(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_id=snapshot_id,
+                    retention_pin={"pin_id": "synthetic-pin", "repeatable_read_token": "synthetic-read"},
+                )
+
+
+@pytest.mark.asyncio
+async def test_native_archive_closure_rejects_dangling_selected_target() -> None:
+    """A coordinate cannot select a target row absent from the shared block table."""
+
+    async with _database() as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema)
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(
+                f"DELETE FROM {schema}.ptg2_v3_block WHERE object_kind = 'graph_locator_v1'"
+            )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            with pytest.raises(ResultArchiveClosureError, match="dangling map targets"):
+                await select_result_archive_closure(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_id=snapshot_id,
+                    retention_pin={"pin_id": "synthetic-pin", "repeatable_read_token": "synthetic-read"},
+                )
+
+
+def test_conflicting_coordinate_identity_is_rejected() -> None:
+    """One content hash cannot represent two decoded map object identities."""
+
+    identities_by_hash: dict[bytes, tuple[str, int]] = {}
+    archive_closure._record_target_identity(
+        identities_by_hash,
+        block_hash=b"x" * 32,
+        target_identity=("graph_locator_v1", 1),
+    )
+    with pytest.raises(ResultArchiveClosureError, match="conflicting identities"):
+        archive_closure._record_target_identity(
+            identities_by_hash,
+            block_hash=b"x" * 32,
+            target_identity=("different_graph_locator_v1", 1),
+        )
+
+
+@pytest.mark.asyncio
 async def test_native_archive_closure_rejects_extra_finalizer_anchor_with_bounded_read() -> None:
     """A rogue anchor is detected without reading beyond expected targets plus one."""
 
@@ -624,6 +735,7 @@ async def test_every_archive_relation_uses_current_model_columns_and_parses() ->
         "ptg2_v3_snapshot_layout": {"snapshot_key"},
         "ptg2_v3_layout_fingerprint": {"snapshot_key"},
         "ptg2_v3_snapshot_block": {"snapshot_key"},
+        "ptg2_v3_code": {"snapshot_key"},
         "ptg2_v3_provider_group": {"snapshot_key"},
         "ptg2_v4_snapshot_map_root": {"snapshot_key"},
         "ptg2_v4_snapshot_map_pack": {"snapshot_key"},
@@ -643,7 +755,10 @@ async def test_every_archive_relation_uses_current_model_columns_and_parses() ->
     assert relations
     for relation in relations:
         if relation.table_name in _NATIVE_DDL_ONLY_TABLES:
-            assert required_columns_by_table[relation.table_name] == {"snapshot_key"}
+            assert required_columns_by_table[relation.table_name] <= {
+                "snapshot_key",
+                "internal_run_id",
+            }
         else:
             assert required_columns_by_table[relation.table_name] <= model_columns[relation.table_name]
     async with _database() as (engine, schema_name, schema):
@@ -663,6 +778,7 @@ async def test_new_snapshot_key_relations_include_only_selected_snapshot_rows() 
     expected_tables = {
         "ptg2_v3_layout_fingerprint",
         "ptg2_v3_snapshot_block",
+        "ptg2_v3_code",
         "ptg2_v3_provider_group",
         "ptg2_v4_npi_scope",
         "ptg2_provider_tax_identity_manifest",
@@ -714,3 +830,51 @@ async def test_new_snapshot_key_relations_include_only_selected_snapshot_rows() 
                     {"snapshot_key": 71},
                 )
                 assert selected_keys.scalars().all() == [71]
+
+
+@pytest.mark.asyncio
+async def test_import_and_snapshot_scoped_relations_exclude_unrelated_rows() -> None:
+    """Archive source bindings and allowed evidence follow one selected snapshot."""
+
+    expected_snapshot_tables = {
+        "ptg2_allowed_amount_plan",
+        "ptg2_allowed_amount_item",
+        "ptg2_allowed_amount_payment",
+        "ptg2_allowed_amount_provider_payment",
+    }
+    async with _database() as (engine, schema_name, schema):
+        async with engine.begin() as connection:
+            await _create_relation_predicate_support(connection, schema)
+            await connection.exec_driver_sql(
+                f"INSERT INTO {schema}.ptg2_snapshot VALUES "
+                "('synthetic-result-closure', 'ptg2:synthetic-import', 'validated', '{}'), "
+                "('synthetic-other-result', 'ptg2:synthetic-other-import', 'validated', '{}')"
+            )
+            await connection.exec_driver_sql(
+                f"INSERT INTO {schema}.ptg2_frozen_source_file_binding VALUES "
+                "('ptg2:synthetic-import'), ('ptg2:synthetic-other-import')"
+            )
+            for table_name in expected_snapshot_tables:
+                await connection.exec_driver_sql(
+                    f"INSERT INTO {schema}.{table_name} VALUES ('synthetic-result-closure'), ('synthetic-other-result')"
+                )
+            relations_by_table = {relation.table_name: relation for relation in archive_closure._relations(schema_name)}
+            frozen_relation = relations_by_table["ptg2_frozen_source_file_binding"]
+            selected_runs = await connection.execute(
+                text(
+                    f"SELECT internal_run_id FROM {schema}.ptg2_frozen_source_file_binding "
+                    f"WHERE {frozen_relation.predicate_sql} ORDER BY internal_run_id"
+                ),
+                {"snapshot_id": "synthetic-result-closure"},
+            )
+            assert selected_runs.scalars().all() == ["ptg2:synthetic-import"]
+            for table_name in expected_snapshot_tables:
+                relation = relations_by_table[table_name]
+                selected_snapshots = await connection.execute(
+                    text(
+                        f"SELECT snapshot_id FROM {schema}.{table_name} "
+                        f"WHERE {relation.predicate_sql} ORDER BY snapshot_id"
+                    ),
+                    {"snapshot_id": "synthetic-result-closure"},
+                )
+                assert selected_snapshots.scalars().all() == ["synthetic-result-closure"]
