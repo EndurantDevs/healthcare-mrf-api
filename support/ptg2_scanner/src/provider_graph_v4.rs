@@ -2111,7 +2111,6 @@ fn load_raw_factors(
     Ok(raw)
 }
 
-
 #[derive(Debug)]
 struct GraphModel {
     set_base: u32,
@@ -11994,13 +11993,20 @@ mod tests {
                 std::slice::from_ref(shard),
                 &fixture.provider_map,
                 &ProviderGraphV4Options::default(),
-            ).unwrap().summary.base_estimated_model_bytes
+            )
+            .unwrap()
+            .summary
+            .base_estimated_model_bytes
         };
         let mut shard = fixture.shard.clone();
         let baseline = estimate(&shard);
         // Referenced groups need model dictionaries even when they have no
         // corresponding group/NPI owner; owner counts are deliberately fixed.
-        let globals = shard.provider_component_group.metadata.member_global_count.unwrap();
+        let globals = shard
+            .provider_component_group
+            .metadata
+            .member_global_count
+            .unwrap();
         shard.provider_component_group.metadata.member_global_count = Some(globals + 100);
         assert_eq!(estimate(&shard) - baseline, 100 * 256);
         let dense = estimate(&shard);
