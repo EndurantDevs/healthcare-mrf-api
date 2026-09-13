@@ -175,6 +175,39 @@ def _validated_staged_layout(layout: Mapping[str, Any]) -> tuple[bytes, bytes, M
     return fingerprint, support_digest, manifest
 
 
+def _remapped_layout_manifest(
+    layout_manifest: Mapping[str, Any],
+    *,
+    source_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> Mapping[str, Any]:
+    """Rekey only the local tax-identity receipt nested in a sealed manifest."""
+
+    manifest_by_field = dict(layout_manifest)
+    serving_index = manifest_by_field.get("serving_index")
+    if not isinstance(serving_index, Mapping):
+        return manifest_by_field
+    provider_graph = serving_index.get("provider_graph")
+    if not isinstance(provider_graph, Mapping):
+        return manifest_by_field
+    tax_identity = provider_graph.get("provider_tax_identity")
+    if not isinstance(tax_identity, Mapping):
+        return manifest_by_field
+    tax_snapshot_key = tax_identity.get("snapshot_key")
+    if tax_snapshot_key != source_snapshot_key:
+        raise ResultArchiveAdoptionError("archive adoption tax identity receipt has the wrong snapshot key")
+    remapped_provider_graph_by_field = dict(provider_graph)
+    remapped_provider_graph_by_field["provider_tax_identity"] = {
+        **tax_identity,
+        "snapshot_key": destination_snapshot_key,
+    }
+    manifest_by_field["serving_index"] = {
+        **serving_index,
+        "provider_graph": remapped_provider_graph_by_field,
+    }
+    return manifest_by_field
+
+
 async def _assert_destination_snapshot(session: Any, *, schema: str, snapshot_id: str) -> None:
     await _one(
         session,
@@ -431,20 +464,11 @@ async def _copy_staged_layout_rows(
     source_snapshot_key: int,
     destination_snapshot_key: int,
 ) -> None:
-    if not all(table_name in _REKEYED_TABLES for table_name in _FINALIZER_MAP_TABLES):
-        for table_name in _REKEYED_TABLES:
-            await _copy_rekeyed_table(
-                session,
-                schema_name=schema_name,
-                staging_schema_name=staging_schema_name,
-                table_name=table_name,
-                source_snapshot_key=source_snapshot_key,
-                destination_snapshot_key=destination_snapshot_key,
-            )
-        return
-
-    first_finalizer_table = _REKEYED_TABLES.index(_FINALIZER_MAP_TABLES[0])
-    last_finalizer_table = _REKEYED_TABLES.index(_FINALIZER_MAP_TABLES[-1])
+    finalizer_indexes = tuple(_REKEYED_TABLES.index(table_name) for table_name in _FINALIZER_MAP_TABLES)
+    first_finalizer_table = finalizer_indexes[0]
+    last_finalizer_table = finalizer_indexes[-1]
+    if finalizer_indexes != tuple(range(first_finalizer_table, last_finalizer_table + 1)):
+        raise ResultArchiveAdoptionError("archive adoption finalizer relations are not contiguous")
     for table_name in _REKEYED_TABLES[:first_finalizer_table]:
         await _copy_rekeyed_table(
             session,
@@ -856,7 +880,12 @@ async def _reserve_destination_layout(
         semantic_fingerprint=semantic_fingerprint,
         build_token=build_token,
     )
-    return reservation, semantic_fingerprint, support_digest, layout_manifest
+    destination_manifest = _remapped_layout_manifest(
+        layout_manifest,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot_key=reservation.snapshot_key,
+    )
+    return reservation, semantic_fingerprint, support_digest, destination_manifest
 
 
 async def _prepare_new_destination_layout(
