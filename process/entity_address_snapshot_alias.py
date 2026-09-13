@@ -15,7 +15,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from process.ext import address_alias_sql
 
-
 CONTRACT = "entity_address_alias_semantic_receipt.v1"
 RECEIPT_VERSION = "entity_address_alias_semantic_receipt.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

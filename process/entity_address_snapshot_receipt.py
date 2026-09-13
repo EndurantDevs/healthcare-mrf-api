@@ -14,7 +14,6 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
-
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 CONTRACT = "entity_address_unified.postgres.v1"

@@ -11,7 +11,6 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STAGE_SCHEMA_PREFIX = "entity_address_archive_"
