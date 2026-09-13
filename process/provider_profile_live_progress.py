@@ -3,15 +3,16 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Iterable, Iterator
+import asyncio
+from collections.abc import AsyncIterator, Callable, Iterable
+from time import monotonic
 from typing import Any, TypeVar
 
 _Row = TypeVar("_Row")
 PROGRESS_INTERVAL_SECONDS = 10.0
 
 
-def normalization_rows(
+async def normalization_rows(
     rows: Iterable[_Row],
     *,
     title: str,
@@ -19,7 +20,7 @@ def normalization_rows(
     file_index: int,
     file_count: int,
     report: Callable[..., Any],
-) -> Iterator[_Row]:
+) -> AsyncIterator[_Row]:
     """Announce each source and count consumed rows without inventing a total."""
     progress_by_field = {
         "phase": "normalizing",
@@ -30,12 +31,14 @@ def normalization_rows(
         "file_count": file_count,
     }
     report(**progress_by_field, counters={"file_rows_processed": 0})
-    last_report = time.monotonic()
+    await asyncio.sleep(0)
+    last_report = monotonic()
     for processed, row in enumerate(rows, start=1):
         yield row
-        now = time.monotonic()
+        now = monotonic()
         if now - last_report >= PROGRESS_INTERVAL_SECONDS:
             report(**progress_by_field, counters={"file_rows_processed": processed})
+            await asyncio.sleep(0)
             last_report = now
 
 
