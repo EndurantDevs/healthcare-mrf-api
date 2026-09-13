@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 from pathlib import Path
 import re
 import subprocess
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -163,6 +165,20 @@ async def _assert_live_sentinel(connection, schema_name: str, table_name: str) -
     assert await connection.scalar(text(f'SELECT location_key FROM "{schema_name}"."{table_name}"')) == "live-sentinel"
 
 
+def _restore_archive(dump_path: Path, pg_restore: str, environment) -> None:
+    """Restore the previously captured archive with the same native database tool."""
+
+    result = subprocess.run(
+        [pg_restore, "--no-owner", "--exit-on-error", "--dbname", environment["PGDATABASE"], str(dump_path)],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("dsn", "expected"),
     [
@@ -222,7 +238,7 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
             )
             await _rename_live_sentinel(sessions, live_schema, relations[0].table_name)
 
-        manifest = await source.export_entity_address_archive_stage(
+        manifest, source_receipt = await source.export_entity_address_archive_with_receipt(
             sessions,
             schema_name=live_schema,
             dataset_id=dataset_id,
@@ -232,17 +248,16 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         assert manifest.relations == relations
         async with engine.begin() as connection:
             await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
-            await connection.execute(text(f'DROP SCHEMA "{stage_schema}" CASCADE'))
+            assert (
+                await connection.scalar(
+                    text("SELECT oid FROM pg_namespace WHERE nspname=:schema_name"), {"schema_name": stage_schema}
+                )
+                is None
+            )
             await connection.execute(text(f'CREATE SCHEMA "{stage_schema}"'))
-        restore = subprocess.run(
-            [pg_restore, "--no-owner", "--exit-on-error", "--dbname", tool_environment["PGDATABASE"], str(dump_path)],
-            capture_output=True,
-            check=False,
-            env=tool_environment,
-            text=True,
-            timeout=30,
-        )
-        assert restore.returncode == 0, restore.stderr
+        _restore_archive(dump_path, pg_restore, tool_environment)
+        restored_receipt = await _capture_receipt(sessions, stage_schema, "UTC")
+        assert restored_receipt.as_dict() == source_receipt.as_dict()
         async with engine.connect() as connection:
             await _assert_live_sentinel(connection, stage_schema, relations[0].table_name)
             await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
@@ -334,4 +349,79 @@ async def test_native_stage_receipt_preserves_order_independence_across_chunk_bo
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{source_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{restored_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ("receipt", "copy", "cancel"))
+async def test_native_owned_export_cleans_its_clone_on_failure(monkeypatch, failure_stage):
+    """Receipt failure, dump failure, and cancellation cannot leak the owned clone."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live_schema = "address_export_failure_" + uuid4().hex
+    dataset_id = uuid4()
+    stage_schema = source.entity_address_archive_stage_schema(dataset_id)
+    failure = asyncio.CancelledError() if failure_stage == "cancel" else RuntimeError("synthetic export failure")
+    copied = AsyncMock(side_effect=failure)
+    if failure_stage == "receipt":
+        monkeypatch.setattr(source, "capture_entity_address_archive_receipt", AsyncMock(side_effect=failure))
+    try:
+        await _seed_live_sentinel(engine, live_schema, source.entity_address_archive_relations())
+        with pytest.raises(type(failure)):
+            await source.export_entity_address_archive_with_receipt(
+                sessions, schema_name=live_schema, dataset_id=dataset_id, archive_copy=copied
+            )
+        assert copied.await_count == (0 if failure_stage == "receipt" else 1)
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT oid FROM pg_namespace WHERE nspname=:name"), {"name": stage_schema}
+                )
+                is None
+            )
+            await _assert_live_sentinel(connection, live_schema, "entity_address_unified")
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_owned_export_never_cleans_a_preexisting_collision():
+    """A failed CREATE SCHEMA grants no authority over the preexisting object."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live_schema = "address_export_collision_" + uuid4().hex
+    dataset_id = uuid4()
+    stage_schema = source.entity_address_archive_stage_schema(dataset_id)
+    copied = AsyncMock()
+    try:
+        await _seed_live_sentinel(engine, live_schema, source.entity_address_archive_relations())
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{stage_schema}"'))
+            incumbent_oid = await connection.scalar(
+                text("SELECT oid FROM pg_namespace WHERE nspname=:name"), {"name": stage_schema}
+            )
+        from sqlalchemy.exc import DBAPIError
+
+        with pytest.raises(DBAPIError):
+            await source.export_entity_address_archive_with_receipt(
+                sessions, schema_name=live_schema, dataset_id=dataset_id, archive_copy=copied
+            )
+        copied.assert_not_awaited()
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT oid FROM pg_namespace WHERE nspname=:name"), {"name": stage_schema}
+                )
+                == incumbent_oid
+            )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
         await engine.dispose()

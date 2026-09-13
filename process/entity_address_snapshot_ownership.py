@@ -105,7 +105,7 @@ async def _namespace_relation_records(session: Any, schema_oid: int) -> list[Map
         (
             await session.execute(
                 text(
-                    "SELECT relation.oid, relation.relkind, indexed.indrelid AS index_table_oid "
+                    "SELECT relation.oid, relation.relkind::text AS relkind, indexed.indrelid AS index_table_oid "
                     "FROM pg_catalog.pg_class AS relation "
                     "LEFT JOIN pg_catalog.pg_index AS indexed ON indexed.indexrelid = relation.oid "
                     "WHERE relation.relnamespace = :schema_oid ORDER BY relation.oid"
@@ -179,7 +179,7 @@ def validate_entity_address_archive_stage_ownership(
     """Validate a persisted local owner token without consulting mutable catalogs."""
 
     if isinstance(owner_value, EntityAddressArchiveStageOwnership):
-        return owner_value
+        owner_value = owner_value.as_dict()
     if not isinstance(owner_value, Mapping) or set(owner_value) != {
         "dataset_id",
         "schema_name",
@@ -252,11 +252,21 @@ async def cleanup_entity_address_archive_stage(
     """Remove only an unchanged UUID-owned stage, using restrictive DDL only."""
 
     _require_caller_transaction(session)
-    validated_owner = await verify_entity_address_archive_stage_ownership(session, owner=owner)
+    validated_owner = validate_entity_address_archive_stage_ownership(owner)
+    current_schema_oid = await session.scalar(
+        text("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=:schema_name"),
+        {"schema_name": validated_owner.schema_name},
+    )
+    if current_schema_oid is None:
+        return
+    if current_schema_oid != validated_owner.schema_oid:
+        raise EntityAddressArchiveOwnershipError("entity-address archive ownership schema OID differs")
     table_names = ", ".join(
         f"{_quoted(validated_owner.schema_name)}.{_quoted(table_name)}"
         for table_name, _ in validated_owner.relation_oids
     )
+    await session.execute(text(f"LOCK TABLE {table_names} IN ACCESS EXCLUSIVE MODE NOWAIT"))
+    await verify_entity_address_archive_stage_ownership(session, owner=validated_owner)
     await session.execute(text(f"DROP TABLE {table_names} RESTRICT"))
     remaining = await session.scalar(
         text("SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relnamespace = :schema_oid"),

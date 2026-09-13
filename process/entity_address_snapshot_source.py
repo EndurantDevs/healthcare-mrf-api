@@ -11,6 +11,7 @@ targeting serving relations.  Stage cleanup deliberately remains caller-owned.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import re
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,11 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy import text
+
+from process.entity_address_snapshot_receipt import (
+    EntityAddressArchiveReceipt,
+    capture_entity_address_archive_receipt,
+)
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -207,6 +213,7 @@ async def export_entity_address_archive_stage(
     schema_name: str,
     dataset_id: UUID,
     archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]],
+    stage_created: Callable[[object], Awaitable[None]] | None = None,
 ) -> EntityAddressArchiveStageManifest:
     """Clone and dump the exact family without passing live names to ``pg_dump``.
 
@@ -227,6 +234,8 @@ async def export_entity_address_archive_stage(
                 source_capture=source_capture,
                 stage_schema=stage_schema,
             )
+            if stage_created is not None:
+                await stage_created(clone_session)
     async with session_factory() as stage_session, stage_session.begin():
         capture = await _capture_entity_address_archive_stage(
             stage_session,
@@ -236,6 +245,73 @@ async def export_entity_address_archive_stage(
     return EntityAddressArchiveStageManifest(
         capture.contract, capture.dataset_id, capture.schema_name, capture.relations
     )
+
+
+async def export_entity_address_archive_with_receipt(
+    session_factory,
+    *,
+    schema_name: str,
+    dataset_id: UUID,
+    archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]],
+) -> tuple[EntityAddressArchiveStageManifest, EntityAddressArchiveReceipt]:
+    """Bind the native receipt and dump to the same pinned, committed clone.
+
+    Receipt capture starts a fresh transaction while the existing stage pin
+    blocks writers. The live generation is no longer pinned during either the
+    receipt scan or archive copy. This wrapper cleans only its locally created
+    clone on success, failure, and cancellation; a preexisting schema collision
+    never grants cleanup authority.
+    """
+
+    ownership = importlib.import_module("process.entity_address_snapshot_ownership")
+    captured_receipts = []
+    owned_stages = []
+
+    async def _record_created_stage(session) -> None:
+        owned_stages.append(
+            await ownership.capture_created_entity_address_archive_stage(session, dataset_id=dataset_id)
+        )
+
+    async def _capture_and_copy(capture: EntityAddressArchiveStageCapture) -> None:
+        async with session_factory() as session, session.begin():
+            captured_receipts.append(
+                await capture_entity_address_archive_receipt(session, schema_name=capture.schema_name)
+            )
+        await archive_copy(capture)
+
+    try:
+        manifest = await export_entity_address_archive_stage(
+            session_factory,
+            schema_name=schema_name,
+            dataset_id=dataset_id,
+            archive_copy=_capture_and_copy,
+            stage_created=_record_created_stage,
+        )
+    finally:
+        if owned_stages:
+            await _cleanup_owned_archive_stage(session_factory, ownership, owned_stages[0])
+    if len(captured_receipts) != 1:
+        raise RuntimeError("entity-address archive stage receipt is unavailable")
+    return manifest, captured_receipts[0]
+
+
+async def _cleanup_owned_archive_stage(session_factory, ownership, owner) -> None:
+    """Drain the exact cleanup even if the exporting task is cancelled again."""
+
+    async def _cleanup() -> None:
+        async with session_factory() as session, session.begin():
+            await ownership.cleanup_entity_address_archive_stage(session, owner=owner)
+
+    cleanup_task = asyncio.create_task(_cleanup())
+    is_cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            is_cancelled = True
+    cleanup_task.result()
+    if is_cancelled:
+        raise asyncio.CancelledError
 
 
 __all__ = [
@@ -249,4 +325,5 @@ __all__ = [
     "entity_address_archive_relations",
     "export_entity_address_archive_source",
     "export_entity_address_archive_stage",
+    "export_entity_address_archive_with_receipt",
 ]
