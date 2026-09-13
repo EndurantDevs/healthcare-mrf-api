@@ -1,0 +1,131 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+from __future__ import annotations
+
+import importlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+adoption = importlib.import_module("process.entity_address_snapshot_adoption")
+native = importlib.import_module("process.entity_address_unified")
+
+
+@pytest.mark.asyncio
+async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shutdown(
+    monkeypatch,
+):
+    ensured_tables: list[str] = []
+    stage_cls = SimpleNamespace(__tablename__="entity_address_unified_20260913")
+    support_stage_class_map = {
+        model: SimpleNamespace(__tablename__=f"{model.__tablename__}_20260913") for model in native.SUPPORT_TABLE_MODELS
+    }
+    swaps = [
+        SimpleNamespace(stage_cls=stage_cls),
+        *(SimpleNamespace(stage_cls=support_stage_cls) for support_stage_cls in support_stage_class_map.values()),
+    ]
+    plan = (swaps, [], ["relations"], ["required"])
+    monkeypatch.setattr(
+        adoption,
+        "_prepared_full_result_stage",
+        lambda **_kwargs: (
+            stage_cls,
+            support_stage_class_map,
+            *plan,
+        ),
+    )
+
+    async def ensure_logged(_schema, table_name):
+        ensured_tables.append(table_name)
+
+    validate = AsyncMock(return_value={"bridge_orphans": {}})
+    run_phase = AsyncMock()
+    monkeypatch.setattr(native, "_ensure_promoted_stage_logged", ensure_logged)
+    monkeypatch.setattr(native, "_address_alias_generation", AsyncMock(return_value=9))
+    monkeypatch.setattr(native, "_run_sql_phase", run_phase)
+    monkeypatch.setattr(native, "_validate_publish_integrity", validate)
+
+    prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
+        db_schema="mrf",
+        import_date="20260913",
+    )
+
+    assert len(native.SUPPORT_TABLE_MODELS) == 6
+    assert ensured_tables == [swap.stage_cls.__tablename__ for swap in swaps]
+    assert prepared.context == {"address_alias_generation": 9, "stage_persistence": "p"}
+    assert prepared.publish_validation == {"bridge_orphans": {}}
+    run_phase.assert_awaited_once_with(
+        "ANALYZE mrf.entity_address_unified_20260913;",
+        context=prepared.context,
+        phase="entity-address snapshot analyzing restored main table",
+    )
+    validate.assert_awaited_once_with(
+        "mrf",
+        "entity_address_unified_20260913",
+        support_stage_class_map,
+        test_mode=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_adopt_delegates_only_named_local_fence_and_receipt_callbacks(monkeypatch):
+    cutover_events: list[str] = []
+    callback_events: list[str] = []
+
+    async def verify_local_state():
+        callback_events.append("verified")
+
+    async def record_adoption():
+        callback_events.append("receipted")
+
+    async def run_cutover(*args, **kwargs):
+        cutover_events.append("cutover")
+        assert args[:6] == ("mrf", [], [], [], [], {"address_alias_generation": 4})
+        assert kwargs["require_caller_owned_transaction"] is True
+        callbacks = kwargs["callbacks"]
+        await callbacks.before_cutover()
+        await callbacks.after_publish()
+
+    monkeypatch.setattr(native, "_run_entity_address_cutover", run_cutover)
+    prepared = adoption.PreparedEntityAddressSnapshotAdoption(
+        db_schema="mrf",
+        stage_cls=object,
+        support_stage_class_map={},
+        swaps=[],
+        patch_statements=[],
+        relation_names=[],
+        required_names=[],
+        context={"address_alias_generation": 4},
+        publish_validation={"address_alias_generation": 4},
+    )
+
+    publish_validation = await adoption.adopt_prepared_entity_address_snapshot(
+        prepared,
+        callbacks=adoption.EntityAddressSnapshotAdoptionCallbacks(
+            verify_local_state=verify_local_state,
+            record_adoption=record_adoption,
+        ),
+    )
+
+    assert cutover_events == ["cutover"]
+    assert callback_events == ["verified", "receipted"]
+    assert publish_validation == {"address_alias_generation": 4}
+
+
+@pytest.mark.asyncio
+async def test_native_cutover_rejects_adoption_without_a_bound_caller_transaction(
+    monkeypatch,
+):
+    monkeypatch.setattr(native, "db", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="caller-owned database transaction"):
+        await native._run_entity_address_cutover(
+            "mrf",
+            [],
+            [],
+            [],
+            [],
+            {},
+            require_caller_owned_transaction=True,
+        )
