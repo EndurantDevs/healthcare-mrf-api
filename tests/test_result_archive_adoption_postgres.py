@@ -14,12 +14,18 @@ from sqlalchemy import MetaData, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
+from api import ptg2_billing_entity_refs as billing_refs
+from api import ptg2_billing_entity_source_resolution as source_resolution
 from api.ptg2_shared_blocks import fetch_shared_blocks
 from db.connection import Database
 from db.migration_ptg2_frozen_source_file_binding import install_frozen_source_file_binding
 from db.models._legacy import Base
+from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
 from process.ptg_parts import ptg2_v4_finalizer_publish as finalizer_publish
 from process.ptg_parts import result_archive_adoption as adoption
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    tax_identity_source_publication_from_metadata,
+)
 from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
     has_valid_finalizer_map,
@@ -56,9 +62,33 @@ _MODEL_CLOSURE_TABLES = (
     "ptg2_allowed_amount_payment",
     "ptg2_allowed_amount_provider_payment",
 )
+_TAX_SOURCE_REKEYED_TABLES = (
+    "ptg2_v4_snapshot_map_pack",
+    *adoption._FINALIZER_MAP_TABLES,
+    "ptg2_v3_provider_group",
+    "ptg2_provider_tax_identity_manifest",
+    "ptg2_provider_tax_identity",
+    "ptg2_provider_group_tax_identity",
+    "ptg2_provider_tax_identity_source_manifest",
+    "ptg2_provider_tax_identity_source_binding",
+    "ptg2_provider_group_tax_identity_source",
+)
+_TAX_SOURCE_RECEIPT_TABLES = _TAX_SOURCE_REKEYED_TABLES[
+    _TAX_SOURCE_REKEYED_TABLES.index("ptg2_provider_tax_identity_manifest") :
+]
 _FINALIZER_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260825120000_ptg_v4_finalizer_map_pack.py"
 )
+
+
+def _fixture_rekeyed_tables() -> tuple[str, ...]:
+    """Retain the guarded finalizer family in reduced native fixture coverage."""
+
+    return tuple(
+        table_name
+        for table_name in adoption._REKEYED_TABLES
+        if table_name in _FIXTURE_REKEYED_TABLES or table_name in adoption._FINALIZER_MAP_TABLES
+    )
 
 
 def _quoted(identifier: str) -> str:
@@ -110,6 +140,19 @@ async def _install_model_closure_tables(database: Database, *, schema_name: str)
 async def _install_finalizer_map_tables(database: Database, *, schema_name: str, monkeypatch) -> None:
     """Apply the current packed-finalizer DDL to a disposable native fixture."""
 
+    if (
+        await database.scalar(
+            """
+            SELECT COUNT(*)
+              FROM information_schema.tables
+             WHERE table_schema = :schema_name
+               AND table_name = 'ptg2_v4_finalizer_map_root'
+            """,
+            schema_name=schema_name,
+        )
+        == 1
+    ):
+        return
     module_spec = importlib.util.spec_from_file_location("receiver_finalizer_migration", _FINALIZER_MIGRATION_PATH)
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -323,6 +366,7 @@ async def _seed_preparation_catalog(
         compilation.cleanup()
     schema = _quoted(schema_name)
     await _create_destination_snapshot_table(database, schema)
+    await _install_finalizer_map_tables(database, schema_name=schema_name, monkeypatch=monkeypatch)
     await database.status(
         f"INSERT INTO {schema}.ptg2_v3_snapshot_binding (snapshot_id, snapshot_key) VALUES ('staged-snapshot', :snapshot_key)",
         snapshot_key=sealed.snapshot_key,
@@ -359,6 +403,204 @@ async def _seed_full_preparation_catalog(
         monkeypatch=monkeypatch,
     )
     return source_snapshot_key
+
+
+async def _seed_tax_source_preparation_catalog(
+    database: Database,
+    *,
+    schema_name: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Publish one sealed selected tax-source sidecar through its native producer."""
+
+    fixture = await v4_e2e._compile_source_local_tax_fixture(tmp_path)
+    reservation, build_token = await v4_e2e._prepare_source_local_layout(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    await _install_archive_extra_schema(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    publication = await _publish_tax_source_layout(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
+        snapshot_key=reservation.snapshot_key,
+        build_token=build_token,
+        logical_snapshot_id="synthetic-snapshot",
+    )
+    unrelated_snapshot_key = await _publish_unrelated_tax_source_layout(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
+    )
+    await _install_archive_snapshot_binding(
+        database,
+        schema_name=schema_name,
+        snapshot_keys=(reservation.snapshot_key, unrelated_snapshot_key),
+    )
+    return (
+        fixture,
+        reservation.snapshot_key,
+        unrelated_snapshot_key,
+        publication.provider_tax_identity_source,
+    )
+
+
+async def _publish_tax_source_layout(
+    database: Database,
+    *,
+    fixture,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    logical_snapshot_id: str,
+):
+    """Publish and seal one source-local tax sidecar with the real graph writer."""
+
+    publication = await snapshot_publish._publish_v4_graph(
+        fixture.compilation,
+        publication_context=snapshot_publish._V4GraphCoordinates(
+            schema_name=schema_name,
+            logical_snapshot_id=logical_snapshot_id,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+        ),
+        compressed_acquisition_bytes=1024,
+        empty_npi_tin_only_normalization_count=0,
+        tax_identity_source_artifacts=fixture.tax_sources,
+    )
+    layout_manifest = v4_e2e._base_layout_manifest(dict(publication.adaptive_layout))
+    provider_graph = layout_manifest["serving_index"]["provider_graph"]
+    provider_graph["provider_tax_identity"] = dict(publication.provider_tax_identity)
+    provider_graph["provider_tax_identity_source"] = dict(publication.provider_tax_identity_source)
+    async with database.transaction() as session:
+        await v4_e2e.seal_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            expected_summary=publication.map_summary,
+            support_digest=publication.support_digest,
+            layout_manifest=layout_manifest,
+        )
+    return publication
+
+
+async def _publish_unrelated_tax_source_layout(
+    database: Database,
+    *,
+    fixture,
+    schema_name: str,
+) -> int:
+    """Build a second producer-owned sidecar that must not enter selected copy."""
+
+    schema = _quoted(schema_name)
+    await _seed_tax_source_logical_identity(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
+        snapshot_id="unrelated-snapshot",
+    )
+    build_token = f"unrelated-tax-source-{uuid.uuid4().hex}"
+    async with database.transaction() as session:
+        reservation = await v4_e2e.reserve_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=b"r" * 32,
+            build_token=build_token,
+        )
+        await v4_e2e._insert_provider_set_rows(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            provider_sets_by_key=fixture.provider_sets_by_key,
+        )
+    await _publish_tax_source_layout(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
+        snapshot_key=reservation.snapshot_key,
+        build_token=build_token,
+        logical_snapshot_id="unrelated-snapshot",
+    )
+    return reservation.snapshot_key
+
+
+async def _seed_tax_source_logical_identity(
+    database: Database,
+    *,
+    fixture,
+    schema_name: str,
+    snapshot_id: str,
+) -> None:
+    """Seed caller-owned logical source identity for the unrelated producer run."""
+
+    schema = _quoted(schema_name)
+    await database.status(
+        f"INSERT INTO {schema}.ptg2_snapshot (snapshot_id, status) VALUES (:snapshot_id, 'building')",
+        snapshot_id=snapshot_id,
+    )
+    await database.status(
+        f"INSERT INTO {schema}.ptg2_v3_snapshot_scope (snapshot_id) VALUES (:snapshot_id)",
+        snapshot_id=snapshot_id,
+    )
+    source_bindings = tuple(dict(source_artifact["physical_source_binding"]) for source_artifact in fixture.tax_sources)
+    async with database.transaction() as session:
+        await session.execute(
+            text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_source
+                    (snapshot_id, source_key, source_type, identity_kind, identity_sha256)
+                VALUES (:snapshot_id, :source_key, :source_type, :identity_kind, :identity_sha256)
+                """
+            ),
+            [{"snapshot_id": snapshot_id, **source_binding} for source_binding in source_bindings],
+        )
+
+
+async def _install_archive_extra_schema(
+    database: Database,
+    *,
+    schema_name: str,
+    monkeypatch,
+) -> None:
+    """Install archive relations absent from the source-local tax fixture."""
+
+    await _install_model_closure_tables(database, schema_name=schema_name)
+    recorder = v4_e2e._OpRecorder()
+    install_frozen_source_file_binding(recorder, schema_name)
+    for statement in recorder.executed:
+        await database.execute_ddl(statement)
+    await _install_finalizer_map_tables(database, schema_name=schema_name, monkeypatch=monkeypatch)
+
+
+async def _install_archive_snapshot_binding(
+    database: Database,
+    *,
+    schema_name: str,
+    snapshot_keys: tuple[int, int],
+) -> None:
+    """Attach synthetic stage binding identity without changing source publication rows."""
+
+    schema = _quoted(schema_name)
+    await database.execute_ddl(
+        f"CREATE TABLE {schema}.ptg2_v3_snapshot_binding (snapshot_id text PRIMARY KEY, snapshot_key bigint NOT NULL)"
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_binding (snapshot_id, snapshot_key)
+        VALUES ('synthetic-snapshot', :selected_snapshot_key),
+               ('unrelated-snapshot', :unrelated_snapshot_key)
+        """,
+        selected_snapshot_key=snapshot_keys[0],
+        unrelated_snapshot_key=snapshot_keys[1],
+    )
 
 
 async def _publish_native_finalizer_fixture(
@@ -496,6 +738,7 @@ async def _create_destination_catalog(database: Database, *, schema_name: str, s
     await v4_e2e._create_v4_test_schema(database, schema_name=schema_name, monkeypatch=monkeypatch)
     schema = _quoted(schema_name)
     await _create_destination_snapshot_table(database, schema)
+    await _install_finalizer_map_tables(database, schema_name=schema_name, monkeypatch=monkeypatch)
     await database.status(
         f"INSERT INTO {schema}.ptg2_snapshot (snapshot_id) VALUES (:snapshot_id)",
         snapshot_id=snapshot_id,
@@ -953,7 +1196,7 @@ async def test_native_archive_preparation_remaps_local_layout_and_preserves_cas(
     monkeypatch.setattr(
         adoption,
         "_REKEYED_TABLES",
-        tuple(table for table in adoption._REKEYED_TABLES if table in _FIXTURE_REKEYED_TABLES),
+        _fixture_rekeyed_tables(),
     )
     try:
         source_key = await _seed_preparation_catalog(
@@ -1053,6 +1296,198 @@ async def test_native_archive_preparation_copies_full_current_layout_family(
 
 
 @pytest.mark.asyncio
+async def test_native_archive_preparation_preserves_published_tax_source_sidecar(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Rekey a producer-published tax-source sidecar and resolve it locally."""
+
+    _require_native_postgres()
+    stage_name = f"ptg_archive_stage_{uuid.uuid4().hex[:16]}"
+    destination_name = f"ptg_archive_destination_{uuid.uuid4().hex[:16]}"
+    database = Database()
+    await database.connect()
+    v4_e2e._bind_source_local_database(monkeypatch, database)
+    fixture = None
+    try:
+        (
+            fixture,
+            source_snapshot_key,
+            unrelated_snapshot_key,
+            source_publication_metadata,
+        ) = await _seed_tax_source_preparation_catalog(
+            database,
+            schema_name=stage_name,
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        await _create_full_destination_catalog(
+            database,
+            schema_name=destination_name,
+            snapshot_id="destination-tax-snapshot",
+            monkeypatch=monkeypatch,
+        )
+        prepared = await _prepare_tax_source_destination(
+            database,
+            destination_schema_name=destination_name,
+            staging_schema_name=stage_name,
+            source_snapshot_key=source_snapshot_key,
+        )
+        assert prepared.destination_snapshot_key != source_snapshot_key
+        await _assert_destination_tax_source_reader(
+            database,
+            stage_schema_name=stage_name,
+            destination_schema_name=destination_name,
+            source_snapshot_key=source_snapshot_key,
+            unrelated_snapshot_key=unrelated_snapshot_key,
+            destination_snapshot_key=prepared.destination_snapshot_key,
+            source_publication_metadata=source_publication_metadata,
+        )
+    finally:
+        if fixture is not None:
+            fixture.compilation.cleanup()
+        try:
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {_quoted(destination_name)} CASCADE")
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {_quoted(stage_name)} CASCADE")
+        finally:
+            await database.disconnect()
+
+
+async def _prepare_tax_source_destination(
+    database: Database,
+    *,
+    destination_schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+):
+    """Reserve unrelated local keys before preparing the selected tax layout."""
+
+    async with database.transaction() as session:
+        for fingerprint, build_token in (
+            (b"u" * 32, "unrelated-layout"),
+            (b"v" * 32, "second-unrelated-layout"),
+        ):
+            await v4_e2e.reserve_v4_shared_layout(
+                session,
+                schema_name=destination_schema_name,
+                semantic_fingerprint=fingerprint,
+                build_token=build_token,
+            )
+        return await adoption.prepare_result_archive_layout(
+            session,
+            schema_name=destination_schema_name,
+            staging_schema_name=staging_schema_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_id="destination-tax-snapshot",
+            build_token=f"receiver-{uuid.uuid4().hex}",
+        )
+
+
+async def _assert_destination_tax_source_reader(
+    database: Database,
+    *,
+    stage_schema_name: str,
+    destination_schema_name: str,
+    source_snapshot_key: int,
+    unrelated_snapshot_key: int,
+    destination_snapshot_key: int,
+    source_publication_metadata: dict[str, object],
+) -> None:
+    """Authenticate copied source records with the destination billing resolver."""
+
+    publication = tax_identity_source_publication_from_metadata(source_publication_metadata)
+    stage = _quoted(stage_schema_name)
+    destination = _quoted(destination_schema_name)
+    await _assert_selected_tax_source_rows(
+        database,
+        stage=stage,
+        destination=destination,
+        source_snapshot_key=source_snapshot_key,
+        unrelated_snapshot_key=unrelated_snapshot_key,
+        destination_snapshot_key=destination_snapshot_key,
+    )
+    await _assert_destination_tax_source_resolution(
+        database,
+        destination=destination,
+        destination_schema_name=destination_schema_name,
+        destination_snapshot_key=destination_snapshot_key,
+        publication=publication,
+    )
+
+
+async def _assert_selected_tax_source_rows(
+    database: Database,
+    *,
+    stage: str,
+    destination: str,
+    source_snapshot_key: int,
+    unrelated_snapshot_key: int,
+    destination_snapshot_key: int,
+) -> None:
+    """Prove selected tax receipt rows were copied without unrelated layout rows."""
+
+    for table_name in _TAX_SOURCE_RECEIPT_TABLES:
+        source_count = await database.scalar(
+            f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_key = :snapshot_key",
+            snapshot_key=source_snapshot_key,
+        )
+        destination_count = await database.scalar(
+            f"SELECT COUNT(*) FROM {destination}.{table_name} WHERE snapshot_key = :snapshot_key",
+            snapshot_key=destination_snapshot_key,
+        )
+        assert source_count > 0
+        assert destination_count == source_count
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_key = :snapshot_key",
+                snapshot_key=unrelated_snapshot_key,
+            )
+            > 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {destination}.{table_name} WHERE snapshot_key = :snapshot_key",
+                snapshot_key=unrelated_snapshot_key,
+            )
+            == 0
+        )
+
+
+async def _assert_destination_tax_source_resolution(
+    database: Database,
+    *,
+    destination: str,
+    destination_schema_name: str,
+    destination_snapshot_key: int,
+    publication,
+) -> None:
+    """Resolve a destination-local opaque tax reference through persisted records."""
+
+    tax_identity = await database.first(
+        f"SELECT tin_id_128, tin_hmac_sha256 FROM {destination}.ptg2_provider_tax_identity "
+        "WHERE snapshot_key = :snapshot_key ORDER BY tin_key LIMIT 1",
+        snapshot_key=destination_snapshot_key,
+    )
+    assert tax_identity is not None
+    billing_entity_ref = billing_refs.encode_billing_entity_ref(
+        snapshot_key=destination_snapshot_key,
+        tin_id_128=bytes(tax_identity.tin_id_128),
+        tin_hmac_sha256=bytes(tax_identity.tin_hmac_sha256),
+    )
+    async with database.transaction() as session:
+        resolved = await source_resolution.resolve_billing_entity_ref_source_scope(
+            session,
+            schema_name=destination_schema_name,
+            snapshot_key=destination_snapshot_key,
+            billing_entity_ref=billing_entity_ref,
+            source_publication=publication,
+        )
+    assert resolved is not None
+    assert resolved.publication == publication
+    assert resolved.witnesses
+
+
+@pytest.mark.asyncio
 async def test_native_archive_preparation_rejects_collision_without_partial_layout(
     tmp_path: Path,
     monkeypatch,
@@ -1065,7 +1500,7 @@ async def test_native_archive_preparation_rejects_collision_without_partial_layo
     database = Database()
     await database.connect()
     v4_e2e._bind_source_local_database(monkeypatch, database)
-    monkeypatch.setattr(adoption, "_REKEYED_TABLES", ())
+    monkeypatch.setattr(adoption, "_REKEYED_TABLES", adoption._FINALIZER_MAP_TABLES)
     try:
         source_key = await _seed_preparation_catalog(
             database, schema_name=stage_name, tmp_path=tmp_path, monkeypatch=monkeypatch
@@ -1115,7 +1550,7 @@ async def test_native_archive_preparation_reuse_rechecks_staged_cas_before_bindi
     monkeypatch.setattr(
         adoption,
         "_REKEYED_TABLES",
-        tuple(table for table in adoption._REKEYED_TABLES if table in _FIXTURE_REKEYED_TABLES),
+        _fixture_rekeyed_tables(),
     )
     try:
         source_key = await _seed_preparation_catalog(
