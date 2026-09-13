@@ -765,7 +765,13 @@ def _relations(schema_name: str) -> tuple[ArchiveRelation, ...]:
     artifact_table = f"{schema}.ptg2_artifact_manifest"
     import_run = f"import_run_id IN (SELECT import_run_id FROM {snapshot_table} WHERE snapshot_id = :snapshot_id)"
     return (
-        _snapshot_relations(snapshot, key, import_run, artifact_table)
+        _snapshot_relations(
+            snapshot,
+            key,
+            import_run,
+            snapshot_table,
+            artifact_table,
+        )
         + _source_evidence_relations(
             source_table,
             trace_set_table,
@@ -780,6 +786,7 @@ def _snapshot_relations(
     snapshot: str,
     key: str,
     import_run: str,
+    snapshot_table: str,
     artifact_table: str,
 ) -> tuple[ArchiveRelation, ...]:
     """Return snapshot, import, and artifact rows selected by native identity."""
@@ -789,12 +796,26 @@ def _snapshot_relations(
         ArchiveRelation("ptg2_import_run", import_run, "existing dependent import run"),
         ArchiveRelation("ptg2_import_job", import_run, "existing dependent import jobs"),
         ArchiveRelation("ptg2_source_catalog", import_run, "existing dependent source catalog"),
+        ArchiveRelation(
+            "ptg2_frozen_source_file_binding",
+            f"internal_run_id IN (SELECT import_run_id FROM {snapshot_table} WHERE snapshot_id = :snapshot_id)",
+            "immutable frozen source-file binding for the selected import",
+        ),
         ArchiveRelation("ptg2_v3_snapshot_binding", snapshot, "snapshot-to-layout binding"),
         ArchiveRelation("ptg2_v3_snapshot_scope", snapshot, "coverage scope"),
         ArchiveRelation("ptg2_v3_snapshot_plan_scope", snapshot, "plan scope"),
         ArchiveRelation("ptg2_v3_snapshot_source", snapshot, "sealed source assignments"),
         ArchiveRelation("ptg2_v3_candidate_audit_attestation", snapshot, "candidate audit"),
         ArchiveRelation("ptg2_v3_audit_occurrence", key, "audit occurrence evidence"),
+        *(
+            ArchiveRelation(table_name, snapshot, "snapshot-scoped allowed amount evidence")
+            for table_name in (
+                "ptg2_allowed_amount_plan",
+                "ptg2_allowed_amount_item",
+                "ptg2_allowed_amount_payment",
+                "ptg2_allowed_amount_provider_payment",
+            )
+        ),
         ArchiveRelation("ptg2_artifact_manifest", snapshot, "snapshot artifacts"),
         ArchiveRelation(
             "ptg2_artifact_blob_chunk",
@@ -847,6 +868,7 @@ def _layout_relations(key: str) -> tuple[ArchiveRelation, ...]:
     return (
         ArchiveRelation("ptg2_v3_snapshot_layout", key, "sealed layout"),
         ArchiveRelation("ptg2_v3_layout_fingerprint", key, "sealed layout fingerprint"),
+        ArchiveRelation("ptg2_v3_code", key, "sealed code dictionary"),
         ArchiveRelation(
             "ptg2_v3_snapshot_block",
             f"{key} AND object_kind IN ('price_atoms_v3', 'price_set_atom_memberships_v3')",
