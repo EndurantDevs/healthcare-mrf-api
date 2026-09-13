@@ -20,6 +20,8 @@ from sqlalchemy.schema import MetaData
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
+ownership = importlib.import_module("process.entity_address_snapshot_ownership")
+restore = importlib.import_module("process.entity_address_snapshot_restore")
 _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN"
 _DUMP_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_DUMP"
 _RESTORE_ENV = "HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_PG_RESTORE"
@@ -424,4 +426,42 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_restore_precreate_and_cleanup_retain_exact_owned_family():
+    """Precreate every real model relation and clean only its unchanged UUID owner."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn)
+    dataset_id = uuid4()
+    destination_schema = "address_restore_destination_" + uuid4().hex
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{destination_schema}"'))
+        async with sessions() as session, session.begin():
+            owner = await restore.precreate_entity_address_archive_restore(
+                session,
+                dataset_id=dataset_id,
+                db_schema=destination_schema,
+                import_date="20260913",
+            )
+            assert owner.schema_name == ownership.entity_address_archive_stage_schema(dataset_id)
+            assert {table_name for table_name, _ in owner.relation_oids} == {
+                relation.table_name for relation in source.entity_address_archive_relations()
+            }
+            await ownership.cleanup_entity_address_archive_stage(session, owner=owner)
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT to_regnamespace(:schema_name)"),
+                    {"schema_name": owner.schema_name},
+                )
+                is None
+            )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{destination_schema}" CASCADE'))
         await engine.dispose()

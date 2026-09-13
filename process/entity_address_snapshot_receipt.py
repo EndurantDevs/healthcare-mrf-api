@@ -105,11 +105,10 @@ def _json_scalar(value: object) -> str:
 
 
 async def _normalize_receipt_session(session, schema_name: str) -> None:
-    """Start a repeatable capture before any relation or catalog access."""
+    """Normalize a caller transaction before locking the full immutable family."""
     if not session.in_transaction():
         raise EntityAddressArchiveReceiptError("entity-address archive receipt requires a caller transaction")
     for setting in (
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
         "SET LOCAL TimeZone TO 'UTC'",
         "SET LOCAL DateStyle TO 'ISO, YMD'",
         "SET LOCAL IntervalStyle TO 'iso_8601'",
