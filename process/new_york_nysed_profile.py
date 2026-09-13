@@ -16,6 +16,7 @@ from process.kentucky_profile_acquisition import _read_artifact
 from process.massachusetts_profile_acquisition import encoded_json
 from process.massachusetts_profile_rows import _hash, _source_date
 from process.new_york_profile_acquisition import _validated_headers
+from process.new_york_nysed_profile_retries import read_timeout_responses
 from process.provider_directory_projection_json import decoded_json_object
 
 SOURCE_KEY = "new-york-nysed"
@@ -73,7 +74,11 @@ def _timestamp(timestamp):
 
 
 def request_descriptor(license_number):
-    """Describe the reproducible public request without retaining its header key."""
+    """Describe one request without its key or implicit client retries.
+
+    Explicit recovery of completed HTTP 408 responses is recorded separately in
+    the versioned timeout history pinned by the acquisition receipt.
+    """
     _require(isinstance(license_number, str) and re.fullmatch(r"[0-9]{6}", license_number), "license_invalid")
     return {
         "method": "GET",
@@ -398,6 +403,7 @@ def _retained_acquisition(destination, receipt_sha256, expected_outcome):
         <= _timestamp(receipt.get("completed_at")),
         "chronology_invalid",
     )
+    read_timeout_responses(destination, manifest_by_field, response_by_field, receipt)
     return manifest_by_field, response_by_field, receipt
 
 

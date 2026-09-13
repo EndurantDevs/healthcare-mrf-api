@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 
 import click
@@ -20,6 +21,7 @@ import click
 from db.models import ProviderProfileArtifact, ProviderProfileFact, ProviderProfileSourceRecord, db
 from process import new_york_nysed_profile as nysed
 from process import new_york_nysed_profile_acquisition as nysed_acquisition
+from process import new_york_nysed_profile_retries as nysed_retries
 from process import new_york_profile_acquisition as acquisition
 from process import new_york_profile_registry as registry
 from process.control_cancel import raise_if_cancelled
@@ -251,18 +253,30 @@ def _run_row(task, snapshot_pin, row_count, cohort, previous):
 
 async def _acquire_support(ctx, task, license_number, directory, run_id, api_key, budget):
     await _checkpoint(ctx, task, budget)
-    _check_resources(budget, sum(NYSED_FILES.values()), len(NYSED_FILES) + 2)
+    extra_files = len(nysed_retries.TIMEOUT_DELAYS)
+    _check_resources(
+        budget,
+        sum(NYSED_FILES.values()) + extra_files * nysed_retries.MAX_TIMEOUT_ENVELOPE_BYTES,
+        len(NYSED_FILES) + extra_files + 2,
+    )
     try:
-        await nysed_acquisition.acquire_license(license_number, directory, run_id=run_id, api_key=api_key)
+        await nysed_acquisition.acquire_license(
+            license_number,
+            directory,
+            run_id=run_id,
+            api_key=api_key,
+            checkpoint=partial(_checkpoint, ctx, task, budget),
+        )
     finally:
         _account_capture(directory, budget)
     _check_resources(budget)
-    hashes_by_name = _capture_inventory(directory, NYSED_FILES)
     receipt = _read_artifact(directory / "result.json", nysed.MAX_METADATA_BYTES)
+    manifest_by_field = _read_artifact(directory / "manifest.json", nysed.MAX_METADATA_BYTES)
+    limits_by_file = {**NYSED_FILES, **nysed_retries.timeout_files(receipt, manifest_by_field)}
+    hashes_by_name = _capture_inventory(directory, limits_by_file)
     receipt_pin = _hash(receipt)
     reader = nysed.read_held_acquisition if receipt.get("outcome") == "held" else nysed.read_acquisition
     replayed = reader(directory, receipt_sha256=receipt_pin)
-    manifest_by_field = _read_artifact(directory / "manifest.json", nysed.MAX_METADATA_BYTES)
     _require(
         manifest_by_field["run_id"] == run_id and manifest_by_field["license_number"] == license_number,
         "support_identity_changed",

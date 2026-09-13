@@ -12,6 +12,7 @@ from contextlib import aclosing
 from sqlalchemy import select
 
 from process import new_york_nysed_profile as nysed
+from process import new_york_nysed_profile_retries as nysed_retries
 from process import provider_profile_source_store as shared
 from process.massachusetts_profile_acquisition import encoded_json
 from process.new_york_profile_binding import ACQUISITION_FILES, CORROBORATED_METHOD, QUERY_SHA256
@@ -323,7 +324,9 @@ def _validate_nysed_capture(support, run_id, license_number):
     )
     _require(
         isinstance(files, dict)
-        and set(files) == {"manifest.json", "request.json", "response.json", "result.json"}
+        and set(files)
+        == {"manifest.json", "request.json", "response.json", "result.json"}
+        | set(nysed_retries.timeout_files(receipt, manifest, file_sha256=files))
         and all(_sha(digest) for digest in files.values())
         and files["manifest.json"] == _hash(manifest)
         and files["request.json"] == _hash(nysed.request_descriptor(license_number))
@@ -348,7 +351,10 @@ def _validate_nysed_receipt(support, run_id, license_number):
     }
     _require(
         outcome in {"acquired", "held"}
-        and set(receipt) == fields | ({"reason"} if outcome == "held" else set())
+        and set(receipt)
+        == fields
+        | ({"reason"} if outcome == "held" else set())
+        | ({"timeout_retries"} if "timeout_retries" in receipt else set())
         and receipt["schema_version"] == nysed.SCHEMA_VERSION
         and type(receipt["fact_count"]) is int
         and all(receipt[field + "_sha256"] == files[field + ".json"] for field in ("manifest", "request", "response")),
@@ -392,6 +398,9 @@ def _validate_nysed_identity(support, run_id, license_number):
         <= nysed._timestamp(identity["downloaded_at"])
         <= nysed._timestamp(support["receipt"]["completed_at"]),
         "nysed_chronology_invalid",
+    )
+    nysed_retries.timeout_files(
+        support["receipt"], support["capture_manifest"], final_response={"downloaded_at": identity["downloaded_at"]}
     )
 
 
