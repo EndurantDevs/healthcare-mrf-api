@@ -19,12 +19,6 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_PUBLISHED,
     PTG2_STATUS_VALIDATED,
 )
-from process.ptg_parts.ptg2_candidate_layout_identity import (
-    PTG2_CANDIDATE_V3_GENERATION,
-    PTG2_CANDIDATE_V4_GENERATION,
-    normalize_candidate_storage_generation,
-)
-from process.ptg_parts.ptg2_shared_blocks import bind_snapshot_to_shared_layout
 from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE,
     PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
@@ -32,17 +26,23 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     verify_candidate_audit_attestation_in_transaction,
     verify_held_candidate_attestation_in_transaction,
 )
-from process.ptg_parts.ptg2_lifecycle_lock import (
-    PTG2LifecycleLockDeferred,
-    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
-    acquire_ptg2_source_lifecycle_lock,
-    is_retryable_lifecycle_database_error,
+from process.ptg_parts.ptg2_candidate_layout_identity import (
+    PTG2_CANDIDATE_V3_GENERATION,
+    PTG2_CANDIDATE_V4_GENERATION,
+    normalize_candidate_storage_generation,
 )
 from process.ptg_parts.ptg2_legacy_global_projection_queue import (
     drain_legacy_global_projection_queue,
     mark_legacy_global_projection_dirty,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+    PTG2LifecycleLockDeferred,
+    acquire_ptg2_source_lifecycle_lock,
+    is_retryable_lifecycle_database_error,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_shared_blocks import bind_snapshot_to_shared_layout
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
 )
@@ -52,7 +52,6 @@ from process.ptg_parts.source_pointer_reviewed_activation import (
     completed_reviewed_activation,
     pin_reviewed_activation_predecessor,
 )
-
 
 logger = logging.getLogger(__name__)
 _GLOBAL_POINTER_LOCK_IDENTITY = "legacy_global_snapshot_pointer"
@@ -1202,52 +1201,18 @@ async def _commit_candidate_activation(
 ) -> dict[str, Any]:
     """Commit one source-local activation and its projection dirty marker."""
 
-    activation_result: dict[str, Any] | None = None
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(
-            session,
-            source_key=source_key,
-        )
-        if rollback_owner_id is not None:
-            completed_activation = await completed_reviewed_activation(
-                session,
-                schema_name=schema_name,
-                source_key=source_key,
-                snapshot_id=snapshot_id,
-                expected_current_snapshot_id=expected_current_snapshot_id,
-                expected_audit_only_attestation_digest=(
-                    expected_audit_only_attestation_digest
-                ),
-                rollback_owner_id=rollback_owner_id,
-            )
-            if completed_activation is not None:
-                activation_result = completed_activation
-        if activation_result is None:
-            await lock_writable_snapshot(
-                session,
-                db,
-                schema_name=schema_name,
-                snapshot_id=snapshot_id,
-            )
-            activation_result = await (
-                _activate_ptg2_source_candidate_in_transaction(
-                    session,
-                    schema_name=schema_name,
-                    source_key=source_key,
-                    snapshot_id=snapshot_id,
-                    expected_current_snapshot_id=expected_current_snapshot_id,
-                    expected_audit_only_attestation_digest=(
-                        expected_audit_only_attestation_digest
-                    ),
-                    rollback_owner_id=rollback_owner_id,
-                )
-            )
-        await mark_legacy_global_projection_dirty(
+        return await activate_ptg2_candidate_in_transaction(
             session,
             schema_name=schema_name,
             source_key=source_key,
+            snapshot_id=snapshot_id,
+            expected_current_snapshot_id=expected_current_snapshot_id,
+            expected_audit_only_attestation_digest=(
+                expected_audit_only_attestation_digest
+            ),
+            rollback_owner_id=rollback_owner_id,
         )
-    return activation_result
 
 
 async def _attach_legacy_global_pointer_status(
@@ -1655,6 +1620,137 @@ async def _complete_candidate_activation(
     )
 
 
+def _normalized_candidate_activation_inputs(
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+) -> tuple[str, str, str]:
+    """Normalize the identifiers required by candidate activation."""
+
+    normalized_schema_name = str(schema_name or "").strip()
+    normalized_source_key = str(source_key or "").strip().lower()
+    normalized_snapshot_id = str(snapshot_id or "").strip()
+    if not normalized_schema_name:
+        raise ValueError("schema_name is required")
+    if not normalized_source_key or not normalized_snapshot_id:
+        raise ValueError("source_key and snapshot_id are required")
+    return normalized_schema_name, normalized_source_key, normalized_snapshot_id
+
+
+async def _completed_reviewed_candidate_activation(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None,
+    expected_audit_only_attestation_digest: bytes | None,
+    rollback_owner_id: str | None,
+) -> dict[str, Any] | None:
+    """Return a reviewed activation already completed by its owner, if any."""
+
+    if rollback_owner_id is None:
+        return None
+    return await completed_reviewed_activation(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+        expected_audit_only_attestation_digest=expected_audit_only_attestation_digest,
+        rollback_owner_id=rollback_owner_id,
+    )
+
+
+async def _activate_uncompleted_candidate(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None,
+    expected_audit_only_attestation_digest: bytes | None,
+    rollback_owner_id: str | None,
+) -> dict[str, Any]:
+    """Lock and activate a candidate that has no completed review result."""
+
+    await lock_writable_snapshot(
+        session,
+        db,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+    )
+    return await _activate_source_candidate_tx(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+        expected_audit_only_attestation_digest=expected_audit_only_attestation_digest,
+        rollback_owner_id=rollback_owner_id,
+    )
+
+
+async def activate_ptg2_candidate_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None = None,
+    expected_audit_only_attestation_digest: bytes | None = None,
+    rollback_owner_id: str | None = None,
+) -> dict[str, Any]:
+    """Activate one candidate through a caller-owned open transaction.
+
+    The caller owns transaction commit or rollback.  This function obtains the
+    required shared GC/source lifecycle fence before it locks and validates the
+    candidate, so all candidate, attestation, source-pointer, and plan-pointer
+    writes remain in that one transaction.
+    """
+
+    (
+        normalized_schema_name,
+        normalized_source_key,
+        normalized_snapshot_id,
+    ) = _normalized_candidate_activation_inputs(
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+    )
+    await _acquire_source_pointer_gc_lock(
+        session,
+        source_key=normalized_source_key,
+    )
+    activation_result = await _completed_reviewed_candidate_activation(
+        session,
+        schema_name=normalized_schema_name,
+        source_key=normalized_source_key,
+        snapshot_id=normalized_snapshot_id,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+        expected_audit_only_attestation_digest=expected_audit_only_attestation_digest,
+        rollback_owner_id=rollback_owner_id,
+    )
+    if activation_result is None:
+        activation_result = await _activate_uncompleted_candidate(
+            session,
+            schema_name=normalized_schema_name,
+            source_key=normalized_source_key,
+            snapshot_id=normalized_snapshot_id,
+            expected_current_snapshot_id=expected_current_snapshot_id,
+            expected_audit_only_attestation_digest=expected_audit_only_attestation_digest,
+            rollback_owner_id=rollback_owner_id,
+        )
+    await mark_legacy_global_projection_dirty(
+        session,
+        schema_name=normalized_schema_name,
+        source_key=normalized_source_key,
+    )
+    return activation_result
+
+
+activate_ptg2_source_candidate_in_transaction = activate_ptg2_candidate_in_transaction
 _activate_ptg2_source_candidate_in_transaction = _activate_source_candidate_tx
 
 
