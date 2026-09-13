@@ -5,18 +5,18 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
-
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
@@ -81,6 +81,27 @@ async def _create_model_family(connection, schema_name: str) -> None:
     await connection.run_sync(metadata.create_all)
 
 
+async def _create_alias_validation_relations(connection, schema_name: str) -> None:
+    """Provide the actual empty alias relations required by native stage validation."""
+
+    await connection.execute(
+        text(
+            f'CREATE TABLE "{schema_name}"."address_alias_state_v1" '
+            "(singleton boolean PRIMARY KEY, schema_version smallint NOT NULL, "
+            "active_ruleset_version smallint NOT NULL, generation bigint NOT NULL)"
+        )
+    )
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."address_alias_state_v1" '
+            "(singleton, schema_version, active_ruleset_version, generation) VALUES (true, 2, 1, 0)"
+        )
+    )
+    await connection.execute(
+        text(f'CREATE TABLE "{schema_name}"."address_alias_v1" (source_address_key uuid, revoked_at timestamptz)')
+    )
+
+
 async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
     """Create the live model family with one value that must survive staging."""
 
@@ -102,11 +123,17 @@ async def _seed_receipt_family(connection, schema_name: str, *, reversed_rows: b
     await connection.execute(
         text(
             f'INSERT INTO "{schema_name}"."entity_address_unified" '
-            "(entity_type, entity_id, location_key, checksum, type) "
-            "VALUES (:entity_type, :entity_id, :location_key, :checksum, 'primary')"
+            "(entity_type, entity_id, location_key, checksum, type, base_address_version) "
+            "VALUES (:entity_type, :entity_id, :location_key, :checksum, 'primary', :base_address_version)"
         ),
         [
-            {"entity_type": "synthetic", "entity_id": location_key, "location_key": location_key, "checksum": checksum}
+            {
+                "entity_type": "synthetic",
+                "entity_id": location_key,
+                "location_key": location_key,
+                "checksum": checksum,
+                "base_address_version": source.entity_address_unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX + "0",
+            }
             for location_key, checksum in rows
         ],
     )
@@ -165,6 +192,16 @@ async def _assert_live_sentinel(connection, schema_name: str, table_name: str) -
     """Require that a relation still carries the pre-stage sentinel value."""
 
     assert await connection.scalar(text(f'SELECT location_key FROM "{schema_name}"."{table_name}"')) == "live-sentinel"
+
+
+async def _assert_stage_share_pins_block_ddl(sessions, schema_name: str, table_name: str) -> None:
+    """Require a rehydrated caller transaction to retain its exact stage lock."""
+
+    async with sessions() as contender, contender.begin():
+        await contender.execute(text("SET LOCAL lock_timeout = '100ms'"))
+        with pytest.raises(DBAPIError) as error:
+            await contender.execute(text(f'ALTER TABLE "{schema_name}"."{table_name}" RENAME TO "blocked_rename"'))
+        assert getattr(error.value.orig, "sqlstate", None) == "55P03"
 
 
 def _restore_archive(dump_path: Path, pg_restore: str, environment) -> None:
@@ -426,6 +463,128 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live_schema}" CASCADE'))
+        await engine.dispose()
+
+
+async def _prepare_nonempty_restore_fixture(engine, sessions, destination_schema: str, dataset_id):
+    """Create incumbent and owned staged rows that use the actual native model family."""
+
+    async with engine.begin() as connection:
+        await _create_model_family(connection, destination_schema)
+        await _create_alias_validation_relations(connection, destination_schema)
+        incumbent_relation_oid = await connection.scalar(
+            text(
+                "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
+                "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                "WHERE namespace.nspname = :schema_name AND relation.relname = 'entity_address_unified'"
+            ),
+            {"schema_name": destination_schema},
+        )
+        await connection.execute(
+            text(
+                f'INSERT INTO "{destination_schema}"."entity_address_unified" '
+                "(entity_type, entity_id, location_key, checksum, type) "
+                "VALUES ('synthetic', 'incumbent', 'live-sentinel', 1, 'primary')"
+            )
+        )
+    async with sessions() as session, session.begin():
+        owner = await restore.precreate_entity_address_archive_restore(
+            session,
+            dataset_id=dataset_id,
+            db_schema=destination_schema,
+            import_date="20260913",
+        )
+        await _seed_receipt_family(session, owner.schema_name, reversed_rows=False)
+    expected_receipt = await _capture_receipt(sessions, owner.schema_name, "UTC")
+    return owner, expected_receipt, incumbent_relation_oid
+
+
+async def _assert_rehydrated_restore_state(
+    sessions,
+    *,
+    destination_schema: str,
+    prepared_restore,
+    stored,
+    incumbent_relation_oid: int,
+) -> None:
+    """Require rehydration to preserve incumbent data and retain restored rows under pins."""
+
+    async with sessions() as session, session.begin():
+        rehydrated = await restore.rehydrate_entity_address_archive_restore(session, stored=stored)
+        assert rehydrated.context == prepared_restore.context
+        assert rehydrated.publish_validation == prepared_restore.native_validation
+        assert (
+            await session.scalar(
+                text(
+                    "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
+                    "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                    "WHERE namespace.nspname = :schema_name AND relation.relname = 'entity_address_unified'"
+                ),
+                {"schema_name": destination_schema},
+            )
+            == incumbent_relation_oid
+        )
+        assert (
+            await session.scalar(text(f'SELECT location_key FROM "{destination_schema}"."entity_address_unified"'))
+            == "live-sentinel"
+        )
+        assert (
+            await session.scalar(
+                text(
+                    f'SELECT COUNT(*) FROM "{destination_schema}"."entity_address_unified_20260913" '
+                    "WHERE location_key IN ('first', 'second')"
+                )
+            )
+            == 2
+        )
+        await _assert_stage_share_pins_block_ddl(
+            sessions, destination_schema, prepared_restore.stage_relation_oids[0][0]
+        )
+        assert {table_name for table_name, _ in prepared_restore.stage_relation_oids} == {
+            f"{relation.table_name}_20260913" for relation in source.entity_address_archive_relations()
+        }
+        assert (
+            await session.scalar(
+                text("SELECT to_regnamespace(:schema_name)"), {"schema_name": prepared_restore.ownership.schema_name}
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_restore_finalization_rehydrates_pinned_stage():
+    """Finalize an owned archive beside live relations, then rehydrate only its fences."""
+
+    async_dsn, _ = _native_test_connection()
+    engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
+    destination_schema = "address_restore_destination_" + uuid4().hex
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        owner, expected_receipt, incumbent_relation_oid = await _prepare_nonempty_restore_fixture(
+            engine,
+            sessions,
+            destination_schema,
+            uuid4(),
+        )
+        async with sessions() as session, session.begin():
+            prepared_restore = await restore.finalize_entity_address_archive_restore(
+                session,
+                owner=owner,
+                semantic_receipt=expected_receipt,
+                db_schema=destination_schema,
+                import_date="20260913",
+            )
+            stored = prepared_restore.as_dict()
+        await _assert_rehydrated_restore_state(
+            sessions,
+            destination_schema=destination_schema,
+            prepared_restore=prepared_restore,
+            stored=stored,
+            incumbent_relation_oid=incumbent_relation_oid,
+        )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{destination_schema}" CASCADE'))
         await engine.dispose()
 
 

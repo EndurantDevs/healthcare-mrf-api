@@ -30,7 +30,6 @@ from process.entity_address_snapshot_receipt import (
     validate_entity_address_archive_receipt,
 )
 
-
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -252,6 +251,40 @@ async def _primary_index_name(session: Any, relation_oid: int) -> str:
     return value
 
 
+async def _owned_sequence_names(session: Any, relation_oid: int) -> tuple[str, ...]:
+    """Return only serial or identity sequences owned by one captured stage relation."""
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT sequence_relation.relname FROM pg_catalog.pg_class AS sequence_relation "
+                "JOIN pg_catalog.pg_depend AS dependency ON dependency.classid = 'pg_class'::regclass "
+                "AND dependency.objid = sequence_relation.oid "
+                "WHERE sequence_relation.relkind = 'S' AND dependency.refclassid = 'pg_class'::regclass "
+                "AND dependency.refobjid = :relation_oid AND dependency.deptype IN ('a', 'i') "
+                "ORDER BY sequence_relation.relname"
+            ),
+            {"relation_oid": relation_oid},
+        )
+    ).mappings()
+    sequence_names = tuple(str(row["relname"]) for row in rows)
+    if len(sequence_names) != len(set(sequence_names)):
+        raise EntityAddressSnapshotRestoreError("entity-address restore sequence ownership is invalid")
+    return sequence_names
+
+
+def _stage_sequence_name(table_name: str, stage_table_name: str, sequence_name: str) -> str:
+    """Derive a native stage sequence name without accepting arbitrary destination DDL."""
+
+    prefix = table_name + "_"
+    if not sequence_name.startswith(prefix):
+        raise EntityAddressSnapshotRestoreError("entity-address restore sequence name is invalid")
+    expected_name = stage_table_name + sequence_name.removeprefix(table_name)
+    if len(expected_name.encode("utf-8")) > entity_address_unified.POSTGRES_IDENTIFIER_MAX_LENGTH:
+        raise EntityAddressSnapshotRestoreError("entity-address restore sequence name is invalid")
+    return expected_name
+
+
 async def _move_owned_relations(
     session: Any,
     *,
@@ -265,18 +298,41 @@ async def _move_owned_relations(
     for table_name, relation_oid in owner.relation_oids:
         stage_table_name = stage_names[table_name]
         primary_index = await _primary_index_name(session, relation_oid)
+        sequence_names = await _owned_sequence_names(session, relation_oid)
         await session.execute(
-            text(f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(table_name)} SET SCHEMA {_quoted(db_schema)}")
-        )
-        await session.execute(
-            text(f"ALTER TABLE {_quoted(db_schema)}.{_quoted(table_name)} RENAME TO {_quoted(stage_table_name)}")
+            text(
+                f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(table_name)} RENAME TO {_quoted(stage_table_name)}"
+            )
         )
         primary_name = entity_address_unified._stage_index_name(stage_table_name, "primary")
         await session.execute(
-            text(f"ALTER INDEX {_quoted(db_schema)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}")
+            text(f"ALTER INDEX {_quoted(owner.schema_name)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}")
+        )
+        for sequence_name in sequence_names:
+            await session.execute(
+                text(
+                    f"ALTER SEQUENCE {_quoted(owner.schema_name)}.{_quoted(sequence_name)} RENAME TO "
+                    f"{_quoted(_stage_sequence_name(table_name, stage_table_name, sequence_name))}"
+                )
+            )
+        await session.execute(
+            text(
+                f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(stage_table_name)} SET SCHEMA {_quoted(db_schema)}"
+            )
         )
         stage_oids.append((stage_table_name, relation_oid))
     return tuple(sorted(stage_oids))
+
+
+async def _verify_moved_stage_oids(
+    session: Any,
+    *,
+    db_schema: str,
+    stage_oids: tuple[tuple[str, int], ...],
+) -> None:
+    """Require each moved owner relation to retain its captured OID and new name."""
+
+    await _verify_stored_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
 
 
 async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
@@ -326,6 +382,7 @@ async def finalize_entity_address_archive_restore(
         db_schema=normalized_schema,
         stage_names=stage_names,
     )
+    await _verify_moved_stage_oids(session, db_schema=normalized_schema, stage_oids=stage_oids)
     await _drop_empty_owned_schema(session, validated_owner)
     async with db.bind_existing_session(session):
         prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
@@ -389,14 +446,47 @@ async def _verify_stored_stage_oids(
             raise EntityAddressSnapshotRestoreError("entity-address restore stage OID differs")
 
 
-async def rehydrate_entity_address_archive_restore(
+async def _lock_stored_stage_relations(
     session: Any,
     *,
-    stored: Mapping[str, Any],
-) -> adoption.PreparedEntityAddressSnapshotAdoption:
-    """Rebuild only the immutable native cutover plan after rechecking local fences."""
+    db_schema: str,
+    stage_oids: tuple[tuple[str, int], ...],
+) -> None:
+    """Keep the exact restored stage stable through the caller-owned activation transaction."""
 
-    _require_caller_transaction(session)
+    relations = ", ".join(f"{_quoted(db_schema)}.{_quoted(table_name)}" for table_name, _ in stage_oids)
+    await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
+
+
+def _rehydrated_context(value: Any) -> dict[str, Any]:
+    """Require the exact durable native preparation context before cutover."""
+
+    context = _json_object(value, "context")
+    if (
+        not {"address_alias_generation", "stage_persistence"} <= set(context)
+        or set(context) - {"address_alias_generation", "stage_persistence", "phase_timings"}
+        or type(context["address_alias_generation"]) is not int
+        or context["address_alias_generation"] < 0
+        or context["stage_persistence"] != "p"
+    ):
+        raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid")
+    return context
+
+
+def _rehydrated_native_validation(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the durable native validation to the same alias generation as preparation."""
+
+    native_validation = _json_object(value, "native_validation")
+    if native_validation.get("address_alias_generation") != context["address_alias_generation"]:
+        raise EntityAddressSnapshotRestoreError("entity-address restore native validation is invalid")
+    return native_validation
+
+
+def _validated_rehydration_state(
+    stored: Mapping[str, Any],
+) -> tuple[str, str, tuple[tuple[str, int], ...], dict[str, Any], dict[str, Any]]:
+    """Validate durable restore fields and return only the pinned local activation state."""
+
     required_fields = {
         "ownership",
         "db_schema",
@@ -409,17 +499,39 @@ async def rehydrate_entity_address_archive_restore(
     if not isinstance(stored, Mapping) or set(stored) != required_fields:
         raise EntityAddressSnapshotRestoreError("entity-address restore record is invalid")
     try:
-        validate_entity_address_archive_stage_ownership(stored["ownership"])
+        owner = validate_entity_address_archive_stage_ownership(stored["ownership"])
         semantic_receipt = validate_entity_address_archive_receipt(stored["semantic_receipt"])
     except (EntityAddressArchiveOwnershipError, EntityAddressArchiveReceiptError) as error:
         raise EntityAddressSnapshotRestoreError(str(error)) from error
-    db_schema = stored["db_schema"]
-    import_date = stored["import_date"]
     normalized_schema, normalized_date, stage_names = _stage_plan(
-        db_schema=db_schema,
-        import_date=import_date,
+        db_schema=stored["db_schema"],
+        import_date=stored["import_date"],
     )
     stage_oids = _stored_stage_oids(stored["stage_relation_oids"], stage_names)
+    expected_stage_oids = tuple(
+        sorted((stage_names[table_name], relation_oid) for table_name, relation_oid in owner.relation_oids)
+    )
+    if stage_oids != expected_stage_oids:
+        raise EntityAddressSnapshotRestoreError("entity-address restore stage ownership is invalid")
+    if not isinstance(stored["semantic_receipt"], Mapping) or semantic_receipt.as_dict() != dict(
+        stored["semantic_receipt"]
+    ):
+        raise EntityAddressSnapshotRestoreError("entity-address restore semantic receipt is invalid")
+    context = _rehydrated_context(stored["context"])
+    native_validation = _rehydrated_native_validation(stored["native_validation"], context)
+    return normalized_schema, normalized_date, stage_oids, context, native_validation
+
+
+async def rehydrate_entity_address_archive_restore(
+    session: Any,
+    *,
+    stored: Mapping[str, Any],
+) -> adoption.PreparedEntityAddressSnapshotAdoption:
+    """Rebuild only the immutable native cutover plan after rechecking local fences."""
+
+    _require_caller_transaction(session)
+    normalized_schema, normalized_date, stage_oids, context, native_validation = _validated_rehydration_state(stored)
+    await _lock_stored_stage_relations(session, db_schema=normalized_schema, stage_oids=stage_oids)
     await _verify_stored_stage_oids(session, db_schema=normalized_schema, stage_oids=stage_oids)
     (
         stage_cls,
@@ -437,8 +549,8 @@ async def rehydrate_entity_address_archive_restore(
         patch_statements=patch_statements,
         relation_names=relation_names,
         required_names=required_names,
-        context=_json_object(stored["context"], "context"),
-        publish_validation=_json_object(stored["native_validation"], "native_validation"),
+        context=context,
+        publish_validation=native_validation,
     )
 
 
