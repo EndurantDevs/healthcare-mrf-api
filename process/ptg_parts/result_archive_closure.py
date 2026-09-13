@@ -197,12 +197,16 @@ def _validate_layout(layout_by_field: Mapping[str, Any]) -> tuple[int, bytes, by
     layout_serving = layout_manifest.get("serving_index")
     if not isinstance(serving, Mapping) or not isinstance(layout_serving, Mapping):
         raise ResultArchiveClosureError("archive closure has no serving-index metadata")
-    snapshot_key = int(layout_by_field.get("snapshot_key"))
+    snapshot_key = _required_nonnegative_int(layout_by_field.get("snapshot_key"), "snapshot key")
+    serving_snapshot_key = _required_nonnegative_int(serving.get("shared_snapshot_key"), "serving snapshot key")
+    layout_snapshot_key = _required_nonnegative_int(
+        layout_serving.get("shared_snapshot_key"), "layout serving snapshot key"
+    )
     if (
         serving.get("storage_generation") != PTG2_V4_SHARED_GENERATION
         or layout_serving.get("storage_generation") != PTG2_V4_SHARED_GENERATION
-        or int(serving.get("shared_snapshot_key", -1)) != snapshot_key
-        or int(layout_serving.get("shared_snapshot_key", -1)) != snapshot_key
+        or serving_snapshot_key != snapshot_key
+        or layout_snapshot_key != snapshot_key
     ):
         raise ResultArchiveClosureError("archive closure serving metadata does not bind this layout")
     return (

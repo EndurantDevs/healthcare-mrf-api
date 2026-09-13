@@ -926,6 +926,34 @@ async def _prepare_new_destination_layout(
     )
 
 
+async def _authenticated_seal_mapping_digest(
+    session: Any,
+    *,
+    preparation: _NewLayoutPreparation,
+    sealed_snapshot_key: int,
+    sealed_mapping_digest: bytes,
+) -> bytes:
+    """Authenticate a seal-time canonical reuse before its key is bound."""
+
+    if sealed_snapshot_key == preparation.destination_snapshot_key:
+        return sealed_mapping_digest
+    canonical_manifest = _remapped_layout_manifest(
+        preparation.layout_manifest,
+        source_snapshot_key=preparation.destination_snapshot_key,
+        destination_snapshot_key=sealed_snapshot_key,
+    )
+    return await _reused_mapping_digest(
+        session,
+        schema_name=preparation.schema_name,
+        staging_schema_name=preparation.staging_schema_name,
+        source_snapshot_key=preparation.source_snapshot_key,
+        destination_snapshot_key=sealed_snapshot_key,
+        support_digest=preparation.support_digest,
+        layout_manifest=canonical_manifest,
+        max_staged_block_rows=preparation.max_staged_block_rows,
+    )
+
+
 async def _bind_prepared_snapshot(
     session: Any,
     *,
@@ -976,6 +1004,34 @@ async def _prepare_reused_destination_layout(
     )
 
 
+async def _prepare_and_bind_new_destination_layout(
+    session: Any,
+    *,
+    preparation: _NewLayoutPreparation,
+    destination_snapshot_id: str,
+) -> PreparedResultArchiveLayout:
+    """Seal a copied layout, authenticate canonical reuse, and bind it."""
+
+    sealed_key, mapping_digest = await _prepare_new_destination_layout(
+        session,
+        preparation=preparation,
+    )
+    mapping_digest = await _authenticated_seal_mapping_digest(
+        session,
+        preparation=preparation,
+        sealed_snapshot_key=sealed_key,
+        sealed_mapping_digest=mapping_digest,
+    )
+    return await _bind_prepared_snapshot(
+        session,
+        schema_name=preparation.schema_name,
+        snapshot_id=destination_snapshot_id,
+        snapshot_key=sealed_key,
+        source_snapshot_key=preparation.source_snapshot_key,
+        mapping_digest=mapping_digest,
+    )
+
+
 async def prepare_result_archive_layout(
     session: Any,
     *,
@@ -1021,17 +1077,10 @@ async def prepare_result_archive_layout(
             destination_snapshot_id=destination_snapshot,
         )
 
-    sealed_key, mapping_digest = await _prepare_new_destination_layout(
+    return await _prepare_and_bind_new_destination_layout(
         session,
         preparation=preparation,
-    )
-    return await _bind_prepared_snapshot(
-        session,
-        schema_name=destination_schema,
-        snapshot_id=destination_snapshot,
-        snapshot_key=sealed_key,
-        source_snapshot_key=source_key,
-        mapping_digest=mapping_digest,
+        destination_snapshot_id=destination_snapshot,
     )
 
 
