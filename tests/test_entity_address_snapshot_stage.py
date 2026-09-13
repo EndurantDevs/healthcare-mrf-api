@@ -13,6 +13,8 @@ import pytest
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
+ownership = importlib.import_module("process.entity_address_snapshot_ownership")
+restore = importlib.import_module("process.entity_address_snapshot_restore")
 
 
 def _session(snapshot: str | None = None):
@@ -162,6 +164,66 @@ def test_stage_receipt_accepts_only_the_model_derived_seven_table_family():
 
     assert observed.as_dict() == value
     assert len(observed.tables) == 7
+
+
+def test_stage_ownership_token_is_closed_to_the_uuid_model_family():
+    dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+    relation_oids = tuple(
+        (model.__tablename__, ordinal)
+        for ordinal, model in enumerate(sorted(receipt._models(), key=lambda item: item.__tablename__), start=1)
+    )
+    owner = ownership.EntityAddressArchiveStageOwnership(
+        dataset_id=dataset_id,
+        schema_name=ownership.entity_address_archive_stage_schema(dataset_id),
+        schema_oid=99,
+        relation_oids=relation_oids,
+    )
+
+    assert ownership.validate_entity_address_archive_stage_ownership(owner.as_dict()) == owner
+    tampered = owner.as_dict()
+    tampered["relation_oids"][0]["oid"] = 0
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="token is invalid"):
+        ownership.validate_entity_address_archive_stage_ownership(tampered)
+
+
+@pytest.mark.asyncio
+async def test_stage_ownership_cleanup_ignores_only_an_absent_rolled_back_schema():
+    dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+    owner = ownership.EntityAddressArchiveStageOwnership(
+        dataset_id=dataset_id,
+        schema_name=ownership.entity_address_archive_stage_schema(dataset_id),
+        schema_oid=99,
+        relation_oids=tuple(
+            (model.__tablename__, ordinal)
+            for ordinal, model in enumerate(sorted(receipt._models(), key=lambda item: item.__tablename__), start=1)
+        ),
+    )
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=None), execute=AsyncMock())
+
+    await ownership.cleanup_entity_address_archive_stage(session, owner=owner)
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stage_receipt_uses_family_locks_without_late_transaction_isolation_change():
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+
+    await receipt._normalize_receipt_session(session, "address_stage")
+
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements
+    assert all("SET TRANSACTION" not in statement for statement in statements)
+
+
+def test_restore_uses_native_safe_stage_mapping_for_all_seven_models():
+    _schema, _import_date, stage_table_by_name = restore._stage_plan(
+        db_schema="mrf",
+        import_date="20260913",
+    )
+
+    assert set(stage_table_by_name) == {model.__tablename__ for model in receipt._models()}
+    assert set(stage_table_by_name.values()) == {f"{model.__tablename__}_20260913" for model in receipt._models()}
 
 
 @pytest.mark.asyncio
