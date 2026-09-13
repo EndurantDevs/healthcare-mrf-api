@@ -258,10 +258,13 @@ async def test_complete_cohort_is_not_limited_to_one_hundred(managed_case):
     assert not state.pending
 
 
-async def test_null_empty_search_retains_hold_without_nysed_or_provider_rows(managed_case):
+@pytest.mark.parametrize("incomplete_identity", [False, True])
+async def test_held_search_continues_without_nysed_or_provider_rows(managed_case, incomplete_identity):
     state = managed_case([{"license": "111111", "total": 0}, {"license": "222222", "nysed_held": True}])
     response = _search(0)
     response["data"]["physicians"] = None
+    if incomplete_identity:
+        response = _search(physicianLastName="")
     state.sessions[0].responses[0] = SourceResponse(response)
     result = await worker.import_profiles({}, TASK)
     assert result["responses"] == 2 and result["held_attempts"] == result["acquired_profiles"] == 1
@@ -269,7 +272,7 @@ async def test_null_empty_search_retains_hold_without_nysed_or_provider_rows(man
     assert not (state.directory / "nysed" / "111111").exists()
     bundle = json.loads((state.directory / "manifest.json").read_bytes())
     descriptor = bundle["profiles"]["111111"]
-    assert descriptor["acquisition_outcome"] == "held" and descriptor["reported_total"] == 0
+    assert descriptor["acquisition_outcome"] == "held" and descriptor["reported_total"] == (1 if incomplete_identity else 0)
     assert descriptor["record_id"] is None and descriptor["facts"] == {}
     assert set(bundle["acquisition"]["nysed_support"]) == {"222222"}
     records = [row for model, rows, _ in state.writes if model == worker.ProviderProfileSourceRecord for row in rows]

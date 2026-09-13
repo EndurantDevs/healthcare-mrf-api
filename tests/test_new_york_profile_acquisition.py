@@ -224,7 +224,7 @@ async def test_inconsistent_counts_and_pages_are_failures(source_session, change
 
 
 @pytest.mark.parametrize("identity", [{"physicianID": 91001}, {"physicianID": "../1"}, {"physicianID": "0"},
-                                    {"physicianFirstName": ""}, {"statusCode": None}, {"practiceLocations": None}])
+                                    {"physicianFirstName": None}, {"statusCode": None}, {"practiceLocations": None}])
 async def test_invalid_search_identity_cannot_form_profile_url(source_session, identity):
     session = source_session(SourceResponse(_search(**identity)))
     with pytest.raises(ValueError, match="search_identity_invalid"):
@@ -349,3 +349,18 @@ async def test_exclusive_request_collision_stops_before_dispatch(source_session,
     with pytest.raises(FileExistsError):
         await _acquire(session)
     assert session.requests == [] and (session.destination / "search.request.json").read_bytes() == b"collision"
+
+
+@pytest.mark.parametrize("identity", [
+    {"physicianFirstName": ""}, {"physicianLastName": ""},
+    {"physicianFirstName": " ", "physicianLastName": " "},
+])
+async def test_blank_search_names_are_retained_without_profile_fetch(source_session, identity):
+    response = SourceResponse(_search(**identity))
+    session = source_session(response)
+    result = await _acquire(session)
+    assert result == {"outcome": "held", "reason": "search_identity_incomplete", "reported_total": 1,
+                      "source_record": None, "facts": []}
+    assert len(session.requests) == 1
+    assert {path.name for path in session.destination.iterdir()} == set(retained.HELD_FILES)
+    assert base64.b64decode(_artifact(session, "search.response.json")["body_base64"]) == response.body

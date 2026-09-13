@@ -15,6 +15,7 @@ from process import new_york_nysed_profile as nysed
 from process import new_york_nysed_profile_retries as nysed_retries
 from process import provider_profile_source_store as shared
 from process.massachusetts_profile_acquisition import encoded_json
+from process.new_york_profile_acquisition import _held_search_reason
 from process.new_york_profile_binding import ACQUISITION_FILES, CORROBORATED_METHOD, QUERY_SHA256
 from process.new_york_profile_registry import REGISTRY_PRECONDITIONS
 from process.new_york_profile_retained import HELD_FILES, _validated_manifest
@@ -106,14 +107,13 @@ def prepare_profile(run_id, root, bound_result, *, capture_manifest, file_sha256
             bound_result
             == {
                 "outcome": "held",
-                "reason": "search_not_singleton",
+                "reason": _held_search_reason(total),
                 "reported_total": total,
                 "source_record": None,
                 "facts": [],
             }
             and type(total) is int
-            and total >= 0
-            and total != 1,
+            and total >= 0,
             "held_attempt_invalid",
         )
         descriptor_by_field["reported_total"] = total
@@ -242,10 +242,9 @@ def _validate_descriptor(descriptor_by_field, run_id, license_number):
     if is_held:
         _require(
             descriptor_by_field["binding_outcome"] is None
-            and descriptor_by_field["reason"] == "search_not_singleton"
+            and descriptor_by_field["reason"] == _held_search_reason(descriptor_by_field["reported_total"])
             and type(descriptor_by_field["reported_total"]) is int
             and descriptor_by_field["reported_total"] >= 0
-            and descriptor_by_field["reported_total"] != 1
             and descriptor_by_field["capture_artifact_id"] is None
             and descriptor_by_field["record_id"] is None
             and descriptor_by_field["record_sha256"] is None
