@@ -149,6 +149,38 @@ def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
         _assert_strict_scanner_run(run)
 
 
+def test_v4_scanner_emits_native_factor_artifacts(tmp_path):
+    """Exercise the scanner's normal V4 factor output, not test-built factors."""
+    run = _run_scanner(
+        _built_scanner_binary(),
+        tmp_path,
+        "native-v4-factors",
+        arch="postgres_binary_v3",
+        provider_references_first=True,
+        grouped=False,
+        provider_graph_v4=True,
+        tin_token_secret=bytes(range(32)),
+    )
+
+    frame_kinds = {kind for kind, _payload in run["frames"]}
+    assert {
+        "manifest_provider_set_component_sidecar_file",
+        "manifest_provider_component_group_sidecar_file",
+        "manifest_provider_group_tax_identity_sidecar_file",
+        "source_audit_witness_file",
+    } <= frame_kinds
+    assert not {"manifest_provider_forward_sidecar_file", "manifest_provider_inverted_sidecar_file"} & frame_kinds
+    assert all(
+        run[path_key].exists()
+        for path_key in (
+            "provider_set_component_path",
+            "provider_component_group_path",
+            "provider_group_tax_identity_path",
+        )
+    )
+    _assert_scanner_source_witness(run)
+
+
 def test_v3_worker_and_serial_paths_preserve_source_rate_occurrences(tmp_path):
     scanner_binary = _built_scanner_binary()
     runs = [

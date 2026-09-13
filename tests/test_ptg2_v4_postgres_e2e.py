@@ -109,6 +109,7 @@ from tests import test_ptg2_scanner_v3_runs as scanner_support
 
 ROOT = Path(__file__).resolve().parents[1]
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
+ptg_runtime = importlib.import_module("process.ptg")
 MIGRATION_PATH = (
     ROOT / "alembic" / "versions" / "20260723100000_ptg2_v4_snapshot_map_pack.py"
 )
@@ -614,6 +615,8 @@ def _scan_downloaded_frozen_parts(
             provider_references_first=True,
             grouped=False,
             input_artifact=Path(downloaded_job.raw_artifact.raw_path),
+            provider_graph_v4=True,
+            tin_token_secret=bytes(range(32)),
         )
         for ordinal, downloaded_job in enumerate(downloaded_jobs, start=1)
     )
@@ -732,38 +735,55 @@ def _write_provider_set_map(
     return provider_map
 
 
-def _scan_provider_graph_fixture(
+async def _scan_provider_graph_fixture(
     tmp_path: Path,
     scans: tuple[dict[str, object], ...],
 ) -> tuple[list[dict[str, object]], Path, dict[int, bytes]]:
-    """Convert the two scanner identities into the V4 compiler input."""
+    """Build the V4 compiler input from the exact scanner factor outputs."""
 
     provider_sets_by_key: dict[int, bytes] = {}
-    set_component_pairs = []
-    component_group_pairs = []
-    group_npi_pairs = []
-    npi_group_pairs = []
-    tax_observations = []
+    artifacts: list[dict[str, object]] = []
     for provider_set_key, scan in enumerate(scans):
-        provider_set_id, provider_group_id, npi_ids = _provider_graph_identities(scan)
+        provider_set_id, _provider_group_id, _npi_ids = _provider_graph_identities(
+            scan
+        )
         provider_sets_by_key[provider_set_key] = provider_set_id
-        component_id = hashlib.blake2b(
-            b"frozen-component:" + provider_group_id,
-            digest_size=16,
-        ).digest()
-        set_component_pairs.append((provider_set_id, component_id))
-        component_group_pairs.append((component_id, provider_group_id))
-        group_npi_pairs.extend((provider_group_id, npi_id) for npi_id in npi_ids)
-        npi_group_pairs.extend((npi_id, provider_group_id) for npi_id in npi_ids)
-        tax_observations.append((provider_group_id, 2, None))
-    artifacts = _write_provider_graph_artifacts(
-        tmp_path,
-        set_component_pairs=set_component_pairs,
-        component_group_pairs=component_group_pairs,
-        group_npi_pairs=group_npi_pairs,
-        npi_group_pairs=npi_group_pairs,
-        tax_observations=tax_observations,
-    )
+        factor_directory = tmp_path / f"frozen-source-factors-{provider_set_key}"
+        membership_metrics = await ptg_runtime._build_ptg2_provider_membership_sidecars(
+            provider_group_npi_path=factor_directory / "provider-group-npi.ptg2sc",
+            provider_npi_group_path=factor_directory / "provider-npi-group.ptg2sc",
+            provider_npi_scope_copy_path=factor_directory / "provider-npi-scope.copy",
+            input_paths=[
+                Path(frame["path"])
+                for frame in scan["provider_group_member_frames"]
+            ],
+        )
+        factor_paths = {
+            "provider_set_component": scan["provider_set_component_path"],
+            "provider_component_group": scan["provider_component_group_path"],
+            "provider_group_tax_identity": scan[
+                "provider_group_tax_identity_path"
+            ],
+            "provider_group_npi": factor_directory / "provider-group-npi.ptg2sc",
+            "provider_npi_group": factor_directory / "provider-npi-group.ptg2sc",
+            "provider_npi_scope": factor_directory / "provider-npi-scope.copy",
+        }
+        factors = ptg_runtime._collect_ptg2_manifest_sidecar_artifacts(
+            factor_paths,
+            provider_group_tax_identity_artifact=scanner_support._single_frame(
+                scan["frames"],
+                "manifest_provider_group_tax_identity_sidecar_file",
+            ),
+            membership_graph_metrics=membership_metrics,
+        )
+        artifacts.extend(
+            ptg_runtime._bound_manifest_sidecars(
+                {"file_id": f"frozen-source-{provider_set_key}"},
+                {},
+                {"sidecars": list(factors.values())},
+                provider_set_key,
+            )
+        )
     provider_map = _write_provider_set_map(
         tmp_path,
         provider_sets_by_key,
@@ -2208,7 +2228,7 @@ async def _compile_frozen_provider_graph(
     tmp_path: Path,
     batch: _FrozenScanBatch,
 ):
-    artifacts, provider_map, provider_sets_by_key = _scan_provider_graph_fixture(
+    artifacts, provider_map, provider_sets_by_key = await _scan_provider_graph_fixture(
         tmp_path, batch.scans
     )
     compilation = await _compile_publication_fixture(
@@ -2220,6 +2240,41 @@ async def _compile_frozen_provider_graph(
     assert compilation.observe["provider_set_count"] == 2
     assert compilation.observe["group_count"] == 2
     return compilation, provider_sets_by_key
+
+
+@pytest.mark.asyncio
+async def test_frozen_scanner_factors_feed_compiler(tmp_path, monkeypatch) -> None:
+    """Keep the V4 compiler fixture bound to scanner-produced factor files."""
+    batch = await _acquire_and_scan_frozen_parts(tmp_path, monkeypatch)
+    artifacts, _provider_map, provider_sets_by_key = await _scan_provider_graph_fixture(
+        tmp_path,
+        batch.scans,
+    )
+
+    names_by_shard: dict[str, set[str]] = {}
+    for artifact in artifacts:
+        shard_id = str(artifact["source_shard_id"])
+        names_by_shard.setdefault(shard_id, set()).add(str(artifact["name"]))
+        assert Path(str(artifact["path"])).is_file()
+    assert names_by_shard == {
+        "frozen-source-0": {
+            "provider_set_component",
+            "provider_component_group",
+            "provider_group_npi",
+            "provider_npi_group",
+            "provider_npi_scope",
+            "provider_group_tax_identity",
+        },
+        "frozen-source-1": {
+            "provider_set_component",
+            "provider_component_group",
+            "provider_group_npi",
+            "provider_npi_group",
+            "provider_npi_scope",
+            "provider_group_tax_identity",
+        },
+    }
+    assert len(provider_sets_by_key) == 2
 
 
 async def _publish_frozen_provider_graph_with_patches(
