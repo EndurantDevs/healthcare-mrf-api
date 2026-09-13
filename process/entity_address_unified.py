@@ -37,8 +37,10 @@ from db.models import (
 from process.control_lifecycle import mark_control_run
 from process.entity_address_cutover_contract import (
     EntityAddressCutoverCallbacks,
+    apply_transaction_sql_settings,
     postgres_sqlstate,
     require_caller_owned_cutover_transaction,
+    run_publish_validation_operations,
 )
 from process.ext import address_alias_sql
 from process.ext.address_format import (
@@ -6346,19 +6348,7 @@ async def _project_geo_assurance_transaction(
 
 
 async def _apply_entity_address_transaction_settings() -> None:
-    for name, value in _entity_address_sql_settings():
-        try:
-            async with db.transaction():
-                await db.status(f"SET LOCAL {name} = {_sql_literal(value)};")
-        except Exception as exc:
-            if "permission denied to set parameter" not in str(exc).lower():
-                raise
-            logger.warning(
-                "Skipping unprivileged entity-address SQL setting %s=%s: %s",
-                name,
-                value,
-                exc,
-            )
+    await apply_transaction_sql_settings(db, _entity_address_sql_settings(), _sql_literal, logger)
 
 
 async def _drop_stage_secondary_indexes(stage_cls, db_schema: str) -> int:
@@ -6779,15 +6769,6 @@ async def _is_location_primary_key_validated(db_schema: str, table_name: str) ->
     )
 
 
-async def _run_publish_validation_operations(*operations):
-    """Serialize validation queries when a caller owns the bound transaction session."""
-
-    transaction_binding = getattr(db, "_transaction_binding", None)
-    if callable(transaction_binding) and transaction_binding() is not None:
-        return tuple([await operation() for operation in operations])
-    return await asyncio.gather(*(operation() for operation in operations))
-
-
 async def _validate_publish_integrity(
     db_schema: str,
     stage_table: str,
@@ -6806,7 +6787,8 @@ async def _validate_publish_integrity(
     expected_base_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     residual_alias_source_rows, stale_alias_generation_rows = (
         int(metric_value or 0)
-        for metric_value in await _run_publish_validation_operations(
+        for metric_value in await run_publish_validation_operations(
+            db,
             lambda: db.scalar(
                 f"""
                 SELECT count(*)
@@ -6884,7 +6866,8 @@ async def _validate_publish_integrity(
             archive_identity_mismatch_rows,
         ) = (
             int(metric_value or 0)
-            for metric_value in await _run_publish_validation_operations(
+            for metric_value in await run_publish_validation_operations(
+                db,
                 lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
@@ -6976,7 +6959,8 @@ async def _validate_publish_integrity(
         practice_null_address_key_by_source_rows,
         fallback_archive_identity_mismatch_rows_raw,
         invalid_coordinate_rows,
-    ) = await _run_publish_validation_operations(
+    ) = await run_publish_validation_operations(
+        db,
         lambda: db.scalar(
             f"""
             SELECT COUNT(*)

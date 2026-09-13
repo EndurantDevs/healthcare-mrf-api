@@ -182,7 +182,7 @@ async def _require_supported_relation_state(session: AsyncSession, relation_oid:
         "security labels": relation_state["has_security_labels"],
         "publication membership": relation_state["is_published"],
     }
-    present_kinds = tuple(name for name, value in unsupported_by_kind.items() if value)
+    present_kinds = tuple(name for name, is_present in unsupported_by_kind.items() if is_present)
     if present_kinds:
         raise CodeCatalogSnapshotError(f"code-catalog relation has unsupported {', '.join(present_kinds)}")
 
@@ -191,7 +191,7 @@ def _index_signature(index: Mapping[str, Any]) -> str:
     return json.dumps(dict(index), sort_keys=True, separators=(",", ":"), default=_receipt._json_scalar)
 
 
-async def _matches_model_schema_variant(
+async def _is_matching_model_schema(
     session: AsyncSession,
     schema_name: str,
     capture: CodeCatalogCapture,
@@ -245,7 +245,7 @@ async def _matches_model_schema_variant(
 async def _require_model_schema(session: AsyncSession, schema_name: str, capture: CodeCatalogCapture) -> None:
     """Require the model schema, including the importer-normalized text variant."""
     for has_normalized_descriptions in (False, True):
-        if await _matches_model_schema_variant(
+        if await _is_matching_model_schema(
             session,
             schema_name,
             capture,

@@ -102,7 +102,8 @@ async def test_unbound_publish_validation_keeps_parallel_operations(monkeypatch)
 
     monkeypatch.setattr(native, "db", SimpleNamespace())
 
-    values = await native._run_publish_validation_operations(
+    values = await native.run_publish_validation_operations(
+        native.db,
         lambda: operation("first"),
         lambda: operation("second"),
     )
