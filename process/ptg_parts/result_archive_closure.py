@@ -33,7 +33,6 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     decode_v4_snapshot_map_pack,
 )
 
-
 RESULT_ARCHIVE_CLOSURE_CONTRACT = "ptg_result_archive_closure_v1"
 _MAP_PACK_PAGE_ROWS = 16
 _MAP_PACK_BYTES_PER_COORDINATE_CEILING = 64
@@ -43,6 +42,14 @@ _PAYLOAD_BATCH_BYTES = 64 * 1024 * 1024
 _MAX_TARGET_BLOCK_PAYLOAD_BYTES = PTG2_V3_AUDIT_MAX_BLOCK_BYTES
 _DEFAULT_MAX_BLOCK_HASHES = 500_000
 _SNAPSHOT_STATUS = frozenset(("validated", "published"))
+_RELATIONAL_PRICE_OBJECT_KINDS = (
+    "price_atoms_v3",
+    "price_set_atom_memberships_v3",
+)
+DecodedMapSelection = tuple[
+    tuple[dict[str, Any], ...],
+    Mapping[bytes, tuple[str, int]],
+]
 
 
 class ResultArchiveClosureError(RuntimeError):
@@ -333,13 +340,30 @@ def _append_map_pack_targets(
     for coordinate in coordinates:
         block_hash = bytes(coordinate.block_hash)
         target_identity = (coordinate.object_kind, int(coordinate.entry_count))
-        previous_identity = target_identity_by_hash.get(block_hash)
-        if previous_identity is not None and previous_identity != target_identity:
-            raise ResultArchiveClosureError("archive closure maps one block hash to conflicting identities")
-        if previous_identity is None:
-            target_identity_by_hash[block_hash] = target_identity
+        is_new_identity = block_hash not in target_identity_by_hash
+        _record_target_identity(
+            target_identity_by_hash,
+            block_hash=block_hash,
+            target_identity=target_identity,
+        )
+        if is_new_identity:
             new_target_hashes.add(block_hash)
     return new_target_hashes
+
+
+def _record_target_identity(
+    target_identity_by_hash: dict[bytes, tuple[str, int]],
+    *,
+    block_hash: bytes,
+    target_identity: tuple[str, int],
+) -> None:
+    """Record one exact block identity and reject conflicting reachability."""
+
+    previous_identity = target_identity_by_hash.get(block_hash)
+    if previous_identity is not None and previous_identity != target_identity:
+        raise ResultArchiveClosureError("archive closure maps one block hash to conflicting identities")
+    if previous_identity is None:
+        target_identity_by_hash[block_hash] = target_identity
 
 
 def _map_pack_metadata(map_pack_by_field: Mapping[str, Any]) -> dict[str, Any]:
@@ -381,6 +405,100 @@ async def _validate_target_blocks(
             payload_hashes=payload_hashes,
             metadata_by_hash=metadata_by_hash,
         )
+
+
+async def _load_relational_mapping_blocks(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    max_block_hashes: int,
+    closure_block_hashes: set[bytes],
+) -> dict[bytes, tuple[str, int]]:
+    """Page exact snapshot mappings and retain their CAS identity constraints."""
+
+    identity_by_hash: dict[bytes, tuple[str, int]] = {}
+    after_object_kind = ""
+    after_block_key = -1
+    after_fragment_no = -1
+    while True:
+        mapping_records = await _relational_mapping_page(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            after_object_kind=after_object_kind,
+            after_block_key=after_block_key,
+            after_fragment_no=after_fragment_no,
+        )
+        if not mapping_records:
+            return identity_by_hash
+        for mapping_by_field in mapping_records:
+            block_hash = _required_bytes(
+                mapping_by_field.get("block_hash"),
+                "relational mapping block hash",
+            )
+            object_kind = str(mapping_by_field.get("object_kind") or "")
+            entry_count = _required_nonnegative_int(
+                mapping_by_field.get("entry_count"),
+                "relational mapping entry count",
+            )
+            if not object_kind:
+                raise ResultArchiveClosureError("archive closure relational mapping is invalid")
+            _record_target_identity(
+                identity_by_hash,
+                block_hash=block_hash,
+                target_identity=(object_kind, entry_count),
+            )
+            closure_block_hashes.add(block_hash)
+            if len(closure_block_hashes) > max_block_hashes:
+                raise ResultArchiveClosureError("archive closure block reachability exceeds its declared bound")
+        after_object_kind = str(mapping_records[-1]["object_kind"])
+        after_block_key = _required_nonnegative_int(
+            mapping_records[-1].get("block_key"),
+            "relational mapping block key",
+        )
+        after_fragment_no = _required_nonnegative_int(
+            mapping_records[-1].get("fragment_no"),
+            "relational mapping fragment number",
+        )
+        if len(mapping_records) < _BLOCK_METADATA_PAGE_ROWS:
+            return identity_by_hash
+
+
+async def _relational_mapping_page(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    after_object_kind: str,
+    after_block_key: int,
+    after_fragment_no: int,
+) -> tuple[dict[str, Any], ...]:
+    """Read one fixed-size page of the two V4 relational price map kinds."""
+
+    query = await session.execute(
+        text(
+            f"""
+            SELECT object_kind, block_key, fragment_no, entry_count, block_hash
+              FROM {schema}.ptg2_v3_snapshot_block
+             WHERE snapshot_key = :snapshot_key
+               AND object_kind = ANY(CAST(:object_kinds AS text[]))
+               AND (object_kind, block_key, fragment_no)
+                   > (:after_object_kind, :after_block_key, :after_fragment_no)
+             ORDER BY object_kind, block_key, fragment_no
+             LIMIT :page_rows
+            """
+        ),
+        {
+            "snapshot_key": snapshot_key,
+            "object_kinds": _RELATIONAL_PRICE_OBJECT_KINDS,
+            "after_object_kind": after_object_kind,
+            "after_block_key": after_block_key,
+            "after_fragment_no": after_fragment_no,
+            "page_rows": _BLOCK_METADATA_PAGE_ROWS,
+        },
+    )
+    return tuple(_mapping(mapping_row) for mapping_row in query)
 
 
 async def _load_target_block_metadata(
@@ -728,6 +846,12 @@ def _layout_relations(key: str) -> tuple[ArchiveRelation, ...]:
 
     return (
         ArchiveRelation("ptg2_v3_snapshot_layout", key, "sealed layout"),
+        ArchiveRelation("ptg2_v3_layout_fingerprint", key, "sealed layout fingerprint"),
+        ArchiveRelation(
+            "ptg2_v3_snapshot_block",
+            f"{key} AND object_kind IN ('price_atoms_v3', 'price_set_atom_memberships_v3')",
+            "relational price mapping anchors",
+        ),
         ArchiveRelation("ptg2_v4_snapshot_map_root", key, "map root"),
         ArchiveRelation("ptg2_v4_snapshot_map_pack", key, "map packs"),
         ArchiveRelation("ptg2_v4_finalizer_map_root", key, "finalizer root"),
@@ -737,6 +861,7 @@ def _layout_relations(key: str) -> tuple[ArchiveRelation, ...]:
             ArchiveRelation(table, key, "sealed V4 dictionary or metadata")
             for table in (
                 "ptg2_v4_npi_scope",
+                "ptg2_v3_provider_group",
                 "ptg2_v4_provider_component",
                 "ptg2_v4_pattern",
                 "ptg2_v4_relation_manifest",
@@ -746,6 +871,12 @@ def _layout_relations(key: str) -> tuple[ArchiveRelation, ...]:
                 "ptg2_v4_inferred_taxonomy_candidate",
                 "ptg2_v3_source_audit_witness",
                 "ptg2_v3_source_audit_witness_part",
+                "ptg2_provider_tax_identity_manifest",
+                "ptg2_provider_tax_identity",
+                "ptg2_provider_group_tax_identity",
+                "ptg2_provider_tax_identity_source_manifest",
+                "ptg2_provider_tax_identity_source_binding",
+                "ptg2_provider_group_tax_identity_source",
             )
         ),
         ArchiveRelation(
@@ -869,6 +1000,51 @@ async def _archive_block_selection(
         max_block_hashes=max_block_hashes,
         closure_block_hashes=closure_block_hashes,
     )
+    relational_target_identity_by_hash = await _load_relational_mapping_blocks(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        max_block_hashes=max_block_hashes,
+        closure_block_hashes=closure_block_hashes,
+    )
+    target_identity_by_hash = await _validate_decoded_map_selection(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        layout_by_field=layout_by_field,
+        map_selection=(map_packs, map_target_identity_by_hash),
+        finalizer_selection=(finalizer_packs, finalizer_target_identity_by_hash),
+        relational_target_identity_by_hash=relational_target_identity_by_hash,
+    )
+    block_hashes = closure_block_hashes
+    expected_hashes = {bytes(map_pack["map_block_hash"]) for map_pack in map_packs + finalizer_packs}
+    expected_hashes.update(target_identity_by_hash)
+    if set(block_hashes) != expected_hashes:
+        raise ResultArchiveClosureError("archive closure decoded block reachability is inconsistent")
+    await _validate_target_blocks(
+        session,
+        schema=schema,
+        target_hashes=block_hashes,
+        coordinate_identity=target_identity_by_hash,
+        max_block_hashes=max_block_hashes,
+    )
+    return tuple(sorted(block_hashes)), len(map_packs), len(finalizer_packs)
+
+
+async def _validate_decoded_map_selection(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    layout_by_field: Mapping[str, Any],
+    map_selection: DecodedMapSelection,
+    finalizer_selection: DecodedMapSelection,
+    relational_target_identity_by_hash: Mapping[bytes, tuple[str, int]],
+) -> dict[bytes, tuple[str, int]]:
+    """Validate map receipts and return one conflict-free target identity map."""
+
+    map_packs, map_target_identity_by_hash = map_selection
+    finalizer_packs, finalizer_target_identity_by_hash = finalizer_selection
     _validate_root_geometry(layout_by_field, prefix="map", packs=map_packs)
     _validate_root_geometry(
         layout_by_field, prefix="finalizer", packs=finalizer_packs, target_count=len(finalizer_target_identity_by_hash)
@@ -882,19 +1058,11 @@ async def _archive_block_selection(
         map_target_identity_by_hash,
         finalizer_target_identity_by_hash,
     )
-    block_hashes = closure_block_hashes
-    if set(block_hashes) != {bytes(map_pack["map_block_hash"]) for map_pack in map_packs + finalizer_packs} | set(
-        target_identity_by_hash
-    ):
-        raise ResultArchiveClosureError("archive closure decoded block reachability is inconsistent")
-    await _validate_target_blocks(
-        session,
-        schema=schema,
-        target_hashes=block_hashes,
-        coordinate_identity=target_identity_by_hash,
-        max_block_hashes=max_block_hashes,
+    target_identity_by_hash = _merged_target_identities(
+        target_identity_by_hash,
+        relational_target_identity_by_hash,
     )
-    return tuple(sorted(block_hashes)), len(map_packs), len(finalizer_packs)
+    return target_identity_by_hash
 
 
 def _merged_target_identities(
@@ -905,9 +1073,11 @@ def _merged_target_identities(
 
     target_identity_by_hash = dict(map_target_identity_by_hash)
     for block_hash, finalizer_identity in finalizer_target_identity_by_hash.items():
-        previous_identity = target_identity_by_hash.setdefault(block_hash, finalizer_identity)
-        if previous_identity != finalizer_identity:
-            raise ResultArchiveClosureError("archive closure maps one block hash to conflicting identities")
+        _record_target_identity(
+            target_identity_by_hash,
+            block_hash=block_hash,
+            target_identity=finalizer_identity,
+        )
     return target_identity_by_hash
 
 
