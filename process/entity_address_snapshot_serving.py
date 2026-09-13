@@ -123,38 +123,22 @@ def _signature_tuple(value: object, *, schema_name: str) -> tuple[tuple[str, int
     return tuple(sorted(entries))
 
 
-def validate_entity_address_observed_serving_capture(
-    capture_value: Mapping[str, Any] | EntityAddressObservedServingCapture,
-    *,
-    schema_name: str | None = None,
-) -> EntityAddressObservedServingCapture:
-    """Validate one queued source-local identity without treating it as portable."""
-
-    value = capture_value.as_dict() if isinstance(capture_value, EntityAddressObservedServingCapture) else capture_value
-    if not isinstance(value, Mapping):
-        raise ValueError("entity-address observed serving capture is invalid")
-    schema = _schema_name(schema_name if schema_name is not None else value.get("source_schema"))
-    if set(value) != {
-        "contract",
-        "source_schema",
-        "relations",
-        "alias_state",
-        "geo_assurance",
-    }:
-        raise ValueError("entity-address observed serving capture is invalid")
-    relation_values = value["relations"]
-    if not isinstance(relation_values, (list, tuple)) or len(relation_values) != len(_RELATIONS):
+def _validated_relation_oids(relation_entries: object) -> tuple[int, ...]:
+    if not isinstance(relation_entries, (list, tuple)) or len(relation_entries) != len(_RELATIONS):
         raise ValueError("entity-address observed serving relation identity is invalid")
     relation_oids = []
-    for expected_relation, relation_value in zip(_RELATIONS, relation_values, strict=True):
+    for expected_relation, relation_entry in zip(_RELATIONS, relation_entries, strict=True):
         if (
-            not isinstance(relation_value, Mapping)
-            or set(relation_value) != {"model_name", "table_name", "relation_oid"}
-            or (relation_value["model_name"], relation_value["table_name"]) != expected_relation
+            not isinstance(relation_entry, Mapping)
+            or set(relation_entry) != {"model_name", "table_name", "relation_oid"}
+            or (relation_entry["model_name"], relation_entry["table_name"]) != expected_relation
         ):
             raise ValueError("entity-address observed serving relation identity is invalid")
-        relation_oids.append(_positive_oid(relation_value["relation_oid"], field_name="relation OID"))
-    alias_state = value["alias_state"]
+        relation_oids.append(_positive_oid(relation_entry["relation_oid"], field_name="relation OID"))
+    return tuple(relation_oids)
+
+
+def _validated_alias_state(alias_state: object) -> tuple[int, int, int]:
     if (
         not isinstance(alias_state, Mapping)
         or set(alias_state) != {"schema_version", "active_ruleset_version", "generation"}
@@ -166,33 +150,88 @@ def validate_entity_address_observed_serving_capture(
         or alias_state["generation"] < 0
     ):
         raise ValueError("entity-address observed serving alias state is invalid")
-    geo_assurance = value["geo_assurance"]
+    return alias_state["schema_version"], alias_state["active_ruleset_version"], alias_state["generation"]
+
+
+def _validated_geo_assurance(
+    geo_assurance: object,
+    *,
+    schema_name: str,
+    live_table_oid: int,
+) -> tuple[int, int, tuple[tuple[str, int, int], ...]]:
     if (
         not isinstance(geo_assurance, Mapping)
         or set(geo_assurance) != {"version", "active_table_oid", "active_relation_signature"}
         or type(geo_assurance["version"]) is not int
         or geo_assurance["version"] != geo_projection.GEO_ASSURANCE_VERSION
-        or value["contract"] != CONTRACT
-        or value["source_schema"] != schema
     ):
         raise ValueError("entity-address observed serving capture is invalid")
     geo_active_table_oid = _positive_oid(geo_assurance["active_table_oid"], field_name="geo active table OID")
-    if geo_active_table_oid != relation_oids[0]:
+    if geo_active_table_oid != live_table_oid:
         raise ValueError("entity-address observed serving geo table identity is invalid")
+    signature = _signature_tuple(
+        geo_assurance["active_relation_signature"],
+        schema_name=schema_name,
+    )
+    return geo_assurance["version"], geo_active_table_oid, signature
+
+
+def validate_entity_address_observed_serving_capture(
+    capture_value: Mapping[str, Any] | EntityAddressObservedServingCapture,
+    *,
+    schema_name: str | None = None,
+) -> EntityAddressObservedServingCapture:
+    """Validate one queued source-local identity without treating it as portable."""
+
+    capture_mapping = (
+        capture_value.as_dict() if isinstance(capture_value, EntityAddressObservedServingCapture) else capture_value
+    )
+    if not isinstance(capture_mapping, Mapping):
+        raise ValueError("entity-address observed serving capture is invalid")
+    schema = _schema_name(schema_name if schema_name is not None else capture_mapping.get("source_schema"))
+    if set(capture_mapping) != {
+        "contract",
+        "source_schema",
+        "relations",
+        "alias_state",
+        "geo_assurance",
+    }:
+        raise ValueError("entity-address observed serving capture is invalid")
+    if capture_mapping["contract"] != CONTRACT or capture_mapping["source_schema"] != schema:
+        raise ValueError("entity-address observed serving capture is invalid")
+    relation_oids = _validated_relation_oids(capture_mapping["relations"])
+    alias_schema_version, alias_ruleset_version, alias_generation = _validated_alias_state(
+        capture_mapping["alias_state"]
+    )
+    geo_assurance_version, geo_active_table_oid, geo_signature = _validated_geo_assurance(
+        capture_mapping["geo_assurance"],
+        schema_name=schema,
+        live_table_oid=relation_oids[0],
+    )
     return EntityAddressObservedServingCapture(
         contract=CONTRACT,
         source_schema=schema,
-        relation_oids=tuple(relation_oids),
-        alias_schema_version=alias_state["schema_version"],
-        alias_ruleset_version=alias_state["active_ruleset_version"],
-        alias_generation=alias_state["generation"],
-        geo_assurance_version=geo_assurance["version"],
+        relation_oids=relation_oids,
+        alias_schema_version=alias_schema_version,
+        alias_ruleset_version=alias_ruleset_version,
+        alias_generation=alias_generation,
+        geo_assurance_version=geo_assurance_version,
         geo_active_table_oid=geo_active_table_oid,
-        geo_active_relation_signature=_signature_tuple(
-            geo_assurance["active_relation_signature"],
-            schema_name=schema,
-        ),
+        geo_active_relation_signature=geo_signature,
     )
+
+
+def _validated_observed_alias_state(alias_state: Mapping[str, Any]) -> tuple[int, int, int]:
+    if (
+        type(alias_state["schema_version"]) is not int
+        or alias_state["schema_version"] != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION
+        or type(alias_state["active_ruleset_version"]) is not int
+        or alias_state["active_ruleset_version"] != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
+        or type(alias_state["generation"]) is not int
+        or alias_state["generation"] < 0
+    ):
+        raise RuntimeError("entity-address observed serving alias state is unsupported")
+    return alias_state["schema_version"], alias_state["active_ruleset_version"], alias_state["generation"]
 
 
 async def _relation_oid(session, schema_name: str, table_name: str) -> int:
@@ -224,7 +263,7 @@ async def _relation_oid(session, schema_name: str, table_name: str) -> int:
 
 
 async def _alias_state(session, schema_name: str) -> tuple[int, int, int]:
-    rows = (
+    alias_state_rows = (
         (
             await session.execute(
                 text(
@@ -237,19 +276,9 @@ async def _alias_state(session, schema_name: str) -> tuple[int, int, int]:
         .mappings()
         .all()
     )
-    if len(rows) != 1 or rows[0]["singleton"] is not True:
+    if len(alias_state_rows) != 1 or alias_state_rows[0]["singleton"] is not True:
         raise RuntimeError("entity-address observed serving alias state is invalid")
-    state = rows[0]
-    if (
-        type(state["schema_version"]) is not int
-        or state["schema_version"] != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION
-        or type(state["active_ruleset_version"]) is not int
-        or state["active_ruleset_version"] != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
-        or type(state["generation"]) is not int
-        or state["generation"] < 0
-    ):
-        raise RuntimeError("entity-address observed serving alias state is unsupported")
-    return state["schema_version"], state["active_ruleset_version"], state["generation"]
+    return _validated_observed_alias_state(alias_state_rows[0])
 
 
 async def _geo_assurance_state(
@@ -258,7 +287,7 @@ async def _geo_assurance_state(
     schema_name: str,
     live_table_oid: int,
 ) -> tuple[int, int, tuple[tuple[str, int, int], ...]]:
-    rows = (
+    geo_state_rows = (
         (
             await session.execute(
                 text(
@@ -272,23 +301,23 @@ async def _geo_assurance_state(
         .mappings()
         .all()
     )
-    if len(rows) != 1 or rows[0]["singleton"] is not True:
+    if len(geo_state_rows) != 1 or geo_state_rows[0]["singleton"] is not True:
         raise RuntimeError("entity-address observed serving geo assurance state is invalid")
-    state = rows[0]
+    geo_state = geo_state_rows[0]
     try:
-        active_signature = _signature_tuple(state["active_relation_signature"], schema_name=schema_name)
-        current_signature = _signature_tuple(state["current_relation_signature"], schema_name=schema_name)
-        active_table_oid = _positive_oid(state["active_table_oid"], field_name="geo active table OID")
+        active_signature = _signature_tuple(geo_state["active_relation_signature"], schema_name=schema_name)
+        current_signature = _signature_tuple(geo_state["current_relation_signature"], schema_name=schema_name)
+        active_table_oid = _positive_oid(geo_state["active_table_oid"], field_name="geo active table OID")
     except ValueError as error:
         raise RuntimeError("entity-address observed serving geo assurance state is invalid") from error
     if (
-        type(state["active_geo_assurance_version"]) is not int
-        or state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
+        type(geo_state["active_geo_assurance_version"]) is not int
+        or geo_state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
         or active_table_oid != live_table_oid
         or active_signature != current_signature
     ):
         raise RuntimeError("entity-address observed serving geo assurance is not active")
-    return state["active_geo_assurance_version"], active_table_oid, active_signature
+    return geo_state["active_geo_assurance_version"], active_table_oid, active_signature
 
 
 async def observe_entity_address_serving(
