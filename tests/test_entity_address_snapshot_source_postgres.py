@@ -20,7 +20,13 @@ def _dsn() -> str:
     dsn = os.environ.get("HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN", "")
     if not dsn:
         pytest.skip("HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN is not set")
-    return dsn
+    return dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+asyncpg"])
+def test_source_archive_dsn_selects_async_driver(monkeypatch, driver):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_ARCHIVE_TEST_DSN", f"{driver}://reader@localhost/archive_test")
+    assert _dsn() == "postgresql+asyncpg://reader@localhost/archive_test"
 
 
 @pytest.mark.asyncio
