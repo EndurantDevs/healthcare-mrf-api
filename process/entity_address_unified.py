@@ -848,11 +848,11 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
         return _coerce_rowcount(rowcount)
 
     async with db.acquire() as conn:
-        for index, (name, value) in enumerate(settings):
+        for index, (name, setting_value) in enumerate(settings):
             savepoint = f"entity_address_sql_setting_{index}"
             await conn.status(f"SAVEPOINT {savepoint};")
             try:
-                await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+                await conn.status(f"SET LOCAL {name} = {_sql_literal(setting_value)};")
                 await conn.status(f"RELEASE SAVEPOINT {savepoint};")
             except Exception as exc:
                 await conn.status(f"ROLLBACK TO SAVEPOINT {savepoint};")
@@ -861,7 +861,7 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
                     logger.warning(
                         "Skipping unprivileged entity-address SQL setting %s=%s: %s",
                         name,
-                        value,
+                        setting_value,
                         exc,
                     )
                     continue
