@@ -201,7 +201,7 @@ async def export_entity_address_archive_source(
     return EntityAddressArchiveSourceManifest(capture.contract, capture.schema_name, capture.relations)
 
 
-async def stage_and_export_entity_address_archive_source(
+async def export_entity_address_archive_stage(
     session_factory,
     *,
     schema_name: str,
@@ -248,5 +248,5 @@ __all__ = [
     "entity_address_archive_stage_schema",
     "entity_address_archive_relations",
     "export_entity_address_archive_source",
-    "stage_and_export_entity_address_archive_source",
+    "export_entity_address_archive_stage",
 ]

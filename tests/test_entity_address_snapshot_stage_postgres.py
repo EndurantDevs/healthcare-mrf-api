@@ -76,6 +76,58 @@ async def _create_model_family(connection, schema_name: str) -> None:
     await connection.run_sync(metadata.create_all)
 
 
+async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
+    """Create the live model family with one value that must survive staging."""
+
+    async with engine.begin() as connection:
+        await _create_model_family(connection, live_schema)
+        await connection.execute(
+            text(
+                f'INSERT INTO "{live_schema}"."{relations[0].table_name}" '
+                "(entity_type, entity_id, location_key, checksum, type) "
+                "VALUES ('synthetic', 'owned', 'live-sentinel', 1, 'primary')"
+            )
+        )
+
+
+def _dump_stage_capture(capture, *, dataset_id, stage_schema: str, dump_path: Path, pg_dump: str, environment) -> None:
+    """Write the clone-only native archive covered by the stage snapshot pin."""
+
+    assert capture.dataset_id == dataset_id
+    assert capture.schema_name == stage_schema
+    dump = subprocess.run(
+        [
+            pg_dump,
+            "--format=custom",
+            "--file",
+            str(dump_path),
+            f"--snapshot={capture.postgres_snapshot}",
+            *[f"--table={stage_schema}.{relation.table_name}" for relation in capture.relations],
+        ],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+    assert dump.returncode == 0, dump.stderr
+
+
+async def _rename_live_sentinel(sessions, live_schema: str, table_name: str) -> None:
+    """Prove that copying the owned stage leaves the live relation writable."""
+
+    renamed_table = "renamed_while_stage_is_pinned"
+    async with sessions() as contender, contender.begin():
+        await contender.execute(text(f'ALTER TABLE "{live_schema}"."{table_name}" RENAME TO "{renamed_table}"'))
+        await contender.execute(text(f'ALTER TABLE "{live_schema}"."{renamed_table}" RENAME TO "{table_name}"'))
+
+
+async def _assert_live_sentinel(connection, schema_name: str, table_name: str) -> None:
+    """Require that a relation still carries the pre-stage sentinel value."""
+
+    assert await connection.scalar(text(f'SELECT location_key FROM "{schema_name}"."{table_name}"')) == "live-sentinel"
+
+
 @pytest.mark.parametrize(
     ("dsn", "expected"),
     [
@@ -92,21 +144,23 @@ def test_native_test_database_guard(dsn: str, expected: bool) -> None:
 
 
 def test_native_test_connection_preserves_an_authenticated_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
-    password = "synthetic-password"
+    fixture_secret = "synthetic-dsn-secret"
     monkeypatch.setenv(
         _DSN_ENV,
-        f"postgresql://postgres:{password}@postgres:5432/{_CI_DATABASE}",
+        f"postgresql://postgres:{fixture_secret}@postgres:5432/{_CI_DATABASE}",
     )
 
     async_dsn, environment = _native_test_connection()
 
-    assert password in async_dsn
+    assert fixture_secret in async_dsn
     assert "***" not in async_dsn
-    assert environment["PGPASSWORD"] == password
+    assert environment["PGPASSWORD"] == fixture_secret
 
 
 @pytest.mark.asyncio
-async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path: Path):
+async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
+    """The staged archive restores the owned copy without changing the live family."""
+
     async_dsn, tool_environment = _native_test_connection()
     pg_dump = _native_tool(_DUMP_ENV)
     pg_restore = _native_tool(_RESTORE_ENV)
@@ -117,46 +171,23 @@ async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path
     relations = source.entity_address_archive_relations()
     dump_path = tmp_path / "entity-address-stage.dump"
     try:
-        async with engine.begin() as connection:
-            await _create_model_family(connection, live_schema)
-            await connection.execute(
-                text(
-                    f'INSERT INTO "{live_schema}"."{relations[0].table_name}" '
-                    "(entity_type, entity_id, location_key, checksum, type) "
-                    "VALUES ('synthetic', 'owned', 'live-sentinel', 1, 'primary')"
-                )
-            )
+        await _seed_live_sentinel(engine, live_schema, relations)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
 
         async def archive_copy(capture):
-            assert capture.dataset_id == dataset_id
-            assert capture.schema_name == stage_schema
-            dump = subprocess.run(
-                [
-                    pg_dump,
-                    "--format=custom",
-                    "--file",
-                    str(dump_path),
-                    f"--snapshot={capture.postgres_snapshot}",
-                    *[f"--table={stage_schema}.{relation.table_name}" for relation in capture.relations],
-                ],
-                capture_output=True,
-                check=False,
-                env=tool_environment,
-                text=True,
-                timeout=30,
-            )
-            assert dump.returncode == 0, dump.stderr
-            renamed_live_table = "renamed_while_stage_is_pinned"
-            async with sessions() as contender, contender.begin():
-                await contender.execute(
-                    text(f'ALTER TABLE "{live_schema}"."{relations[0].table_name}" RENAME TO "{renamed_live_table}"')
-                )
-                await contender.execute(
-                    text(f'ALTER TABLE "{live_schema}"."{renamed_live_table}" RENAME TO "{relations[0].table_name}"')
-                )
+            """Dump the stage and prove it no longer locks live relations."""
 
-        manifest = await source.stage_and_export_entity_address_archive_source(
+            _dump_stage_capture(
+                capture,
+                dataset_id=dataset_id,
+                stage_schema=stage_schema,
+                dump_path=dump_path,
+                pg_dump=pg_dump,
+                environment=tool_environment,
+            )
+            await _rename_live_sentinel(sessions, live_schema, relations[0].table_name)
+
+        manifest = await source.export_entity_address_archive_stage(
             sessions,
             schema_name=live_schema,
             dataset_id=dataset_id,
@@ -165,10 +196,7 @@ async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path
         assert manifest.schema_name == stage_schema
         assert manifest.relations == relations
         async with engine.begin() as connection:
-            assert (
-                await connection.scalar(text(f'SELECT location_key FROM "{live_schema}"."{relations[0].table_name}"'))
-                == "live-sentinel"
-            )
+            await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
             await connection.execute(text(f'DROP SCHEMA "{stage_schema}" CASCADE'))
             await connection.execute(text(f'CREATE SCHEMA "{stage_schema}"'))
         restore = subprocess.run(
@@ -181,14 +209,8 @@ async def test_native_pg5440_stage_dump_restore_preserves_live_sentinel(tmp_path
         )
         assert restore.returncode == 0, restore.stderr
         async with engine.connect() as connection:
-            assert (
-                await connection.scalar(text(f'SELECT location_key FROM "{stage_schema}"."{relations[0].table_name}"'))
-                == "live-sentinel"
-            )
-            assert (
-                await connection.scalar(text(f'SELECT location_key FROM "{live_schema}"."{relations[0].table_name}"'))
-                == "live-sentinel"
-            )
+            await _assert_live_sentinel(connection, stage_schema, relations[0].table_name)
+            await _assert_live_sentinel(connection, live_schema, relations[0].table_name)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
