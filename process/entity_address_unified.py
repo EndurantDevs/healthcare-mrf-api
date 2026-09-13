@@ -834,6 +834,11 @@ def _runtime_config_metrics(context: dict) -> dict:
 
 
 async def _status_with_entity_address_tuning(statement: str) -> int | None:
+    transaction_binding = getattr(db, "_transaction_binding", None)
+    if callable(transaction_binding) and transaction_binding() is not None:
+        await _apply_entity_address_transaction_settings()
+        rowcount = await db.status(statement)
+        return _coerce_rowcount(rowcount)
     settings = _entity_address_sql_settings()
     acquire = getattr(db, "acquire", None)
     if not settings or not callable(acquire):
@@ -6774,6 +6779,15 @@ async def _is_location_primary_key_validated(db_schema: str, table_name: str) ->
     )
 
 
+async def _run_publish_validation_operations(*operations):
+    """Serialize validation queries when a caller owns the bound transaction session."""
+
+    transaction_binding = getattr(db, "_transaction_binding", None)
+    if callable(transaction_binding) and transaction_binding() is not None:
+        return tuple([await operation() for operation in operations])
+    return await asyncio.gather(*(operation() for operation in operations))
+
+
 async def _validate_publish_integrity(
     db_schema: str,
     stage_table: str,
@@ -6792,8 +6806,8 @@ async def _validate_publish_integrity(
     expected_base_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     residual_alias_source_rows, stale_alias_generation_rows = (
         int(metric_value or 0)
-        for metric_value in await asyncio.gather(
-            db.scalar(
+        for metric_value in await _run_publish_validation_operations(
+            lambda: db.scalar(
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{stage_table} AS staged
@@ -6802,7 +6816,7 @@ async def _validate_publish_integrity(
                  AND active.revoked_at IS NULL;
                 """
             ),
-            db.scalar(
+            lambda: db.scalar(
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{stage_table}
@@ -6870,8 +6884,8 @@ async def _validate_publish_integrity(
             archive_identity_mismatch_rows,
         ) = (
             int(metric_value or 0)
-            for metric_value in await asyncio.gather(
-                db.scalar(
+            for metric_value in await _run_publish_validation_operations(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6881,7 +6895,7 @@ async def _validate_publish_integrity(
                    AND a.merged_into IS NOT NULL;
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6899,7 +6913,7 @@ async def _validate_publish_integrity(
                    );
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6910,7 +6924,7 @@ async def _validate_publish_integrity(
                    AND (a.lat IS NULL OR a.long IS NULL);
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6923,7 +6937,7 @@ async def _validate_publish_integrity(
                    );
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6962,8 +6976,8 @@ async def _validate_publish_integrity(
         practice_null_address_key_by_source_rows,
         fallback_archive_identity_mismatch_rows_raw,
         invalid_coordinate_rows,
-    ) = await asyncio.gather(
-        db.scalar(
+    ) = await _run_publish_validation_operations(
+        lambda: db.scalar(
             f"""
             SELECT COUNT(*)
               FROM {db_schema}.{stage_table}
@@ -6971,7 +6985,7 @@ async def _validate_publish_integrity(
                AND address_key IS NULL;
             """
         ),
-        db.all(
+        lambda: db.all(
             f"""
         SELECT COALESCE(source, 'unknown') AS source, COUNT(*)::bigint AS rows
           FROM {db_schema}.{stage_table} AS t
@@ -6983,7 +6997,7 @@ async def _validate_publish_integrity(
          LIMIT 20;
         """
         ),
-        db.scalar(
+        lambda: db.scalar(
             f"""
               SELECT COUNT(*)
               FROM {db_schema}.{stage_table}
@@ -6991,7 +7005,7 @@ async def _validate_publish_integrity(
                AND COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
             """
         ),
-        _invalid_coordinate_count(db_schema, stage_table),
+        lambda: _invalid_coordinate_count(db_schema, stage_table),
     )
     practice_null_address_key_rows = int(practice_null_address_key_rows_raw or 0)
     integrity_metric_map["practice_null_address_key_rows"] = practice_null_address_key_rows

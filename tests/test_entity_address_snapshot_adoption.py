@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -67,6 +68,47 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
         support_stage_class_map,
         test_mode=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_bound_sql_phase_preserves_settings_without_opening_an_engine_connection(monkeypatch):
+    bound_database = SimpleNamespace(
+        _transaction_binding=Mock(return_value=object()),
+        acquire=Mock(),
+        status=AsyncMock(return_value=4),
+    )
+    apply_settings = AsyncMock()
+    monkeypatch.setattr(native, "db", bound_database)
+    monkeypatch.setattr(native, "_apply_entity_address_transaction_settings", apply_settings)
+
+    rowcount = await native._status_with_entity_address_tuning("ANALYZE synthetic.stage")
+
+    assert rowcount == 4
+    apply_settings.assert_awaited_once_with()
+    bound_database.status.assert_awaited_once_with("ANALYZE synthetic.stage")
+    bound_database.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unbound_publish_validation_keeps_parallel_operations(monkeypatch):
+    operation_counter_map = {"active": 0, "peak": 0}
+
+    async def operation(value):
+        operation_counter_map["active"] += 1
+        operation_counter_map["peak"] = max(operation_counter_map["peak"], operation_counter_map["active"])
+        await asyncio.sleep(0)
+        operation_counter_map["active"] -= 1
+        return value
+
+    monkeypatch.setattr(native, "db", SimpleNamespace())
+
+    values = await native._run_publish_validation_operations(
+        lambda: operation("first"),
+        lambda: operation("second"),
+    )
+
+    assert values == ["first", "second"]
+    assert operation_counter_map["peak"] == 2
 
 
 @pytest.mark.parametrize(
