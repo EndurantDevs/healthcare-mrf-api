@@ -10,7 +10,6 @@ from uuid import UUID
 
 import pytest
 
-
 source = importlib.import_module("process.entity_address_snapshot_source")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 ownership = importlib.import_module("process.entity_address_snapshot_ownership")
@@ -94,9 +93,13 @@ async def test_stage_export_clones_pinned_family():
         "SET TRANSACTION SNAPSHOT '00000003-0000001B-1'",
         f'CREATE SCHEMA "{stage_schema}"',
     ]
-    assert len(clone_statements) == 17
+    assert len(clone_statements) == 20
     assert all(
-        f'CREATE TABLE "{stage_schema}".' in statement or f'INSERT INTO "{stage_schema}".' in statement
+        f'CREATE TABLE "{stage_schema}".' in statement
+        or f'INSERT INTO "{stage_schema}".' in statement
+        or f'CREATE SEQUENCE "{stage_schema}"."entity_address_evidence_evidence_id_seq"' in statement
+        or f'ALTER SEQUENCE "{stage_schema}"."entity_address_evidence_evidence_id_seq"' in statement
+        or f'ALTER TABLE "{stage_schema}"."entity_address_evidence" ALTER COLUMN "evidence_id"' in statement
         for statement in clone_statements[3:]
     )
     stage_statements = [str(call.args[0]) for call in stage.execute.await_args_list]

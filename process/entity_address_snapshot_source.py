@@ -30,6 +30,9 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CONTRACT = "entity_address_unified.postgres.v1"
 _STAGE_SCHEMA_PREFIX = "entity_address_archive_"
 _SNAPSHOT_TOKEN = re.compile(r"^[0-9A-Fa-f-]+$")
+_EVIDENCE_TABLE_NAME = entity_address_unified.EntityAddressEvidence.__tablename__
+_EVIDENCE_ID_COLUMN = "evidence_id"
+_EVIDENCE_SEQUENCE_NAME = f"{_EVIDENCE_TABLE_NAME}_{_EVIDENCE_ID_COLUMN}_seq"
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,25 @@ async def capture_entity_address_archive_source(session, *, schema_name: str) ->
     return EntityAddressArchiveSourceCapture(_CONTRACT, schema, relations, snapshot)
 
 
+async def _clone_entity_address_evidence_sequence(session, *, stage_schema: str) -> None:
+    """Replace the source-bound BIGSERIAL default with its exact clone-owned sequence."""
+
+    stage_table_ref = f"{_quoted_identifier(stage_schema)}.{_quoted_identifier(_EVIDENCE_TABLE_NAME)}"
+    stage_sequence_ref = f"{_quoted_identifier(stage_schema)}.{_quoted_identifier(_EVIDENCE_SEQUENCE_NAME)}"
+    await session.execute(text(f"CREATE SEQUENCE {stage_sequence_ref}"))
+    await session.execute(
+        text(
+            f"ALTER SEQUENCE {stage_sequence_ref} OWNED BY {stage_table_ref}.{_quoted_identifier(_EVIDENCE_ID_COLUMN)}"
+        )
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE {stage_table_ref} ALTER COLUMN {_quoted_identifier(_EVIDENCE_ID_COLUMN)} "
+            f"SET DEFAULT nextval('{stage_sequence_ref}'::regclass)"
+        )
+    )
+
+
 async def _clone_entity_address_archive_source(
     session,
     *,
@@ -164,6 +186,8 @@ async def _clone_entity_address_archive_source(
         source_ref = f"{_quoted_identifier(source_capture.schema_name)}.{_quoted_identifier(relation.table_name)}"
         stage_ref = f"{_quoted_identifier(stage_schema)}.{_quoted_identifier(relation.table_name)}"
         await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
+        if relation.table_name == _EVIDENCE_TABLE_NAME:
+            await _clone_entity_address_evidence_sequence(session, stage_schema=stage_schema)
         await session.execute(text(f"INSERT INTO {stage_ref} SELECT * FROM {source_ref}"))
 
 
