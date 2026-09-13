@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -14,6 +16,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.models._legacy import Base
 from process.ptg_parts import result_archive_closure as archive_closure
+from process.ptg_parts.frozen_rate_binding import frozen_rate_binding_sha256
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock, shared_block_hash
 from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
@@ -22,6 +26,16 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import encode_v4_snapshot_map_pack
 from process.ptg_parts.result_archive_closure import (
     ResultArchiveClosureError,
     select_result_archive_closure,
+)
+from process.ptg_parts.result_archive_source_authority import (
+    PtgResultArchiveSourceAuthorityError,
+    capture_ptg_result_archive_source_authority,
+    commit_ptg_result_archive_source_authority,
+    lock_ptg_result_archive_for_clone,
+    prepare_ptg_result_archive_source_authority,
+    reconcile_ptg_archive_source_release,
+    release_ptg_result_archive_source_authority,
+    revalidate_ptg_result_archive_source_authority,
 )
 
 _RELATION_SUPPORT_COLUMNS = {
@@ -181,7 +195,7 @@ def _dsn() -> str:
 
 
 @asynccontextmanager
-async def _database():
+async def _database(*, source_authority: bool = False):
     """Create and remove one synthetic schema in the caller-owned test database."""
 
     engine = create_async_engine(_dsn())
@@ -191,6 +205,8 @@ async def _database():
         async with engine.begin() as connection:
             await connection.exec_driver_sql(f"CREATE SCHEMA {schema}")
             await _create_schema_tables(connection, schema)
+            if source_authority:
+                await _create_source_authority_tables(connection, schema)
         yield engine, schema_name, schema
     finally:
         async with engine.begin() as connection:
@@ -258,6 +274,27 @@ async def _create_schema_tables(connection, schema: str) -> None:
             await connection.exec_driver_sql(statement)
 
 
+async def _create_source_authority_tables(connection, schema: str) -> None:
+    """Create the two persisted source-authority relations for native proof."""
+
+    ddl = f"""
+        CREATE TABLE {schema}.ptg2_frozen_source_file_binding (
+            source_file_import_id text PRIMARY KEY, internal_run_id text UNIQUE NOT NULL,
+            source_key text NOT NULL, binding_sha256 text NOT NULL,
+            binding_payload jsonb NOT NULL
+        );
+        CREATE TABLE {schema}.ptg2_snapshot_pin (
+            owner_type text NOT NULL, owner_id text NOT NULL, snapshot_id text NOT NULL,
+            reason text, created_at timestamptz,
+            PRIMARY KEY (owner_type, owner_id, snapshot_id),
+            FOREIGN KEY (snapshot_id) REFERENCES {schema}.ptg2_snapshot(snapshot_id)
+        );
+    """
+    for statement in ddl.split(";"):
+        if statement.strip():
+            await connection.exec_driver_sql(statement)
+
+
 async def _create_relation_predicate_support(connection, schema: str) -> None:
     """Create remaining model-named tables referenced by archive predicates."""
 
@@ -290,7 +327,7 @@ def test_added_relations_match_current_model_and_native_ddl_keys() -> None:
         assert identity_constraint in source
 
 
-async def _seed(engine, schema: str) -> tuple[str, set[bytes]]:
+async def _seed(engine, schema: str, *, source_authority: bool = False) -> tuple[str, set[bytes]]:
     """Persist one complete synthetic V4 layout and its isolated map closure."""
 
     snapshot_id = "synthetic-result-closure"
@@ -298,7 +335,7 @@ async def _seed(engine, schema: str) -> tuple[str, set[bytes]]:
     digest = b"d" * 32
     hashes: set[bytes] = set()
     async with engine.begin() as connection:
-        await _seed_roots(connection, schema, snapshot_id, digest)
+        await _seed_roots(connection, schema, snapshot_id, digest, source_authority=source_authority)
         map_payload_bytes, finalizer_payload_bytes = await _seed_map_blocks(
             connection,
             schema,
@@ -313,12 +350,37 @@ async def _seed(engine, schema: str) -> tuple[str, set[bytes]]:
     return snapshot_id, hashes
 
 
-async def _seed_roots(connection, schema: str, snapshot_id: str, digest: bytes) -> None:
+async def _seed_roots(
+    connection, schema: str, snapshot_id: str, digest: bytes, *, source_authority: bool = False
+) -> None:
     """Insert logical snapshot, binding, layout, and initial complete roots."""
 
     await connection.exec_driver_sql(
         f"INSERT INTO {schema}.ptg2_snapshot VALUES ('{snapshot_id}', 'synthetic-import', 'validated', '{{\"serving_index\": {{\"storage_generation\": \"shared_blocks_v4\", \"shared_snapshot_key\": 71}}}}')"
     )
+    if source_authority:
+        frozen_binding_by_field = {
+            "contract": "ptg_frozen_source_file_binding_v1",
+            "source_file_import_id": "synthetic-import",
+            "source_key": "synthetic-source",
+        }
+        await connection.execute(
+            text(
+                f"""
+                INSERT INTO {schema}.ptg2_frozen_source_file_binding
+                    (source_file_import_id, internal_run_id, source_key, binding_sha256, binding_payload)
+                VALUES (:source_file_import_id, :internal_run_id, :source_key, :binding_sha256,
+                        CAST(:binding_payload AS jsonb))
+                """
+            ),
+            {
+                "source_file_import_id": "synthetic-import",
+                "internal_run_id": "synthetic-import",
+                "source_key": "synthetic-source",
+                "binding_sha256": frozen_rate_binding_sha256(frozen_binding_by_field),
+                "binding_payload": json.dumps(frozen_binding_by_field),
+            },
+        )
     await connection.exec_driver_sql(f"INSERT INTO {schema}.ptg2_v3_snapshot_binding VALUES ('{snapshot_id}', 71)")
     await connection.execute(
         text(
@@ -465,6 +527,372 @@ async def _seed_root_receipts(
         ),
         {"stored_bytes": finalizer_payload_bytes},
     )
+
+
+async def _seed_authority_snapshot(
+    connection, schema: str, snapshot_id: str, *, source_key: str = "synthetic-source"
+) -> None:
+    """Insert a second immutable source identity for replay-conflict proof."""
+
+    import_run_id = f"import-{snapshot_id}"
+    frozen_binding_by_field = {
+        "contract": "ptg_frozen_source_file_binding_v1",
+        "source_file_import_id": import_run_id,
+        "source_key": source_key,
+    }
+    await connection.execute(
+        text(
+            f"""
+            INSERT INTO {schema}.ptg2_snapshot
+                (snapshot_id, import_run_id, status, manifest)
+            VALUES (:snapshot_id, :import_run_id, 'published', '{{}}')
+            """
+        ),
+        {"snapshot_id": snapshot_id, "import_run_id": import_run_id},
+    )
+    await connection.execute(
+        text(
+            f"""
+            INSERT INTO {schema}.ptg2_frozen_source_file_binding
+                (source_file_import_id, internal_run_id, source_key, binding_sha256, binding_payload)
+            VALUES (:source_file_import_id, :internal_run_id, :source_key, :binding_sha256,
+                    CAST(:binding_payload AS jsonb))
+            """
+        ),
+        {
+            "source_file_import_id": import_run_id,
+            "internal_run_id": import_run_id,
+            "source_key": source_key,
+            "binding_sha256": frozen_rate_binding_sha256(frozen_binding_by_field),
+            "binding_payload": json.dumps(frozen_binding_by_field),
+        },
+    )
+
+
+async def _stored_authority_pins(connection, schema: str) -> list[tuple[str, str]]:
+    """Return only the synthetic pin owner and retained snapshot identities."""
+
+    records = await connection.execute(
+        text(
+            f"""
+            SELECT owner_id, snapshot_id
+              FROM {schema}.ptg2_snapshot_pin
+             ORDER BY owner_id, snapshot_id
+            """
+        )
+    )
+    return [(str(row[0]), str(row[1])) for row in records.all()]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_retains_exact_snapshot_and_preserves_siblings() -> None:
+    """An exact replay retains one snapshot and release leaves sibling pins untouched."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1001"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        async with session_factory() as session, session.begin():
+            replay = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        assert replay == authority
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_snapshot_pin
+                        (owner_type, owner_id, snapshot_id, reason)
+                    VALUES ('sibling-owner', 'sibling-operation', :snapshot_id, 'sibling retention')
+                    """
+                ),
+                {"snapshot_id": snapshot_id},
+            )
+        async with session_factory() as session, session.begin():
+            assert (
+                await revalidate_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == authority
+            )
+            assert (
+                await release_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == 1
+            )
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == [("sibling-operation", snapshot_id)]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_preparation_precedes_exact_pin_commit() -> None:
+    """A durable receipt can exist before its exact native pin is committed."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1000"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            prepared = await prepare_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == []
+        async with session_factory() as session, session.begin():
+            committed = await commit_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, authority=prepared.as_dict()
+            )
+        assert committed == prepared
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == [(prepared.owner_id, snapshot_id)]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_rejects_operation_replay_for_other_snapshot() -> None:
+    """One operation cannot acquire retention for two source snapshots."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1002"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        async with engine.begin() as connection:
+            await _seed_authority_snapshot(connection, schema, "other-snapshot")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PtgResultArchiveSourceAuthorityError, match="pin conflicts"):
+                await capture_ptg_result_archive_source_authority(
+                    session,
+                    schema_name=schema_name,
+                    operation_id=operation_id,
+                    snapshot_id="other-snapshot",
+                )
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == [(authority.owner_id, snapshot_id)]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_serializes_operation_across_source_keys() -> None:
+    """One operation cannot retain two sources while its first capture is open."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1004"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        async with engine.begin() as connection:
+            await _seed_authority_snapshot(connection, schema, "other-snapshot", source_key="other-source")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        first_captured = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def capture_first_source() -> object:
+            async with session_factory() as session, session.begin():
+                authority = await capture_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+                )
+                first_captured.set()
+                await release_first.wait()
+                return authority
+
+        first_capture = asyncio.create_task(capture_first_source())
+        await first_captured.wait()
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PTG2LifecycleLockDeferred, match="operation is busy"):
+                await capture_ptg_result_archive_source_authority(
+                    session,
+                    schema_name=schema_name,
+                    operation_id=operation_id,
+                    snapshot_id="other-snapshot",
+                )
+        release_first.set()
+        authority = await first_capture
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == [(authority.owner_id, snapshot_id)]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_rejects_changed_frozen_binding() -> None:
+    """A retained pin cannot make a changed immutable source binding acceptable."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1003"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        replacement_binding_by_field = {
+            "contract": "ptg_frozen_source_file_binding_v1",
+            "source_file_import_id": "synthetic-import",
+            "source_key": "replacement-source",
+        }
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"""
+                    UPDATE {schema}.ptg2_frozen_source_file_binding
+                       SET source_key = :source_key,
+                           binding_sha256 = :binding_sha256,
+                           binding_payload = CAST(:binding_payload AS jsonb)
+                    """
+                ),
+                {
+                    "source_key": "replacement-source",
+                    "binding_sha256": frozen_rate_binding_sha256(replacement_binding_by_field),
+                    "binding_payload": json.dumps(replacement_binding_by_field),
+                },
+            )
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PtgResultArchiveSourceAuthorityError, match="pin conflicts"):
+                await capture_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+                )
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PtgResultArchiveSourceAuthorityError, match="changed after capture"):
+                await revalidate_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == [(authority.owner_id, snapshot_id)]
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_release_allows_published_activation_update() -> None:
+    """Terminal cleanup remains possible after the permitted source publication transition."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1005"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"""
+                    UPDATE {schema}.ptg2_snapshot
+                       SET status = 'published',
+                           manifest = jsonb_set(
+                               manifest, '{{activation}}',
+                               '{{"state": "activated", "mode": "source"}}'::jsonb
+                           )
+                    """
+                )
+            )
+        async with session_factory() as session, session.begin():
+            assert (
+                await revalidate_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == authority
+            )
+            assert (
+                await release_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == 1
+            )
+        async with engine.begin() as connection:
+            assert await _stored_authority_pins(connection, schema) == []
+
+
+@pytest.mark.asyncio
+async def test_native_source_clone_pin_defers_terminal_release() -> None:
+    """An RR clone keeps its exact retention pin until its transaction ends."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1006"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        clone_pinned = asyncio.Event()
+        finish_clone = asyncio.Event()
+
+        async def hold_clone_pin() -> object:
+            async with session_factory() as session, session.begin():
+                validated = await lock_ptg_result_archive_for_clone(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                clone_pinned.set()
+                await finish_clone.wait()
+                return validated
+
+        clone_task = asyncio.create_task(hold_clone_pin())
+        await clone_pinned.wait()
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PTG2LifecycleLockDeferred, match="release is busy"):
+                await release_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+        finish_clone.set()
+        assert await clone_task == authority
+        async with session_factory() as session, session.begin():
+            assert (
+                await release_ptg_result_archive_source_authority(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == 1
+            )
+
+
+@pytest.mark.asyncio
+async def test_native_source_authority_release_reconciliation_is_exact() -> None:
+    """An uncertain exact terminal release can acknowledge absence, never a mismatch."""
+
+    operation_id = "4c04a959-9d50-49ae-996b-a258a7aa1007"
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+            )
+        async with session_factory() as session, session.begin():
+            assert (
+                await reconcile_ptg_archive_source_release(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == "released"
+            )
+        async with session_factory() as session, session.begin():
+            assert (
+                await reconcile_ptg_archive_source_release(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
+                == "already_released"
+            )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_snapshot_pin
+                        (owner_type, owner_id, snapshot_id, reason)
+                    VALUES (:owner_type, :owner_id, :snapshot_id, 'different authority')
+                    """
+                ),
+                {
+                    "owner_type": "ptg-result-archive-source",
+                    "owner_id": authority.owner_id,
+                    "snapshot_id": snapshot_id,
+                },
+            )
+        async with session_factory() as session, session.begin():
+            with pytest.raises(PtgResultArchiveSourceAuthorityError, match="pin is unavailable"):
+                await reconcile_ptg_archive_source_release(
+                    session, schema_name=schema_name, authority=authority.as_dict()
+                )
 
 
 @pytest.mark.asyncio
