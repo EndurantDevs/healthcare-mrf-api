@@ -869,6 +869,7 @@ def _layout_relations(key: str) -> tuple[ArchiveRelation, ...]:
         ArchiveRelation("ptg2_v3_snapshot_layout", key, "sealed layout"),
         ArchiveRelation("ptg2_v3_layout_fingerprint", key, "sealed layout fingerprint"),
         ArchiveRelation("ptg2_v3_code", key, "sealed code dictionary"),
+        ArchiveRelation("ptg2_v3_provider_set", key, "sealed provider-set dictionary"),
         ArchiveRelation(
             "ptg2_v3_snapshot_block",
             f"{key} AND object_kind IN ('price_atoms_v3', 'price_set_atom_memberships_v3')",
