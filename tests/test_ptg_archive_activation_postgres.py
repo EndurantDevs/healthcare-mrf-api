@@ -19,7 +19,7 @@ from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 
 _OPT_IN_ENV = "HLTHPRT_PTG_ARCHIVE_ACTIVATION_POSTGRES_TEST"
 _DSN_ENV = "HLTHPRT_PTG_ARCHIVE_ACTIVATION_POSTGRES_DSN"
-_DATABASE_PATTERN = re.compile(r"^ptg_archive_activation_test_[a-z0-9_]+$")
+_DATABASE_PATTERN = re.compile(r"^(?:ptg_archive_activation_test_[a-z0-9_]+|ptg2_v3_lifecycle_test_ci_runner)$")
 
 
 def _require_postgres(monkeypatch: pytest.MonkeyPatch) -> str:
@@ -38,7 +38,7 @@ def _require_postgres(monkeypatch: pytest.MonkeyPatch) -> str:
         or not url.username
         or not _DATABASE_PATTERN.fullmatch(database_name)
     ):
-        pytest.fail(f"{_DSN_ENV} must identify this test's disposable database")
+        pytest.fail(f"{_DSN_ENV} must identify the dedicated archive-activation test database")
     monkeypatch.setenv("HLTHPRT_DB_DRIVER", "asyncpg")
     monkeypatch.setenv("HLTHPRT_DB_HOST", str(url.host))
     monkeypatch.setenv("HLTHPRT_DB_PORT", str(url.port or 5432))

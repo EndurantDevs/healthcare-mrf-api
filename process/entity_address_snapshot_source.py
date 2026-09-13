@@ -106,7 +106,7 @@ async def export_entity_address_archive_source(
 
     ``archive_copy`` must consume the snapshot synchronously, for example by
     awaiting a subprocess-backed ``pg_dump``.  The returned manifest contains
-    no snapshot token because the transaction has rolled back and released its
+    no snapshot token because the transaction has ended and released its
     locks.  It identifies source relations only; an admitted source-clone
     lifecycle remains necessary for a differently named destination stage.
     """
