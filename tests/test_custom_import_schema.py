@@ -62,6 +62,14 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "INSERT INTO" not in normalized
     assert "guard_custom_import_immutable_row" in normalized
     assert normalized.count("BEFORE UPDATE OR DELETE") == len(migration._IMMUTABLE_TABLES)
+    function_statement = next(
+        statement for statement in statements if "CREATE FUNCTION" in statement
+    )
+    revoke_statement = next(
+        statement for statement in statements if "REVOKE ALL ON FUNCTION" in statement
+    )
+    assert "REVOKE ALL ON FUNCTION" not in function_statement
+    assert "CREATE FUNCTION" not in revoke_statement
 
 
 def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch):
