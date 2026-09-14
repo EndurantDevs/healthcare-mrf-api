@@ -112,10 +112,39 @@ def test_source_url_normalization_requires_complete_asr_coordinates():
 
 def test_source_url_normalization_repairs_healthsparq_leading_path_slashes():
     malformed = "https://mrf.healthsparq.com//rates/file.json.gz?token=value"
+    tenant_index = (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/latest.json"
+    )
+    missing_tenant = "https://mrf.healthsparq.com//prd/mrf/issuer/rates.json.gz?token=value"
 
     assert canonical.normalize_tic_source_url(malformed) == (
         "https://mrf.healthsparq.com/rates/file.json.gz?token=value"
     )
+    assert canonical.normalize_tic_source_url(
+        missing_tenant,
+        source_index_url=tenant_index,
+    ) == (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/rates.json.gz?token=value"
+    )
+    assert canonical.normalize_tic_source_url(
+        "https://mrf.healthsparq.com/prd/mrf/issuer/rates.json.gz?token=value",
+        source_index_url=tenant_index,
+    ) == (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/rates.json.gz?token=value"
+    )
+    assert canonical.normalize_tic_source_url(missing_tenant) == missing_tenant
+    assert canonical.normalize_tic_source_url(
+        missing_tenant,
+        source_index_url="https://other.example.test/tenant-a/prd/mrf/issuer/latest.json",
+    ) == missing_tenant
+    assert canonical.normalize_tic_source_url(
+        missing_tenant,
+        source_index_url="https://mrf.healthsparq.com/%2E%2E/prd/mrf/issuer/latest.json",
+    ) == missing_tenant
+    assert canonical.normalize_tic_source_url(
+        missing_tenant,
+        source_index_url="https://mrf.healthsparq.com/tenant%2Fchild/prd/mrf/issuer/latest.json",
+    ) == missing_tenant
     assert canonical.normalize_tic_source_url(
         "https://example.test//rates/file.json.gz?token=value"
     ) == "https://example.test//rates/file.json.gz?token=value"

@@ -61,7 +61,10 @@ def _catalog_entry_from_file(
     if source_type_and_domain is None:
         return None
     source_type, domain = source_type_and_domain
-    file_url = normalize_tic_source_url(_file_url(toc_url, file_item))
+    file_url = normalize_tic_source_url(
+        _file_url(toc_url, file_item),
+        source_index_url=toc_url,
+    )
     if not _is_file_location_like_download(file_url):
         return None
     plans = _filter_plans(

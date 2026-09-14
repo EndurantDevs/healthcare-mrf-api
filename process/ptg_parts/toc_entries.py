@@ -156,7 +156,10 @@ def _build_flat_toc_catalog_entry(
     if not _is_toc_body_file_location(location):
         return None
     source_type, domain = section_type
-    normalized_location = normalize_tic_source_url(location)
+    normalized_location = normalize_tic_source_url(
+        location,
+        source_index_url=toc_url,
+    )
     return PTG2SourceCatalogEntry(
         source_type=source_type,
         domain=domain,

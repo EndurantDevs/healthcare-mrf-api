@@ -227,7 +227,10 @@ def parse_toc_catalog_entries(
                 source_type, domain = _toc_body_source_type(
                     "in-network", location, file_entry.get("description")
                 )
-                location = normalize_tic_source_url(location)
+                location = normalize_tic_source_url(
+                    location,
+                    source_index_url=toc_url,
+                )
                 entries.append(
                     PTG2SourceCatalogEntry(
                         source_type=source_type,
@@ -260,7 +263,10 @@ def parse_toc_catalog_entries(
                 allowed_amount_file["location"],
                 allowed_amount_file.get("description"),
             )
-            location = normalize_tic_source_url(allowed_amount_file["location"])
+            location = normalize_tic_source_url(
+                allowed_amount_file["location"],
+                source_index_url=toc_url,
+            )
             entries.append(
                 PTG2SourceCatalogEntry(
                     source_type=source_type,
@@ -296,7 +302,10 @@ def parse_toc_catalog_entries(
                     source_type, domain = _toc_body_source_type(
                         "payer-drug", location, drug_entry.get("description")
                     )
-                    location = normalize_tic_source_url(location)
+                    location = normalize_tic_source_url(
+                        location,
+                        source_index_url=toc_url,
+                    )
                     entries.append(
                         PTG2SourceCatalogEntry(
                             source_type=source_type,
@@ -385,7 +394,10 @@ def _filter_jobs_by_url_contains(
 
 def _ptg_job_identity(job: dict[str, Any]) -> tuple[str, str]:
     job_type = str(job.get("type") or "").strip()
-    url = normalize_tic_source_url(str(job.get("url") or ""))
+    url = normalize_tic_source_url(
+        str(job.get("url") or ""),
+        source_index_url=str(job.get("from_index_url") or ""),
+    )
     return job_type, canonicalize_url(url)
 
 
@@ -432,7 +444,8 @@ def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
         identity = _ptg_job_identity(job)
         normalized_job_by_field = dict(job)
         normalized_job_by_field["url"] = normalize_tic_source_url(
-            str(job.get("url") or "")
+            str(job.get("url") or ""),
+            source_index_url=str(job.get("from_index_url") or ""),
         )
         if identity in jobs_by_identity:
             duplicate_count += 1
