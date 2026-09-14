@@ -494,6 +494,19 @@ async def prepare_entity_address_archive_destination(
         )
 
 
+def _validated_source_generation(
+    source_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
+) -> EntityAddressServingGeneration | None:
+    """Normalize the source identity into the destination error contract."""
+
+    try:
+        if source_generation is None:
+            return None
+        return validate_entity_address_serving_generation(source_generation)
+    except ValueError as error:
+        raise EntityAddressSnapshotDestinationError("entity-address source serving generation is invalid") from error
+
+
 async def _prepare_bound_destination(
     session: Any,
     *,
@@ -505,21 +518,9 @@ async def _prepare_bound_destination(
     source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
 ) -> PreparedEntityAddressSnapshotDestination:
     """Prepare while the module database uses the caller-owned session."""
-
-    try:
-        validated_source_generation = (
-            None
-            if source_serving_generation is None
-            else validate_entity_address_serving_generation(source_serving_generation)
-        )
-    except ValueError as error:
-        raise EntityAddressSnapshotDestinationError(
-            "entity-address source serving generation is invalid"
-        ) from error
+    validated_source_generation = _validated_source_generation(source_serving_generation)
     source_alias, destination_alias = await _destination_alias_binding(
-        session,
-        db_schema=db_schema,
-        source_alias_receipt=source_alias_receipt,
+        session, db_schema=db_schema, source_alias_receipt=source_alias_receipt
     )
     validated_owner, source_receipt, normalized_schema, normalized_date, stage_names = await _validate_owned_source(
         session,

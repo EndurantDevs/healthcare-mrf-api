@@ -2401,10 +2401,7 @@ async def _run_entity_address_cutover(
             )
         await _assert_provider_directory_overlay_alias_fence(db_schema, context)
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
-        await _assert_cutover_has_no_dependent_views(
-            db_schema,
-            [swap.live_cls.__main_table__ for swap in swaps],
-        )
+        await _assert_cutover_has_no_dependent_views(db_schema, [swap.live_cls.__main_table__ for swap in swaps])
         if callbacks is not None and callbacks.before_cutover is not None:
             await callbacks.before_cutover()
         for swap in swaps:
@@ -2418,30 +2415,13 @@ async def _run_entity_address_cutover(
                 time.monotonic() - started,
                 _coerce_rowcount(rowcount),
             )
-        active_table_oid = await db.scalar(
-            _activate_geo_assurance_candidate_sql(db_schema)
-        )
+        active_table_oid = await db.scalar(_activate_geo_assurance_candidate_sql(db_schema))
         if active_table_oid is None:
-            raise RuntimeError(
-                "geo assurance candidate does not match the published table and sources"
-            )
+            raise RuntimeError("geo assurance candidate does not match the published table and sources")
         context["geo_assurance_active_table_oid"] = int(active_table_oid)
-        generation_mode = context.get("result_generation_mode")
-        if generation_mode == "ordinary":
-            generation_authority = await result_generation.publish_local_entity_address_generation(
-                db,
-                schema_name=db_schema,
-            )
-        elif generation_mode == "adoption":
-            generation_authority = await result_generation.publish_adopted_entity_address_generation(
-                db,
-                schema_name=db_schema,
-                source_generation=context.get("source_serving_generation"),
-            )
-        elif generation_mode is not None:
-            raise RuntimeError("entity-address result generation mode is invalid")
-        else:
-            generation_authority = None
+        generation_authority = await result_generation.publish_cutover_entity_address_generation(
+            db, schema_name=db_schema, context=context
+        )
         if generation_authority is not None:
             context["result_generation"] = generation_authority.as_dict()
         if callbacks is not None and callbacks.after_publish is not None:
@@ -2525,8 +2505,7 @@ async def _publish_staged_entity_address_tables(
         context=context,
         phase="entity-address-unified analyzing staged main table",
     )
-    context["stage_persistence"] = "p"
-    context["result_generation_mode"] = "ordinary"
+    context.update(stage_persistence="p", result_generation_mode="ordinary")
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):
         context["cutover_attempts"] = attempt
