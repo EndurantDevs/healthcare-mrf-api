@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
+import asyncpg
 from sqlalchemy import text
 
 
@@ -148,6 +149,8 @@ def _relation_oids(importer_id: str, value: object) -> tuple[int, ...]:
 def _row_mapping(row: object) -> Mapping[str, Any]:
     mapping = getattr(row, "_mapping", row)
     if not isinstance(mapping, Mapping):
+        if isinstance(row, asyncpg.Record):
+            return dict(row)
         raise RuntimeError("reference family generation authority is unavailable")
     return mapping
 
