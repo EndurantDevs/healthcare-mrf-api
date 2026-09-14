@@ -51,6 +51,7 @@ _FIXTURE_REKEYED_TABLES = frozenset(
 )
 _MODEL_CLOSURE_TABLES = (
     "ptg2_v3_code",
+    "ptg2_v3_audit_occurrence",
     "ptg2_v3_source_audit_witness",
     "ptg2_v3_source_audit_witness_part",
     "ptg2_allowed_amount_plan",
@@ -132,7 +133,6 @@ async def _install_model_closure_tables(database: Database, *, schema_name: str)
             CreateTable(target_table, include_foreign_key_constraints=[]).compile(dialect=postgresql.dialect())
         )
         await database.execute_ddl(statement)
-    await _install_audit_occurrence_table(database, schema_name=schema_name)
 
 
 async def _install_finalizer_map_tables(database: Database, *, schema_name: str, monkeypatch) -> None:
