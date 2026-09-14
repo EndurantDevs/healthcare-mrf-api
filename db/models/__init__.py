@@ -16,3 +16,4 @@ from db.models.provider_directory_rooted_graph_publication import *
 from db.models.hospital_price import *
 from db.models.hospital_price_header import *
 from db.models.hospital_price_facts import *
+from db.models.custom_import import *
