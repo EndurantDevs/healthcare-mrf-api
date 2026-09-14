@@ -50,6 +50,23 @@ _STAGED_AMOUNT_MUTATION_COLUMNS = (
 )
 
 
+@pytest.mark.parametrize("source_key", [None, "--", "a" * 97, "é" * 49, "source\na", "source\ta"])
+def test_activation_scope_rejects_invalid_frozen_source_key(source_key) -> None:
+    """Reject inadmissible raw values before normalization can hide them."""
+
+    with pytest.raises(candidate_preparation.ResultArchiveCandidatePreparationError, match="valid activation scope"):
+        candidate_preparation._activation_scope({"activation": {"source_key": source_key}}, label="candidate")
+
+
+def test_activation_scope_uses_frozen_source_key_normalization() -> None:
+    """Ordinary source aliases resolve to the same frozen binding identity."""
+
+    assert candidate_preparation._activation_scope({"activation": {"source_key": " Source-A "}}, label="candidate") == (
+        "source_a",
+        None,
+    )
+
+
 def _require_native_postgres() -> None:
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
         pytest.skip("set guarded PTG V4 PostgreSQL test variables for native proof")
