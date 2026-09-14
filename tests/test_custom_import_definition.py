@@ -175,6 +175,30 @@ def test_root_without_a_logical_key_rejects_the_whole_candidate(definition):
         merge_families({}, result, refresh_mode="snapshot", complete_scope=True)
 
 
+def test_non_hashable_key_values_are_rejected_without_raising(definition):
+    root_result = assemble_root_families(
+        definition,
+        [{"npi": ["1234567893"], "display_name": "Synthetic Provider"}],
+        {"rates": []},
+    )
+    assert root_result.candidate_errors == ("root_key_missing",)
+
+    child_result = assemble_root_families(
+        definition,
+        [_root()],
+        {
+            "rates": [
+                {
+                    "rate_npi": ["1234567893"],
+                    "service_code": "A100",
+                    "amount": Decimal("12.50"),
+                }
+            ]
+        },
+    )
+    assert child_result.candidate_errors == ("orphan_child",)
+
+
 def test_upsert_retains_rejected_and_absent_families_but_snapshot_requires_scope(definition):
     first = assemble_root_families(definition, [_root()], {"rates": [_rate()]})
     previous_families_by_key = {family.root_key: family for family in first.families}

@@ -295,7 +295,12 @@ def _key(record: Mapping[str, Any], fields: tuple[str, ...]) -> tuple[Any, ...] 
     for field in fields:
         if field not in record or record[field] is None:
             return None
-        values.append(record[field])
+        value = record[field]
+        try:
+            hash(value)
+        except TypeError:
+            return None
+        values.append(value)
     return tuple(values)
 
 
@@ -304,7 +309,12 @@ def _parent_key(record: Mapping[str, Any], collection: ChildCollection) -> tuple
     for part in collection.parent_key:
         if part.child_field not in record or record[part.child_field] is None:
             return None
-        values.append(record[part.child_field])
+        value = record[part.child_field]
+        try:
+            hash(value)
+        except TypeError:
+            return None
+        values.append(value)
     return tuple(values)
 
 
