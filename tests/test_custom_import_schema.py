@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
 import sqlalchemy as sa
 
 from db import maintenance
@@ -82,11 +81,28 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "CREATE FUNCTION" not in revoke_statement
 
 
-def test_migration_refuses_destructive_downgrade():
+def test_migration_downgrade_removes_only_v1_relations_in_reverse_dependency_order(
+    monkeypatch,
+):
     migration = _migration()
     assert not hasattr(migration, "models")
-    with pytest.raises(RuntimeError, match="intentionally unsupported"):
-        migration.downgrade()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+
+    migration.downgrade()
+
+    schema = migration._quote(migration._schema())
+    assert statements[0] == (
+        f"DROP TABLE IF EXISTS {schema}.\"custom_import_winner\""
+    )
+    assert statements[-2] == (
+        f"DROP TABLE IF EXISTS {schema}.\"custom_import_dataset\""
+    )
+    assert statements[-1] == (
+        f"DROP FUNCTION IF EXISTS {schema}.guard_custom_import_immutable_row()"
+    )
+    assert len(statements) == len(migration._TABLE_CREATION_ORDER) + 1
 
 
 def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch):
