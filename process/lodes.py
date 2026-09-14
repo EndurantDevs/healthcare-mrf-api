@@ -15,10 +15,18 @@ from arq import create_pool
 
 from db.models import LODESWorkplaceAggregate, db
 from process.control_lifecycle import mark_control_run
-from process.ext.utils import (download_it_and_save, ensure_database,
-                               make_class, my_init_db, print_time_info,
-                               push_objects)
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    make_class,
+    my_init_db,
+    print_time_info,
+    push_objects,
+)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import (
+    publish_local_reference_family_generation,
+)
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -28,11 +36,57 @@ POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 # All 50 states + DC
 ALL_STATES = [
-    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "dc", "fl",
-    "ga", "hi", "id", "il", "in", "ia", "ks", "ky", "la", "me",
-    "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh",
-    "nj", "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri",
-    "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy",
+    "al",
+    "ak",
+    "az",
+    "ar",
+    "ca",
+    "co",
+    "ct",
+    "de",
+    "dc",
+    "fl",
+    "ga",
+    "hi",
+    "id",
+    "il",
+    "in",
+    "ia",
+    "ks",
+    "ky",
+    "la",
+    "me",
+    "md",
+    "ma",
+    "mi",
+    "mn",
+    "ms",
+    "mo",
+    "mt",
+    "ne",
+    "nv",
+    "nh",
+    "nj",
+    "nm",
+    "ny",
+    "nc",
+    "nd",
+    "oh",
+    "ok",
+    "or",
+    "pa",
+    "ri",
+    "sc",
+    "sd",
+    "tn",
+    "tx",
+    "ut",
+    "vt",
+    "va",
+    "wa",
+    "wv",
+    "wi",
+    "wy",
 ]
 DEFAULT_TEST_STATES = ["tx", "ca", "fl"]
 
@@ -56,14 +110,11 @@ LODES_MIN_YEAR = int(os.getenv("HLTHPRT_LODES_MIN_YEAR", "2010"))
 LODES_BASE_URL = "https://lehd.ces.census.gov/data/lodes/LODES8"
 
 # HUD USPS ZIP Crosswalk (TRACT-to-ZIP)
-HUD_CROSSWALK_URL = (
-    "https://www.huduser.gov/hudapi/public/usps?type=2&query=All"
-)
+HUD_CROSSWALK_URL = "https://www.huduser.gov/hudapi/public/usps?type=2&query=All"
 # Census 2020 ZCTA-to-tract relationship file (public, no token required).
 # We invert it to tract->ZCTA by selecting the ZCTA with max overlap area.
 CENSUS_TRACT_ZCTA_REL_URL = (
-    "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
-    "tab20_zcta520_tract20_natl.txt"
+    "https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_tract20_natl.txt"
 )
 DEFAULT_BATCH_SIZE = 5000
 DEFAULT_MIN_ROWS = 5000
@@ -145,9 +196,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(
-            await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
-        )
+        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -175,16 +224,8 @@ def _has_loaded_local_tract_crosswalk(
     logger.info("Loading local crosswalk file: %s", crosswalk_file)
     with open(crosswalk_file, "r", encoding="utf-8") as handle:
         for local_crosswalk_row in csv.DictReader(handle):
-            tract = (
-                local_crosswalk_row.get("TRACT")
-                or local_crosswalk_row.get("tract")
-                or ""
-            )
-            zip_code = (
-                local_crosswalk_row.get("ZIP")
-                or local_crosswalk_row.get("zip")
-                or ""
-            )
+            tract = local_crosswalk_row.get("TRACT") or local_crosswalk_row.get("tract") or ""
+            zip_code = local_crosswalk_row.get("ZIP") or local_crosswalk_row.get("zip") or ""
             _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
     return _is_usable_tract_crosswalk(zip_by_tract_geoid)
 
@@ -251,12 +292,7 @@ async def _has_loaded_census_tract_crosswalk(
             if not tract or len(zcta) != 5:
                 continue
             try:
-                area = int(
-                    float(
-                        (relationship_row.get("AREALAND_PART") or "0").strip()
-                        or "0"
-                    )
-                )
+                area = int(float((relationship_row.get("AREALAND_PART") or "0").strip() or "0"))
             except ValueError:
                 area = 0
             previous = best_by_tract.get(tract)
@@ -285,8 +321,7 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
             logger.info("Loaded %d tract→zip mappings from file", len(zip_by_tract_geoid))
             return zip_by_tract_geoid
         logger.warning(
-            "Local LODES crosswalk file produced only %d valid 11-digit tract mappings; "
-            "trying network fallbacks",
+            "Local LODES crosswalk file produced only %d valid 11-digit tract mappings; trying network fallbacks",
             len(zip_by_tract_geoid),
         )
         zip_by_tract_geoid.clear()
@@ -300,8 +335,7 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
             logger.info("Loaded %d tract→zip mappings from HUD API", len(zip_by_tract_geoid))
             return zip_by_tract_geoid
         logger.warning(
-            "HUD crosswalk API produced only %d valid 11-digit tract mappings; "
-            "trying Census fallback",
+            "HUD crosswalk API produced only %d valid 11-digit tract mappings; trying Census fallback",
             len(zip_by_tract_geoid),
         )
         zip_by_tract_geoid.clear()
@@ -317,10 +351,7 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
         len(zip_by_tract_geoid),
     )
 
-    logger.warning(
-        "No tract→ZIP crosswalk available (set HLTHPRT_HUD_API_TOKEN or "
-        "HLTHPRT_LODES_CROSSWALK_FILE)."
-    )
+    logger.warning("No tract→ZIP crosswalk available (set HLTHPRT_HUD_API_TOKEN or HLTHPRT_LODES_CROSSWALK_FILE).")
     return zip_by_tract_geoid
 
 
@@ -383,7 +414,7 @@ def _lodes_zcta_worker_totals(
         block_id = workplace_row.get("w_geocode", "")
         try:
             worker_count = int(float(workplace_row.get("C000") or 0))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             worker_count = 0
         if not block_id or worker_count == 0:
             continue
@@ -416,12 +447,14 @@ async def _process_lodes_state(
             now = datetime.datetime.utcnow()
             pending_workplace_rows = []
             for zcta_code, total_workers in zcta_totals.items():
-                pending_workplace_rows.append({
-                    "zcta_code": zcta_code[:5],
-                    "total_workers": total_workers,
-                    "year": year,
-                    "updated_at": now,
-                })
+                pending_workplace_rows.append(
+                    {
+                        "zcta_code": zcta_code[:5],
+                        "total_workers": total_workers,
+                        "year": year,
+                        "updated_at": now,
+                    }
+                )
                 if len(pending_workplace_rows) >= batch_size:
                     await push_objects(pending_workplace_rows, stage_cls)
                     pending_workplace_rows.clear()
@@ -500,12 +533,15 @@ async def process_lodes_data(ctx, task=None):
     batch_size = int(os.getenv("HLTHPRT_LODES_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
 
     import aiohttp
+
     client = aiohttp.ClientSession()
     try:
         crosswalk = await _load_tract_to_zip_crosswalk(client)
-        needs_crosswalk = str(
-            os.getenv("HLTHPRT_LODES_REQUIRE_CROSSWALK", "true")
-        ).strip().lower() not in {"0", "false", "no"}
+        needs_crosswalk = str(os.getenv("HLTHPRT_LODES_REQUIRE_CROSSWALK", "true")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
         if needs_crosswalk and not crosswalk:
             raise RuntimeError(
                 "LODES crosswalk is required but unavailable. "
@@ -513,14 +549,12 @@ async def process_lodes_data(ctx, task=None):
             )
 
         states = TEST_STATES if test_mode else ALL_STATES
-        total_zctas, year_by_processed_state, skipped_states = (
-            await _process_lodes_batch(
-                client,
-                states,
-                crosswalk,
-                stage_cls,
-                batch_size,
-            )
+        total_zctas, year_by_processed_state, skipped_states = await _process_lodes_batch(
+            client,
+            states,
+            crosswalk,
+            stage_cls,
+            batch_size,
         )
     finally:
         await client.close()
@@ -599,21 +633,22 @@ async def publish_lodes_generation(ctx):
             f"LODES stage table {db_schema}.{stage_cls.__tablename__} is missing; aborting publish.",
         )
 
-    stage_rows = int(await db.scalar(
-        f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
-    distinct_zctas = int(await db.scalar(
-        f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
+    distinct_zctas = int(
+        await db.scalar(f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_cls.__tablename__};") or 0
+    )
     if await _table_exists(db_schema, "geo_zip_lookup"):
-        matched_zctas = int(await db.scalar(
-            f"""
+        matched_zctas = int(
+            await db.scalar(
+                f"""
             SELECT COUNT(DISTINCT s.zcta_code)
               FROM {db_schema}.{stage_cls.__tablename__} AS s
               JOIN {db_schema}.geo_zip_lookup AS g
                 ON g.zip_code = s.zcta_code
             """
-        ) or 0)
+            )
+            or 0
+        )
     elif context.get("test_mode"):
         matched_zctas = 0
         logger.info("LODES test mode: %s.geo_zip_lookup is missing; skipping geo match validation.", db_schema)
@@ -630,20 +665,19 @@ async def publish_lodes_generation(ctx):
         )
     elif stage_rows < DEFAULT_MIN_ROWS:
         await _abort_lodes_publish(
-            run_id,
-            f"LODES stage row count {stage_rows} is below minimum {DEFAULT_MIN_ROWS}; aborting publish."
+            run_id, f"LODES stage row count {stage_rows} is below minimum {DEFAULT_MIN_ROWS}; aborting publish."
         )
     elif distinct_zctas < DEFAULT_MIN_DISTINCT_ZCTAS:
         await _abort_lodes_publish(
             run_id,
             f"LODES distinct ZCTA count {distinct_zctas} is below minimum "
-            f"{DEFAULT_MIN_DISTINCT_ZCTAS}; aborting publish."
+            f"{DEFAULT_MIN_DISTINCT_ZCTAS}; aborting publish.",
         )
     elif geo_match_ratio < DEFAULT_MIN_GEO_MATCH_RATIO:
         await _abort_lodes_publish(
             run_id,
             f"LODES geo match ratio {geo_match_ratio:.3f} below minimum "
-            f"{DEFAULT_MIN_GEO_MATCH_RATIO:.2f}; aborting publish."
+            f"{DEFAULT_MIN_GEO_MATCH_RATIO:.2f}; aborting publish.",
         )
 
     # Atomic swap: staging → live
@@ -652,18 +686,19 @@ async def publish_lodes_generation(ctx):
             table = LODESWorkplaceAggregate.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-            )
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
             archived = _archived_identifier(f"{table}_idx_primary")
             await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-            await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-            )
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
             await db.status(
                 f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
                 f"RENAME TO {table}_idx_primary;"
+            )
+            await publish_local_reference_family_generation(
+                db,
+                importer_id="lodes",
+                schema_name=db_schema,
             )
     except Exception as exc:
         await _mark_lodes_publish_failed(run_id, exc)

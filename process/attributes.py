@@ -22,13 +22,21 @@ from sqlalchemy.exc import IntegrityError
 
 from api.for_human import plan_attributes_labels_to_key
 from db.connection import init_db
-from db.models import (PlanAttributes, PlanBenefits, PlanPrices,
-                       PlanRatingAreas, db)
+from db.models import PlanAttributes, PlanBenefits, PlanPrices, PlanRatingAreas, db
 from process.ext.archive import unzip
-from process.ext.utils import (download_it_and_save, ensure_database,
-                               get_import_schema, make_class, print_time_info,
-                               push_objects, return_checksum)
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    get_import_schema,
+    make_class,
+    print_time_info,
+    push_objects,
+    return_checksum,
+)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import (
+    publish_local_reference_family_generation,
+)
 from process.serialization import deserialize_job, serialize_job
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
@@ -90,9 +98,7 @@ async def _prepare_attribute_tables(ctx):
             PlanBenefits,
         ):
             table_model = make_class(cls, import_date, schema_override=db_schema)
-            await db.status(
-                f"DROP TABLE IF EXISTS {db_schema}.{table_model.__main_table__}_{import_date};"
-            )
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table_model.__main_table__}_{import_date};")
             try:
                 await db.create_table(table_model.__table__, checkfirst=True)
             except IntegrityError as exc:  # pragma: no cover - rare race; ignore if table/type already exists
@@ -115,7 +121,7 @@ async def _safe_unzip(zip_path: str, destination: str) -> None:
         await unzip(zip_path, destination)
     except (zipfile.BadZipFile, RuntimeError, ValueError) as exc:
         print(f"Falling back to zipfile extraction for {zip_path}: {exc}")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(destination)
 
 
@@ -169,11 +175,7 @@ def _attribute_objects_from_row(
         text_value = str(raw_value).strip()
         if not text_value:
             continue
-        attribute_name = (
-            attribute_name_by_label[key]
-            if attribute_name_by_label is not None
-            else key
-        )
+        attribute_name = attribute_name_by_label[key] if attribute_name_by_label is not None else key
         attribute_objects.append(
             {
                 "plan_id": plan_id,
@@ -200,23 +202,15 @@ def _benefit_object_from_row(benefit_row, plan_id: str, full_plan_id: str):
         "coins_inn_tier2": benefit_row["CoinsInnTier2"],
         "coins_outof_net": benefit_row["CoinsOutofNet"],
         "is_ehb": _parse_flag(benefit_row.get("IsEHB"), ("yes", "y"), ("no", "n")),
-        "is_covered": _parse_flag(
-            benefit_row.get("IsCovered"), ("covered",), ("not covered",)
-        ),
-        "quant_limit_on_svc": _parse_flag(
-            benefit_row.get("QuantLimitOnSvc"), ("yes", "y"), ("no", "n")
-        ),
+        "is_covered": _parse_flag(benefit_row.get("IsCovered"), ("covered",), ("not covered",)),
+        "quant_limit_on_svc": _parse_flag(benefit_row.get("QuantLimitOnSvc"), ("yes", "y"), ("no", "n")),
         "limit_qty": None,
         "limit_unit": benefit_row["LimitUnit"],
         "exclusions": benefit_row["Exclusions"],
         "explanation": benefit_row["Explanation"],
         "ehb_var_reason": benefit_row["EHBVarReason"],
-        "is_excl_from_inn_mo": _parse_flag(
-            benefit_row.get("IsExclFromInnMOOP"), ("yes", "y"), ("no", "n")
-        ),
-        "is_excl_from_oon_mo": _parse_flag(
-            benefit_row.get("IsExclFromOonMOOP"), ("yes", "y"), ("no", "n")
-        ),
+        "is_excl_from_inn_mo": _parse_flag(benefit_row.get("IsExclFromInnMOOP"), ("yes", "y"), ("no", "n")),
+        "is_excl_from_oon_mo": _parse_flag(benefit_row.get("IsExclFromOonMOOP"), ("yes", "y"), ("no", "n")),
     }
     if benefit_row["LimitQty"]:
         try:
@@ -269,11 +263,11 @@ async def startup(ctx):
 
 
 async def _create_additional_indexes(cls, table_model, db_schema: str) -> None:
-    for index in (getattr(cls, "__my_additional_indexes__", None) or ()):
+    for index in getattr(cls, "__my_additional_indexes__", None) or ():
         index_name = index.get("name", "_".join(index.get("index_elements")))
         using = f"USING {index['using']} " if index.get("using") else ""
         unique = " UNIQUE " if index.get("unique") else " "
-        where = f' WHERE {index.get("where")} ' if index.get("where") else ""
+        where = f" WHERE {index.get('where')} " if index.get("where") else ""
         create_index_sql = (
             f"CREATE{unique}INDEX IF NOT EXISTS "
             f"{table_model.__tablename__}_idx_{index_name} "
@@ -301,28 +295,16 @@ async def _swap_attribute_stage(cls, table_model, db_schema: str) -> None:
         return
     table = table_model.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+    await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+    await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} RENAME TO {table};")
+    await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {table}_idx_primary_old;")
     await db.status(
-        f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;"
+        f"ALTER INDEX IF EXISTS {db_schema}.{table_model.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
     )
-    await db.status(
-        f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} "
-        f"RENAME TO {table};"
-    )
-    await db.status(
-        f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary "
-        f"RENAME TO {table}_idx_primary_old;"
-    )
-    await db.status(
-        f"ALTER INDEX IF EXISTS {db_schema}.{table_model.__tablename__}_idx_primary "
-        f"RENAME TO {table}_idx_primary;"
-    )
-    for index in (
-        getattr(table_model, "__my_additional_indexes__", None) or ()
-    ):
+    for index in getattr(table_model, "__my_additional_indexes__", None) or ():
         index_name = index.get("name", "_".join(index.get("index_elements")))
         await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_{index_name} "
-            f"RENAME TO {table}_idx_{index_name}_old;"
+            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_{index_name} RENAME TO {table}_idx_{index_name}_old;"
         )
         await db.status(
             f"ALTER INDEX IF EXISTS "
@@ -351,6 +333,11 @@ async def finalize_attribute_tables(ctx):
         for cls in processing_classes:
             table_model = make_class(cls, import_date, schema_override=db_schema)
             await _swap_attribute_stage(cls, table_model, db_schema)
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="plan-attributes",
+            schema_name=db_schema,
+        )
     print_time_info(ctx["context"]["start"])
 
 
@@ -402,7 +389,7 @@ async def process_attributes(ctx, task):
         attr_obj_list = []
 
         count = 0
-        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
+        async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
             async for attribute_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     attribute_row.get("StandardComponentId"),
@@ -461,7 +448,7 @@ async def process_benefits(ctx, task):
         attr_obj_list = []
 
         count = 0
-        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
+        async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
             async for benefit_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     benefit_row.get("StandardComponentId"), benefit_row.get("PlanId")
@@ -509,7 +496,7 @@ async def process_rating_areas(ctx):
     rating_areas_path = _PROJECT_ROOT / "data" / "rating_areas.csv"
     if not rating_areas_path.exists():
         rating_areas_path = _PROJECT_ROOT / "restore" / "data" / "rating_areas.csv"
-    async with async_open(rating_areas_path, "r", encoding='utf-8-sig') as afp:
+    async with async_open(rating_areas_path, "r", encoding="utf-8-sig") as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
             rating_area_dict = {
                 "state": row["STATE CODE"].upper(),
@@ -554,7 +541,7 @@ async def process_prices(ctx, task):
         range_regex = re.compile(r"^(\d+)-(\d+)$")
         int_more_regex = re.compile(r"^(\d+) and over$")
         clean_int = re.compile(r"^(\d+)$")
-        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
+        async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
             async for price_row in AsyncDictReader(afp, delimiter=","):
                 if not price_row["PlanId"]:
                     continue
@@ -564,37 +551,25 @@ async def process_prices(ctx, task):
                     "plan_id": price_row["PlanId"],
                     "state": price_row["StateCode"].upper(),
                     "year": int(task["year"]),
-                    "rate_effective_date": pytz.utc.localize(
-                        parse_date(price_row["RateEffectiveDate"], fuzzy=True)
-                    )
+                    "rate_effective_date": pytz.utc.localize(parse_date(price_row["RateEffectiveDate"], fuzzy=True))
                     if price_row["RateEffectiveDate"]
                     else None,
-                    "rate_expiration_date": pytz.utc.localize(
-                        parse_date(price_row["RateExpirationDate"], fuzzy=True)
-                    )
+                    "rate_expiration_date": pytz.utc.localize(parse_date(price_row["RateExpirationDate"], fuzzy=True))
                     if price_row["RateExpirationDate"]
                     else None,
                     "rating_area_id": price_row["RatingAreaId"],
                     "tobacco": price_row["Tobacco"],
                     "min_age": 0,
                     "max_age": 125,
-                    "individual_rate": float(price_row["IndividualRate"])
-                    if price_row["IndividualRate"]
-                    else None,
+                    "individual_rate": float(price_row["IndividualRate"]) if price_row["IndividualRate"] else None,
                     "individual_tobacco_rate": float(price_row["IndividualTobaccoRate"])
                     if price_row["IndividualTobaccoRate"]
                     else None,
-                    "couple": float(price_row["Couple"])
-                    if price_row["Couple"]
-                    else None,
-                    "primary_subscriber_and_one_dependent": float(
-                        price_row["PrimarySubscriberAndOneDependent"]
-                    )
+                    "couple": float(price_row["Couple"]) if price_row["Couple"] else None,
+                    "primary_subscriber_and_one_dependent": float(price_row["PrimarySubscriberAndOneDependent"])
                     if price_row["PrimarySubscriberAndOneDependent"]
                     else None,
-                    "primary_subscriber_and_two_dependents": float(
-                        price_row["PrimarySubscriberAndTwoDependents"]
-                    )
+                    "primary_subscriber_and_two_dependents": float(price_row["PrimarySubscriberAndTwoDependents"])
                     if price_row["PrimarySubscriberAndTwoDependents"]
                     else None,
                     "primary_subscriber_and_three_or_more_dependents": float(
@@ -602,19 +577,13 @@ async def process_prices(ctx, task):
                     )
                     if price_row["PrimarySubscriberAndThreeOrMoreDependents"]
                     else None,
-                    "couple_and_one_dependent": float(
-                        price_row["CoupleAndOneDependent"]
-                    )
+                    "couple_and_one_dependent": float(price_row["CoupleAndOneDependent"])
                     if price_row["CoupleAndOneDependent"]
                     else None,
-                    "couple_and_two_dependents": float(
-                        price_row["CoupleAndTwoDependents"]
-                    )
+                    "couple_and_two_dependents": float(price_row["CoupleAndTwoDependents"])
                     if price_row["CoupleAndTwoDependents"]
                     else None,
-                    "couple_and_three_or_more_dependents": float(
-                        price_row["CoupleAndThreeOrMoreDependents"]
-                    )
+                    "couple_and_three_or_more_dependents": float(price_row["CoupleAndThreeOrMoreDependents"])
                     if price_row["CoupleAndThreeOrMoreDependents"]
                     else None,
                 }
@@ -754,6 +723,8 @@ async def process_prices(ctx, task):
         #
         # for url in url_list:
         #     await redis.enqueue_job('process_json_index', {'url': url, 'issuer_array': url2issuer[url]})
+
+
 #     # break
 
 
@@ -784,7 +755,7 @@ async def process_state_attributes(ctx, task):
         attr_obj_list = []
 
         count = 0
-        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
+        async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
             async for attribute_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     attribute_row.get("STANDARD COMPONENT ID"),

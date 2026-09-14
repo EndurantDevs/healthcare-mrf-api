@@ -25,6 +25,12 @@ from sqlalchemy.schema import CreateTable, MetaData
 
 from db import models
 from process import entity_address_snapshot_receipt as catalog_identity
+from process.reference_family_result_generation import (
+    publish_adopted_reference_family_generation,
+    read_reference_family_result_generation_authority,
+    require_reference_family_automatic_generation_order,
+    validate_reference_family_serving_generation,
+)
 
 CONTRACT = "reference-replacement-family.postgres.v1"
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
@@ -199,6 +205,7 @@ class ReferenceFamilyCutoverAuthority:
     sealed_owner_oid: int
     expected_stage_owner_oid: int
     authority: str
+    source_serving_generation: Mapping[str, Any] | None = None
 
 
 _SPECS = {
@@ -1216,8 +1223,8 @@ async def activate_validated_reference_family_stage(
     _require_transaction(session)
     if not isinstance(cutover, ReferenceFamilyCutoverAuthority):
         raise ReferenceFamilyArchiveError("reference family cutover authority is invalid")
-    if cutover.authority != "manual":
-        raise ReferenceFamilyArchiveError("reference family automatic activation is unsupported")
+    if cutover.authority not in {"manual", "automatic"}:
+        raise ReferenceFamilyArchiveError("reference family activation authority is unsupported")
     if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
         expected_incumbent,
         ReferenceFamilyIncumbent,
@@ -1243,6 +1250,45 @@ async def activate_validated_reference_family_stage(
     spec = reference_family_spec(ownership.importer_id)
     await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
+    source_generation = None
+    if cutover.source_serving_generation is not None:
+        try:
+            source_generation = validate_reference_family_serving_generation(cutover.source_serving_generation)
+        except ValueError as error:
+            raise ReferenceFamilyArchiveError("reference family source generation is invalid") from error
+    if cutover.authority == "automatic":
+        if source_generation is None:
+            raise ReferenceFamilyArchiveError("reference family automatic source generation is unavailable")
+        current_authority = await read_reference_family_result_generation_authority(
+            session,
+            importer_id=spec.importer_id,
+            schema_name=expected_incumbent.schema_name,
+            lock=True,
+        )
+        incumbent_oids = tuple(oid for _, oid in expected_incumbent.relation_oids)
+        if current_authority.serving_generation is None:
+            if all(oid is not None for oid in incumbent_oids):
+                for table_name in spec.table_names:
+                    populated = await session.scalar(
+                        text(
+                            f"SELECT EXISTS (SELECT 1 FROM {_quoted(expected_incumbent.schema_name)}."
+                            f"{_quoted(table_name)} LIMIT 1)"
+                        )
+                    )
+                    if populated:
+                        raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
+        else:
+            if current_authority.relation_oids != incumbent_oids:
+                raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
+            try:
+                require_reference_family_automatic_generation_order(
+                    source_generation,
+                    current_authority.serving_generation,
+                )
+            except ValueError as error:
+                raise ReferenceFamilyArchiveError(
+                    "reference family automatic generation is stale or unrelated"
+                ) from error
     predecessor_schema_name = await _rotate_family_relations(
         session,
         spec,
@@ -1253,6 +1299,16 @@ async def activate_validated_reference_family_stage(
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
     if tuple(sorted(live_pairs)) != ownership.relation_oids:
         raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    if source_generation is not None:
+        published_authority = await publish_adopted_reference_family_generation(
+            session,
+            importer_id=spec.importer_id,
+            schema_name=expected_incumbent.schema_name,
+            source_generation=source_generation,
+        )
+        ordered_live_oids = tuple(dict(live_pairs)[name] for name in spec.table_names)
+        if published_authority.relation_oids != ordered_live_oids:
+            raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
         validated_manifest.source_metadata_sha256,

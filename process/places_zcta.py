@@ -17,17 +17,23 @@ from arq import create_pool
 
 from db.models import PricingPlacesZcta, db
 from process.control_cancel import raise_if_cancelled
-from process.ext.utils import (download_it_and_save, ensure_database, make_class,
-                               my_init_db, print_time_info, push_objects)
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    make_class,
+    my_init_db,
+    print_time_info,
+    push_objects,
+)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import (
+    publish_local_reference_family_generation,
+)
 from process.serialization import deserialize_job, serialize_job
 
 PLACES_ZCTA_QUEUE_NAME = "arq:PlacesZcta"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
-DEFAULT_DOWNLOAD_URL = (
-    "https://chronicdata.cdc.gov/api/views/"
-    "qnzd-25i4/rows.csv?accessType=DOWNLOAD"
-)
+DEFAULT_DOWNLOAD_URL = "https://chronicdata.cdc.gov/api/views/qnzd-25i4/rows.csv?accessType=DOWNLOAD"
 SOURCE_DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 DEFAULT_BATCH_SIZE = 5000
 DEFAULT_TEST_ROWS = 1500
@@ -42,7 +48,7 @@ def _env_positive_int(name: str, default: int) -> int:
     try:
         value = int(raw)
         return value if value > 0 else default
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -76,7 +82,7 @@ def _safe_int(value: Any) -> int | None:
         return None
     try:
         return int(float(text.replace(",", "")))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -86,7 +92,7 @@ def _safe_float(value: Any) -> float | None:
         return None
     try:
         return float(text.replace(",", ""))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -245,9 +251,7 @@ async def import_places_zcta_data(ctx, task=None):
         )
 
     if accepted_rows <= 0:
-        raise RuntimeError(
-            f"CDC PLACES import produced no rows for latest year={latest_year}; aborting stage publish"
-        )
+        raise RuntimeError(f"CDC PLACES import produced no rows for latest year={latest_year}; aborting stage publish")
 
     ctx["context"]["audit"] = {
         "source_url": source_url,
@@ -257,10 +261,7 @@ async def import_places_zcta_data(ctx, task=None):
     }
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
 
-    print(
-        "PLACES ZCTA import done: "
-        f"latest_year={latest_year} processed={processed_rows:,} accepted={accepted_rows:,}"
-    )
+    print(f"PLACES ZCTA import done: latest_year={latest_year} processed={processed_rows:,} accepted={accepted_rows:,}")
 
 
 process_data = import_places_zcta_data
@@ -294,10 +295,7 @@ async def startup(ctx):  # pragma: no cover
             f"({', '.join(stage_cls.__my_index_elements__)});"
         )
 
-    print(
-        f"PLACES ZCTA startup ready for schema={db_schema} "
-        f"import_date={import_date}"
-    )
+    print(f"PLACES ZCTA startup ready for schema={db_schema} import_date={import_date}")
 
 
 async def _is_table_available(schema: str, table_name: str) -> bool:
@@ -312,12 +310,7 @@ async def _validated_places_stage_rows(stage_cls, db_schema: str, context) -> in
             f"Staging table {db_schema}.{stage_cls.__tablename__} is missing; cannot finalize PLACES publish."
         )
 
-    stage_rows = int(
-        await db.scalar(
-            f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-        )
-        or 0
-    )
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     min_rows = _env_positive_int("HLTHPRT_PLACES_ZCTA_MIN_ROWS", DEFAULT_MIN_ROWS)
 
     if context.get("test_mode"):
@@ -332,10 +325,7 @@ async def _validated_places_stage_rows(stage_cls, db_schema: str, context) -> in
 async def _create_places_stage_indexes(stage_cls, db_schema: str) -> None:
     """Create the configured additional indexes before PLACES cutover."""
     async with db.transaction():
-        if (
-            hasattr(PricingPlacesZcta, "__my_additional_indexes__")
-            and PricingPlacesZcta.__my_additional_indexes__
-        ):
+        if hasattr(PricingPlacesZcta, "__my_additional_indexes__") and PricingPlacesZcta.__my_additional_indexes__:
             for index in PricingPlacesZcta.__my_additional_indexes__:
                 index_name = index.get("name", "_".join(index.get("index_elements")))
                 using = f"USING {index.get('using')} " if index.get("using") else ""
@@ -367,23 +357,18 @@ async def publish_places_zcta_generation(ctx):
         """Archive one canonical index before renaming its staged replacement."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};"
-        )
+        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};")
         return archived_name
 
     async with db.transaction():
         table = stage_cls.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
         await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
+        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
         await archive_index(f"{table}_idx_primary")
         await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
+            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
         )
 
         for index in PricingPlacesZcta.__my_additional_indexes__:
@@ -393,6 +378,11 @@ async def publish_places_zcta_generation(ctx):
                 f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_{index_name} "
                 f"RENAME TO {table}_idx_{index_name};"
             )
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="places-zcta",
+            schema_name=db_schema,
+        )
 
     print_time_info(context.get("start"))
 
