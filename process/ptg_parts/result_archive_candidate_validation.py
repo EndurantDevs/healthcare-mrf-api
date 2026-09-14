@@ -185,7 +185,8 @@ async def _candidate_source_key(
         {"snapshot_id": snapshot_id},
     )
     source_key_rows = source_key_query.all()
-    source_key = str(source_key_rows[0][0] if len(source_key_rows) == 1 else "").strip().lower()
+    raw_source_key = source_key_rows[0][0] if len(source_key_rows) == 1 else None
+    source_key = str(raw_source_key or "").strip().lower()
     if not source_key:
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation destination source scope is unavailable"

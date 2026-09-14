@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -481,6 +482,27 @@ async def revalidate_ptg_result_archive_source_authority(
     return actual
 
 
+@asynccontextmanager
+async def _bounded_clone_lock_reads(session: Any):
+    """Bound source row-lock reads without imposing a short timeout on the clone."""
+
+    previous_settings = (
+        await session.execute(text("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')"))
+    ).one()
+    try:
+        await configure_ptg2_lifecycle_transaction(session)
+        yield
+        await configure_ptg2_lifecycle_transaction(
+            session,
+            lock_timeout=previous_settings[0],
+            statement_timeout=previous_settings[1],
+        )
+    except Exception as error:
+        if not is_retryable_lifecycle_database_error(error):
+            raise
+        raise PTG2LifecycleLockDeferred("result archive source clone is busy; retry") from error
+
+
 async def lock_ptg_result_archive_for_clone(
     session: Any,
     *,
@@ -506,16 +528,17 @@ async def lock_ptg_result_archive_for_clone(
         snapshot_manifest_sha256=authority_by_field["snapshot_manifest_sha256"],
         frozen_binding_sha256=authority_by_field["frozen_binding_sha256"],
     )
-    actual = _authority_from_row(
-        await _authority_row(session, schema=_quote_ident(schema_name), snapshot_id=expected.snapshot_id),
-        expected.operation_id,
-    )
-    if actual != expected:
-        raise PtgResultArchiveSourceAuthorityError("result archive source authority changed after capture")
-    if await _pin_rows(session, schema=_quote_ident(schema_name), authority=expected) != [
-        {"snapshot_id": expected.snapshot_id, "reason": expected.pin_reason}
-    ]:
-        raise PtgResultArchiveSourceAuthorityError("result archive source authority pin is unavailable")
+    async with _bounded_clone_lock_reads(session):
+        actual = _authority_from_row(
+            await _authority_row(session, schema=_quote_ident(schema_name), snapshot_id=expected.snapshot_id),
+            expected.operation_id,
+        )
+        if actual != expected:
+            raise PtgResultArchiveSourceAuthorityError("result archive source authority changed after capture")
+        if await _pin_rows(session, schema=_quote_ident(schema_name), authority=expected) != [
+            {"snapshot_id": expected.snapshot_id, "reason": expected.pin_reason}
+        ]:
+            raise PtgResultArchiveSourceAuthorityError("result archive source authority pin is unavailable")
     return actual
 
 
