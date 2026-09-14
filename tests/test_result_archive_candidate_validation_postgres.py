@@ -83,6 +83,7 @@ def _serving_index(fixture: _NativeFixture) -> dict[str, object]:
         "provider_scope_strategy": "postgres_packed_graph_v4",
         "shared_block_layout": "packed_snapshot_maps_v4",
         "shared_snapshot_key": _DESTINATION_SNAPSHOT_KEY,
+        "source_key": "source_a",
         "snapshot_map": {
             "contract": "ptg_v4_packed_snapshot_map_v1",
             "map_digest": _MAPPING_DIGEST.hex(),
@@ -111,6 +112,7 @@ async def _seed_local_layout(session, fixture: _NativeFixture) -> None:
     schema = '"' + fixture.destination_schema + '"'
     serving_index = _serving_index(fixture)
     serving_index.pop("source_set")
+    serving_index.pop("source_key")
     await session.execute(
         text(
             f"""
@@ -386,6 +388,47 @@ async def test_native_validation_rejects_conflicting_sealed_source_set(native_ca
                     "snapshot_key": _DESTINATION_SNAPSHOT_KEY,
                     "source_set": json.dumps(conflicting_source_set_by_field),
                 },
+            )
+            await validation.validate_result_archive_candidate_for_audit(
+                session,
+                schema_name=fixture.destination_schema,
+                prepared_candidate=prepared_candidate,
+                prepared_layout=prepared_layout,
+            )
+    schema = '"' + fixture.destination_schema + '"'
+    assert await db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot") == 0
+    assert await db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout") == 0
+
+
+@pytest.mark.asyncio
+async def test_native_validation_rejects_conflicting_sealed_source_key(native_candidate) -> None:
+    """A layout cannot override the destination's locked logical source scope."""
+
+    fixture = native_candidate
+    await _install_validation_tables(fixture)
+    with pytest.raises(
+        validation.ResultArchiveCandidateValidationError,
+        match="sealed source key differs from local scope",
+    ):
+        async with _caller_transaction() as session:
+            prepared_candidate, prepared_layout = await _prepare_candidate_and_layout(
+                session,
+                fixture,
+            )
+            schema = '"' + fixture.destination_schema + '"'
+            await session.execute(
+                text(
+                    f"""
+                    UPDATE {schema}.ptg2_v3_snapshot_layout
+                       SET layout_manifest = jsonb_set(
+                               layout_manifest,
+                               '{{serving_index,source_key}}',
+                               '"wrong_source"'::jsonb
+                           )
+                     WHERE snapshot_key = :snapshot_key
+                    """
+                ),
+                {"snapshot_key": _DESTINATION_SNAPSHOT_KEY},
             )
             await validation.validate_result_archive_candidate_for_audit(
                 session,

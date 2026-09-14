@@ -336,11 +336,22 @@ def _candidate_attributes(
     )
 
 
-def _attach_destination_source_set(
+def _attach_destination_source_identity(
     serving_index: Mapping[str, Any],
+    *,
+    source_key: str,
     source_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Bind the locally copied source rows to the destination serving manifest."""
+    """Bind locked logical scope and copied source rows to destination serving."""
+
+    sealed_source_key = serving_index.get("source_key")
+    if "source_key" in serving_index and (
+        not isinstance(sealed_source_key, str)
+        or sealed_source_key.strip().lower() != source_key
+    ):
+        raise ResultArchiveCandidateValidationError(
+            "archive candidate validation sealed source key differs from local scope"
+        )
 
     try:
         source_set = shared_source_set_metadata(
@@ -357,7 +368,11 @@ def _attach_destination_source_set(
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation sealed source set differs from local evidence"
         )
-    return {**serving_index, "source_set": source_set}
+    return {
+        **serving_index,
+        "source_key": source_key,
+        "source_set": source_set,
+    }
 
 
 async def _complete_local_run(
@@ -447,12 +462,13 @@ async def _validated_audit_target(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
     )
-    serving_index = _attach_destination_source_set(
+    serving_index = _attach_destination_source_identity(
         _validated_layout_serving_index(
             candidate_state,
             prepared_layout,
         ),
-        candidate_sources,
+        source_key=source_key,
+        source_records=candidate_sources,
     )
     candidate_attributes = _candidate_attributes(
         candidate_state,
