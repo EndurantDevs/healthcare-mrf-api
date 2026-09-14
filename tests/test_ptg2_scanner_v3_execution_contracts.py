@@ -68,6 +68,7 @@ from tests.ptg2_scanner_v3_run_support import (
     _scanner_run_paths,
 )
 
+
 def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
     scanner_binary = _built_scanner_binary()
     mode_specs_by_name = {
@@ -111,16 +112,13 @@ def test_scanner_quarantine_is_identical_across_execution_modes(tmp_path):
         assert summary["serving_run_rows"] == 2
         quarantine_evidence_list.append(summary["provider_identifier_quarantine"])
 
-        member_rows = _SUPPORT_MODULE._sorted_copy_rows(
-            run["provider_group_member_copy_path"]
-        )
-        member_npis = tuple(
-            sorted(int(member_row.rsplit(b"\t", 1)[1]) for member_row in member_rows)
-        )
+        member_rows = _SUPPORT_MODULE._sorted_copy_rows(run["provider_group_member_copy_path"])
+        member_npis = tuple(sorted(int(member_row.rsplit(b"\t", 1)[1]) for member_row in member_rows))
         assert member_npis == (1234567890, 1234567891)
         assert malformed_npis.isdisjoint(member_npis)
 
     assert quarantine_evidence_list == [expected_quarantine] * len(mode_specs_by_name)
+
 
 def test_v3_all_scanner_paths_emit_identical_fixed_width_records(tmp_path):
     """Verify v3 all scanner paths emit identical fixed width records."""
@@ -207,9 +205,7 @@ def test_v3_worker_and_serial_paths_preserve_source_rate_occurrences(tmp_path):
         partition_bytes = run["partition_bytes"]
         assert len(partition_bytes) == 3 * _SERVING_RECORD.size
         serving_records = [
-            _SERVING_RECORD.unpack(
-                partition_bytes[offset : offset + _SERVING_RECORD.size]
-            )
+            _SERVING_RECORD.unpack(partition_bytes[offset : offset + _SERVING_RECORD.size])
             for offset in range(0, len(partition_bytes), _SERVING_RECORD.size)
         ]
         assert sorted(Counter(serving_records).values()) == [1, 2]
@@ -222,9 +218,7 @@ def test_v3_worker_and_serial_paths_preserve_source_rate_occurrences(tmp_path):
         ]
         assert sum(frame["row_count"] for frame in run["partition_frames"]) == 3
         assert _single_frame(run["frames"], "scanner_summary")["serving_run_rows"] == 3
-        assert sum(
-            frame["row_count"] for frame in run["provider_group_member_frames"]
-        ) == 3
+        assert sum(frame["row_count"] for frame in run["provider_group_member_frames"]) == 3
 
 
 def test_strict_v3_rejects_negotiated_rate_grouping_before_input_open(tmp_path):
@@ -261,17 +255,13 @@ def test_strict_v3_rejects_negotiated_rate_grouping_before_input_open(tmp_path):
         " postgres_binary_v3 ",
     ],
 )
-def test_scanner_requires_exact_postgres_binary_v3_arch_before_input_open(
-    tmp_path, arch
-):
+def test_scanner_requires_exact_postgres_binary_v3_arch_before_input_open(tmp_path, arch):
     scanner_environment_map = dict(os.environ)
     if arch is None:
         scanner_environment_map.pop("HLTHPRT_PTG2_SNAPSHOT_ARCH", None)
     else:
         scanner_environment_map["HLTHPRT_PTG2_SNAPSHOT_ARCH"] = arch
-    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(
-        tmp_path / "serving-runs"
-    )
+    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(tmp_path / "serving-runs")
 
     completed = subprocess.run(
         [str(_built_scanner_binary()), "--compact-serving", str(tmp_path / "missing.json")],
@@ -283,10 +273,7 @@ def test_scanner_requires_exact_postgres_binary_v3_arch_before_input_open(
     )
 
     assert completed.returncode != 0
-    assert (
-        b"HLTHPRT_PTG2_SNAPSHOT_ARCH must be exactly postgres_binary_v3"
-        in completed.stderr
-    )
+    assert b"HLTHPRT_PTG2_SNAPSHOT_ARCH must be exactly postgres_binary_v3" in completed.stderr
     assert not (tmp_path / "serving-runs").exists()
 
 
