@@ -87,10 +87,10 @@ async def _assert_cancelled_export_cleanup(sessions, live_schema: str, unrelated
 
 async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
     dataset_id = uuid4()
-    recorded = []
+    prepared_sources = []
 
     async def persist(_session, prepared):
-        recorded.append(prepared)
+        prepared_sources.append(prepared)
 
     prepared = await archive.prepare_reference_family_archive_source(
         sessions,
@@ -100,9 +100,9 @@ async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
         dataset_id=dataset_id,
         on_prepared=persist,
     )
-    assert recorded == [prepared]
+    assert prepared_sources == [prepared]
     async with sessions() as session, session.begin():
-        await session.execute(text(f'UPDATE "{live_schema}".pricing_places_zcta SET measure_name=\'new-live\''))
+        await session.execute(text(f"UPDATE \"{live_schema}\".pricing_places_zcta SET measure_name='new-live'"))
     captures = []
 
     async def copy(capture):
@@ -135,10 +135,13 @@ async def _assert_prepare_callback_rollback(sessions, live_schema: str) -> None:
             on_prepared=reject,
         )
     async with sessions() as session, session.begin():
-        assert await session.scalar(
-            text("SELECT to_regnamespace(:schema)"),
-            {"schema": archive.reference_family_stage_schema(dataset_id)},
-        ) is None
+        assert (
+            await session.scalar(
+                text("SELECT to_regnamespace(:schema)"),
+                {"schema": archive.reference_family_stage_schema(dataset_id)},
+            )
+            is None
+        )
 
 
 async def _create_places_fixture(session, live_schema: str, unrelated_schema: str) -> None:
@@ -204,6 +207,119 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
             assert await session.scalar(text(f'SELECT count(*) FROM "{stage_schema}".pricing_places_zcta')) == 1
             assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
             await archive.cleanup_reference_family_stage(session, owner)
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (stage_schema, live_schema, unrelated_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+async def _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id):
+    async with sessions() as session, session.begin():
+        await _create_places_fixture(session, live_schema, unrelated_schema)
+    manifest = await _manifest(sessions, "places-zcta", live_schema)
+    async with sessions() as session, session.begin():
+        ownership = await archive.precreate_reference_family_restore(
+            session, importer_id="places-zcta", dataset_id=dataset_id
+        )
+        await _copy_live_to_stage(session, "places-zcta", live_schema, ownership.schema_name)
+        sealed_owner_oid = await session.scalar(text("SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user"))
+    async with sessions() as session, session.begin():
+        incumbent = await archive.capture_reference_family_incumbent(
+            session, importer_id="places-zcta", schema_name=live_schema
+        )
+        validation = await archive.prepare_reference_family_activation(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            package_id=package_id,
+            profile_contract=archive.CONTRACT,
+            sealed_owner_oid=sealed_owner_oid,
+        )
+    return ownership, manifest, incumbent, validation, sealed_owner_oid
+
+
+async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
+    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+    forged_receipt = validation.as_dict()
+    forged_receipt["package_id"] = "b" * 64
+    cases = ((forged_receipt, sealed_owner_oid, "digest differs"), (validation, sealed_owner_oid + 1, "owner differs"))
+    for validation_receipt, owner_oid, error_message in cases:
+        async with sessions() as session, session.begin():
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match=error_message):
+                await archive.activate_validated_reference_family_stage(
+                    session,
+                    ownership=ownership,
+                    manifest=manifest,
+                    expected_incumbent=incumbent,
+                    validation_receipt=validation_receipt,
+                    cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, owner_oid, "manual"),
+                )
+
+
+async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, package_id):
+    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+
+    async def reject_recount(*_args, **_kwargs):
+        raise AssertionError("short activation recounted the stage")
+
+    monkeypatch.setattr(archive, "_validate_stage_manifest", reject_recount)
+    async with sessions() as session:
+        transaction = await session.begin()
+        receipt = await archive.activate_validated_reference_family_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            expected_incumbent=incumbent,
+            validation_receipt=validation,
+            cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, sealed_owner_oid, "manual"),
+        )
+        assert receipt.tables == manifest.tables
+        await transaction.rollback()
+
+
+async def _replace_incumbent_and_reject(sessions, live_schema, candidate, package_id):
+    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(f'ALTER TABLE "{live_schema}".pricing_places_zcta RENAME TO pricing_places_zcta_stale')
+        )
+        await session.execute(
+            text(
+                f'CREATE TABLE "{live_schema}".pricing_places_zcta '
+                f'(LIKE "{live_schema}".pricing_places_zcta_stale INCLUDING ALL)'
+            )
+        )
+    async with sessions() as session, session.begin():
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="incumbent changed"):
+            await archive.activate_validated_reference_family_stage(
+                session,
+                ownership=ownership,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                validation_receipt=validation,
+                cutover=archive.ReferenceFamilyCutoverAuthority(
+                    package_id, archive.CONTRACT, sealed_owner_oid, "manual"
+                ),
+            )
+        await archive.cleanup_reference_family_stage(session, ownership)
+
+
+@pytest.mark.asyncio
+async def test_publisher_validation_receipt_fences_short_cutover(monkeypatch):
+    """Reject forged evidence, wrong ownership, and stale incumbent without recounting."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema, unrelated_schema = f"rf_validated_{token}", f"rf_validated_keep_{token}"
+    dataset_id, package_id = uuid4(), "a" * 64
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
+        await _assert_invalid_validation_cutovers(sessions, candidate, package_id)
+        await _assert_short_cutover_rollback(sessions, monkeypatch, candidate, package_id)
+        await _replace_incumbent_and_reject(sessions, live_schema, candidate, package_id)
     finally:
         async with engine.begin() as connection:
             for schema_name in (stage_schema, live_schema, unrelated_schema):
@@ -298,12 +414,11 @@ async def _commit_and_assert_medicare_activation(sessions, owner, manifest, incu
         assert await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".medicare_enrollment_stats')) == 1
         predecessor_schema = archive.reference_family_predecessor_schema(owner.dataset_id)
         assert receipt.predecessor_schema_name == predecessor_schema
-        assert await session.scalar(
-            text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_county_stats')
-        ) == 1
-        assert await session.scalar(
-            text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_stats')
-        ) == 1
+        assert (
+            await session.scalar(text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_county_stats'))
+            == 1
+        )
+        assert await session.scalar(text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_stats')) == 1
         assert await session.scalar(text(f'SELECT marker FROM "{live_schema}".medicare_enrollment_stats_old')) == 7
 
 
