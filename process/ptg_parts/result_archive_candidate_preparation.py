@@ -40,6 +40,7 @@ from process.ptg_parts.ptg2_invalid_price_exclusion import (
     INVALID_PRICE_EXCLUSION_POLICY_FIELD,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.snapshot_tables import _normalize_source_key
 
 RESULT_ARCHIVE_CANDIDATE_PREPARATION_CONTRACT = "ptg_result_archive_candidate_preparation_v1"
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -98,15 +99,43 @@ async def _one(
     return rows[0]
 
 
-def _activation_scope(manifest: Any, *, label: str) -> tuple[str, str, str]:
+def _activation_scope(
+    manifest: Any,
+    *,
+    label: str,
+) -> tuple[str, tuple[str, str] | None]:
     manifest_by_name = _mapping(manifest)
     activation_by_name = _mapping(manifest_by_name.get("activation"))
-    source_key = str(activation_by_name.get("source_key") or "").strip().lower()
+    source_key = _normalize_source_key(
+        str(activation_by_name.get("source_key") or "").strip()
+    )
+    if not source_key:
+        raise ResultArchiveCandidatePreparationError(f"archive candidate preparation {label} has no activation scope")
+    has_plan_id_declaration = "plan_id" in activation_by_name
+    has_market_type_declaration = "plan_market_type" in activation_by_name
+    if has_plan_id_declaration != has_market_type_declaration:
+        raise ResultArchiveCandidatePreparationError(
+            f"archive candidate preparation {label} has a partial activation plan scope"
+        )
+    if not has_plan_id_declaration:
+        return source_key, None
     plan_id = str(activation_by_name.get("plan_id") or "").strip()
     market_type = str(activation_by_name.get("plan_market_type") or "").strip().lower()
-    if not all((source_key, plan_id, market_type)):
-        raise ResultArchiveCandidatePreparationError(f"archive candidate preparation {label} has no activation scope")
-    return source_key, plan_id, market_type
+    if not plan_id or not market_type:
+        raise ResultArchiveCandidatePreparationError(
+            f"archive candidate preparation {label} has an invalid activation plan scope"
+        )
+    return source_key, (plan_id, market_type)
+
+
+def _database_scope(snapshot: Mapping[str, Any], *, label: str) -> tuple[str, str]:
+    plan_id = str(snapshot.get("scope_plan_id") or "").strip()
+    market_type = str(snapshot.get("scope_plan_market_type") or "").strip().lower()
+    if not plan_id or not market_type:
+        raise ResultArchiveCandidatePreparationError(
+            f"archive candidate preparation {label} has no authoritative plan scope"
+        )
+    return plan_id, market_type
 
 
 async def _locked_candidate(
@@ -175,26 +204,33 @@ def _assert_scope_matches(
     destination_candidate: Mapping[str, Any],
     staging_snapshot: Mapping[str, Any],
 ) -> None:
-    destination_scope = _activation_scope(
+    destination_source_key, destination_declared_scope = _activation_scope(
         destination_candidate.get("manifest"),
         label="destination candidate",
     )
-    staging_scope = _activation_scope(
+    staging_source_key, staging_declared_scope = _activation_scope(
         staging_snapshot.get("manifest"),
         label="staging snapshot",
     )
-    destination_database_scope = (
-        str(destination_candidate.get("scope_plan_id") or "").strip(),
-        str(destination_candidate.get("scope_plan_market_type") or "").strip().lower(),
+    destination_database_scope = _database_scope(
+        destination_candidate,
+        label="destination candidate",
     )
-    staging_database_scope = (
-        str(staging_snapshot.get("scope_plan_id") or "").strip(),
-        str(staging_snapshot.get("scope_plan_market_type") or "").strip().lower(),
+    staging_database_scope = _database_scope(
+        staging_snapshot,
+        label="staging snapshot",
     )
     if (
-        destination_scope != staging_scope
-        or destination_database_scope != destination_scope[1:]
-        or staging_database_scope != staging_scope[1:]
+        destination_source_key != staging_source_key
+        or destination_database_scope != staging_database_scope
+        or (
+            destination_declared_scope is not None
+            and destination_declared_scope != destination_database_scope
+        )
+        or (
+            staging_declared_scope is not None
+            and staging_declared_scope != staging_database_scope
+        )
     ):
         raise ResultArchiveCandidatePreparationError("archive candidate preparation source scope differs from staging")
 
@@ -485,8 +521,11 @@ async def _validate_local_frozen_candidate(
         raise ResultArchiveCandidatePreparationError(
             "archive candidate preparation frozen binding does not match the local candidate"
         )
-    destination_scope = _activation_scope(candidate_manifest, label="destination candidate")
-    if destination_scope[0] != str(expected_binding.get("source_key") or "").strip().lower():
+    destination_source_key, _declared_scope = _activation_scope(
+        candidate_manifest,
+        label="destination candidate",
+    )
+    if destination_source_key != str(expected_binding.get("source_key") or "").strip().lower():
         raise ResultArchiveCandidatePreparationError(
             "archive candidate preparation frozen binding has the wrong source scope"
         )
