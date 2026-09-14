@@ -30,6 +30,7 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_candidate_attestation import CANDIDATE_SOURCE_RECORDS_SQL
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_source_lifecycle_lock
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_shared_source_set import shared_source_set_metadata
 from process.ptg_parts.result_archive_adoption import (
     RESULT_ARCHIVE_ADOPTION_CONTRACT,
     PreparedResultArchiveLayout,
@@ -335,6 +336,32 @@ def _candidate_attributes(
     )
 
 
+def _attach_destination_source_set(
+    serving_index: Mapping[str, Any],
+    source_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind the locally copied source rows to the destination serving manifest."""
+
+    try:
+        source_set = shared_source_set_metadata(
+            source_record.get("raw_container_sha256")
+            for source_record in source_records
+        )
+    except ValueError as error:
+        raise ResultArchiveCandidateValidationError(
+            "archive candidate validation destination source set is invalid"
+        ) from error
+    sealed_source_set = serving_index.get("source_set")
+    if sealed_source_set is not None and (
+        not isinstance(sealed_source_set, Mapping)
+        or dict(sealed_source_set) != source_set
+    ):
+        raise ResultArchiveCandidateValidationError(
+            "archive candidate validation sealed source set differs from local evidence"
+        )
+    return {**serving_index, "source_set": source_set}
+
+
 async def _complete_local_run(
     session: Any,
     *,
@@ -417,19 +444,22 @@ async def _validated_audit_target(
         candidate_row=candidate_state,
         prepared_candidate=prepared_candidate,
     )
-    serving_index = _validated_layout_serving_index(
-        candidate_state,
-        prepared_layout,
+    candidate_sources = await _source_records(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+    )
+    serving_index = _attach_destination_source_set(
+        _validated_layout_serving_index(
+            candidate_state,
+            prepared_layout,
+        ),
+        candidate_sources,
     )
     candidate_attributes = _candidate_attributes(
         candidate_state,
         source_key=source_key,
         serving_index=serving_index,
-    )
-    candidate_sources = await _source_records(
-        session,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
     )
     try:
         audit_target = validate_candidate_audit_target_state(

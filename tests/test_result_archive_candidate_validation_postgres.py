@@ -106,10 +106,11 @@ def _serving_index(fixture: _NativeFixture) -> dict[str, object]:
 
 
 async def _seed_local_layout(session, fixture: _NativeFixture) -> None:
-    """Represent the sealed destination output of archive layout preparation."""
+    """Represent a production layout whose source set lives in the snapshot."""
 
     schema = '"' + fixture.destination_schema + '"'
     serving_index = _serving_index(fixture)
+    serving_index.pop("source_set")
     await session.execute(
         text(
             f"""
@@ -342,6 +343,55 @@ async def test_native_validation_wrong_layout_rolls_back_candidate(native_candid
                 schema_name=fixture.destination_schema,
                 prepared_candidate=prepared_candidate,
                 prepared_layout=replace(prepared_layout, mapping_digest=b"z" * 32),
+            )
+    schema = '"' + fixture.destination_schema + '"'
+    assert await db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot") == 0
+    assert await db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout") == 0
+
+
+@pytest.mark.asyncio
+async def test_native_validation_rejects_conflicting_sealed_source_set(native_candidate) -> None:
+    """A layout cannot override the source set reconstructed from copied rows."""
+
+    fixture = native_candidate
+    await _install_validation_tables(fixture)
+    with pytest.raises(
+        validation.ResultArchiveCandidateValidationError,
+        match="sealed source set differs from local evidence",
+    ):
+        async with _caller_transaction() as session:
+            prepared_candidate, prepared_layout = await _prepare_candidate_and_layout(
+                session,
+                fixture,
+            )
+            schema = '"' + fixture.destination_schema + '"'
+            conflicting_source_set = {
+                "contract": "sorted_raw_container_sha256_bytes_v1",
+                "source_count": 2,
+                "raw_container_sha256_digest": "00" * 32,
+            }
+            await session.execute(
+                text(
+                    f"""
+                    UPDATE {schema}.ptg2_v3_snapshot_layout
+                       SET layout_manifest = jsonb_set(
+                               layout_manifest,
+                               '{{serving_index,source_set}}',
+                               CAST(:source_set AS jsonb)
+                           )
+                     WHERE snapshot_key = :snapshot_key
+                    """
+                ),
+                {
+                    "snapshot_key": _DESTINATION_SNAPSHOT_KEY,
+                    "source_set": json.dumps(conflicting_source_set),
+                },
+            )
+            await validation.validate_result_archive_candidate_for_audit(
+                session,
+                schema_name=fixture.destination_schema,
+                prepared_candidate=prepared_candidate,
+                prepared_layout=prepared_layout,
             )
     schema = '"' + fixture.destination_schema + '"'
     assert await db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot") == 0
