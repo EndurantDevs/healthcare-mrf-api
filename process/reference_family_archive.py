@@ -1269,63 +1269,18 @@ async def activate_validated_reference_family_stage(
         raise ReferenceFamilyArchiveError("reference family activation ownership is invalid")
     validated_manifest = validate_reference_family_manifest(manifest)
     validation = validate_reference_family_validation_receipt(validation_receipt)
-    manifest_sha256 = hashlib.sha256(_canonical_json(validated_manifest.as_dict())).hexdigest()
-    if (
-        validated_manifest.importer_id != ownership.importer_id
-        or expected_incumbent.importer_id != ownership.importer_id
-        or validation.importer_id != ownership.importer_id
-        or validation.package_id != cutover.package_id
-        or validation.profile_contract != cutover.profile_contract
-        or validation.sealed_owner_oid != cutover.sealed_owner_oid
-        or validation.stage_schema != ownership.schema_name
-        or validation.stage_schema_oid != ownership.schema_oid
-        or validation.relation_oids != ownership.relation_oids
-        or validation.manifest_sha256 != manifest_sha256
-        or validation.tables != validated_manifest.tables
-    ):
-        raise ReferenceFamilyArchiveError("reference family validation authority differs")
+    _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
     spec = reference_family_spec(ownership.importer_id)
     await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
-    source_generation = None
-    if cutover.source_serving_generation is not None:
-        try:
-            source_generation = validate_reference_family_serving_generation(cutover.source_serving_generation)
-        except ValueError as error:
-            raise ReferenceFamilyArchiveError("reference family source generation is invalid") from error
+    incoming_generation = _cutover_source_generation(cutover)
     if cutover.authority == "automatic":
-        if source_generation is None:
-            raise ReferenceFamilyArchiveError("reference family automatic source generation is unavailable")
-        current_authority = await read_reference_family_result_generation_authority(
+        await _require_automatic_cutover_generation(
             session,
-            importer_id=spec.importer_id,
-            schema_name=expected_incumbent.schema_name,
-            lock=True,
+            spec,
+            expected_incumbent,
+            incoming_generation,
         )
-        incumbent_oids = tuple(oid for _, oid in expected_incumbent.relation_oids)
-        if current_authority.serving_generation is None:
-            if all(oid is not None for oid in incumbent_oids):
-                for table_name in spec.table_names:
-                    populated = await session.scalar(
-                        text(
-                            f"SELECT EXISTS (SELECT 1 FROM {_quoted(expected_incumbent.schema_name)}."
-                            f"{_quoted(table_name)} LIMIT 1)"
-                        )
-                    )
-                    if populated:
-                        raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
-        else:
-            if current_authority.relation_oids != incumbent_oids:
-                raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
-            try:
-                require_reference_family_automatic_generation_order(
-                    source_generation,
-                    current_authority.serving_generation,
-                )
-            except ValueError as error:
-                raise ReferenceFamilyArchiveError(
-                    "reference family automatic generation is stale or unrelated"
-                ) from error
     predecessor_schema_name = await _rotate_family_relations(
         session,
         spec,
@@ -1340,14 +1295,9 @@ async def activate_validated_reference_family_stage(
         session,
         importer_id=spec.importer_id,
         schema_name=expected_incumbent.schema_name,
-        source_generation=source_generation,
+        source_generation=incoming_generation,
     )
-    if source_generation is not None:
-        ordered_live_oids = tuple(dict(live_pairs)[name] for name in spec.table_names)
-        if published_authority.relation_oids != ordered_live_oids:
-            raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
-    elif published_authority.serving_generation is not None or published_authority.relation_oids is not None:
-        raise ReferenceFamilyArchiveError("reference family generation-less adoption differs")
+    _require_published_generation_binding(spec, live_pairs, incoming_generation, published_authority)
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
         validated_manifest.source_metadata_sha256,
@@ -1356,6 +1306,79 @@ async def activate_validated_reference_family_stage(
         predecessor_schema_name,
         validation.tables,
     )
+
+
+def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, validation, cutover) -> None:
+    """Bind the protected receipt to the exact stage, package, and incumbent."""
+
+    manifest_sha256 = hashlib.sha256(_canonical_json(manifest.as_dict())).hexdigest()
+    if (
+        manifest.importer_id != ownership.importer_id
+        or expected_incumbent.importer_id != ownership.importer_id
+        or validation.importer_id != ownership.importer_id
+        or validation.package_id != cutover.package_id
+        or validation.profile_contract != cutover.profile_contract
+        or validation.sealed_owner_oid != cutover.sealed_owner_oid
+        or validation.stage_schema != ownership.schema_name
+        or validation.stage_schema_oid != ownership.schema_oid
+        or validation.relation_oids != ownership.relation_oids
+        or validation.manifest_sha256 != manifest_sha256
+        or validation.tables != manifest.tables
+    ):
+        raise ReferenceFamilyArchiveError("reference family validation authority differs")
+
+
+def _cutover_source_generation(cutover):
+    """Validate the optional portable source generation on trusted cutover authority."""
+
+    if cutover.source_serving_generation is not None:
+        try:
+            return validate_reference_family_serving_generation(cutover.source_serving_generation)
+        except ValueError as error:
+            raise ReferenceFamilyArchiveError("reference family source generation is invalid") from error
+    return None
+
+
+async def _require_automatic_cutover_generation(session, spec, expected_incumbent, incoming_generation) -> None:
+    """Require empty bootstrap or a strictly newer same-lineage generation."""
+
+    if incoming_generation is None:
+        raise ReferenceFamilyArchiveError("reference family automatic source generation is unavailable")
+    current_authority = await read_reference_family_result_generation_authority(
+        session,
+        importer_id=spec.importer_id,
+        schema_name=expected_incumbent.schema_name,
+        lock=True,
+    )
+    incumbent_oids = tuple(oid for _, oid in expected_incumbent.relation_oids)
+    if current_authority.serving_generation is None:
+        for table_name in spec.table_names:
+            populated = await session.scalar(
+                text(
+                    f"SELECT EXISTS (SELECT 1 FROM {_quoted(expected_incumbent.schema_name)}."
+                    f"{_quoted(table_name)} LIMIT 1)"
+                )
+            )
+            if populated:
+                raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
+        return
+    if current_authority.relation_oids != incumbent_oids:
+        raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
+    try:
+        require_reference_family_automatic_generation_order(incoming_generation, current_authority.serving_generation)
+    except ValueError as error:
+        raise ReferenceFamilyArchiveError("reference family automatic generation is stale or unrelated") from error
+
+
+def _require_published_generation_binding(spec, live_pairs, incoming_generation, published_authority) -> None:
+    """Verify adopted authority names the exact activated relation OIDs."""
+
+    if incoming_generation is not None:
+        ordered_live_oids = tuple(dict(live_pairs)[name] for name in spec.table_names)
+        if published_authority.relation_oids != ordered_live_oids:
+            raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
+    elif published_authority.serving_generation is not None or published_authority.relation_oids is not None:
+        raise ReferenceFamilyArchiveError("reference family generation-less adoption differs")
 
 
 __all__ = [
