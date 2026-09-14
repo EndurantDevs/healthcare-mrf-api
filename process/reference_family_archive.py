@@ -30,6 +30,7 @@ CONTRACT = "reference-replacement-family.postgres.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
 _STAGE_PREFIX = "reference_family_archive_"
+_PREDECESSOR_PREFIX = "reference_family_predecessor_"
 _LOCK_TIMEOUT = "500ms"
 _CAPTURE_TIMEOUT = "5s"
 _MAX_METADATA_BYTES = 16_384
@@ -143,6 +144,7 @@ class ReferenceFamilyActivationReceipt:
     source_metadata_sha256: str
     relation_oids: tuple[tuple[str, int], ...]
     predecessor_oids: tuple[tuple[str, int | None], ...]
+    predecessor_schema_name: str | None
     tables: tuple[ReferenceTableReceipt, ...]
 
 
@@ -776,33 +778,12 @@ async def _verify_incumbent(session: Any, expected: ReferenceFamilyIncumbent) ->
         raise ReferenceFamilyArchiveError("reference family incumbent changed")
 
 
-def _archived_index_name(index_name: str) -> str:
-    suffix = "_old"
-    if len((index_name + suffix).encode()) <= 63:
-        return index_name + suffix
-    digest = hashlib.sha256(index_name.encode()).hexdigest()[:8]
-    return index_name[: 63 - len(digest) - len(suffix) - 1] + "_" + digest + suffix
+def reference_family_predecessor_schema(dataset_id: UUID) -> str:
+    """Derive a collision-free retained namespace from the new UUID owner."""
 
-
-async def _archive_incumbent_indexes(session: Any, schema_name: str, table_name: str, relation_oid: int) -> None:
-    rows = (
-        await session.execute(
-            text(
-                "SELECT index_relation.relname FROM pg_catalog.pg_index AS index_meta "
-                "JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid=index_meta.indexrelid "
-                "WHERE index_meta.indrelid=:relation_oid ORDER BY index_relation.relname"
-            ),
-            {"relation_oid": relation_oid},
-        )
-    ).mappings()
-    for row in rows:
-        index_name = str(row["relname"])
-        await session.execute(
-            text(
-                f"ALTER INDEX {_quoted(schema_name)}.{_quoted(index_name)} "
-                f"RENAME TO {_quoted(_archived_index_name(index_name))}"
-            )
-        )
+    if not isinstance(dataset_id, UUID):
+        raise ReferenceFamilyArchiveError("reference family predecessor requires a UUID dataset_id")
+    return _PREDECESSOR_PREFIX + dataset_id.hex
 
 
 async def _lock_and_verify_activation(
@@ -825,25 +806,21 @@ async def _rotate_family_relations(
     spec: ReferenceFamilySpec,
     ownership: ReferenceFamilyStageOwnership,
     expected_incumbent: ReferenceFamilyIncumbent,
-) -> None:
+) -> str | None:
     incumbent_oids_by_name = dict(expected_incumbent.relation_oids)
+    predecessor_schema = None
+    if any(oid is not None for oid in incumbent_oids_by_name.values()):
+        predecessor_schema = reference_family_predecessor_schema(ownership.dataset_id)
+        # Never infer ownership from a UUID-shaped name or replace content
+        # already present there: CREATE is the collision/CAS fence.
+        await session.execute(text(f"CREATE SCHEMA {_quoted(predecessor_schema)}"))
     for table_name in spec.table_names:
-        old_name = table_name + "_old"
-        await session.execute(
-            text(f"DROP TABLE IF EXISTS {_quoted(expected_incumbent.schema_name)}.{_quoted(old_name)}")
-        )
         incumbent_oid = incumbent_oids_by_name[table_name]
         if incumbent_oid is not None:
-            await _archive_incumbent_indexes(
-                session,
-                expected_incumbent.schema_name,
-                table_name,
-                incumbent_oid,
-            )
             await session.execute(
                 text(
                     f"ALTER TABLE {_quoted(expected_incumbent.schema_name)}.{_quoted(table_name)} "
-                    f"RENAME TO {_quoted(old_name)}"
+                    f"SET SCHEMA {_quoted(predecessor_schema)}"
                 )
             )
         await session.execute(
@@ -852,6 +829,7 @@ async def _rotate_family_relations(
                 f"SET SCHEMA {_quoted(expected_incumbent.schema_name)}"
             )
         )
+    return predecessor_schema
 
 
 async def _drop_empty_stage_schema(session: Any, ownership: ReferenceFamilyStageOwnership) -> None:
@@ -874,6 +852,7 @@ async def _activation_receipt(
     expected_incumbent: ReferenceFamilyIncumbent,
     manifest: ReferenceFamilyManifest,
     tables: tuple[ReferenceTableReceipt, ...],
+    predecessor_schema_name: str | None,
 ) -> ReferenceFamilyActivationReceipt:
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
     if any(type(oid) is not int or oid <= 0 for _, oid in live_pairs):
@@ -893,6 +872,7 @@ async def _activation_receipt(
         manifest.source_metadata_sha256,
         tuple((name, int(oid)) for name, oid in live_pairs),
         expected_incumbent.relation_oids,
+        predecessor_schema_name,
         tables,
     )
 
@@ -928,7 +908,12 @@ async def activate_reference_family_stage(
         ownership=ownership,
         manifest=validated_manifest,
     )
-    await _rotate_family_relations(session, spec, ownership, expected_incumbent)
+    predecessor_schema_name = await _rotate_family_relations(
+        session,
+        spec,
+        ownership,
+        expected_incumbent,
+    )
     await _drop_empty_stage_schema(session, ownership)
     return await _activation_receipt(
         session,
@@ -937,6 +922,7 @@ async def activate_reference_family_stage(
         expected_incumbent,
         validated_manifest,
         tables,
+        predecessor_schema_name,
     )
 
 
@@ -959,6 +945,7 @@ __all__ = [
     "export_reference_family_archive",
     "precreate_reference_family_restore",
     "reference_family_spec",
+    "reference_family_predecessor_schema",
     "reference_family_stage_schema",
     "validate_reference_family_manifest",
     "validate_reference_family_stage",

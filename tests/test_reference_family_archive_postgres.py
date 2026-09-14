@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
@@ -182,6 +183,27 @@ async def _activate_then_rollback(sessions, owner, manifest, incumbent, stage_sc
         await transaction.rollback()
 
 
+async def _assert_unowned_predecessor_is_preserved(sessions, owner, manifest, incumbent) -> None:
+    predecessor_schema = archive.reference_family_predecessor_schema(owner.dataset_id)
+    async with sessions() as session, session.begin():
+        await session.execute(text(f'CREATE SCHEMA "{predecessor_schema}"'))
+        await session.execute(text(f'CREATE TABLE "{predecessor_schema}".keep_me (marker integer PRIMARY KEY)'))
+        await session.execute(text(f'INSERT INTO "{predecessor_schema}".keep_me VALUES (9)'))
+    async with sessions() as session, session.begin():
+        with pytest.raises(ProgrammingError, match="already exists"):
+            await archive.activate_reference_family_stage(
+                session,
+                ownership=owner,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                authority="manual",
+            )
+    async with sessions() as session, session.begin():
+        assert await session.scalar(text(f'SELECT marker FROM "{predecessor_schema}".keep_me')) == 9
+        assert await session.scalar(text(f'SELECT count(*) FROM "{owner.schema_name}".medicare_enrollment_stats')) == 1
+        await session.execute(text(f'DROP SCHEMA "{predecessor_schema}" CASCADE'))
+
+
 async def _assert_stage_restored_after_rollback(sessions, stage_schema: str) -> None:
     async with sessions() as session, session.begin():
         assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is not None
@@ -216,11 +238,15 @@ async def _commit_and_assert_medicare_activation(sessions, owner, manifest, incu
         )
         assert await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".medicare_enrollment_county_stats')) == 1
         assert await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".medicare_enrollment_stats')) == 1
-        assert (
-            await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".medicare_enrollment_county_stats_old'))
-            == 1
-        )
-        assert await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".medicare_enrollment_stats_old')) == 1
+        predecessor_schema = archive.reference_family_predecessor_schema(owner.dataset_id)
+        assert receipt.predecessor_schema_name == predecessor_schema
+        assert await session.scalar(
+            text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_county_stats')
+        ) == 1
+        assert await session.scalar(
+            text(f'SELECT count(*) FROM "{predecessor_schema}".medicare_enrollment_stats')
+        ) == 1
+        assert await session.scalar(text(f'SELECT marker FROM "{live_schema}".medicare_enrollment_stats_old')) == 7
 
 
 @pytest.mark.asyncio
@@ -248,6 +274,10 @@ async def test_native_multi_table_activation_is_atomic_and_preserves_indexes():
                     "(zcta_code, year, part_d_beneficiaries, total_beneficiaries) VALUES ('36001', 2026, 4, 8)"
                 )
             )
+            await session.execute(
+                text(f'CREATE TABLE "{live_schema}".medicare_enrollment_stats_old (marker integer PRIMARY KEY)')
+            )
+            await session.execute(text(f'INSERT INTO "{live_schema}".medicare_enrollment_stats_old VALUES (7)'))
         manifest = await _manifest(sessions, "medicare-enrollment", live_schema)
         async with sessions() as session, session.begin():
             owner = await archive.precreate_reference_family_restore(
@@ -262,11 +292,16 @@ async def test_native_multi_table_activation_is_atomic_and_preserves_indexes():
                 importer_id="medicare-enrollment",
                 schema_name=live_schema,
             )
+        await _assert_unowned_predecessor_is_preserved(sessions, owner, manifest, incumbent)
         await _activate_then_rollback(sessions, owner, manifest, incumbent, stage_schema)
         await _assert_stage_restored_after_rollback(sessions, stage_schema)
         await _commit_and_assert_medicare_activation(sessions, owner, manifest, incumbent, live_schema)
     finally:
         async with engine.begin() as connection:
-            for schema_name in (stage_schema, live_schema):
+            for schema_name in (
+                stage_schema,
+                archive.reference_family_predecessor_schema(dataset_id),
+                live_schema,
+            ):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
