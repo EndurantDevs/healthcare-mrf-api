@@ -700,18 +700,19 @@ async def test_native_source_authority_serializes_operation_across_source_keys()
                 await release_first.wait()
                 return authority
 
-        first_capture = asyncio.create_task(capture_first_source())
-        await first_captured.wait()
-        async with session_factory() as session, session.begin():
-            with pytest.raises(PTG2LifecycleLockDeferred, match="operation is busy"):
-                await capture_ptg_result_archive_source_authority(
-                    session,
-                    schema_name=schema_name,
-                    operation_id=operation_id,
-                    snapshot_id="other-snapshot",
-                )
-        release_first.set()
-        authority = await first_capture
+        async with asyncio.TaskGroup() as tasks:
+            first_capture = tasks.create_task(capture_first_source())
+            await asyncio.wait_for(first_captured.wait(), timeout=10)
+            async with session_factory() as session, session.begin():
+                with pytest.raises(PTG2LifecycleLockDeferred, match="operation is busy"):
+                    await capture_ptg_result_archive_source_authority(
+                        session,
+                        schema_name=schema_name,
+                        operation_id=operation_id,
+                        snapshot_id="other-snapshot",
+                    )
+            release_first.set()
+        authority = first_capture.result()
         async with engine.begin() as connection:
             assert await _stored_authority_pins(connection, schema) == [(authority.owner_id, snapshot_id)]
 
@@ -829,15 +830,16 @@ async def test_native_source_clone_pin_defers_terminal_release() -> None:
                 await finish_clone.wait()
                 return validated
 
-        clone_task = asyncio.create_task(hold_clone_pin())
-        await clone_pinned.wait()
-        async with session_factory() as session, session.begin():
-            with pytest.raises(PTG2LifecycleLockDeferred, match="release is busy"):
-                await release_ptg_result_archive_source_authority(
-                    session, schema_name=schema_name, authority=authority.as_dict()
-                )
-        finish_clone.set()
-        assert await clone_task == authority
+        async with asyncio.TaskGroup() as tasks:
+            clone_task = tasks.create_task(hold_clone_pin())
+            await asyncio.wait_for(clone_pinned.wait(), timeout=10)
+            async with session_factory() as session, session.begin():
+                with pytest.raises(PTG2LifecycleLockDeferred, match="release is busy"):
+                    await release_ptg_result_archive_source_authority(
+                        session, schema_name=schema_name, authority=authority.as_dict()
+                    )
+            finish_clone.set()
+        assert clone_task.result() == authority
         async with session_factory() as session, session.begin():
             assert (
                 await release_ptg_result_archive_source_authority(
@@ -845,6 +847,56 @@ async def test_native_source_clone_pin_defers_terminal_release() -> None:
                 )
                 == 1
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked_table", ["ptg2_snapshot", "ptg2_frozen_source_file_binding", "ptg2_snapshot_pin"])
+async def test_native_source_clone_defers_conflicting_row_locks(locked_table: str) -> None:
+    """Every retained source row has a bounded retryable lock acquisition."""
+
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id="clone-lock-test", snapshot_id=snapshot_id
+            )
+        async with engine.begin() as holder:
+            await holder.execute(text(f"SELECT * FROM {schema}.{locked_table} FOR UPDATE"))
+            with pytest.raises(PTG2LifecycleLockDeferred, match="clone is busy"):
+                async with session_factory() as session, session.begin():
+                    await asyncio.wait_for(
+                        lock_ptg_result_archive_for_clone(
+                            session, schema_name=schema_name, authority=authority.as_dict()
+                        ),
+                        timeout=3,
+                    )
+
+
+@pytest.mark.asyncio
+async def test_native_source_clone_restores_caller_timeouts() -> None:
+    """Short lock-read settings cannot leak into the caller's long clone work."""
+
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id="clone-setting-test", snapshot_id=snapshot_id
+            )
+        async with session_factory() as session, session.begin():
+            await session.execute(text("SET LOCAL lock_timeout = '13s'"))
+            await session.execute(text("SET LOCAL statement_timeout = '0'"))
+            assert (
+                await lock_ptg_result_archive_for_clone(session, schema_name=schema_name, authority=authority.as_dict())
+                == authority
+            )
+            restored = (
+                await session.execute(
+                    text("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
+                )
+            ).one()
+            assert tuple(restored) == ("13s", "0")
 
 
 @pytest.mark.asyncio

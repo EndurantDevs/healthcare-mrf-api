@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import MetaData, text
@@ -36,6 +38,16 @@ _VALIDATION_TABLES = (
 )
 _MAPPING_DIGEST = bytes.fromhex("ab" * 32)
 _DESTINATION_SNAPSHOT_KEY = 1701
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows", [[], [(None,)], [(" ",)], [("a",), ("b",)]])
+async def test_candidate_source_key_rejects_missing_or_ambiguous_scope(rows) -> None:
+    """Invalid source scope fails before a lifecycle lock can be selected."""
+
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=Mock(return_value=rows))))
+    with pytest.raises(validation.ResultArchiveCandidateValidationError, match="source scope is unavailable"):
+        await validation._candidate_source_key(session, schema_name="mrf", snapshot_id="candidate")
 
 
 async def _install_validation_tables(fixture: _NativeFixture) -> None:
