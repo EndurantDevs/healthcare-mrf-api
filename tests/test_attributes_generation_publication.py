@@ -60,7 +60,7 @@ async def test_partial_attribute_family_fails_before_cutover_or_generation(monke
 
 @pytest.mark.asyncio
 async def test_complete_attribute_family_writes_generation_inside_cutover(monkeypatch):
-    state = {"active": False}
+    state_by_field = {"active": False}
     monkeypatch.setattr(attributes, "ensure_database", AsyncMock())
     monkeypatch.setattr(
         attributes,
@@ -71,14 +71,14 @@ async def test_complete_attribute_family_writes_generation_inside_cutover(monkey
     monkeypatch.setattr(attributes, "_finalize_attribute_stage", AsyncMock())
 
     async def swap(*_args):
-        assert state["active"] is True
+        assert state_by_field["active"] is True
 
     async def write(*_args, **_kwargs):
-        assert state["active"] is True
+        assert state_by_field["active"] is True
 
     monkeypatch.setattr(attributes, "_swap_attribute_stage", swap)
     monkeypatch.setattr(attributes, "publish_local_reference_family_generation", write)
-    monkeypatch.setattr(attributes.db, "transaction", lambda: _TrackedTransaction(state))
+    monkeypatch.setattr(attributes.db, "transaction", lambda: _TrackedTransaction(state_by_field))
     monkeypatch.setattr(attributes, "print_time_info", lambda _start: None)
 
     await attributes.finalize_attribute_tables(
@@ -88,4 +88,4 @@ async def test_complete_attribute_family_writes_generation_inside_cutover(monkey
         }
     )
 
-    assert state["active"] is False
+    assert state_by_field["active"] is False

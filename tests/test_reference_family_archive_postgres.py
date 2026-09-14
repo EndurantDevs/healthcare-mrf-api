@@ -430,6 +430,66 @@ async def _install_places_generation_authority(session, live_schema: str):
     )
 
 
+async def _activate_automatic_candidate(session, candidate, package_id, source_generation_by_field):
+    """Activate one trusted candidate with automatic generation authority."""
+
+    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+    return await archive.activate_validated_reference_family_stage(
+        session,
+        ownership=ownership,
+        manifest=manifest,
+        expected_incumbent=incumbent,
+        validation_receipt=validation,
+        cutover=archive.ReferenceFamilyCutoverAuthority(
+            package_id,
+            archive.CONTRACT,
+            sealed_owner_oid,
+            sealed_owner_oid,
+            "automatic",
+            source_generation_by_field,
+        ),
+    )
+
+
+async def _assert_automatic_rollback(sessions, candidate, package_id, live_schema, initial, source_generation_by_field):
+    """Prove data rotation and generation adoption share one rollback boundary."""
+
+    ownership = candidate[0]
+    async with sessions() as session:
+        transaction = await session.begin()
+        await _activate_automatic_candidate(session, candidate, package_id, source_generation_by_field)
+        adopted = await result_generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id="places-zcta",
+            schema_name=live_schema,
+        )
+        assert adopted.local_generation == 1
+        assert adopted.serving_generation.origin_generation == 2
+        assert adopted.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+        await transaction.rollback()
+    async with sessions() as session, session.begin():
+        rolled_back = await result_generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id="places-zcta",
+            schema_name=live_schema,
+        )
+        assert rolled_back == initial
+        assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": ownership.schema_name})
+
+
+async def _assert_automatic_generation_rejections(sessions, candidate, package_id, initial, source_generation_by_field):
+    """Reject equal and unrelated source generations before rotation."""
+
+    rejected_generations = (
+        initial.serving_generation.as_dict(),
+        {**source_generation_by_field, "origin_lineage_id": str(uuid4())},
+    )
+    for rejected_generation in rejected_generations:
+        async with sessions() as session, session.begin():
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="stale or unrelated"):
+                await _activate_automatic_candidate(session, candidate, package_id, rejected_generation)
+
+
 @pytest.mark.asyncio
 async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically():
     """Keep serving OIDs and adopted origin in the same activation transaction."""
@@ -442,92 +502,22 @@ async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically(
     stage_schema = archive.reference_family_stage_schema(dataset_id)
     try:
         candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
-        ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+        ownership = candidate[0]
         async with sessions() as session, session.begin():
             initial = await _install_places_generation_authority(session, live_schema)
-        source_generation = {
+        source_generation_by_field = {
             "origin_lineage_id": initial.local_lineage_id,
             "origin_generation": 2,
             "published_at": "2026-09-14T10:00:00Z",
         }
-        async with sessions() as session:
-            transaction = await session.begin()
-            await archive.activate_validated_reference_family_stage(
-                session,
-                ownership=ownership,
-                manifest=manifest,
-                expected_incumbent=incumbent,
-                validation_receipt=validation,
-                cutover=archive.ReferenceFamilyCutoverAuthority(
-                    package_id,
-                    archive.CONTRACT,
-                    sealed_owner_oid,
-                    sealed_owner_oid,
-                    "automatic",
-                    source_generation,
-                ),
-            )
-            adopted = await result_generation.read_reference_family_result_generation_authority(
-                session,
-                importer_id="places-zcta",
-                schema_name=live_schema,
-            )
-            assert adopted.local_generation == 1
-            assert adopted.serving_generation.origin_generation == 2
-            assert adopted.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
-            await transaction.rollback()
-        async with sessions() as session, session.begin():
-            rolled_back = await result_generation.read_reference_family_result_generation_authority(
-                session,
-                importer_id="places-zcta",
-                schema_name=live_schema,
-            )
-            assert rolled_back == initial
-            assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema})
-        rejected_generations = (
-            initial.serving_generation.as_dict(),
-            {
-                **source_generation,
-                "origin_lineage_id": str(uuid4()),
-            },
+        await _assert_automatic_rollback(
+            sessions, candidate, package_id, live_schema, initial, source_generation_by_field
         )
-        for rejected_generation in rejected_generations:
-            async with sessions() as session, session.begin():
-                with pytest.raises(
-                    archive.ReferenceFamilyArchiveError,
-                    match="stale or unrelated",
-                ):
-                    await archive.activate_validated_reference_family_stage(
-                        session,
-                        ownership=ownership,
-                        manifest=manifest,
-                        expected_incumbent=incumbent,
-                        validation_receipt=validation,
-                        cutover=archive.ReferenceFamilyCutoverAuthority(
-                            package_id,
-                            archive.CONTRACT,
-                            sealed_owner_oid,
-                            sealed_owner_oid,
-                            "automatic",
-                            rejected_generation,
-                        ),
-                    )
+        await _assert_automatic_generation_rejections(
+            sessions, candidate, package_id, initial, source_generation_by_field
+        )
         async with sessions() as session, session.begin():
-            await archive.activate_validated_reference_family_stage(
-                session,
-                ownership=ownership,
-                manifest=manifest,
-                expected_incumbent=incumbent,
-                validation_receipt=validation,
-                cutover=archive.ReferenceFamilyCutoverAuthority(
-                    package_id,
-                    archive.CONTRACT,
-                    sealed_owner_oid,
-                    sealed_owner_oid,
-                    "automatic",
-                    source_generation,
-                ),
-            )
+            await _activate_automatic_candidate(session, candidate, package_id, source_generation_by_field)
         async with sessions() as session, session.begin():
             committed = await result_generation.read_reference_family_result_generation_authority(
                 session,
