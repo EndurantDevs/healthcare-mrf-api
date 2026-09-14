@@ -7,6 +7,7 @@ import os
 import re
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -324,6 +325,122 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
             for schema_name in (stage_schema, live_schema, unrelated_schema):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
+
+
+async def _assert_absent_bootstrap_rollback(sessions, candidate, incumbent, cutover, live_schema, stage_schema):
+    ownership, manifest, _, validation, _ = candidate
+    async with sessions() as session:
+        transaction = await session.begin()
+        receipt = await archive.activate_validated_reference_family_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            expected_incumbent=incumbent,
+            validation_receipt=validation,
+            cutover=cutover,
+        )
+        assert receipt.predecessor_schema_name is None
+        assert await session.scalar(text(f'SELECT count(*) FROM "{live_schema}".pricing_places_zcta')) == 1
+        await transaction.rollback()
+    async with sessions() as session, session.begin():
+        assert (
+            await session.scalar(
+                text("SELECT to_regclass(:relation)"),
+                {"relation": f"{live_schema}.pricing_places_zcta"},
+            )
+            is None
+        )
+        authority = await result_generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id="places-zcta",
+            schema_name=live_schema,
+        )
+        assert authority.serving_generation is None
+        assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema})
+
+
+@pytest.mark.asyncio
+async def test_automatic_bootstrap_accepts_all_absent_incumbent():
+    """Install a source generation when the destination family is wholly absent."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema, unrelated_schema = f"rf_absent_{token}", f"rf_absent_keep_{token}"
+    dataset_id, package_id = uuid4(), "e" * 64
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
+        ownership, manifest, _, validation, sealed_owner_oid = candidate
+        async with sessions() as session, session.begin():
+            await session.execute(text(f'DROP TABLE "{live_schema}".pricing_places_zcta'))
+            incumbent = await archive.capture_reference_family_incumbent(
+                session, importer_id="places-zcta", schema_name=live_schema
+            )
+        assert incumbent.relation_oids == (("pricing_places_zcta", None),)
+        source_generation_by_field = {
+            "origin_lineage_id": str(uuid4()),
+            "origin_generation": 1,
+            "published_at": "2026-09-14T10:00:00Z",
+        }
+        cutover = archive.ReferenceFamilyCutoverAuthority(
+            package_id,
+            archive.CONTRACT,
+            sealed_owner_oid,
+            sealed_owner_oid,
+            "automatic",
+            source_generation_by_field,
+        )
+        await _assert_absent_bootstrap_rollback(sessions, candidate, incumbent, cutover, live_schema, stage_schema)
+        async with sessions() as session, session.begin():
+            receipt = await archive.activate_validated_reference_family_stage(
+                session,
+                ownership=ownership,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                validation_receipt=validation,
+                cutover=cutover,
+            )
+            assert receipt.predecessor_schema_name is None
+        async with sessions() as session, session.begin():
+            authority = await result_generation.read_reference_family_result_generation_authority(
+                session, importer_id="places-zcta", schema_name=live_schema
+            )
+            assert authority.serving_generation.as_dict() == source_generation_by_field
+            assert authority.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+            assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
+            assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (stage_schema, live_schema, unrelated_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_validator_accepts_actual_asyncpg_record():
+    """Accept the concrete record type returned to the archive controller."""
+
+    sqlalchemy_url = make_url(_database_url())
+    connection = await asyncpg.connect(
+        sqlalchemy_url.set(drivername="postgresql").render_as_string(hide_password=False)
+    )
+    lineage_id = uuid4()
+    try:
+        authority_row = await connection.fetchrow(
+            "SELECT 'places-zcta'::text AS importer_id, $1::uuid AS local_lineage_id, "
+            "0::bigint AS local_generation, NULL::uuid AS origin_lineage_id, "
+            "NULL::bigint AS origin_generation, NULL::timestamptz AS published_at, "
+            "NULL::bigint[] AS relation_oids",
+            lineage_id,
+        )
+        authority = result_generation.validate_reference_family_result_generation_authority(authority_row)
+        assert authority.importer_id == "places-zcta"
+        assert authority.local_lineage_id == str(lineage_id)
+        assert authority.serving_generation is None
+        assert authority.relation_oids is None
+    finally:
+        await connection.close()
 
 
 async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):

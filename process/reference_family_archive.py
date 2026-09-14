@@ -1352,6 +1352,11 @@ async def _require_automatic_cutover_generation(session, spec, expected_incumben
     )
     incumbent_oids = tuple(oid for _, oid in expected_incumbent.relation_oids)
     if current_authority.serving_generation is None:
+        incumbent_presence_flags = tuple(oid is not None for oid in incumbent_oids)
+        if not any(incumbent_presence_flags):
+            return
+        if not all(incumbent_presence_flags):
+            raise ReferenceFamilyArchiveError("reference family incumbent is incomplete")
         for table_name in spec.table_names:
             populated = await session.scalar(
                 text(
