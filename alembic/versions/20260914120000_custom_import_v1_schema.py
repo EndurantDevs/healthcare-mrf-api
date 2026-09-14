@@ -2,7 +2,7 @@
 """Create migration-owned generic custom-import v1 storage.
 
 Revision ID: 20260914120000_custom_import_v1_schema
-Revises: 20260907220000_hospital_price_missing_plan
+Revises: 20260911100000_hospital_price_tall_notes
 
 The revision is strictly schema-only.  It creates no dataset, definition,
 capture, execution, generation, or pointer rows.
@@ -16,7 +16,7 @@ from alembic import op
 
 
 revision = "20260914120000_custom_import_v1_schema"
-down_revision = "20260907220000_hospital_price_missing_plan"
+down_revision = "20260911100000_hospital_price_tall_notes"
 branch_labels = None
 depends_on = None
 
@@ -616,6 +616,37 @@ _TABLE_NAMES = (
     'custom_import_publication_event',
 )
 
+_TABLE_CREATION_ORDER = (
+    "custom_import_dataset",
+    "custom_import_entity_binding",
+    "custom_import_field_slot",
+    "custom_import_root_record",
+    "custom_import_schema_revision",
+    "custom_import_child_collection",
+    "custom_import_definition_revision",
+    "custom_import_field",
+    "custom_import_capture_bundle",
+    "custom_import_selection_profile",
+    "custom_import_source_stream",
+    "custom_import_capture",
+    "custom_import_execution",
+    "custom_import_field_alias",
+    "custom_import_generation",
+    "custom_import_lease",
+    "custom_import_pack",
+    "custom_import_child_revision",
+    "custom_import_current_generation",
+    "custom_import_publication_event",
+    "custom_import_rejection",
+    "custom_import_root_revision",
+    "custom_import_child_scalar",
+    "custom_import_family_revision",
+    "custom_import_root_scalar",
+    "custom_import_family_child",
+    "custom_import_generation_family",
+    "custom_import_winner",
+)
+
 _IMMUTABLE_TABLES = tuple(
     table_name
     for table_name in _TABLE_NAMES
@@ -681,6 +712,15 @@ def _immutable_trigger_sql(schema: str, table_name: str) -> str:
     """
 
 
+def _drop_table_sql(schema: str, table_name: str) -> str:
+    return f"DROP TABLE IF EXISTS {_quote(schema)}.{_quote(table_name)}"
+
+
+def _drop_immutable_function_sql(schema: str) -> str:
+    qualified = f"{_quote(schema)}.guard_custom_import_immutable_row"
+    return f"DROP FUNCTION IF EXISTS {qualified}()"
+
+
 def upgrade() -> None:
     """Install the v1 schema, indexes, and immutable-content guards."""
 
@@ -699,6 +739,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Refuse a downgrade that would desynchronize immutable retained evidence."""
+    """Remove only the v1 relations, in reverse dependency order."""
 
-    raise RuntimeError("custom-import/v1 schema downgrade is intentionally unsupported")
+    schema = _schema()
+    for table_name in reversed(_TABLE_CREATION_ORDER):
+        op.execute(_drop_table_sql(schema, table_name))
+    op.execute(_drop_immutable_function_sql(schema))
