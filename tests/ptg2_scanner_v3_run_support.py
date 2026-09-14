@@ -51,6 +51,7 @@ from tests.ptg2_scanner_v3_release_support import (
     _v3_finalizer_test_resource_args,
 )
 
+
 @dataclass(frozen=True)
 class _ScannerRunOptions:
     arch: str
@@ -100,9 +101,7 @@ def _scanner_run_paths(run_directory: Path) -> _ScannerRunPaths:
         provider_inverted=run_directory / "provider-inverted.sidecar",
         provider_set_component=run_directory / "provider-set-component.sidecar",
         provider_component_group=run_directory / "provider-component-group.sidecar",
-        provider_group_tax_identity=(
-            run_directory / "provider-group-tax-identity.sidecar"
-        ),
+        provider_group_tax_identity=(run_directory / "provider-group-tax-identity.sidecar"),
         serving_run_directory=serving_run_directory,
         source_witness_scratch_directory=source_witness_scratch_directory,
     )
@@ -113,9 +112,7 @@ def _scanner_fixture_artifact(
     options: _ScannerRunOptions,
 ) -> Path:
     artifact = (
-        Path(options.input_artifact).resolve()
-        if options.input_artifact is not None
-        else run_directory / "input.json"
+        Path(options.input_artifact).resolve() if options.input_artifact is not None else run_directory / "input.json"
     )
     # Keep the default scanner parity fixture one-record wide; the PostgreSQL
     # publication smoke opts into multiple dense price keys.
@@ -202,9 +199,7 @@ def _scanner_execution_environment(
 ) -> dict[str, str]:
     return {
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": options.arch,
-        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(
-            artifact.read_bytes()
-        ).hexdigest(),
+        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
         "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot-v3-runs",
         "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan-v3-runs",
@@ -217,14 +212,10 @@ def _scanner_execution_environment(
         "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
         "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
-        "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": (
-            "true" if options.top_level_byte_scan else "false"
-        ),
+        "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": ("true" if options.top_level_byte_scan else "false"),
         "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS": "true",
         "HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS": "2",
-        "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": (
-            "true" if options.grouped else "false"
-        ),
+        "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": ("true" if options.grouped else "false"),
         "HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED": "false",
     }
 
@@ -327,12 +318,8 @@ def _run_scanner(
     return _scanner_result(artifact, paths, _parse_scanner_frames(completed.stdout))
 
 
-def _malformed_provider_identifier_payload(
-    *, provider_references_first: bool
-) -> dict:
-    source_document = _fixture_payload(
-        provider_references_first=provider_references_first
-    )
+def _malformed_provider_identifier_payload(*, provider_references_first: bool) -> dict:
+    source_document = _fixture_payload(provider_references_first=provider_references_first)
     source_document["provider_references"][0]["provider_groups"][0]["npi"] = [
         1234567890,
         123456789,
@@ -383,24 +370,21 @@ def _malformed_provider_identifier_payload(
     )
     return source_document
 
+
 def _assert_scanner_execution_mode_contracts(scanner_runs_by_mode: dict) -> None:
     baseline = scanner_runs_by_mode["worker_ungrouped"]["partition_bytes"]
     assert len(baseline) == _SERVING_RECORD.size
     assert scanner_runs_by_mode["late_reordered"]["partition_bytes"] == baseline
     assert _SERVING_RECORD.unpack(baseline)[3] == 2
 
-    assert _single_frame(
-        scanner_runs_by_mode["worker_ungrouped"]["frames"], "scanner_config"
-    )["execution_mode"] == ("parallel_top_level_bytes")
+    assert _single_frame(scanner_runs_by_mode["worker_ungrouped"]["frames"], "scanner_config")["execution_mode"] == (
+        "parallel_top_level_bytes"
+    )
     assert (
-        _single_frame(
-            scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config"
-        )["execution_mode"]
+        _single_frame(scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config")["execution_mode"]
         == "parallel_top_level_bytes_plain_range_reorder"
     )
-    late_config = _single_frame(
-        scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config"
-    )
+    late_config = _single_frame(scanner_runs_by_mode["late_reordered"]["frames"], "scanner_config")
     assert late_config["provider_reference_order"] == "after_in_network"
     assert late_config["plain_range_reorder"] is True
     assert late_config["plain_provider_range_bytes"] > 0
@@ -428,24 +412,12 @@ def _assert_scanner_source_witness(run: dict) -> None:
 def _assert_scanner_publication_files(run: dict) -> None:
     assert not run["compact_copy_path"].exists()
     assert not run["lean_copy_path"].exists()
-    assert not any(
-        kind == "manifest_lean_serving_copy_file" for kind, _payload in run["frames"]
-    )
-    assert not any(
-        kind in {"procedure", "provider_set", "serving_rate_compact"}
-        for kind, _payload in run["frames"]
-    )
-    assert sum(
-        frame["row_count"] for frame in run["provider_group_member_frames"]
-    ) == 2
-    assert all(
-        Path(frame["path"]).exists() for frame in run["provider_group_member_frames"]
-    )
+    assert not any(kind == "manifest_lean_serving_copy_file" for kind, _payload in run["frames"])
+    assert not any(kind in {"procedure", "provider_set", "serving_rate_compact"} for kind, _payload in run["frames"])
+    assert sum(frame["row_count"] for frame in run["provider_group_member_frames"]) == 2
+    assert all(Path(frame["path"]).exists() for frame in run["provider_group_member_frames"])
     assert sum(frame["row_count"] for frame in run["price_set_summary_frames"]) == 1
-    summary_rows = b"".join(
-        Path(frame["path"]).read_bytes()
-        for frame in run["price_set_summary_frames"]
-    ).splitlines()
+    summary_rows = b"".join(Path(frame["path"]).read_bytes() for frame in run["price_set_summary_frames"]).splitlines()
     assert len(summary_rows) == 1
     assert summary_rows[0].rsplit(b"\t", 1)[1] == b"125.5"
     assert run["provider_forward_path"].exists()
@@ -470,17 +442,12 @@ def _assert_scanner_partition_contract(run: dict) -> None:
     assert summary["serving_run_rows"] == 1
     assert summary["serving_run_bytes"] == _SERVING_RECORD.size
     assert len(run["code_dictionary_frames"]) == 1
-    assert (
-        run["code_dictionary_frames"][0]["format"]
-        == "ptg2_v3_serving_code_dictionary"
-    )
+    assert run["code_dictionary_frames"][0]["format"] == "ptg2_v3_serving_code_dictionary"
 
 
 def _assert_strict_scanner_run(run: dict) -> None:
     frame_kinds = {kind for kind, _payload in run["frames"]}
-    assert frame_kinds - {"dedupe_summary"} == (
-        _STRICT_SCANNER_FRAME_KINDS - {"dedupe_summary"}
-    )
+    assert frame_kinds - {"dedupe_summary"} == (_STRICT_SCANNER_FRAME_KINDS - {"dedupe_summary"})
     _assert_scanner_source_witness(run)
     _assert_scanner_publication_files(run)
     _assert_scanner_partition_contract(run)
