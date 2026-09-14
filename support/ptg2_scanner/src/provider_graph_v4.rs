@@ -23,6 +23,10 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[path = "provider_graph_v4_memory.rs"]
+mod memory;
+use memory::{resource_admission_preflight, unique_sorted_globals};
+
 const MANIFEST_VERSION: u32 = 1;
 const STANDARD_MAGIC: &[u8; 8] = b"PTG2MNSC";
 const DENSE_MAGIC: &[u8; 8] = b"PTG2MNDS";
@@ -2107,195 +2111,6 @@ fn load_raw_factors(
     Ok(raw)
 }
 
-fn resource_admission_preflight(
-    descriptors: &[V4ProviderGraphShardDescriptor],
-    provider_set_key_map_path: &Path,
-    options: &ProviderGraphV4Options,
-) -> ProviderGraphV4Result<ResourceAdmissionTracker> {
-    if descriptors.is_empty() {
-        return Err(invalid("V4 provider graph requires at least one shard"));
-    }
-    let mut input_factor_bytes = 0u64;
-    let mut factor_edge_count = 0u64;
-    let mut factor_owner_count = 0u64;
-    let mut matched_ein_occurrence_upper_bound = 0u64;
-    let shard_count = invalid_conversion(
-        u64::try_from(descriptors.len()),
-        "resource_admission: shard count exceeds uint64",
-    )?;
-    let source_bitmap_bytes = shard_count.checked_add(7).ok_or(invalid(
-        "resource_admission: tax identity bitmap width overflows",
-    ))? / 8;
-    let mut tax_identity_group_occurrence_upper_bound = 0u64;
-    // This covers the ordinal vector, cloned shard IDs, and the temporary
-    // uniqueness set before any factor mmap is opened.
-    let mut tax_identity_source_ordinal_upper_bound_bytes = shard_count
-        .checked_mul(TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES)
-        .ok_or(invalid(
-            "resource_admission: tax identity source ordinal bytes overflow",
-        ))?;
-    for shard in descriptors {
-        for artifact in [
-            &shard.provider_set_component,
-            &shard.provider_component_group,
-            &shard.provider_group_npi,
-            &shard.provider_npi_group,
-        ] {
-            input_factor_bytes = input_factor_bytes
-                .checked_add(artifact.metadata.byte_count)
-                .ok_or(invalid("resource_admission: input byte count overflows"))?;
-            factor_edge_count = factor_edge_count
-                .checked_add(artifact.metadata.member_count)
-                .ok_or(invalid("resource_admission: factor edge count overflows"))?;
-            factor_owner_count = factor_owner_count
-                .checked_add(artifact.metadata.owner_count)
-                .ok_or(invalid("resource_admission: factor owner count overflows"))?;
-        }
-        input_factor_bytes = input_factor_bytes
-            .checked_add(shard.provider_group_tax_identity.metadata.byte_count)
-            .ok_or(invalid("resource_admission: input byte count overflows"))?;
-        factor_edge_count = factor_edge_count
-            .checked_add(shard.provider_group_tax_identity.metadata.row_count)
-            .ok_or(invalid("resource_admission: factor edge count overflows"))?;
-        factor_owner_count = factor_owner_count
-            .checked_add(
-                shard
-                    .provider_group_tax_identity
-                    .metadata
-                    .provider_group_count,
-            )
-            .ok_or(invalid("resource_admission: factor owner count overflows"))?;
-        tax_identity_group_occurrence_upper_bound = tax_identity_group_occurrence_upper_bound
-            .checked_add(
-                shard
-                    .provider_group_tax_identity
-                    .metadata
-                    .provider_group_count,
-            )
-            .ok_or(invalid(
-                "resource_admission: tax identity group occurrence count overflows",
-            ))?;
-        matched_ein_occurrence_upper_bound = matched_ein_occurrence_upper_bound
-            .checked_add(shard.provider_group_tax_identity.metadata.matched_ein_count)
-            .ok_or(invalid(
-                "resource_admission: matched tax identity count overflows",
-            ))?;
-        let shard_id_bytes = invalid_conversion(
-            u64::try_from(shard.shard_id.len()),
-            "resource_admission: shard ID length exceeds uint64",
-        )?;
-        tax_identity_source_ordinal_upper_bound_bytes =
-            tax_identity_source_ordinal_upper_bound_bytes
-                .checked_add(
-                    shard_id_bytes
-                        .checked_mul(TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND)
-                        .ok_or(invalid(
-                            "resource_admission: tax identity source ID bytes overflow",
-                        ))?,
-                )
-                .ok_or(invalid(
-                    "resource_admission: tax identity source ordinal bytes overflow",
-                ))?;
-    }
-    let tax_identity_merge_bitmap_upper_bound_bytes = tax_identity_group_occurrence_upper_bound
-        .checked_mul(source_bitmap_bytes)
-        .ok_or(invalid(
-            "resource_admission: tax identity merge bitmap bytes overflow",
-        ))?;
-    let tax_identity_projection_upper_bound_bytes = tax_identity_group_occurrence_upper_bound
-        .checked_mul(TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES.saturating_add(source_bitmap_bytes))
-        .and_then(|value| {
-            value.checked_add(
-                matched_ein_occurrence_upper_bound
-                    .saturating_mul(TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES),
-            )
-        })
-        .ok_or(invalid(
-            "resource_admission: tax identity projection upper bound overflows",
-        ))?;
-    let provider_set_key_map_bytes = match fs::metadata(provider_set_key_map_path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) => {
-            return Err(invalid(format!(
-                "resource_admission: provider-set key map is unavailable: {error}"
-            )));
-        }
-    };
-    // This deliberately over-accounts both reciprocal NPI relations and all
-    // immutable input mmaps.  The factor model never includes flat set/group
-    // incidence, but HashMap/vector allocator overhead is budgeted at 128
-    // bytes per declared edge and 256 bytes per declared owner.
-    let base_estimated_model_bytes = input_factor_bytes
-        .checked_add(provider_set_key_map_bytes.saturating_mul(4))
-        .and_then(|value| value.checked_add(factor_edge_count.saturating_mul(128)))
-        .and_then(|value| value.checked_add(factor_owner_count.saturating_mul(256)))
-        .and_then(|value| value.checked_add(tax_identity_merge_bitmap_upper_bound_bytes))
-        .and_then(|value| value.checked_add(tax_identity_source_ordinal_upper_bound_bytes))
-        .ok_or(invalid(
-            "resource_admission: estimated peak byte count overflows",
-        ))?;
-    // Emission holds one relation-member page, one locator page, and at most
-    // one streamed heavy-bitmap page at the same time. Reference rows are
-    // externally spooled by object kind, so their resident memory is bounded
-    // by a fixed number of small writer buffers rather than block count.
-    let bounded_emission_buffer_bytes = invalid_conversion(
-        u64::try_from(options.member_page_bytes),
-        "resource_admission: member page bytes exceed uint64",
-    )?
-    .checked_mul(2)
-    .and_then(|value| value.checked_add(options.locator_page_bytes as u64))
-    .and_then(|value| value.checked_add(REFERENCE_SPOOL_FIXED_BYTES))
-    .ok_or(invalid(
-        "resource_admission: emission buffer byte count overflows",
-    ))?;
-    let estimated_peak_bytes = base_estimated_model_bytes
-        .checked_add(tax_identity_projection_upper_bound_bytes)
-        .and_then(|value| value.checked_add(bounded_emission_buffer_bytes))
-        .ok_or(invalid(
-            "resource_admission: estimated peak byte count overflows",
-        ))?;
-    if options
-        .max_factor_edges
-        .is_some_and(|limit| factor_edge_count > limit)
-    {
-        return Err(invalid(format!(
-            "resource_admission: factor edge count {factor_edge_count} exceeds configured limit {}",
-            options.max_factor_edges.expect("checked above")
-        )));
-    }
-    if options
-        .max_estimated_model_bytes
-        .is_some_and(|limit| estimated_peak_bytes > limit)
-    {
-        return Err(invalid(format!(
-            "resource_admission: estimated peak bytes {estimated_peak_bytes} exceeds configured limit {}",
-            options.max_estimated_model_bytes.expect("checked above")
-        )));
-    }
-    Ok(ResourceAdmissionTracker {
-        summary: V4ResourceAdmissionSummary {
-            formula: "base(input_factor_bytes + provider_set_key_map_bytes*4 + factor_edges*128 + factor_owners*256 + tax_identity_merge_bitmap_upper_bound_bytes + tax_identity_source_ordinal_upper_bound_bytes) + derived_projection_bytes + tax_identity_projection_bytes(preflight=tax_identity_projection_upper_bound_bytes,reconciled=exact) + retained_scratch_high_water_bytes + bounded_emission_buffer_bytes"
-                .to_string(),
-            input_factor_bytes,
-            provider_set_key_map_bytes,
-            factor_edge_count,
-            factor_owner_count,
-            tax_identity_merge_bitmap_upper_bound_bytes,
-            tax_identity_source_ordinal_upper_bound_bytes,
-            tax_identity_projection_upper_bound_bytes,
-            base_estimated_model_bytes,
-            derived_projection_bytes: 0,
-            tax_identity_projection_bytes: tax_identity_projection_upper_bound_bytes,
-            retained_scratch_high_water_bytes: 0,
-            bounded_emission_buffer_bytes,
-            estimated_peak_bytes,
-            max_estimated_model_bytes: options.max_estimated_model_bytes,
-            max_factor_edges: options.max_factor_edges,
-        },
-        tax_identity_projection_reconciled: false,
-    })
-}
-
 #[derive(Debug)]
 struct GraphModel {
     set_base: u32,
@@ -2578,7 +2393,7 @@ fn validate_factor_completeness(
         provider_sets.key(factor_set)?;
     }
 
-    let mut referenced_components = Vec::new();
+    let mut referenced_components = HashSet::new();
     for set_global in &provider_sets.globals_by_index {
         let Some(components) = raw.set_components.get(set_global) else {
             return Err(invalid(
@@ -2590,10 +2405,8 @@ fn validate_factor_completeness(
                 "V4 incomplete factor truth: authoritative provider set has no components",
             ));
         }
-        referenced_components.extend_from_slice(components);
+        referenced_components.extend(components.iter().copied());
     }
-    referenced_components.sort_unstable();
-    referenced_components.dedup();
     for component in referenced_components {
         if raw
             .component_groups
@@ -3652,7 +3465,7 @@ fn pattern_digest(set_keys: &[u32]) -> [u8; 32] {
 }
 
 fn build_graph_model(
-    raw: &RawFactors,
+    raw: &mut RawFactors,
     provider_sets: &ProviderSetMap,
     progress: &mut ProgressReporter<'_>,
     admission: &mut ResourceAdmissionTracker,
@@ -3706,43 +3519,31 @@ fn build_graph_model(
     let mut build_done = 0u64;
     progress.periodic("build_model", 0, build_total, "factor_items");
 
-    let mut component_globals = Vec::new();
-    for component in raw.component_groups.keys().copied() {
-        component_globals.push(component);
-        advance_build_progress(progress, &mut build_done, build_total)?;
-    }
-    for members in raw.set_components.values() {
-        for component in members {
-            component_globals.push(*component);
-            advance_build_progress(progress, &mut build_done, build_total)?;
-        }
-    }
-    component_globals.sort_unstable();
-    component_globals.dedup();
-
-    let mut group_globals = Vec::new();
-    for members in raw.component_groups.values() {
-        for group in members {
-            group_globals.push(*group);
-            advance_build_progress(progress, &mut build_done, build_total)?;
-        }
-    }
-    for group in raw.group_npis.keys().copied() {
-        group_globals.push(group);
-        advance_build_progress(progress, &mut build_done, build_total)?;
-    }
-    group_globals.sort_unstable();
-    group_globals.dedup();
-
-    let mut npi_globals = Vec::new();
-    for members in raw.group_npis.values() {
-        for npi in members {
-            npi_globals.push(*npi);
-            advance_build_progress(progress, &mut build_done, build_total)?;
-        }
-    }
-    npi_globals.sort_unstable();
-    npi_globals.dedup();
+    let component_globals = unique_sorted_globals(
+        raw.component_groups
+            .keys()
+            .copied()
+            .chain(raw.set_components.values().flatten().copied()),
+        progress,
+        &mut build_done,
+        build_total,
+    )?;
+    let group_globals = unique_sorted_globals(
+        raw.component_groups
+            .values()
+            .flatten()
+            .copied()
+            .chain(raw.group_npis.keys().copied()),
+        progress,
+        &mut build_done,
+        build_total,
+    )?;
+    let npi_globals = unique_sorted_globals(
+        raw.group_npis.values().flatten().copied(),
+        progress,
+        &mut build_done,
+        build_total,
+    )?;
     let npis = npi_globals
         .iter()
         .copied()
@@ -3753,12 +3554,12 @@ fn build_graph_model(
     let npi_map = dense_global_map(&npi_globals, "NPI")?;
 
     let mut set_components = vec![Vec::new(); provider_sets.globals_by_index.len()];
-    for (set_global, component_globals_for_set) in &raw.set_components {
-        let set_key = provider_sets.key(*set_global)?;
+    for (set_global, component_globals_for_set) in std::mem::take(&mut raw.set_components) {
+        let set_key = provider_sets.key(set_global)?;
         let set_index = provider_sets.index(set_key)?;
         let members = &mut set_components[set_index];
         for component in component_globals_for_set {
-            members.push(map_key(&component_map, *component, "component")?);
+            members.push(map_key(&component_map, component, "component")?);
             advance_build_progress(progress, &mut build_done, build_total)?;
         }
         members.sort_unstable();
@@ -3766,10 +3567,11 @@ fn build_graph_model(
         advance_build_progress(progress, &mut build_done, build_total)?;
     }
     let mut component_groups = vec![Vec::new(); component_globals.len()];
-    for (component_global, group_globals_for_component) in &raw.component_groups {
-        let component = map_key(&component_map, *component_global, "component")? as usize;
+    for (component_global, group_globals_for_component) in std::mem::take(&mut raw.component_groups)
+    {
+        let component = map_key(&component_map, component_global, "component")? as usize;
         for group in group_globals_for_component {
-            component_groups[component].push(map_key(&group_map, *group, "group")?);
+            component_groups[component].push(map_key(&group_map, group, "group")?);
             advance_build_progress(progress, &mut build_done, build_total)?;
         }
         component_groups[component].sort_unstable();
@@ -3800,16 +3602,20 @@ fn build_graph_model(
         components.dedup();
     }
     let mut group_npis = vec![Vec::new(); group_globals.len()];
-    for (group_global, npi_globals_for_group) in &raw.group_npis {
-        let group = map_key(&group_map, *group_global, "group")? as usize;
+    for (group_global, npi_globals_for_group) in std::mem::take(&mut raw.group_npis) {
+        let group = map_key(&group_map, group_global, "group")? as usize;
         for npi in npi_globals_for_group {
-            group_npis[group].push(map_key(&npi_map, *npi, "NPI")?);
+            group_npis[group].push(map_key(&npi_map, npi, "NPI")?);
             advance_build_progress(progress, &mut build_done, build_total)?;
         }
         group_npis[group].sort_unstable();
         group_npis[group].dedup();
         advance_build_progress(progress, &mut build_done, build_total)?;
     }
+    drop(component_map);
+    drop(group_map);
+    drop(npi_map);
+    drop(npi_globals);
     let mut npi_groups = vec![Vec::new(); npis.len()];
     for (group, members) in group_npis.iter().enumerate() {
         for npi in members {
@@ -8133,10 +7939,10 @@ fn compile_provider_graph_v4_inner(
     let mut resource_admission =
         resource_admission_preflight(shards, provider_set_key_map_path, options)?;
     progress.emit("resource_admission", 1, 1, "stage", false);
-    let raw = load_raw_factors(shards, progress)?;
+    let mut raw = load_raw_factors(shards, progress)?;
     let provider_sets = ProviderSetMap::read(provider_set_key_map_path)?;
     let mut model = build_graph_model(
-        &raw,
+        &mut raw,
         &provider_sets,
         progress,
         &mut resource_admission,
@@ -8173,6 +7979,7 @@ fn compile_provider_graph_v4_inner(
         options,
     )?;
     let tax_identity = V4TaxIdentityModel::build(&raw.tax_identities, &model.group_globals)?;
+    raw.tax_identities = V4TaxIdentityFactors::default();
     let tax_dictionary_projection_bytes = (tax_identity.tin_hmacs.len() as u64)
         .checked_mul(TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES)
         .ok_or(invalid(
@@ -10169,7 +9976,8 @@ mod tests {
         let fixture = shared_pattern_fixture(64, 16);
         let mut sink = |_event: &V4ProgressEvent| {};
         let mut progress = ProgressReporter::new(&mut sink);
-        let raw = load_raw_factors(std::slice::from_ref(&fixture.shard), &mut progress).unwrap();
+        let mut raw =
+            load_raw_factors(std::slice::from_ref(&fixture.shard), &mut progress).unwrap();
         let provider_sets = ProviderSetMap::read(&fixture.provider_map).unwrap();
         let mut admission = resource_admission_preflight(
             std::slice::from_ref(&fixture.shard),
@@ -10178,13 +9986,17 @@ mod tests {
         )
         .unwrap();
         let model = build_graph_model(
-            &raw,
+            &mut raw,
             &provider_sets,
             &mut progress,
             &mut admission,
             &ProviderGraphV4Options::default(),
         )
         .unwrap();
+        assert_eq!(raw.set_components.capacity(), 0);
+        assert_eq!(raw.component_groups.capacity(), 0);
+        assert_eq!(raw.group_npis.capacity(), 0);
+        assert!(model.component_globals.capacity() <= 2 * model.component_globals.len());
         assert_eq!(model.pattern_sets.len(), 1);
         assert_eq!(model.pattern_groups[0].len(), 64);
         assert_eq!(model.pattern_sets[0], (1..=16).collect::<Vec<_>>());
@@ -10265,7 +10077,7 @@ mod tests {
         write_provider_map(&provider_map, &sets, 0);
         let mut sink = |_event: &V4ProgressEvent| {};
         let mut progress = ProgressReporter::new(&mut sink);
-        let raw = load_raw_factors(std::slice::from_ref(&shard), &mut progress).unwrap();
+        let mut raw = load_raw_factors(std::slice::from_ref(&shard), &mut progress).unwrap();
         let provider_sets = ProviderSetMap::read(&provider_map).unwrap();
         let mut admission = resource_admission_preflight(
             std::slice::from_ref(&shard),
@@ -10274,7 +10086,7 @@ mod tests {
         )
         .unwrap();
         let model = build_graph_model(
-            &raw,
+            &mut raw,
             &provider_sets,
             &mut progress,
             &mut admission,
@@ -12145,7 +11957,7 @@ mod tests {
         write_provider_map(&provider_map, &sets, 0);
         let mut sink = |_event: &V4ProgressEvent| {};
         let mut progress = ProgressReporter::new(&mut sink);
-        let raw = load_raw_factors(std::slice::from_ref(&shard), &mut progress).unwrap();
+        let mut raw = load_raw_factors(std::slice::from_ref(&shard), &mut progress).unwrap();
         let provider_sets = ProviderSetMap::read(&provider_map).unwrap();
         let mut admission = resource_admission_preflight(
             std::slice::from_ref(&shard),
@@ -12154,7 +11966,7 @@ mod tests {
         )
         .unwrap();
         let model = build_graph_model(
-            &raw,
+            &mut raw,
             &provider_sets,
             &mut progress,
             &mut admission,
@@ -12171,6 +11983,40 @@ mod tests {
         );
         assert!(model.pattern_sets[model.group_patterns[2] as usize].is_empty());
         assert_eq!(model.provider_set_audit_npis.len(), 2);
+    }
+
+    #[test]
+    fn member_only_globals_have_a_separate_dictionary_allowance() {
+        let fixture = shared_pattern_fixture(2, 2);
+        let estimate = |shard: &V4ProviderGraphShardDescriptor| {
+            resource_admission_preflight(
+                std::slice::from_ref(shard),
+                &fixture.provider_map,
+                &ProviderGraphV4Options::default(),
+            )
+            .unwrap()
+            .summary
+            .base_estimated_model_bytes
+        };
+        let mut shard = fixture.shard.clone();
+        let baseline = estimate(&shard);
+        // Referenced groups need model dictionaries even when they have no
+        // corresponding group/NPI owner; owner counts are deliberately fixed.
+        let globals = shard
+            .provider_component_group
+            .metadata
+            .member_global_count
+            .unwrap();
+        shard.provider_component_group.metadata.member_global_count = Some(globals + 100);
+        assert_eq!(estimate(&shard) - baseline, 100 * 256);
+        let dense = estimate(&shard);
+        shard.provider_component_group.metadata.member_count = globals + 200;
+        shard.provider_component_group.metadata.member_global_count = None;
+        assert!(estimate(&shard) >= dense + 100 * 256);
+        let standard = estimate(&shard);
+        shard.provider_component_group.metadata.record_format = STANDARD_FORMAT.to_owned();
+        shard.provider_component_group.metadata.member_global_count = Some(0);
+        assert_eq!(estimate(&shard), standard);
     }
 
     #[test]
