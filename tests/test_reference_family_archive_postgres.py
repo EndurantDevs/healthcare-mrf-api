@@ -243,8 +243,12 @@ async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
     ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
     forged_receipt = validation.as_dict()
     forged_receipt["package_id"] = "b" * 64
-    cases = ((forged_receipt, sealed_owner_oid, "digest differs"), (validation, sealed_owner_oid + 1, "owner differs"))
-    for validation_receipt, owner_oid, error_message in cases:
+    cases = (
+        (forged_receipt, sealed_owner_oid, sealed_owner_oid, "digest differs"),
+        (validation, sealed_owner_oid, sealed_owner_oid + 1, "owner differs"),
+        (validation, sealed_owner_oid + 1, sealed_owner_oid, "authority differs"),
+    )
+    for validation_receipt, original_owner_oid, current_owner_oid, error_message in cases:
         async with sessions() as session, session.begin():
             with pytest.raises(archive.ReferenceFamilyArchiveError, match=error_message):
                 await archive.activate_validated_reference_family_stage(
@@ -253,7 +257,9 @@ async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
                     manifest=manifest,
                     expected_incumbent=incumbent,
                     validation_receipt=validation_receipt,
-                    cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, owner_oid, "manual"),
+                    cutover=archive.ReferenceFamilyCutoverAuthority(
+                        package_id, archive.CONTRACT, original_owner_oid, current_owner_oid, "manual"
+                    ),
                 )
 
 
@@ -272,7 +278,9 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
             manifest=manifest,
             expected_incumbent=incumbent,
             validation_receipt=validation,
-            cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, sealed_owner_oid, "manual"),
+            cutover=archive.ReferenceFamilyCutoverAuthority(
+                package_id, archive.CONTRACT, sealed_owner_oid, sealed_owner_oid, "manual"
+            ),
         )
         assert receipt.tables == manifest.tables
         await transaction.rollback()
@@ -299,7 +307,7 @@ async def _replace_incumbent_and_reject(sessions, live_schema, candidate, packag
                 expected_incumbent=incumbent,
                 validation_receipt=validation,
                 cutover=archive.ReferenceFamilyCutoverAuthority(
-                    package_id, archive.CONTRACT, sealed_owner_oid, "manual"
+                    package_id, archive.CONTRACT, sealed_owner_oid, sealed_owner_oid, "manual"
                 ),
             )
         await archive.cleanup_reference_family_stage(session, ownership)
