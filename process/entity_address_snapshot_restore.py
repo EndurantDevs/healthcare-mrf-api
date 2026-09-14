@@ -505,10 +505,10 @@ async def _lock_stored_stage_relations(
     await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
 
 
-def _rehydrated_context(value: Any) -> dict[str, Any]:
+def _rehydrated_context(stored_context: Any) -> dict[str, Any]:
     """Require the exact durable native preparation context before cutover."""
 
-    context = _json_object(value, "context")
+    context = _json_object(stored_context, "context")
     allowed_legacy_fields = {"address_alias_generation", "stage_persistence", "phase_timings"}
     allowed_generation_fields = {
         "result_generation_mode",
@@ -538,9 +538,7 @@ def _rehydrated_context(value: Any) -> dict[str, Any]:
                 ).as_dict()
             )
         except ValueError as error:
-            raise EntityAddressSnapshotRestoreError(
-                "entity-address restore context is invalid"
-            ) from error
+            raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid") from error
     return context
 
 

@@ -136,14 +136,50 @@ def _prepared_full_result_stage(
     )
 
 
+def _validated_source_generation(
+    source_generation: Mapping[str, Any] | result_generation.EntityAddressServingGeneration | None,
+) -> result_generation.EntityAddressServingGeneration | None:
+    """Normalize a portable source identity while preserving legacy absence."""
+
+    if source_generation is None:
+        return None
+    return result_generation.validate_entity_address_serving_generation(source_generation)
+
+
+async def _prepare_adoption_context(
+    *,
+    db_schema: str,
+    stage_cls: type,
+    swaps: list,
+    source_generation: result_generation.EntityAddressServingGeneration | None,
+) -> dict[str, Any]:
+    """Make stages durable and bind analysis to the adoption identity."""
+
+    for swap in swaps:
+        await entity_address_unified._ensure_promoted_stage_logged(
+            db_schema,
+            swap.stage_cls.__tablename__,
+        )
+    context_map = {
+        "address_alias_generation": await entity_address_unified._address_alias_generation(db_schema),
+        "stage_persistence": "p",
+        "result_generation_mode": "adoption",
+        "source_serving_generation": (None if source_generation is None else source_generation.as_dict()),
+    }
+    await entity_address_unified._run_sql_phase(
+        f"ANALYZE {db_schema}.{stage_cls.__tablename__};",
+        context=context_map,
+        phase="entity-address snapshot analyzing restored main table",
+    )
+    return context_map
+
+
 async def prepare_completed_entity_address_snapshot_adoption(
     *,
     db_schema: str,
     import_date: str,
     preserve_unversioned_base_rows: bool = False,
-    source_serving_generation: (
-        Mapping[str, Any] | result_generation.EntityAddressServingGeneration | None
-    ) = None,
+    source_serving_generation: (Mapping[str, Any] | result_generation.EntityAddressServingGeneration | None) = None,
 ) -> PreparedEntityAddressSnapshotAdoption:
     """Prepare one result, preserving its origin or explicitly adopting legacy input.
 
@@ -156,13 +192,7 @@ async def prepare_completed_entity_address_snapshot_adoption(
         db_schema=db_schema,
         import_date=import_date,
     )
-    validated_source_generation = (
-        None
-        if source_serving_generation is None
-        else result_generation.validate_entity_address_serving_generation(
-            source_serving_generation
-        )
-    )
+    validated_source_generation = _validated_source_generation(source_serving_generation)
     (
         stage_cls,
         support_stage_class_map,
@@ -174,23 +204,11 @@ async def prepare_completed_entity_address_snapshot_adoption(
         db_schema=normalized_schema,
         import_date=normalized_import_date,
     )
-    for swap in swaps:
-        await entity_address_unified._ensure_promoted_stage_logged(
-            normalized_schema,
-            swap.stage_cls.__tablename__,
-        )
-    cutover_context_map = {
-        "address_alias_generation": await entity_address_unified._address_alias_generation(normalized_schema),
-        "stage_persistence": "p",
-        "result_generation_mode": "adoption",
-        "source_serving_generation": (
-            None if validated_source_generation is None else validated_source_generation.as_dict()
-        ),
-    }
-    await entity_address_unified._run_sql_phase(
-        f"ANALYZE {normalized_schema}.{stage_cls.__tablename__};",
-        context=cutover_context_map,
-        phase="entity-address snapshot analyzing restored main table",
+    cutover_context_map = await _prepare_adoption_context(
+        db_schema=normalized_schema,
+        stage_cls=stage_cls,
+        swaps=swaps,
+        source_generation=validated_source_generation,
     )
     publish_validation = await _validate_adoption_stage(
         normalized_schema,

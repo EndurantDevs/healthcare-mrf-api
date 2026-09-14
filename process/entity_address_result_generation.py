@@ -72,9 +72,7 @@ class EntityAddressResultGenerationAuthority:
         return {
             "local_lineage_id": self.local_lineage_id,
             "local_generation": self.local_generation,
-            "serving_generation": (
-                None if self.serving_generation is None else self.serving_generation.as_dict()
-            ),
+            "serving_generation": (None if self.serving_generation is None else self.serving_generation.as_dict()),
             "relation_oids": None if self.relation_oids is None else list(self.relation_oids),
         }
 
@@ -93,7 +91,7 @@ def _quoted(value: str) -> str:
 def _uuid_text(value: object) -> str:
     try:
         normalized = str(UUID(str(value)))
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         raise ValueError("entity-address result generation lineage is invalid") from None
     return normalized
 
@@ -103,9 +101,7 @@ def _timestamp(value: object) -> datetime.datetime:
         try:
             value = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            raise ValueError(
-                "entity-address result generation publication time is invalid"
-            ) from None
+            raise ValueError("entity-address result generation publication time is invalid") from None
     if not isinstance(value, datetime.datetime) or value.tzinfo is None:
         raise ValueError("entity-address result generation publication time is invalid")
     return value.astimezone(datetime.timezone.utc)
@@ -138,19 +134,15 @@ def validate_entity_address_serving_generation(
     )
 
 
-def _relation_oids(value: object) -> tuple[int, ...]:
-    if not isinstance(value, (list, tuple)) or len(value) != len(RELATION_NAMES):
+def _relation_oids(relation_oid_values: object) -> tuple[int, ...]:
+    if not isinstance(relation_oid_values, (list, tuple)) or len(relation_oid_values) != len(RELATION_NAMES):
         raise ValueError("entity-address result generation relation identity is invalid")
-    normalized = tuple(value)
-    if (
-        any(
-            type(relation_oid) is not int or not 0 < relation_oid <= _MAX_OID
-            for relation_oid in normalized
-        )
-        or len(set(normalized)) != len(normalized)
-    ):
+    relation_oids = tuple(relation_oid_values)
+    if any(type(relation_oid) is not int or not 0 < relation_oid <= _MAX_OID for relation_oid in relation_oids) or len(
+        set(relation_oids)
+    ) != len(relation_oids):
         raise ValueError("entity-address result generation relation identity is invalid")
-    return normalized
+    return relation_oids
 
 
 def _row_mapping(row: object) -> Mapping[str, Any]:
@@ -161,22 +153,22 @@ def _row_mapping(row: object) -> Mapping[str, Any]:
 
 
 def validate_entity_address_result_generation_authority(
-    row: object,
+    authority_row: object,
 ) -> EntityAddressResultGenerationAuthority:
     """Validate one migration-installed singleton without inferring history."""
 
-    value = _row_mapping(row)
-    if value.get("singleton") is not True:
+    authority_by_field = _row_mapping(authority_row)
+    if authority_by_field.get("singleton") is not True:
         raise RuntimeError("entity-address result generation singleton is unavailable")
-    local_generation = value.get("local_generation")
+    local_generation = authority_by_field.get("local_generation")
     if type(local_generation) is not int or not 0 <= local_generation <= _MAX_GENERATION:
         raise RuntimeError("entity-address local result generation is invalid")
-    local_lineage_id = _uuid_text(value.get("local_lineage_id"))
+    local_lineage_id = _uuid_text(authority_by_field.get("local_lineage_id"))
     origin_values = (
-        value.get("origin_lineage_id"),
-        value.get("origin_generation"),
-        value.get("published_at"),
-        value.get("relation_oids"),
+        authority_by_field.get("origin_lineage_id"),
+        authority_by_field.get("origin_generation"),
+        authority_by_field.get("published_at"),
+        authority_by_field.get("relation_oids"),
     )
     if all(origin_value is None for origin_value in origin_values):
         return EntityAddressResultGenerationAuthority(
@@ -190,12 +182,12 @@ def validate_entity_address_result_generation_authority(
     try:
         serving_generation = validate_entity_address_serving_generation(
             {
-                "origin_lineage_id": str(value["origin_lineage_id"]),
-                "origin_generation": value["origin_generation"],
-                "published_at": value["published_at"],
+                "origin_lineage_id": str(authority_by_field["origin_lineage_id"]),
+                "origin_generation": authority_by_field["origin_generation"],
+                "published_at": authority_by_field["published_at"],
             }
         )
-        relation_oids = _relation_oids(value["relation_oids"])
+        relation_oids = _relation_oids(authority_by_field["relation_oids"])
     except ValueError as error:
         raise RuntimeError("entity-address serving generation is invalid") from error
     return EntityAddressResultGenerationAuthority(
@@ -234,11 +226,7 @@ async def read_entity_address_result_generation_authority(
     """Read the required singleton in a caller-owned serving transaction."""
 
     schema = _schema_name(schema_name)
-    row = (
-        (await session.execute(text(_state_sql(schema, lock=False))))
-        .mappings()
-        .one_or_none()
-    )
+    row = (await session.execute(text(_state_sql(schema, lock=False)))).mappings().one_or_none()
     if row is None:
         raise RuntimeError("entity-address result generation singleton is unavailable")
     return validate_entity_address_result_generation_authority(row)
@@ -259,7 +247,7 @@ async def _current_relation_oids(database: Any, schema_name: str) -> tuple[int, 
     try:
         names = tuple(str(row[0]) for row in rows)
         relation_oids = _relation_oids(tuple(int(row[1]) for row in rows))
-    except (IndexError, TypeError, ValueError):
+    except IndexError, TypeError, ValueError:
         raise RuntimeError("entity-address serving relations are unavailable") from None
     if names != RELATION_NAMES:
         raise RuntimeError("entity-address serving relations are unavailable")
@@ -308,20 +296,20 @@ async def publish_adopted_entity_address_generation(
     """Preserve a source origin while replacing only destination-local OIDs."""
 
     schema = _schema_name(schema_name)
-    current = await _locked_authority(database, schema)
+    current_authority = await _locked_authority(database, schema)
     if source_generation is None:
-        parameters = {
+        update_values_by_column = {
             "origin_lineage_id": None,
             "origin_generation": None,
             "published_at": None,
             "relation_oids": None,
         }
     else:
-        source = validate_entity_address_serving_generation(source_generation)
-        parameters = {
-            "origin_lineage_id": UUID(source.origin_lineage_id),
-            "origin_generation": source.origin_generation,
-            "published_at": source.published_at,
+        source_identity = validate_entity_address_serving_generation(source_generation)
+        update_values_by_column = {
+            "origin_lineage_id": UUID(source_identity.origin_lineage_id),
+            "origin_generation": source_identity.origin_generation,
+            "published_at": source_identity.published_at,
             "relation_oids": list(await _current_relation_oids(database, schema)),
         }
     updated = await database.first(
@@ -335,17 +323,42 @@ async def publish_adopted_entity_address_generation(
             "RETURNING singleton, local_lineage_id, local_generation, "
             "origin_lineage_id, origin_generation, published_at, relation_oids"
         ),
-        **parameters,
+        **update_values_by_column,
     )
     if updated is None:
         raise RuntimeError("entity-address result generation singleton is unavailable")
-    result = validate_entity_address_result_generation_authority(updated)
+    updated_authority = validate_entity_address_result_generation_authority(updated)
     if (
-        result.local_lineage_id != current.local_lineage_id
-        or result.local_generation != current.local_generation
+        updated_authority.local_lineage_id != current_authority.local_lineage_id
+        or updated_authority.local_generation != current_authority.local_generation
     ):
         raise RuntimeError("entity-address local result generation changed during adoption")
-    return result
+    return updated_authority
+
+
+async def publish_cutover_entity_address_generation(
+    database: Any,
+    *,
+    schema_name: str,
+    context: Mapping[str, Any],
+) -> EntityAddressResultGenerationAuthority | None:
+    """Publish the configured generation identity inside the cutover transaction."""
+
+    generation_mode = context.get("result_generation_mode")
+    if generation_mode == "ordinary":
+        return await publish_local_entity_address_generation(
+            database,
+            schema_name=schema_name,
+        )
+    if generation_mode == "adoption":
+        return await publish_adopted_entity_address_generation(
+            database,
+            schema_name=schema_name,
+            source_generation=context.get("source_serving_generation"),
+        )
+    if generation_mode is not None:
+        raise RuntimeError("entity-address result generation mode is invalid")
+    return None
 
 
 def require_entity_address_automatic_generation_order(
@@ -359,10 +372,8 @@ def require_entity_address_automatic_generation_order(
     candidate_generation = validate_entity_address_serving_generation(candidate)
     incumbent_generation = validate_entity_address_serving_generation(incumbent)
     if (
-        candidate_generation.origin_lineage_id
-        != incumbent_generation.origin_lineage_id
-        or candidate_generation.origin_generation
-        <= incumbent_generation.origin_generation
+        candidate_generation.origin_lineage_id != incumbent_generation.origin_lineage_id
+        or candidate_generation.origin_generation <= incumbent_generation.origin_generation
     ):
         raise ValueError("automatic entity-address generation order is unsupported")
 
@@ -373,6 +384,7 @@ __all__ = [
     "EntityAddressServingGeneration",
     "RELATION_NAMES",
     "publish_adopted_entity_address_generation",
+    "publish_cutover_entity_address_generation",
     "publish_local_entity_address_generation",
     "read_entity_address_result_generation_authority",
     "require_entity_address_automatic_generation_order",

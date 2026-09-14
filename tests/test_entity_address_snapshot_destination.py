@@ -443,6 +443,32 @@ async def _generation_authority(database: Database, schema: str):
     return result_generation.validate_entity_address_result_generation_authority(row)
 
 
+async def _assert_adopted_generation(database: Database, schema: str) -> None:
+    """Require the preserved origin to reference all destination-local relations."""
+
+    authority = await _generation_authority(database, schema)
+    assert authority.local_generation == 0
+    assert authority.serving_generation.as_dict() == _source_serving_generation()
+    relation_oids_list = []
+    for table_name in result_generation.RELATION_NAMES:
+        relation_oids_list.append(
+            await database.scalar(
+                "SELECT to_regclass(:relation_name)::oid::bigint",
+                relation_name=f"{schema}.{table_name}",
+            )
+        )
+    assert authority.relation_oids == tuple(relation_oids_list)
+
+
+async def _install_destination_extensions(database: Database) -> None:
+    """Install only the extensions required by native destination activation."""
+
+    await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
+    await database.status("CREATE EXTENSION IF NOT EXISTS intarray")
+    await database.status("CREATE EXTENSION IF NOT EXISTS btree_gin")
+    await database.status('CREATE SCHEMA "tiger"')
+
+
 async def _spliced_main_stage(database: Database, prepared) -> dict:
     """Substitute a non-derived main value and recompute the actual stage receipt."""
 
@@ -506,10 +532,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
 
     async_dsn, _environment = _native_test_connection()
     async with _owned_native_database(async_dsn, monkeypatch) as database:
-        await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
-        await database.status("CREATE EXTENSION IF NOT EXISTS intarray")
-        await database.status("CREATE EXTENSION IF NOT EXISTS btree_gin")
-        await database.status('CREATE SCHEMA "tiger"')
+        await _install_destination_extensions(database)
         successful_schema = "address_destination_success_" + uuid4().hex
         rollback_schema = "address_destination_rollback_" + uuid4().hex
         successful, successful_incumbent_oid_by_table = await _prepare_fixture(database, successful_schema)
@@ -537,18 +560,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             suffix="_old",
         )
         assert await database.scalar(f"SELECT count(*) FROM {successful_schema}.adoption_receipt") == 1
-        successful_generation = await _generation_authority(database, successful_schema)
-        assert successful_generation.local_generation == 0
-        assert successful_generation.serving_generation.as_dict() == _source_serving_generation()
-        serving_oids = []
-        for table_name in result_generation.RELATION_NAMES:
-            serving_oids.append(
-                await database.scalar(
-                "SELECT to_regclass(:relation_name)::oid::bigint",
-                relation_name=f"{successful_schema}.{table_name}",
-            )
-            )
-        assert successful_generation.relation_oids == tuple(serving_oids)
+        await _assert_adopted_generation(database, successful_schema)
 
         rolled_back, rollback_incumbent_oid_by_table = await _prepare_fixture(database, rollback_schema)
         await database.status(f"CREATE TABLE {rollback_schema}.adoption_receipt (marker text NOT NULL)")

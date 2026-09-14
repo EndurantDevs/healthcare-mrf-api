@@ -29,6 +29,8 @@ def _source_generation():
 async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shutdown(
     monkeypatch,
 ):
+    """Prepare every family member without invoking ordinary worker shutdown."""
+
     ensured_tables: list[str] = []
     stage_cls = SimpleNamespace(__tablename__="entity_address_unified_20260913")
     support_stage_class_map = {
@@ -81,10 +83,7 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
         phase="entity-address snapshot analyzing restored main table",
     )
     validate.assert_awaited_once_with(
-        "mrf",
-        "entity_address_unified_20260913",
-        support_stage_class_map,
-        test_mode=False,
+        "mrf", "entity_address_unified_20260913", support_stage_class_map, test_mode=False
     )
 
 

@@ -27,9 +27,7 @@ def _schema() -> str:
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
+        raise RuntimeError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
     schema = runtime_schema or legacy_schema or "mrf"
     if not _IDENTIFIER.fullmatch(schema) or len(schema.encode("utf-8")) > 63:
         raise RuntimeError("entity-address result generation schema is invalid")
