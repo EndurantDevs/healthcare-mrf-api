@@ -14,6 +14,7 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
+from process import reference_family_result_generation as result_generation
 
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
@@ -311,6 +312,91 @@ async def _replace_incumbent_and_reject(sessions, live_schema, candidate, packag
                 ),
             )
         await archive.cleanup_reference_family_stage(session, ownership)
+
+
+async def _install_places_generation_authority(session, live_schema: str):
+    await session.execute(
+        text(
+            f'CREATE TABLE "{live_schema}".reference_family_result_generation ('
+            "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
+            "local_generation bigint NOT NULL, origin_lineage_id uuid, "
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+        )
+    )
+    await session.execute(
+        text(
+            f'INSERT INTO "{live_schema}".reference_family_result_generation '
+            "(importer_id, local_lineage_id, local_generation) "
+            "VALUES ('places-zcta', :lineage_id, 0)"
+        ),
+        {"lineage_id": uuid4()},
+    )
+    return await result_generation.publish_local_reference_family_generation(
+        session,
+        importer_id="places-zcta",
+        schema_name=live_schema,
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically():
+    """Keep serving OIDs and adopted origin in the same activation transaction."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema, unrelated_schema = f"rf_auto_{token}", f"rf_auto_keep_{token}"
+    dataset_id, package_id = uuid4(), "c" * 64
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
+        ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+        async with sessions() as session, session.begin():
+            initial = await _install_places_generation_authority(session, live_schema)
+        source_generation = {
+            "origin_lineage_id": initial.local_lineage_id,
+            "origin_generation": 2,
+            "published_at": "2026-09-14T10:00:00Z",
+        }
+        async with sessions() as session:
+            transaction = await session.begin()
+            await archive.activate_validated_reference_family_stage(
+                session,
+                ownership=ownership,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                validation_receipt=validation,
+                cutover=archive.ReferenceFamilyCutoverAuthority(
+                    package_id,
+                    archive.CONTRACT,
+                    sealed_owner_oid,
+                    sealed_owner_oid,
+                    "automatic",
+                    source_generation,
+                ),
+            )
+            adopted = await result_generation.read_reference_family_result_generation_authority(
+                session,
+                importer_id="places-zcta",
+                schema_name=live_schema,
+            )
+            assert adopted.local_generation == 1
+            assert adopted.serving_generation.origin_generation == 2
+            assert adopted.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+            await transaction.rollback()
+        async with sessions() as session, session.begin():
+            rolled_back = await result_generation.read_reference_family_result_generation_authority(
+                session,
+                importer_id="places-zcta",
+                schema_name=live_schema,
+            )
+            assert rolled_back == initial
+            assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema})
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (stage_schema, live_schema, unrelated_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

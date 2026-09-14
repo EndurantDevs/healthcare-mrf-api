@@ -1,0 +1,387 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Durable generation authority for closed reference replacement families."""
+
+from __future__ import annotations
+
+import datetime
+import re
+from dataclasses import dataclass
+from typing import Any, Mapping
+from uuid import UUID
+
+from sqlalchemy import text
+
+
+TABLE_NAME = "reference_family_result_generation"
+RELATION_NAMES_BY_IMPORTER = {
+    "plan-attributes": (
+        "plan_attributes",
+        "plan_prices",
+        "plan_rating_areas",
+        "plan_benefits",
+    ),
+    "places-zcta": ("pricing_places_zcta",),
+    "lodes": ("lodes_workplace_aggregate",),
+    "medicare-enrollment": (
+        "medicare_enrollment_county_stats",
+        "medicare_enrollment_stats",
+    ),
+}
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_MAX_GENERATION = (1 << 63) - 1
+_MAX_OID = (1 << 32) - 1
+
+
+@dataclass(frozen=True)
+class ReferenceFamilyServingGeneration:
+    """Portable origin identity for one published family generation."""
+
+    origin_lineage_id: str
+    origin_generation: int
+    published_at: datetime.datetime
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "origin_lineage_id": self.origin_lineage_id,
+            "origin_generation": self.origin_generation,
+            "published_at": _timestamp_text(self.published_at),
+        }
+
+
+@dataclass(frozen=True)
+class ReferenceFamilyResultGenerationAuthority:
+    """Destination-local counter and the origin currently served by exact OIDs."""
+
+    importer_id: str
+    local_lineage_id: str
+    local_generation: int
+    serving_generation: ReferenceFamilyServingGeneration | None
+    relation_oids: tuple[int, ...] | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "importer_id": self.importer_id,
+            "local_lineage_id": self.local_lineage_id,
+            "local_generation": self.local_generation,
+            "serving_generation": (None if self.serving_generation is None else self.serving_generation.as_dict()),
+            "relation_oids": None if self.relation_oids is None else list(self.relation_oids),
+        }
+
+
+def _importer_id(value: object) -> str:
+    if not isinstance(value, str) or value not in RELATION_NAMES_BY_IMPORTER:
+        raise ValueError("reference family result generation importer is invalid")
+    return value
+
+
+def _schema_name(value: object) -> str:
+    normalized = str(value or "").strip()
+    if not _IDENTIFIER.fullmatch(normalized) or len(normalized.encode("utf-8")) > 63:
+        raise ValueError("reference family result generation schema is invalid")
+    return normalized
+
+
+def _quoted(value: str) -> str:
+    return f'"{value}"'
+
+
+def _uuid_text(value: object) -> str:
+    try:
+        return str(UUID(str(value)))
+    except AttributeError, TypeError, ValueError:
+        raise ValueError("reference family result generation lineage is invalid") from None
+
+
+def _timestamp(value: object) -> datetime.datetime:
+    if isinstance(value, str):
+        try:
+            value = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("reference family publication time is invalid") from None
+    if not isinstance(value, datetime.datetime) or value.tzinfo is None:
+        raise ValueError("reference family publication time is invalid")
+    return value.astimezone(datetime.timezone.utc)
+
+
+def _timestamp_text(value: datetime.datetime) -> str:
+    return _timestamp(value).isoformat().replace("+00:00", "Z")
+
+
+def validate_reference_family_serving_generation(value: object) -> ReferenceFamilyServingGeneration:
+    """Validate one complete portable origin generation."""
+
+    if isinstance(value, ReferenceFamilyServingGeneration):
+        value = value.as_dict()
+    if not isinstance(value, Mapping) or set(value) != {
+        "origin_lineage_id",
+        "origin_generation",
+        "published_at",
+    }:
+        raise ValueError("reference family serving generation is invalid")
+    generation = value["origin_generation"]
+    if type(generation) is not int or not 0 < generation <= _MAX_GENERATION:
+        raise ValueError("reference family serving generation is invalid")
+    return ReferenceFamilyServingGeneration(
+        _uuid_text(value["origin_lineage_id"]),
+        generation,
+        _timestamp(value["published_at"]),
+    )
+
+
+def _relation_oids(importer_id: str, value: object) -> tuple[int, ...]:
+    expected = RELATION_NAMES_BY_IMPORTER[importer_id]
+    if not isinstance(value, (list, tuple)) or len(value) != len(expected):
+        raise ValueError("reference family relation identity is invalid")
+    relation_oids = tuple(value)
+    if any(type(oid) is not int or not 0 < oid <= _MAX_OID for oid in relation_oids) or len(set(relation_oids)) != len(
+        relation_oids
+    ):
+        raise ValueError("reference family relation identity is invalid")
+    return relation_oids
+
+
+def _row_mapping(row: object) -> Mapping[str, Any]:
+    mapping = getattr(row, "_mapping", row)
+    if not isinstance(mapping, Mapping):
+        raise RuntimeError("reference family generation authority is unavailable")
+    return mapping
+
+
+def validate_reference_family_result_generation_authority(
+    authority_row: object,
+) -> ReferenceFamilyResultGenerationAuthority:
+    """Validate one migration-installed family row without inferring legacy history."""
+
+    values = _row_mapping(authority_row)
+    try:
+        importer_id = _importer_id(values.get("importer_id"))
+        local_lineage_id = _uuid_text(values.get("local_lineage_id"))
+    except ValueError as error:
+        raise RuntimeError("reference family generation authority is invalid") from error
+    local_generation = values.get("local_generation")
+    if type(local_generation) is not int or not 0 <= local_generation <= _MAX_GENERATION:
+        raise RuntimeError("reference family local generation is invalid")
+    serving_values = (
+        values.get("origin_lineage_id"),
+        values.get("origin_generation"),
+        values.get("published_at"),
+        values.get("relation_oids"),
+    )
+    if all(value is None for value in serving_values):
+        return ReferenceFamilyResultGenerationAuthority(importer_id, local_lineage_id, local_generation, None, None)
+    if any(value is None for value in serving_values):
+        raise RuntimeError("reference family serving generation is incomplete")
+    try:
+        serving_generation = validate_reference_family_serving_generation(
+            {
+                "origin_lineage_id": values["origin_lineage_id"],
+                "origin_generation": values["origin_generation"],
+                "published_at": values["published_at"],
+            }
+        )
+        relation_oids = _relation_oids(importer_id, values["relation_oids"])
+    except ValueError as error:
+        raise RuntimeError("reference family serving generation is invalid") from error
+    return ReferenceFamilyResultGenerationAuthority(
+        importer_id,
+        local_lineage_id,
+        local_generation,
+        serving_generation,
+        relation_oids,
+    )
+
+
+async def _first(database: Any, statement: Any, **params: Any) -> object | None:
+    if hasattr(database, "first"):
+        return await database.first(statement, **params)
+    return (await database.execute(statement, params)).mappings().one_or_none()
+
+
+async def _all(database: Any, statement: Any, **params: Any) -> list[object]:
+    if hasattr(database, "all"):
+        return list(await database.all(statement, **params))
+    return list((await database.execute(statement, params)).all())
+
+
+def _state_sql(schema_name: str, *, lock: bool) -> str:
+    suffix = " FOR UPDATE" if lock else ""
+    return (
+        "SELECT importer_id, local_lineage_id, local_generation, origin_lineage_id, "
+        "origin_generation, published_at, relation_oids "
+        f"FROM {_quoted(schema_name)}.{_quoted(TABLE_NAME)} "
+        "WHERE importer_id=:importer_id" + suffix
+    )
+
+
+async def read_reference_family_result_generation_authority(
+    database: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+    lock: bool = False,
+) -> ReferenceFamilyResultGenerationAuthority:
+    """Read and optionally lock one closed family authority row."""
+
+    importer = _importer_id(importer_id)
+    schema = _schema_name(schema_name)
+    row = await _first(database, text(_state_sql(schema, lock=lock)), importer_id=importer)
+    if row is None:
+        raise RuntimeError("reference family generation authority is unavailable")
+    return validate_reference_family_result_generation_authority(row)
+
+
+async def current_reference_family_relation_oids(
+    database: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+) -> tuple[int, ...]:
+    """Resolve the fixed canonical family in model order."""
+
+    importer = _importer_id(importer_id)
+    schema = _schema_name(schema_name)
+    relation_names = RELATION_NAMES_BY_IMPORTER[importer]
+    rows = await _all(
+        database,
+        text(
+            "SELECT relation_name, "
+            "to_regclass(format('%I.%I', CAST(:schema_name AS text), relation_name))::oid::bigint "
+            "AS relation_oid FROM unnest(CAST(:relation_names AS text[])) WITH ORDINALITY "
+            "AS relations(relation_name, ordinal) ORDER BY ordinal"
+        ),
+        schema_name=schema,
+        relation_names=list(relation_names),
+    )
+    try:
+        names = tuple(str(row[0]) for row in rows)
+        relation_oids = _relation_oids(importer, tuple(int(row[1]) for row in rows))
+    except IndexError, TypeError, ValueError:
+        raise RuntimeError("reference family serving relations are unavailable") from None
+    if names != relation_names:
+        raise RuntimeError("reference family serving relations are unavailable")
+    return relation_oids
+
+
+async def capture_reference_family_serving_generation(
+    database: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+) -> ReferenceFamilyServingGeneration:
+    """Bind the serving generation to the exact canonical OIDs in this transaction."""
+
+    authority = await read_reference_family_result_generation_authority(
+        database, importer_id=importer_id, schema_name=schema_name
+    )
+    current_oids = await current_reference_family_relation_oids(
+        database, importer_id=importer_id, schema_name=schema_name
+    )
+    if authority.serving_generation is None or authority.relation_oids != current_oids:
+        raise RuntimeError("reference family serving generation is unavailable or drifted")
+    return authority.serving_generation
+
+
+async def publish_local_reference_family_generation(
+    database: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+) -> ReferenceFamilyResultGenerationAuthority:
+    """Advance one local generation inside the ordinary publication transaction."""
+
+    importer = _importer_id(importer_id)
+    schema = _schema_name(schema_name)
+    current = await read_reference_family_result_generation_authority(
+        database, importer_id=importer, schema_name=schema, lock=True
+    )
+    if current.local_generation >= _MAX_GENERATION:
+        raise RuntimeError("reference family local generation is exhausted")
+    relation_oids = await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
+    next_generation = current.local_generation + 1
+    updated = await _first(
+        database,
+        text(
+            f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
+            "local_generation=:next_generation, origin_lineage_id=local_lineage_id, "
+            "origin_generation=:next_generation, published_at=clock_timestamp(), "
+            "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
+            "RETURNING importer_id, local_lineage_id, local_generation, origin_lineage_id, "
+            "origin_generation, published_at, relation_oids"
+        ),
+        importer_id=importer,
+        next_generation=next_generation,
+        relation_oids=list(relation_oids),
+    )
+    if updated is None:
+        raise RuntimeError("reference family generation authority is unavailable")
+    return validate_reference_family_result_generation_authority(updated)
+
+
+async def publish_adopted_reference_family_generation(
+    database: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+    source_generation: Mapping[str, Any] | ReferenceFamilyServingGeneration,
+) -> ReferenceFamilyResultGenerationAuthority:
+    """Preserve a source origin while recording destination-local serving OIDs."""
+
+    importer = _importer_id(importer_id)
+    schema = _schema_name(schema_name)
+    source = validate_reference_family_serving_generation(source_generation)
+    current = await read_reference_family_result_generation_authority(
+        database, importer_id=importer, schema_name=schema, lock=True
+    )
+    relation_oids = await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
+    updated = await _first(
+        database,
+        text(
+            f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
+            "origin_lineage_id=CAST(:origin_lineage_id AS uuid), "
+            "origin_generation=:origin_generation, published_at=CAST(:published_at AS timestamptz), "
+            "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
+            "RETURNING importer_id, local_lineage_id, local_generation, origin_lineage_id, "
+            "origin_generation, published_at, relation_oids"
+        ),
+        importer_id=importer,
+        origin_lineage_id=source.origin_lineage_id,
+        origin_generation=source.origin_generation,
+        published_at=source.published_at,
+        relation_oids=list(relation_oids),
+    )
+    if updated is None:
+        raise RuntimeError("reference family generation authority is unavailable")
+    result = validate_reference_family_result_generation_authority(updated)
+    if result.local_lineage_id != current.local_lineage_id or result.local_generation != current.local_generation:
+        raise RuntimeError("reference family local generation changed during adoption")
+    return result
+
+
+def require_reference_family_automatic_generation_order(candidate: object, incumbent: object) -> None:
+    """Require a strictly newer generation from the same known origin lineage."""
+
+    if candidate is None or incumbent is None:
+        raise ValueError("automatic reference family generation order is unavailable")
+    candidate_generation = validate_reference_family_serving_generation(candidate)
+    incumbent_generation = validate_reference_family_serving_generation(incumbent)
+    if (
+        candidate_generation.origin_lineage_id != incumbent_generation.origin_lineage_id
+        or candidate_generation.origin_generation <= incumbent_generation.origin_generation
+    ):
+        raise ValueError("automatic reference family generation order is unsupported")
+
+
+__all__ = [
+    "RELATION_NAMES_BY_IMPORTER",
+    "ReferenceFamilyResultGenerationAuthority",
+    "ReferenceFamilyServingGeneration",
+    "capture_reference_family_serving_generation",
+    "current_reference_family_relation_oids",
+    "publish_adopted_reference_family_generation",
+    "publish_local_reference_family_generation",
+    "read_reference_family_result_generation_authority",
+    "require_reference_family_automatic_generation_order",
+    "validate_reference_family_result_generation_authority",
+    "validate_reference_family_serving_generation",
+]

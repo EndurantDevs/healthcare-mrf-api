@@ -13,12 +13,13 @@ from collections import defaultdict
 from arq import create_pool
 from sqlalchemy import and_, select
 
-from db.models import (GeoZipLookup, MedicareEnrollmentCountyStats,
-                       MedicareEnrollmentStats, db)
+from db.models import GeoZipLookup, MedicareEnrollmentCountyStats, MedicareEnrollmentStats, db
 from process.control_lifecycle import mark_control_run
-from process.ext.utils import (ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects)
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import (
+    publish_local_reference_family_generation,
+)
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -92,9 +93,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(
-            await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
-        )
+        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -127,7 +126,7 @@ def _to_int(raw) -> int:
         return 0
     try:
         return int(float(text))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -200,20 +199,21 @@ def _allocate_by_weights(total: int, zip_weights: list[tuple[str, int]]) -> dict
 
 
 async def _has_geo_zip_lookup_table(db_schema: str) -> bool:
-    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"))
+    return bool(
+        await db.scalar(
+            "SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"
+        )
+    )
 
 
 _geo_zip_lookup_exists = _has_geo_zip_lookup_table
 
 
 async def _load_county_zip_weight_rows():
-    stmt = (
-        select(GeoZipLookup.county_code, GeoZipLookup.zip_code, GeoZipLookup.population)
-        .where(
-            and_(
-                GeoZipLookup.county_code.isnot(None),
-                GeoZipLookup.zip_code.isnot(None),
-            )
+    stmt = select(GeoZipLookup.county_code, GeoZipLookup.zip_code, GeoZipLookup.population).where(
+        and_(
+            GeoZipLookup.county_code.isnot(None),
+            GeoZipLookup.zip_code.isnot(None),
         )
     )
     return await db.all(stmt)
@@ -229,7 +229,10 @@ async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list
         try:
             await db.connect()
             if not await _has_geo_zip_lookup_table(db_schema):
-                logger.info("Medicare Enrollment test mode: %s.geo_zip_lookup is unavailable; ZIP allocation will be empty.", db_schema)
+                logger.info(
+                    "Medicare Enrollment test mode: %s.geo_zip_lookup is unavailable; ZIP allocation will be empty.",
+                    db_schema,
+                )
                 county_zip_rows = []
             else:
                 county_zip_rows = await _load_county_zip_weight_rows()
@@ -246,33 +249,25 @@ async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list
             continue
         try:
             population = int(getattr(county_zip_row, "population") or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             population = 0
         existing = mapping[county_code].get(zip_code, 0)
         mapping[county_code][zip_code] = max(existing, population)
 
-    return {
-        county_code: sorted(zip_weights.items())
-        for county_code, zip_weights in mapping.items()
-    }
+    return {county_code: sorted(zip_weights.items()) for county_code, zip_weights in mapping.items()}
 
 
 async def _publish_stage_table(db_schema: str, model_cls, stage_cls) -> None:
     table = model_cls.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-    await db.status(
-        f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-    )
+    await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
     archived = _archived_identifier(f"{table}_idx_primary")
     await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+    await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
     await db.status(
-        f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-    )
-    await db.status(
-        f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-        f"RENAME TO {table}_idx_primary;"
+        f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
     )
 
     if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
@@ -281,10 +276,7 @@ async def _publish_stage_table(db_schema: str, model_cls, stage_cls) -> None:
             old_live_name = f"{table}_idx_{index_name}"
             archived_live_name = _archived_identifier(old_live_name)
             await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-            await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                f"RENAME TO {archived_live_name};"
-            )
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
             await db.status(
                 f"ALTER INDEX IF EXISTS "
                 f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
@@ -340,19 +332,13 @@ async def _fetch_county_enrollment(
         )
         async with client.get(f"{api_url}?{query}", timeout=60) as response:
             if response.status != 200:
-                raise ValueError(
-                    "Medicare Monthly Enrollment API returned "
-                    f"HTTP {response.status} at offset {offset}"
-                )
+                raise ValueError(f"Medicare Monthly Enrollment API returned HTTP {response.status} at offset {offset}")
             enrollment_rows = await response.json(content_type=None)
         if not enrollment_rows:
             return enrollment_by_county
         for enrollment_row in enrollment_rows:
             _merge_county_enrollment(enrollment_by_county, enrollment_row)
-            if (
-                test_row_limit is not None
-                and len(enrollment_by_county) >= test_row_limit
-            ):
+            if test_row_limit is not None and len(enrollment_by_county) >= test_row_limit:
                 return enrollment_by_county
         offset += len(enrollment_rows)
 
@@ -367,17 +353,11 @@ def _county_rows(
         {
             "county_fips": county_fips,
             "year": year,
-            "part_d_beneficiaries": int(
-                county_totals.get("part_d_beneficiaries", 0) or 0
-            ),
-            "total_beneficiaries": int(
-                county_totals.get("total_beneficiaries", 0) or 0
-            ),
+            "part_d_beneficiaries": int(county_totals.get("part_d_beneficiaries", 0) or 0),
+            "total_beneficiaries": int(county_totals.get("total_beneficiaries", 0) or 0),
             "updated_at": updated_at,
         }
-        for (county_fips, year), county_totals in sorted(
-            enrollment_by_county.items()
-        )
+        for (county_fips, year), county_totals in sorted(enrollment_by_county.items())
     ]
 
 
@@ -397,12 +377,8 @@ def _zip_rows(
         if not zip_weights:
             unmatched_counties += 1
             continue
-        total_by_zip = _allocate_by_weights(
-            county_row["total_beneficiaries"], zip_weights
-        )
-        part_d_by_zip = _allocate_by_weights(
-            county_row["part_d_beneficiaries"], zip_weights
-        )
+        total_by_zip = _allocate_by_weights(county_row["total_beneficiaries"], zip_weights)
+        part_d_by_zip = _allocate_by_weights(county_row["part_d_beneficiaries"], zip_weights)
         for zip_code, total_value in total_by_zip.items():
             totals = totals_by_zip[(zip_code, county_row["year"])]
             totals["total_beneficiaries"] += total_value
@@ -422,7 +398,7 @@ def _zip_rows(
 
 async def _push_batches(rows: list[dict], batch_size: int, stage_cls) -> None:
     for start in range(0, len(rows), batch_size):
-        await push_objects(rows[start:start + batch_size], stage_cls)
+        await push_objects(rows[start : start + batch_size], stage_cls)
 
 
 async def process_medicare_enrollment_data(ctx, task=None):
@@ -442,6 +418,7 @@ async def process_medicare_enrollment_data(ctx, task=None):
     row_limit = int(os.getenv("HLTHPRT_MEDICARE_ENROLLMENT_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
 
     import aiohttp
+
     client = aiohttp.ClientSession()
     try:
         api_url = await _resolve_enrollment_api_url(client)
@@ -530,12 +507,8 @@ async def _validate_medicare_enrollment_stage_counts(
     context: dict,
 ) -> tuple[int, int, int, float]:
     """Count staged rows and reject incomplete production generations."""
-    county_stage_rows = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{county_stage_cls.__tablename__};") or 0
-    )
-    zip_stage_rows = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{zip_stage_cls.__tablename__};") or 0
-    )
+    county_stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{county_stage_cls.__tablename__};") or 0)
+    zip_stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{zip_stage_cls.__tablename__};") or 0)
     unmatched_counties = int(context.get("unmatched_counties") or 0)
     county_rows = int(context.get("county_rows") or county_stage_rows or 0)
     unmatched_ratio = (unmatched_counties / county_rows) if county_rows else 0.0
@@ -560,8 +533,7 @@ async def _validate_medicare_enrollment_stage_counts(
         )
     elif zip_stage_rows < DEFAULT_MIN_ZIP_ROWS:
         raise RuntimeError(
-            "Medicare Enrollment ZIP stage row count "
-            f"{zip_stage_rows} below minimum {DEFAULT_MIN_ZIP_ROWS}; aborting."
+            f"Medicare Enrollment ZIP stage row count {zip_stage_rows} below minimum {DEFAULT_MIN_ZIP_ROWS}; aborting."
         )
     elif unmatched_ratio > max_unmatched_ratio:
         raise RuntimeError(
@@ -588,18 +560,26 @@ async def publish_medicare_enrollment_generation(ctx):
     county_stage_cls = make_class(MedicareEnrollmentCountyStats, import_date)
     zip_stage_cls = make_class(MedicareEnrollmentStats, import_date)
 
-    county_stage_rows, zip_stage_rows, unmatched_counties, unmatched_ratio = (
-        await _validate_medicare_enrollment_stage_counts(
-            db_schema,
-            county_stage_cls,
-            zip_stage_cls,
-            context,
-        )
+    (
+        county_stage_rows,
+        zip_stage_rows,
+        unmatched_counties,
+        unmatched_ratio,
+    ) = await _validate_medicare_enrollment_stage_counts(
+        db_schema,
+        county_stage_cls,
+        zip_stage_cls,
+        context,
     )
 
     async with db.transaction():
         await _publish_stage_table(db_schema, MedicareEnrollmentCountyStats, county_stage_cls)
         await _publish_stage_table(db_schema, MedicareEnrollmentStats, zip_stage_cls)
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="medicare-enrollment",
+            schema_name=db_schema,
+        )
 
     logger.info(
         "Medicare Enrollment publish complete: county_rows=%d zip_rows=%d unmatched_ratio=%.3f",
