@@ -58,6 +58,7 @@ _MODEL_CLOSURE_TABLES = (
     "ptg2_allowed_amount_payment",
     "ptg2_allowed_amount_provider_payment",
 )
+_SOURCE_AUTHORITY_TABLES = ("ptg2_v3_candidate_audit_attestation",)
 _TAX_SOURCE_REKEYED_TABLES = (
     "ptg2_v4_snapshot_map_pack",
     *adoption._FINALIZER_MAP_TABLES,
@@ -124,7 +125,7 @@ async def _install_model_closure_tables(database: Database, *, schema_name: str)
     """Install current model columns for logical evidence outside layout rekeying."""
 
     metadata = MetaData(schema=schema_name)
-    for table_name in _MODEL_CLOSURE_TABLES:
+    for table_name in (*_MODEL_CLOSURE_TABLES, *_SOURCE_AUTHORITY_TABLES):
         source_table = Base.metadata.tables[f"mrf.{table_name}"]
         target_table = source_table.to_metadata(metadata, schema=schema_name)
         statement = str(
@@ -196,6 +197,11 @@ async def _seed_logical_closure_dependencies(
         source_snapshot_key=source_snapshot_key,
     )
     await _seed_source_audit_witness(
+        database,
+        schema=schema,
+        source_snapshot_key=source_snapshot_key,
+    )
+    await _seed_source_attestation(
         database,
         schema=schema,
         source_snapshot_key=source_snapshot_key,
@@ -299,6 +305,37 @@ async def _seed_source_audit_witness(
         )
 
 
+async def _seed_source_attestation(
+    database: Database,
+    *,
+    schema: str,
+    source_snapshot_key: int,
+) -> None:
+    """Seed source authority that must never be adopted by the destination."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_candidate_audit_attestation
+            (snapshot_id, snapshot_key, source_key, plan_id, plan_market_type,
+             coverage_scope_id, source_set_digest, audit_sample_digest,
+             contract, tool_name, tool_version, report_digest, report,
+             activation_intent, attestation_digest, attested_at, expires_at)
+        VALUES
+            ('staged-snapshot', :snapshot_key, 'source-key', 'plan-a',
+             'market-a', :coverage_scope_id, :source_set_digest,
+             :audit_sample_digest, 'ptg2_candidate_audit_attestation_v4',
+             'source-auditor', '1', :report_digest, '{{}}'::jsonb,
+             'audit_only', :attestation_digest, now(), now() + interval '1 hour')
+        """,
+        snapshot_key=source_snapshot_key,
+        coverage_scope_id=b"c" * 32,
+        source_set_digest=b"s" * 32,
+        audit_sample_digest=b"a" * 32,
+        report_digest=b"r" * 32,
+        attestation_digest=b"t" * 32,
+    )
+
+
 async def _seed_allowed_amount_rows(database: Database, *, schema: str) -> None:
     """Seed the four selected and unrelated allowed-amount evidence tables."""
 
@@ -361,6 +398,13 @@ async def _seed_preparation_catalog(
     finally:
         compilation.cleanup()
     schema = _quoted(schema_name)
+    await database.status(
+        f"UPDATE {schema}.ptg2_v3_snapshot_layout SET layout_manifest = "
+        "jsonb_set(layout_manifest, '{serving_index,shared_snapshot_key}', "
+        "to_jsonb(CAST(:snapshot_key AS bigint))) "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=sealed.snapshot_key,
+    )
     await _create_destination_snapshot_table(database, schema)
     await _install_finalizer_map_tables(database, schema_name=schema_name, monkeypatch=monkeypatch)
     await database.status(
@@ -472,6 +516,7 @@ async def _publish_tax_source_layout(
         tax_identity_source_artifacts=fixture.tax_sources,
     )
     layout_manifest = v4_e2e._base_layout_manifest(dict(publication.adaptive_layout))
+    layout_manifest["serving_index"]["shared_snapshot_key"] = snapshot_key
     provider_graph = layout_manifest["serving_index"]["provider_graph"]
     provider_graph["provider_tax_identity"] = dict(publication.provider_tax_identity)
     provider_graph["provider_tax_identity_source"] = dict(publication.provider_tax_identity_source)
@@ -651,6 +696,18 @@ async def _assert_prepared_destination(
         )
         == 1
     )
+    destination_manifest = await database.scalar(
+        f"SELECT layout_manifest FROM {destination_schema}.ptg2_v3_snapshot_layout "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=prepared.destination_snapshot_key,
+    )
+    source_manifest = await database.scalar(
+        f"SELECT layout_manifest FROM {staging_schema}.ptg2_v3_snapshot_layout "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=source_snapshot_key,
+    )
+    assert source_manifest["serving_index"]["shared_snapshot_key"] == source_snapshot_key
+    assert destination_manifest["serving_index"]["shared_snapshot_key"] == prepared.destination_snapshot_key
     assert (
         await database.scalar(
             f"SELECT COUNT(*) FROM {destination_schema}.ptg2_v3_block WHERE block_hash IN (SELECT block_hash FROM {staging_schema}.ptg2_v3_block)"
@@ -732,6 +789,11 @@ async def _assert_logical_closure_boundary(
     )
     assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_v3_code WHERE code_key = 8") == 0
     assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_frozen_source_file_binding") == 0
+    await _assert_source_authority_boundary(
+        database,
+        stage=stage,
+        destination=destination,
+    )
     for table_name in _MODEL_CLOSURE_TABLES[1:3]:
         assert (
             await database.scalar(
@@ -754,6 +816,24 @@ async def _assert_logical_closure_boundary(
             )
             == 1
         )
+
+
+async def _assert_source_authority_boundary(
+    database: Database,
+    *,
+    stage: str,
+    destination: str,
+) -> None:
+    """Keep source audit authority outside the destination layout copy."""
+
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {stage}.ptg2_v3_candidate_audit_attestation "
+            "WHERE snapshot_id = 'staged-snapshot'"
+        )
+        == 1
+    )
+    assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_v3_candidate_audit_attestation") == 0
 
 
 async def _assert_rekeyed_table_contract(

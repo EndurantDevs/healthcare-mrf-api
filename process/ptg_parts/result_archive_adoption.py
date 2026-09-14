@@ -181,17 +181,27 @@ def _remapped_layout_manifest(
     source_snapshot_key: int,
     destination_snapshot_key: int,
 ) -> Mapping[str, Any]:
-    """Rekey only the local tax-identity receipt nested in a sealed manifest."""
+    """Rekey destination-local serving and tax-identity coordinates."""
 
     manifest_by_field = dict(layout_manifest)
     serving_index = manifest_by_field.get("serving_index")
     if not isinstance(serving_index, Mapping):
         return manifest_by_field
+    if serving_index.get("shared_snapshot_key") != source_snapshot_key:
+        raise ResultArchiveAdoptionError(
+            "archive adoption serving index has the wrong snapshot key"
+        )
+    remapped_serving_index = {
+        **serving_index,
+        "shared_snapshot_key": destination_snapshot_key,
+    }
     provider_graph = serving_index.get("provider_graph")
     if not isinstance(provider_graph, Mapping):
+        manifest_by_field["serving_index"] = remapped_serving_index
         return manifest_by_field
     tax_identity = provider_graph.get("provider_tax_identity")
     if not isinstance(tax_identity, Mapping):
+        manifest_by_field["serving_index"] = remapped_serving_index
         return manifest_by_field
     tax_snapshot_key = tax_identity.get("snapshot_key")
     if tax_snapshot_key != source_snapshot_key:
@@ -202,7 +212,7 @@ def _remapped_layout_manifest(
         "snapshot_key": destination_snapshot_key,
     }
     manifest_by_field["serving_index"] = {
-        **serving_index,
+        **remapped_serving_index,
         "provider_graph": remapped_provider_graph_by_field,
     }
     return manifest_by_field
