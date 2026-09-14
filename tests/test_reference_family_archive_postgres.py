@@ -45,6 +45,21 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
         await session.execute(text(ddl))
         for index in getattr(model_type, "__my_additional_indexes__", ()) or ():
             await session.execute(text(archive._additional_index_sql(schema_name, model_type, index)))
+    await session.execute(
+        text(
+            f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
+            "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
+            "local_generation bigint NOT NULL, origin_lineage_id uuid, "
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+        )
+    )
+    await session.execute(
+        text(
+            f'INSERT INTO "{schema_name}".reference_family_result_generation '
+            "(importer_id, local_lineage_id, local_generation) VALUES (:importer_id, :lineage_id, 0)"
+        ),
+        {"importer_id": importer_id, "lineage_id": uuid4()},
+    )
 
 
 async def _manifest(sessions, importer_id: str, schema_name: str):
@@ -215,9 +230,21 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
         await engine.dispose()
 
 
-async def _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id):
+async def _validated_places_candidate(
+    sessions,
+    live_schema,
+    unrelated_schema,
+    dataset_id,
+    package_id,
+    *,
+    populated=True,
+):
     async with sessions() as session, session.begin():
-        await _create_places_fixture(session, live_schema, unrelated_schema)
+        if populated:
+            await _create_places_fixture(session, live_schema, unrelated_schema)
+        else:
+            await _create_live_family(session, "places-zcta", live_schema)
+            await session.execute(text(f'CREATE SCHEMA "{unrelated_schema}"'))
     manifest = await _manifest(sessions, "places-zcta", live_schema)
     async with sessions() as session, session.begin():
         ownership = await archive.precreate_reference_family_restore(
@@ -238,6 +265,65 @@ async def _validated_places_candidate(sessions, live_schema, unrelated_schema, d
             sealed_owner_oid=sealed_owner_oid,
         )
     return ownership, manifest, incumbent, validation, sealed_owner_oid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("populated", [False, True])
+async def test_automatic_generationless_bootstrap_requires_empty_incumbent(populated):
+    """Only an actually empty legacy family can bootstrap without prior origin."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema, unrelated_schema = f"rf_boot_{token}", f"rf_boot_keep_{token}"
+    dataset_id, package_id = uuid4(), "d" * 64
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        ownership, manifest, incumbent, validation, sealed_owner_oid = await _validated_places_candidate(
+            sessions,
+            live_schema,
+            unrelated_schema,
+            dataset_id,
+            package_id,
+            populated=populated,
+        )
+        cutover = archive.ReferenceFamilyCutoverAuthority(
+            package_id,
+            archive.CONTRACT,
+            sealed_owner_oid,
+            sealed_owner_oid,
+            "automatic",
+            {
+                "origin_lineage_id": str(uuid4()),
+                "origin_generation": 1,
+                "published_at": "2026-09-14T10:00:00Z",
+            },
+        )
+        async with sessions() as session, session.begin():
+            if populated:
+                with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires manual adoption"):
+                    await archive.activate_validated_reference_family_stage(
+                        session,
+                        ownership=ownership,
+                        manifest=manifest,
+                        expected_incumbent=incumbent,
+                        validation_receipt=validation,
+                        cutover=cutover,
+                    )
+            else:
+                await archive.activate_validated_reference_family_stage(
+                    session,
+                    ownership=ownership,
+                    manifest=manifest,
+                    expected_incumbent=incumbent,
+                    validation_receipt=validation,
+                    cutover=cutover,
+                )
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (stage_schema, live_schema, unrelated_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
 
 
 async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
@@ -271,6 +357,12 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
         raise AssertionError("short activation recounted the stage")
 
     monkeypatch.setattr(archive, "_validate_stage_manifest", reject_recount)
+    async with sessions() as session, session.begin():
+        initial_generation = await result_generation.publish_local_reference_family_generation(
+            session,
+            importer_id=ownership.importer_id,
+            schema_name=incumbent.schema_name,
+        )
     async with sessions() as session:
         transaction = await session.begin()
         receipt = await archive.activate_validated_reference_family_stage(
@@ -284,7 +376,23 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
             ),
         )
         assert receipt.tables == manifest.tables
+        cleared = await result_generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id=ownership.importer_id,
+            schema_name=incumbent.schema_name,
+        )
+        assert cleared.local_generation == initial_generation.local_generation
+        assert cleared.serving_generation is None
+        assert cleared.relation_oids is None
         await transaction.rollback()
+    async with sessions() as session, session.begin():
+        assert (
+            await result_generation.read_reference_family_result_generation_authority(
+                session,
+                importer_id=ownership.importer_id,
+                schema_name=incumbent.schema_name,
+            )
+        ) == initial_generation
 
 
 async def _replace_incumbent_and_reject(sessions, live_schema, candidate, package_id):
@@ -315,22 +423,6 @@ async def _replace_incumbent_and_reject(sessions, live_schema, candidate, packag
 
 
 async def _install_places_generation_authority(session, live_schema: str):
-    await session.execute(
-        text(
-            f'CREATE TABLE "{live_schema}".reference_family_result_generation ('
-            "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
-            "local_generation bigint NOT NULL, origin_lineage_id uuid, "
-            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
-        )
-    )
-    await session.execute(
-        text(
-            f'INSERT INTO "{live_schema}".reference_family_result_generation '
-            "(importer_id, local_lineage_id, local_generation) "
-            "VALUES ('places-zcta', :lineage_id, 0)"
-        ),
-        {"lineage_id": uuid4()},
-    )
     return await result_generation.publish_local_reference_family_generation(
         session,
         importer_id="places-zcta",
@@ -392,6 +484,60 @@ async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically(
             )
             assert rolled_back == initial
             assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema})
+        rejected_generations = (
+            initial.serving_generation.as_dict(),
+            {
+                **source_generation,
+                "origin_lineage_id": str(uuid4()),
+            },
+        )
+        for rejected_generation in rejected_generations:
+            async with sessions() as session, session.begin():
+                with pytest.raises(
+                    archive.ReferenceFamilyArchiveError,
+                    match="stale or unrelated",
+                ):
+                    await archive.activate_validated_reference_family_stage(
+                        session,
+                        ownership=ownership,
+                        manifest=manifest,
+                        expected_incumbent=incumbent,
+                        validation_receipt=validation,
+                        cutover=archive.ReferenceFamilyCutoverAuthority(
+                            package_id,
+                            archive.CONTRACT,
+                            sealed_owner_oid,
+                            sealed_owner_oid,
+                            "automatic",
+                            rejected_generation,
+                        ),
+                    )
+        async with sessions() as session, session.begin():
+            await archive.activate_validated_reference_family_stage(
+                session,
+                ownership=ownership,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                validation_receipt=validation,
+                cutover=archive.ReferenceFamilyCutoverAuthority(
+                    package_id,
+                    archive.CONTRACT,
+                    sealed_owner_oid,
+                    sealed_owner_oid,
+                    "automatic",
+                    source_generation,
+                ),
+            )
+        async with sessions() as session, session.begin():
+            committed = await result_generation.read_reference_family_result_generation_authority(
+                session,
+                importer_id="places-zcta",
+                schema_name=live_schema,
+            )
+            assert committed.local_generation == 1
+            assert committed.serving_generation.origin_generation == 2
+            assert committed.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+            assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
     finally:
         async with engine.begin() as connection:
             for schema_name in (stage_schema, live_schema, unrelated_schema):
@@ -437,6 +583,12 @@ async def _validate_and_change_incumbent(session, owner, manifest, live_schema):
 
 
 async def _activate_then_rollback(sessions, owner, manifest, incumbent, stage_schema: str) -> None:
+    async with sessions() as session, session.begin():
+        initial_generation = await result_generation.publish_local_reference_family_generation(
+            session,
+            importer_id=owner.importer_id,
+            schema_name=incumbent.schema_name,
+        )
     async with sessions() as session:
         transaction = await session.begin()
         receipt = await archive.activate_reference_family_stage(
@@ -448,7 +600,23 @@ async def _activate_then_rollback(sessions, owner, manifest, incumbent, stage_sc
         )
         assert len(receipt.relation_oids) == 2
         assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
+        cleared = await result_generation.read_reference_family_result_generation_authority(
+            session,
+            importer_id=owner.importer_id,
+            schema_name=incumbent.schema_name,
+        )
+        assert cleared.local_generation == initial_generation.local_generation
+        assert cleared.serving_generation is None
+        assert cleared.relation_oids is None
         await transaction.rollback()
+    async with sessions() as session, session.begin():
+        assert (
+            await result_generation.read_reference_family_result_generation_authority(
+                session,
+                importer_id=owner.importer_id,
+                schema_name=incumbent.schema_name,
+            )
+        ) == initial_generation
 
 
 async def _assert_unowned_predecessor_is_preserved(sessions, owner, manifest, incumbent) -> None:

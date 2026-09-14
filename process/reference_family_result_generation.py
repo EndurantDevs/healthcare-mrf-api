@@ -323,17 +323,32 @@ async def publish_adopted_reference_family_generation(
     *,
     importer_id: str,
     schema_name: str,
-    source_generation: Mapping[str, Any] | ReferenceFamilyServingGeneration,
+    source_generation: Mapping[str, Any] | ReferenceFamilyServingGeneration | None,
 ) -> ReferenceFamilyResultGenerationAuthority:
-    """Preserve a source origin while recording destination-local serving OIDs."""
+    """Preserve a source origin or explicitly clear generation-less adoption."""
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
-    source = validate_reference_family_serving_generation(source_generation)
     current = await read_reference_family_result_generation_authority(
         database, importer_id=importer, schema_name=schema, lock=True
     )
-    relation_oids = await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
+    if source_generation is None:
+        update_values = {
+            "origin_lineage_id": None,
+            "origin_generation": None,
+            "published_at": None,
+            "relation_oids": None,
+        }
+    else:
+        source = validate_reference_family_serving_generation(source_generation)
+        update_values = {
+            "origin_lineage_id": source.origin_lineage_id,
+            "origin_generation": source.origin_generation,
+            "published_at": source.published_at,
+            "relation_oids": list(
+                await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
+            ),
+        }
     updated = await _first(
         database,
         text(
@@ -345,10 +360,7 @@ async def publish_adopted_reference_family_generation(
             "origin_generation, published_at, relation_oids"
         ),
         importer_id=importer,
-        origin_lineage_id=source.origin_lineage_id,
-        origin_generation=source.origin_generation,
-        published_at=source.published_at,
-        relation_oids=list(relation_oids),
+        **update_values,
     )
     if updated is None:
         raise RuntimeError("reference family generation authority is unavailable")
