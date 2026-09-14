@@ -158,6 +158,27 @@ def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(
         CustomImportDefinition.from_mapping(raw)
 
 
+def test_stream_record_path_is_limited_to_xml():
+    raw = _raw_definition()
+    raw["streams"][0]["format"] = "xml"
+    with pytest.raises(DefinitionError, match="record_path is required"):
+        CustomImportDefinition.from_mapping(raw)
+
+    raw["streams"][0]["record_path"] = "provider"
+    definition = CustomImportDefinition.from_mapping(raw)
+    assert definition.source_streams[0].record_path == "provider"
+
+    raw = _raw_definition()
+    raw["streams"][0]["record_path"] = "provider"
+    with pytest.raises(DefinitionError, match="only supported for XML"):
+        CustomImportDefinition.from_mapping(raw)
+
+    raw = _raw_definition()
+    raw["streams"][0]["record_path"] = None
+    with pytest.raises(DefinitionError, match="only supported for XML"):
+        CustomImportDefinition.from_mapping(raw)
+
+
 def test_source_tokens_must_be_complete_single_and_shared(definition):
     assert (
         validate_source_snapshot_tokens(

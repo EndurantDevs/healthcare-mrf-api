@@ -237,6 +237,7 @@ class SourceStream:
     format: str
     compression: str
     snapshot_token: str
+    record_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -690,6 +691,8 @@ def _validate_field_identity(
 
 
 def _parse_streams(raw: Any, child_names: set[str]) -> tuple[SourceStream, ...]:
+    """Parse one root source and every declared child source with stable structure."""
+
     streams = tuple(
         _source_stream_from_mapping(raw_stream, ordinal, child_names)
         for ordinal, raw_stream in enumerate(_array(raw, "definition.streams"))
@@ -709,7 +712,15 @@ def _source_stream_from_mapping(
     stream = _mapping(
         raw_stream,
         path,
-        keys={"id", "kind", "child", "format", "compression", "snapshot_token"},
+        keys={
+            "id",
+            "kind",
+            "child",
+            "format",
+            "compression",
+            "snapshot_token",
+            "record_path",
+        },
     )
     kind = _required(stream, "kind", path)
     if kind not in {"root", "child"}:
@@ -725,6 +736,7 @@ def _source_stream_from_mapping(
     compression = _required(stream, "compression", path)
     if format_name not in _FORMATS or compression not in _COMPRESSIONS:
         raise DefinitionError(f"{path} declares an unsupported format or compression")
+    record_path = _parse_stream_record_path(stream, format_name, path)
     return SourceStream(
         stream_id=_identifier(_required(stream, "id", path), f"{path}.id"),
         record_kind=kind,
@@ -734,6 +746,7 @@ def _source_stream_from_mapping(
         snapshot_token=_identifier(
             _required(stream, "snapshot_token", path), f"{path}.snapshot_token"
         ),
+        record_path=record_path,
     )
 
 
@@ -754,6 +767,23 @@ def _validate_stream_coverage(
         raise DefinitionError(
             "v1 requires exactly one root stream and one stream per child collection"
         )
+
+
+def _parse_stream_record_path(
+    stream: Mapping[str, Any],
+    format_name: str,
+    path: str,
+) -> str | None:
+    """Accept a simple record element only for XML source streams."""
+
+    if format_name == "xml":
+        return _identifier(
+            _required(stream, "record_path", path),
+            f"{path}.record_path",
+        )
+    if "record_path" in stream:
+        raise DefinitionError(f"{path}.record_path is only supported for XML streams")
+    return None
 
 
 def _parse_aliases(
