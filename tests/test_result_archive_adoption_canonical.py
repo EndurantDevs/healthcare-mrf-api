@@ -19,9 +19,10 @@ async def test_new_reservation_authenticates_different_canonical_seal_key(monkey
     calls = []
     reserved_manifest_by_field = {
         "serving_index": {
+            "shared_snapshot_key": 41,
             "provider_graph": {
                 "provider_tax_identity": {"snapshot_key": 41},
-            }
+            },
         }
     }
 
@@ -35,6 +36,7 @@ async def test_new_reservation_authenticates_different_canonical_seal_key(monkey
     async def authenticate_layout(*_args, **kwargs):
         calls.append("authenticate")
         assert kwargs["destination_snapshot_key"] == 99
+        assert kwargs["layout_manifest"]["serving_index"]["shared_snapshot_key"] == 99
         assert (
             kwargs["layout_manifest"]["serving_index"]["provider_graph"]["provider_tax_identity"]["snapshot_key"] == 99
         )
@@ -62,6 +64,7 @@ async def test_new_reservation_authenticates_different_canonical_seal_key(monkey
 
     assert prepared == "prepared"
     assert calls == ["prepare", "authenticate", "bind"]
+    assert reserved_manifest_by_field["serving_index"]["shared_snapshot_key"] == 41
 
 
 @pytest.mark.asyncio
