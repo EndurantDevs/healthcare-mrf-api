@@ -56,6 +56,7 @@ _REKEYED_TABLES = (
     "ptg2_v4_provider_set_npi_prefix",
     "ptg2_v4_provider_graph_diagnostic",
     "ptg2_v4_inferred_taxonomy_candidate",
+    "ptg2_v3_audit_occurrence",
     "ptg2_v3_source_audit_witness",
     "ptg2_v3_source_audit_witness_part",
     "ptg2_provider_tax_identity_manifest",
