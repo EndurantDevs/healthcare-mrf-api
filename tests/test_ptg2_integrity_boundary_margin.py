@@ -110,6 +110,17 @@ def test_source_url_normalization_requires_complete_asr_coordinates():
     )
 
 
+def test_source_url_normalization_repairs_healthsparq_leading_path_slashes():
+    malformed = "https://mrf.healthsparq.com//rates/file.json.gz?token=value"
+
+    assert canonical.normalize_tic_source_url(malformed) == (
+        "https://mrf.healthsparq.com/rates/file.json.gz?token=value"
+    )
+    assert canonical.normalize_tic_source_url(
+        "https://example.test//rates/file.json.gz?token=value"
+    ) == "https://example.test//rates/file.json.gz?token=value"
+
+
 def test_bounded_reader_enforces_zero_read_readall_and_readinto_contracts():
     """Every read shape must share the same decompressed-byte limit."""
 
