@@ -85,6 +85,62 @@ async def _assert_cancelled_export_cleanup(sessions, live_schema: str, unrelated
         assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
 
 
+async def _assert_prepared_source_reuse(sessions, live_schema: str) -> None:
+    dataset_id = uuid4()
+    recorded = []
+
+    async def persist(_session, prepared):
+        recorded.append(prepared)
+
+    prepared = await archive.prepare_reference_family_archive_source(
+        sessions,
+        importer_id="places-zcta",
+        schema_name=live_schema,
+        source_metadata={"run_id": "synthetic-prepare"},
+        dataset_id=dataset_id,
+        on_prepared=persist,
+    )
+    assert recorded == [prepared]
+    async with sessions() as session, session.begin():
+        await session.execute(text(f'UPDATE "{live_schema}".pricing_places_zcta SET measure_name=\'new-live\''))
+    captures = []
+
+    async def copy(capture):
+        captures.append(capture)
+
+    try:
+        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
+        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
+        assert [capture.manifest for capture in captures] == [prepared.manifest, prepared.manifest]
+        assert all(capture.ownership == prepared.ownership for capture in captures)
+        assert prepared.manifest.tables[0].row_count == 1
+    finally:
+        async with sessions() as session, session.begin():
+            await archive.cleanup_reference_family_stage(session, prepared.ownership)
+
+
+async def _assert_prepare_callback_rollback(sessions, live_schema: str) -> None:
+    dataset_id = uuid4()
+
+    async def reject(_session, _prepared):
+        raise RuntimeError("synthetic persistence failure")
+
+    with pytest.raises(RuntimeError, match="persistence failure"):
+        await archive.prepare_reference_family_archive_source(
+            sessions,
+            importer_id="places-zcta",
+            schema_name=live_schema,
+            source_metadata={"run_id": "synthetic-rollback"},
+            dataset_id=dataset_id,
+            on_prepared=reject,
+        )
+    async with sessions() as session, session.begin():
+        assert await session.scalar(
+            text("SELECT to_regnamespace(:schema)"),
+            {"schema": archive.reference_family_stage_schema(dataset_id)},
+        ) is None
+
+
 async def _create_places_fixture(session, live_schema: str, unrelated_schema: str) -> None:
     await _create_live_family(session, "places-zcta", live_schema)
     await session.execute(text(f'CREATE SCHEMA "{unrelated_schema}"'))
@@ -113,6 +169,8 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
     try:
         async with sessions() as session, session.begin():
             await _create_places_fixture(session, live_schema, unrelated_schema)
+        await _assert_prepare_callback_rollback(sessions, live_schema)
+        await _assert_prepared_source_reuse(sessions, live_schema)
         await _assert_cancelled_export_cleanup(sessions, live_schema, unrelated_schema)
         manifest = await _manifest(sessions, "places-zcta", live_schema)
         async with sessions() as session, session.begin():
