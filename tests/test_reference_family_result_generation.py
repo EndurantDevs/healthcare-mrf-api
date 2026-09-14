@@ -21,6 +21,21 @@ def _serving(lineage: str, value: int):
 
 def test_closed_relation_families_are_ordered_and_distinct():
     assert generation.RELATION_NAMES_BY_IMPORTER == {
+        "mrf": (
+            "issuer",
+            "plan",
+            "plan_formulary",
+            "plan_benefits_marketplace",
+            "plan_transparency",
+            "plan_drug_raw",
+            "plan_drug_stats",
+            "plan_drug_tier_stats",
+            "log",
+            "plan_npi_raw",
+            "plan_networktier",
+            "mrf_address",
+            "mrf_address_evidence",
+        ),
         "plan-attributes": (
             "plan_attributes",
             "plan_prices",

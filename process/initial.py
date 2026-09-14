@@ -50,6 +50,7 @@ from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
 from process.plan_summary import rebuild_plan_search_summary
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.ptg_parts.copy_load import _copy_ignore_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -63,6 +64,21 @@ TEST_PLAN_RECORDS = 30
 TEST_PROVIDER_RECORDS = 60
 TEST_DRUG_RECORDS = 60
 TEST_MIN_PLAN_COUNT = 1
+_MRF_PUBLICATION_MODELS = (
+    Issuer,
+    Plan,
+    PlanFormulary,
+    PlanBenefitsMarketplace,
+    PlanTransparency,
+    PlanDrugRaw,
+    PlanDrugStats,
+    PlanDrugTierStats,
+    ImportLog,
+    PlanNPIRaw,
+    PlanNetworkTierRaw,
+    MRFAddress,
+    MRFAddressEvidence,
+)
 
 PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 
@@ -3305,6 +3321,58 @@ async def startup(ctx):
         ctx["context"]["import_date"] = datetime.datetime.utcnow().strftime("%Y%m%d")
 
 
+async def _publish_mrf_table_generation(import_date: str, db_schema: str) -> None:
+    """Rotate the closed MRF family and record its generation atomically."""
+
+    staging_tables_by_main_name = {}
+    async with db.transaction():
+        for cls in _MRF_PUBLICATION_MODELS:
+            staging_tables_by_main_name[cls.__main_table__] = make_class(
+                cls, import_date, schema_override=db_schema
+            )
+            staging_cls = staging_tables_by_main_name[cls.__main_table__]
+            table = staging_cls.__main_table__
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{staging_cls.__tablename__} RENAME TO {table};"
+            )
+
+            await db.status(
+                f"ALTER INDEX IF EXISTS "
+                f"{db_schema}.{table}_idx_primary RENAME TO {table}_idx_primary_old;"
+            )
+            await db.status(
+                f"ALTER INDEX IF EXISTS "
+                f"{db_schema}.{staging_cls.__tablename__}_idx_primary RENAME TO "
+                f"{table}_idx_primary;"
+            )
+
+            if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
+                move_indexes = []
+                if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                    move_indexes += list(cls.__my_initial_indexes__)
+                if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
+                    move_indexes += list(cls.__my_additional_indexes__)
+                for index in move_indexes:
+                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{table}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name}_old;"
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name};"
+                    )
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="mrf",
+            schema_name=db_schema,
+        )
+
+
 async def publish_initial_generation(ctx, task):
     """
     The shutdown function is called after the import process has completed.
@@ -3570,63 +3638,8 @@ async def publish_initial_generation(ctx, task):
     await db.status(f"ANALYZE {db_schema}.{mrf_evidence_stage.__tablename__};")
     record_finalize_phase("mrf_serving_indexes", serving_indexes_started)
 
-    staging_tables_by_main_name = {}
     publication_started = time.monotonic()
-    async with db.transaction():
-        for cls in (
-            Issuer,
-            Plan,
-            PlanFormulary,
-            PlanBenefitsMarketplace,
-            PlanTransparency,
-            PlanDrugRaw,
-            PlanDrugStats,
-            PlanDrugTierStats,
-            ImportLog,
-            PlanNPIRaw,
-            PlanNetworkTierRaw,
-            MRFAddress,
-            MRFAddressEvidence,
-        ):
-            staging_tables_by_main_name[cls.__main_table__] = make_class(
-                cls, import_date, schema_override=db_schema
-            )
-            staging_cls = staging_tables_by_main_name[cls.__main_table__]
-            table = staging_cls.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{staging_cls.__tablename__} RENAME TO {table};"
-            )
-
-            await db.status(
-                f"ALTER INDEX IF EXISTS " f"{db_schema}.{table}_idx_primary RENAME TO " f"{table}_idx_primary_old;"
-            )
-
-            await db.status(
-                f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{staging_cls.__tablename__}_idx_primary RENAME TO "
-                f"{table}_idx_primary;"
-            )
-
-            if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
-                move_indexes = []
-                if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
-                    move_indexes += list(cls.__my_initial_indexes__)
-                if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
-                    move_indexes += list(cls.__my_additional_indexes__)
-                for index in move_indexes:
-                    index_name = index.get("name", "_".join(index.get("index_elements")))
-                    await db.status(
-                        f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{table}_idx_{index_name} RENAME TO "
-                        f"{table}_idx_{index_name}_old;"
-                    )
-                    await db.status(
-                        f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
-                        f"{table}_idx_{index_name};"
-                    )
+    await _publish_mrf_table_generation(import_date, db_schema)
     record_finalize_phase("mrf_table_publication", publication_started)
 
     upsert_history = (

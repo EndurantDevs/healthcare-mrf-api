@@ -1,10 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Closed native archive mechanics for replacement-style reference families.
 
-This module does not register importers or infer publication authority.  It
-only pins, clones, validates, and manually activates four reviewed model
-families.  The caller owns native ``pg_dump``/``pg_restore`` execution and the
-transaction that makes a validated stage live.
+This module does not register importers or infer publication authority. It
+only pins, clones, validates, and activates reviewed replacement families. The
+caller owns native ``pg_dump``/``pg_restore`` execution and the transaction
+that makes a validated stage live.
 """
 
 from __future__ import annotations
@@ -123,6 +123,7 @@ class ReferenceFamilyStageOwnership:
     schema_name: str
     schema_oid: int
     relation_oids: tuple[tuple[str, int], ...]
+    sequence_oids: tuple[tuple[str, int, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,24 @@ _SPECS = {
             "plan-attributes",
             (models.PlanAttributes, models.PlanPrices, models.PlanRatingAreas, models.PlanBenefits),
         ),
+        ReferenceFamilySpec(
+            "mrf",
+            (
+                models.Issuer,
+                models.Plan,
+                models.PlanFormulary,
+                models.PlanBenefitsMarketplace,
+                models.PlanTransparency,
+                models.PlanDrugRaw,
+                models.PlanDrugStats,
+                models.PlanDrugTierStats,
+                models.ImportLog,
+                models.PlanNPIRaw,
+                models.PlanNetworkTierRaw,
+                models.MRFAddress,
+                models.MRFAddressEvidence,
+            ),
+        ),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec(
@@ -222,6 +241,16 @@ _SPECS = {
             (models.MedicareEnrollmentCountyStats, models.MedicareEnrollmentStats),
         ),
     )
+}
+_OWNED_SEQUENCES = {
+    "mrf": (
+        ("issuer_issuer_id_seq", "issuer", "issuer_id"),
+        (
+            "mrf_address_evidence_evidence_checksum_seq",
+            "mrf_address_evidence",
+            "evidence_checksum",
+        ),
+    ),
 }
 
 
@@ -369,6 +398,7 @@ async def _lock_family(
 async def _table_receipt(
     session: Any,
     *,
+    importer_id: str,
     schema_name: str,
     model_type: type,
 ) -> ReferenceTableReceipt:
@@ -377,18 +407,58 @@ async def _table_receipt(
     if relation_oid is None:
         raise ReferenceFamilyArchiveError("reference family relation is missing")
     try:
-        schema_sha256 = await catalog_identity._schema_identity(
-            session,
-            relation_oid,
-            schema_name,
-            table_name,
-        )
+        schema_sha256 = await _family_schema_identity(session, importer_id, relation_oid, schema_name, table_name)
     except Exception as error:
         raise ReferenceFamilyArchiveError("reference family schema identity is unavailable") from error
     row_count = await session.scalar(text(f"SELECT count(*)::bigint FROM {_quoted(schema_name)}.{_quoted(table_name)}"))
     if type(row_count) is not int or row_count < 0:
         raise ReferenceFamilyArchiveError("reference family row count is invalid")
     return ReferenceTableReceipt(model_type.__name__, table_name, schema_sha256, row_count)
+
+
+async def _family_schema_identity(
+    session: Any,
+    importer_id: str,
+    relation_oid: int,
+    schema_name: str,
+    table_name: str,
+) -> str:
+    if importer_id != "mrf" or table_name not in {"issuer", "mrf_address_evidence"}:
+        return await catalog_identity._schema_identity(session, relation_oid, schema_name, table_name)
+    columns = await catalog_identity._catalog_columns(session, relation_oid)
+    constraints = await catalog_identity._catalog_constraints(session, relation_oid, schema_name)
+    indexes = await catalog_identity._catalog_indexes(session, relation_oid)
+    expected_sequence, expected_column = {
+        owner_table: (sequence_name, owner_column)
+        for sequence_name, owner_table, owner_column in _OWNED_SEQUENCES["mrf"]
+    }[table_name]
+    default_pattern = re.compile(
+        rf"nextval\('(?:\"?[A-Za-z_][A-Za-z0-9_]*\"?\.)?"
+        rf"\"?{re.escape(expected_sequence)}\"?\'::regclass\)"
+    )
+    sequence_default_found = False
+    for column in columns:
+        default_expression = column.get("default_expression")
+        if isinstance(default_expression, str) and "nextval(" in default_expression:
+            if (
+                sequence_default_found
+                or column.get("attname") != expected_column
+                or default_pattern.fullmatch(default_expression) is None
+            ):
+                raise ReferenceFamilyArchiveError("MRF owned sequence default is unsupported")
+            sequence_default_found = True
+            column["default_expression"] = f"reference-family-owned-sequence:{expected_sequence}"
+    if not sequence_default_found:
+        raise ReferenceFamilyArchiveError("MRF owned sequence default is unavailable")
+    catalog_identity._reject_schema_qualified_expressions(schema_name, columns, constraints, indexes)
+    return catalog_identity._canonical_digest(
+        {
+            "table_name": table_name,
+            "columns": columns,
+            "constraints": constraints,
+            "indexes": indexes,
+        }
+    )
 
 
 async def _family_manifest(
@@ -401,7 +471,12 @@ async def _family_manifest(
     metadata, metadata_sha256 = _source_metadata(source_metadata)
     receipts = tuple(
         [
-            await _table_receipt(session, schema_name=schema_name, model_type=model_type)
+            await _table_receipt(
+                session,
+                importer_id=spec.importer_id,
+                schema_name=schema_name,
+                model_type=model_type,
+            )
             for model_type in spec.model_types
         ]
     )
@@ -613,12 +688,37 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
         raise ReferenceFamilyArchiveError("reference family source snapshot is invalid")
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
-    await session.execute(text(f"CREATE SCHEMA {_quoted(stage_schema)}"))
+    spec = reference_family_spec(capture.manifest.importer_id)
+    if spec.importer_id == "mrf":
+        await _create_model_family(session, spec, stage_schema)
+    else:
+        await session.execute(text(f"CREATE SCHEMA {_quoted(stage_schema)}"))
     for table in capture.manifest.tables:
         source_ref = f"{_quoted(capture.schema_name)}.{_quoted(table.table_name)}"
         stage_ref = f"{_quoted(stage_schema)}.{_quoted(table.table_name)}"
-        await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
+        if spec.importer_id != "mrf":
+            await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
         await session.execute(text(f"INSERT INTO {stage_ref} SELECT * FROM {source_ref}"))
+    if spec.importer_id == "mrf":
+        await _rebase_mrf_sequences(session, stage_schema)
+
+
+async def _rebase_mrf_sequences(session: Any, stage_schema: str) -> None:
+    """Set cloned sequence state from frozen rows, without consulting mutable sequences."""
+
+    for sequence_name, table_name, column_name in _OWNED_SEQUENCES["mrf"]:
+        maximum_value = await session.scalar(
+            text(f"SELECT max({_quoted(column_name)})::bigint FROM {_quoted(stage_schema)}.{_quoted(table_name)}")
+        )
+        sequence_value = int(maximum_value) if maximum_value is not None else 1
+        await session.execute(
+            text("SELECT pg_catalog.setval(CAST(:sequence AS regclass), :value, :called)"),
+            {
+                "sequence": f"{stage_schema}.{sequence_name}",
+                "value": sequence_value,
+                "called": maximum_value is not None,
+            },
+        )
 
 
 async def _schema_oid(session: Any, schema_name: str) -> int:
@@ -647,6 +747,45 @@ async def _namespace_relations(session: Any, schema_oid: int) -> list[Mapping[st
     )
 
 
+async def _owned_sequences(
+    session: Any,
+    schema_oid: int,
+) -> tuple[tuple[str, int, str, str], ...]:
+    rows = list(
+        (
+            await session.execute(
+                text(
+                    "SELECT sequence.relname AS sequence_name, sequence.oid AS sequence_oid, "
+                    "owner_table.relname AS table_name, owner_column.attname AS column_name "
+                    "FROM pg_catalog.pg_class AS sequence "
+                    "JOIN pg_catalog.pg_depend AS dependency "
+                    "ON dependency.classid='pg_class'::regclass "
+                    "AND dependency.objid=sequence.oid AND dependency.objsubid=0 "
+                    "AND dependency.refclassid='pg_class'::regclass "
+                    "AND dependency.deptype='a' "
+                    "JOIN pg_catalog.pg_class AS owner_table "
+                    "ON owner_table.oid=dependency.refobjid "
+                    "JOIN pg_catalog.pg_attribute AS owner_column "
+                    "ON owner_column.attrelid=owner_table.oid "
+                    "AND owner_column.attnum=dependency.refobjsubid "
+                    "WHERE sequence.relnamespace=:schema_oid AND sequence.relkind='S' "
+                    "ORDER BY sequence.relname"
+                ),
+                {"schema_oid": schema_oid},
+            )
+        ).mappings()
+    )
+    return tuple(
+        (
+            str(row["sequence_name"]),
+            int(row["sequence_oid"]),
+            str(row["table_name"]),
+            str(row["column_name"]),
+        )
+        for row in rows
+    )
+
+
 async def capture_reference_family_stage_ownership(
     session: Any,
     *,
@@ -666,11 +805,24 @@ async def capture_reference_family_stage_ownership(
             raise ReferenceFamilyArchiveError("reference family owned relation is missing")
         relation_oids.append((table_name, relation_oid))
     owned_oids = {oid for _, oid in relation_oids}
+    sequence_oids = await _owned_sequences(session, schema_oid)
+    expected_sequences = _OWNED_SEQUENCES.get(spec.importer_id, ())
+    if (
+        tuple((name, table_name, column_name) for name, _, table_name, column_name in sequence_oids)
+        != expected_sequences
+    ):
+        raise ReferenceFamilyArchiveError("reference family owned sequence set is invalid")
+    owned_sequence_oids = {sequence_oid for _, sequence_oid, _, _ in sequence_oids}
     for relation_row in await _namespace_relations(session, schema_oid):
-        kind, relation_oid = str(relation_row["relkind"]), int(relation_row["oid"])
+        kind = relation_row["relkind"]
+        if isinstance(kind, bytes):
+            kind = kind.decode("ascii")
+        relation_oid = int(relation_row["oid"])
         if kind == "r" and relation_oid in owned_oids:
             continue
         if kind == "i" and int(relation_row["index_table_oid"] or 0) in owned_oids:
+            continue
+        if kind == "S" and relation_oid in owned_sequence_oids:
             continue
         raise ReferenceFamilyArchiveError("reference family owned schema contains an unexpected relation")
     return ReferenceFamilyStageOwnership(
@@ -679,6 +831,7 @@ async def capture_reference_family_stage_ownership(
         schema_name,
         schema_oid,
         tuple(relation_oids),
+        sequence_oids,
     )
 
 
@@ -890,19 +1043,14 @@ async def export_prepared_reference_family_archive(
 
 
 def _additional_index_sql(schema_name: str, model_type: type, index_spec: Mapping[str, Any]) -> str:
-    allowed_keys = {"index_elements", "name", "using", "unique", "include"}
+    allowed_keys = {"index_elements", "name", "using", "unique", "include", "where"}
     if set(index_spec) - allowed_keys:
         raise ReferenceFamilyArchiveError("reference family model index is unsupported")
     elements = index_spec.get("index_elements")
     if (
         not isinstance(elements, (tuple, list))
         or not elements
-        or not all(
-            isinstance(index_element, str)
-            and all(_IDENTIFIER.fullmatch(token) is not None for token in index_element.split())
-            and len(index_element.split()) <= 2
-            for index_element in elements
-        )
+        or not all(_is_reviewed_index_element(index_element) for index_element in elements)
     ):
         raise ReferenceFamilyArchiveError("reference family model index is invalid")
     suffix = index_spec.get("name", "_".join(elements))
@@ -924,10 +1072,30 @@ def _additional_index_sql(schema_name: str, model_type: type, index_spec: Mappin
     using = f" USING {method}" if method else ""
     unique = "UNIQUE " if is_unique else ""
     include = f" INCLUDE ({', '.join(included_columns)})" if included_columns else ""
+    where_clause = index_spec.get("where")
+    if where_clause not in {
+        None,
+        "type='practice'",
+        "type='practice' AND phone_number IS NOT NULL AND phone_number <> ''",
+    }:
+        raise ReferenceFamilyArchiveError("reference family model index predicate is unsupported")
+    where = "" if where_clause is None else f" WHERE {where_clause}"
     return (
         f"CREATE {unique}INDEX {_quoted(index_name)} ON {_quoted(schema_name)}."
-        f"{_quoted(model_type.__tablename__)}{using} ({', '.join(elements)}){include}"
+        f"{_quoted(model_type.__tablename__)}{using} ({', '.join(elements)}){include}{where}"
     )
+
+
+def _is_reviewed_index_element(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    tokens = value.split()
+    if 0 < len(tokens) <= 2 and all(_IDENTIFIER.fullmatch(token) is not None for token in tokens):
+        return True
+    return value in {
+        "LEFT(postal_code, 5)",
+        "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+    }
 
 
 async def precreate_reference_family_restore(
@@ -941,19 +1109,30 @@ async def precreate_reference_family_restore(
     _require_transaction(session)
     spec = reference_family_spec(importer_id)
     schema_name = reference_family_stage_schema(dataset_id)
+    await _create_model_family(session, spec, schema_name)
+    return await capture_reference_family_stage_ownership(
+        session,
+        importer_id=importer_id,
+        dataset_id=dataset_id,
+    )
+
+
+async def _create_model_family(
+    session: Any,
+    spec: ReferenceFamilySpec,
+    schema_name: str,
+) -> None:
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
     metadata = MetaData(schema=schema_name)
     for model_type in spec.model_types:
         table = model_type.__table__.to_metadata(metadata, schema=schema_name)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
-        for index in getattr(model_type, "__my_additional_indexes__", ()) or ():
+        indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
+            getattr(model_type, "__my_additional_indexes__", ()) or ()
+        )
+        for index in indexes:
             await session.execute(text(_additional_index_sql(schema_name, model_type, index)))
-    return await capture_reference_family_stage_ownership(
-        session,
-        importer_id=importer_id,
-        dataset_id=dataset_id,
-    )
 
 
 async def validate_reference_family_stage(
@@ -1010,6 +1189,23 @@ async def _verify_stage_owner(
         (table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in ownership.relation_oids
     ]:
         raise ReferenceFamilyArchiveError("reference family stage owner differs")
+    if ownership.sequence_oids:
+        sequence_rows = list(
+            (
+                await session.execute(
+                    text(
+                        "SELECT relname, oid, relowner FROM pg_catalog.pg_class "
+                        "WHERE oid=ANY(CAST(:sequence_oids AS oid[])) ORDER BY relname"
+                    ),
+                    {"sequence_oids": [sequence_oid for _, sequence_oid, _, _ in ownership.sequence_oids]},
+                )
+            ).mappings()
+        )
+        if [(row["relname"], int(row["oid"]), int(row["relowner"])) for row in sequence_rows] != [
+            (sequence_name, sequence_oid, expected_owner_oid)
+            for sequence_name, sequence_oid, _, _ in ownership.sequence_oids
+        ]:
+            raise ReferenceFamilyArchiveError("reference family stage sequence owner differs")
 
 
 async def prepare_reference_family_activation(
