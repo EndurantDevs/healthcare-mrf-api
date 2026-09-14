@@ -27,6 +27,7 @@ from db import models
 from process import entity_address_snapshot_receipt as catalog_identity
 
 CONTRACT = "reference-replacement-family.postgres.v1"
+VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
 _STAGE_PREFIX = "reference_family_archive_"
@@ -154,6 +155,49 @@ class ReferenceFamilyActivationReceipt:
     predecessor_oids: tuple[tuple[str, int | None], ...]
     predecessor_schema_name: str | None
     tables: tuple[ReferenceTableReceipt, ...]
+
+
+@dataclass(frozen=True)
+class ReferenceFamilyValidationReceipt:
+    """Publisher-minted evidence for one immutable protected stage."""
+
+    importer_id: str
+    package_id: str
+    profile_contract: str
+    stage_schema: str
+    stage_schema_oid: int
+    relation_oids: tuple[tuple[str, int], ...]
+    sealed_owner_oid: int
+    manifest_sha256: str
+    tables: tuple[ReferenceTableReceipt, ...]
+    validation_sha256: str
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the closed durable representation stored by the controller."""
+
+        return {
+            "contract": VALIDATION_CONTRACT,
+            "importer_id": self.importer_id,
+            "package_id": self.package_id,
+            "profile_contract": self.profile_contract,
+            "stage_schema": self.stage_schema,
+            "stage_schema_oid": self.stage_schema_oid,
+            "relation_oids": [list(pair) for pair in self.relation_oids],
+            "sealed_owner_oid": self.sealed_owner_oid,
+            "manifest_sha256": self.manifest_sha256,
+            "tables": [table.as_dict() for table in self.tables],
+            "validation_sha256": self.validation_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class ReferenceFamilyCutoverAuthority:
+    """Trusted controller bindings rechecked during a short cutover."""
+
+    package_id: str
+    profile_contract: str
+    expected_stage_owner_oid: int
+    authority: str
 
 
 _SPECS = {
@@ -409,6 +453,105 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
     return ReferenceFamilyManifest(spec.importer_id, tuple(receipts), metadata, metadata_sha256, schema_sha256)
 
 
+def _validation_digest(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(b"reference-family-validation/v1\0" + _canonical_json(dict(payload))).hexdigest()
+
+
+def _validation_inventory(value: Mapping[str, Any], spec: ReferenceFamilySpec) -> tuple[tuple[str, int], ...]:
+    relation_values = value["relation_oids"]
+    if not isinstance(relation_values, list) or len(relation_values) != len(spec.table_names):
+        raise ReferenceFamilyArchiveError("reference family validation inventory is invalid")
+    relation_oids: list[tuple[str, int]] = []
+    for relation_value, expected_name in zip(relation_values, sorted(spec.table_names), strict=True):
+        if (
+            not isinstance(relation_value, list)
+            or len(relation_value) != 2
+            or relation_value[0] != expected_name
+            or type(relation_value[1]) is not int
+            or relation_value[1] <= 0
+        ):
+            raise ReferenceFamilyArchiveError("reference family validation inventory is invalid")
+        relation_oids.append((relation_value[0], relation_value[1]))
+    return tuple(relation_oids)
+
+
+def _validation_tables(value: Mapping[str, Any], spec: ReferenceFamilySpec) -> tuple[ReferenceTableReceipt, ...]:
+    raw_tables = value["tables"]
+    if not isinstance(raw_tables, list) or len(raw_tables) != len(spec.model_types):
+        raise ReferenceFamilyArchiveError("reference family validation tables are invalid")
+    table_receipts: list[ReferenceTableReceipt] = []
+    for raw_table, model_type in zip(raw_tables, spec.model_types, strict=True):
+        if not isinstance(raw_table, Mapping) or set(raw_table) != {
+            "model_name",
+            "table_name",
+            "schema_sha256",
+            "row_count",
+        }:
+            raise ReferenceFamilyArchiveError("reference family validation tables are invalid")
+        if (
+            raw_table["model_name"] != model_type.__name__
+            or raw_table["table_name"] != model_type.__tablename__
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw_table["schema_sha256"])) is None
+            or type(raw_table["row_count"]) is not int
+            or raw_table["row_count"] < 0
+        ):
+            raise ReferenceFamilyArchiveError("reference family validation tables are invalid")
+        table_receipts.append(ReferenceTableReceipt(**dict(raw_table)))
+    return tuple(table_receipts)
+
+
+def validate_reference_family_validation_receipt(receipt_value: object) -> ReferenceFamilyValidationReceipt:
+    """Validate a durable receipt without treating it as publication authority."""
+
+    if isinstance(receipt_value, ReferenceFamilyValidationReceipt):
+        receipt_value = receipt_value.as_dict()
+    expected_fields = {
+        "contract",
+        "importer_id",
+        "package_id",
+        "profile_contract",
+        "stage_schema",
+        "stage_schema_oid",
+        "relation_oids",
+        "sealed_owner_oid",
+        "manifest_sha256",
+        "tables",
+        "validation_sha256",
+    }
+    if not isinstance(receipt_value, Mapping) or set(receipt_value) != expected_fields:
+        raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
+    spec = reference_family_spec(receipt_value["importer_id"])
+    if (
+        receipt_value["contract"] != VALIDATION_CONTRACT
+        or receipt_value["profile_contract"] != CONTRACT
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["package_id"])) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["manifest_sha256"])) is None
+        or type(receipt_value["stage_schema_oid"]) is not int
+        or receipt_value["stage_schema_oid"] <= 0
+        or type(receipt_value["sealed_owner_oid"]) is not int
+        or receipt_value["sealed_owner_oid"] <= 0
+    ):
+        raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
+    stage_schema = _schema_name(receipt_value["stage_schema"])
+    relation_oids = _validation_inventory(receipt_value, spec)
+    table_receipts = _validation_tables(receipt_value, spec)
+    digest_by_field = {key: receipt_value[key] for key in expected_fields - {"validation_sha256"}}
+    if receipt_value["validation_sha256"] != _validation_digest(digest_by_field):
+        raise ReferenceFamilyArchiveError("reference family validation digest differs")
+    return ReferenceFamilyValidationReceipt(
+        spec.importer_id,
+        receipt_value["package_id"],
+        receipt_value["profile_contract"],
+        stage_schema,
+        receipt_value["stage_schema_oid"],
+        relation_oids,
+        receipt_value["sealed_owner_oid"],
+        receipt_value["manifest_sha256"],
+        table_receipts,
+        receipt_value["validation_sha256"],
+    )
+
+
 async def capture_reference_family_source(
     session: Any,
     *,
@@ -617,24 +760,27 @@ async def export_reference_family_archive(
 
     ownership = None
     try:
-        async def prepared(_session, _prepared):
+
+        async def retain_prepared_source(_session, _prepared_source):
+            """The convenience wrapper owns cleanup rather than durable retention."""
+
             return None
 
-        source = await prepare_reference_family_archive_source(
+        prepared_source = await prepare_reference_family_archive_source(
             session_factory,
             importer_id=importer_id,
             schema_name=schema_name,
             source_metadata=source_metadata,
             dataset_id=dataset_id,
-            on_prepared=prepared,
+            on_prepared=retain_prepared_source,
         )
-        ownership = source.ownership
+        ownership = prepared_source.ownership
         await export_prepared_reference_family_archive(
             session_factory,
-            prepared=source,
+            prepared=prepared_source,
             archive_copy=archive_copy,
         )
-        return source.manifest
+        return prepared_source.manifest
     finally:
         if ownership is not None:
             await _shielded_cleanup(session_factory, ownership)
@@ -793,6 +939,76 @@ async def validate_reference_family_stage(
         session,
         ownership=ownership,
         manifest=validated_manifest,
+    )
+
+
+async def _verify_stage_owner(
+    session: Any,
+    ownership: ReferenceFamilyStageOwnership,
+    expected_owner_oid: int,
+) -> None:
+    if type(expected_owner_oid) is not int or expected_owner_oid <= 0:
+        raise ReferenceFamilyArchiveError("reference family stage owner is invalid")
+    schema_owner = await session.scalar(
+        text("SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid=:schema_oid AND nspname=:schema_name"),
+        {"schema_oid": ownership.schema_oid, "schema_name": ownership.schema_name},
+    )
+    if schema_owner != expected_owner_oid:
+        raise ReferenceFamilyArchiveError("reference family stage owner differs")
+    rows = list(
+        (
+            await session.execute(
+                text(
+                    "SELECT relation.relname, relation.oid, relation.relowner "
+                    "FROM pg_catalog.pg_class AS relation "
+                    "WHERE relation.oid=ANY(CAST(:relation_oids AS oid[])) ORDER BY relation.relname"
+                ),
+                {"relation_oids": [relation_oid for _, relation_oid in ownership.relation_oids]},
+            )
+        ).mappings()
+    )
+    if [(row["relname"], int(row["oid"]), int(row["relowner"])) for row in rows] != [
+        (table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in ownership.relation_oids
+    ]:
+        raise ReferenceFamilyArchiveError("reference family stage owner differs")
+
+
+async def prepare_reference_family_activation(
+    session: Any,
+    *,
+    ownership: ReferenceFamilyStageOwnership,
+    manifest: Mapping[str, Any] | ReferenceFamilyManifest,
+    package_id: str,
+    profile_contract: str,
+    sealed_owner_oid: int,
+) -> ReferenceFamilyValidationReceipt:
+    """Perform long validation over an already publisher-frozen stage."""
+
+    _require_transaction(session)
+    validated_manifest = validate_reference_family_manifest(manifest)
+    if (
+        profile_contract != CONTRACT
+        or re.fullmatch(r"[0-9a-f]{64}", str(package_id)) is None
+        or validated_manifest.importer_id != ownership.importer_id
+    ):
+        raise ReferenceFamilyArchiveError("reference family validation scope differs")
+    await verify_reference_family_stage_ownership(session, ownership)
+    await _verify_stage_owner(session, ownership, sealed_owner_oid)
+    table_receipts = await _validate_stage_manifest(session, ownership=ownership, manifest=validated_manifest)
+    validation_by_field = {
+        "contract": VALIDATION_CONTRACT,
+        "importer_id": ownership.importer_id,
+        "package_id": package_id,
+        "profile_contract": profile_contract,
+        "stage_schema": ownership.schema_name,
+        "stage_schema_oid": ownership.schema_oid,
+        "relation_oids": [list(pair) for pair in ownership.relation_oids],
+        "sealed_owner_oid": sealed_owner_oid,
+        "manifest_sha256": hashlib.sha256(_canonical_json(validated_manifest.as_dict())).hexdigest(),
+        "tables": [table.as_dict() for table in table_receipts],
+    }
+    return validate_reference_family_validation_receipt(
+        {**validation_by_field, "validation_sha256": _validation_digest(validation_by_field)}
     )
 
 
@@ -985,19 +1201,83 @@ async def activate_reference_family_stage(
     )
 
 
+async def activate_validated_reference_family_stage(
+    session: Any,
+    *,
+    ownership: ReferenceFamilyStageOwnership,
+    manifest: Mapping[str, Any] | ReferenceFamilyManifest,
+    expected_incumbent: ReferenceFamilyIncumbent,
+    validation_receipt: Mapping[str, Any] | ReferenceFamilyValidationReceipt,
+    cutover: ReferenceFamilyCutoverAuthority,
+) -> ReferenceFamilyActivationReceipt:
+    """CAS-rotate one publisher-validated immutable stage without recounting."""
+
+    _require_transaction(session)
+    if not isinstance(cutover, ReferenceFamilyCutoverAuthority):
+        raise ReferenceFamilyArchiveError("reference family cutover authority is invalid")
+    if cutover.authority != "manual":
+        raise ReferenceFamilyArchiveError("reference family automatic activation is unsupported")
+    if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
+        expected_incumbent,
+        ReferenceFamilyIncumbent,
+    ):
+        raise ReferenceFamilyArchiveError("reference family activation ownership is invalid")
+    validated_manifest = validate_reference_family_manifest(manifest)
+    validation = validate_reference_family_validation_receipt(validation_receipt)
+    manifest_sha256 = hashlib.sha256(_canonical_json(validated_manifest.as_dict())).hexdigest()
+    if (
+        validated_manifest.importer_id != ownership.importer_id
+        or expected_incumbent.importer_id != ownership.importer_id
+        or validation.importer_id != ownership.importer_id
+        or validation.package_id != cutover.package_id
+        or validation.profile_contract != cutover.profile_contract
+        or validation.stage_schema != ownership.schema_name
+        or validation.stage_schema_oid != ownership.schema_oid
+        or validation.relation_oids != ownership.relation_oids
+        or validation.manifest_sha256 != manifest_sha256
+        or validation.tables != validated_manifest.tables
+    ):
+        raise ReferenceFamilyArchiveError("reference family validation authority differs")
+    spec = reference_family_spec(ownership.importer_id)
+    await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
+    await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
+    predecessor_schema_name = await _rotate_family_relations(
+        session,
+        spec,
+        ownership,
+        expected_incumbent,
+    )
+    await _drop_empty_stage_schema(session, ownership)
+    live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
+    if tuple(sorted(live_pairs)) != ownership.relation_oids:
+        raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    return ReferenceFamilyActivationReceipt(
+        spec.importer_id,
+        validated_manifest.source_metadata_sha256,
+        tuple((name, int(relation_oid)) for name, relation_oid in live_pairs),
+        expected_incumbent.relation_oids,
+        predecessor_schema_name,
+        validation.tables,
+    )
+
+
 __all__ = [
     "CONTRACT",
+    "VALIDATION_CONTRACT",
     "ReferenceFamilyActivationReceipt",
     "ReferenceFamilyArchiveError",
+    "ReferenceFamilyCutoverAuthority",
     "ReferenceFamilyIncumbent",
     "ReferenceFamilyManifest",
     "ReferenceFamilyPreparedSource",
     "ReferenceFamilySourceCapture",
     "ReferenceFamilyStageCapture",
     "ReferenceFamilyStageOwnership",
+    "ReferenceFamilyValidationReceipt",
     "ReferenceFamilySpec",
     "ReferenceTableReceipt",
     "activate_reference_family_stage",
+    "activate_validated_reference_family_stage",
     "capture_reference_family_incumbent",
     "capture_reference_family_source",
     "capture_reference_family_stage_ownership",
@@ -1006,10 +1286,12 @@ __all__ = [
     "export_prepared_reference_family_archive",
     "precreate_reference_family_restore",
     "prepare_reference_family_archive_source",
+    "prepare_reference_family_activation",
     "reference_family_spec",
     "reference_family_predecessor_schema",
     "reference_family_stage_schema",
     "validate_reference_family_manifest",
+    "validate_reference_family_validation_receipt",
     "validate_reference_family_stage",
     "verify_reference_family_stage_ownership",
 ]
