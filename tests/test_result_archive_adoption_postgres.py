@@ -122,7 +122,7 @@ async def _create_destination_snapshot_table(database: Database, schema: str) ->
 
 
 async def _install_model_closure_tables(database: Database, *, schema_name: str) -> None:
-    """Install current model columns for logical evidence outside layout rekeying."""
+    """Install model-shaped logical evidence and persisted audit samples."""
 
     metadata = MetaData(schema=schema_name)
     for table_name in (*_MODEL_CLOSURE_TABLES, *_SOURCE_AUTHORITY_TABLES):
@@ -132,6 +132,7 @@ async def _install_model_closure_tables(database: Database, *, schema_name: str)
             CreateTable(target_table, include_foreign_key_constraints=[]).compile(dialect=postgresql.dialect())
         )
         await database.execute_ddl(statement)
+    await _install_audit_occurrence_table(database, schema_name=schema_name)
 
 
 async def _install_finalizer_map_tables(database: Database, *, schema_name: str, monkeypatch) -> None:
