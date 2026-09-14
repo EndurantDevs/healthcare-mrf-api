@@ -111,12 +111,11 @@ async def test_automatic_activation_is_rejected_before_mutation():
     session.scalar.assert_not_awaited()
 
 
-def test_archived_index_name_is_bounded_and_stable():
-    original = "x" * 63
-    archived = archive._archived_index_name(original)
-    assert len(archived.encode()) <= 63
-    assert archived == archive._archived_index_name(original)
-    assert archived.endswith("_old")
+def test_predecessor_schema_is_uuid_owned_and_bounded():
+    dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
+    predecessor = archive.reference_family_predecessor_schema(dataset_id)
+    assert predecessor == "reference_family_predecessor_550e8400e29b41d4a716446655440000"
+    assert len(predecessor.encode()) <= 63
 
 
 def test_model_index_ddl_rejects_unreviewed_sql_fragments():
