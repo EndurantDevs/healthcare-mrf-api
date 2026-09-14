@@ -16,6 +16,9 @@ import importlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any, Mapping
+
+from process import entity_address_result_generation as result_generation
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -138,12 +141,27 @@ async def prepare_completed_entity_address_snapshot_adoption(
     db_schema: str,
     import_date: str,
     preserve_unversioned_base_rows: bool = False,
+    source_serving_generation: (
+        Mapping[str, Any] | result_generation.EntityAddressServingGeneration | None
+    ) = None,
 ) -> PreparedEntityAddressSnapshotAdoption:
-    """Perform bounded, non-cutover work for one restored completed result."""
+    """Prepare one result, preserving its origin or explicitly adopting legacy input.
+
+    A missing ``source_serving_generation`` denotes a generation-less manual
+    archive and causes activation to clear the destination serving tuple while
+    leaving its local generation counter unchanged.
+    """
 
     normalized_schema, normalized_import_date = _validated_snapshot_destination(
         db_schema=db_schema,
         import_date=import_date,
+    )
+    validated_source_generation = (
+        None
+        if source_serving_generation is None
+        else result_generation.validate_entity_address_serving_generation(
+            source_serving_generation
+        )
     )
     (
         stage_cls,
@@ -164,6 +182,10 @@ async def prepare_completed_entity_address_snapshot_adoption(
     cutover_context_map = {
         "address_alias_generation": await entity_address_unified._address_alias_generation(normalized_schema),
         "stage_persistence": "p",
+        "result_generation_mode": "adoption",
+        "source_serving_generation": (
+            None if validated_source_generation is None else validated_source_generation.as_dict()
+        ),
     }
     await entity_address_unified._run_sql_phase(
         f"ANALYZE {normalized_schema}.{stage_cls.__tablename__};",

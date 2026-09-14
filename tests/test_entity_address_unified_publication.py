@@ -3,11 +3,40 @@
 from contextlib import asynccontextmanager
 import importlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
+
+
+class _GenerationAuthority:
+    def as_dict(self):
+        return {
+            "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+            "local_generation": 1,
+            "serving_generation": {
+                "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+                "origin_generation": 1,
+                "published_at": "2026-09-14T08:30:00Z",
+            },
+            "relation_oids": list(range(10, 17)),
+        }
+
+
+@pytest.fixture(autouse=True)
+def _stub_generation_publication(monkeypatch):
+    async def publish(database, *, schema_name):
+        assert schema_name == "mrf"
+        database.events.append("result generation published")
+        return _GenerationAuthority()
+
+    monkeypatch.setattr(
+        entity_address_unified.result_generation,
+        "publish_local_entity_address_generation",
+        AsyncMock(side_effect=publish),
+    )
 
 
 class _LiveTable:
@@ -131,6 +160,12 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     assert cutover_context_map["cutover_attempts"] == 1
     assert cutover_context_map["stage_persistence"] == "p"
     assert cutover_context_map["geo_assurance_active_table_oid"] == 123
+    assert cutover_context_map["result_generation_mode"] == "ordinary"
+    assert cutover_context_map["result_generation"]["local_generation"] == 1
+    entity_address_unified.result_generation.publish_local_entity_address_generation.assert_awaited_once_with(
+        recording_db,
+        schema_name="mrf",
+    )
     stage_rename_at = recording_db.events.index(
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
     )
@@ -139,7 +174,8 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
         for index, statement in enumerate(recording_db.events)
         if "entity_address_geo_assurance_state" in statement
     )
-    assert stage_rename_at < activation_at
+    generation_at = recording_db.events.index("result generation published")
+    assert stage_rename_at < activation_at < generation_at
     dependency_check_at = next(
         index
         for index, statement in enumerate(recording_db.events)

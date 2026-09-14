@@ -20,6 +20,33 @@ from tests.ptg2_serving_address_evidence_postgres_support import (
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
+class _GenerationAuthority:
+    def as_dict(self):
+        return {
+            "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+            "local_generation": 1,
+            "serving_generation": {
+                "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+                "origin_generation": 1,
+                "published_at": "2026-09-14T08:30:00Z",
+            },
+            "relation_oids": list(range(10, 17)),
+        }
+
+
+@pytest.fixture(autouse=True)
+def _stub_result_generation(monkeypatch):
+    async def publish(_database, *, schema_name):
+        assert schema_name.startswith("eau_cutover_")
+        return _GenerationAuthority()
+
+    monkeypatch.setattr(
+        entity_address_unified.result_generation,
+        "publish_local_entity_address_generation",
+        publish,
+    )
+
+
 class _LiveTable:
     __main_table__ = "entity_address_unified"
     __my_additional_indexes__ = []

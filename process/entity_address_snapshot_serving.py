@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
+from process import entity_address_result_generation as result_generation
 from process.ext import address_alias_sql
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -20,10 +21,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _POSTGRES_OID_MAX = (1 << 32) - 1
 _RELATIONS = tuple(
     (model.__name__, model.__tablename__)
-    for model in (
-        entity_address_unified.EntityAddressUnified,
-        *entity_address_unified.SUPPORT_TABLE_MODELS,
-    )
+    for model in result_generation.ENTITY_ADDRESS_RESULT_MODELS
 )
 _LOCAL_GEO_DEPENDENCIES = (
     "npi_address",
@@ -47,6 +45,7 @@ class EntityAddressObservedServingCapture:
     geo_assurance_version: int
     geo_active_table_oid: int
     geo_active_relation_signature: tuple[tuple[str, int, int], ...]
+    result_generation: result_generation.EntityAddressServingGeneration | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded queue form; every identity remains source-local."""
@@ -79,6 +78,9 @@ class EntityAddressObservedServingCapture:
                     for relation_name, relation_oid, relation_filenode in self.geo_active_relation_signature
                 },
             },
+            "result_generation": (
+                None if self.result_generation is None else self.result_generation.as_dict()
+            ),
         }
 
 
@@ -135,6 +137,8 @@ def _validated_relation_oids(relation_entries: object) -> tuple[int, ...]:
         ):
             raise ValueError("entity-address observed serving relation identity is invalid")
         relation_oids.append(_positive_oid(relation_entry["relation_oid"], field_name="relation OID"))
+    if len(set(relation_oids)) != len(relation_oids):
+        raise ValueError("entity-address observed serving relation identity is invalid")
     return tuple(relation_oids)
 
 
@@ -189,13 +193,14 @@ def validate_entity_address_observed_serving_capture(
     if not isinstance(capture_mapping, Mapping):
         raise ValueError("entity-address observed serving capture is invalid")
     schema = _schema_name(schema_name if schema_name is not None else capture_mapping.get("source_schema"))
-    if set(capture_mapping) != {
+    legacy_fields = {
         "contract",
         "source_schema",
         "relations",
         "alias_state",
         "geo_assurance",
-    }:
+    }
+    if set(capture_mapping) not in (legacy_fields, legacy_fields | {"result_generation"}):
         raise ValueError("entity-address observed serving capture is invalid")
     if capture_mapping["contract"] != CONTRACT or capture_mapping["source_schema"] != schema:
         raise ValueError("entity-address observed serving capture is invalid")
@@ -208,6 +213,12 @@ def validate_entity_address_observed_serving_capture(
         schema_name=schema,
         live_table_oid=relation_oids[0],
     )
+    generation_value = capture_mapping.get("result_generation")
+    serving_generation = (
+        None
+        if generation_value is None
+        else result_generation.validate_entity_address_serving_generation(generation_value)
+    )
     return EntityAddressObservedServingCapture(
         contract=CONTRACT,
         source_schema=schema,
@@ -218,6 +229,7 @@ def validate_entity_address_observed_serving_capture(
         geo_assurance_version=geo_assurance_version,
         geo_active_table_oid=geo_active_table_oid,
         geo_active_relation_signature=geo_signature,
+        result_generation=serving_generation,
     )
 
 
@@ -320,6 +332,24 @@ async def _geo_assurance_state(
     return geo_state["active_geo_assurance_version"], active_table_oid, active_signature
 
 
+async def _result_generation_state(
+    session: Any,
+    *,
+    schema_name: str,
+    relation_oids: tuple[int, ...],
+) -> result_generation.EntityAddressServingGeneration | None:
+    authority = await result_generation.read_entity_address_result_generation_authority(
+        session,
+        schema_name=schema_name,
+    )
+    if authority.relation_oids is None:
+        # Migration and legacy/manual adoption deliberately expose no origin.
+        return None
+    if authority.relation_oids != relation_oids or authority.serving_generation is None:
+        raise RuntimeError("entity-address result generation does not identify the serving relations")
+    return authority.serving_generation
+
+
 async def observe_entity_address_serving(
     session,
     *,
@@ -349,6 +379,11 @@ async def observe_entity_address_serving(
         schema_name=schema,
         live_table_oid=relation_oids[0],
     )
+    serving_generation = await _result_generation_state(
+        session,
+        schema_name=schema,
+        relation_oids=relation_oids,
+    )
     return EntityAddressObservedServingCapture(
         contract=CONTRACT,
         source_schema=schema,
@@ -359,6 +394,7 @@ async def observe_entity_address_serving(
         geo_assurance_version=geo_assurance_version,
         geo_active_table_oid=geo_active_table_oid,
         geo_active_relation_signature=geo_active_relation_signature,
+        result_generation=serving_generation,
     )
 
 

@@ -509,14 +509,38 @@ def _rehydrated_context(value: Any) -> dict[str, Any]:
     """Require the exact durable native preparation context before cutover."""
 
     context = _json_object(value, "context")
+    allowed_legacy_fields = {"address_alias_generation", "stage_persistence", "phase_timings"}
+    allowed_generation_fields = {
+        "result_generation_mode",
+        "source_serving_generation",
+    }
     if (
         not {"address_alias_generation", "stage_persistence"} <= set(context)
-        or set(context) - {"address_alias_generation", "stage_persistence", "phase_timings"}
+        or set(context) - allowed_legacy_fields - allowed_generation_fields
         or type(context["address_alias_generation"]) is not int
         or context["address_alias_generation"] < 0
         or context["stage_persistence"] != "p"
     ):
         raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid")
+    generation_fields = set(context) & allowed_generation_fields
+    if generation_fields and generation_fields != allowed_generation_fields:
+        raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid")
+    if not generation_fields:
+        context["result_generation_mode"] = "adoption"
+        context["source_serving_generation"] = None
+    elif context["result_generation_mode"] != "adoption":
+        raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid")
+    elif context["source_serving_generation"] is not None:
+        try:
+            context["source_serving_generation"] = (
+                adoption.result_generation.validate_entity_address_serving_generation(
+                    context["source_serving_generation"]
+                ).as_dict()
+            )
+        except ValueError as error:
+            raise EntityAddressSnapshotRestoreError(
+                "entity-address restore context is invalid"
+            ) from error
     return context
 
 
