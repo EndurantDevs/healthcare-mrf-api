@@ -42,6 +42,8 @@ class ReferenceFamilyServingGeneration:
     published_at: datetime.datetime
 
     def as_dict(self) -> dict[str, Any]:
+        """Return the portable generation identity as canonical fields."""
+
         return {
             "origin_lineage_id": self.origin_lineage_id,
             "origin_generation": self.origin_generation,
@@ -60,6 +62,8 @@ class ReferenceFamilyResultGenerationAuthority:
     relation_oids: tuple[int, ...] | None
 
     def as_dict(self) -> dict[str, Any]:
+        """Return local and portable authority fields for durable receipts."""
+
         return {
             "importer_id": self.importer_id,
             "local_lineage_id": self.local_lineage_id,
@@ -153,34 +157,34 @@ def validate_reference_family_result_generation_authority(
 ) -> ReferenceFamilyResultGenerationAuthority:
     """Validate one migration-installed family row without inferring legacy history."""
 
-    values = _row_mapping(authority_row)
+    authority_by_field = _row_mapping(authority_row)
     try:
-        importer_id = _importer_id(values.get("importer_id"))
-        local_lineage_id = _uuid_text(values.get("local_lineage_id"))
+        importer_id = _importer_id(authority_by_field.get("importer_id"))
+        local_lineage_id = _uuid_text(authority_by_field.get("local_lineage_id"))
     except ValueError as error:
         raise RuntimeError("reference family generation authority is invalid") from error
-    local_generation = values.get("local_generation")
+    local_generation = authority_by_field.get("local_generation")
     if type(local_generation) is not int or not 0 <= local_generation <= _MAX_GENERATION:
         raise RuntimeError("reference family local generation is invalid")
-    serving_values = (
-        values.get("origin_lineage_id"),
-        values.get("origin_generation"),
-        values.get("published_at"),
-        values.get("relation_oids"),
+    serving_fields = (
+        authority_by_field.get("origin_lineage_id"),
+        authority_by_field.get("origin_generation"),
+        authority_by_field.get("published_at"),
+        authority_by_field.get("relation_oids"),
     )
-    if all(value is None for value in serving_values):
+    if all(field is None for field in serving_fields):
         return ReferenceFamilyResultGenerationAuthority(importer_id, local_lineage_id, local_generation, None, None)
-    if any(value is None for value in serving_values):
+    if any(field is None for field in serving_fields):
         raise RuntimeError("reference family serving generation is incomplete")
     try:
         serving_generation = validate_reference_family_serving_generation(
             {
-                "origin_lineage_id": values["origin_lineage_id"],
-                "origin_generation": values["origin_generation"],
-                "published_at": values["published_at"],
+                "origin_lineage_id": authority_by_field["origin_lineage_id"],
+                "origin_generation": authority_by_field["origin_generation"],
+                "published_at": authority_by_field["published_at"],
             }
         )
-        relation_oids = _relation_oids(importer_id, values["relation_oids"])
+        relation_oids = _relation_oids(importer_id, authority_by_field["relation_oids"])
     except ValueError as error:
         raise RuntimeError("reference family serving generation is invalid") from error
     return ReferenceFamilyResultGenerationAuthority(
@@ -242,7 +246,7 @@ async def current_reference_family_relation_oids(
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
     relation_names = RELATION_NAMES_BY_IMPORTER[importer]
-    rows = await _all(
+    relation_rows = await _all(
         database,
         text(
             "SELECT relation_name, "
@@ -254,8 +258,8 @@ async def current_reference_family_relation_oids(
         relation_names=list(relation_names),
     )
     try:
-        names = tuple(str(row[0]) for row in rows)
-        relation_oids = _relation_oids(importer, tuple(int(row[1]) for row in rows))
+        names = tuple(str(relation_row[0]) for relation_row in relation_rows)
+        relation_oids = _relation_oids(importer, tuple(int(relation_row[1]) for relation_row in relation_rows))
     except IndexError, TypeError, ValueError:
         raise RuntimeError("reference family serving relations are unavailable") from None
     if names != relation_names:
@@ -333,18 +337,18 @@ async def publish_adopted_reference_family_generation(
         database, importer_id=importer, schema_name=schema, lock=True
     )
     if source_generation is None:
-        update_values = {
+        update_by_field = {
             "origin_lineage_id": None,
             "origin_generation": None,
             "published_at": None,
             "relation_oids": None,
         }
     else:
-        source = validate_reference_family_serving_generation(source_generation)
-        update_values = {
-            "origin_lineage_id": source.origin_lineage_id,
-            "origin_generation": source.origin_generation,
-            "published_at": source.published_at,
+        source_serving_generation = validate_reference_family_serving_generation(source_generation)
+        update_by_field = {
+            "origin_lineage_id": source_serving_generation.origin_lineage_id,
+            "origin_generation": source_serving_generation.origin_generation,
+            "published_at": source_serving_generation.published_at,
             "relation_oids": list(
                 await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
             ),
@@ -360,14 +364,17 @@ async def publish_adopted_reference_family_generation(
             "origin_generation, published_at, relation_oids"
         ),
         importer_id=importer,
-        **update_values,
+        **update_by_field,
     )
     if updated is None:
         raise RuntimeError("reference family generation authority is unavailable")
-    result = validate_reference_family_result_generation_authority(updated)
-    if result.local_lineage_id != current.local_lineage_id or result.local_generation != current.local_generation:
+    adopted_authority = validate_reference_family_result_generation_authority(updated)
+    if (
+        adopted_authority.local_lineage_id != current.local_lineage_id
+        or adopted_authority.local_generation != current.local_generation
+    ):
         raise RuntimeError("reference family local generation changed during adoption")
-    return result
+    return adopted_authority
 
 
 def require_reference_family_automatic_generation_order(candidate: object, incumbent: object) -> None:

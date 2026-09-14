@@ -330,12 +330,12 @@ async def finalize_attribute_tables(ctx):
         PlanBenefits,
     )
     table_models = tuple(make_class(cls, import_date, schema_override=db_schema) for cls in processing_classes)
-    missing = [
+    missing_tables = [
         table_model.__tablename__
         for table_model in table_models
         if not await _is_table_available(db_schema, table_model.__tablename__)
     ]
-    if missing:
+    if missing_tables:
         raise RuntimeError("Required plan attribute stages are missing")
     for cls, table_model in zip(processing_classes, table_models, strict=True):
         await _finalize_attribute_stage(cls, table_model, db_schema)

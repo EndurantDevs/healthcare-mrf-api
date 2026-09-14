@@ -60,6 +60,64 @@ async def _run_migration(connection, action: str) -> None:
     await connection.run_sync(apply)
 
 
+async def _publish_initial_generations(engine, schema):
+    """Publish and verify generation one for every closed family."""
+
+    authority_by_importer = {}
+    for importer_id in generation.RELATION_NAMES_BY_IMPORTER:
+        async with engine.begin() as connection:
+            first = await generation.publish_local_reference_family_generation(
+                connection,
+                importer_id=importer_id,
+                schema_name=schema,
+            )
+            assert first.local_generation == 1
+            assert first.serving_generation.origin_lineage_id == first.local_lineage_id
+            assert first.serving_generation.origin_generation == 1
+            assert first.relation_oids == await generation.current_reference_family_relation_oids(
+                connection,
+                importer_id=importer_id,
+                schema_name=schema,
+            )
+            authority_by_importer[importer_id] = first
+    return authority_by_importer
+
+
+async def _assert_adoption_rollback(engine, schema, incumbent_authority, source_generation_by_field):
+    """Rotate one family and prove its authority rolls back with the tables."""
+
+    importer_id = incumbent_authority.importer_id
+    with pytest.raises(RuntimeError, match="force rollback"):
+        async with engine.begin() as connection:
+            table_name = generation.RELATION_NAMES_BY_IMPORTER[importer_id][0]
+            await connection.execute(text(f'ALTER TABLE "{schema}"."{table_name}" RENAME TO "{table_name}_old"'))
+            await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
+            adopted = await generation.publish_adopted_reference_family_generation(
+                connection,
+                importer_id=importer_id,
+                schema_name=schema,
+                source_generation=source_generation_by_field,
+            )
+            assert adopted.local_generation == 1
+            assert adopted.serving_generation.origin_generation == 2
+            assert adopted.relation_oids != incumbent_authority.relation_oids
+            raise RuntimeError("force rollback")
+    async with engine.connect() as connection:
+        rolled_back = await generation.read_reference_family_result_generation_authority(
+            connection,
+            importer_id=importer_id,
+            schema_name=schema,
+        )
+        assert rolled_back == incumbent_authority
+        assert (
+            await generation.capture_reference_family_serving_generation(
+                connection,
+                importer_id=importer_id,
+                schema_name=schema,
+            )
+        ) == incumbent_authority.serving_generation
+
+
 @pytest.mark.asyncio
 async def test_four_family_generation_publication_adoption_and_rollback(monkeypatch):
     """Bind every family to exact OIDs and keep adoption transaction-local."""
@@ -76,61 +134,14 @@ async def test_four_family_generation_publication_adoption_and_rollback(monkeypa
                 for table_name in relation_names:
                     await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
 
-        first_by_importer = {}
-        for importer_id in generation.RELATION_NAMES_BY_IMPORTER:
-            async with engine.begin() as connection:
-                first = await generation.publish_local_reference_family_generation(
-                    connection,
-                    importer_id=importer_id,
-                    schema_name=schema,
-                )
-                assert first.local_generation == 1
-                assert first.serving_generation.origin_lineage_id == first.local_lineage_id
-                assert first.serving_generation.origin_generation == 1
-                assert first.relation_oids == await generation.current_reference_family_relation_oids(
-                    connection,
-                    importer_id=importer_id,
-                    schema_name=schema,
-                )
-                first_by_importer[importer_id] = first
-
-        importer_id = "places-zcta"
-        source = first_by_importer[importer_id]
-        source_generation = {
-            "origin_lineage_id": source.local_lineage_id,
+        authority_by_importer = await _publish_initial_generations(engine, schema)
+        incumbent_authority = authority_by_importer["places-zcta"]
+        source_generation_by_field = {
+            "origin_lineage_id": incumbent_authority.local_lineage_id,
             "origin_generation": 2,
             "published_at": datetime.datetime(2026, 9, 14, 10, tzinfo=datetime.UTC),
         }
-        with pytest.raises(RuntimeError, match="force rollback"):
-            async with engine.begin() as connection:
-                table_name = generation.RELATION_NAMES_BY_IMPORTER[importer_id][0]
-                await connection.execute(text(f'ALTER TABLE "{schema}"."{table_name}" RENAME TO "{table_name}_old"'))
-                await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
-                adopted = await generation.publish_adopted_reference_family_generation(
-                    connection,
-                    importer_id=importer_id,
-                    schema_name=schema,
-                    source_generation=source_generation,
-                )
-                assert adopted.local_generation == 1
-                assert adopted.serving_generation.origin_generation == 2
-                assert adopted.relation_oids != source.relation_oids
-                raise RuntimeError("force rollback")
-
-        async with engine.connect() as connection:
-            rolled_back = await generation.read_reference_family_result_generation_authority(
-                connection,
-                importer_id=importer_id,
-                schema_name=schema,
-            )
-            assert rolled_back == source
-            assert (
-                await generation.capture_reference_family_serving_generation(
-                    connection,
-                    importer_id=importer_id,
-                    schema_name=schema,
-                )
-            ) == source.serving_generation
+        await _assert_adoption_rollback(engine, schema, incumbent_authority, source_generation_by_field)
 
         async with engine.begin() as connection:
             with pytest.raises(RuntimeError, match="prevents downgrade"):
