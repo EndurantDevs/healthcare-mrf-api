@@ -799,19 +799,28 @@ async def prepare_reference_family_archive_source(
     *,
     importer_id: str,
     schema_name: str,
-    source_metadata: Mapping[str, Any],
+    source_metadata: Mapping[str, Any] | None,
     dataset_id: UUID,
     on_prepared: Callable[[Any, ReferenceFamilyPreparedSource], Awaitable[None]],
+    source_metadata_factory: Callable[[Any], Awaitable[Mapping[str, Any]]] | None = None,
 ) -> ReferenceFamilyPreparedSource:
     """Clone once and persist its exact owner before the clone transaction commits."""
 
     stage_schema = reference_family_stage_schema(dataset_id)
     async with session_factory() as source_session, source_session.begin():
+        effective_source_metadata = source_metadata
+        if source_metadata_factory is not None:
+            spec = reference_family_spec(importer_id)
+            async with _bounded_capture(source_session):
+                await _lock_family(source_session, _schema_name(schema_name), spec.table_names, "SHARE")
+                effective_source_metadata = await source_metadata_factory(source_session)
+        if effective_source_metadata is None:
+            raise ReferenceFamilyArchiveError("reference family source metadata is required")
         capture = await capture_reference_family_source(
             source_session,
             importer_id=importer_id,
             schema_name=schema_name,
-            source_metadata=source_metadata,
+            source_metadata=effective_source_metadata,
         )
         async with session_factory() as clone_session, clone_session.begin():
             await _clone_source(clone_session, capture, stage_schema)
@@ -1198,6 +1207,12 @@ async def activate_reference_family_stage(
         expected_incumbent,
     )
     await _drop_empty_stage_schema(session, ownership)
+    await publish_adopted_reference_family_generation(
+        session,
+        importer_id=spec.importer_id,
+        schema_name=expected_incumbent.schema_name,
+        source_generation=None,
+    )
     return await _activation_receipt(
         session,
         spec,
@@ -1299,16 +1314,18 @@ async def activate_validated_reference_family_stage(
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
     if tuple(sorted(live_pairs)) != ownership.relation_oids:
         raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    published_authority = await publish_adopted_reference_family_generation(
+        session,
+        importer_id=spec.importer_id,
+        schema_name=expected_incumbent.schema_name,
+        source_generation=source_generation,
+    )
     if source_generation is not None:
-        published_authority = await publish_adopted_reference_family_generation(
-            session,
-            importer_id=spec.importer_id,
-            schema_name=expected_incumbent.schema_name,
-            source_generation=source_generation,
-        )
         ordered_live_oids = tuple(dict(live_pairs)[name] for name in spec.table_names)
         if published_authority.relation_oids != ordered_live_oids:
             raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
+    elif published_authority.serving_generation is not None or published_authority.relation_oids is not None:
+        raise ReferenceFamilyArchiveError("reference family generation-less adoption differs")
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
         validated_manifest.source_metadata_sha256,

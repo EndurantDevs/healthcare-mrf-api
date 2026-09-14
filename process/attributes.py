@@ -291,8 +291,7 @@ async def _finalize_attribute_stage(cls, table_model, db_schema: str) -> None:
 async def _swap_attribute_stage(cls, table_model, db_schema: str) -> None:
     table_name = f"{db_schema}.{table_model.__tablename__}"
     if not await _is_table_available(db_schema, table_model.__tablename__):
-        print(f"Skipping swap for missing table {table_name}")
-        return
+        raise RuntimeError(f"Required plan attribute stage is missing: {table_name}")
     table = table_model.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
@@ -316,8 +315,12 @@ async def _swap_attribute_stage(cls, table_model, db_schema: str) -> None:
 async def finalize_attribute_tables(ctx):
     """Finalize staged attribute tables after worker shutdown."""
 
+    context = ctx.get("context") or {}
+    if not context.get("tables_prepared"):
+        print("No plan attribute tables were prepared; skipping shutdown finalization.")
+        return
     import_date = ctx["import_date"]
-    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    test_mode = bool(context.get("test_mode"))
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     processing_classes = (
@@ -326,12 +329,18 @@ async def finalize_attribute_tables(ctx):
         PlanRatingAreas,
         PlanBenefits,
     )
-    for cls in processing_classes:
-        table_model = make_class(cls, import_date, schema_override=db_schema)
+    table_models = tuple(make_class(cls, import_date, schema_override=db_schema) for cls in processing_classes)
+    missing = [
+        table_model.__tablename__
+        for table_model in table_models
+        if not await _is_table_available(db_schema, table_model.__tablename__)
+    ]
+    if missing:
+        raise RuntimeError("Required plan attribute stages are missing")
+    for cls, table_model in zip(processing_classes, table_models, strict=True):
         await _finalize_attribute_stage(cls, table_model, db_schema)
     async with db.transaction():
-        for cls in processing_classes:
-            table_model = make_class(cls, import_date, schema_override=db_schema)
+        for cls, table_model in zip(processing_classes, table_models, strict=True):
             await _swap_attribute_stage(cls, table_model, db_schema)
         await publish_local_reference_family_generation(
             db,
