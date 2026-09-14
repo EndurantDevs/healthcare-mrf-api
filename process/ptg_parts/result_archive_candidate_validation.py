@@ -346,8 +346,7 @@ def _attach_destination_source_identity(
 
     sealed_source_key = serving_index.get("source_key")
     if "source_key" in serving_index and (
-        not isinstance(sealed_source_key, str)
-        or sealed_source_key.strip().lower() != source_key
+        not isinstance(sealed_source_key, str) or sealed_source_key.strip().lower() != source_key
     ):
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation sealed source key differs from local scope"
