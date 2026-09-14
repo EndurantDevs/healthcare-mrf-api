@@ -204,6 +204,19 @@ def normalize_tic_source_url(url: str) -> str:
     """Normalize known payer TOC download URLs that point at stale wrappers."""
     raw_url = html.unescape(str(url or "").strip())
     parsed = urlsplit(raw_url)
+    if (
+        parsed.hostname == "mrf.healthsparq.com"
+        and parsed.path.startswith("//")
+    ):
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                "/" + parsed.path.lstrip("/"),
+                parsed.query,
+                parsed.fragment,
+            )
+        )
     if parsed.netloc.lower() == "www.asrhealthbenefits.com":
         path = parsed.path.rstrip("/")
         if path.lower() == "/home/umbraco/surface/mrfdownload/index":
