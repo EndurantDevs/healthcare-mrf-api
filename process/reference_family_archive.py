@@ -128,6 +128,14 @@ class ReferenceFamilyStageCapture:
 
 
 @dataclass(frozen=True)
+class ReferenceFamilyPreparedSource:
+    """A committed frozen clone whose exact ownership is durably recorded."""
+
+    manifest: ReferenceFamilyManifest
+    ownership: ReferenceFamilyStageOwnership
+
+
+@dataclass(frozen=True)
 class ReferenceFamilyIncumbent:
     """Compare-and-swap token for the complete destination family."""
 
@@ -607,42 +615,93 @@ async def export_reference_family_archive(
 ) -> ReferenceFamilyManifest:
     """Clone, validate, dump, and exactly clean one closed family stage."""
 
-    stage_schema = reference_family_stage_schema(dataset_id)
     ownership = None
     try:
-        async with session_factory() as source_session, source_session.begin():
-            capture = await capture_reference_family_source(
-                source_session,
-                importer_id=importer_id,
-                schema_name=schema_name,
-                source_metadata=source_metadata,
-            )
-            async with session_factory() as clone_session, clone_session.begin():
-                await _clone_source(clone_session, capture, stage_schema)
-                ownership = await capture_reference_family_stage_ownership(
-                    clone_session,
-                    importer_id=importer_id,
-                    dataset_id=dataset_id,
-                )
-        async with session_factory() as stage_session, stage_session.begin():
-            await stage_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            async with _bounded_capture(stage_session):
-                await _lock_family(
-                    stage_session,
-                    stage_schema,
-                    reference_family_spec(importer_id).table_names,
-                    "SHARE",
-                )
-                await verify_reference_family_stage_ownership(stage_session, ownership)
-                await _validate_stage_manifest(stage_session, ownership=ownership, manifest=capture.manifest)
-                snapshot = (await stage_session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
-                if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
-                    raise ReferenceFamilyArchiveError("reference family stage snapshot is invalid")
-            await archive_copy(ReferenceFamilyStageCapture(capture.manifest, ownership, snapshot))
-        return capture.manifest
+        async def prepared(_session, _prepared):
+            return None
+
+        source = await prepare_reference_family_archive_source(
+            session_factory,
+            importer_id=importer_id,
+            schema_name=schema_name,
+            source_metadata=source_metadata,
+            dataset_id=dataset_id,
+            on_prepared=prepared,
+        )
+        ownership = source.ownership
+        await export_prepared_reference_family_archive(
+            session_factory,
+            prepared=source,
+            archive_copy=archive_copy,
+        )
+        return source.manifest
     finally:
         if ownership is not None:
             await _shielded_cleanup(session_factory, ownership)
+
+
+async def prepare_reference_family_archive_source(
+    session_factory: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+    source_metadata: Mapping[str, Any],
+    dataset_id: UUID,
+    on_prepared: Callable[[Any, ReferenceFamilyPreparedSource], Awaitable[None]],
+) -> ReferenceFamilyPreparedSource:
+    """Clone once and persist its exact owner before the clone transaction commits."""
+
+    stage_schema = reference_family_stage_schema(dataset_id)
+    async with session_factory() as source_session, source_session.begin():
+        capture = await capture_reference_family_source(
+            source_session,
+            importer_id=importer_id,
+            schema_name=schema_name,
+            source_metadata=source_metadata,
+        )
+        async with session_factory() as clone_session, clone_session.begin():
+            await _clone_source(clone_session, capture, stage_schema)
+            ownership = await capture_reference_family_stage_ownership(
+                clone_session,
+                importer_id=importer_id,
+                dataset_id=dataset_id,
+            )
+            prepared = ReferenceFamilyPreparedSource(capture.manifest, ownership)
+            await on_prepared(clone_session, prepared)
+    return prepared
+
+
+async def export_prepared_reference_family_archive(
+    session_factory: Any,
+    *,
+    prepared: ReferenceFamilyPreparedSource,
+    archive_copy: Callable[[ReferenceFamilyStageCapture], Awaitable[None]],
+) -> ReferenceFamilyManifest:
+    """Dump only one previously committed frozen clone; never recapture live data."""
+
+    if not isinstance(prepared, ReferenceFamilyPreparedSource):
+        raise ReferenceFamilyArchiveError("reference family prepared source is invalid")
+    ownership, manifest = prepared.ownership, prepared.manifest
+    stage_schema = ownership.schema_name
+    importer_id = ownership.importer_id
+    if manifest.importer_id != importer_id:
+        raise ReferenceFamilyArchiveError("reference family prepared source scope differs")
+    async with session_factory() as stage_session, stage_session.begin():
+        await stage_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        async with _bounded_capture(stage_session):
+            await _lock_family(
+                stage_session,
+                stage_schema,
+                reference_family_spec(importer_id).table_names,
+                "SHARE",
+            )
+            await verify_reference_family_stage_ownership(stage_session, ownership)
+            await _validate_stage_manifest(stage_session, ownership=ownership, manifest=manifest)
+            snapshot = (await stage_session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
+            if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
+                raise ReferenceFamilyArchiveError("reference family stage snapshot is invalid")
+        await archive_copy(ReferenceFamilyStageCapture(manifest, ownership, snapshot))
+    return manifest
 
 
 def _additional_index_sql(schema_name: str, model_type: type, index_spec: Mapping[str, Any]) -> str:
@@ -932,6 +991,7 @@ __all__ = [
     "ReferenceFamilyArchiveError",
     "ReferenceFamilyIncumbent",
     "ReferenceFamilyManifest",
+    "ReferenceFamilyPreparedSource",
     "ReferenceFamilySourceCapture",
     "ReferenceFamilyStageCapture",
     "ReferenceFamilyStageOwnership",
@@ -943,7 +1003,9 @@ __all__ = [
     "capture_reference_family_stage_ownership",
     "cleanup_reference_family_stage",
     "export_reference_family_archive",
+    "export_prepared_reference_family_archive",
     "precreate_reference_family_restore",
+    "prepare_reference_family_archive_source",
     "reference_family_spec",
     "reference_family_predecessor_schema",
     "reference_family_stage_schema",
