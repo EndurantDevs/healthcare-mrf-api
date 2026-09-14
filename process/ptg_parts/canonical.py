@@ -8,16 +8,20 @@ import hashlib
 import html
 import json
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from dateutil.parser import parse as parse_date
 
 from process.ptg_parts.config import PTG2_HASH_MODE_ENV
 from process.ptg_parts.domain import PTG2_MONEY_KEYS, PTG2_SET_LIKE_KEYS, PTG2_STRIPPED_QUERY_PARAMS
+
+
+_HEALTHSPARQ_TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -200,58 +204,119 @@ def canonicalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, parsed.path or "/", query, ""))
 
 
-def normalize_tic_source_url(url: str) -> str:
-    """Normalize known payer TOC download URLs that point at stale wrappers."""
-    raw_url = html.unescape(str(url or "").strip())
-    parsed = urlsplit(raw_url)
+def _healthsparq_tenant_from_source_index(
+    source_index_url: str | None,
+    *,
+    target_hostname: str | None,
+) -> str | None:
+    """Return the bounded HealthSparq tenant segment for one source index."""
+
+    source_index = urlsplit(html.unescape(str(source_index_url or "").strip()))
     if (
-        parsed.hostname == "mrf.healthsparq.com"
-        and parsed.path.startswith("//")
+        target_hostname != "mrf.healthsparq.com"
+        or source_index.hostname != target_hostname
     ):
+        return None
+    path_segments = [segment for segment in source_index.path.split("/") if segment]
+    if len(path_segments) < 2 or path_segments[1].casefold() != "prd":
+        return None
+    tenant = unquote(path_segments[0])
+    if _HEALTHSPARQ_TENANT_RE.fullmatch(tenant) is None:
+        return None
+    return tenant
+
+
+def _normalize_healthsparq_source_url(
+    parsed,
+    raw_url: str,
+    *,
+    source_index_url: str | None,
+) -> str:
+    """Repair a tenant-relative HealthSparq path only with index context."""
+
+    normalized_path = "/" + parsed.path.lstrip("/")
+    if normalized_path.startswith("/prd/") or normalized_path == "/prd":
+        tenant = _healthsparq_tenant_from_source_index(
+            source_index_url,
+            target_hostname=parsed.hostname,
+        )
+        if tenant is not None:
+            return urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    f"/{tenant}{normalized_path}",
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        if parsed.path.startswith("//"):
+            return raw_url
+    if parsed.path.startswith("//"):
         return urlunsplit(
             (
                 parsed.scheme,
                 parsed.netloc,
-                "/" + parsed.path.lstrip("/"),
+                normalized_path,
                 parsed.query,
                 parsed.fragment,
             )
         )
-    if parsed.netloc.lower() == "www.asrhealthbenefits.com":
-        path = parsed.path.rstrip("/")
-        if path.lower() == "/home/umbraco/surface/mrfdownload/index":
-            query_parameter_map = {
-                key.lower(): query_value
-                for key, query_value in parse_qsl(
-                    parsed.query, keep_blank_values=True
-                )
-            }
-            group_number = query_parameter_map.get("g") or query_parameter_map.get(
-                "groupnumber"
-            )
-            file_id = query_parameter_map.get("i") or query_parameter_map.get(
-                "fileid"
-            )
-            file_type = query_parameter_map.get("t") or query_parameter_map.get(
-                "filetype"
-            )
-            if group_number and file_id and file_type:
-                return urlunsplit(
-                    (
-                        parsed.scheme or "https",
-                        parsed.netloc,
-                        "/umbraco/surface/mrfdownload",
-                        urlencode(
-                            {
-                                "groupNumber": group_number,
-                                "fileType": file_type,
-                                "fileId": file_id,
-                            }
-                        ),
-                        "",
-                    )
-                )
     return raw_url
+
+
+def _normalize_asr_source_url(parsed, raw_url: str) -> str:
+    """Rewrite one complete ASR wrapper URL to its direct download URL."""
+
+    if parsed.netloc.lower() != "www.asrhealthbenefits.com":
+        return raw_url
+    if parsed.path.rstrip("/").lower() != "/home/umbraco/surface/mrfdownload/index":
+        return raw_url
+    query_parameter_map = {
+        key.lower(): query_value
+        for key, query_value in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    group_number = query_parameter_map.get("g") or query_parameter_map.get(
+        "groupnumber"
+    )
+    file_id = query_parameter_map.get("i") or query_parameter_map.get("fileid")
+    file_type = query_parameter_map.get("t") or query_parameter_map.get(
+        "filetype"
+    )
+    if not all((group_number, file_id, file_type)):
+        return raw_url
+    return urlunsplit(
+        (
+            parsed.scheme or "https",
+            parsed.netloc,
+            "/umbraco/surface/mrfdownload",
+            urlencode(
+                {
+                    "groupNumber": group_number,
+                    "fileType": file_type,
+                    "fileId": file_id,
+                }
+            ),
+            "",
+        )
+    )
+
+
+def normalize_tic_source_url(
+    url: str,
+    *,
+    source_index_url: str | None = None,
+) -> str:
+    """Normalize known payer TOC download URLs that point at stale wrappers."""
+    raw_url = html.unescape(str(url or "").strip())
+    parsed = urlsplit(raw_url)
+    if parsed.hostname == "mrf.healthsparq.com":
+        return _normalize_healthsparq_source_url(
+            parsed,
+            raw_url,
+            source_index_url=source_index_url,
+        )
+    return _normalize_asr_source_url(parsed, raw_url)
 
 
 def normalize_import_month(value: str | datetime.date | None) -> datetime.date:
