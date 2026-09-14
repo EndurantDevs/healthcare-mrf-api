@@ -866,6 +866,101 @@ async def _assert_rekeyed_table_contract(
         )
 
 
+async def _install_audit_occurrence_table(
+    database: Database,
+    *,
+    schema_name: str,
+) -> None:
+    """Install the production partitioned audit relation for a focused copy."""
+
+    metadata = MetaData(schema=schema_name)
+    source_table = Base.metadata.tables["mrf.ptg2_v3_audit_occurrence"]
+    target_table = source_table.to_metadata(metadata, schema=schema_name)
+    statement = str(
+        CreateTable(
+            target_table,
+            include_foreign_key_constraints=[],
+        ).compile(dialect=postgresql.dialect())
+    )
+    await database.execute_ddl(statement)
+    schema = _quoted(schema_name)
+    await database.execute_ddl(
+        f"CREATE TABLE {schema}.ptg2_v3_audit_occurrence_0 "
+        f"PARTITION OF {schema}.ptg2_v3_audit_occurrence "
+        "FOR VALUES WITH (MODULUS 1, REMAINDER 0)"
+    )
+
+
+async def _seed_audit_occurrence(
+    database: Database,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    occurrence_id: bytes,
+) -> None:
+    schema = _quoted(schema_name)
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_audit_occurrence
+            (snapshot_key, occurrence_id, code_key, provider_set_key,
+             price_key, source_key, npi, atom_ordinal, atom_key)
+        VALUES (:snapshot_key, :occurrence_id, 1, 2, 3, 0,
+                1234567890, 0, 4)
+        """,
+        snapshot_key=snapshot_key,
+        occurrence_id=occurrence_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_archive_rekeys_persisted_audit_occurrences() -> None:
+    """Copy only the selected sealed sample under its destination layout key."""
+
+    _require_native_postgres()
+    stage_name = f"ptg_archive_stage_{uuid.uuid4().hex[:16]}"
+    destination_name = f"ptg_archive_destination_{uuid.uuid4().hex[:16]}"
+    database = Database()
+    await database.connect()
+    try:
+        for schema_name in (stage_name, destination_name):
+            await database.execute_ddl(f"CREATE SCHEMA {_quoted(schema_name)}")
+            await _install_audit_occurrence_table(
+                database,
+                schema_name=schema_name,
+            )
+        await _seed_audit_occurrence(
+            database,
+            schema_name=stage_name,
+            snapshot_key=71,
+            occurrence_id=b"a" * 32,
+        )
+        await _seed_audit_occurrence(
+            database,
+            schema_name=stage_name,
+            snapshot_key=72,
+            occurrence_id=b"b" * 32,
+        )
+        async with database.transaction() as session:
+            await adoption._copy_rekeyed_table(
+                session,
+                schema_name=destination_name,
+                staging_schema_name=stage_name,
+                table_name="ptg2_v3_audit_occurrence",
+                source_snapshot_key=71,
+                destination_snapshot_key=1701,
+            )
+        destination = _quoted(destination_name)
+        assert "ptg2_v3_audit_occurrence" in adoption._REKEYED_TABLES
+        assert await database.scalar(f"SELECT snapshot_key FROM {destination}.ptg2_v3_audit_occurrence") == 1701
+        assert await database.scalar(f"SELECT occurrence_id FROM {destination}.ptg2_v3_audit_occurrence") == b"a" * 32
+    finally:
+        try:
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {_quoted(destination_name)} CASCADE")
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {_quoted(stage_name)} CASCADE")
+        finally:
+            await database.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_native_archive_preparation_remaps_local_layout_and_preserves_cas(
     tmp_path: Path,
