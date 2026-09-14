@@ -22,6 +22,7 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
+    _canonical_source_key,
     frozen_internal_run_id,
     frozen_rate_binding_from_params,
     frozen_rate_binding_sha256,
@@ -33,6 +34,7 @@ from process.ptg_parts.frozen_rate_binding_store import (
 from process.ptg_parts.frozen_rate_candidate import (
     validate_frozen_candidate_evidence,
 )
+from process.ptg_parts.frozen_rate_files import FrozenRateFileValidationError
 from process.ptg_parts.ptg2_candidate_attestation import (
     CANDIDATE_SOURCE_RECORDS_SQL,
 )
@@ -40,7 +42,6 @@ from process.ptg_parts.ptg2_invalid_price_exclusion import (
     INVALID_PRICE_EXCLUSION_POLICY_FIELD,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
-from process.ptg_parts.snapshot_tables import _normalize_source_key
 
 RESULT_ARCHIVE_CANDIDATE_PREPARATION_CONTRACT = "ptg_result_archive_candidate_preparation_v1"
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -106,9 +107,12 @@ def _activation_scope(
 ) -> tuple[str, tuple[str, str] | None]:
     manifest_by_name = _mapping(manifest)
     activation_by_name = _mapping(manifest_by_name.get("activation"))
-    source_key = _normalize_source_key(str(activation_by_name.get("source_key") or "").strip())
-    if not source_key:
-        raise ResultArchiveCandidatePreparationError(f"archive candidate preparation {label} has no activation scope")
+    try:
+        source_key = _canonical_source_key(activation_by_name.get("source_key"))
+    except FrozenRateFileValidationError as exc:
+        raise ResultArchiveCandidatePreparationError(
+            f"archive candidate preparation {label} has no valid activation scope"
+        ) from exc
     has_plan_id_declaration = "plan_id" in activation_by_name
     has_market_type_declaration = "plan_market_type" in activation_by_name
     if has_plan_id_declaration != has_market_type_declaration:

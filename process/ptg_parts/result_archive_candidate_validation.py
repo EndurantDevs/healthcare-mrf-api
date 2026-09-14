@@ -27,6 +27,8 @@ from process.ptg_candidate_audit import (
     IMPORTER_NAME as CANDIDATE_AUDIT_IMPORTER,
 )
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.frozen_rate_binding import _canonical_source_key
+from process.ptg_parts.frozen_rate_files import FrozenRateFileValidationError
 from process.ptg_parts.ptg2_candidate_attestation import CANDIDATE_SOURCE_RECORDS_SQL
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_source_lifecycle_lock
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
@@ -91,9 +93,7 @@ _LOCKED_CANDIDATE_SQL = """
       JOIN {schema}.ptg2_frozen_source_file_binding frozen
         ON frozen.internal_run_id = snapshot.import_run_id
       LEFT JOIN {schema}.ptg2_current_source_snapshot current_pointer
-        ON current_pointer.source_key = lower(
-            snapshot.manifest->'activation'->>'source_key'
-        )
+        ON current_pointer.source_key = :source_key
      WHERE snapshot.snapshot_id = :snapshot_id
      FOR UPDATE OF snapshot, internal_run, binding, scope
 """
@@ -171,6 +171,17 @@ def _validate_preparation_receipts(
     return snapshot_id
 
 
+def _validated_source_key(value: Any) -> str:
+    """Use frozen-binding admission for the lifecycle lock and pointer identity."""
+
+    try:
+        return _canonical_source_key(value)
+    except FrozenRateFileValidationError as exc:
+        raise ResultArchiveCandidateValidationError(
+            "archive candidate validation destination source scope is unavailable"
+        ) from exc
+
+
 async def _candidate_source_key(
     session: Any,
     *,
@@ -187,12 +198,7 @@ async def _candidate_source_key(
     )
     source_key_rows = source_key_query.all()
     raw_source_key = source_key_rows[0][0] if len(source_key_rows) == 1 else None
-    source_key = str(raw_source_key or "").strip().lower()
-    if not source_key:
-        raise ResultArchiveCandidateValidationError(
-            "archive candidate validation destination source scope is unavailable"
-        )
-    return source_key
+    return _validated_source_key(raw_source_key)
 
 
 async def _locked_candidate_row(
@@ -200,10 +206,11 @@ async def _locked_candidate_row(
     *,
     schema_name: str,
     snapshot_id: str,
+    source_key: str,
 ) -> dict[str, Any]:
     candidate_query = await session.execute(
         text(_LOCKED_CANDIDATE_SQL.format(schema=_quote_ident(schema_name))),
-        {"snapshot_id": snapshot_id},
+        {"snapshot_id": snapshot_id, "source_key": source_key},
     )
     candidate_rows = [_mapping(candidate_record) for candidate_record in candidate_query]
     if len(candidate_rows) != 1:
@@ -317,7 +324,7 @@ def _candidate_attributes(
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation destination state is not building or replayable"
         )
-    if str(activation.get("source_key") or "").strip().lower() != source_key:
+    if _validated_source_key(activation.get("source_key")) != source_key:
         raise ResultArchiveCandidateValidationError("archive candidate validation destination source scope changed")
     manifest["serving_index"] = copy.deepcopy(dict(serving_index))
     return candidate_snapshot_attributes(
@@ -530,6 +537,7 @@ async def validate_result_archive_candidate_for_audit(
         session,
         schema_name=destination_schema,
         snapshot_id=snapshot_id,
+        source_key=source_key,
     )
     audit_target, candidate_attributes = await _validated_audit_target(
         session,

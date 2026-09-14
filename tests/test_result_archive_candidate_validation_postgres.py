@@ -41,7 +41,9 @@ _DESTINATION_SNAPSHOT_KEY = 1701
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rows", [[], [(None,)], [(" ",)], [("a",), ("b",)]])
+@pytest.mark.parametrize(
+    "rows", [[], [(None,)], [(" ",)], [("a",), ("b",)], [("a" * 97,)], [("é" * 49,)], [("source\na",)]]
+)
 async def test_candidate_source_key_rejects_missing_or_ambiguous_scope(rows) -> None:
     """Invalid source scope fails before a lifecycle lock can be selected."""
 
@@ -294,7 +296,8 @@ async def test_validation_requires_caller_transaction_before_database_access() -
 
 
 @pytest.mark.asyncio
-async def test_native_validation_stages_local_manifest_and_replays(native_candidate) -> None:
+@pytest.mark.parametrize("activation_source_key", ["source_a", " Source-A "])
+async def test_native_validation_stages_local_manifest_and_replays(native_candidate, activation_source_key) -> None:
     """Retain the incumbent while producing a replayable post-commit audit request."""
 
     fixture = native_candidate
@@ -304,6 +307,14 @@ async def test_native_validation_stages_local_manifest_and_replays(native_candid
         prepared_candidate, prepared_layout = await _prepare_candidate_and_layout(
             session,
             fixture,
+        )
+        await session.execute(
+            text(
+                f'UPDATE "{fixture.destination_schema}".ptg2_snapshot '
+                "SET manifest = jsonb_set(manifest::jsonb, '{activation,source_key}', CAST(:source_key AS jsonb)) "
+                "WHERE snapshot_id = 'local-candidate'"
+            ),
+            {"source_key": json.dumps(activation_source_key)},
         )
         handoff = await validation.validate_result_archive_candidate_for_audit(
             session,
