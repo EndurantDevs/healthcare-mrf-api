@@ -27,6 +27,7 @@ from process.ptg_parts.frozen_rate_files import (
     frozen_rate_file_proof_sha256,
     frozen_rate_file_set_sha256,
 )
+from process.ptg_parts.source_pointers import candidate_snapshot_attributes
 
 _ALLOWED_AMOUNT_TABLES = (
     "ptg2_allowed_amount_plan",
@@ -207,6 +208,29 @@ def _candidate_manifest(
     }
 
 
+def _ordinary_source_candidate_manifest(
+    *,
+    frozen_params: dict[str, object],
+    descriptors: list[dict[str, object]],
+) -> dict[str, object]:
+    """Build the source manifest through the ordinary candidate transition."""
+
+    snapshot = candidate_snapshot_attributes(
+        {"manifest": _candidate_manifest(frozen_params=frozen_params, descriptors=descriptors)},
+        source_key="source-a",
+        previous_snapshot_id=None,
+    )
+    manifest = snapshot["manifest"]
+    assert isinstance(manifest, dict)
+    assert set(manifest["activation"]) == {
+        "contract",
+        "state",
+        "source_key",
+        "expected_previous_snapshot_id",
+    }
+    return manifest
+
+
 async def _seed_source_versions(database: Database, schema: str, descriptor: dict) -> None:
     """Persist the source identity and immutable file version used by the candidate."""
 
@@ -383,7 +407,10 @@ async def _seed_candidate_pair(fixture: _CandidateFixture, frozen_params: dict, 
         schema_name=fixture.stage_name,
         snapshot_id="archive-snapshot",
         import_run_id="ptg2:archive-filing",
-        manifest=_candidate_manifest(frozen_params=stage_params_by_name, descriptors=descriptors),
+        manifest=_ordinary_source_candidate_manifest(
+            frozen_params=stage_params_by_name,
+            descriptors=descriptors,
+        ),
         snapshot_key=71,
     )
     await _seed_snapshot(
@@ -535,6 +562,70 @@ async def test_native_candidate_rejects_source_scope_mismatch(native_candidate) 
     await fixture.database.status(
         f"UPDATE {_quoted(fixture.destination_name)}.ptg2_snapshot SET manifest = "
         "jsonb_set(manifest, '{activation,source_key}', '\"other-source\"'::jsonb) "
+        "WHERE snapshot_id = 'local-candidate'"
+    )
+    with pytest.raises(candidate_preparation.ResultArchiveCandidatePreparationError, match="source scope differs"):
+        await _prepare_candidate(fixture)
+    await _assert_unwritten_candidate(fixture)
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_rejects_database_plan_scope_mismatch(native_candidate) -> None:
+    """The locked snapshot-scope rows remain authoritative for both candidates."""
+
+    fixture = native_candidate
+    await fixture.database.status(
+        f"UPDATE {_quoted(fixture.destination_name)}.ptg2_v3_snapshot_scope "
+        "SET plan_id = 'other-plan' WHERE snapshot_id = 'local-candidate'"
+    )
+    with pytest.raises(candidate_preparation.ResultArchiveCandidatePreparationError, match="source scope differs"):
+        await _prepare_candidate(fixture)
+    await _assert_unwritten_candidate(fixture)
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_rejects_missing_database_plan_scope(native_candidate) -> None:
+    """A manifest cannot replace the source snapshot's locked scope row."""
+
+    fixture = native_candidate
+    await fixture.database.status(
+        f"DELETE FROM {_quoted(fixture.stage_name)}.ptg2_v3_snapshot_scope "
+        "WHERE snapshot_id = 'archive-snapshot'"
+    )
+    with pytest.raises(
+        candidate_preparation.ResultArchiveCandidatePreparationError,
+        match="staging snapshot binding is missing or ambiguous",
+    ):
+        await _prepare_candidate(fixture)
+    await _assert_unwritten_candidate(fixture)
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_rejects_partial_legacy_manifest_plan_scope(native_candidate) -> None:
+    """Optional legacy manifest scope must be complete when declared."""
+
+    fixture = native_candidate
+    await fixture.database.status(
+        f"UPDATE {_quoted(fixture.destination_name)}.ptg2_snapshot "
+        "SET manifest = manifest #- '{activation,plan_market_type}' "
+        "WHERE snapshot_id = 'local-candidate'"
+    )
+    with pytest.raises(
+        candidate_preparation.ResultArchiveCandidatePreparationError,
+        match="partial activation plan scope",
+    ):
+        await _prepare_candidate(fixture)
+    await _assert_unwritten_candidate(fixture)
+
+
+@pytest.mark.asyncio
+async def test_native_candidate_rejects_conflicting_legacy_manifest_plan_scope(native_candidate) -> None:
+    """Optional legacy manifest scope cannot conflict with its locked row."""
+
+    fixture = native_candidate
+    await fixture.database.status(
+        f"UPDATE {_quoted(fixture.destination_name)}.ptg2_snapshot SET manifest = "
+        "jsonb_set(manifest, '{activation,plan_id}', '\"other-plan\"'::jsonb) "
         "WHERE snapshot_id = 'local-candidate'"
     )
     with pytest.raises(candidate_preparation.ResultArchiveCandidatePreparationError, match="source scope differs"):
