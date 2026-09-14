@@ -15,6 +15,7 @@ from db.models import (
     CustomImportPublicationEvent,
     CustomImportRootScalar,
     CustomImportSchemaRevision,
+    CustomImportSourceStream,
 )
 from db.models import CustomImportWinner
 
@@ -36,6 +37,18 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
     assert isinstance(CustomImportSchemaRevision.__table__.c.canonical_schema.type, sa.Text)
     assert CustomImportSchemaRevision.__table__.c.schema_sha256.type.length == 32
     assert CustomImportField.__table__.c.projection_slot.nullable is False
+    assert CustomImportSourceStream.__table__.c.record_path.nullable is True
+    source_stream_checks_by_name = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in CustomImportSourceStream.__table__.constraints
+        if isinstance(constraint, sa.CheckConstraint)
+    }
+    assert "decoder = 'xml' AND record_path IS NOT NULL" in source_stream_checks_by_name[
+        "custom_import_source_stream_record_path_check"
+    ]
+    assert "decoder <> 'xml' AND record_path IS NULL" in source_stream_checks_by_name[
+        "custom_import_source_stream_record_path_check"
+    ]
     assert "state" not in CustomImportGeneration.__table__.c
     assert "custom_import_generation_execution_key" in {
         constraint.name for constraint in CustomImportGeneration.__table__.constraints
@@ -87,6 +100,12 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "custom_import_generation_family_lookup_idx" not in index_ddl
     assert "custom_import_entity_binding_lookup_idx" not in index_ddl
     assert "custom_import_winner_lookup_idx" in index_ddl
+    source_stream_statement = next(
+        statement for statement in migration._TABLE_DDL if "custom_import_source_stream" in statement
+    )
+    assert "record_path VARCHAR(63)" in source_stream_statement
+    assert "decoder = 'xml' AND record_path IS NOT NULL" in source_stream_statement
+    assert "decoder <> 'xml' AND record_path IS NULL" in source_stream_statement
     function_statement = next(
         statement for statement in statements if "CREATE FUNCTION" in statement
     )

@@ -196,11 +196,13 @@ CREATE TABLE mrf.custom_import_source_stream (
 	decoder VARCHAR(16) NOT NULL,
 	compression VARCHAR(8) NOT NULL,
 	snapshot_token_selector VARCHAR(255) NOT NULL,
+	record_path VARCHAR(63),
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT transaction_timestamp() NOT NULL,
 	CONSTRAINT custom_import_source_stream_pkey PRIMARY KEY (definition_revision_id, stream_slot),
 	CONSTRAINT custom_import_source_stream_id_key UNIQUE (definition_revision_id, stream_id),
 	CONSTRAINT custom_import_source_stream_collection_fkey FOREIGN KEY(schema_revision_id, dataset_id, collection_slot) REFERENCES mrf.custom_import_child_collection (schema_revision_id, dataset_id, collection_slot) ON DELETE RESTRICT,
 	CONSTRAINT custom_import_source_stream_shape_check CHECK (stream_slot > 0 AND stream_id ~ '^[a-z][a-z0-9_]{0,62}$' AND record_kind IN ('root', 'child') AND decoder IN ('csv', 'tsv', 'json', 'ndjson', 'xml', 'parquet') AND compression IN ('none', 'gzip') AND ((record_kind = 'root' AND collection_slot IS NULL) OR (record_kind = 'child' AND collection_slot IS NOT NULL))),
+	CONSTRAINT custom_import_source_stream_record_path_check CHECK ((decoder = 'xml' AND record_path IS NOT NULL AND record_path ~ '^[a-z][a-z0-9_]{0,62}$') OR (decoder <> 'xml' AND record_path IS NULL)),
 	CONSTRAINT custom_import_source_stream_owner_key UNIQUE (definition_revision_id, dataset_id, schema_revision_id, stream_slot),
 	CONSTRAINT custom_import_source_stream_definition_fkey FOREIGN KEY(definition_revision_id, dataset_id, schema_revision_id) REFERENCES mrf.custom_import_definition_revision (definition_revision_id, dataset_id, schema_revision_id) ON DELETE RESTRICT
 )
