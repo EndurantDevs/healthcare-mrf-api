@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Behavior contracts for PLACES importer helper boundaries."""
+
 from __future__ import annotations
 import csv
 import importlib
@@ -7,13 +8,36 @@ import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import pytest
+
 places = importlib.import_module("process.places_zcta")
+
+
 class _Transaction:
-    async def __aenter__(self): return self
-    async def __aexit__(self, *_args): return False
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
 def _places_csv(row_list):
-    field_name_list=["Year","LocationID","MeasureId","Measure","Data_Value","Low_Confidence_Limit","High_Confidence_Limit","Data_Value_Type","DataSource"]
-    buffer=io.StringIO(); writer=csv.DictWriter(buffer,fieldnames=field_name_list); writer.writeheader(); writer.writerows(row_list); return buffer.getvalue()
+    field_name_list = [
+        "Year",
+        "LocationID",
+        "MeasureId",
+        "Measure",
+        "Data_Value",
+        "Low_Confidence_Limit",
+        "High_Confidence_Limit",
+        "Data_Value_Type",
+        "DataSource",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=field_name_list)
+    writer.writeheader()
+    writer.writerows(row_list)
+    return buffer.getvalue()
+
 
 @pytest.mark.asyncio
 async def test_places_reader_flushes_deduplicated_rows_and_stops_at_selected_limit(monkeypatch, tmp_path):
@@ -21,13 +45,15 @@ async def test_places_reader_flushes_deduplicated_rows_and_stops_at_selected_lim
 
     csv_path = tmp_path / "places.csv"
     csv_path.write_text(
-        _places_csv([
-            {"Year": "2025", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "old"},
-            {"Year": "2026", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "first"},
-            {"Year": "2026", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "replacement"},
-            {"Year": "2026", "LocationID": "bad", "MeasureId": "B", "Measure": "invalid"},
-            {"Year": "2026", "LocationID": "60655", "MeasureId": "C", "Measure": "second"},
-        ]),
+        _places_csv(
+            [
+                {"Year": "2025", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "old"},
+                {"Year": "2026", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "first"},
+                {"Year": "2026", "LocationID": "USZCTA5 60654", "MeasureId": "A", "Measure": "replacement"},
+                {"Year": "2026", "LocationID": "bad", "MeasureId": "B", "Measure": "invalid"},
+                {"Year": "2026", "LocationID": "60655", "MeasureId": "C", "Measure": "second"},
+            ]
+        ),
         encoding="utf-8",
     )
     pushed_batch_list = []
@@ -38,13 +64,21 @@ async def test_places_reader_flushes_deduplicated_rows_and_stops_at_selected_lim
     monkeypatch.setattr(places, "push_objects", push)
     monkeypatch.setattr(places, "raise_if_cancelled", AsyncMock())
     processed, accepted = await places._read_places_rows(
-        str(csv_path), latest_year=2026, target_cls="stage", batch_size=2,
-        test_mode=True, test_row_limit=3, ctx={}, task={},
+        str(csv_path),
+        latest_year=2026,
+        target_cls="stage",
+        batch_size=2,
+        test_mode=True,
+        test_row_limit=3,
+        ctx={},
+        task={},
     )
 
     assert processed == 5
     assert accepted == 2
-    staged_by_measure = {staged_record["measure_id"]: staged_record for batch, _, _ in pushed_batch_list for staged_record in batch}
+    staged_by_measure = {
+        staged_record["measure_id"]: staged_record for batch, _, _ in pushed_batch_list for staged_record in batch
+    }
     assert staged_by_measure["A"]["measure_name"] == "replacement"
     assert staged_by_measure["C"]["zcta"] == "60655"
 
@@ -74,7 +108,6 @@ async def test_places_detect_and_validation_fail_closed_for_empty_or_sparse_stag
     assert await places._validated_places_stage_rows(stage, "mrf", {"test_mode": True}) == 2
 
 
-
 def test_places_scalar_normalizers_and_identifier_helpers_are_fail_closed(monkeypatch):
     """Loose source fields cannot manufacture valid PLACES values or unsafe limits."""
 
@@ -96,10 +129,13 @@ def test_places_empty_identifiers_and_incomplete_records_are_rejected():
     assert len(places._normalize_import_id(None)) == 8
     assert len(places._normalize_import_id("!!!")) == 8
     assert places._safe_int(None) is None
-    assert places._build_places_record(
-        {"Year": "2026", "LocationID": "60654"},
-        latest_year=2026,
-    ) is None
+    assert (
+        places._build_places_record(
+            {"Year": "2026", "LocationID": "60654"},
+            latest_year=2026,
+        )
+        is None
+    )
     assert places._safe_float("1,024.5") == 1024.5
     assert places._safe_float({}) is None
     assert places._normalize_zcta("zip 60654 then 60655") == "60655"
@@ -134,6 +170,8 @@ async def test_places_index_builder_and_publish_swap_preserve_declared_indexes(m
     monkeypatch.setattr(places.db, "status", status)
     monkeypatch.setattr(places.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(places, "print_time_info", lambda _start: None)
+    generation_writer = AsyncMock()
+    monkeypatch.setattr(places, "publish_local_reference_family_generation", generation_writer)
     monkeypatch.setattr(
         places.PricingPlacesZcta,
         "__my_additional_indexes__",
@@ -142,6 +180,11 @@ async def test_places_index_builder_and_publish_swap_preserve_declared_indexes(m
 
     await places.publish_places_zcta_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True, "start": "start"}}
+    )
+    generation_writer.assert_awaited_once_with(
+        places.db,
+        importer_id="places-zcta",
+        schema_name="mrf",
     )
 
     sql_statement_list = [call.args[0] for call in status.await_args_list]
