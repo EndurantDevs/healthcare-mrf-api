@@ -569,11 +569,31 @@ async def capture_reference_family_source(
 ) -> ReferenceFamilySourceCapture:
     """Pin and describe one exact live family under the caller transaction."""
 
+    return await _capture_reference_family_source(
+        session,
+        importer_id=importer_id,
+        schema_name=schema_name,
+        source_metadata=source_metadata,
+        configure_isolation=True,
+    )
+
+
+async def _capture_reference_family_source(
+    session: Any,
+    *,
+    importer_id: str,
+    schema_name: str,
+    source_metadata: Mapping[str, Any],
+    configure_isolation: bool,
+) -> ReferenceFamilySourceCapture:
+    """Capture after either this function or its caller establishes isolation."""
+
     _require_transaction(session)
     spec = reference_family_spec(importer_id)
     schema = _schema_name(schema_name)
     _source_metadata(source_metadata)
-    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+    if configure_isolation:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     async with _bounded_capture(session):
         await _lock_family(session, schema, spec.table_names, "SHARE")
         manifest = await _family_manifest(
@@ -808,6 +828,7 @@ async def prepare_reference_family_archive_source(
 
     stage_schema = reference_family_stage_schema(dataset_id)
     async with session_factory() as source_session, source_session.begin():
+        await source_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         effective_source_metadata = source_metadata
         if source_metadata_factory is not None:
             spec = reference_family_spec(importer_id)
@@ -816,11 +837,12 @@ async def prepare_reference_family_archive_source(
                 effective_source_metadata = await source_metadata_factory(source_session)
         if effective_source_metadata is None:
             raise ReferenceFamilyArchiveError("reference family source metadata is required")
-        capture = await capture_reference_family_source(
+        capture = await _capture_reference_family_source(
             source_session,
             importer_id=importer_id,
             schema_name=schema_name,
             source_metadata=effective_source_metadata,
+            configure_isolation=False,
         )
         async with session_factory() as clone_session, clone_session.begin():
             await _clone_source(clone_session, capture, stage_schema)
