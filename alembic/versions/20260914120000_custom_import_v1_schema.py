@@ -285,7 +285,7 @@ CREATE TABLE mrf.custom_import_generation (
 	CONSTRAINT custom_import_generation_content_key UNIQUE (dataset_id, generation_sha256),
 	CONSTRAINT custom_import_generation_execution_fkey FOREIGN KEY(execution_id, dataset_id, definition_revision_id, schema_revision_id, capture_bundle_id) REFERENCES mrf.custom_import_execution (execution_id, dataset_id, definition_revision_id, schema_revision_id, capture_bundle_id) ON DELETE RESTRICT,
 	CONSTRAINT custom_import_generation_base_fkey FOREIGN KEY(base_generation_id, base_dataset_id) REFERENCES mrf.custom_import_generation (generation_id, dataset_id) ON DELETE RESTRICT,
-	CONSTRAINT custom_import_generation_shape_check CHECK (root_count >= 0 AND family_count >= 0 AND octet_length(source_bundle_sha256) = 32 AND octet_length(generation_sha256) = 32 AND ((base_generation_id IS NULL AND base_dataset_id IS NULL) OR (base_generation_id IS NOT NULL AND base_dataset_id = dataset_id)))
+	CONSTRAINT custom_import_generation_shape_check CHECK (root_count >= 0 AND family_count >= 0 AND octet_length(source_bundle_sha256) = 32 AND octet_length(generation_sha256) = 32 AND ((base_generation_id IS NULL AND base_dataset_id IS NULL) OR (base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL AND base_dataset_id = dataset_id)))
 )
     """,
     """\
@@ -379,7 +379,7 @@ CREATE TABLE mrf.custom_import_publication_event (
 	CONSTRAINT custom_import_publication_event_pkey PRIMARY KEY (publication_event_id),
 	CONSTRAINT custom_import_publication_event_execution_fkey FOREIGN KEY(execution_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_execution (execution_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
 	CONSTRAINT custom_import_publication_event_to_fkey FOREIGN KEY(to_generation_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_generation (generation_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
-	CONSTRAINT custom_import_publication_event_shape_check CHECK (event_kind IN ('activated', 'rolled_back', 'no_change') AND expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND ((event_kind IN ('activated', 'rolled_back') AND committed_pointer_version = expected_pointer_version + 1) OR (event_kind = 'no_change' AND from_generation_id = to_generation_id AND committed_pointer_version = expected_pointer_version)) AND octet_length(event_sha256) = 32),
+	CONSTRAINT custom_import_publication_event_shape_check CHECK (event_kind IN ('activated', 'rolled_back', 'no_change') AND expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND ((event_kind IN ('activated', 'rolled_back') AND committed_pointer_version = expected_pointer_version + 1) OR (event_kind = 'no_change' AND from_generation_id IS NOT NULL AND from_generation_id = to_generation_id AND committed_pointer_version = expected_pointer_version)) AND octet_length(event_sha256) = 32),
 	CONSTRAINT custom_import_publication_event_from_fkey FOREIGN KEY(from_generation_id, dataset_id) REFERENCES mrf.custom_import_generation (generation_id, dataset_id) ON DELETE RESTRICT
 )
     """,

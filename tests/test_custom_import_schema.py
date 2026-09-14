@@ -12,6 +12,7 @@ from db.models import (
     CustomImportDataset,
     CustomImportField,
     CustomImportGeneration,
+    CustomImportPublicationEvent,
     CustomImportRootScalar,
     CustomImportSchemaRevision,
 )
@@ -39,6 +40,18 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
     assert "custom_import_generation_execution_key" in {
         constraint.name for constraint in CustomImportGeneration.__table__.constraints
     }
+    generation_shape = next(
+        constraint
+        for constraint in CustomImportGeneration.__table__.constraints
+        if constraint.name == "custom_import_generation_shape_check"
+    )
+    assert "base_dataset_id IS NOT NULL" in str(generation_shape.sqltext)
+    publication_event_shape = next(
+        constraint
+        for constraint in CustomImportPublicationEvent.__table__.constraints
+        if constraint.name == "custom_import_publication_event_shape_check"
+    )
+    assert "from_generation_id IS NOT NULL" in str(publication_event_shape.sqltext)
     assert tuple(CustomImportWinner.__table__.primary_key.columns.keys()) == (
         "generation_id", "profile_slot", "entity_binding_id", "context_key_sha256"
     )
@@ -51,6 +64,7 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
     migration = _migration()
     statements: list[str] = []
     monkeypatch.setattr(migration.op, "execute", statements.append)
@@ -63,6 +77,8 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert all(f"CREATE TABLE {schema}.{name}" in normalized for name in migration._TABLE_NAMES)
     assert "INSERT INTO" not in normalized
     assert "guard_custom_import_immutable_row" in normalized
+    assert "base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL" in normalized
+    assert "event_kind = 'no_change' AND from_generation_id IS NOT NULL" in normalized
     assert normalized.count("BEFORE UPDATE OR DELETE") == len(migration._IMMUTABLE_TABLES)
     assert len(migration._TABLE_DDL) == len(migration._TABLE_NAMES)
     assert all("mrf." in statement for statement in migration._TABLE_DDL)
@@ -87,6 +103,7 @@ def test_migration_downgrade_removes_only_v1_relations_in_reverse_dependency_ord
     migration = _migration()
     assert not hasattr(migration, "models")
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
     statements: list[str] = []
     monkeypatch.setattr(migration.op, "execute", statements.append)
 
