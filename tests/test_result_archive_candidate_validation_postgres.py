@@ -365,7 +365,7 @@ async def test_native_validation_rejects_conflicting_sealed_source_set(native_ca
                 fixture,
             )
             schema = '"' + fixture.destination_schema + '"'
-            conflicting_source_set = {
+            conflicting_source_set_by_field = {
                 "contract": "sorted_raw_container_sha256_bytes_v1",
                 "source_count": 2,
                 "raw_container_sha256_digest": "00" * 32,
@@ -384,7 +384,7 @@ async def test_native_validation_rejects_conflicting_sealed_source_set(native_ca
                 ),
                 {
                     "snapshot_key": _DESTINATION_SNAPSHOT_KEY,
-                    "source_set": json.dumps(conflicting_source_set),
+                    "source_set": json.dumps(conflicting_source_set_by_field),
                 },
             )
             await validation.validate_result_archive_candidate_for_audit(
