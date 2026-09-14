@@ -589,8 +589,7 @@ async def test_native_candidate_rejects_missing_database_plan_scope(native_candi
 
     fixture = native_candidate
     await fixture.database.status(
-        f"DELETE FROM {_quoted(fixture.stage_name)}.ptg2_v3_snapshot_scope "
-        "WHERE snapshot_id = 'archive-snapshot'"
+        f"DELETE FROM {_quoted(fixture.stage_name)}.ptg2_v3_snapshot_scope WHERE snapshot_id = 'archive-snapshot'"
     )
     with pytest.raises(
         candidate_preparation.ResultArchiveCandidatePreparationError,

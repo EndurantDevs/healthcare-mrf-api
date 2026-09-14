@@ -344,8 +344,7 @@ def _attach_destination_source_set(
 
     try:
         source_set = shared_source_set_metadata(
-            source_record.get("raw_container_sha256")
-            for source_record in source_records
+            source_record.get("raw_container_sha256") for source_record in source_records
         )
     except ValueError as error:
         raise ResultArchiveCandidateValidationError(
@@ -353,8 +352,7 @@ def _attach_destination_source_set(
         ) from error
     sealed_source_set = serving_index.get("source_set")
     if sealed_source_set is not None and (
-        not isinstance(sealed_source_set, Mapping)
-        or dict(sealed_source_set) != source_set
+        not isinstance(sealed_source_set, Mapping) or dict(sealed_source_set) != source_set
     ):
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation sealed source set differs from local evidence"
