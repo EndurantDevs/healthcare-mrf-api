@@ -1097,7 +1097,8 @@ class CustomImportGeneration(_CustomImportModel):
             "root_count >= 0 AND family_count >= 0 AND " + _sha256_check("source_bundle_sha256")
             + " AND " + _sha256_check("generation_sha256") + " AND "
             "((base_generation_id IS NULL AND base_dataset_id IS NULL) OR "
-            "(base_generation_id IS NOT NULL AND base_dataset_id = dataset_id))",
+            "(base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL AND "
+            "base_dataset_id = dataset_id))",
             name="custom_import_generation_shape_check",
         ),
     )
@@ -1468,7 +1469,8 @@ class CustomImportPublicationEvent(_CustomImportModel):
             "expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND "
             "((event_kind IN ('activated', 'rolled_back') AND "
             "committed_pointer_version = expected_pointer_version + 1) OR "
-            "(event_kind = 'no_change' AND from_generation_id = to_generation_id AND "
+            "(event_kind = 'no_change' AND from_generation_id IS NOT NULL AND "
+            "from_generation_id = to_generation_id AND "
             "committed_pointer_version = expected_pointer_version)) AND "
             + _sha256_check("event_sha256"),
             name="custom_import_publication_event_shape_check",
