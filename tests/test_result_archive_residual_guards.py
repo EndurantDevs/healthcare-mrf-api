@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,8 +19,8 @@ from process.ptg_parts import result_archive_closure as closure
 from process.ptg_parts import result_archive_source_authority as source_authority
 from process.ptg_parts import source_pointers
 from process.ptg_parts.frozen_rate_binding import frozen_rate_binding_from_params, frozen_rate_binding_sha256
-from tests.test_result_archive_candidate_preparation_postgres import _candidate_manifest, _frozen_params
 from tests.test_ptg_singleton_direct_control import _invalid_price_policy
+from tests.test_result_archive_candidate_preparation_postgres import _candidate_manifest, _frozen_params
 
 
 class _QueryResult:
