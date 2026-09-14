@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import copy
 from dataclasses import dataclass
+import datetime
 import hashlib
 import importlib
 import importlib.util
@@ -31,7 +32,7 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
 )
 from api.ptg2_types import PTG2ServingTables
-from db.connection import Database
+from db.connection import Database, db
 from db.migration_ptg2_frozen_source_file_binding import (
     install_frozen_source_file_binding,
 )
@@ -54,6 +55,7 @@ from process.ptg_parts.domain import (
     PTG2DownloadedJob,
     PTG2HeadMetadata,
     PTG2RawArtifact,
+    PTG2SourceVersion,
 )
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
@@ -75,10 +77,35 @@ from process.ptg_parts.frozen_rate_runtime import (
 )
 from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock
+from process.ptg_parts.ptg2_shared_blocks import shared_semantic_fingerprint
+from process.ptg_parts.ptg2_shared_finalize import (
+    attach_v3_dictionary_contract,
+    attach_v3_source_run_contract,
+)
+from process.ptg_parts.ptg2_shared_reuse import (
+    SharedLogicalPlanScope,
+    SharedPhysicalArtifactIdentity,
+    SharedSnapshotSourceAssignment,
+    shared_source_set_metadata,
+)
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
     abandon_owned_v4_layout,
 )
+from process.ptg_parts.ptg2_manifest_publish import (
+    _copy_price_atom_file,
+    _copy_price_atom_member_file,
+    _copy_price_set_summary_file,
+    _create_serving_stage_table,
+    _ptg2_manifest_support_stage_table,
+)
+from process.ptg_parts.ptg2_shared_snapshot_publish import (
+    publish_shared_v3_snapshot_sources,
+    publish_strict_shared_v3_layout,
+)
+from process.ptg_parts.import_rows import _ptg2_source_trace_rows
+from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
+from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     V4GraphCompilationResult,
     compile_provider_graph_v4_rust,
@@ -106,6 +133,7 @@ from tests.ptg2_v4_graph_compiler_test_support import (
 )
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 from tests import test_ptg2_scanner_v3_runs as scanner_support
+from tests import test_ptg2_v3_migrated_lifecycle_postgres as lifecycle_support
 
 ROOT = Path(__file__).resolve().parents[1]
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
@@ -132,6 +160,9 @@ _STANDARD_FORMAT = (
 _GROUP_COUNT = 5_000
 _SET_COUNT = 16
 _NPI = 1_234_567_890
+_FROZEN_SOURCE_FILE_IMPORT_ID = "frozen-multipart-v4-audit-001"
+_FROZEN_SOURCE_KEY = "synthetic-source"
+_FROZEN_PLAN_IDS = ("synthetic-main", "synthetic-transplant")
 
 
 class _OpRecorder:
@@ -735,60 +766,284 @@ def _write_provider_set_map(
     return provider_map
 
 
-async def _scan_provider_graph_fixture(
+async def _scanned_source_graph_artifacts(
+    tmp_path: Path,
+    scan: dict[str, object],
+    source_key: int,
+) -> tuple[list[dict[str, object]], bytes]:
+    """Bind one scanner result to its production six-factor graph."""
+
+    provider_set_id, _provider_group_id, _npi_ids = _provider_graph_identities(scan)
+    factor_directory = tmp_path / f"frozen-source-factors-{source_key}"
+    membership_metrics = await ptg_runtime._build_ptg2_provider_membership_sidecars(
+        provider_group_npi_path=factor_directory / "provider-group-npi.ptg2sc",
+        provider_npi_group_path=factor_directory / "provider-npi-group.ptg2sc",
+        provider_npi_scope_copy_path=factor_directory / "provider-npi-scope.copy",
+        input_paths=[Path(frame["path"]) for frame in scan["provider_group_member_frames"]],
+    )
+    factor_paths_by_name = {
+        "provider_set_component": scan["provider_set_component_path"],
+        "provider_component_group": scan["provider_component_group_path"],
+        "provider_group_tax_identity": scan["provider_group_tax_identity_path"],
+        "provider_group_npi": factor_directory / "provider-group-npi.ptg2sc",
+        "provider_npi_group": factor_directory / "provider-npi-group.ptg2sc",
+        "provider_npi_scope": factor_directory / "provider-npi-scope.copy",
+    }
+    factors = ptg_runtime._collect_ptg2_manifest_sidecar_artifacts(
+        factor_paths_by_name,
+        provider_group_tax_identity_artifact=scanner_support._single_frame(
+            scan["frames"], "manifest_provider_group_tax_identity_sidecar_file"
+        ),
+        membership_graph_metrics=membership_metrics,
+    )
+    return (
+        ptg_runtime._bound_manifest_sidecars(
+            {"file_id": f"frozen-source-{source_key}"},
+            {},
+            {"sidecars": list(factors.values())},
+            source_key,
+        ),
+        provider_set_id,
+    )
+
+
+async def _collect_scanned_provider_graph(
     tmp_path: Path,
     scans: tuple[dict[str, object], ...],
 ) -> tuple[list[dict[str, object]], Path, dict[int, bytes]]:
-    """Build the V4 compiler input from the exact scanner factor outputs."""
+    """Collect all source-bound V4 factors and their provider-set key map."""
 
     provider_sets_by_key: dict[int, bytes] = {}
     artifacts: list[dict[str, object]] = []
-    for provider_set_key, scan in enumerate(scans):
-        provider_set_id, _provider_group_id, _npi_ids = _provider_graph_identities(
-            scan
+    for source_key, scan in enumerate(scans):
+        source_artifacts, provider_set_id = await _scanned_source_graph_artifacts(
+            tmp_path,
+            scan,
+            source_key,
         )
-        provider_sets_by_key[provider_set_key] = provider_set_id
-        factor_directory = tmp_path / f"frozen-source-factors-{provider_set_key}"
-        membership_metrics = await ptg_runtime._build_ptg2_provider_membership_sidecars(
-            provider_group_npi_path=factor_directory / "provider-group-npi.ptg2sc",
-            provider_npi_group_path=factor_directory / "provider-npi-group.ptg2sc",
-            provider_npi_scope_copy_path=factor_directory / "provider-npi-scope.copy",
-            input_paths=[
-                Path(frame["path"])
-                for frame in scan["provider_group_member_frames"]
-            ],
+        artifacts.extend(source_artifacts)
+        provider_sets_by_key[source_key] = provider_set_id
+    provider_map = _write_provider_set_map(tmp_path, provider_sets_by_key)
+    return artifacts, provider_map, provider_sets_by_key
+
+
+@dataclass(frozen=True)
+class _FrozenStrictPublicationInputs:
+    assignments: tuple[SharedSnapshotSourceAssignment, ...]
+    trace_rows: tuple[dict[str, object], ...]
+    trace_set_rows: tuple[dict[str, object], ...]
+    serving_run_entries: tuple[dict[str, object], ...]
+    code_dictionary_entries: tuple[dict[str, object], ...]
+    provider_set_metadata_entries: tuple[dict[str, object], ...]
+    source_audit_witness_entries: tuple[dict[str, object], ...]
+    graph_artifact_entries: tuple[dict[str, object], ...]
+    tax_identity_source_artifacts: tuple[dict[str, object], ...]
+    provider_identifier_quarantine: dict[str, object]
+    source_trace_set_hash: str
+    empty_npi_tin_only_normalization_count: int
+
+    @property
+    def identities(self) -> tuple[SharedPhysicalArtifactIdentity, ...]:
+        return tuple(assignment.identity for assignment in self.assignments)
+
+
+def _frozen_source_version(
+    descriptor: dict[str, object],
+    scan: dict[str, object],
+) -> PTG2SourceVersion:
+    return PTG2SourceVersion(
+        source_identity_hash=str(descriptor["engine_source_identity_hash"]),
+        source_file_version_id=str(descriptor["engine_source_file_version_id"]),
+        original_url=str(descriptor["canonical_url"]),
+        canonical_url=str(descriptor["canonical_url"]),
+        raw_storage_uri=str(scan["artifact"]),
+        raw_sha256=str(descriptor["raw_sha256"]),
+        logical_sha256=str(descriptor["logical_sha256"]),
+        logical_hash_deferred=bool(descriptor["logical_hash_deferred"]),
+        content_length=int(descriptor["content_length"]),
+        raw_byte_count=int(descriptor["content_length"]),
+        etag=str(descriptor["etag"]),
+        last_modified=descriptor["last_modified"],
+        verification_mode="downloaded",
+    )
+
+
+def _frozen_source_assignments(
+    batch: _FrozenScanBatch,
+) -> tuple[
+    tuple[SharedSnapshotSourceAssignment, ...],
+    tuple[dict[str, object], ...],
+    tuple[dict[str, object], ...],
+]:
+    assignments: list[SharedSnapshotSourceAssignment] = []
+    trace_rows: list[dict[str, object]] = []
+    trace_set_rows: list[dict[str, object]] = []
+    for source_key, (descriptor, scan) in enumerate(zip(batch.descriptors, batch.scans, strict=True)):
+        source_version = _frozen_source_version(descriptor, scan)
+        trace_row, trace_set_row = _ptg2_source_trace_rows(
+            source_version,
+            source_version.canonical_url,
         )
-        factor_paths = {
-            "provider_set_component": scan["provider_set_component_path"],
-            "provider_component_group": scan["provider_component_group_path"],
-            "provider_group_tax_identity": scan[
-                "provider_group_tax_identity_path"
-            ],
-            "provider_group_npi": factor_directory / "provider-group-npi.ptg2sc",
-            "provider_npi_group": factor_directory / "provider-npi-group.ptg2sc",
-            "provider_npi_scope": factor_directory / "provider-npi-scope.copy",
-        }
-        factors = ptg_runtime._collect_ptg2_manifest_sidecar_artifacts(
-            factor_paths,
-            provider_group_tax_identity_artifact=scanner_support._single_frame(
-                scan["frames"],
-                "manifest_provider_group_tax_identity_sidecar_file",
-            ),
-            membership_graph_metrics=membership_metrics,
+        identity = SharedPhysicalArtifactIdentity(
+            "in_network",
+            "logical_json_sha256_v1",
+            str(descriptor["logical_sha256"]),
         )
-        artifacts.extend(
-            ptg_runtime._bound_manifest_sidecars(
-                {"file_id": f"frozen-source-{provider_set_key}"},
-                {},
-                {"sidecars": list(factors.values())},
-                provider_set_key,
+        assignments.append(
+            SharedSnapshotSourceAssignment(
+                source_key=source_key,
+                identity=identity,
+                source_trace_set_hash=str(trace_set_row["source_trace_set_hash"]),
+                source_trace_hashes=(str(trace_row["source_trace_hash"]),),
+                raw_container_sha256=str(descriptor["raw_sha256"]),
+                logical_json_sha256=str(descriptor["logical_sha256"]),
+                logical_hash_deferred=False,
             )
         )
-    provider_map = _write_provider_set_map(
-        tmp_path,
-        provider_sets_by_key,
+        trace_rows.append(trace_row)
+        trace_set_rows.append(trace_set_row)
+    return tuple(assignments), tuple(trace_rows), tuple(trace_set_rows)
+
+
+@dataclass(frozen=True)
+class _FrozenFinalizerEntries:
+    serving: tuple[dict[str, object], ...]
+    dictionaries: tuple[dict[str, object], ...]
+    metadata: tuple[dict[str, object], ...]
+    witnesses: tuple[dict[str, object], ...]
+
+
+def _source_finalizer_entries(
+    scan: dict[str, object],
+    assignment: SharedSnapshotSourceAssignment,
+) -> _FrozenFinalizerEntries:
+    """Authenticate the strict finalizer artifacts from one scanner source."""
+
+    scanner_summary = scanner_support._single_frame(scan["frames"], "scanner_summary")
+    serving_entries = tuple(
+        attach_v3_source_run_contract(
+            scan["partition_frames"],
+            source_identity=assignment.identity,
+            scanner_summary=scanner_summary,
+            scanner_config=scanner_support._single_frame(scan["frames"], "scanner_config"),
+        )
     )
-    return artifacts, provider_map, provider_sets_by_key
+    source_run_digest = serving_entries[0]["source_run_contract_sha256"]
+    dictionaries = tuple(
+        attach_v3_dictionary_contract(
+            scan["code_dictionary_frames"],
+            source_identity=assignment.identity,
+            source_run_contract_sha256=source_run_digest,
+            scanner_summary=scanner_summary,
+        )
+    )
+    metadata = tuple(
+        {
+            **entry,
+            **assignment.identity.as_dict(),
+            "sha256": hashlib.sha256(Path(str(entry["path"])).read_bytes()).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+            "source_run_contract_sha256": source_run_digest,
+        }
+        for entry in scan["provider_set_metadata_frames"]
+    )
+    witness = scanner_support._single_frame(scan["frames"], "source_audit_witness_file")
+    return _FrozenFinalizerEntries(
+        serving_entries,
+        dictionaries,
+        metadata,
+        (witness,),
+    )
+
+
+def _strict_finalizer_entries(
+    batch: _FrozenScanBatch,
+    assignments: tuple[SharedSnapshotSourceAssignment, ...],
+) -> _FrozenFinalizerEntries:
+    """Combine source-local finalizer contracts without changing identity."""
+
+    serving_entries: list[dict[str, object]] = []
+    dictionary_entries: list[dict[str, object]] = []
+    metadata_entries: list[dict[str, object]] = []
+    witness_entries: list[dict[str, object]] = []
+    for scan, assignment in zip(batch.scans, assignments, strict=True):
+        entries = _source_finalizer_entries(scan, assignment)
+        serving_entries.extend(entries.serving)
+        dictionary_entries.extend(entries.dictionaries)
+        metadata_entries.extend(entries.metadata)
+        witness_entries.extend(entries.witnesses)
+    return _FrozenFinalizerEntries(
+        tuple(serving_entries),
+        tuple(dictionary_entries),
+        tuple(metadata_entries),
+        tuple(witness_entries),
+    )
+
+
+def _frozen_scanner_results(
+    batch: _FrozenScanBatch,
+    assignments: tuple[SharedSnapshotSourceAssignment, ...],
+    trace_rows: tuple[dict[str, object], ...],
+    graph_artifacts: list[dict[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Return normal runtime result records for the frozen scanner files."""
+
+    results: list[dict[str, object]] = []
+    for source_key, (scan, assignment, trace_row) in enumerate(zip(batch.scans, assignments, trace_rows, strict=True)):
+        shard_id = f"file:frozen-source-{source_key}"
+        results.append(
+            {
+                "file_id": f"frozen-source-{source_key}",
+                "summary": {
+                    "scanner": {"summary": scanner_support._single_frame(scan["frames"], "scanner_summary")},
+                    "manifest": {
+                        "physical_artifact_identity": assignment.identity.as_dict(),
+                        "source_trace_hash": trace_row["source_trace_hash"],
+                        "sidecars": [
+                            artifact for artifact in graph_artifacts if artifact["source_shard_id"] == shard_id
+                        ],
+                    },
+                },
+            }
+        )
+    return tuple(results)
+
+
+async def _strict_frozen_publication_inputs(
+    tmp_path: Path,
+    batch: _FrozenScanBatch,
+) -> _FrozenStrictPublicationInputs:
+    assignments, trace_rows, trace_set_rows = _frozen_source_assignments(batch)
+    graph_artifacts, _provider_map, provider_sets_by_key = await _collect_scanned_provider_graph(tmp_path, batch.scans)
+    assert len(provider_sets_by_key) == len(batch.descriptors)
+    scanner_results = _frozen_scanner_results(
+        batch,
+        assignments,
+        trace_rows,
+        graph_artifacts,
+    )
+    manifest_artifacts = ptg_runtime._collect_manifest_artifacts(list(scanner_results))
+    finalizer_entries = _strict_finalizer_entries(batch, assignments)
+    return _FrozenStrictPublicationInputs(
+        assignments=assignments,
+        trace_rows=trace_rows,
+        trace_set_rows=trace_set_rows,
+        serving_run_entries=finalizer_entries.serving,
+        code_dictionary_entries=finalizer_entries.dictionaries,
+        provider_set_metadata_entries=finalizer_entries.metadata,
+        source_audit_witness_entries=finalizer_entries.witnesses,
+        graph_artifact_entries=tuple(manifest_artifacts["sidecars"]),
+        tax_identity_source_artifacts=(
+            ptg_runtime._bound_tax_identity_source_artifacts(
+                scanner_results,
+                assignments,
+            )
+        ),
+        provider_identifier_quarantine=(ptg_runtime._shared_v3_provider_identifier_quarantine(scanner_results)),
+        source_trace_set_hash=str(manifest_artifacts["source_trace_set_hash"]),
+        empty_npi_tin_only_normalization_count=(ptg_runtime._sum_v4_tin_only_audits(scanner_results)),
+    )
 
 
 async def _insert_provider_set_rows(
@@ -1280,15 +1535,21 @@ async def _seed_frozen_snapshot_source(
     )
 
 
-def _frozen_candidate_params(batch: _FrozenScanBatch) -> dict[str, object]:
+def _frozen_candidate_params(
+    batch: _FrozenScanBatch,
+    *,
+    source_file_import_id: str = "frozen-multipart-e2e-001",
+    source_key: str = "synthetic-source",
+    plan_ids: tuple[str, ...] = ("synthetic-plan",),
+) -> dict[str, object]:
     return normalize_protected_frozen_rate_params(
         {
-            "source_file_import_id": "frozen-multipart-e2e-001",
-            "import_id": "frozen-multipart-e2e-001",
-            "source_key": "synthetic-source",
+            "source_file_import_id": source_file_import_id,
+            "import_id": source_file_import_id,
+            "source_key": source_key,
             "import_month": "2026-07",
-            "plan_ids": ["synthetic-plan"],
-            "plan_market_types": ["group"],
+            "plan_ids": list(plan_ids),
+            "plan_market_types": ["group"] * len(plan_ids),
             "frozen_rate_file_set_contract": FROZEN_RATE_FILE_SET_CONTRACT,
             "frozen_rate_files": batch.descriptors,
             "frozen_rate_file_set_sha256": batch.set_digest,
@@ -1320,6 +1581,409 @@ def _frozen_candidate_manifest(
         ],
         FROZEN_RATE_FILE_BINDING_OPTION: binding,
     }
+
+
+async def _persist_migrated_frozen_sources(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+    *,
+    snapshot_id: str,
+    candidate_run_id: str,
+) -> None:
+    """Persist the real source/version/trace vector on the migrated schema."""
+
+    schema = _quoted(lifecycle_support.SCHEMA_NAME)
+    await _insert_migrated_frozen_snapshot(
+        schema=schema,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+    )
+    for descriptor, scan, trace_row, trace_set_row in zip(
+        batch.descriptors,
+        batch.scans,
+        publication_inputs.trace_rows,
+        publication_inputs.trace_set_rows,
+        strict=True,
+    ):
+        await _persist_migrated_frozen_trace(
+            schema=schema,
+            descriptor=descriptor,
+            scan=scan,
+            trace_row=trace_row,
+            trace_set_row=trace_set_row,
+        )
+    await publish_shared_v3_snapshot_sources(
+        schema_name=lifecycle_support.SCHEMA_NAME,
+        snapshot_id=snapshot_id,
+        plan_scopes=[SharedLogicalPlanScope(plan_id, "ein", "group") for plan_id in _FROZEN_PLAN_IDS],
+        coverage_scope_id=lifecycle_support.COVERAGE_SCOPE_ID,
+        assignments=publication_inputs.assignments,
+    )
+
+
+async def _insert_migrated_frozen_snapshot(
+    *,
+    schema: str,
+    snapshot_id: str,
+    candidate_run_id: str,
+) -> None:
+    """Create the ordinary building snapshot for the retained source set."""
+
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_snapshot
+            (snapshot_id, import_run_id, import_month, status, created_at,
+             validated_at, published_at, previous_snapshot_id, manifest)
+        VALUES
+            (:snapshot_id, :candidate_run_id, DATE '2026-07-01', 'building',
+             timezone('UTC', clock_timestamp()), NULL, NULL, NULL, '{{}}'::json)
+        """,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+    )
+
+
+async def _persist_migrated_frozen_trace(
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    scan: dict[str, object],
+    trace_row: dict[str, object],
+    trace_set_row: dict[str, object],
+) -> None:
+    """Persist one retained file version and its generated trace chain."""
+
+    await _persist_frozen_source_version(
+        schema=schema,
+        descriptor=descriptor,
+        scan=scan,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_trace
+            (source_trace_hash, source_file_version_id, original_url,
+             canonical_url, json_pointer, line_number, created_at)
+        VALUES
+            (:source_trace_hash, :source_file_version_id, :original_url,
+             :canonical_url, :json_pointer, :line_number, :created_at)
+        """,
+        **trace_row,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_trace_set
+            (source_trace_set_hash, source_trace_hashes, created_at)
+        VALUES
+            (:source_trace_set_hash,
+             CAST(:source_trace_hashes AS varchar[]), :created_at)
+        """,
+        **trace_set_row,
+    )
+
+
+async def _persist_frozen_source_version(
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    scan: dict[str, object],
+) -> None:
+    source_identity_hash = str(descriptor["engine_source_identity_hash"])
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_identity
+            (source_identity_hash, hash_prefix, source_type, canonical_url,
+             original_url, payload, created_at)
+        VALUES
+            (:source_identity_hash, :hash_prefix, :source_type, :canonical_url,
+             :canonical_url, CAST(:payload AS jsonb),
+             timezone('UTC', clock_timestamp()))
+        """,
+        source_identity_hash=source_identity_hash,
+        hash_prefix=source_identity_hash[:16],
+        source_type=descriptor["source_type"],
+        canonical_url=descriptor["canonical_url"],
+        payload=json.dumps({"fixture_role": "retained_frozen_rate_source"}),
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_file_version
+            (source_file_version_id, source_identity_hash, content_hash,
+             raw_storage_uri, raw_sha256, logical_sha256, content_length,
+             etag, last_modified, reuse_policy, verification_mode,
+             verified_at, created_at, payload)
+        VALUES
+            (:source_file_version_id, :source_identity_hash, :logical_sha256,
+             :raw_storage_uri, :raw_sha256, :logical_sha256, :content_length,
+             :etag, :last_modified, 'exact_source_v1', 'downloaded',
+             timezone('UTC', clock_timestamp()),
+             timezone('UTC', clock_timestamp()), CAST(:payload AS jsonb))
+        """,
+        source_file_version_id=descriptor["engine_source_file_version_id"],
+        source_identity_hash=source_identity_hash,
+        raw_storage_uri=str(scan["artifact"]),
+        raw_sha256=descriptor["raw_sha256"],
+        logical_sha256=descriptor["logical_sha256"],
+        content_length=descriptor["content_length"],
+        etag=descriptor["etag"],
+        last_modified=descriptor["last_modified"],
+        payload=json.dumps(
+            {
+                "raw_byte_count": descriptor["content_length"],
+                "logical_hash_deferred": descriptor["logical_hash_deferred"],
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+async def _copy_frozen_prices(
+    batch: _FrozenScanBatch,
+    *,
+    stage_table: str,
+) -> None:
+    for scan in batch.scans:
+        for frame in scan["price_atom_frames"]:
+            await _copy_price_atom_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(stage_table, "price_atom"),
+            )
+        for frame in scan["price_set_atom_frames"]:
+            await _copy_price_atom_member_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(stage_table, "price_set_atom"),
+            )
+        for frame in scan["price_set_summary_frames"]:
+            await _copy_price_set_summary_file(
+                Path(frame["path"]),
+                target_table=_ptg2_manifest_support_stage_table(stage_table, "price_set_summary"),
+            )
+
+
+async def _publish_migrated_frozen_v4(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+    *,
+    tmp_path: Path,
+    snapshot_id: str,
+):
+    """Reserve, stage, and publish one ordinary strict V4 layout."""
+
+    reservation, build_token = await _reserve_migrated_frozen_v4(
+        batch,
+        publication_inputs,
+    )
+    stage_table = await _create_serving_stage_table(
+        f"frozen_v4_audit_{reservation.snapshot_key}_{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        await _copy_frozen_prices(batch, stage_table=stage_table)
+        return await _publish_strict_frozen_v4_stage(
+            batch,
+            publication_inputs,
+            stage_table=stage_table,
+            snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
+            snapshot_id=snapshot_id,
+            tmp_path=tmp_path,
+        )
+    finally:
+        await _drop_ptg2_snapshot_table_names(ptg_runtime._ptg2_manifest_stage_table_names(stage_table))
+
+
+async def _reserve_migrated_frozen_v4(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+):
+    """Reserve a source-set-bound V4 layout using the normal reservation path."""
+
+    build_token = f"frozen-v4-audit-{uuid.uuid4().hex}"
+    semantic_fingerprint = shared_semantic_fingerprint(
+        {
+            "contract": "frozen_v4_audit_source_fixture_v1",
+            "frozen_rate_file_set_sha256": batch.set_digest,
+            "source_identities": [identity.as_dict() for identity in publication_inputs.identities],
+        }
+    )
+    async with db.transaction() as session:
+        reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=lifecycle_support.SCHEMA_NAME,
+            semantic_fingerprint=semantic_fingerprint,
+            build_token=build_token,
+        )
+    return reservation, build_token
+
+
+async def _publish_strict_frozen_v4_stage(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+    *,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+    snapshot_id: str,
+    tmp_path: Path,
+):
+    """Feed retained scanner artifacts to the production strict publisher."""
+
+    raw_digests = tuple(str(descriptor["raw_sha256"]) for descriptor in batch.descriptors)
+    compressed_sources = tuple(
+        {
+            "raw_sha256": descriptor["raw_sha256"],
+            "byte_count": descriptor["content_length"],
+        }
+        for descriptor in batch.descriptors
+    )
+    return await publish_strict_shared_v3_layout(
+        schema_name=lifecycle_support.SCHEMA_NAME,
+        manifest_stage_table=stage_table,
+        reserved_snapshot_key=snapshot_key,
+        build_token=build_token,
+        expected_coverage_scope_id=lifecycle_support.COVERAGE_SCOPE_ID,
+        logical_snapshot_id=snapshot_id,
+        expected_source_identities=publication_inputs.identities,
+        serving_run_entries=publication_inputs.serving_run_entries,
+        code_dictionary_entries=publication_inputs.code_dictionary_entries,
+        provider_set_metadata_entries=publication_inputs.provider_set_metadata_entries,
+        source_audit_witness_entries=publication_inputs.source_audit_witness_entries,
+        price_set_summary_source_count=len(batch.descriptors),
+        expected_raw_source_sha256=raw_digests,
+        graph_artifact_entries=publication_inputs.graph_artifact_entries,
+        tax_identity_source_artifacts=publication_inputs.tax_identity_source_artifacts,
+        provider_identifier_quarantine=(publication_inputs.provider_identifier_quarantine),
+        compressed_acquisition_entries=compressed_sources,
+        empty_npi_tin_only_normalization_count=(publication_inputs.empty_npi_tin_only_normalization_count),
+        scratch_parent=tmp_path,
+        provider_graph_v4=True,
+    )
+
+
+async def _stage_migrated_frozen_candidate(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+    publication,
+    *,
+    snapshot_id: str,
+    candidate_run_id: str,
+    frozen_binding: dict[str, object],
+) -> None:
+    serving_index = {
+        **dict(publication.serving_index),
+        "source_key": _FROZEN_SOURCE_KEY,
+        "coverage_scope_id": lifecycle_support.COVERAGE_SCOPE_ID.hex(),
+        "source_set": shared_source_set_metadata([str(descriptor["raw_sha256"]) for descriptor in batch.descriptors]),
+        "source_trace_set_hash": publication_inputs.source_trace_set_hash,
+        "network_names": ["Synthetic Main and Transplant Network"],
+    }
+    timestamp = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    staged = await _stage_ptg2_source_candidate(
+        source_key=_FROZEN_SOURCE_KEY,
+        snapshot_id=snapshot_id,
+        import_month=datetime.date(2026, 7, 1),
+        updated_at=timestamp,
+        snapshot_attributes={
+            "snapshot_id": snapshot_id,
+            "import_run_id": candidate_run_id,
+            "import_month": datetime.date(2026, 7, 1),
+            "status": "validated",
+            "created_at": timestamp,
+            "validated_at": timestamp,
+            "published_at": None,
+            "previous_snapshot_id": None,
+            "manifest": {
+                **_frozen_candidate_manifest(batch, frozen_binding),
+                "snapshot_id": snapshot_id,
+                "serving_index": serving_index,
+                "serving_rates": int(serving_index["serving_rates"]),
+                "rate_count": int(serving_index["rate_count"]),
+            },
+        },
+        shared_snapshot_key=publication.snapshot_key,
+        coverage_scope_id=lifecycle_support.COVERAGE_SCOPE_ID,
+        coverage_plan_scopes=[SharedLogicalPlanScope(plan_id, "ein", "group") for plan_id in _FROZEN_PLAN_IDS],
+    )
+    assert staged["status"] == "validated"
+    assert staged["plan_source_count"] == len(_FROZEN_PLAN_IDS)
+
+
+async def _attest_migrated_frozen_candidate(
+    batch: _FrozenScanBatch,
+    publication,
+    *,
+    snapshot_id: str,
+    candidate_run_id: str,
+    monkeypatch,
+) -> None:
+    """Submit the genuine audit report to the ordinary attestation endpoint."""
+
+    app = lifecycle_support._build_asgi_app()
+    client = app.asgi_client
+    report = await _migrated_frozen_candidate_audit_report(
+        batch,
+        publication,
+        client=client,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+        monkeypatch=monkeypatch,
+    )
+    response = await lifecycle_support._asgi_request(
+        client,
+        "post",
+        "/control/v1/ptg/source-snapshots/attest",
+        json={
+            "snapshot_id": snapshot_id,
+            "source_key": _FROZEN_SOURCE_KEY,
+            "plan_id": _FROZEN_PLAN_IDS[0],
+            "plan_market_type": "group",
+            "storage_generation": "shared_blocks_v4",
+            "report": report,
+        },
+        headers=lifecycle_support._control_headers(),
+    )
+    attestation = lifecycle_support._response_json(response)
+    assert attestation["status"] == "attested"
+    assert attestation["snapshot_id"] == snapshot_id
+
+
+async def _migrated_frozen_candidate_audit_report(
+    batch: _FrozenScanBatch,
+    publication,
+    *,
+    client,
+    snapshot_id: str,
+    candidate_run_id: str,
+    monkeypatch,
+) -> dict[str, object]:
+    """Resolve the candidate and build its genuine exact-source audit report."""
+
+    audit_target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id=candidate_run_id,
+        snapshot_id=snapshot_id,
+    )
+    assert audit_target.storage_generation == "shared_blocks_v4"
+    assert "ptg_frozen_candidate_identity_v1" in str(audit_target.frozen_candidate_identity)
+    audit_occurrences = await lifecycle_support._candidate_audit_occurrences(
+        client,
+        monkeypatch,
+        snapshot_id=snapshot_id,
+        source_key=_FROZEN_SOURCE_KEY,
+        plan_id=_FROZEN_PLAN_IDS[0],
+    )
+    assert audit_occurrences["items"]
+    assert (
+        audit_occurrences["audit_sample"]["sample_digest"]
+        == (publication.serving_index["audit_sample"]["sample_digest"])
+    )
+    return await lifecycle_support._release_report(
+        client=client,
+        snapshot_id=snapshot_id,
+        source_key=_FROZEN_SOURCE_KEY,
+        plan_id=_FROZEN_PLAN_IDS[0],
+        raw_container_sha256=tuple(str(descriptor["raw_sha256"]) for descriptor in batch.descriptors),
+        audit_sample=audit_occurrences["audit_sample"],
+        source_witness=publication.serving_index["source_witness"],
+        provider_identifier_quarantine=publication.serving_index["provider_identifier_quarantine"],
+    )
 
 
 async def _complete_shared_gc_test_schema(
@@ -2228,9 +2892,7 @@ async def _compile_frozen_provider_graph(
     tmp_path: Path,
     batch: _FrozenScanBatch,
 ):
-    artifacts, provider_map, provider_sets_by_key = await _scan_provider_graph_fixture(
-        tmp_path, batch.scans
-    )
+    artifacts, provider_map, provider_sets_by_key = await _collect_scanned_provider_graph(tmp_path, batch.scans)
     compilation = await _compile_publication_fixture(
         tmp_path,
         artifacts,
@@ -2246,7 +2908,7 @@ async def _compile_frozen_provider_graph(
 async def test_frozen_scanner_factors_feed_compiler(tmp_path, monkeypatch) -> None:
     """Keep the V4 compiler fixture bound to scanner-produced factor files."""
     batch = await _acquire_and_scan_frozen_parts(tmp_path, monkeypatch)
-    artifacts, _provider_map, provider_sets_by_key = await _scan_provider_graph_fixture(
+    artifacts, _provider_map, provider_sets_by_key = await _collect_scanned_provider_graph(
         tmp_path,
         batch.scans,
     )
@@ -2257,7 +2919,7 @@ async def test_frozen_scanner_factors_feed_compiler(tmp_path, monkeypatch) -> No
         names_by_shard.setdefault(shard_id, set()).add(str(artifact["name"]))
         assert Path(str(artifact["path"])).is_file()
     assert names_by_shard == {
-        "frozen-source-0": {
+        "file:frozen-source-0": {
             "provider_set_component",
             "provider_component_group",
             "provider_group_npi",
@@ -2265,7 +2927,7 @@ async def test_frozen_scanner_factors_feed_compiler(tmp_path, monkeypatch) -> No
             "provider_npi_scope",
             "provider_group_tax_identity",
         },
-        "frozen-source-1": {
+        "file:frozen-source-1": {
             "provider_set_component",
             "provider_component_group",
             "provider_group_npi",
@@ -2620,11 +3282,11 @@ async def _assert_frozen_candidate_sequence(
 
 
 @pytest.mark.asyncio
-async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
+async def test_frozen_multipart_scans_publish_and_candidate_identity_exactly(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Prove two acquired files through Rust, V4, and the DB audit gate."""
+    """Prove two acquired files through Rust, V4, and identity replay."""
 
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
@@ -2665,6 +3327,132 @@ async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
             await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         finally:
             await database.disconnect()
+
+
+async def _connect_migrated_frozen_v4(monkeypatch, dsn: str) -> str:
+    """Connect the V4 runtime to the caller-owned disposable database."""
+
+    database_name = lifecycle_support._configure_disposable_database(
+        monkeypatch,
+        dsn,
+    )
+    lifecycle_support._set_lifecycle_environment(monkeypatch)
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "true")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_RUST_SCANNER_BIN",
+        str(scanner_support._built_scanner_binary()),
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN",
+        str(_compiler_binary()),
+    )
+    await db.disconnect()
+    await db.connect()
+    _isolate_graph_caches(monkeypatch)
+    return database_name
+
+
+async def _seed_frozen_code_catalog() -> None:
+    """Ensure both frozen fixture codes have normal catalog rows."""
+
+    await db.status(
+        f"""
+        INSERT INTO {_quoted(lifecycle_support.SCHEMA_NAME)}.code_catalog
+            (code_system, code, display_name, short_description)
+        VALUES
+            ('CPT', '99213', 'Office visit 99213', 'Office visit 99213'),
+            ('CPT', '99214', 'Office visit 99214', 'Office visit 99214')
+        ON CONFLICT (code_system, code) DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            short_description = EXCLUDED.short_description
+        """
+    )
+
+
+async def _build_migrated_frozen_candidate(
+    batch: _FrozenScanBatch,
+    publication_inputs: _FrozenStrictPublicationInputs,
+    *,
+    tmp_path: Path,
+    snapshot_id: str,
+    candidate_run_id: str,
+):
+    """Persist, strictly publish, and stage the retained V4 source set."""
+
+    params_by_name = _frozen_candidate_params(
+        batch,
+        source_file_import_id=_FROZEN_SOURCE_FILE_IMPORT_ID,
+        source_key=_FROZEN_SOURCE_KEY,
+        plan_ids=_FROZEN_PLAN_IDS,
+    )
+    async with db.acquire() as connection:
+        frozen_binding = await insert_or_compare_frozen_binding(
+            connection,
+            params_by_name,
+        )
+    assert frozen_binding is not None
+    await _persist_migrated_frozen_sources(
+        batch,
+        publication_inputs,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+    )
+    publication = await _publish_migrated_frozen_v4(
+        batch,
+        publication_inputs,
+        tmp_path=tmp_path,
+        snapshot_id=snapshot_id,
+    )
+    await _stage_migrated_frozen_candidate(
+        batch,
+        publication_inputs,
+        publication,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+        frozen_binding=frozen_binding,
+    )
+    return publication
+
+
+@pytest.mark.asyncio
+async def test_frozen_multipart_v4_publishes_and_attests_on_migrated_postgres(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Publish and audit a frozen V4 candidate through the ordinary lifecycle."""
+
+    dsn = os.getenv(lifecycle_support.OPT_IN_DSN_ENV)
+    if not dsn:
+        pytest.skip(
+            f"set {lifecycle_support.OPT_IN_DSN_ENV} to a pre-migrated "
+            "disposable ptg2_v3_lifecycle_test_<unique-suffix> database"
+        )
+    batch = await _acquire_and_scan_frozen_parts(tmp_path, monkeypatch)
+    inputs = await _strict_frozen_publication_inputs(tmp_path, batch)
+    database_name = await _connect_migrated_frozen_v4(monkeypatch, dsn)
+    snapshot_id = f"frozen-v4-audit-{uuid.uuid4().hex}"
+    candidate_run_id = f"ptg2:{_FROZEN_SOURCE_FILE_IMPORT_ID}"
+    try:
+        await lifecycle_support._assert_migrated_empty_target(database_name)
+        await _seed_frozen_code_catalog()
+        publication = await _build_migrated_frozen_candidate(
+            batch,
+            inputs,
+            tmp_path=tmp_path,
+            snapshot_id=snapshot_id,
+            candidate_run_id=candidate_run_id,
+        )
+        assert publication.serving_index["storage_generation"] == "shared_blocks_v4"
+        assert publication.serving_index["source_witness"]["source_count"] == 2
+        await _attest_migrated_frozen_candidate(
+            batch,
+            publication,
+            snapshot_id=snapshot_id,
+            candidate_run_id=candidate_run_id,
+            monkeypatch=monkeypatch,
+        )
+    finally:
+        await db.disconnect()
 
 
 def _bind_synthetic_tax_source(
