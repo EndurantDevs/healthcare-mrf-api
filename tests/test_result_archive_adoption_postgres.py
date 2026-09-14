@@ -764,22 +764,7 @@ async def _assert_logical_closure_boundary(
 ) -> None:
     """Separate logical snapshot evidence from rekeyed physical relations."""
 
-    assert (
-        await database.scalar(
-            f"SELECT COUNT(*) FROM {stage}.ptg2_frozen_source_file_binding WHERE internal_run_id = 'ptg2:source-file'"
-        )
-        == 1
-    )
-    for table_name in _MODEL_CLOSURE_TABLES[3:]:
-        assert (
-            await database.scalar(f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_id = 'staged-snapshot'")
-            == 1
-        )
-        assert (
-            await database.scalar(f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_id = 'unrelated-snapshot'")
-            == 1
-        )
-        assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.{table_name}") == 0
+    await _assert_staged_logical_evidence(database, stage=stage, destination=destination)
     assert (
         await database.scalar(
             f"SELECT COUNT(*) FROM {destination}.ptg2_v3_code WHERE snapshot_key = :snapshot_key",
@@ -816,6 +801,32 @@ async def _assert_logical_closure_boundary(
             )
             == 1
         )
+
+
+async def _assert_staged_logical_evidence(
+    database: Database,
+    *,
+    stage: str,
+    destination: str,
+) -> None:
+    """Keep source filing and logical evidence outside physical adoption."""
+
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {stage}.ptg2_frozen_source_file_binding WHERE internal_run_id = 'ptg2:source-file'"
+        )
+        == 1
+    )
+    for table_name in _MODEL_CLOSURE_TABLES[3:]:
+        assert (
+            await database.scalar(f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_id = 'staged-snapshot'")
+            == 1
+        )
+        assert (
+            await database.scalar(f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_id = 'unrelated-snapshot'")
+            == 1
+        )
+        assert await database.scalar(f"SELECT COUNT(*) FROM {destination}.{table_name}") == 0
 
 
 async def _assert_source_authority_boundary(
