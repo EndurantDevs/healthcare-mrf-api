@@ -38,6 +38,15 @@ destination = importlib.import_module("process.entity_address_snapshot_destinati
 models = importlib.import_module("db.models")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 restore = importlib.import_module("process.entity_address_snapshot_restore")
+result_generation = importlib.import_module("process.entity_address_result_generation")
+
+
+def _source_serving_generation() -> dict[str, object]:
+    return {
+        "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        "origin_generation": 27,
+        "published_at": "2026-09-14T08:30:00Z",
+    }
 
 
 async def _create_alias_relations(database: Database, schema: str, generation: int) -> None:
@@ -291,6 +300,7 @@ async def _prepare_fixture(database: Database, schema: str):
             source_alias_receipt=source_alias,
             db_schema=schema,
             import_date="20260913",
+            source_serving_generation=_source_serving_generation(),
         )
     return prepared, incumbent_oid_by_table
 
@@ -424,6 +434,15 @@ async def _assert_family_identity_and_rows(
         assert await database.scalar(f'SELECT count(*) FROM "{schema}"."{actual_table_name}"') == 1
 
 
+async def _generation_authority(database: Database, schema: str):
+    row = await database.first(
+        f"SELECT singleton, local_lineage_id, local_generation, origin_lineage_id, "
+        f"origin_generation, published_at, relation_oids FROM {schema}."
+        "entity_address_result_generation WHERE singleton IS TRUE"
+    )
+    return result_generation.validate_entity_address_result_generation_authority(row)
+
+
 async def _spliced_main_stage(database: Database, prepared) -> dict:
     """Substitute a non-derived main value and recompute the actual stage receipt."""
 
@@ -518,6 +537,18 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             suffix="_old",
         )
         assert await database.scalar(f"SELECT count(*) FROM {successful_schema}.adoption_receipt") == 1
+        successful_generation = await _generation_authority(database, successful_schema)
+        assert successful_generation.local_generation == 0
+        assert successful_generation.serving_generation.as_dict() == _source_serving_generation()
+        serving_oids = []
+        for table_name in result_generation.RELATION_NAMES:
+            serving_oids.append(
+                await database.scalar(
+                "SELECT to_regclass(:relation_name)::oid::bigint",
+                relation_name=f"{successful_schema}.{table_name}",
+            )
+            )
+        assert successful_generation.relation_oids == tuple(serving_oids)
 
         rolled_back, rollback_incumbent_oid_by_table = await _prepare_fixture(database, rollback_schema)
         await database.status(f"CREATE TABLE {rollback_schema}.adoption_receipt (marker text NOT NULL)")
@@ -538,6 +569,10 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             suffix="",
         )
         assert await database.scalar(f"SELECT count(*) FROM {rollback_schema}.adoption_receipt") == 0
+        rolled_back_generation = await _generation_authority(database, rollback_schema)
+        assert rolled_back_generation.local_generation == 0
+        assert rolled_back_generation.serving_generation is None
+        assert rolled_back_generation.relation_oids is None
 
 
 @pytest.mark.asyncio

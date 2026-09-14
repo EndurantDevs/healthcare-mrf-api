@@ -38,6 +38,10 @@ from process.entity_address_snapshot_receipt import (
     validate_entity_address_archive_receipt,
     validate_entity_address_stage_integrity_receipt,
 )
+from process.entity_address_result_generation import (
+    EntityAddressServingGeneration,
+    validate_entity_address_serving_generation,
+)
 
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 restore = importlib.import_module("process.entity_address_snapshot_restore")
@@ -352,6 +356,7 @@ async def _prepare_moved_destination(
     import_date: str,
     stage_names: Mapping[str, str],
     stage_oids: tuple[tuple[str, int], ...],
+    source_serving_generation: EntityAddressServingGeneration | None,
 ) -> tuple[
     adoption.PreparedEntityAddressSnapshotAdoption,
     EntityAddressGeoAssurancePreparation,
@@ -375,6 +380,7 @@ async def _prepare_moved_destination(
         db_schema=db_schema,
         import_date=import_date,
         preserve_unversioned_base_rows=True,
+        source_serving_generation=source_serving_generation,
     )
     geo_preparation = await _capture_geo_preparation(
         session,
@@ -468,8 +474,13 @@ async def prepare_entity_address_archive_destination(
     source_alias_receipt: Mapping[str, Any] | EntityAddressAliasSemanticReceipt,
     db_schema: str,
     import_date: str,
+    source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None = None,
 ) -> PreparedEntityAddressSnapshotDestination:
-    """Validate, remap, project, and prepare a restored local result."""
+    """Validate, remap, project, and prepare a restored local result.
+
+    ``source_serving_generation`` is the source capture's portable origin
+    tuple. ``None`` explicitly selects generation-less manual compatibility.
+    """
     _require_caller_transaction(session)
     async with db.bind_existing_session(session):
         return await _prepare_bound_destination(
@@ -479,6 +490,7 @@ async def prepare_entity_address_archive_destination(
             source_alias_receipt=source_alias_receipt,
             db_schema=db_schema,
             import_date=import_date,
+            source_serving_generation=source_serving_generation,
         )
 
 
@@ -490,9 +502,20 @@ async def _prepare_bound_destination(
     source_alias_receipt: Mapping[str, Any] | EntityAddressAliasSemanticReceipt,
     db_schema: str,
     import_date: str,
+    source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
 ) -> PreparedEntityAddressSnapshotDestination:
     """Prepare while the module database uses the caller-owned session."""
 
+    try:
+        validated_source_generation = (
+            None
+            if source_serving_generation is None
+            else validate_entity_address_serving_generation(source_serving_generation)
+        )
+    except ValueError as error:
+        raise EntityAddressSnapshotDestinationError(
+            "entity-address source serving generation is invalid"
+        ) from error
     source_alias, destination_alias = await _destination_alias_binding(
         session,
         db_schema=db_schema,
@@ -524,6 +547,7 @@ async def _prepare_bound_destination(
         import_date=normalized_date,
         stage_names=stage_names,
         stage_oids=stage_oids,
+        source_serving_generation=validated_source_generation,
     )
     restored = _prepared_restore_receipt(
         validated_owner=validated_owner,

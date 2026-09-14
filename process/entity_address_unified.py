@@ -35,6 +35,7 @@ from db.models import (
     db,
 )
 from process.control_lifecycle import mark_control_run
+from process import entity_address_result_generation as result_generation
 from process.entity_address_cutover_contract import (
     EntityAddressCutoverCallbacks,
     apply_transaction_sql_settings,
@@ -2425,6 +2426,24 @@ async def _run_entity_address_cutover(
                 "geo assurance candidate does not match the published table and sources"
             )
         context["geo_assurance_active_table_oid"] = int(active_table_oid)
+        generation_mode = context.get("result_generation_mode")
+        if generation_mode == "ordinary":
+            generation_authority = await result_generation.publish_local_entity_address_generation(
+                db,
+                schema_name=db_schema,
+            )
+        elif generation_mode == "adoption":
+            generation_authority = await result_generation.publish_adopted_entity_address_generation(
+                db,
+                schema_name=db_schema,
+                source_generation=context.get("source_serving_generation"),
+            )
+        elif generation_mode is not None:
+            raise RuntimeError("entity-address result generation mode is invalid")
+        else:
+            generation_authority = None
+        if generation_authority is not None:
+            context["result_generation"] = generation_authority.as_dict()
         if callbacks is not None and callbacks.after_publish is not None:
             await callbacks.after_publish()
 
@@ -2507,6 +2526,7 @@ async def _publish_staged_entity_address_tables(
         phase="entity-address-unified analyzing staged main table",
     )
     context["stage_persistence"] = "p"
+    context["result_generation_mode"] = "ordinary"
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):
         context["cutover_attempts"] = attempt
