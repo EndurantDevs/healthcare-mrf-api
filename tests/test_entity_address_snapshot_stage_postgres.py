@@ -84,7 +84,19 @@ async def _create_model_family(connection, schema_name: str) -> None:
         *source.entity_address_unified.SUPPORT_TABLE_MODELS,
     ):
         model.__table__.to_metadata(metadata, schema=schema_name)
+    models.EntityAddressResultGeneration.__table__.to_metadata(
+        metadata,
+        schema=schema_name,
+    )
     await connection.run_sync(metadata.create_all)
+    await connection.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."entity_address_result_generation" '
+            "(singleton, local_lineage_id, local_generation) "
+            "VALUES (TRUE, CAST(:lineage_id AS uuid), 0)"
+        ),
+        {"lineage_id": str(uuid4())},
+    )
 
 
 async def _create_alias_validation_relations(connection, schema_name: str) -> None:

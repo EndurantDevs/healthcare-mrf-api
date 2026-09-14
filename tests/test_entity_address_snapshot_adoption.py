@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -13,6 +14,15 @@ import pytest
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 cutover_contract = importlib.import_module("process.entity_address_cutover_contract")
 native = importlib.import_module("process.entity_address_unified")
+generation = importlib.import_module("process.entity_address_result_generation")
+
+
+def _source_generation():
+    return generation.EntityAddressServingGeneration(
+        origin_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        origin_generation=12,
+        published_at=datetime.datetime(2026, 9, 14, 8, 30, tzinfo=datetime.UTC),
+    )
 
 
 @pytest.mark.asyncio
@@ -52,12 +62,18 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
     prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
         db_schema=" mrf ",
         import_date=" 20260913 ",
+        source_serving_generation=_source_generation(),
     )
 
     assert len(native.SUPPORT_TABLE_MODELS) == 6
     assert ensured_tables == [swap.stage_cls.__tablename__ for swap in swaps]
     assert prepared.db_schema == "mrf"
-    assert prepared.context == {"address_alias_generation": 9, "stage_persistence": "p"}
+    assert prepared.context == {
+        "address_alias_generation": 9,
+        "stage_persistence": "p",
+        "result_generation_mode": "adoption",
+        "source_serving_generation": _source_generation().as_dict(),
+    }
     assert prepared.publish_validation == {"bridge_orphans": {}}
     run_phase.assert_awaited_once_with(
         "ANALYZE mrf.entity_address_unified_20260913;",
@@ -303,7 +319,18 @@ async def test_adopt_delegates_only_named_local_fence_and_receipt_callbacks(monk
 
     async def run_cutover(*args, **kwargs):
         cutover_events.append("cutover")
-        assert args[:6] == ("mrf", [], [], [], [], {"address_alias_generation": 4})
+        assert args[:6] == (
+            "mrf",
+            [],
+            [],
+            [],
+            [],
+            {
+                "address_alias_generation": 4,
+                "result_generation_mode": "adoption",
+                "source_serving_generation": _source_generation().as_dict(),
+            },
+        )
         assert kwargs["require_caller_owned_transaction"] is True
         callbacks = kwargs["callbacks"]
         await callbacks.before_cutover()
@@ -318,7 +345,11 @@ async def test_adopt_delegates_only_named_local_fence_and_receipt_callbacks(monk
         patch_statements=[],
         relation_names=[],
         required_names=[],
-        context={"address_alias_generation": 4},
+        context={
+            "address_alias_generation": 4,
+            "result_generation_mode": "adoption",
+            "source_serving_generation": _source_generation().as_dict(),
+        },
         publish_validation={"address_alias_generation": 4},
     )
 
