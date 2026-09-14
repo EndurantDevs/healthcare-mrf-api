@@ -456,22 +456,34 @@ def _release_audit_contract(
     snapshot_id: str,
     source_key: str,
     plan_id: str,
-    raw_container_sha256: str,
+    raw_container_sha256: str | tuple[str, ...],
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
 ):
     """Build the immutable target and request for one release audit."""
 
+    raw_source_digests = (
+        (raw_container_sha256,)
+        if isinstance(raw_container_sha256, str)
+        else raw_container_sha256
+    )
+    storage_generation = (
+        "shared_blocks_v3"
+        if isinstance(raw_container_sha256, str)
+        else "shared_blocks_v4"
+    )
+
     audit_target = BatchAuditReportTarget(
         snapshot_id=snapshot_id,
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type="group",
-        raw_container_sha256=(raw_container_sha256,),
+        raw_container_sha256=raw_source_digests,
         source_witness=dict(source_witness),
         audit_sample=dict(audit_sample),
         provider_identifier_quarantine=dict(provider_identifier_quarantine),
+        storage_generation=storage_generation,
     )
     audit_request = build_audit_batch_request(
         snapshot_id=snapshot_id,
@@ -482,7 +494,7 @@ def _release_audit_contract(
             audit_sample_digest=str(audit_sample["sample_digest"]),
             source_witness_sample_digest=str(source_witness["sample_digest"]),
             source_witness_payload_sha256=str(source_witness["payload_sha256"]),
-            raw_container_sha256=(raw_container_sha256,),
+            raw_container_sha256=raw_source_digests,
             source_witness_occurrence_count=int(
                 source_witness["occurrence_witness_count"]
             ),
@@ -497,7 +509,7 @@ async def _release_report(
     snapshot_id: str,
     source_key: str,
     plan_id: str,
-    raw_container_sha256: str,
+    raw_container_sha256: str | tuple[str, ...],
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],

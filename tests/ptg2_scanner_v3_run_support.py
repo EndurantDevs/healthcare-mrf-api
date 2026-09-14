@@ -139,69 +139,61 @@ def _scanner_fixture_artifact(
     return artifact
 
 
-def _scanner_output_environment(
+def _v3_graph_output_environment(paths: _ScannerRunPaths) -> dict[str, str]:
+    """Return the legacy two-sidecar scanner outputs."""
+
+    return {
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(paths.provider_forward),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH": str(paths.provider_inverted),
+    }
+
+
+def _v4_graph_output_environment(
     paths: _ScannerRunPaths,
     options: _ScannerRunOptions,
 ) -> dict[str, str]:
-    environment = {
+    """Return strict V4 factor outputs and the test-only token input."""
+
+    if options.tin_token_secret is None:
+        raise ValueError("V4 scanner test input requires a synthetic TIN token")
+    if len(options.tin_token_secret) != 32:
+        raise ValueError("synthetic TIN token must contain exactly 32 bytes")
+    token_path = paths.compact_copy.with_name("tin-token.bin")
+    token_path.write_bytes(options.tin_token_secret)
+    token_path.chmod(0o600)
+    return {
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4": "true",
+        "HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE": str(token_path),
+        "HLTHPRT_PTG2_TIN_TOKEN_POLICY_ID": "ptg-tin-hmac-sha256-v1:test-fixture",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH": str(paths.provider_set_component),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH": str(paths.provider_component_group),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH": str(paths.provider_group_tax_identity),
+    }
+
+
+def _scanner_output_environment_variables(
+    paths: _ScannerRunPaths,
+    options: _ScannerRunOptions,
+) -> dict[str, str]:
+    """Return every file-backed output expected from one scanner run."""
+
+    common_variables_by_name = {
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(paths.compact_copy),
         "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH": str(paths.lean_copy),
         "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(paths.price_atom_copy),
-        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(
-            paths.price_set_atom_copy
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(
-            paths.price_set_summary_copy
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(
-            paths.provider_group_member_copy
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH": str(
-            paths.provider_set_metadata_copy
-        ),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(paths.price_set_atom_copy),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(paths.price_set_summary_copy),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(paths.provider_group_member_copy),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH": str(paths.provider_set_metadata_copy),
         "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(paths.serving_run_directory),
-        "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR": str(
-            paths.source_witness_scratch_directory
-        ),
+        "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR": str(paths.source_witness_scratch_directory),
     }
-    if options.provider_graph_v4:
-        if options.tin_token_secret is None:
-            raise ValueError("V4 scanner test input requires a synthetic TIN token")
-        if len(options.tin_token_secret) != 32:
-            raise ValueError("synthetic TIN token must contain exactly 32 bytes")
-        token_path = paths.compact_copy.with_name("tin-token.bin")
-        token_path.write_bytes(options.tin_token_secret)
-        token_path.chmod(0o600)
-        environment.update(
-            {
-                "HLTHPRT_PTG2_PROVIDER_GRAPH_V4": "true",
-                "HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE": str(token_path),
-                "HLTHPRT_PTG2_TIN_TOKEN_POLICY_ID": (
-                    "ptg-tin-hmac-sha256-v1:test-fixture"
-                ),
-                "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH": str(
-                    paths.provider_set_component
-                ),
-                "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH": str(
-                    paths.provider_component_group
-                ),
-                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH": str(
-                    paths.provider_group_tax_identity
-                ),
-            }
-        )
-    else:
-        environment.update(
-            {
-                "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
-                    paths.provider_forward
-                ),
-                "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH": str(
-                    paths.provider_inverted
-                ),
-            }
-        )
-    return environment
+    graph_variables = (
+        _v4_graph_output_environment(paths, options)
+        if options.provider_graph_v4
+        else _v3_graph_output_environment(paths)
+    )
+    return {**common_variables_by_name, **graph_variables}
 
 
 def _scanner_execution_environment(
@@ -256,7 +248,7 @@ def _scanner_environment(
         "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
     ):
         scanner_environment_map.pop(environment_name, None)
-    scanner_environment_map.update(_scanner_output_environment(paths, options))
+    scanner_environment_map.update(_scanner_output_environment_variables(paths, options))
     scanner_environment_map.update(_scanner_execution_environment(artifact, options))
     return scanner_environment_map
 

@@ -64,7 +64,6 @@ from tests.ptg2_scanner_v3_run_support import (
     _scanner_execution_environment,
     _scanner_fixture_artifact,
     _scanner_frames_of_kind,
-    _scanner_output_environment,
     _scanner_result,
     _scanner_run_paths,
 )
