@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 
 from db import maintenance
@@ -50,6 +51,7 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
 
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
     migration = _migration()
     statements: list[str] = []
     monkeypatch.setattr(migration.op, "execute", statements.append)
@@ -57,11 +59,19 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     migration.upgrade()
 
     normalized = "\n".join(" ".join(statement.split()) for statement in statements)
+    schema = migration._quote(migration._schema())
     assert migration.down_revision == "20260907220000_hospital_price_missing_plan"
-    assert all(f'CREATE TABLE mrf.{name}' in normalized for name in migration._TABLE_NAMES)
+    assert all(f"CREATE TABLE {schema}.{name}" in normalized for name in migration._TABLE_NAMES)
     assert "INSERT INTO" not in normalized
     assert "guard_custom_import_immutable_row" in normalized
     assert normalized.count("BEFORE UPDATE OR DELETE") == len(migration._IMMUTABLE_TABLES)
+    assert len(migration._TABLE_DDL) == len(migration._TABLE_NAMES)
+    assert all("mrf." in statement for statement in migration._TABLE_DDL)
+    index_ddl = "\n".join(migration._INDEX_DDL)
+    assert "custom_import_pack_execution_stream_idx" not in index_ddl
+    assert "custom_import_generation_family_lookup_idx" not in index_ddl
+    assert "custom_import_entity_binding_lookup_idx" not in index_ddl
+    assert "custom_import_winner_lookup_idx" in index_ddl
     function_statement = next(
         statement for statement in statements if "CREATE FUNCTION" in statement
     )
@@ -70,6 +80,13 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     )
     assert "REVOKE ALL ON FUNCTION" not in function_statement
     assert "CREATE FUNCTION" not in revoke_statement
+
+
+def test_migration_refuses_destructive_downgrade():
+    migration = _migration()
+    assert not hasattr(migration, "models")
+    with pytest.raises(RuntimeError, match="intentionally unsupported"):
+        migration.downgrade()
 
 
 def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch):
