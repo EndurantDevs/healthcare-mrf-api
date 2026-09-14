@@ -120,8 +120,14 @@ def _immutable_function_sql(schema: str) -> str:
             USING ERRCODE = 'P0001';
     END;
     $function$;
-    REVOKE ALL ON FUNCTION {qualified}() FROM PUBLIC;
     """
+
+
+def _revoke_immutable_function_sql(schema: str) -> str:
+    """Return the function permission statement as a separate operation."""
+
+    qualified = f"{_quote(schema)}.guard_custom_import_immutable_row"
+    return f"REVOKE ALL ON FUNCTION {qualified}() FROM PUBLIC"
 
 
 def _immutable_trigger_sql(schema: str, table_name: str) -> str:
@@ -150,7 +156,11 @@ def upgrade() -> None:
             postgresql_where=sa.text(predicate) if predicate else None,
         )
         op.execute(str(CreateIndex(index).compile(dialect=postgresql.dialect())))
+    # asyncpg prepares each Alembic operation independently and rejects a
+    # string containing more than one command.  Keep creation and revocation
+    # as distinct operations so the migration works with the runtime driver.
     op.execute(_immutable_function_sql(schema))
+    op.execute(_revoke_immutable_function_sql(schema))
     for table_name in _IMMUTABLE_TABLES:
         op.execute(_immutable_trigger_sql(schema, table_name))
 
