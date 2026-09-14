@@ -196,6 +196,7 @@ class ReferenceFamilyCutoverAuthority:
 
     package_id: str
     profile_contract: str
+    sealed_owner_oid: int
     expected_stage_owner_oid: int
     authority: str
 
@@ -1231,6 +1232,7 @@ async def activate_validated_reference_family_stage(
         or validation.importer_id != ownership.importer_id
         or validation.package_id != cutover.package_id
         or validation.profile_contract != cutover.profile_contract
+        or validation.sealed_owner_oid != cutover.sealed_owner_oid
         or validation.stage_schema != ownership.schema_name
         or validation.stage_schema_oid != ownership.schema_oid
         or validation.relation_oids != ownership.relation_oids
