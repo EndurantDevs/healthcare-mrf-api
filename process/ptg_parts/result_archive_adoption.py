@@ -188,9 +188,7 @@ def _remapped_layout_manifest(
     if not isinstance(serving_index, Mapping):
         return manifest_by_field
     if serving_index.get("shared_snapshot_key") != source_snapshot_key:
-        raise ResultArchiveAdoptionError(
-            "archive adoption serving index has the wrong snapshot key"
-        )
+        raise ResultArchiveAdoptionError("archive adoption serving index has the wrong snapshot key")
     remapped_serving_index = {
         **serving_index,
         "shared_snapshot_key": destination_snapshot_key,

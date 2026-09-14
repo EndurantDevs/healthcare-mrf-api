@@ -697,13 +697,11 @@ async def _assert_prepared_destination(
         == 1
     )
     destination_manifest = await database.scalar(
-        f"SELECT layout_manifest FROM {destination_schema}.ptg2_v3_snapshot_layout "
-        "WHERE snapshot_key = :snapshot_key",
+        f"SELECT layout_manifest FROM {destination_schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key",
         snapshot_key=prepared.destination_snapshot_key,
     )
     source_manifest = await database.scalar(
-        f"SELECT layout_manifest FROM {staging_schema}.ptg2_v3_snapshot_layout "
-        "WHERE snapshot_key = :snapshot_key",
+        f"SELECT layout_manifest FROM {staging_schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key",
         snapshot_key=source_snapshot_key,
     )
     assert source_manifest["serving_index"]["shared_snapshot_key"] == source_snapshot_key
@@ -839,8 +837,7 @@ async def _assert_source_authority_boundary(
 
     assert (
         await database.scalar(
-            f"SELECT COUNT(*) FROM {stage}.ptg2_v3_candidate_audit_attestation "
-            "WHERE snapshot_id = 'staged-snapshot'"
+            f"SELECT COUNT(*) FROM {stage}.ptg2_v3_candidate_audit_attestation WHERE snapshot_id = 'staged-snapshot'"
         )
         == 1
     )

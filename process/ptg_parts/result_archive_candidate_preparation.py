@@ -106,9 +106,7 @@ def _activation_scope(
 ) -> tuple[str, tuple[str, str] | None]:
     manifest_by_name = _mapping(manifest)
     activation_by_name = _mapping(manifest_by_name.get("activation"))
-    source_key = _normalize_source_key(
-        str(activation_by_name.get("source_key") or "").strip()
-    )
+    source_key = _normalize_source_key(str(activation_by_name.get("source_key") or "").strip())
     if not source_key:
         raise ResultArchiveCandidatePreparationError(f"archive candidate preparation {label} has no activation scope")
     has_plan_id_declaration = "plan_id" in activation_by_name
@@ -223,14 +221,8 @@ def _assert_scope_matches(
     if (
         destination_source_key != staging_source_key
         or destination_database_scope != staging_database_scope
-        or (
-            destination_declared_scope is not None
-            and destination_declared_scope != destination_database_scope
-        )
-        or (
-            staging_declared_scope is not None
-            and staging_declared_scope != staging_database_scope
-        )
+        or (destination_declared_scope is not None and destination_declared_scope != destination_database_scope)
+        or (staging_declared_scope is not None and staging_declared_scope != staging_database_scope)
     ):
         raise ResultArchiveCandidatePreparationError("archive candidate preparation source scope differs from staging")
 
