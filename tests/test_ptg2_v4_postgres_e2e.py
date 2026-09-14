@@ -91,6 +91,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
     abandon_owned_v4_layout,
+    sweep_ptg2_shared_blocks,
 )
 from process.ptg_parts.ptg2_manifest_publish import (
     _copy_price_atom_file,
@@ -105,6 +106,7 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 )
 from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
+from process.ptg_parts.source_snapshot_control import remove_ptg2_source_snapshot
 from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     V4GraphCompilationResult,
@@ -1617,27 +1619,44 @@ async def _persist_migrated_frozen_trace(
         descriptor=descriptor,
         scan=scan,
     )
-    await db.status(
+    trace_status = await db.status(
         f"""
-        INSERT INTO {schema}.ptg2_source_trace
+        INSERT INTO {schema}.ptg2_source_trace AS retained
             (source_trace_hash, source_file_version_id, original_url,
              canonical_url, json_pointer, line_number, created_at)
         VALUES
             (:source_trace_hash, :source_file_version_id, :original_url,
              :canonical_url, :json_pointer, :line_number, :created_at)
+        ON CONFLICT (source_trace_hash) DO UPDATE SET
+            source_trace_hash = EXCLUDED.source_trace_hash
+        WHERE ROW(
+                  retained.source_file_version_id, retained.original_url,
+                  retained.canonical_url, retained.json_pointer,
+                  retained.line_number
+              ) IS NOT DISTINCT FROM ROW(
+                  EXCLUDED.source_file_version_id, EXCLUDED.original_url,
+                  EXCLUDED.canonical_url, EXCLUDED.json_pointer,
+                  EXCLUDED.line_number
+              )
         """,
         **trace_row,
     )
-    await db.status(
+    assert trace_status == 1, "retained frozen source trace changed"
+    trace_set_status = await db.status(
         f"""
-        INSERT INTO {schema}.ptg2_source_trace_set
+        INSERT INTO {schema}.ptg2_source_trace_set AS retained
             (source_trace_set_hash, source_trace_hashes, created_at)
         VALUES
             (:source_trace_set_hash,
              CAST(:source_trace_hashes AS varchar[]), :created_at)
+        ON CONFLICT (source_trace_set_hash) DO UPDATE SET
+            source_trace_set_hash = EXCLUDED.source_trace_set_hash
+        WHERE retained.source_trace_hashes IS NOT DISTINCT FROM
+              EXCLUDED.source_trace_hashes
         """,
         **trace_set_row,
     )
+    assert trace_set_status == 1, "retained frozen source trace set changed"
 
 
 async def _persist_frozen_source_version(
@@ -1646,16 +1665,50 @@ async def _persist_frozen_source_version(
     descriptor: dict[str, object],
     scan: dict[str, object],
 ) -> None:
+    """Insert or compare one immutable retained source and file version."""
+
     source_identity_hash = str(descriptor["engine_source_identity_hash"])
-    await db.status(
+    await _persist_frozen_source_identity(
+        schema=schema,
+        descriptor=descriptor,
+        source_identity_hash=source_identity_hash,
+    )
+    await _persist_frozen_file_version(
+        schema=schema,
+        descriptor=descriptor,
+        scan=scan,
+        source_identity_hash=source_identity_hash,
+    )
+
+
+async def _persist_frozen_source_identity(
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    source_identity_hash: str,
+) -> None:
+    """Insert one source identity or require an exact retained match."""
+
+    source_status = await db.status(
         f"""
-        INSERT INTO {schema}.ptg2_source_identity
+        INSERT INTO {schema}.ptg2_source_identity AS retained
             (source_identity_hash, hash_prefix, source_type, canonical_url,
              original_url, payload, created_at)
         VALUES
             (:source_identity_hash, :hash_prefix, :source_type, :canonical_url,
              :canonical_url, CAST(:payload AS jsonb),
              timezone('UTC', clock_timestamp()))
+        ON CONFLICT (source_identity_hash) DO UPDATE SET
+            source_identity_hash = EXCLUDED.source_identity_hash
+        WHERE ROW(
+                  retained.hash_prefix, retained.source_type,
+                  retained.canonical_url, retained.original_url,
+                  retained.payload::jsonb
+              ) IS NOT DISTINCT FROM ROW(
+                  EXCLUDED.hash_prefix, EXCLUDED.source_type,
+                  EXCLUDED.canonical_url, EXCLUDED.original_url,
+                  EXCLUDED.payload::jsonb
+              )
         """,
         source_identity_hash=source_identity_hash,
         hash_prefix=source_identity_hash[:16],
@@ -1663,9 +1716,21 @@ async def _persist_frozen_source_version(
         canonical_url=descriptor["canonical_url"],
         payload=json.dumps({"fixture_role": "retained_frozen_rate_source"}),
     )
-    await db.status(
+    assert source_status == 1, "retained frozen source identity changed"
+
+
+async def _persist_frozen_file_version(
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    scan: dict[str, object],
+    source_identity_hash: str,
+) -> None:
+    """Insert one source version or require an exact retained match."""
+
+    version_status = await db.status(
         f"""
-        INSERT INTO {schema}.ptg2_source_file_version
+        INSERT INTO {schema}.ptg2_source_file_version AS retained
             (source_file_version_id, source_identity_hash, content_hash,
              raw_storage_uri, raw_sha256, logical_sha256, content_length,
              etag, last_modified, reuse_policy, verification_mode,
@@ -1676,6 +1741,21 @@ async def _persist_frozen_source_version(
              :etag, :last_modified, 'exact_source_v1', 'downloaded',
              timezone('UTC', clock_timestamp()),
              timezone('UTC', clock_timestamp()), CAST(:payload AS jsonb))
+        ON CONFLICT (source_file_version_id) DO UPDATE SET
+            source_file_version_id = EXCLUDED.source_file_version_id
+        WHERE ROW(
+                  retained.source_identity_hash, retained.content_hash,
+                  retained.raw_sha256, retained.logical_sha256,
+                  retained.content_length, retained.etag,
+                  retained.last_modified, retained.reuse_policy,
+                  retained.verification_mode, retained.payload::jsonb
+              ) IS NOT DISTINCT FROM ROW(
+                  EXCLUDED.source_identity_hash, EXCLUDED.content_hash,
+                  EXCLUDED.raw_sha256, EXCLUDED.logical_sha256,
+                  EXCLUDED.content_length, EXCLUDED.etag,
+                  EXCLUDED.last_modified, EXCLUDED.reuse_policy,
+                  EXCLUDED.verification_mode, EXCLUDED.payload::jsonb
+              )
         """,
         source_file_version_id=descriptor["engine_source_file_version_id"],
         source_identity_hash=source_identity_hash,
@@ -1693,6 +1773,7 @@ async def _persist_frozen_source_version(
             sort_keys=True,
         ),
     )
+    assert version_status == 1, "retained frozen source version changed"
 
 
 async def _copy_frozen_prices(
@@ -3339,8 +3420,10 @@ async def test_frozen_multipart_v4_publishes_and_attests_on_migrated_postgres(
     database_name = await _connect_migrated_frozen_v4(monkeypatch, dsn)
     snapshot_id = f"frozen-v4-audit-{uuid.uuid4().hex}"
     candidate_run_id = f"ptg2:{_FROZEN_SOURCE_FILE_IMPORT_ID}"
+    is_cleanup_armed = False
     try:
         await lifecycle_support._assert_migrated_empty_target(database_name)
+        is_cleanup_armed = True
         await _seed_frozen_code_catalog()
         publication = await _build_migrated_frozen_candidate(
             batch,
@@ -3359,7 +3442,23 @@ async def test_frozen_multipart_v4_publishes_and_attests_on_migrated_postgres(
             monkeypatch=monkeypatch,
         )
     finally:
-        await db.disconnect()
+        try:
+            if is_cleanup_armed:
+                removal = await remove_ptg2_source_snapshot(
+                    snapshot_id=snapshot_id,
+                    source_key=_FROZEN_SOURCE_KEY,
+                )
+                if removal["queued_shared_block_candidates"]:
+                    await sweep_ptg2_shared_blocks(
+                        schema_name=lifecycle_support.SCHEMA_NAME,
+                        max_bytes=removal["queued_shared_block_bytes"],
+                        max_rows=removal["queued_shared_block_candidates"],
+                    )
+                await lifecycle_support._assert_migrated_empty_target(
+                    database_name,
+                )
+        finally:
+            await db.disconnect()
 
 
 def _bind_synthetic_tax_source(

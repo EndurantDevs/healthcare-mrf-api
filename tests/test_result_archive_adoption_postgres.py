@@ -49,15 +49,21 @@ _FIXTURE_REKEYED_TABLES = frozenset(
         "ptg2_provider_group_tax_identity",
     }
 )
-_MODEL_CLOSURE_TABLES = (
-    "ptg2_v3_code",
-    "ptg2_v3_audit_occurrence",
+_SNAPSHOT_KEY_LOGICAL_EVIDENCE_TABLES = (
     "ptg2_v3_source_audit_witness",
     "ptg2_v3_source_audit_witness_part",
+)
+_SNAPSHOT_ID_LOGICAL_EVIDENCE_TABLES = (
     "ptg2_allowed_amount_plan",
     "ptg2_allowed_amount_item",
     "ptg2_allowed_amount_payment",
     "ptg2_allowed_amount_provider_payment",
+)
+_MODEL_CLOSURE_TABLES = (
+    "ptg2_v3_code",
+    "ptg2_v3_audit_occurrence",
+    *_SNAPSHOT_KEY_LOGICAL_EVIDENCE_TABLES,
+    *_SNAPSHOT_ID_LOGICAL_EVIDENCE_TABLES,
 )
 _SOURCE_AUTHORITY_TABLES = ("ptg2_v3_candidate_audit_attestation",)
 _TAX_SOURCE_REKEYED_TABLES = (
@@ -778,7 +784,7 @@ async def _assert_logical_closure_boundary(
         stage=stage,
         destination=destination,
     )
-    for table_name in _MODEL_CLOSURE_TABLES[1:3]:
+    for table_name in _SNAPSHOT_KEY_LOGICAL_EVIDENCE_TABLES:
         assert (
             await database.scalar(
                 f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_key = :snapshot_key",
@@ -816,7 +822,7 @@ async def _assert_staged_logical_evidence(
         )
         == 1
     )
-    for table_name in _MODEL_CLOSURE_TABLES[3:]:
+    for table_name in _SNAPSHOT_ID_LOGICAL_EVIDENCE_TABLES:
         assert (
             await database.scalar(f"SELECT COUNT(*) FROM {stage}.{table_name} WHERE snapshot_id = 'staged-snapshot'")
             == 1
