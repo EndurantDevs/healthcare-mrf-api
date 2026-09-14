@@ -161,6 +161,25 @@ def test_json_decoder_is_incremental_strict_and_preserves_decimal_values():
         list(iter_records(_capture(b'[{"npi":"\\ud800"}]', stream), stream))
 
 
+def test_json_decoder_errors_do_not_echo_duplicate_source_labels():
+    """Malformed source labels remain out of capture errors and downstream logs."""
+
+    stream = _stream(format_name="json")
+    source_label = "Unreported Source Label"
+    payload = (
+        b'[{"'
+        + source_label.encode("utf-8")
+        + b'":"one","'
+        + source_label.encode("utf-8")
+        + b'":"two"}]'
+    )
+
+    with pytest.raises(CaptureError) as error:
+        list(iter_records(_capture(payload, stream), stream))
+
+    assert source_label not in str(error.value)
+
+
 def test_json_oversized_integer_fails_closed_without_terminating_python():
     """JSON integer conversion must remain a normal capture failure on Python 3.14."""
 

@@ -465,7 +465,7 @@ def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     values_by_key: dict[str, Any] = {}
     for key, value in pairs:
         if key in values_by_key:
-            raise CaptureError(f"duplicate JSON object key: {key}")
+            raise CaptureError("duplicate JSON object key")
         values_by_key[key] = value
     return values_by_key
 
@@ -637,7 +637,7 @@ def _xml_record_values(element: ElementTree.Element) -> dict[str, str]:
             raise CaptureError("XML records must contain flat scalar child elements")
         label = _validated_source_label(child.tag)
         if label in values_by_label:
-            raise CaptureError(f"XML record contains duplicate label: {label}")
+            raise CaptureError("XML record contains duplicate label")
         values_by_label[label] = child.text or ""
     return values_by_label
 
@@ -648,7 +648,7 @@ def _decoded_record(ordinal: int, value: Any, limits: CaptureLimits) -> DecodedR
     if ordinal > limits.maximum_records:
         raise CaptureError("source stream exceeds the record limit")
     if isinstance(value, _DuplicateKeyDict) and value.duplicate_key is not None:
-        raise CaptureError(f"duplicate JSON object key: {value.duplicate_key}")
+        raise CaptureError("duplicate JSON object key")
     if not isinstance(value, Mapping):
         raise CaptureError(f"record {ordinal} must be an object")
     if len(value) > limits.maximum_fields_per_record:
@@ -657,7 +657,7 @@ def _decoded_record(ordinal: int, value: Any, limits: CaptureLimits) -> DecodedR
     for raw_label, raw_scalar in value.items():
         label = _validated_source_label(raw_label)
         if label in values_by_label:
-            raise CaptureError(f"record {ordinal} contains duplicate label: {label}")
+            raise CaptureError(f"record {ordinal} contains duplicate label")
         values_by_label[label] = _validated_scalar(raw_scalar, ordinal)
     if _record_size(values_by_label) > limits.maximum_record_bytes:
         raise CaptureError(f"record {ordinal} exceeds the byte limit")
