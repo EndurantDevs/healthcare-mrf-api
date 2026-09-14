@@ -69,6 +69,27 @@ def test_manifest_binds_explicit_provenance_but_remains_manual_only():
         archive.validate_reference_family_manifest(tampered)
 
 
+def test_validation_receipt_rejects_tampered_package_binding():
+    manifest = _manifest()
+    receipt_by_field = {
+        "contract": archive.VALIDATION_CONTRACT,
+        "importer_id": "places-zcta",
+        "package_id": "a" * 64,
+        "profile_contract": archive.CONTRACT,
+        "stage_schema": "reference_family_archive_550e8400e29b41d4a716446655440000",
+        "stage_schema_oid": 10,
+        "relation_oids": [["pricing_places_zcta", 11]],
+        "sealed_owner_oid": 12,
+        "manifest_sha256": "b" * 64,
+        "tables": [table.as_dict() for table in manifest.tables],
+    }
+    receipt_by_field["validation_sha256"] = archive._validation_digest(receipt_by_field)
+    assert archive.validate_reference_family_validation_receipt(receipt_by_field).package_id == "a" * 64
+    receipt_by_field["package_id"] = "c" * 64
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="digest differs"):
+        archive.validate_reference_family_validation_receipt(receipt_by_field)
+
+
 @pytest.mark.asyncio
 async def test_capture_rejects_absent_provenance_before_database_access():
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=AsyncMock())
