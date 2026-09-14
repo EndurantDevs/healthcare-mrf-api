@@ -382,6 +382,12 @@ class CustomImportSourceStream(_CustomImportModel):
             "(record_kind = 'child' AND collection_slot IS NOT NULL))",
             name="custom_import_source_stream_shape_check",
         ),
+        CheckConstraint(
+            "((decoder = 'xml' AND record_path IS NOT NULL AND "
+            "record_path ~ '^[a-z][a-z0-9_]{0,62}$') OR "
+            "(decoder <> 'xml' AND record_path IS NULL))",
+            name="custom_import_source_stream_record_path_check",
+        ),
     )
 
     definition_revision_id = Column(BigInteger, primary_key=True)
@@ -394,6 +400,7 @@ class CustomImportSourceStream(_CustomImportModel):
     decoder = Column(String(16), nullable=False)
     compression = Column(String(8), nullable=False)
     snapshot_token_selector = Column(String(255), nullable=False)
+    record_path = Column(String(63))
     created_at = _timestamp_column()
 
 
