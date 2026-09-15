@@ -6,9 +6,10 @@ permissions:
   actions: read
 concurrency:
   group: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-    && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}
-  cancel-in-progress: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title
-    && !github.event.changes.base) && github.ref != 'refs/heads/main' }}
+    && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' && format('ci-push-{0}', github.run_id) ||
+    format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !(github.event_name == 'pull_request' && github.event.action
+    == 'edited' && !github.event.changes.title && !github.event.changes.base) }}
 jobs:
   smoke:
     name: portable import checks
@@ -46,6 +47,8 @@ jobs:
       && 'Repository checks (metadata only)' || 'Repository checks' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs:
+    - python-quality
     defaults:
       run:
         shell: bash
@@ -55,7 +58,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -119,7 +122,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -142,7 +145,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -174,7 +177,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -245,6 +248,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -255,7 +259,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -289,6 +293,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -299,7 +304,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -320,6 +325,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -330,13 +336,21 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         rust: 'true'
+    - name: Install verified Rust validation tools
+      run: 'tools_directory="$RUNNER_TEMP/healthcare-rust-tools"
+
+        python "$CI_ROOT/scripts/healthcare/install_rust_tools.py" "$tools_directory"
+
+        printf ''%s\n'' "$tools_directory" >> "$GITHUB_PATH"
+
+        '
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" rust
 
@@ -363,6 +377,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -373,12 +388,15 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
     - name: Run complete validation stage
+      env:
+        PUBLIC_CI_EXPORT_IMAGE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && '1' || '0' }}
+        GH_TOKEN: ${{ github.token }}
       run: 'bash "$CI_ROOT/scripts/healthcare/check" container-package
 
         git diff --exit-code
@@ -386,6 +404,15 @@ jobs:
         git diff --cached --exit-code
 
         test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload tested DEV image
+      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-image-staging-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/healthcare-public-image-staging-${{ github.run_id }}-${{ github.run_attempt }}/
+        if-no-files-found: error
+        retention-days: 1
+        compression-level: 0
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   security:
@@ -394,6 +421,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     defaults:
       run:
@@ -404,7 +432,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -425,10 +453,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
+    - python-quality
     - readability-preflight
     services:
       redis:
-        image: redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73
+        image: redis:7@sha256:71da9275c5f3fcb97d0fa0c8c5b36cc995327265420f17a04bfd544f458059f7
         ports:
         - 6379:6379
         options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
@@ -441,7 +470,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -468,7 +497,7 @@ jobs:
     - readability-preflight
     services:
       postgres:
-        image: postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871
+        image: postgis/postgis:18-3.6@sha256:60f6ad1d21ea86a67d47780b9a0d1e1d200500f62b19293fa834d0dea80b8677
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
@@ -497,7 +526,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -589,7 +618,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
         path: ci
         persist-credentials: false
     - name: Resolve exact source event
@@ -633,6 +662,101 @@ jobs:
       env:
         RESULTS: ${{ toJSON(needs.*.result) }}
       run: jq -e 'length > 0 and all(. == "success")' <<< "$RESULTS"
+  dev-image-publication:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'DEV image publication (metadata only)' || 'DEV image publication' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - smoke
+    - source-validation
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: write
+    env:
+      CI_REVISION: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+    - name: Check out trusted image publisher
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
+        path: ci
+        persist-credentials: false
+    - name: Authenticate DEV image input
+      id: image
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/source_image.py prepare
+    - name: Download validated image archive
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ steps.image.outputs.artifact_id }}
+        digest-mismatch: error
+        path: ${{ runner.temp }}/public-image-download
+        merge-multiple: true
+    - name: Stage DEV image publication intent
+      if: steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/source_image.py stage
+    - name: Upload DEV image publication intent
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-image-intent-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/public-image-intent/intent.json
+        if-no-files-found: error
+        retention-days: 90
+    - name: Publish validated DEV image
+      if: steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/source_image.py publish
+    - name: Upload DEV image receipt
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/public-image-receipt/image.json
+        if-no-files-found: error
+        retention-days: 90
+    - name: Reconcile DEV image publication
+      if: always() && steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/source_image.py reconcile
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  artifact-cleanup:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+    - dev-image-publication
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (always()) }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+    - name: Check out trusted cleanup helper
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
+        path: ci
+        persist-credentials: false
+    - name: Remove validated CI intermediates
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PYTHONDONTWRITEBYTECODE: '1'
+      run: python3 ci/scripts/artifact_cleanup.py
 'on':
   pull_request:
     types:
@@ -646,7 +770,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: fc9fd0e4eff86fbbd5d274c54c002e66bb6114ee
+  CI_REVISION: 463e13c0e62d44c39cf57b50604d3c815e5fa5de
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
