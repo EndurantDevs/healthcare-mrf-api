@@ -14,7 +14,6 @@ import os
 
 from alembic import op
 
-
 revision = "20260914120000_custom_import_v1_schema"
 down_revision = "20260907220000_hospital_price_missing_plan"
 branch_labels = None
@@ -588,34 +587,34 @@ CREATE INDEX custom_import_winner_lookup_idx ON mrf.custom_import_winner (genera
 )
 
 _TABLE_NAMES = (
-    'custom_import_dataset',
-    'custom_import_schema_revision',
-    'custom_import_field_slot',
-    'custom_import_child_collection',
-    'custom_import_field',
-    'custom_import_definition_revision',
-    'custom_import_source_stream',
-    'custom_import_field_alias',
-    'custom_import_selection_profile',
-    'custom_import_execution',
-    'custom_import_lease',
-    'custom_import_capture_bundle',
-    'custom_import_capture',
-    'custom_import_pack',
-    'custom_import_rejection',
-    'custom_import_root_record',
-    'custom_import_root_revision',
-    'custom_import_child_revision',
-    'custom_import_family_revision',
-    'custom_import_family_child',
-    'custom_import_generation',
-    'custom_import_generation_family',
-    'custom_import_root_scalar',
-    'custom_import_child_scalar',
-    'custom_import_entity_binding',
-    'custom_import_winner',
-    'custom_import_current_generation',
-    'custom_import_publication_event',
+    "custom_import_dataset",
+    "custom_import_schema_revision",
+    "custom_import_field_slot",
+    "custom_import_child_collection",
+    "custom_import_field",
+    "custom_import_definition_revision",
+    "custom_import_source_stream",
+    "custom_import_field_alias",
+    "custom_import_selection_profile",
+    "custom_import_execution",
+    "custom_import_lease",
+    "custom_import_capture_bundle",
+    "custom_import_capture",
+    "custom_import_pack",
+    "custom_import_rejection",
+    "custom_import_root_record",
+    "custom_import_root_revision",
+    "custom_import_child_revision",
+    "custom_import_family_revision",
+    "custom_import_family_child",
+    "custom_import_generation",
+    "custom_import_generation_family",
+    "custom_import_root_scalar",
+    "custom_import_child_scalar",
+    "custom_import_entity_binding",
+    "custom_import_winner",
+    "custom_import_current_generation",
+    "custom_import_publication_event",
 )
 
 _TABLE_CREATION_ORDER = (
