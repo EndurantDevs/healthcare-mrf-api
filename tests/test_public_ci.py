@@ -26,7 +26,7 @@ JOB_LABELS = {
     "source-validation": "Validation complete",
 }
 PRIVILEGED_JOB_IDS = {"dev-image-publication", "artifact-cleanup"}
-APPROVED_SHARED_CI_REVISION = "5a4beeabc1615f5979d7d0aa49ee85e267eed0ca"
+APPROVED_SHARED_CI_REVISION = "aca1a4b9e9553ae04edf451d240ac9ccba8ca4b0"
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 ARTIFACT_DOWNLOAD_ACTION = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 ARTIFACT_UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
