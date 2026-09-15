@@ -34,7 +34,9 @@ def _migration():
     return module
 
 
-def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync():
+def test_schema_models_keep_identity_and_xml_record_path_rules_explicit():
+    """Keep immutable schema identity and XML record-path rules explicit."""
+
     assert CustomImportDataset.__runtime_schema_sync__ is False
     assert isinstance(CustomImportSchemaRevision.__table__.c.canonical_schema.type, sa.Text)
     assert CustomImportSchemaRevision.__table__.c.schema_sha256.type.length == 32
@@ -53,12 +55,27 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
         "decoder <> 'xml' AND record_path IS NULL"
         in source_stream_checks_by_name["custom_import_source_stream_record_path_check"]
     )
+
+
+def test_schema_models_enforce_child_key_and_scalar_projection_identity():
+    """Keep child collection keys and scalar slots tied to one schema revision."""
+
     child_collection_shape = next(
         constraint
         for constraint in CustomImportChildCollection.__table__.constraints
         if constraint.name == "custom_import_child_collection_shape_check"
     )
     assert "octet_length(key_shape_sha256) = 32" in str(child_collection_shape.sqltext)
+    foreign_key_columns_by_name = {
+        foreign_key.name: tuple(element.parent.name for element in foreign_key.elements)
+        for foreign_key in CustomImportRootScalar.__table__.foreign_key_constraints
+    }
+    assert foreign_key_columns_by_name["custom_import_root_scalar_field_fkey"][-1] == "projection_slot"
+
+
+def test_runtime_models_keep_generation_selection_and_lease_shapes_explicit():
+    """Keep generations, winners, rejections, leases, and rollback references bounded."""
+
     rejection_shape = next(
         constraint
         for constraint in CustomImportRejection.__table__.constraints
@@ -94,11 +111,6 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
         "entity_binding_id",
         "context_key_sha256",
     )
-    foreign_key_columns_by_name = {
-        foreign_key.name: tuple(element.parent.name for element in foreign_key.elements)
-        for foreign_key in CustomImportRootScalar.__table__.foreign_key_constraints
-    }
-    assert foreign_key_columns_by_name["custom_import_root_scalar_field_fkey"][-1] == "projection_slot"
 
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):
