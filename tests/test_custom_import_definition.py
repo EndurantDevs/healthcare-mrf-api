@@ -41,12 +41,8 @@ def _rate(npi="1234567893", code="A100", amount=Decimal("12.50")):
 
 
 def test_json_and_yaml_have_one_canonical_definition_and_digest():
-    json_definition = CustomImportDefinition.from_json(
-        (FIXTURES / "v1_valid.json").read_text()
-    )
-    yaml_definition = CustomImportDefinition.from_yaml(
-        (FIXTURES / "v1_valid.yaml").read_text()
-    )
+    json_definition = CustomImportDefinition.from_json((FIXTURES / "v1_valid.json").read_text())
+    yaml_definition = CustomImportDefinition.from_yaml((FIXTURES / "v1_valid.yaml").read_text())
 
     assert json_definition.canonical == yaml_definition.canonical
     assert json_definition.digest == yaml_definition.digest
@@ -124,9 +120,7 @@ def test_definition_enforces_profile_and_projection_limits():
         CustomImportDefinition.from_mapping(raw)
 
     raw = _raw_definition()
-    raw["selection_profiles"] = [
-        copy.deepcopy(raw["selection_profiles"][0]) for _ in range(5)
-    ]
+    raw["selection_profiles"] = [copy.deepcopy(raw["selection_profiles"][0]) for _ in range(5)]
     for number, profile in enumerate(raw["selection_profiles"]):
         profile["id"] = f"profile_{number}"
     with pytest.raises(DefinitionError, match="profile count"):
@@ -146,9 +140,7 @@ def test_definition_enforces_profile_and_projection_limits():
         ),
     ],
 )
-def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(
-    mutate, message
-):
+def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(mutate, message):
     """Stream-local validation and whole-definition coverage remain distinct."""
 
     raw = _raw_definition()
@@ -160,9 +152,7 @@ def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(
 
 def test_source_tokens_must_be_complete_single_and_shared(definition):
     assert (
-        validate_source_snapshot_tokens(
-            definition, {"providers": ["snapshot-1"], "rates": ("snapshot-1",)}
-        )
+        validate_source_snapshot_tokens(definition, {"providers": ["snapshot-1"], "rates": ("snapshot-1",)})
         == "snapshot-1"
     )
     for tokens in (
@@ -182,9 +172,7 @@ def test_invalid_children_and_duplicate_keys_reject_only_their_root_family(defin
     assert result.families == ()
     assert {item.code for item in result.rejections} == {"required_field_missing"}
 
-    duplicate = assemble_root_families(
-        definition, [_root(), _root()], {"rates": [_rate(), _rate()]}
-    )
+    duplicate = assemble_root_families(definition, [_root(), _root()], {"rates": [_rate(), _rate()]})
     assert duplicate.families == ()
     assert {item.code for item in duplicate.rejections} == {
         "duplicate_root_key",
@@ -213,9 +201,7 @@ def test_missing_nullable_field_does_not_hide_a_later_required_field():
 
 
 def test_orphan_child_rejects_the_whole_candidate(definition):
-    result = assemble_root_families(
-        definition, [_root()], {"rates": [_rate(npi="1003000126")]}
-    )
+    result = assemble_root_families(definition, [_root()], {"rates": [_rate(npi="1003000126")]})
     assert result.candidate_errors == ("orphan_child",)
     with pytest.raises(CandidateRejected, match="orphan_child"):
         merge_families({}, result, refresh_mode="upsert")
@@ -264,14 +250,9 @@ def test_upsert_retains_rejected_and_absent_families_but_snapshot_requires_scope
     previous_families_by_key = {family.root_key: family for family in first.families}
     rejected_child = _rate()
     rejected_child["amount"] = object()
-    candidate = assemble_root_families(
-        definition, [_root()], {"rates": [rejected_child]}
-    )
+    candidate = assemble_root_families(definition, [_root()], {"rates": [rejected_child]})
 
-    assert (
-        merge_families(previous_families_by_key, candidate, refresh_mode="upsert")
-        == previous_families_by_key
-    )
+    assert merge_families(previous_families_by_key, candidate, refresh_mode="upsert") == previous_families_by_key
     assert (
         merge_families(
             previous_families_by_key,
