@@ -9,10 +9,13 @@ import sqlalchemy as sa
 
 from db import maintenance
 from db.models import (
+    CustomImportChildCollection,
     CustomImportDataset,
     CustomImportField,
     CustomImportGeneration,
+    CustomImportLease,
     CustomImportPublicationEvent,
+    CustomImportRejection,
     CustomImportRootScalar,
     CustomImportSchemaRevision,
     CustomImportSourceStream,
@@ -50,6 +53,24 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
         "decoder <> 'xml' AND record_path IS NULL"
         in source_stream_checks_by_name["custom_import_source_stream_record_path_check"]
     )
+    child_collection_shape = next(
+        constraint
+        for constraint in CustomImportChildCollection.__table__.constraints
+        if constraint.name == "custom_import_child_collection_shape_check"
+    )
+    assert "octet_length(key_shape_sha256) = 32" in str(child_collection_shape.sqltext)
+    rejection_shape = next(
+        constraint
+        for constraint in CustomImportRejection.__table__.constraints
+        if constraint.name == "custom_import_rejection_shape_check"
+    )
+    assert "root_key_sha256 IS NULL OR octet_length(root_key_sha256) = 32" in str(rejection_shape.sqltext)
+    lease_shape = next(
+        constraint
+        for constraint in CustomImportLease.__table__.constraints
+        if constraint.name == "custom_import_lease_shape_check"
+    )
+    assert "fence > 0 AND token_sha256 IS NOT NULL" in str(lease_shape.sqltext)
     assert "state" not in CustomImportGeneration.__table__.c
     assert "custom_import_generation_execution_key" in {
         constraint.name for constraint in CustomImportGeneration.__table__.constraints
@@ -66,6 +87,7 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
         if constraint.name == "custom_import_publication_event_shape_check"
     )
     assert "from_generation_id IS NOT NULL" in str(publication_event_shape.sqltext)
+    assert "event_kind = 'rolled_back' AND from_generation_id IS NOT NULL" in str(publication_event_shape.sqltext)
     assert tuple(CustomImportWinner.__table__.primary_key.columns.keys()) == (
         "generation_id",
         "profile_slot",
@@ -96,6 +118,7 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "guard_custom_import_immutable_row" in normalized
     assert "base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL" in normalized
     assert "event_kind = 'no_change' AND from_generation_id IS NOT NULL" in normalized
+    assert "event_kind = 'rolled_back' AND from_generation_id IS NOT NULL" in normalized
     assert normalized.count("BEFORE UPDATE OR DELETE") == len(migration._IMMUTABLE_TABLES)
     assert len(migration._TABLE_DDL) == len(migration._TABLE_NAMES)
     assert all("mrf." in statement for statement in migration._TABLE_DDL)
@@ -110,6 +133,9 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "record_path VARCHAR(63)" in source_stream_statement
     assert "decoder = 'xml' AND record_path IS NOT NULL" in source_stream_statement
     assert "decoder <> 'xml' AND record_path IS NULL" in source_stream_statement
+    assert "octet_length(key_shape_sha256) = 32" in normalized
+    assert "root_key_sha256 IS NULL OR octet_length(root_key_sha256) = 32" in normalized
+    assert "fence > 0 AND token_sha256 IS NOT NULL" in normalized
     function_statement = next(statement for statement in statements if "CREATE FUNCTION" in statement)
     revoke_statement = next(statement for statement in statements if "REVOKE ALL ON FUNCTION" in statement)
     assert "REVOKE ALL ON FUNCTION" not in function_statement

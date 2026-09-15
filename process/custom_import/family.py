@@ -62,6 +62,8 @@ def validate_source_snapshot_tokens(
 ) -> str:
     """Require every declared stream to observe one equal, non-empty token."""
 
+    if not isinstance(stream_tokens, Mapping):
+        raise SourceSnapshotError("snapshot token observations must be a mapping")
     expected_stream_ids = {stream.stream_id for stream in definition.source_streams}
     if set(stream_tokens) != expected_stream_ids:
         raise SourceSnapshotError("snapshot stream set does not match the definition")
@@ -69,12 +71,12 @@ def validate_source_snapshot_tokens(
     for stream_id, observed in stream_tokens.items():
         if not isinstance(observed, (list, tuple)) or not observed:
             raise SourceSnapshotError(f"stream {stream_id} has no bounded token observations")
+        if any(not isinstance(token, str) for token in observed):
+            raise SourceSnapshotError(f"stream {stream_id} has a non-string snapshot token")
         stream_values = set(observed)
         if None in stream_values or "" in stream_values or len(stream_values) != 1:
             raise SourceSnapshotError(f"stream {stream_id} lacks one snapshot token")
         token = next(iter(stream_values))
-        if not isinstance(token, str):
-            raise SourceSnapshotError(f"stream {stream_id} has a non-string snapshot token")
         shared_tokens.add(token)
     if len(shared_tokens) != 1:
         raise SourceSnapshotError("source streams do not share one snapshot token")
@@ -131,6 +133,8 @@ def _validate_family_inputs(
 ) -> None:
     if not isinstance(roots, (list, tuple)):
         raise DefinitionError("roots must be a bounded record array")
+    if not isinstance(children_by_collection, Mapping):
+        raise DefinitionError("children must contain one bounded array per declared collection")
     expected_collection_names = {collection.name for collection in definition.child_collections}
     has_bounded_child_records = all(
         isinstance(child_records, (list, tuple)) for child_records in children_by_collection.values()
