@@ -858,3 +858,11 @@ def _validate_revision_transition(previous: CustomImportDefinition, current: Cus
         for slot, field_id in field_id_by_previous_slot.items()
     ):
         raise DefinitionError("stable field slots cannot be rebound")
+    slot_by_previous_field_id = {field.field_id: field.field_slot for field in previous.fields}
+    slot_by_current_field_id = {field.field_id: field.field_slot for field in current.fields}
+    if any(
+        slot_by_current_field_id[field_id] != slot
+        for field_id, slot in slot_by_previous_field_id.items()
+        if field_id in slot_by_current_field_id
+    ):
+        raise DefinitionError("stable field slots cannot be rebound")
