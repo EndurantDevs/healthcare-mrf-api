@@ -58,6 +58,10 @@ from process.npi_canonical_publication_store import (
     has_settled_npi_publication,
     mark_npi_publication_succeeded,
 )
+from process.npi_result_generation import (
+    install_npi_result_revision_guards,
+    publish_local_npi_result_generation,
+)
 from process.nppes_public_evidence_catalog import assert_nppes_admission_catalog
 from process.nppes_public_evidence_import import (
     NppesEvidenceRuntimeConfig,
@@ -2664,6 +2668,11 @@ WHERE
             schema=schema,
             stage_tables=tuple(stage_table_by_live_table.values()),
         )
+        await install_npi_result_revision_guards(
+            lease.connection,
+            schema_name=schema,
+            stage_tables=tuple(stage_table_by_live_table.values()),
+        )
         await timed_shutdown_phase(
             "search_taxonomy_projection_validation",
             validate_npi_search_taxonomy_projection(
@@ -2743,6 +2752,11 @@ WHERE
                 relation_oids,
                 publication_row_counts,
             ),
+        )
+        await publish_local_npi_result_generation(
+            lease.connection,
+            schema_name=schema,
+            receipt=publication_receipt,
         )
         terminal_metrics_by_name["npi_canonical_publication"] = (
             npi_publication_metrics(publication_receipt)
