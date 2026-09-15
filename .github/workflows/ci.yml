@@ -532,9 +532,14 @@ jobs:
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
     - name: Install PostgreSQL client
-      run: 'sudo apt-get update -qq
-
-        sudo apt-get install --yes --no-install-recommends postgresql-client'
+      run: "sudo apt-get update -qq\nsudo apt-get install --yes --no-install-recommends ca-certificates curl\nsudo install\
+        \ -d -m 0755 /usr/share/postgresql-common/pgdg\nsudo curl --fail --location --silent --show-error \\\n  --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc\
+        \ \\\n  https://www.postgresql.org/media/keys/ACCC4CF8.asc\n. /etc/os-release\nprintf '%s\\n' \\\n  'Types: deb' \\\
+        \n  'URIs: https://apt.postgresql.org/pub/repos/apt' \\\n  \"Suites: ${VERSION_CODENAME}-pgdg\" \\\n  'Components:\
+        \ main' \\\n  'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' |\n  sudo tee /etc/apt/sources.list.d/pgdg.sources\
+        \ >/dev/null\nsudo apt-get update -qq\nsudo apt-get install --yes --no-install-recommends postgresql-client-18\nprintf\
+        \ '%s\\n' /usr/lib/postgresql/18/bin >> \"$GITHUB_PATH\"\nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\"\
+        \ --version | grep -Eq \"^$tool \\\\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
