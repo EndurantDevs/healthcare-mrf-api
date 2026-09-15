@@ -6,9 +6,22 @@ import datetime
 from uuid import uuid4
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
+
+
+def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    hospital_revision = "20260917100000_hospital_price_csv_v3_label"
+    npi_revision = "20260914120000_npi_result_generation"
+
+    assert script.get_heads() == [npi_revision]
+    assert script.get_revision(hospital_revision).down_revision == "20260914120000_custom_import_v1_schema"
+    assert script.get_revision(npi_revision).down_revision == hospital_revision
+    assert [step.revision.revision for step in script._upgrade_revs("head", hospital_revision)] == [npi_revision]
 
 
 def _serving(lineage_id: str, revision: int) -> dict[str, object]:
