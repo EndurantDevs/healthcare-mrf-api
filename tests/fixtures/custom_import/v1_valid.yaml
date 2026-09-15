@@ -1,0 +1,43 @@
+contract: custom-import/v1
+revision:
+  definition: 1
+  schema: 1
+refresh_mode: upsert
+streams:
+  - id: providers
+    kind: root
+    format: csv
+    compression: none
+    snapshot_token: snapshot_id
+  - id: rates
+    kind: child
+    child: rates
+    format: ndjson
+    compression: gzip
+    snapshot_token: snapshot_id
+schema:
+  root:
+    logical_key: [npi]
+    entity: {adapter: npi, field: npi}
+    fields:
+      - {id: npi, slot: 1, type: string, nullable: false, projection_slot: 1}
+      - {id: display_name, slot: 2, type: string, nullable: false, projection_slot: 2}
+  children:
+    - name: rates
+      parent_key: [{child: rate_npi, root: npi}]
+      child_key: [service_code]
+      fields:
+        - {id: rate_npi, slot: 3, type: string, nullable: false}
+        - {id: service_code, slot: 4, type: string, nullable: false, projection_slot: 3}
+        - {id: amount, slot: 5, type: decimal, nullable: true, projection_slot: 4}
+aliases:
+  providers: {Provider ID: npi, Provider Name: display_name}
+  rates: {Provider ID: rate_npi, Service Code: service_code, Amount: amount}
+query:
+  root_fields: [npi, display_name]
+  child: {collection: rates, fields: [service_code, amount]}
+  order: [{field: amount, direction: asc, nulls: last}]
+selection_profiles:
+  - id: default
+    selection: [{field: amount, direction: asc, nulls: last}]
+    context_dimensions: [service_code]

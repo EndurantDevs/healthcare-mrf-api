@@ -76,6 +76,9 @@ def _sync_structure(
             continue
         table_name = table.name
         fullname = table.fullname
+        model = model_map.get(fullname)
+        if model is not None and not getattr(model, "__runtime_schema_sync__", True):
+            continue
 
         if not inspector.has_table(table_name, schema=schema):
             table.create(bind=sync_conn, checkfirst=True)
@@ -85,16 +88,14 @@ def _sync_structure(
         if add_columns:
             _ensure_columns(sync_conn, inspector, table, sync_summary_by_kind)
 
-        if add_indexes:
-            model = model_map.get(fullname)
-            if model is not None:
-                _ensure_indexes(
-                    sync_conn,
-                    inspector,
-                    table,
-                    model,
-                    sync_summary_by_kind,
-                )
+        if add_indexes and model is not None:
+            _ensure_indexes(
+                sync_conn,
+                inspector,
+                table,
+                model,
+                sync_summary_by_kind,
+            )
 
     checkpoint_schema = ProviderDirectoryPaginationCheckpoint.__table__.schema
     if checkpoint_schema in managed_schemas:

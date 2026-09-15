@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 METADATA_ONLY = (
     "github.event_name == 'pull_request' && github.event.action == 'edited' "
     "&& !github.event.changes.title && !github.event.changes.base"
@@ -26,6 +25,7 @@ JOB_LABELS = {
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
 }
+PRIVILEGED_JOB_IDS = {"dev-image-publication", "artifact-cleanup"}
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
         {"shard": str(index), "label": f"Python tests ({index + 1}/4)", "output": f"artifact_{index}"}
@@ -74,11 +74,18 @@ def _assert_job_actions(job_id, job, revision) -> None:
     assert has_pinned_checkout or job_id in {"smoke", "source-validation"}
 
 
-def test_public_ci_is_hosted_read_only_and_runs_import_checks():
+def _load_public_workflow():
+    """Load the sole public validation workflow and its exact rendered text."""
+
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     assert sorted(path.name for path in workflows.iterdir()) == ["ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
-    workflow = yaml.safe_load(text)
+    return yaml.safe_load(text), text
+
+
+def _assert_public_workflow_contract(workflow, text, revision) -> None:
+    """Keep trigger, concurrency, and workflow-level permissions read-only."""
+
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
     assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
         "opened", "synchronize", "reopened", "edited",
@@ -87,8 +94,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["permissions"] == {
         "contents": "read", "pull-requests": "read", "actions": "read",
     }
-    assert set(workflow["jobs"]) == set(JOB_LABELS)
-    revision = workflow["env"]["CI_REVISION"]
+    assert set(workflow["jobs"]) == set(JOB_LABELS) | PRIVILEGED_JOB_IDS
     assert re.fullmatch(r"[0-9a-f]{40}", revision)
     assert set(revision) != {"0"}
     assert "inputs.ci_revision" not in text
@@ -96,11 +102,23 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+            + " && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' "
+            "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' && !(" + METADATA_ONLY + ") }}",
     }
-    for job_id, job in workflow["jobs"].items():
+
+
+def _assert_read_only_validation_jobs(workflow, revision) -> None:
+    """Require every validation job to remain bounded to public read access."""
+
+    assert {
+        job_id
+        for job_id, job in workflow["jobs"].items()
+        if any(permission == "write" for permission in job.get("permissions", {}).values())
+    } == PRIVILEGED_JOB_IDS
+    for job_id in JOB_LABELS:
+        job = workflow["jobs"][job_id]
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
@@ -112,6 +130,41 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         assert not job.get("continue-on-error")
         assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
+
+
+def _assert_privileged_workflow_jobs(workflow, revision) -> None:
+    """Allow the two tightly constrained post-validation artifact operations."""
+
+    publication = workflow["jobs"]["dev-image-publication"]
+    assert publication["name"] == "${{ " + METADATA_ONLY + " && 'DEV image publication (metadata only)' || 'DEV image publication' }}"
+    assert publication["runs-on"] == "ubuntu-latest"
+    assert publication["timeout-minutes"] == 30
+    assert publication["needs"] == ["smoke", "source-validation"]
+    assert publication["if"] == "${{ !(" + METADATA_ONLY + ") && (success()) }}"
+    assert publication["permissions"] == {
+        "contents": "read", "pull-requests": "read", "actions": "read", "packages": "write",
+    }
+    assert publication["env"] == {"CI_REVISION": revision, "PYTHONDONTWRITEBYTECODE": "1"}
+    _assert_job_actions("dev-image-publication", publication, revision)
+
+    cleanup = workflow["jobs"]["artifact-cleanup"]
+    assert cleanup["name"] == "${{ " + METADATA_ONLY + " && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}"
+    assert cleanup["runs-on"] == "ubuntu-latest"
+    assert cleanup["timeout-minutes"] == 10
+    assert cleanup["needs"] == ["dev-image-publication"]
+    assert cleanup["if"] == "${{ !(" + METADATA_ONLY + ") && (always()) }}"
+    assert cleanup["permissions"] == {"contents": "read", "actions": "write"}
+    _assert_job_actions("artifact-cleanup", cleanup, revision)
+
+    assert workflow["jobs"]["source-validation"]["needs"] == ["measurement"]
+    assert [step["run"] for step in cleanup["steps"] if "run" in step] == [
+        "python3 ci/scripts/artifact_cleanup.py"
+    ]
+
+
+def _assert_public_smoke_job(workflow, text) -> None:
+    """Keep the initial portable check independent of private infrastructure."""
+
     job = workflow["jobs"]["smoke"]
     assert job["runs-on"] == "ubuntu-latest"
     assert "container" not in job
@@ -122,6 +175,17 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert "python -m pytest -q" in commands
     assert "test_process_" in commands or "tests/process/" in commands
     assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
+
+
+def test_public_ci_is_hosted_read_only_and_runs_import_checks():
+    """Keep generated public CI isolated from private infrastructure and credentials."""
+
+    workflow, text = _load_public_workflow()
+    revision = workflow["env"]["CI_REVISION"]
+    _assert_public_workflow_contract(workflow, text, revision)
+    _assert_read_only_validation_jobs(workflow, revision)
+    _assert_privileged_workflow_jobs(workflow, revision)
+    _assert_public_smoke_job(workflow, text)
 
 
 def test_dependency_updates_target_the_development_branch():
