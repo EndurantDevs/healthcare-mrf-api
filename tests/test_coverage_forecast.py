@@ -308,6 +308,47 @@ def test_machine_artifact_transition_allows_only_the_coverage_tool_upgrade() -> 
     )
 
 
+def test_rust_toolchain_transition_allows_only_the_exact_upgrade() -> None:
+    """The measured baseline permits one pinned Rust upgrade without weakening its ratchets."""
+
+    reference = _artifact_baseline()
+    reference["machine_artifact_required"] = True
+    candidate = json.loads(json.dumps(reference))
+    candidate["reports"]["rust"]["scope"]["policy"]["rust"] = "1.98.1"
+
+    assert ratchet._compare_baselines(candidate, reference) == []
+
+    invalid_version = json.loads(json.dumps(candidate))
+    invalid_version["reports"]["rust"]["scope"]["policy"]["rust"] = "1.98.2"
+    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(
+        invalid_version, reference
+    )
+
+    downgrade = json.loads(json.dumps(reference))
+    assert "rust: measurement policy changed rust" in ratchet._compare_baselines(
+        downgrade, candidate
+    )
+
+    changed_coverage_tool = json.loads(json.dumps(candidate))
+    changed_coverage_tool["reports"]["rust"]["scope"]["policy"]["cargo_llvm_cov"] = "0.8.8"
+    assert "rust: measurement policy changed cargo_llvm_cov" in ratchet._compare_baselines(
+        changed_coverage_tool, reference
+    )
+
+    narrowed_scope = json.loads(json.dumps(candidate))
+    narrowed_scope["reports"]["rust"]["scope"]["include"] = []
+    assert "rust: baseline source scope was narrowed" in ratchet._compare_baselines(
+        narrowed_scope, reference
+    )
+
+    lower_coverage = json.loads(json.dumps(candidate))
+    lower_coverage["reports"]["rust"]["metrics"]["lines"]["covered"] -= 4
+    assert any(
+        error.startswith("rust.lines baseline: coverage fell")
+        for error in ratchet._compare_baselines(lower_coverage, reference)
+    )
+
+
 def test_forecast_refuses_mutable_or_short_base_identifiers(tmp_path: Path) -> None:
     """The CI adapter never falls back to an ambiguous target revision."""
 
