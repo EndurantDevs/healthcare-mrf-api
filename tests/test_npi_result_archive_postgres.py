@@ -226,6 +226,19 @@ async def _run_migration(connection, schema_name: str) -> None:
     await connection.run_sync(apply)
 
 
+async def _run_migration_downgrade(connection, schema_name: str) -> None:
+    migration = _migration_module()
+
+    def apply(sync_connection) -> None:
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+            monkeypatch.delenv("DB_SCHEMA", raising=False)
+            migration.downgrade()
+
+    await connection.run_sync(apply)
+
+
 async def _ensure_model_extensions(connection) -> None:
     await connection.execute(text("CREATE EXTENSION IF NOT EXISTS intarray"))
     await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
@@ -604,6 +617,132 @@ async def test_ordinary_publication_generation_is_transactional() -> None:
         try:
             async with engine.begin() as sqlalchemy_connection:
                 await sqlalchemy_connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_migration_accepts_an_empty_schema() -> None:
+    """Directory-only schemas retain state without pretending to own NPI tables."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_generation_empty_" + uuid4().hex
+    relation = f'"{schema_name}"."npi_result_generation"'
+    function = f'"{schema_name}"."advance_npi_result_generation"()'
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+            await _run_migration(connection, schema_name)
+            assert await connection.scalar(text(f"SELECT relation_oids FROM {relation}")) is None
+            assert await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
+            await _run_migration_downgrade(connection, schema_name)
+            assert (
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation}) is None
+            )
+            assert (
+                await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
+                is None
+            )
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_migration_guards_only_a_complete_npi_family() -> None:
+    """A legacy family gets six durable guards without changing its data."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_generation_complete_" + uuid4().hex
+    relation = f'"{schema_name}"."npi_result_generation"'
+    try:
+        async with engine.begin() as connection:
+            await _create_family(connection, schema_name, populated=True)
+            trigger_rows = (
+                await connection.execute(
+                    text(
+                        "SELECT relation.relname, trigger.tgenabled::text "
+                        "FROM pg_trigger AS trigger "
+                        "JOIN pg_class AS relation ON relation.oid = trigger.tgrelid "
+                        "JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                        "WHERE namespace.nspname = :schema_name "
+                        "AND trigger.tgname = 'npi_result_generation_revision_guard' "
+                        "AND NOT trigger.tgisinternal ORDER BY relation.relname"
+                    ),
+                    {"schema_name": schema_name},
+                )
+            ).all()
+            assert {row[0] for row in trigger_rows} == set(generation.RELATION_NAMES)
+            assert {row[1] for row in trigger_rows} == {"A"}
+            await _run_migration_downgrade(connection, schema_name)
+            assert (
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation}) is None
+            )
+            for table_name in generation.RELATION_NAMES:
+                assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}"."{table_name}"')) == 1
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_migration_rejects_a_partial_npi_family() -> None:
+    """An incomplete legacy family cannot leave an ambiguous tracking state."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_generation_partial_" + uuid4().hex
+    relation = f'"{schema_name}"."npi_result_generation"'
+    function = f'"{schema_name}"."advance_npi_result_generation"()'
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+            await connection.execute(text(f'CREATE TABLE "{schema_name}".npi (synthetic_id bigint PRIMARY KEY)'))
+            with pytest.raises(RuntimeError, match="all present or all absent"):
+                await _run_migration(connection, schema_name)
+            assert (
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation}) is None
+            )
+            assert (
+                await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
+                is None
+            )
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_migration_downgrade_rejects_a_partial_family() -> None:
+    """A later damaged family cannot erase its still-live tracking state."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_generation_partial_down_" + uuid4().hex
+    relation = f'"{schema_name}"."npi_result_generation"'
+    function = f'"{schema_name}"."advance_npi_result_generation"()'
+    try:
+        async with engine.begin() as connection:
+            await _create_family(connection, schema_name, populated=True)
+            for table_name in generation.RELATION_NAMES[1:]:
+                await connection.execute(text(f'DROP TABLE "{schema_name}"."{table_name}"'))
+            with pytest.raises(RuntimeError, match="all present or all absent"):
+                await _run_migration_downgrade(connection, schema_name)
+            assert (
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation})
+                is not None
+            )
+            assert (
+                await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
+                is not None
+            )
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
         finally:
             await engine.dispose()
 
