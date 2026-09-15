@@ -78,6 +78,32 @@ def test_definition_rejects_yaml_aliases_and_unknown_nested_keys():
         CustomImportDefinition.from_mapping(raw)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw.update({"refresh_mode": []}),
+        lambda raw: raw["schema"]["root"]["fields"][0].update({"type": []}),
+        lambda raw: raw["query"]["order"][0].update({"direction": []}),
+        lambda raw: raw.update({"refresh_mode": ("upsert",)}),
+    ],
+)
+def test_definition_mapping_rejects_non_scalar_enums_without_type_errors(mutate):
+    raw = _raw_definition()
+    mutate(raw)
+
+    with pytest.raises(DefinitionError):
+        CustomImportDefinition.from_mapping(raw)
+
+
+@pytest.mark.parametrize("revision_name", ("definition", "schema"))
+def test_definition_rejects_revision_numbers_outside_integer_storage(revision_name):
+    raw = _raw_definition()
+    raw["revision"][revision_name] = 2_147_483_648
+
+    with pytest.raises(DefinitionError, match="integer <= 2147483647"):
+        CustomImportDefinition.from_mapping(raw)
+
+
 def test_alias_only_revision_keeps_schema_and_stable_slots():
     first = CustomImportDefinition.from_mapping(_raw_definition())
     second_raw = _raw_definition()
@@ -150,19 +176,50 @@ def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(mutate
         CustomImportDefinition.from_mapping(raw)
 
 
+def test_xml_stream_requires_a_bounded_record_path():
+    raw = _raw_definition()
+    root_stream = raw["streams"][0]
+    root_stream.update({"format": "xml", "record_path": "r" * 63})
+
+    definition = CustomImportDefinition.from_mapping(raw)
+    assert definition.source_streams[0].record_path == "r" * 63
+
+    raw["streams"][0].pop("record_path")
+    with pytest.raises(DefinitionError, match="record_path is required"):
+        CustomImportDefinition.from_mapping(raw)
+
+    raw = _raw_definition()
+    raw["streams"][0]["record_path"] = "provider"
+    with pytest.raises(DefinitionError, match="only valid for XML"):
+        CustomImportDefinition.from_mapping(raw)
+
+    raw = _raw_definition()
+    raw["streams"][0].update({"format": "xml", "record_path": "r" * 64})
+    with pytest.raises(DefinitionError, match="record_path must be lower_snake_case"):
+        CustomImportDefinition.from_mapping(raw)
+
+
 def test_source_tokens_must_be_complete_single_and_shared(definition):
     assert (
         validate_source_snapshot_tokens(definition, {"providers": ["snapshot-1"], "rates": ("snapshot-1",)})
         == "snapshot-1"
     )
     for tokens in (
+        ["providers", "rates"],
         {"providers": ["snapshot-1"]},
         {"providers": ["snapshot-1", "snapshot-2"], "rates": ["snapshot-1"]},
         {"providers": [None], "rates": ["snapshot-1"]},
+        {"providers": [["snapshot-1"]], "rates": ["snapshot-1"]},
+        {"providers": [1], "rates": ["snapshot-1"]},
         {"providers": ["snapshot-1"], "rates": ["snapshot-2"]},
     ):
         with pytest.raises(SourceSnapshotError):
             validate_source_snapshot_tokens(definition, tokens)
+
+
+def test_family_build_requires_a_child_collection_mapping(definition):
+    with pytest.raises(DefinitionError, match="children must contain one bounded array"):
+        assemble_root_families(definition, [], [])
 
 
 def test_invalid_children_and_duplicate_keys_reject_only_their_root_family(definition):

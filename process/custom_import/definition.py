@@ -27,6 +27,7 @@ MAX_SELECTION_PROFILES = 4
 MAX_CONTEXT_DIMENSIONS = 2
 MAX_SELECTION_TERMS = 3
 MAX_ORDER_TERMS = 3
+MAX_REVISION_NUMBER = 2_147_483_647
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _FIELD_TYPES = frozenset({"string", "integer", "decimal", "boolean", "date", "timestamp"})
@@ -147,7 +148,7 @@ def _validate_wire_value(value: Any, *, depth: int = 0, nodes: list[int] | None 
         raise DefinitionError("definitions cannot contain floating-point values")
     if isinstance(value, list):
         return [_validate_wire_value(item, depth=depth + 1, nodes=nodes) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise DefinitionError("definition object keys must be strings")
         return {key: _validate_wire_value(item, depth=depth + 1, nodes=nodes) for key, item in value.items()}
@@ -227,6 +228,7 @@ class SourceStream:
     child_collection: str | None
     format: str
     compression: str
+    record_path: str | None
     snapshot_token: str
 
 
@@ -331,7 +333,7 @@ class CustomImportDefinition:
         previous: CustomImportDefinition | None = None,
     ) -> CustomImportDefinition:
         """Parse an in-memory declaration into its immutable v1 representation."""
-        definition = _parse_definition_header(definition_value)
+        definition = _parse_definition_header(_validate_wire_value(definition_value))
         parsed = _parse_definition_contents(definition)
         if previous is not None:
             _validate_revision_transition(previous, parsed)
@@ -409,18 +411,20 @@ def _parse_revision_numbers(definition: Mapping[str, Any]) -> tuple[int, int]:
         _required(revision, "definition", "definition.revision"),
         "definition.revision.definition",
         minimum=1,
+        maximum=MAX_REVISION_NUMBER,
     )
     schema_revision = _integer(
         _required(revision, "schema", "definition.revision"),
         "definition.revision.schema",
         minimum=1,
+        maximum=MAX_REVISION_NUMBER,
     )
     return definition_revision, schema_revision
 
 
 def _parse_refresh_mode(definition: Mapping[str, Any]) -> str:
     refresh_mode = _required(definition, "refresh_mode", "definition")
-    if refresh_mode not in _REFRESH_MODES:
+    if not isinstance(refresh_mode, str) or refresh_mode not in _REFRESH_MODES:
         raise DefinitionError("definition.refresh_mode must be upsert or snapshot")
     return refresh_mode
 
@@ -588,7 +592,7 @@ def _parse_fields(raw: Any, path: str, *, collection: str | None = None) -> tupl
             keys={"id", "slot", "type", "nullable", "projection_slot"},
         )
         value_type = _required(field, "type", item_path)
-        if value_type not in _FIELD_TYPES:
+        if not isinstance(value_type, str) or value_type not in _FIELD_TYPES:
             raise DefinitionError(f"{item_path}.type is not a v1 scalar type")
         nullable = _required(field, "nullable", item_path)
         if not isinstance(nullable, bool):
@@ -645,10 +649,10 @@ def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[
     stream = _mapping(
         raw_stream,
         path,
-        keys={"id", "kind", "child", "format", "compression", "snapshot_token"},
+        keys={"id", "kind", "child", "format", "compression", "record_path", "snapshot_token"},
     )
     kind = _required(stream, "kind", path)
-    if kind not in {"root", "child"}:
+    if not isinstance(kind, str) or kind not in {"root", "child"}:
         raise DefinitionError(f"{path}.kind must be root or child")
     child = stream.get("child")
     if kind == "root" and child is not None:
@@ -659,14 +663,26 @@ def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[
             raise DefinitionError(f"{path}.child is not declared")
     format_name = _required(stream, "format", path)
     compression = _required(stream, "compression", path)
-    if format_name not in _FORMATS or compression not in _COMPRESSIONS:
+    if (
+        not isinstance(format_name, str)
+        or not isinstance(compression, str)
+        or format_name not in _FORMATS
+        or compression not in _COMPRESSIONS
+    ):
         raise DefinitionError(f"{path} declares an unsupported format or compression")
+    if format_name == "xml":
+        record_path = _identifier(_required(stream, "record_path", path), f"{path}.record_path")
+    elif "record_path" in stream:
+        raise DefinitionError(f"{path}.record_path is only valid for XML streams")
+    else:
+        record_path = None
     return SourceStream(
         stream_id=_identifier(_required(stream, "id", path), f"{path}.id"),
         record_kind=kind,
         child_collection=child,
         format=format_name,
         compression=compression,
+        record_path=record_path,
         snapshot_token=_identifier(_required(stream, "snapshot_token", path), f"{path}.snapshot_token"),
     )
 
@@ -809,7 +825,12 @@ def _parse_sort_terms(raw: Any, path: str, *, maximum: int) -> tuple[SortTerm, .
         term = _mapping(raw_term, term_path, keys={"field", "direction", "nulls"})
         direction = _required(term, "direction", term_path)
         nulls = _required(term, "nulls", term_path)
-        if direction not in _DIRECTIONS or nulls not in _NULLS:
+        if (
+            not isinstance(direction, str)
+            or not isinstance(nulls, str)
+            or direction not in _DIRECTIONS
+            or nulls not in _NULLS
+        ):
             raise DefinitionError(f"{term_path} has invalid direction or null ordering")
         terms.append(
             SortTerm(

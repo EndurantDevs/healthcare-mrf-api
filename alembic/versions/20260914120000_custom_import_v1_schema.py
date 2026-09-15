@@ -102,7 +102,7 @@ CREATE TABLE mrf.custom_import_child_collection (
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT transaction_timestamp() NOT NULL,
 	CONSTRAINT custom_import_child_collection_pkey PRIMARY KEY (schema_revision_id, collection_slot),
 	CONSTRAINT custom_import_child_collection_schema_fkey FOREIGN KEY(schema_revision_id, dataset_id) REFERENCES mrf.custom_import_schema_revision (schema_revision_id, dataset_id) ON DELETE RESTRICT,
-	CONSTRAINT custom_import_child_collection_shape_check CHECK (collection_slot > 0 AND collection_name ~ '^[a-z][a-z0-9_]{0,62}$'),
+	CONSTRAINT custom_import_child_collection_shape_check CHECK (collection_slot > 0 AND collection_name ~ '^[a-z][a-z0-9_]{0,62}$' AND octet_length(key_shape_sha256) = 32),
 	CONSTRAINT custom_import_child_collection_name_key UNIQUE (schema_revision_id, collection_name),
 	CONSTRAINT custom_import_child_collection_owner_key UNIQUE (schema_revision_id, dataset_id, collection_slot)
 )
@@ -298,7 +298,7 @@ CREATE TABLE mrf.custom_import_lease (
 	expires_at TIMESTAMP WITH TIME ZONE,
 	updated_at TIMESTAMP WITH TIME ZONE DEFAULT transaction_timestamp() NOT NULL,
 	CONSTRAINT custom_import_lease_pkey PRIMARY KEY (execution_id),
-	CONSTRAINT custom_import_lease_shape_check CHECK (fence >= 0 AND ((fence = 0 AND token_sha256 IS NULL AND expires_at IS NULL) OR (fence > 0 AND octet_length(token_sha256) = 32 AND expires_at IS NOT NULL))),
+	CONSTRAINT custom_import_lease_shape_check CHECK (fence >= 0 AND ((fence = 0 AND token_sha256 IS NULL AND expires_at IS NULL) OR (fence > 0 AND token_sha256 IS NOT NULL AND octet_length(token_sha256) = 32 AND expires_at IS NOT NULL))),
 	FOREIGN KEY(execution_id) REFERENCES mrf.custom_import_execution (execution_id) ON DELETE CASCADE
 )
     """,
@@ -380,7 +380,7 @@ CREATE TABLE mrf.custom_import_publication_event (
 	CONSTRAINT custom_import_publication_event_pkey PRIMARY KEY (publication_event_id),
 	CONSTRAINT custom_import_publication_event_execution_fkey FOREIGN KEY(execution_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_execution (execution_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
 	CONSTRAINT custom_import_publication_event_to_fkey FOREIGN KEY(to_generation_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_generation (generation_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
-	CONSTRAINT custom_import_publication_event_shape_check CHECK (event_kind IN ('activated', 'rolled_back', 'no_change') AND expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND ((event_kind IN ('activated', 'rolled_back') AND committed_pointer_version = expected_pointer_version + 1) OR (event_kind = 'no_change' AND from_generation_id IS NOT NULL AND from_generation_id = to_generation_id AND committed_pointer_version = expected_pointer_version)) AND octet_length(event_sha256) = 32),
+	CONSTRAINT custom_import_publication_event_shape_check CHECK (event_kind IN ('activated', 'rolled_back', 'no_change') AND expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND ((event_kind = 'activated' AND committed_pointer_version = expected_pointer_version + 1) OR (event_kind = 'rolled_back' AND from_generation_id IS NOT NULL AND committed_pointer_version = expected_pointer_version + 1) OR (event_kind = 'no_change' AND from_generation_id IS NOT NULL AND from_generation_id = to_generation_id AND committed_pointer_version = expected_pointer_version)) AND octet_length(event_sha256) = 32),
 	CONSTRAINT custom_import_publication_event_from_fkey FOREIGN KEY(from_generation_id, dataset_id) REFERENCES mrf.custom_import_generation (generation_id, dataset_id) ON DELETE RESTRICT
 )
     """,
@@ -403,7 +403,7 @@ CREATE TABLE mrf.custom_import_rejection (
 	CONSTRAINT custom_import_rejection_pkey PRIMARY KEY (execution_id, rejection_ordinal),
 	CONSTRAINT custom_import_rejection_pack_fkey FOREIGN KEY(pack_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_pack (pack_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
 	CONSTRAINT custom_import_rejection_execution_fkey FOREIGN KEY(execution_id, dataset_id, definition_revision_id, schema_revision_id) REFERENCES mrf.custom_import_execution (execution_id, dataset_id, definition_revision_id, schema_revision_id) ON DELETE RESTRICT,
-	CONSTRAINT custom_import_rejection_shape_check CHECK (rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{0,62}$' AND (source_ordinal IS NULL OR source_ordinal >= 0) AND (field_slot IS NULL OR field_slot > 0))
+	CONSTRAINT custom_import_rejection_shape_check CHECK (rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{0,62}$' AND (source_ordinal IS NULL OR source_ordinal >= 0) AND (field_slot IS NULL OR field_slot > 0) AND (root_key_sha256 IS NULL OR octet_length(root_key_sha256) = 32))
 )
     """,
     """\

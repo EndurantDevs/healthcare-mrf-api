@@ -242,7 +242,8 @@ class CustomImportChildCollection(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "collection_slot > 0 AND collection_name ~ '^[a-z][a-z0-9_]{0,62}$'",
+            "collection_slot > 0 AND collection_name ~ '^[a-z][a-z0-9_]{0,62}$' AND "
+            + _sha256_check("key_shape_sha256"),
             name="custom_import_child_collection_shape_check",
         ),
     )
@@ -645,7 +646,9 @@ class CustomImportLease(_CustomImportModel):
         PrimaryKeyConstraint("execution_id", name="custom_import_lease_pkey"),
         CheckConstraint(
             "fence >= 0 AND ((fence = 0 AND token_sha256 IS NULL AND expires_at IS NULL) "
-            "OR (fence > 0 AND " + _sha256_check("token_sha256") + " AND expires_at IS NOT NULL))",
+            "OR (fence > 0 AND token_sha256 IS NOT NULL AND "
+            + _sha256_check("token_sha256")
+            + " AND expires_at IS NOT NULL))",
             name="custom_import_lease_shape_check",
         ),
     )
@@ -890,7 +893,8 @@ class CustomImportRejection(_CustomImportModel):
         CheckConstraint(
             "rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{0,62}$' AND "
             "(source_ordinal IS NULL OR source_ordinal >= 0) AND "
-            "(field_slot IS NULL OR field_slot > 0)",
+            "(field_slot IS NULL OR field_slot > 0) AND "
+            "(root_key_sha256 IS NULL OR " + _sha256_check("root_key_sha256") + ")",
             name="custom_import_rejection_shape_check",
         ),
     )
@@ -1687,7 +1691,8 @@ class CustomImportPublicationEvent(_CustomImportModel):
         CheckConstraint(
             "event_kind IN ('activated', 'rolled_back', 'no_change') AND "
             "expected_pointer_version >= 0 AND committed_pointer_version >= 0 AND "
-            "((event_kind IN ('activated', 'rolled_back') AND "
+            "((event_kind = 'activated' AND committed_pointer_version = expected_pointer_version + 1) OR "
+            "(event_kind = 'rolled_back' AND from_generation_id IS NOT NULL AND "
             "committed_pointer_version = expected_pointer_version + 1) OR "
             "(event_kind = 'no_change' AND from_generation_id IS NOT NULL AND "
             "from_generation_id = to_generation_id AND "
