@@ -584,6 +584,203 @@ async def test_npi_snapshot_generation_activation_and_rollback() -> None:
             await engine.dispose()
 
 
+async def _create_paired_metadata_source(
+    engine,
+    source_schema: str,
+    sequence_name: str,
+) -> None:
+    """Create the canonical family and a deliberately unrelated ledger sequence."""
+
+    async with engine.begin() as connection:
+        await _create_family(connection, source_schema, populated=True)
+        # The real serving schema also contains publication-ledger identity
+        # sequences, which must not become part of the six-table clone.
+        await connection.execute(text(
+            f'CREATE TABLE "{source_schema}".unrelated_publication_ledger '
+            '(generation bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)'
+        ))
+        await _add_owned_sequence(
+            connection,
+            source_schema,
+            sequence_name=sequence_name,
+        )
+
+
+async def _prepare_paired_metadata_source(
+    sessions,
+    *,
+    source_schema: str,
+    dataset_id: UUID,
+) -> tuple[archive.NpiPreparedSource, list[object], list[archive.NpiPreparedSource]]:
+    """Prepare one clone while proving metadata and durable callbacks share a view."""
+
+    await _bootstrap(sessions, source_schema)
+    captured_metadata_sessions: list[object] = []
+    prepared_archives: list[archive.NpiPreparedSource] = []
+
+    async def capture_metadata(session):
+        captured_metadata_sessions.append(session)
+        marker = await session.scalar(text(f'SELECT marker FROM "{source_schema}".npi'))
+        return {"release": marker, "contract": "paired-call"}
+
+    async def persist(_session, frozen):
+        assert frozen.ownership.freeze_function_oid is not None
+        assert len(frozen.ownership.freeze_trigger_oids) == 6
+        assert len(frozen.ownership.freeze_catalog_versions) == 13
+        json.dumps(frozen.ownership.as_dict(), sort_keys=True)
+        prepared_archives.append(frozen)
+
+    prepared = await archive.prepare_npi_archive_source(
+        sessions,
+        schema_name=source_schema,
+        source_metadata=None,
+        dataset_id=dataset_id,
+        on_prepared=persist,
+        source_metadata_factory=capture_metadata,
+    )
+    return prepared, captured_metadata_sessions, prepared_archives
+
+
+async def _assert_paired_stage_sequence(
+    sessions,
+    prepared: archive.NpiPreparedSource,
+    source_schema: str,
+    sequence_name: str,
+) -> None:
+    """Require the cloned family to own a new sequence with a local default."""
+
+    assert len(prepared.ownership.sequence_oids) == 1
+    stage_sequence = prepared.ownership.sequence_oids[0]
+    assert stage_sequence[0] == sequence_name
+    assert stage_sequence[2:] == ("npi", "synthetic_id")
+    async with sessions() as session, session.begin():
+        source_sequence_oid = await session.scalar(
+            text("SELECT to_regclass(:qualified)::oid::bigint"),
+            {"qualified": f"{source_schema}.{sequence_name}"},
+        )
+        default_expression = await session.scalar(
+            text(
+                "SELECT pg_get_expr(default_value.adbin,default_value.adrelid) "
+                "FROM pg_attrdef AS default_value "
+                "JOIN pg_attribute AS column_value "
+                "ON column_value.attrelid=default_value.adrelid "
+                "AND column_value.attnum=default_value.adnum "
+                "WHERE default_value.adrelid=to_regclass(:table_name) "
+                "AND column_value.attname='synthetic_id'"
+            ),
+            {"table_name": f"{prepared.ownership.schema_name}.npi"},
+        )
+    assert stage_sequence[1] != source_sequence_oid
+    assert prepared.ownership.schema_name in default_expression
+    assert source_schema not in default_expression
+
+
+async def _assert_frozen_paired_stage_rejects_write(
+    sessions,
+    prepared: archive.NpiPreparedSource,
+) -> None:
+    """Exercise the SQL guard before the clone is sent to an archive copier."""
+
+    with pytest.raises(DBAPIError, match="npi_result_archive_is_frozen"):
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    f'UPDATE "{prepared.ownership.schema_name}".npi '
+                    "SET marker='replacement' WHERE synthetic_id=1"
+                )
+            )
+
+
+async def _export_paired_archive(
+    sessions,
+    prepared: archive.NpiPreparedSource,
+) -> list[archive.NpiStageCapture]:
+    """Capture the callback payload emitted by a prepared NPI archive export."""
+
+    archive_captures: list[archive.NpiStageCapture] = []
+
+    async def archive_copy(capture):
+        archive_captures.append(capture)
+
+    await archive.export_prepared_npi_archive(
+        sessions,
+        prepared=prepared,
+        archive_copy=archive_copy,
+    )
+    return archive_captures
+
+
+def _assert_paired_archive_capture(
+    prepared: archive.NpiPreparedSource,
+    archive_captures: list[archive.NpiStageCapture],
+) -> None:
+    """Require export to preserve prepared manifest and ownership exactly."""
+
+    assert archive_captures == [
+        archive.NpiStageCapture(
+            prepared.manifest,
+            prepared.ownership,
+            archive_captures[0].postgres_snapshot,
+        )
+    ]
+
+
+async def _replace_frozen_paired_stage_row(
+    sessions,
+    prepared: archive.NpiPreparedSource,
+) -> None:
+    """Restore the same trigger definition after an in-place clone mutation."""
+
+    stage_schema = prepared.ownership.schema_name
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'DROP TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
+                f'ON "{stage_schema}".npi'
+            )
+        )
+        await session.execute(
+            text(
+                f'UPDATE "{stage_schema}".npi SET marker=\'replacement\' '
+                "WHERE synthetic_id=1"
+            )
+        )
+        await session.execute(
+            text(
+                f'CREATE TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
+                f'BEFORE INSERT OR UPDATE OR DELETE ON "{stage_schema}".npi '
+                f'FOR EACH STATEMENT EXECUTE FUNCTION "{stage_schema}".'
+                f'"{archive._FREEZE_FUNCTION}"()'
+            )
+        )
+        await session.execute(
+            text(
+                f'ALTER TABLE "{stage_schema}".npi ENABLE ALWAYS TRIGGER '
+                f'"{archive._FREEZE_WRITE_TRIGGER}"'
+            )
+        )
+
+
+async def _assert_frozen_retry_rejected(
+    sessions,
+    prepared: archive.NpiPreparedSource,
+) -> None:
+    """Reject export and cleanup when a frozen clone's catalog seal changes."""
+
+    async def never_copy(_capture):
+        pytest.fail("changed clone reached archive copier")
+
+    with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
+        await archive.export_prepared_npi_archive(
+            sessions,
+            prepared=prepared,
+            archive_copy=never_copy,
+        )
+    with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
+        async with sessions() as session, session.begin():
+            await archive.cleanup_npi_stage(session, prepared.ownership)
+
+
 @pytest.mark.asyncio
 async def test_paired_metadata_sequence_clone_and_frozen_retry_contract() -> None:
     """Exercise the paired IC call and reject same-count clone replacement."""
@@ -593,150 +790,29 @@ async def test_paired_metadata_sequence_clone_and_frozen_retry_contract() -> Non
     source_schema = "npi_paired_source_" + uuid4().hex
     sequence_name = "ordinary_import_owned_" + uuid4().hex[:12]
     dataset_id = uuid4()
-    prepared = None
-    captured_metadata_sessions = []
-    persisted = []
     try:
-        async with engine.begin() as connection:
-            await _create_family(connection, source_schema, populated=True)
-            # The real serving schema also contains publication-ledger identity
-            # sequences, which must not become part of the six-table clone.
-            await connection.execute(text(
-                f'CREATE TABLE "{source_schema}".unrelated_publication_ledger '
-                '(generation bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)'
-            ))
-            await _add_owned_sequence(
-                connection,
-                source_schema,
-                sequence_name=sequence_name,
-            )
-        await _bootstrap(sessions, source_schema)
-
-        async def capture_metadata(session):
-            captured_metadata_sessions.append(session)
-            marker = await session.scalar(
-                text(f'SELECT marker FROM "{source_schema}".npi')
-            )
-            return {"release": marker, "contract": "paired-call"}
-
-        async def persist(_session, frozen):
-            assert frozen.ownership.freeze_function_oid is not None
-            assert len(frozen.ownership.freeze_trigger_oids) == 6
-            assert len(frozen.ownership.freeze_catalog_versions) == 13
-            json.dumps(frozen.ownership.as_dict(), sort_keys=True)
-            persisted.append(frozen)
-
-        prepared = await archive.prepare_npi_archive_source(
+        await _create_paired_metadata_source(engine, source_schema, sequence_name)
+        prepared, captured_metadata_sessions, prepared_archives = await _prepare_paired_metadata_source(
             sessions,
-            schema_name=source_schema,
-            source_metadata=None,
+            source_schema=source_schema,
             dataset_id=dataset_id,
-            on_prepared=persist,
-            source_metadata_factory=capture_metadata,
         )
-        assert captured_metadata_sessions and persisted == [prepared]
+        assert captured_metadata_sessions and prepared_archives == [prepared]
         assert prepared.manifest.source_metadata == {
             "contract": "paired-call",
             "release": "before",
         }
-        assert len(prepared.ownership.sequence_oids) == 1
-        stage_sequence = prepared.ownership.sequence_oids[0]
-        assert stage_sequence[0] == sequence_name
-        assert stage_sequence[2:] == ("npi", "synthetic_id")
-
-        async with sessions() as session, session.begin():
-            source_sequence_oid = await session.scalar(
-                text(
-                    "SELECT to_regclass(:qualified)::oid::bigint"
-                ),
-                {"qualified": f"{source_schema}.{sequence_name}"},
-            )
-            default_expression = await session.scalar(
-                text(
-                    "SELECT pg_get_expr(default_value.adbin,default_value.adrelid) "
-                    "FROM pg_attrdef AS default_value "
-                    "JOIN pg_attribute AS column_value "
-                    "ON column_value.attrelid=default_value.adrelid "
-                    "AND column_value.attnum=default_value.adnum "
-                    "WHERE default_value.adrelid=to_regclass(:table_name) "
-                    "AND column_value.attname='synthetic_id'"
-                ),
-                {"table_name": f"{prepared.ownership.schema_name}.npi"},
-            )
-        assert stage_sequence[1] != source_sequence_oid
-        assert prepared.ownership.schema_name in default_expression
-        assert source_schema not in default_expression
-
-        with pytest.raises(DBAPIError, match="npi_result_archive_is_frozen"):
-            async with sessions() as session, session.begin():
-                await session.execute(
-                    text(
-                        f'UPDATE "{prepared.ownership.schema_name}".npi '
-                        "SET marker='replacement' WHERE synthetic_id=1"
-                    )
-                )
-
-        copied = []
-
-        async def copy(capture):
-            copied.append(capture)
-
-        await archive.export_prepared_npi_archive(
+        await _assert_paired_stage_sequence(
             sessions,
-            prepared=prepared,
-            archive_copy=copy,
+            prepared,
+            source_schema,
+            sequence_name,
         )
-        assert copied == [
-            archive.NpiStageCapture(
-                prepared.manifest,
-                prepared.ownership,
-                copied[0].postgres_snapshot,
-            )
-        ]
-
-        stage_schema = prepared.ownership.schema_name
-        async with sessions() as session, session.begin():
-            await session.execute(
-                text(
-                    f'DROP TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
-                    f'ON "{stage_schema}".npi'
-                )
-            )
-            await session.execute(
-                text(
-                    f'UPDATE "{stage_schema}".npi SET marker=\'replacement\' '
-                    "WHERE synthetic_id=1"
-                )
-            )
-            await session.execute(
-                text(
-                    f'CREATE TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
-                    f'BEFORE INSERT OR UPDATE OR DELETE ON "{stage_schema}".npi '
-                    f'FOR EACH STATEMENT EXECUTE FUNCTION "{stage_schema}".'
-                    f'"{archive._FREEZE_FUNCTION}"()'
-                )
-            )
-            await session.execute(
-                text(
-                    f'ALTER TABLE "{stage_schema}".npi ENABLE ALWAYS TRIGGER '
-                    f'"{archive._FREEZE_WRITE_TRIGGER}"'
-                )
-            )
-        with pytest.raises(
-            archive.NpiResultArchiveError,
-            match="stage ownership differs",
-        ):
-            await archive.export_prepared_npi_archive(
-                sessions,
-                prepared=prepared,
-                archive_copy=copy,
-            )
-        with pytest.raises(
-            archive.NpiResultArchiveError,
-            match="stage ownership differs",
-        ):
-            async with sessions() as session, session.begin():
-                await archive.cleanup_npi_stage(session, prepared.ownership)
+        await _assert_frozen_paired_stage_rejects_write(sessions, prepared)
+        archive_captures = await _export_paired_archive(sessions, prepared)
+        _assert_paired_archive_capture(prepared, archive_captures)
+        await _replace_frozen_paired_stage_row(sessions, prepared)
+        await _assert_frozen_retry_rejected(sessions, prepared)
     finally:
         schemas = {source_schema, archive.npi_stage_schema(dataset_id)}
         try:
@@ -761,42 +837,11 @@ async def test_frozen_retry_rejects_same_oid_catalog_mutation(
     stage_schema = archive.npi_stage_schema(dataset_id)
 
     async def mutate(session):
-        relation = f'"{stage_schema}".npi'
-        trigger = f'"{archive._FREEZE_WRITE_TRIGGER}"'
-        function = f'"{stage_schema}"."{archive._FREEZE_FUNCTION}"()'
-        if mutation == "disable_enable":
-            await session.execute(text(f'ALTER TABLE {relation} DISABLE TRIGGER {trigger}'))
-        elif mutation == "replace_trigger":
-            await session.execute(text(
-                f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
-                f'ON {relation} FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {function}'
-            ))
-        else:
-            await session.execute(text(
-                f'CREATE OR REPLACE FUNCTION {function} RETURNS trigger LANGUAGE plpgsql '
-                'SECURITY DEFINER SET search_path=pg_catalog '
-                'AS $function$ BEGIN RETURN NULL; END; $function$'
-            ))
-        await session.execute(text(f"UPDATE {relation} SET marker='replacement' WHERE synthetic_id=1"))
-        if mutation == "replace_trigger":
-            await session.execute(text(
-                f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
-                f'ON {relation} FOR EACH STATEMENT EXECUTE FUNCTION {function}'
-            ))
-        elif mutation == "replace_function":
-            await session.execute(text(
-                f'CREATE OR REPLACE FUNCTION {function} RETURNS trigger LANGUAGE plpgsql '
-                'SECURITY DEFINER SET search_path=pg_catalog '
-                f'AS $function$ {archive._FREEZE_FUNCTION_BODY} $function$'
-            ))
-        await session.execute(text(f'ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {trigger}'))
+        await _mutate_frozen_catalog(session, stage_schema, mutation)
 
     async def persist(session, _prepared):
         if during_preparation:
             await mutate(session)
-
-    async def never_copy(_capture):
-        pytest.fail("changed clone reached archive copier")
 
     try:
         async with engine.begin() as connection:
@@ -817,20 +862,81 @@ async def test_frozen_retry_rejects_same_oid_catalog_mutation(
             assert changed.freeze_trigger_oids == prepared.ownership.freeze_trigger_oids
             assert changed.freeze_catalog_versions != prepared.ownership.freeze_catalog_versions
             assert await archive._manifest_tables(session, stage_schema) == prepared.manifest.tables
-        with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
-            await archive.export_prepared_npi_archive(
-                sessions,
-                prepared=prepared,
-                archive_copy=never_copy,
-            )
-        with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
-            async with sessions() as session, session.begin():
-                await archive.cleanup_npi_stage(session, prepared.ownership)
+        await _assert_frozen_retry_rejected(sessions, prepared)
     finally:
         try:
             await _drop_schemas(engine, {source_schema, stage_schema})
         finally:
             await engine.dispose()
+
+
+async def _mutate_frozen_catalog(
+    session,
+    stage_schema: str,
+    mutation: str,
+) -> None:
+    """Mutate and restore a guard while preserving its OID and final definition."""
+
+    relation = f'"{stage_schema}".npi'
+    trigger = f'"{archive._FREEZE_WRITE_TRIGGER}"'
+    freeze_function = f'"{stage_schema}"."{archive._FREEZE_FUNCTION}"()'
+    if mutation == "disable_enable":
+        await session.execute(text(f'ALTER TABLE {relation} DISABLE TRIGGER {trigger}'))
+    elif mutation == "replace_trigger":
+        await session.execute(text(
+            f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
+            f'ON {relation} FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {freeze_function}'
+        ))
+    else:
+        await session.execute(text(
+            f'CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql '
+            'SECURITY DEFINER SET search_path=pg_catalog '
+            'AS $function$ BEGIN RETURN NULL; END; $function$'
+        ))
+    await session.execute(text(f"UPDATE {relation} SET marker='replacement' WHERE synthetic_id=1"))
+    if mutation == "replace_trigger":
+        await session.execute(text(
+            f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
+            f'ON {relation} FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}'
+        ))
+    elif mutation == "replace_function":
+        await session.execute(text(
+            f'CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql '
+            'SECURITY DEFINER SET search_path=pg_catalog '
+            f'AS $function$ {archive._FREEZE_FUNCTION_BODY} $function$'
+        ))
+    await session.execute(text(f'ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {trigger}'))
+
+
+def _install_timeout_observers(
+    monkeypatch,
+    timeout_observations: list[tuple[str, str]],
+    stage_sessions: list[object],
+) -> None:
+    """Record timeout scopes without changing archive export behavior."""
+
+    original_lock = archive._lock_family
+    original_validate = archive._validate_stage_manifest
+    original_snapshot = archive._export_stage_snapshot
+
+    async def observed_lock(session, *args, **kwargs):
+        timeout_observations.append(("lock", await session.scalar(text("SHOW statement_timeout"))))
+        return await original_lock(session, *args, **kwargs)
+
+    async def slow_validation(session, *args, **kwargs):
+        timeout_observations.append(("validation", await session.scalar(text("SHOW statement_timeout"))))
+        await session.execute(text("SELECT pg_sleep(0.04)"))
+        return await original_validate(session, *args, **kwargs)
+
+    async def observed_snapshot(session):
+        timeout_observations.append(("snapshot", await session.scalar(text("SHOW statement_timeout"))))
+        stage_sessions.append(session)
+        return await original_snapshot(session)
+
+    monkeypatch.setattr(archive, "_CAPTURE_TIMEOUT", "20ms")
+    monkeypatch.setattr(archive, "_lock_family", observed_lock)
+    monkeypatch.setattr(archive, "_validate_stage_manifest", slow_validation)
+    monkeypatch.setattr(archive, "_export_stage_snapshot", observed_snapshot)
 
 
 @pytest.mark.asyncio
@@ -847,42 +953,26 @@ async def test_prepared_npi_export_keeps_long_validation_outside_capture_timeout
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     schema_name = "npi_export_timeout_" + uuid4().hex
     prepared = None
-    observed: list[tuple[str, str]] = []
-    stage_session_holder = []
+    timeout_observations: list[tuple[str, str]] = []
+    stage_sessions: list[object] = []
     try:
         async with engine.begin() as connection:
             await _create_family(connection, schema_name, populated=True)
         await _bootstrap(sessions, schema_name)
         prepared = await _prepare_tracked_source(sessions, schema_name)
+        _install_timeout_observers(
+            monkeypatch,
+            timeout_observations,
+            stage_sessions,
+        )
 
-        original_lock = archive._lock_family
-        original_validate = archive._validate_stage_manifest
-        original_snapshot = archive._export_stage_snapshot
-
-        async def observed_lock(session, *args, **kwargs):
-            observed.append(("lock", await session.scalar(text("SHOW statement_timeout"))))
-            return await original_lock(session, *args, **kwargs)
-
-        async def slow_validation(session, *args, **kwargs):
-            observed.append(("validation", await session.scalar(text("SHOW statement_timeout"))))
-            await session.execute(text("SELECT pg_sleep(0.04)"))
-            return await original_validate(session, *args, **kwargs)
-
-        async def observed_snapshot(session):
-            observed.append(("snapshot", await session.scalar(text("SHOW statement_timeout"))))
-            stage_session_holder.append(session)
-            return await original_snapshot(session)
-
-        monkeypatch.setattr(archive, "_CAPTURE_TIMEOUT", "20ms")
-        monkeypatch.setattr(archive, "_lock_family", observed_lock)
-        monkeypatch.setattr(archive, "_validate_stage_manifest", slow_validation)
-        monkeypatch.setattr(archive, "_export_stage_snapshot", observed_snapshot)
-
-        copied = []
+        archive_captures: list[archive.NpiStageCapture] = []
 
         async def archive_copy(capture):
-            copied.append(capture)
-            observed.append(("copy", await stage_session_holder[-1].scalar(text("SHOW statement_timeout"))))
+            archive_captures.append(capture)
+            timeout_observations.append(
+                ("copy", await stage_sessions[-1].scalar(text("SHOW statement_timeout")))
+            )
 
         await archive.export_prepared_npi_archive(
             sessions,
@@ -890,8 +980,8 @@ async def test_prepared_npi_export_keeps_long_validation_outside_capture_timeout
             archive_copy=archive_copy,
         )
 
-        assert copied and copied[0].ownership == prepared.ownership
-        assert observed == [
+        assert archive_captures and archive_captures[0].ownership == prepared.ownership
+        assert timeout_observations == [
             ("lock", "20ms"),
             ("validation", "500ms"),
             ("snapshot", "20ms"),
@@ -941,15 +1031,158 @@ async def test_npi_model_restore_layout_has_exact_owned_relations() -> None:
             await engine.dispose()
 
 
+def _install_ordinary_staging_collaborators(
+    monkeypatch,
+    ordinary_npi,
+    session,
+    connection,
+) -> None:
+    """Route ordinary staging helpers through the test transaction and session."""
+
+    async def status(statement):
+        await session.execute(text(statement))
+
+    async def create_table(table, *, checkfirst):
+        await connection.run_sync(
+            lambda sync_connection: table.create(
+                sync_connection,
+                checkfirst=checkfirst,
+            )
+        )
+
+    monkeypatch.setattr(ordinary_npi.db, "status", status)
+    monkeypatch.setattr(ordinary_npi.db, "create_table", create_table)
+
+
+async def _create_ordinary_model_indexes(
+    session,
+    source_schema: str,
+    staged_model,
+    index_definitions,
+    *,
+    has_postgis: bool,
+) -> None:
+    """Create the ordinary staging indexes supported by the local extension set."""
+
+    for index_definition in index_definitions:
+        if archive._uses_postgis_index(index_definition) and not has_postgis:
+            continue
+        await session.execute(
+            text(
+                archive._additional_index_sql(
+                    source_schema,
+                    staged_model,
+                    index_definition,
+                )
+            )
+        )
+
+
+def _ordinary_index_suffixes(
+    model_type,
+    index_definitions,
+    *,
+    has_postgis: bool,
+) -> tuple[str, ...]:
+    """Return ordinary rotation suffixes for indexes present in the test schema."""
+
+    all_indexes = tuple(
+        getattr(model_type, "__my_initial_indexes__", ()) or ()
+    ) + tuple(index_definitions)
+    return tuple(
+        definition.get("name", "_".join(definition["index_elements"]))
+        for definition in all_indexes
+        if not (archive._uses_postgis_index(definition) and not has_postgis)
+    )
+
+
+async def _rotate_ordinary_model(
+    session,
+    ordinary_npi,
+    driver,
+    *,
+    source_schema: str,
+    import_date: str,
+    model_type,
+    has_postgis: bool,
+) -> None:
+    """Build indexes then rotate one ordinary NPI staging model to canonical."""
+
+    from process.ext.utils import make_class
+
+    staged_model = make_class(model_type, import_date)
+    index_definitions = tuple(
+        getattr(model_type, "__my_additional_indexes__", ()) or ()
+    )
+    await _create_ordinary_model_indexes(
+        session,
+        source_schema,
+        staged_model,
+        index_definitions,
+        has_postgis=has_postgis,
+    )
+    await ordinary_npi._rotate_npi_canonical_table(
+        driver,
+        schema=source_schema,
+        live_table=model_type.__tablename__,
+        stage_table=staged_model.__tablename__,
+        index_suffixes=_ordinary_index_suffixes(
+            model_type,
+            index_definitions,
+            has_postgis=has_postgis,
+        ),
+    )
+
+
+async def _prepare_and_rotate_ordinary_npi_models(
+    session,
+    ordinary_npi,
+    driver,
+    *,
+    source_schema: str,
+    import_date: str,
+) -> None:
+    """Run ordinary NPI staging and canonical publication for every model table."""
+
+    await ordinary_npi._prepare_npi_staging(import_date, source_schema)
+    has_postgis = await archive._has_postgis(session)
+    for model_type in archive._MODEL_TYPES:
+        await _rotate_ordinary_model(
+            session,
+            ordinary_npi,
+            driver,
+            source_schema=source_schema,
+            import_date=import_date,
+            model_type=model_type,
+            has_postgis=has_postgis,
+        )
+
+
+async def _assert_primary_indexes(
+    session,
+    source_schema: str,
+    restored_schema: str,
+) -> None:
+    """Require matching ordinary and model-driven primary indexes per table."""
+
+    for table_name in generation.RELATION_NAMES:
+        assert await session.scalar(
+            text("SELECT to_regclass(:name) IS NOT NULL"),
+            {"name": f"{source_schema}.{table_name}_idx_primary"},
+        )
+        assert await session.scalar(
+            text("SELECT to_regclass(:name) IS NOT NULL"),
+            {"name": f"{restored_schema}.{table_name}_idx_primary"},
+        )
+
+
 @pytest.mark.asyncio
 async def test_model_restore_matches_ordinary_staging_publication_route(
     monkeypatch,
 ) -> None:
     """Match the physical family produced by ordinary stage creation and rotation."""
 
-    from process.ext.utils import make_class
-
-    ordinary = importlib.import_module("process.npi")
+    ordinary_npi = importlib.import_module("process.npi")
     engine = create_async_engine(_database_url(), poolclass=NullPool)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     dataset_id = uuid4()
@@ -960,91 +1193,28 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
             await _ensure_model_extensions(session)
             await session.execute(text(f'CREATE SCHEMA "{source_schema}"'))
             connection = await session.connection()
-            driver = (
-                await connection.get_raw_connection()
-            ).driver_connection
-
-            async def status(statement):
-                await session.execute(text(statement))
-
-            async def create_table(table, *, checkfirst):
-                await connection.run_sync(
-                    lambda sync_connection: table.create(
-                        sync_connection,
-                        checkfirst=checkfirst,
-                    )
-                )
-
-            monkeypatch.setattr(ordinary.db, "status", status)
-            monkeypatch.setattr(ordinary.db, "create_table", create_table)
-            await ordinary._prepare_npi_staging(import_date, source_schema)
-            has_postgis = await archive._has_postgis(session)
-            for model_type in archive._MODEL_TYPES:
-                staged_model = make_class(model_type, import_date)
-                index_definitions = tuple(
-                    getattr(model_type, "__my_additional_indexes__", ()) or ()
-                )
-                for index_definition in index_definitions:
-                    if (
-                        archive._uses_postgis_index(index_definition)
-                        and not has_postgis
-                    ):
-                        continue
-                    await session.execute(
-                        text(
-                            archive._additional_index_sql(
-                                source_schema,
-                                staged_model,
-                                index_definition,
-                            )
-                        )
-                    )
-                all_indexes = tuple(
-                    getattr(model_type, "__my_initial_indexes__", ()) or ()
-                ) + index_definitions
-                await ordinary._rotate_npi_canonical_table(
-                    driver,
-                    schema=source_schema,
-                    live_table=model_type.__tablename__,
-                    stage_table=staged_model.__tablename__,
-                    index_suffixes=tuple(
-                        definition.get(
-                            "name",
-                            "_".join(definition["index_elements"]),
-                        )
-                        for definition in all_indexes
-                        if not (
-                            archive._uses_postgis_index(definition)
-                            and not has_postgis
-                        )
-                    ),
-                )
-            source_receipts = await archive._manifest_tables(
+            driver = (await connection.get_raw_connection()).driver_connection
+            _install_ordinary_staging_collaborators(
+                monkeypatch,
+                ordinary_npi,
+                session,
+                connection,
+            )
+            await _prepare_and_rotate_ordinary_npi_models(
+                session,
+                ordinary_npi,
+                driver,
+                source_schema=source_schema,
+                import_date=import_date,
+            )
+            source_receipts = await archive._manifest_tables(session, source_schema)
+            ownership = await archive.precreate_npi_restore(session, dataset_id=dataset_id)
+            restored_receipts = await archive._manifest_tables(session, ownership.schema_name)
+            await _assert_primary_indexes(
                 session,
                 source_schema,
-            )
-            ownership = await archive.precreate_npi_restore(
-                session,
-                dataset_id=dataset_id,
-            )
-            restored_receipts = await archive._manifest_tables(
-                session,
                 ownership.schema_name,
             )
-            for table_name in generation.RELATION_NAMES:
-                assert await session.scalar(
-                    text("SELECT to_regclass(:name) IS NOT NULL"),
-                    {"name": f"{source_schema}.{table_name}_idx_primary"},
-                )
-                assert await session.scalar(
-                    text("SELECT to_regclass(:name) IS NOT NULL"),
-                    {
-                        "name": (
-                            f"{ownership.schema_name}."
-                            f"{table_name}_idx_primary"
-                        )
-                    },
-                )
         assert [
             (receipt.model_name, receipt.table_name, receipt.schema_sha256)
             for receipt in restored_receipts
@@ -1056,10 +1226,7 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
         try:
             await _drop_schemas(
                 engine,
-                {
-                    source_schema,
-                    archive.npi_stage_schema(dataset_id),
-                },
+                {source_schema, archive.npi_stage_schema(dataset_id)},
             )
         finally:
             await engine.dispose()

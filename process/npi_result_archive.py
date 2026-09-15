@@ -611,70 +611,112 @@ async def _bind_independent_stage_sequences(
 ) -> None:
     """Replace copied source defaults with stage-owned sequence dependencies."""
 
-    source_sequences = tuple(
-        sequence
-        for sequence in await _owned_sequences(
-            session,
-            await _schema_oid(session, source_schema),
-        )
-        if sequence[2] in RELATION_NAMES
-    )
+    source_sequences = await _source_family_sequences(session, source_schema)
     stage_oid = await _schema_oid(session, stage_schema)
-    stage_sequences = await _owned_sequences(session, stage_oid)
-    stage_by_owner = {
+    stage_sequences_by_owner = {
         (owner_table, owner_column): (sequence_name, sequence_oid)
-        for sequence_name, sequence_oid, owner_table, owner_column in stage_sequences
+        for sequence_name, sequence_oid, owner_table, owner_column in await _owned_sequences(session, stage_oid)
     }
     for source_sequence_name, _source_sequence_oid, owner_table, owner_column in source_sequences:
-        owner_key = (owner_table, owner_column)
-        stage_sequence_name = source_sequence_name
-        if owner_key not in stage_by_owner:
-            stage_sequence_name = _schema_name(source_sequence_name)
-            await session.execute(
-                text(
-                    f"CREATE SEQUENCE {_quoted(stage_schema)}.{_quoted(stage_sequence_name)} "
-                    "AS bigint"
-                )
-            )
-            await session.execute(
-                text(
-                    f"ALTER SEQUENCE {_quoted(stage_schema)}.{_quoted(stage_sequence_name)} "
-                    f"OWNED BY {_quoted(stage_schema)}.{_quoted(owner_table)}."
-                    f"{_quoted(owner_column)}"
-                )
-            )
-            await session.execute(
-                text(
-                    f"ALTER TABLE {_quoted(stage_schema)}.{_quoted(owner_table)} "
-                    f"ALTER COLUMN {_quoted(owner_column)} SET DEFAULT "
-                    f"nextval('{_quoted(stage_schema)}.{_quoted(stage_sequence_name)}'::regclass)"
-                )
-            )
-        else:
-            stage_sequence_name = stage_by_owner[owner_key][0]
-        maximum = await session.scalar(
-            text(
-                f"SELECT max({_quoted(owner_column)})::bigint "
-                f"FROM {_quoted(stage_schema)}.{_quoted(owner_table)}"
-            )
+        stage_sequence_name = await _ensure_stage_owned_sequence(
+            session,
+            stage_schema=stage_schema,
+            source_sequence_name=source_sequence_name,
+            owner_table=owner_table,
+            owner_column=owner_column,
+            stage_sequences_by_owner=stage_sequences_by_owner,
         )
-        if maximum is not None:
-            await session.execute(
-                text(
-                    "SELECT pg_catalog.setval("
-                    f"'{_quoted(stage_schema)}.{_quoted(stage_sequence_name)}'"
-                    "::regclass,:maximum,true)"
-                ),
-                {"maximum": int(maximum)},
-            )
-    observed = await _owned_sequences(session, stage_oid)
-    if {
+        await _advance_stage_sequence(
+            session,
+            stage_schema=stage_schema,
+            sequence_name=stage_sequence_name,
+            owner_table=owner_table,
+            owner_column=owner_column,
+        )
+    await _verify_stage_sequence_owners(session, stage_oid, source_sequences)
+
+
+async def _source_family_sequences(
+    session: Any,
+    source_schema: str,
+) -> tuple[tuple[str, int, str, str], ...]:
+    """Return source-owned sequences belonging to the copied NPI family."""
+
+    source_schema_oid = await _schema_oid(session, source_schema)
+    return tuple(
+        sequence
+        for sequence in await _owned_sequences(session, source_schema_oid)
+        if sequence[2] in RELATION_NAMES
+    )
+
+
+async def _ensure_stage_owned_sequence(
+    session: Any,
+    *,
+    stage_schema: str,
+    source_sequence_name: str,
+    owner_table: str,
+    owner_column: str,
+    stage_sequences_by_owner: Mapping[tuple[str, str], tuple[str, int]],
+) -> str:
+    """Return or create the sequence owned by one copied stage column."""
+
+    existing = stage_sequences_by_owner.get((owner_table, owner_column))
+    if existing is not None:
+        return existing[0]
+    stage_sequence_name = _schema_name(source_sequence_name)
+    stage_sequence = f"{_quoted(stage_schema)}.{_quoted(stage_sequence_name)}"
+    stage_column = f"{_quoted(stage_schema)}.{_quoted(owner_table)}.{_quoted(owner_column)}"
+    await session.execute(text(f"CREATE SEQUENCE {stage_sequence} AS bigint"))
+    await session.execute(text(f"ALTER SEQUENCE {stage_sequence} OWNED BY {stage_column}"))
+    await session.execute(
+        text(
+            f"ALTER TABLE {_quoted(stage_schema)}.{_quoted(owner_table)} "
+            f"ALTER COLUMN {_quoted(owner_column)} SET DEFAULT nextval('{stage_sequence}'::regclass)"
+        )
+    )
+    return stage_sequence_name
+
+
+async def _advance_stage_sequence(
+    session: Any,
+    *,
+    stage_schema: str,
+    sequence_name: str,
+    owner_table: str,
+    owner_column: str,
+) -> None:
+    """Set one stage-owned sequence to its copied table's maximum value."""
+
+    maximum = await session.scalar(
+        text(
+            f"SELECT max({_quoted(owner_column)})::bigint "
+            f"FROM {_quoted(stage_schema)}.{_quoted(owner_table)}"
+        )
+    )
+    if maximum is not None:
+        stage_sequence = f"{_quoted(stage_schema)}.{_quoted(sequence_name)}"
+        await session.execute(
+            text(f"SELECT pg_catalog.setval('{stage_sequence}'::regclass,:maximum,true)"),
+            {"maximum": int(maximum)},
+        )
+
+
+async def _verify_stage_sequence_owners(
+    session: Any,
+    stage_schema_oid: int,
+    source_sequences: tuple[tuple[str, int, str, str], ...],
+) -> None:
+    """Require the copied stage to retain exactly the source family bindings."""
+
+    observed_owner_keys = {
         (owner_table, owner_column)
-        for _, _, owner_table, owner_column in observed
-    } != {
-        (owner_table, owner_column)
-        for _, _, owner_table, owner_column in source_sequences
-    }:
+        for _, _, owner_table, owner_column in await _owned_sequences(session, stage_schema_oid)
+    }
+    source_owner_keys = {
+        (owner_table, owner_column) for _, _, owner_table, owner_column in source_sequences
+    }
+    if observed_owner_keys != source_owner_keys:
         raise NpiResultArchiveError("NPI archive stage sequence ownership differs")
 
 
@@ -780,7 +822,42 @@ async def _freeze_seal(
 ]:
     """Read and validate the exact always-enabled immutable-clone guard set."""
 
-    function_row = (
+    function_row = await _read_freeze_function(session, schema_oid)
+    trigger_rows = await _read_freeze_triggers(session, schema_oid)
+    if function_row is None and not trigger_rows:
+        return None, (), ()
+    if function_row is None:
+        raise NpiResultArchiveError("NPI archive freeze function differs")
+    function_oid = _validate_freeze_function(function_row)
+    triggers_by_table = _validate_freeze_triggers(trigger_rows, function_oid)
+    # OIDs and final definitions alone do not detect disable/enable or an
+    # in-place CREATE OR REPLACE. Bind catalog tuple versions as local seals;
+    # ctid also detects changes within the preparing transaction. Do not bind
+    # cmin: its header slot is reused by cmax, even after a rolled-back deletion.
+    catalog_versions = tuple(sorted(
+        [("function", function_oid, function_row["xmin"], function_row["ctid"])]
+        + [
+            ("trigger", int(trigger_row["oid"]), trigger_row["xmin"], trigger_row["ctid"])
+            for trigger_row in trigger_rows
+        ]
+    ))
+    return function_oid, tuple(
+        (
+            table_name,
+            triggers_by_table[table_name][_FREEZE_WRITE_TRIGGER],
+            triggers_by_table[table_name][_FREEZE_TRUNCATE_TRIGGER],
+        )
+        for table_name in sorted(RELATION_NAMES)
+    ), catalog_versions
+
+
+async def _read_freeze_function(
+    session: Any,
+    schema_oid: int,
+) -> Mapping[str, Any] | None:
+    """Read the stage-local function used to freeze one NPI clone."""
+
+    return (
         (
             await session.execute(
                 text(
@@ -805,7 +882,15 @@ async def _freeze_seal(
         .mappings()
         .one_or_none()
     )
-    trigger_rows = list(
+
+
+async def _read_freeze_triggers(
+    session: Any,
+    schema_oid: int,
+) -> list[Mapping[str, Any]]:
+    """Read candidate immutable-clone guard triggers from one stage schema."""
+
+    return list(
         (
             await session.execute(
                 text(
@@ -831,17 +916,27 @@ async def _freeze_seal(
             )
         ).mappings()
     )
-    if function_row is None and not trigger_rows:
-        return None, (), ()
+
+
+def _validate_freeze_function(function_row: Mapping[str, Any]) -> int:
+    """Return a freeze-function OID only when its immutable contract matches."""
+
     if (
-        function_row is None
-        or function_row["lanname"] != "plpgsql"
+        function_row["lanname"] != "plpgsql"
         or function_row["prosecdef"] is not True
         or " ".join(str(function_row["prosrc"]).split()) != _FREEZE_FUNCTION_BODY
         or "search_path=pg_catalog" not in tuple(function_row["proconfig"] or ())
     ):
         raise NpiResultArchiveError("NPI archive freeze function differs")
-    function_oid = int(function_row["oid"])
+    return int(function_row["oid"])
+
+
+def _validate_freeze_triggers(
+    trigger_rows: list[Mapping[str, Any]],
+    function_oid: int,
+) -> dict[str, dict[str, int]]:
+    """Require complete, always-enabled write and truncate guards per table."""
+
     triggers_by_table: dict[str, dict[str, int]] = {}
     for trigger_row in trigger_rows:
         table_name = str(trigger_row["table_name"])
@@ -867,25 +962,7 @@ async def _freeze_seal(
         for trigger_by_name in triggers_by_table.values()
     ):
         raise NpiResultArchiveError("NPI archive freeze trigger set differs")
-    # OIDs and final definitions alone do not detect disable/enable or an
-    # in-place CREATE OR REPLACE. Bind catalog tuple versions as local seals;
-    # ctid also detects changes within the preparing transaction. Do not bind
-    # cmin: its header slot is reused by cmax, even after a rolled-back deletion.
-    catalog_versions = tuple(sorted(
-        [("function", function_oid, function_row["xmin"], function_row["ctid"])]
-        + [
-            ("trigger", int(row["oid"]), row["xmin"], row["ctid"])
-            for row in trigger_rows
-        ]
-    ))
-    return function_oid, tuple(
-        (
-            table_name,
-            triggers_by_table[table_name][_FREEZE_WRITE_TRIGGER],
-            triggers_by_table[table_name][_FREEZE_TRUNCATE_TRIGGER],
-        )
-        for table_name in sorted(RELATION_NAMES)
-    ), catalog_versions
+    return triggers_by_table
 
 
 async def capture_npi_stage_ownership(
@@ -960,46 +1037,25 @@ async def _freeze_npi_clone(
             "ACCESS EXCLUSIVE",
         )
         await verify_npi_stage_ownership(session, ownership)
-        function = (
+        freeze_function = (
             f"{_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}"
         )
         await session.execute(
             text(
-                f"CREATE FUNCTION {function}() RETURNS trigger "
+                f"CREATE FUNCTION {freeze_function}() RETURNS trigger "
                 "LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog "
                 f"AS $function$ {_FREEZE_FUNCTION_BODY} $function$"
             )
         )
-        await session.execute(text(f"REVOKE ALL ON FUNCTION {function}() FROM PUBLIC"))
+        await session.execute(
+            text(f"REVOKE ALL ON FUNCTION {freeze_function}() FROM PUBLIC")
+        )
         for table_name in RELATION_NAMES:
-            relation = (
-                f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}"
-            )
-            await session.execute(
-                text(
-                    f"CREATE TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} "
-                    f"BEFORE INSERT OR UPDATE OR DELETE ON {relation} "
-                    f"FOR EACH STATEMENT EXECUTE FUNCTION {function}()"
-                )
-            )
-            await session.execute(
-                text(
-                    f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
-                    f"{_quoted(_FREEZE_WRITE_TRIGGER)}"
-                )
-            )
-            await session.execute(
-                text(
-                    f"CREATE TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} "
-                    f"BEFORE TRUNCATE ON {relation} FOR EACH STATEMENT "
-                    f"EXECUTE FUNCTION {function}()"
-                )
-            )
-            await session.execute(
-                text(
-                    f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
-                    f"{_quoted(_FREEZE_TRUNCATE_TRIGGER)}"
-                )
+            await _install_freeze_triggers(
+                session,
+                schema_name=ownership.schema_name,
+                table_name=table_name,
+                freeze_function=freeze_function,
             )
     frozen = await capture_npi_stage_ownership(
         session,
@@ -1018,6 +1074,44 @@ async def _freeze_npi_clone(
     ):
         raise NpiResultArchiveError("NPI archive clone freeze differs")
     return frozen
+
+
+async def _install_freeze_triggers(
+    session: Any,
+    *,
+    schema_name: str,
+    table_name: str,
+    freeze_function: str,
+) -> None:
+    """Install and force the write and truncate freeze guards for one table."""
+
+    relation = f"{_quoted(schema_name)}.{_quoted(table_name)}"
+    await session.execute(
+        text(
+            f"CREATE TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} "
+            f"BEFORE INSERT OR UPDATE OR DELETE ON {relation} "
+            f"FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}()"
+        )
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
+            f"{_quoted(_FREEZE_WRITE_TRIGGER)}"
+        )
+    )
+    await session.execute(
+        text(
+            f"CREATE TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} "
+            f"BEFORE TRUNCATE ON {relation} FOR EACH STATEMENT "
+            f"EXECUTE FUNCTION {freeze_function}()"
+        )
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
+            f"{_quoted(_FREEZE_TRUNCATE_TRIGGER)}"
+        )
+    )
 
 
 async def verify_npi_stage_ownership(
