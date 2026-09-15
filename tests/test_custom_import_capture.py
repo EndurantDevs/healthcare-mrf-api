@@ -14,6 +14,8 @@ import subprocess
 import sys
 from typing import get_type_hints
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from process.custom_import import CaptureError, CaptureLimits, CustomImportDefinition
@@ -49,6 +51,41 @@ def _capture(payload: bytes, stream, *, limits: CaptureLimits | None = None):
         source_snapshot_token="snapshot-20260914",
         limits=limits or CaptureLimits(),
     )
+
+
+def _parquet_payload(
+    columns: dict[str, object],
+    *,
+    row_group_size: int | None = None,
+    use_dictionary: bool = True,
+) -> bytes:
+    """Encode a sealed-test Parquet payload with page checksums enabled."""
+
+    return _write_parquet_table(
+        pa.table(columns),
+        row_group_size=row_group_size,
+        use_dictionary=use_dictionary,
+    )
+
+
+def _write_parquet_table(
+    table: pa.Table,
+    *,
+    row_group_size: int | None = None,
+    use_dictionary: bool = True,
+) -> bytes:
+    """Build a small in-memory Parquet file without paths or ambient source state."""
+
+    payload = BytesIO()
+    pq.write_table(
+        table,
+        payload,
+        compression="zstd",
+        row_group_size=row_group_size,
+        use_dictionary=use_dictionary,
+        write_page_checksum=True,
+    )
+    return payload.getvalue()
 
 
 def test_capture_seals_and_replays_delimited_source_records():
@@ -305,8 +342,8 @@ def test_xml_record_annotation_can_be_resolved_under_python_314():
     assert get_type_hints(capture._xml_record_values)["element"].__name__ == "Element"
 
 
-def test_decoder_limits_records_and_parquet_remains_explicitly_disabled():
-    """Record-count limits and unavailable formats fail closed without implicit fallback."""
+def test_decoder_limits_records_and_parquet_metadata_limits():
+    """Every decoder, including Parquet metadata, honors the declared record cap."""
 
     json_stream = _stream(format_name="json")
     limits = CaptureLimits(maximum_records=1)
@@ -315,8 +352,221 @@ def test_decoder_limits_records_and_parquet_remains_explicitly_disabled():
         list(iter_records(_capture(payload, json_stream, limits=limits), json_stream, limits=limits))
 
     parquet_stream = _stream(format_name="parquet")
-    with pytest.raises(CaptureError, match="not enabled"):
-        list(iter_records(_capture(b"not a parquet file", parquet_stream), parquet_stream))
+    parquet_payload = _parquet_payload({"npi": ["1234567893", "1003000126"]})
+    with pytest.raises(CaptureError, match="record limit"):
+        list(
+            iter_records(
+                _capture(parquet_payload, parquet_stream, limits=limits),
+                parquet_stream,
+                limits=limits,
+            )
+        )
+
+
+def test_parquet_decoder_streams_flat_scalar_rows_across_batches_and_row_groups():
+    """Parquet retains exact source labels and scalar values without table materialization."""
+
+    stream = _stream(format_name="parquet")
+    payload = _parquet_payload(
+        {
+            "Provider ID": [f"{value:010d}" for value in range(257)],
+            "Amount": pa.array([Decimal("12.50")] * 257, type=pa.decimal128(10, 2)),
+            "Active": [value % 2 == 0 for value in range(257)],
+        },
+        row_group_size=64,
+    )
+
+    records = list(iter_records(_capture(payload, stream), stream))
+
+    assert [records[0].ordinal, records[-1].ordinal] == [1, 257]
+    assert records[0].values == {
+        "Provider ID": "0000000000",
+        "Amount": Decimal("12.50"),
+        "Active": True,
+    }
+    assert records[-1].values["Provider ID"] == "0000000256"
+    assert records[-1].values["Active"] is True
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        pa.array([1.5], type=pa.float64()),
+        pa.array([b"binary"], type=pa.binary()),
+        pa.array([[1]], type=pa.list_(pa.int64())),
+        pa.array([None], type=pa.date32()),
+        pa.array([None], type=pa.timestamp("us", tz="UTC")),
+    ],
+)
+def test_parquet_decoder_rejects_unsupported_or_nested_physical_types(column):
+    """Only exact capture scalar types reach later declared-field mapping."""
+
+    stream = _stream(format_name="parquet")
+    payload = _parquet_payload({"source_value": column})
+
+    with pytest.raises(CaptureError, match="unsupported scalar type"):
+        list(iter_records(_capture(payload, stream), stream))
+
+
+@pytest.mark.parametrize("label", ["", "Not\u0085Printable", "x" * 256])
+def test_parquet_decoder_rejects_unsafe_source_labels(label):
+    """Parquet column names use the same bounded source-label contract as other decoders."""
+
+    stream = _stream(format_name="parquet")
+    payload = _parquet_payload({label: ["value"]})
+
+    with pytest.raises(CaptureError):
+        list(iter_records(_capture(payload, stream), stream))
+
+
+def test_parquet_decoder_rejects_duplicate_source_labels_without_collapsing_columns():
+    """Positional Arrow columns cannot silently overwrite an earlier duplicate label."""
+
+    stream = _stream(format_name="parquet")
+    schema = pa.schema(
+        [
+            pa.field("source_value", pa.string()),
+            pa.field("source_value", pa.int64()),
+        ]
+    )
+    table = pa.Table.from_batches(
+        [
+            pa.record_batch(
+                [pa.array(["first"]), pa.array([1])],
+                schema=schema,
+            )
+        ],
+        schema=schema,
+    )
+    payload = _write_parquet_table(table)
+
+    with pytest.raises(CaptureError, match="duplicate labels"):
+        list(iter_records(_capture(payload, stream), stream))
+
+
+def test_parquet_decoder_supports_gzip_and_rejects_invalid_envelopes():
+    """Random-access Parquet uses a bounded seekable replay buffer and fixed errors."""
+
+    payload = _parquet_payload({"Synthetic Source Label": ["retained only in test payload"]})
+    gzip_stream = _stream(format_name="parquet", compression="gzip")
+    gzip_records = list(iter_records(_capture(gzip.compress(payload), gzip_stream), gzip_stream))
+    assert gzip_records[0].values["Synthetic Source Label"] == "retained only in test payload"
+
+    stream = _stream(format_name="parquet")
+    invalid_envelope = b"BAD!" + payload[4:]
+    with pytest.raises(CaptureError) as error:
+        list(iter_records(_capture(invalid_envelope, stream), stream))
+    assert str(error.value) == "Parquet source payload has an invalid envelope"
+    assert "Synthetic Source Label" not in str(error.value)
+
+    oversized_footer = payload[:-8] + (1024 * 1024 + 1).to_bytes(4, "little") + b"PAR1"
+    with pytest.raises(CaptureError, match="invalid footer"):
+        list(iter_records(_capture(oversized_footer, stream), stream))
+
+
+def test_parquet_outer_gzip_materialization_rechecks_its_sealed_metrics():
+    """The seekable gzip buffer cannot bypass the metrics verified before decoding."""
+
+    from process.custom_import import capture
+
+    payload = _parquet_payload({"source_value": ["value"]})
+    with pytest.raises(CaptureError, match="sealed capture"):
+        capture._bounded_parquet_payload(
+            gzip.compress(payload),
+            "gzip",
+            CaptureLimits(maximum_decoded_bytes=4096, maximum_record_bytes=1024),
+            expected_decoded_bytes=len(payload),
+            expected_decoded_sha256="0" * 64,
+        )
+
+
+def test_parquet_metadata_preflight_rejects_external_references_and_excess_groups():
+    """Metadata cannot turn a sealed single-file capture into a multi-file read."""
+
+    from process.custom_import import capture
+
+    class Column:
+        """Minimal metadata column with an impermissible external reference."""
+
+        file_path = "another-file.parquet"
+        num_values = 1
+        total_uncompressed_size = 1
+
+    class RowGroup:
+        """Minimal flat row group used to exercise metadata preflight."""
+
+        num_rows = 1
+        num_columns = 1
+
+        @staticmethod
+        def column(_index: int) -> Column:
+            return Column()
+
+    class ExternalMetadata:
+        """One-row metadata object pointing outside the sealed capture."""
+
+        num_rows = 1
+        num_row_groups = 1
+        num_columns = 1
+
+        @staticmethod
+        def row_group(_index: int) -> RowGroup:
+            return RowGroup()
+
+    class ExcessGroupMetadata:
+        """Metadata that must fail before it tries to materialize any row group."""
+
+        num_rows = 0
+        num_row_groups = 4_097
+        num_columns = 1
+
+        @staticmethod
+        def row_group(_index: int) -> None:
+            raise AssertionError("row groups must not be inspected after the fanout limit")
+
+    limits = CaptureLimits()
+    with pytest.raises(CaptureError, match="external file"):
+        capture._validated_parquet_metadata(
+            ExternalMetadata(),
+            expected_columns=1,
+            limits=limits,
+        )
+    with pytest.raises(CaptureError, match="row-group limit"):
+        capture._validated_parquet_metadata(
+            ExcessGroupMetadata(),
+            expected_columns=1,
+            limits=limits,
+        )
+
+
+def test_parquet_decoder_enforces_record_and_logical_byte_limits():
+    """Metadata and each emitted row remain bounded despite Parquet compression."""
+
+    stream = _stream(format_name="parquet")
+    record_payload = _parquet_payload({"source_value": ["x" * 64]})
+    record_limits = CaptureLimits(maximum_record_bytes=32, maximum_decoded_bytes=4096)
+    with pytest.raises(CaptureError, match="record 1 exceeds"):
+        list(
+            iter_records(
+                _capture(record_payload, stream, limits=record_limits),
+                stream,
+                limits=record_limits,
+            )
+        )
+
+    logical_payload = _parquet_payload(
+        {"source_value": ["x" * 500 for _ in range(16)]},
+        use_dictionary=False,
+    )
+    logical_limits = CaptureLimits(maximum_record_bytes=1024, maximum_decoded_bytes=2048)
+    with pytest.raises(CaptureError, match="decoded-byte"):
+        list(
+            iter_records(
+                _capture(logical_payload, stream, limits=logical_limits),
+                stream,
+                limits=logical_limits,
+            )
+        )
 
 
 def test_capture_rejects_unsafe_snapshot_tokens_and_nonbinary_sources():

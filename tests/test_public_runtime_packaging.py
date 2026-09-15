@@ -99,6 +99,7 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
         validate(tmp_path)
     names = set(re.findall(r"^([a-z0-9-]+)(?:\[[^]]+\])?==", (ROOT / "requirements-runtime.lock").read_text(), re.M))
     assert not names & {"pytest", "coverage", "pip-audit", "maturin", "uv", "pytest-xdist"}
+    assert "pyarrow" in names
 
 
 def test_local_example_has_neutral_database_and_no_shared_operator_token():

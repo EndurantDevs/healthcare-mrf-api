@@ -27,6 +27,8 @@ import xml.etree.ElementTree as ElementTree
 
 from ijson import common as ijson_common
 from ijson.backends import python as ijson_python
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
 
@@ -34,6 +36,10 @@ from process.custom_import.definition import CONTRACT_VERSION, SourceStream
 _DEFAULT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_SNAPSHOT_TOKEN_BYTES = 1024
 _MAX_SOURCE_LABEL_BYTES = 255
+_MAX_PARQUET_FOOTER_BYTES = 1024 * 1024
+_MAX_PARQUET_ROW_GROUPS = 4_096
+_MAX_PARQUET_THRIFT_CONTAINER_ITEMS = 64 * 1024
+_PARQUET_BATCH_ROWS = 256
 _CSV_FIELD_SIZE_LOCK = threading.Lock()
 
 Scalar = str | int | Decimal | bool | None
@@ -207,6 +213,17 @@ def iter_records(
     """Yield validated source-label records from a verified sealed capture."""
 
     verify_capture(capture, stream, limits=limits)
+    yield from _iter_verified_records(capture, stream, limits=limits)
+
+
+def _iter_verified_records(
+    capture: SealedCapture,
+    stream: SourceStream,
+    *,
+    limits: CaptureLimits,
+) -> Iterator[DecodedRecord]:
+    """Decode one capture only after an internal caller has verified its sealed bytes."""
+
     if stream.format in {"csv", "tsv"}:
         yield from _iter_delimited_records(capture.payload, stream, limits)
         return
@@ -220,7 +237,14 @@ def iter_records(
         yield from _iter_xml_records(capture.payload, stream, limits)
         return
     if stream.format == "parquet":
-        raise CaptureError("parquet decoding is not enabled for custom-import/v1 captures")
+        yield from _iter_parquet_records(
+            capture.payload,
+            stream,
+            limits,
+            expected_decoded_bytes=capture.manifest.decoded_bytes,
+            expected_decoded_sha256=capture.manifest.decoded_sha256,
+        )
+        return
     raise CaptureError("capture manifest declares an unsupported source format")
 
 
@@ -494,6 +518,258 @@ def _iter_xml_records(
                 yield from _iter_xml_text_records(text, record_tag, limits)
     except (ElementTree.ParseError, UnicodeDecodeError) as exc:
         raise CaptureError("XML source payload is invalid") from exc
+
+
+def _iter_parquet_records(
+    captured_bytes: bytes,
+    stream: SourceStream,
+    limits: CaptureLimits,
+    *,
+    expected_decoded_bytes: int,
+    expected_decoded_sha256: str,
+) -> Iterator[DecodedRecord]:
+    """Decode bounded, flat Parquet rows without permitting external file references."""
+
+    decoded_payload = _bounded_parquet_payload(
+        captured_bytes,
+        stream.compression,
+        limits,
+        expected_decoded_bytes=expected_decoded_bytes,
+        expected_decoded_sha256=expected_decoded_sha256,
+    )
+    _validate_parquet_envelope(decoded_payload)
+    with _open_parquet_reader(decoded_payload, limits) as parquet_reader:
+        source_labels = _validated_parquet_schema(parquet_reader.schema_arrow, limits)
+        expected_record_count = _validated_parquet_metadata(
+            parquet_reader.metadata,
+            expected_columns=len(source_labels),
+            limits=limits,
+        )
+        yield from _iter_parquet_batch_records(
+            parquet_reader,
+            source_labels,
+            expected_record_count,
+            limits,
+        )
+
+
+@contextmanager
+def _open_parquet_reader(
+    decoded_payload: bytes | memoryview,
+    limits: CaptureLimits,
+) -> Iterator[pq.ParquetFile]:
+    """Open one in-memory Parquet reader with bounded native parser metadata."""
+
+    native_buffer: pa.BufferReader | None = None
+    parquet_reader: pq.ParquetFile | None = None
+    try:
+        native_buffer = pa.BufferReader(decoded_payload)
+        parquet_reader = pq.ParquetFile(
+            native_buffer,
+            memory_map=False,
+            buffer_size=0,
+            pre_buffer=False,
+            thrift_string_size_limit=min(_MAX_PARQUET_FOOTER_BYTES, limits.maximum_decoded_bytes),
+            thrift_container_size_limit=_MAX_PARQUET_THRIFT_CONTAINER_ITEMS,
+            page_checksum_verification=True,
+            arrow_extensions_enabled=False,
+        )
+        yield parquet_reader
+    except CaptureError:
+        raise
+    except (pa.ArrowException, EOFError, OSError, OverflowError, ValueError) as exc:
+        raise CaptureError("Parquet source payload is invalid") from exc
+    finally:
+        if parquet_reader is not None:
+            parquet_reader.close()
+        if native_buffer is not None:
+            native_buffer.close()
+
+
+def _iter_parquet_batch_records(
+    parquet_reader: pq.ParquetFile,
+    source_labels: tuple[str, ...],
+    expected_record_count: int,
+    limits: CaptureLimits,
+) -> Iterator[DecodedRecord]:
+    """Validate bounded record batches before exposing capture scalar mappings."""
+
+    emitted_record_count = 0
+    logical_batch_bytes = 0
+    for record_batch in parquet_reader.iter_batches(
+        batch_size=min(_PARQUET_BATCH_ROWS, limits.maximum_records),
+        use_threads=False,
+        use_pandas_metadata=False,
+    ):
+        _validate_parquet_batch_schema(record_batch, source_labels)
+        logical_batch_bytes += _nonnegative_parquet_integer(record_batch.nbytes)
+        if logical_batch_bytes > limits.maximum_decoded_bytes:
+            raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+        for row_index in range(record_batch.num_rows):
+            if emitted_record_count >= expected_record_count:
+                raise CaptureError("Parquet source payload has inconsistent row metadata")
+            emitted_record_count += 1
+            scalar_values_by_label = {
+                source_labels[column_index]: record_batch.column(column_index)[row_index].as_py()
+                for column_index in range(record_batch.num_columns)
+            }
+            yield _decoded_record(emitted_record_count, scalar_values_by_label, limits)
+    if emitted_record_count != expected_record_count:
+        raise CaptureError("Parquet source payload has inconsistent row metadata")
+
+
+def _bounded_parquet_payload(
+    captured_bytes: bytes,
+    compression: str,
+    limits: CaptureLimits,
+    *,
+    expected_decoded_bytes: int,
+    expected_decoded_sha256: str,
+) -> bytes | memoryview:
+    """Materialize only the bounded seekable bytes required by Parquet random access."""
+
+    if compression == "none":
+        return captured_bytes
+    if (
+        isinstance(expected_decoded_bytes, bool)
+        or not isinstance(expected_decoded_bytes, int)
+        or expected_decoded_bytes < 0
+        or expected_decoded_bytes > limits.maximum_decoded_bytes
+        or not isinstance(expected_decoded_sha256, str)
+    ):
+        raise CaptureError("Parquet source payload does not match the sealed capture")
+    decoded_bytes = bytearray(expected_decoded_bytes)
+    offset = 0
+    digest = hashlib.sha256()
+    try:
+        with _open_decoded_payload(captured_bytes, compression) as decoded:
+            while offset < expected_decoded_bytes:
+                chunk = decoded.read(min(limits.read_chunk_bytes, expected_decoded_bytes - offset))
+                if not chunk:
+                    break
+                decoded_bytes[offset : offset + len(chunk)] = chunk
+                digest.update(chunk)
+                offset += len(chunk)
+            has_extra_bytes = bool(decoded.read(1))
+    except (EOFError, OSError) as exc:
+        raise CaptureError("Parquet source payload compression is invalid") from exc
+    if (
+        offset != expected_decoded_bytes
+        or has_extra_bytes
+        or digest.hexdigest() != expected_decoded_sha256
+    ):
+        raise CaptureError("Parquet source payload does not match the sealed capture")
+    return memoryview(decoded_bytes).toreadonly()
+
+
+def _validate_parquet_envelope(payload: bytes | memoryview) -> None:
+    """Reject malformed or oversized Parquet footers before native metadata parsing."""
+
+    if len(payload) < 12 or payload[:4] != b"PAR1" or payload[-4:] != b"PAR1":
+        raise CaptureError("Parquet source payload has an invalid envelope")
+    footer_bytes = int.from_bytes(payload[-8:-4], byteorder="little")
+    if (
+        footer_bytes == 0
+        or footer_bytes > _MAX_PARQUET_FOOTER_BYTES
+        or footer_bytes > len(payload) - 8
+    ):
+        raise CaptureError("Parquet source payload has an invalid footer")
+
+
+def _validated_parquet_schema(
+    schema: pa.Schema,
+    limits: CaptureLimits,
+) -> tuple[str, ...]:
+    """Allow only labeled, flat source columns that map to capture scalar values."""
+
+    if len(schema) == 0:
+        raise CaptureError("Parquet source payload requires at least one source column")
+    if len(schema) > limits.maximum_fields_per_record:
+        raise CaptureError("Parquet source payload exceeds the field limit")
+    source_labels = tuple(_validated_source_label(field.name) for field in schema)
+    if len(set(source_labels)) != len(source_labels):
+        raise CaptureError("Parquet source payload contains duplicate labels")
+    if any(not _is_supported_parquet_scalar(field.type) for field in schema):
+        raise CaptureError("Parquet source payload contains an unsupported scalar type")
+    return source_labels
+
+
+def _is_supported_parquet_scalar(data_type: pa.DataType) -> bool:
+    """Keep the native decoder within the existing exact capture scalar contract."""
+
+    return (
+        pa.types.is_null(data_type)
+        or pa.types.is_boolean(data_type)
+        or pa.types.is_integer(data_type)
+        or pa.types.is_string(data_type)
+        or pa.types.is_large_string(data_type)
+        or pa.types.is_decimal(data_type)
+    )
+
+
+def _validated_parquet_metadata(
+    metadata: pq.FileMetaData | None,
+    *,
+    expected_columns: int,
+    limits: CaptureLimits,
+) -> int:
+    """Bound metadata-controlled allocation before iterating Parquet data pages."""
+
+    if metadata is None:
+        raise CaptureError("Parquet source payload has no metadata")
+    record_count = _nonnegative_parquet_integer(metadata.num_rows)
+    row_group_count = _nonnegative_parquet_integer(metadata.num_row_groups)
+    column_count = _nonnegative_parquet_integer(metadata.num_columns)
+    if record_count > limits.maximum_records:
+        raise CaptureError("Parquet source payload exceeds the record limit")
+    if row_group_count > _MAX_PARQUET_ROW_GROUPS:
+        raise CaptureError("Parquet source payload exceeds the row-group limit")
+    if column_count != expected_columns:
+        raise CaptureError("Parquet source payload has inconsistent column metadata")
+
+    row_group_records = 0
+    declared_uncompressed_bytes = 0
+    for row_group_index in range(row_group_count):
+        row_group = metadata.row_group(row_group_index)
+        group_record_count = _nonnegative_parquet_integer(row_group.num_rows)
+        group_column_count = _nonnegative_parquet_integer(row_group.num_columns)
+        if group_column_count != expected_columns:
+            raise CaptureError("Parquet source payload has inconsistent column metadata")
+        row_group_records += group_record_count
+        if row_group_records > limits.maximum_records:
+            raise CaptureError("Parquet source payload exceeds the record limit")
+        for column_index in range(group_column_count):
+            column = row_group.column(column_index)
+            if column.file_path not in (None, ""):
+                raise CaptureError("Parquet source payload cannot reference an external file")
+            if _nonnegative_parquet_integer(column.num_values) != group_record_count:
+                raise CaptureError("Parquet source payload has inconsistent row metadata")
+            declared_uncompressed_bytes += _nonnegative_parquet_integer(
+                column.total_uncompressed_size
+            )
+            if declared_uncompressed_bytes > limits.maximum_decoded_bytes:
+                raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+    if row_group_records != record_count:
+        raise CaptureError("Parquet source payload has inconsistent row metadata")
+    return record_count
+
+
+def _nonnegative_parquet_integer(value: object) -> int:
+    """Reject malformed metadata numbers rather than allowing implicit coercion."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CaptureError("Parquet source payload has invalid metadata")
+    return value
+
+
+def _validate_parquet_batch_schema(
+    batch: pa.RecordBatch,
+    source_labels: tuple[str, ...],
+) -> None:
+    """Ensure batch columns remain positional matches for the validated source schema."""
+
+    if batch.num_columns != len(source_labels) or tuple(batch.schema.names) != source_labels:
+        raise CaptureError("Parquet source payload has an inconsistent batch schema")
 
 
 def _iter_xml_text_records(
