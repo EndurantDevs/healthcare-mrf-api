@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import process.custom_import.contracts as contracts
 from process.custom_import import (
     CandidateRejected,
     CustomImportDefinition,
     DefinitionError,
     SourceSnapshotError,
     assemble_root_families,
+    canonical_sha256,
     load_json_definition,
+    load_yaml_definition,
     merge_families,
     validate_source_snapshot_tokens,
 )
@@ -38,6 +42,14 @@ def _root(npi="1234567893", name="Synthetic Provider"):
 
 def _rate(npi="1234567893", code="A100", amount=Decimal("12.50")):
     return {"rate_npi": npi, "service_code": code, "amount": amount}
+
+
+def _assert_invalid_definition(mutate, message):
+    raw = _raw_definition()
+    mutate(raw)
+
+    with pytest.raises(DefinitionError, match=message):
+        CustomImportDefinition.from_mapping(raw)
 
 
 def test_json_and_yaml_have_one_canonical_definition_and_digest():
@@ -104,6 +116,164 @@ def test_definition_rejects_revision_numbers_outside_integer_storage(revision_na
         CustomImportDefinition.from_mapping(raw)
 
 
+@pytest.mark.parametrize(
+    ("serialized", "message"),
+    (
+        (b"\xff", "must be UTF-8"),
+        (42, "must be text"),
+        ('{"value": 1.5}', "floating-point"),
+        ('{"contract":', "invalid JSON definition"),
+    ),
+)
+def test_definition_wire_parser_rejects_noncanonical_input(serialized, message):
+    with pytest.raises(DefinitionError, match=message):
+        load_json_definition(serialized)
+
+    with pytest.raises(DefinitionError, match="invalid YAML definition"):
+        load_yaml_definition("definition: [")
+    with pytest.raises(ValueError, match="unsupported custom-import digest domain"):
+        canonical_sha256({}, domain="unsupported")
+
+
+def test_definition_wire_parser_rejects_structural_and_encoding_boundaries():
+    with pytest.raises(DefinitionError, match="duplicate object key"):
+        load_yaml_definition("field: one\nfield: two\n")
+    with pytest.raises(DefinitionError, match="structural limits"):
+        load_json_definition("[" * 33 + "0" + "]" * 33)
+    with pytest.raises(DefinitionError, match="byte limit"):
+        load_json_definition(" " * (1024 * 1024 + 1))
+    with pytest.raises(DefinitionError, match="object keys must be strings"):
+        CustomImportDefinition.from_mapping({1: "not-a-definition"})
+    with pytest.raises(DefinitionError, match="definition must be an object"):
+        CustomImportDefinition.from_mapping([])
+
+
+def test_contract_exports_and_definition_indexes_are_usable(definition):
+    assert contracts.CustomImportDefinition is CustomImportDefinition
+    assert contracts.assemble_root_families is assemble_root_families
+    assert definition.fields_by_id["npi"].field_slot == 1
+    assert definition.collections_by_name["rates"].child_key == ("service_code",)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda raw: raw["schema"]["root"].update({"logical_key": []}), "non-empty unique"),
+        (lambda raw: raw["schema"]["root"]["entity"].update({"adapter": "other"}), "must be npi"),
+        (lambda raw: raw["schema"]["root"]["entity"].update({"field": "missing"}), "NPI entity"),
+        (lambda raw: raw["schema"]["root"]["fields"][1].update({"nullable": "false"}), "nullable"),
+        (lambda raw: raw["schema"]["root"]["fields"][1].update({"slot": 1}), "stable field slots"),
+        (lambda raw: raw["schema"]["root"]["fields"][1].update({"projection_slot": 1}), "projection slots"),
+    ),
+)
+def test_definition_rejects_root_schema_identity_violations(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda raw: raw["schema"]["root"]["fields"][0].update({"nullable": True}), "required root"),
+        (
+            lambda raw: raw["schema"].update(
+                {"children": [copy.deepcopy(raw["schema"]["children"][0]) for _ in range(9)]}
+            ),
+            "exceeds the v1 limit",
+        ),
+        (
+            lambda raw: raw["schema"].update(
+                {"children": [raw["schema"]["children"][0], copy.deepcopy(raw["schema"]["children"][0])]}
+            ),
+            "collection names must be unique",
+        ),
+        (lambda raw: raw.update({"streams": {}}), "streams must be an array"),
+        (lambda raw: raw["streams"][1].update({"id": "providers"}), "streams must be non-empty"),
+        (lambda raw: raw["aliases"].update({"providers": {"\x00": "npi"}}), "bounded printable"),
+    ),
+)
+def test_definition_rejects_schema_and_stream_shape_boundaries(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (
+            lambda raw: raw["schema"]["children"][0]["parent_key"][0].update({"root": "display_name"}),
+            "preserve root logical-key order",
+        ),
+        (
+            lambda raw: raw["schema"]["children"][0]["parent_key"][0].update({"child": "amount"}),
+            "required and type-compatible",
+        ),
+        (lambda raw: raw["schema"]["children"][0].update({"parent_key": []}), "complete root logical key"),
+        (lambda raw: raw["schema"]["children"][0].update({"child_key": []}), "one to three unique"),
+        (lambda raw: raw["schema"]["children"][0].update({"child_key": ["amount"]}), "required child"),
+    ),
+)
+def test_definition_rejects_incomplete_child_identity_mappings(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda raw: raw["streams"][0].update({"child": "rates"}), "cannot declare child"),
+        (lambda raw: raw["streams"][1].update({"child": "missing"}), "is not declared"),
+        (lambda raw: raw["streams"][0].update({"format": "binary"}), "unsupported format"),
+        (lambda raw: raw["aliases"].update({"providers": []}), "must be an object"),
+        (lambda raw: raw["aliases"]["providers"].update({"Amount": "amount"}), "stream scope"),
+        (lambda raw: raw["query"].update({"root_fields": ["missing"]}), "unique projected root"),
+        (lambda raw: raw["query"]["child"].update({"collection": "missing"}), "is not declared"),
+        (lambda raw: raw["query"]["child"].update({"fields": ["rate_npi"]}), "one collection"),
+        (
+            lambda raw: raw["query"]["order"][0].update({"field": "rate_npi"}),
+            "permitted query fields",
+        ),
+        (
+            lambda raw: raw["selection_profiles"][0].update({"context_dimensions": ["service_code", "service_code"]}),
+            "at most two unique",
+        ),
+        (
+            lambda raw: raw["selection_profiles"][0]["selection"][0].update({"field": "rate_npi"}),
+            "one permitted query context",
+        ),
+    ),
+)
+def test_definition_rejects_out_of_scope_query_and_selection_values(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (
+            lambda raw: raw["selection_profiles"].append(copy.deepcopy(raw["selection_profiles"][0])),
+            "profile ids must be unique",
+        ),
+        (lambda raw: raw["query"].update({"order": raw["query"]["order"] * 4}), "term limit"),
+        (
+            lambda raw: raw["query"]["order"].append(copy.deepcopy(raw["query"]["order"][0])),
+            "cannot repeat a field",
+        ),
+    ),
+)
+def test_definition_rejects_ambiguous_profiles_and_sort_terms(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+def test_definition_permits_root_only_query_contexts():
+    raw = _raw_definition()
+    raw["query"].pop("child")
+    raw["query"]["order"] = []
+    raw["selection_profiles"][0]["selection"][0]["field"] = "npi"
+    raw["selection_profiles"][0]["context_dimensions"] = []
+
+    definition = CustomImportDefinition.from_mapping(raw)
+    assert definition.query.child_collection is None
+    assert definition.query.child_fields == ()
+
+
 def test_alias_only_revision_keeps_schema_and_stable_slots():
     first = CustomImportDefinition.from_mapping(_raw_definition())
     second_raw = _raw_definition()
@@ -114,6 +284,40 @@ def test_alias_only_revision_keeps_schema_and_stable_slots():
     assert second.schema_revision == first.schema_revision
     assert second.schema_digest == first.schema_digest
     assert {field.field_slot for field in second.fields} == {1, 2, 3, 4, 5}
+
+
+def test_definition_revision_cannot_move_an_existing_field_to_a_new_slot():
+    first = CustomImportDefinition.from_mapping(_raw_definition())
+    moved = _raw_definition()
+    moved["revision"].update({"definition": 2, "schema": 2})
+    moved["schema"]["root"]["fields"][1]["slot"] = 6
+
+    with pytest.raises(DefinitionError, match="stable field slots cannot be rebound"):
+        CustomImportDefinition.from_mapping(moved, previous=first)
+
+
+def test_definition_revision_cannot_rebind_a_retained_field_slot():
+    first = CustomImportDefinition.from_mapping(_raw_definition())
+    rebound = _raw_definition()
+    rebound["revision"].update({"definition": 2, "schema": 2})
+    rebound["schema"]["root"]["fields"][1]["id"] = "provider_name"
+    rebound["aliases"]["providers"]["Provider Name"] = "provider_name"
+    rebound["query"]["root_fields"][1] = "provider_name"
+
+    with pytest.raises(DefinitionError, match="stable field slots cannot be rebound"):
+        CustomImportDefinition.from_mapping(rebound, previous=first)
+
+
+def test_definition_revision_requires_monotonic_definition_and_schema_numbers():
+    first = CustomImportDefinition.from_mapping(_raw_definition())
+
+    with pytest.raises(DefinitionError, match="definition revision must increase"):
+        CustomImportDefinition.from_mapping(_raw_definition(), previous=first)
+
+    unchanged_schema = _raw_definition()
+    unchanged_schema["revision"].update({"definition": 2, "schema": 2})
+    with pytest.raises(DefinitionError, match="unchanged schema must retain"):
+        CustomImportDefinition.from_mapping(unchanged_schema, previous=first)
 
 
 def test_type_or_key_change_requires_new_schema_revision():
@@ -217,9 +421,91 @@ def test_source_tokens_must_be_complete_single_and_shared(definition):
             validate_source_snapshot_tokens(definition, tokens)
 
 
+def test_source_tokens_reject_empty_stream_observations(definition):
+    with pytest.raises(SourceSnapshotError, match="no bounded token observations"):
+        validate_source_snapshot_tokens(
+            definition,
+            {"providers": [], "rates": ["snapshot-1"]},
+        )
+
+
 def test_family_build_requires_a_child_collection_mapping(definition):
     with pytest.raises(DefinitionError, match="children must contain one bounded array"):
         assemble_root_families(definition, [], [])
+
+
+def test_family_build_requires_bounded_root_and_child_record_arrays(definition):
+    with pytest.raises(DefinitionError, match="roots must be a bounded record array"):
+        assemble_root_families(definition, {"root": _root()}, {"rates": []})
+    with pytest.raises(DefinitionError, match="children must contain one bounded array"):
+        assemble_root_families(definition, [_root()], {"rates": {"rate": _rate()}})
+
+
+def test_family_build_rejects_non_object_records_and_invalid_key_shapes(definition):
+    root_result = assemble_root_families(definition, [None], {"rates": []})
+    assert root_result.candidate_errors == ("root_not_object",)
+
+    child_result = assemble_root_families(definition, [_root()], {"rates": [None]})
+    assert child_result.candidate_errors == ("child_not_object",)
+
+    orphan_result = assemble_root_families(
+        definition,
+        [_root()],
+        {"rates": [{"service_code": "A100", "amount": Decimal("12.50")}]},
+    )
+    assert orphan_result.candidate_errors == ("orphan_child",)
+
+
+def test_family_build_rejects_null_invalid_entity_and_decimal_values(definition):
+    required_null = assemble_root_families(
+        definition,
+        [{"npi": "1234567893", "display_name": None}],
+        {"rates": []},
+    )
+    assert {entry.code for entry in required_null.rejections} == {"required_field_null"}
+
+    invalid_entity = assemble_root_families(definition, [_root(npi="1234567894")], {"rates": []})
+    assert {entry.code for entry in invalid_entity.rejections} == {"entity_binding_invalid"}
+
+    malformed_entity = assemble_root_families(definition, [_root(npi="not-an-npi")], {"rates": []})
+    assert {entry.code for entry in malformed_entity.rejections} == {"entity_binding_invalid"}
+
+    invalid_decimal = assemble_root_families(definition, [_root()], {"rates": [_rate(amount=True)]})
+    assert {entry.code for entry in invalid_decimal.rejections} == {"field_type_invalid"}
+
+    nullable_decimal = assemble_root_families(definition, [_root()], {"rates": [_rate(amount=None)]})
+    assert nullable_decimal.families
+
+
+def test_family_build_applies_each_declared_scalar_type():
+    raw = _raw_definition()
+    raw["schema"]["root"]["fields"].extend(
+        (
+            {"id": "rank", "slot": 6, "type": "integer", "nullable": False},
+            {"id": "is_active", "slot": 7, "type": "boolean", "nullable": False},
+            {"id": "born_on", "slot": 8, "type": "date", "nullable": False},
+            {"id": "seen_at", "slot": 9, "type": "timestamp", "nullable": False},
+        )
+    )
+    definition = CustomImportDefinition.from_mapping(raw)
+    root_values_by_field = {
+        **_root(),
+        "rank": 1,
+        "is_active": True,
+        "born_on": date(2026, 9, 15),
+        "seen_at": datetime(2026, 9, 15, tzinfo=timezone.utc),
+    }
+
+    assert assemble_root_families(definition, [root_values_by_field], {"rates": []}).families
+    for field_id, invalid_value in (
+        ("rank", True),
+        ("is_active", 1),
+        ("born_on", datetime(2026, 9, 15, tzinfo=timezone.utc)),
+        ("seen_at", datetime(2026, 9, 15)),
+    ):
+        invalid_root_values_by_field = {**root_values_by_field, field_id: invalid_value}
+        result = assemble_root_families(definition, [invalid_root_values_by_field], {"rates": []})
+        assert {entry.code for entry in result.rejections} == {"field_type_invalid"}
 
 
 def test_invalid_children_and_duplicate_keys_reject_only_their_root_family(definition):
@@ -331,6 +617,13 @@ def test_upsert_retains_rejected_and_absent_families_but_snapshot_requires_scope
         )
         == {}
     )
+
+
+def test_merge_families_rejects_unsupported_refresh_modes(definition):
+    candidate = assemble_root_families(definition, [_root()], {"rates": [_rate()]})
+
+    with pytest.raises(DefinitionError, match="refresh mode must be upsert or snapshot"):
+        merge_families({}, candidate, refresh_mode="replace")
 
 
 def test_definition_records_are_not_mutated_by_canonicalization():
