@@ -126,3 +126,33 @@ def test_manifest_does_not_upgrade_legacy_capture_to_tracked() -> None:
     modified["capture_authority"] = "tracked-generation"
     with pytest.raises(archive.NpiResultArchiveError, match="classification differs"):
         archive.validate_npi_result_manifest(modified)
+
+
+def test_manifest_digest_accepts_metadata_at_the_source_size_boundary() -> None:
+    """A source-accepted payload remains digestible as part of its larger manifest."""
+
+    empty_payload_size = len(archive._canonical_json({"payload": ""}))
+    metadata = {"payload": "x" * (archive._MAX_METADATA_BYTES - empty_payload_size)}
+    assert len(archive._canonical_json(metadata)) == archive._MAX_METADATA_BYTES
+    normalized_metadata, metadata_sha256 = archive._source_metadata(metadata)
+    table_receipts = tuple(
+        archive.NpiTableReceipt(model.__name__, table_name, "a" * 64, 0)
+        for model, table_name in zip(archive._MODEL_TYPES, generation.RELATION_NAMES, strict=True)
+    )
+    manifest = archive.NpiResultManifest(
+        table_receipts,
+        normalized_metadata,
+        metadata_sha256,
+        archive._schema_digest(table_receipts),
+        "legacy-manual",
+        None,
+        None,
+    )
+
+    validated = archive.validate_npi_result_manifest(manifest)
+
+    assert len(archive._canonical_json(validated.as_dict())) > archive._MAX_METADATA_BYTES
+    assert archive._manifest_digest(validated) == archive._manifest_digest(validated)
+    metadata["payload"] += "x"
+    with pytest.raises(archive.NpiResultArchiveError, match="metadata is too large"):
+        archive._source_metadata(metadata)
