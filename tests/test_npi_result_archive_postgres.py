@@ -1093,6 +1093,59 @@ async def test_npi_model_restore_layout_has_exact_owned_relations() -> None:
             await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_public_freeze_captures_full_token_and_rejects_refreeze() -> None:
+    """Expose the complete immutable stage token and reject a second freeze."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    dataset_id = uuid4()
+    try:
+        async with sessions() as session, session.begin():
+            await _ensure_model_extensions(session)
+            initial = await archive.precreate_npi_restore(session, dataset_id=dataset_id)
+            frozen = await archive.freeze_npi_stage(session, ownership=initial)
+            assert frozen.freeze_function_oid is not None
+            assert len(frozen.freeze_trigger_oids) == len(generation.RELATION_NAMES)
+            assert len(frozen.freeze_catalog_versions) == 1 + 2 * len(generation.RELATION_NAMES)
+            assert await archive.verify_npi_stage_ownership(session, frozen) == frozen
+            with pytest.raises(archive.NpiResultArchiveError, match="already frozen"):
+                await archive.freeze_npi_stage(session, ownership=frozen)
+        async with sessions() as session, session.begin():
+            await archive.cleanup_npi_stage(session, frozen)
+    finally:
+        try:
+            await _drop_schemas(engine, {archive.npi_stage_schema(dataset_id)})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_public_freeze_rejects_changed_initial_ownership() -> None:
+    """Refuse an initial token after its exact owned sequence identity changes."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    dataset_id = uuid4()
+    stage_schema = archive.npi_stage_schema(dataset_id)
+    try:
+        async with sessions() as session, session.begin():
+            await _ensure_model_extensions(session)
+            initial = await archive.precreate_npi_restore(session, dataset_id=dataset_id)
+        sequence_name = initial.sequence_oids[0][0]
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(f'ALTER SEQUENCE "{stage_schema}"."{sequence_name}" RENAME TO "changed_sequence"')
+            )
+            with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
+                await archive.freeze_npi_stage(session, ownership=initial)
+    finally:
+        try:
+            await _drop_schemas(engine, {stage_schema})
+        finally:
+            await engine.dispose()
+
+
 async def _build_dumped_npi_archive(
     sessions,
     *,

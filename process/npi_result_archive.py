@@ -1100,6 +1100,22 @@ async def _freeze_npi_clone(
     return frozen
 
 
+async def freeze_npi_stage(
+    session: Any,
+    *,
+    ownership: NpiStageOwnership,
+) -> NpiStageOwnership:
+    """Freeze one exact, initially unfrozen stage in the caller transaction."""
+
+    _require_transaction(session)
+    if not isinstance(ownership, NpiStageOwnership):
+        raise NpiResultArchiveError("NPI archive stage ownership is invalid")
+    if ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids or ownership.freeze_catalog_versions:
+        raise NpiResultArchiveError("NPI archive clone is already frozen")
+    await verify_npi_stage_ownership(session, ownership)
+    return await _freeze_npi_clone(session, ownership)
+
+
 async def _install_freeze_triggers(
     session: Any,
     *,
@@ -1241,7 +1257,7 @@ async def prepare_npi_archive_source(
                 capture.source_serving_generation,
                 capture.canonical_provenance,
             )
-            ownership = await _freeze_npi_clone(clone_session, ownership)
+            ownership = await freeze_npi_stage(clone_session, ownership=ownership)
             prepared = NpiPreparedSource(manifest, ownership)
             await on_prepared(clone_session, prepared)
     return prepared
@@ -1823,6 +1839,7 @@ __all__ = [
     "cleanup_npi_stage",
     "export_npi_archive",
     "export_prepared_npi_archive",
+    "freeze_npi_stage",
     "npi_predecessor_schema",
     "npi_stage_schema",
     "precreate_npi_restore",
