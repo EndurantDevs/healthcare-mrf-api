@@ -242,6 +242,27 @@ async def _run_migration_downgrade(connection, schema_name: str) -> None:
 async def _ensure_model_extensions(connection) -> None:
     await connection.execute(text("CREATE EXTENSION IF NOT EXISTS intarray"))
     await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    extension_search_path = await connection.scalar(
+        text(
+            "SELECT pg_catalog.string_agg("
+            "pg_catalog.format('%I', namespace.nspname), ',' ORDER BY extension.extname"
+            ") "
+            "FROM pg_catalog.pg_extension AS extension "
+            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = extension.extnamespace "
+            "WHERE extension.extname IN ('intarray', 'pg_trgm') "
+            "HAVING count(*) = 2"
+        )
+    )
+    if not isinstance(extension_search_path, str):
+        pytest.fail("model index extensions are unavailable")
+    await connection.execute(
+        text(
+            "SELECT pg_catalog.set_config("
+            "'search_path', :extension_search_path || ',' || pg_catalog.current_setting('search_path'), true"
+            ")"
+        ),
+        {"extension_search_path": extension_search_path},
+    )
 
 
 async def _create_family(connection, schema_name: str, *, populated: bool) -> None:
@@ -1366,6 +1387,7 @@ async def _prepare_data_only_cutover(
 ):
     stage_schema = archive.npi_stage_schema(restore_dataset_id)
     async with sessions() as session, session.begin():
+        await _ensure_model_extensions(session)
         restored_ownership = await archive.precreate_npi_restore(session, dataset_id=restore_dataset_id)
     _restore_npi_table_data(dump_path, restore_list_path, stage_schema)
     sequence_name, _sequence_oid, owner_table, owner_column = restored_ownership.sequence_oids[0]
@@ -1481,8 +1503,19 @@ def _install_ordinary_staging_collaborators(
     ordinary_npi,
     session,
     connection,
+    *,
+    source_schema: str,
 ) -> None:
     """Route ordinary staging helpers through the test transaction and session."""
+
+    original_make_class = ordinary_npi.make_class
+
+    def make_staged_class(model_type, import_date):
+        return original_make_class(
+            model_type,
+            import_date,
+            schema_override=source_schema,
+        )
 
     async def status(statement):
         await session.execute(text(statement))
@@ -1497,6 +1530,7 @@ def _install_ordinary_staging_collaborators(
 
     monkeypatch.setattr(ordinary_npi.db, "status", status)
     monkeypatch.setattr(ordinary_npi.db, "create_table", create_table)
+    monkeypatch.setattr(ordinary_npi, "make_class", make_staged_class)
 
 
 async def _create_ordinary_model_indexes(
@@ -1628,7 +1662,7 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     dataset_id = uuid4()
     import_date = "20990101"
-    source_schema = "mrf"
+    source_schema = f"npi_ordinary_{uuid4().hex}"
     try:
         async with sessions() as session, session.begin():
             await _ensure_model_extensions(session)
@@ -1640,6 +1674,7 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
                 ordinary_npi,
                 session,
                 connection,
+                source_schema=source_schema,
             )
             await _prepare_and_rotate_ordinary_npi_models(
                 session,
