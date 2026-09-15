@@ -195,4 +195,4 @@ def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch)
     )
 
     assert calls == []
-    assert all(not values for values in sync_results_by_kind.values())
+    assert all(not result_values for result_values in sync_results_by_kind.values())

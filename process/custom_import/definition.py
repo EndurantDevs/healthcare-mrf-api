@@ -690,44 +690,58 @@ def _validate_field_identity(
 
 
 def _parse_streams(raw: Any, child_names: set[str]) -> tuple[SourceStream, ...]:
-    streams: list[SourceStream] = []
-    for ordinal, raw_stream in enumerate(_array(raw, "definition.streams")):
-        path = f"definition.streams[{ordinal}]"
-        stream = _mapping(
-            raw_stream,
-            path,
-            keys={"id", "kind", "child", "format", "compression", "snapshot_token"},
-        )
-        kind = _required(stream, "kind", path)
-        if kind not in {"root", "child"}:
-            raise DefinitionError(f"{path}.kind must be root or child")
-        child = stream.get("child")
-        if kind == "root" and child is not None:
-            raise DefinitionError("root streams cannot declare child")
-        if kind == "child":
-            child = _identifier(child, f"{path}.child")
-            if child not in child_names:
-                raise DefinitionError(f"{path}.child is not declared")
-        format_name = _required(stream, "format", path)
-        compression = _required(stream, "compression", path)
-        if format_name not in _FORMATS or compression not in _COMPRESSIONS:
-            raise DefinitionError(
-                f"{path} declares an unsupported format or compression"
-            )
-        streams.append(
-            SourceStream(
-                stream_id=_identifier(_required(stream, "id", path), f"{path}.id"),
-                record_kind=kind,
-                child_collection=child,
-                format=format_name,
-                compression=compression,
-                snapshot_token=_identifier(
-                    _required(stream, "snapshot_token", path), f"{path}.snapshot_token"
-                ),
-            )
-        )
+    streams = tuple(
+        _source_stream_from_mapping(raw_stream, ordinal, child_names)
+        for ordinal, raw_stream in enumerate(_array(raw, "definition.streams"))
+    )
     if not streams or len({stream.stream_id for stream in streams}) != len(streams):
         raise DefinitionError("streams must be non-empty with unique ids")
+    _validate_stream_coverage(streams, child_names)
+    return streams
+
+
+def _source_stream_from_mapping(
+    raw_stream: Any, ordinal: int, child_names: set[str]
+) -> SourceStream:
+    """Parse one declared root or child stream and validate its local shape."""
+
+    path = f"definition.streams[{ordinal}]"
+    stream = _mapping(
+        raw_stream,
+        path,
+        keys={"id", "kind", "child", "format", "compression", "snapshot_token"},
+    )
+    kind = _required(stream, "kind", path)
+    if kind not in {"root", "child"}:
+        raise DefinitionError(f"{path}.kind must be root or child")
+    child = stream.get("child")
+    if kind == "root" and child is not None:
+        raise DefinitionError("root streams cannot declare child")
+    if kind == "child":
+        child = _identifier(child, f"{path}.child")
+        if child not in child_names:
+            raise DefinitionError(f"{path}.child is not declared")
+    format_name = _required(stream, "format", path)
+    compression = _required(stream, "compression", path)
+    if format_name not in _FORMATS or compression not in _COMPRESSIONS:
+        raise DefinitionError(f"{path} declares an unsupported format or compression")
+    return SourceStream(
+        stream_id=_identifier(_required(stream, "id", path), f"{path}.id"),
+        record_kind=kind,
+        child_collection=child,
+        format=format_name,
+        compression=compression,
+        snapshot_token=_identifier(
+            _required(stream, "snapshot_token", path), f"{path}.snapshot_token"
+        ),
+    )
+
+
+def _validate_stream_coverage(
+    streams: tuple[SourceStream, ...], child_names: set[str]
+) -> None:
+    """Require one root stream and exactly one stream for each child collection."""
+
     root_streams = [stream for stream in streams if stream.record_kind == "root"]
     child_collection_names = [
         stream.child_collection for stream in streams if stream.record_kind == "child"
@@ -740,7 +754,6 @@ def _parse_streams(raw: Any, child_names: set[str]) -> tuple[SourceStream, ...]:
         raise DefinitionError(
             "v1 requires exactly one root stream and one stream per child collection"
         )
-    return tuple(streams)
 
 
 def _parse_aliases(
