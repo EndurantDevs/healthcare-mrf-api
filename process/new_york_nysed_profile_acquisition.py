@@ -22,9 +22,11 @@ from process.new_york_nysed_profile import (
     PROFESSION_CODE,
     SCHEMA_VERSION,
     SOURCE_KEY,
+    InvalidProfileValue,
     _require,
     acquisition_result,
     held_acquisition_result,
+    invalid_acquisition_result,
     request_descriptor,
 )
 from process.new_york_nysed_profile_retries import (
@@ -124,11 +126,13 @@ async def _acquire_profile(destination, manifest_by_field, descriptor, api_key, 
         response_by_field, prior_responses = await _fetch_with_timeout_recovery(
             session, destination, descriptor, api_key, checkpoint
         )
-    acquired = (
-        held_acquisition_result(manifest_by_field, response_by_field)
-        if response_by_field["status"] == 204
-        else acquisition_result(manifest_by_field, response_by_field)
-    )
+    if response_by_field["status"] == 204:
+        acquired = held_acquisition_result(manifest_by_field, response_by_field)
+    else:
+        try:
+            acquired = acquisition_result(manifest_by_field, response_by_field)
+        except InvalidProfileValue as error:
+            acquired = invalid_acquisition_result(manifest_by_field, response_by_field, str(error))
     receipt_by_field = {
         "schema_version": SCHEMA_VERSION,
         "outcome": acquired["outcome"],
@@ -138,7 +142,7 @@ async def _acquire_profile(destination, manifest_by_field, descriptor, api_key, 
         "response_sha256": _hash(response_by_field),
         "fact_count": len(acquired["facts"]),
     }
-    if acquired["outcome"] == "held":
+    if acquired["outcome"] in {"held", "invalid"}:
         receipt_by_field["reason"] = acquired["reason"]
     if prior_responses:
         receipt_by_field["timeout_retries"] = timeout_history(prior_responses)

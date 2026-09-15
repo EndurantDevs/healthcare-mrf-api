@@ -275,7 +275,12 @@ async def _acquire_support(ctx, task, license_number, directory, run_id, api_key
     limits_by_file = {**NYSED_FILES, **nysed_retries.timeout_files(receipt, manifest_by_field)}
     hashes_by_name = _capture_inventory(directory, limits_by_file)
     receipt_pin = _hash(receipt)
-    reader = nysed.read_held_acquisition if receipt.get("outcome") == "held" else nysed.read_acquisition
+    reader = {
+        "acquired": nysed.read_acquisition,
+        "held": nysed.read_held_acquisition,
+        "invalid": nysed.read_invalid_acquisition,
+    }.get(receipt.get("outcome"))
+    _require(reader is not None, "support_outcome_invalid")
     replayed = reader(directory, receipt_sha256=receipt_pin)
     _require(
         manifest_by_field["run_id"] == run_id and manifest_by_field["license_number"] == license_number,
@@ -389,6 +394,8 @@ def _append_profile(profiles, metrics_by_field, license_number, descriptor, supp
     counts_by_field["responses"] += 1
     counts_by_field["acquired_profiles" if descriptor["acquisition_outcome"] == "acquired" else "held_attempts"] += 1
     counts_by_field["facts"] += len(descriptor["facts"])
+    if support is not None and support["receipt"]["outcome"] == "invalid":
+        counts_by_field["invalid_nysed_supports"] += 1
     growth = len(encoded_json(counts_by_field)) - len(encoded_json(_aggregate_metrics(metrics_by_field)))
     growth += _json_size({license_number: descriptor}, budget["max_bundle_bytes"]) - 2 + (2 if profiles else 0)
     if support is not None:
@@ -415,6 +422,7 @@ async def _run_claimed(ctx, task, run, cohort, directory, api_key, budget):
         "acquired_profiles": 0,
         "held_attempts": 0,
         "facts": 0,
+        "invalid_nysed_supports": 0,
         "cohort_sha256": run["source_manifest"]["cohort_sha256"],
         "nysed_support": {},
     }

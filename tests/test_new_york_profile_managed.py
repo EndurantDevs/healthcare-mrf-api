@@ -74,11 +74,14 @@ def _sessions(cases, directory):
         sessions.append(SourceSession(replies, directory / "profiles" / license_number))
         if case.get("total", 1) != 1:
             continue
-        response = (
-            NysedResponse(raw=b"", status=204)
-            if case.get("nysed_held")
-            else NysedResponse(_profile_body(license_number, name=("EXAMPLE ALEX " + middle).strip()))
-        )
+        if case.get("nysed_held"):
+            response = NysedResponse(raw=b"", status=204)
+        elif case.get("nysed_invalid"):
+            malformed = _profile_body(license_number, name=("EXAMPLE ALEX " + middle).strip())
+            malformed["name"]["value"] = None
+            response = NysedResponse(malformed)
+        else:
+            response = NysedResponse(_profile_body(license_number, name=("EXAMPLE ALEX " + middle).strip()))
         sessions.append(NysedSession(response))
     return sessions
 
@@ -191,6 +194,45 @@ async def test_full_mixed_cohort_preserves_sources_holds_and_support(managed_cas
     validating = worker.store.update_run.await_args.args[1]["metrics"]
     assert "nysed_support" not in validating and validating["responses"] == 6
     assert all(PUBLIC_HEADER.encode() not in path.read_bytes() for path in state.directory.rglob("*.json"))
+
+
+async def test_invalid_nysed_payload_does_not_abort_the_primary_profile_cohort(managed_case):
+    state = managed_case(
+        [
+            {"license": "111111", "nysed_invalid": True},
+            {"license": "222222", "middle": "Morgan", "transposed": True},
+        ]
+    )
+    completion_metrics = await worker.import_profiles({}, TASK)
+
+    assert completion_metrics["responses"] == completion_metrics["acquired_profiles"] == completion_metrics["facts"] == 2
+    assert completion_metrics["invalid_nysed_supports"] == 1
+    assert not state.pending and not state.failed and state.published == state.run["run_id"]
+    assert all(session.closed for session in state.sessions)
+    bundle = json.loads((state.directory / "manifest.json").read_bytes())
+    invalid_support = bundle["acquisition"]["nysed_support"]["111111"]
+    assert invalid_support["receipt"] == {
+        "schema_version": worker.nysed.SCHEMA_VERSION,
+        "outcome": "invalid",
+        "reason": "new_york_nysed_field_schema_invalid",
+        "completed_at": invalid_support["receipt"]["completed_at"],
+        "manifest_sha256": invalid_support["file_sha256"]["manifest.json"],
+        "request_sha256": invalid_support["file_sha256"]["request.json"],
+        "response_sha256": invalid_support["file_sha256"]["response.json"],
+        "fact_count": 0,
+    }
+    assert invalid_support["source_identity"] is None
+    source_records = [
+        source_record
+        for model, retained_rows, _ in state.writes
+        if model == worker.ProviderProfileSourceRecord
+        for source_record in retained_rows
+    ]
+    by_license = {source_record["license_number"]: source_record for source_record in source_records}
+    invalid_binding = by_license["111111"]["match_evidence"]["registry_binding"]
+    assert invalid_binding["method"] == "exact_ny_license_name_components"
+    assert "nysed_corroboration" not in invalid_binding
+    assert "nysed_corroboration" in by_license["222222"]["match_evidence"]["registry_binding"]
 
 
 @pytest.mark.parametrize(

@@ -349,10 +349,10 @@ def _validate_nysed_receipt(support, run_id, license_number):
         "fact_count",
     }
     _require(
-        outcome in {"acquired", "held"}
+        outcome in {"acquired", "held", "invalid"}
         and set(receipt)
         == fields
-        | ({"reason"} if outcome == "held" else set())
+        | ({"reason"} if outcome in {"held", "invalid"} else set())
         | ({"timeout_retries"} if "timeout_retries" in receipt else set())
         and receipt["schema_version"] == nysed.SCHEMA_VERSION
         and type(receipt["fact_count"]) is int
@@ -369,6 +369,13 @@ def _validate_nysed_receipt(support, run_id, license_number):
             and receipt["fact_count"] == 0
             and support["source_identity"] is None,
             "nysed_held_invalid",
+        )
+    elif outcome == "invalid":
+        _require(
+            receipt["reason"] in nysed.INVALID_PROFILE_REASONS
+            and receipt["fact_count"] == 0
+            and support["source_identity"] is None,
+            "nysed_invalid_invalid",
         )
     else:
         _require(receipt["fact_count"] > 0, "nysed_fact_count_invalid")
@@ -425,7 +432,7 @@ def _has_matching_nysed_support(record, support):
     if not isinstance(binding, dict):
         return False
     corroboration = binding.get("nysed_corroboration")
-    if support["receipt"]["outcome"] == "held":
+    if support["receipt"]["outcome"] in {"held", "invalid"}:
         return binding.get("method") == "exact_ny_license_name_components" and corroboration is None
     return (
         binding.get("method") == CORROBORATED_METHOD
@@ -602,6 +609,12 @@ class NewYorkProfileStore(SourceProfileStore):
             or counts["received_profiles"] != counts["acquired_profiles"]
             or counts["retained_facts"] != counts["bundle_fact_count"]
             or metrics.get("cohort_sha256") != manifest["cohort_sha256"]
+            or type(metrics.get("invalid_nysed_supports", 0)) is not int
+            or metrics.get("invalid_nysed_supports", 0)
+            != sum(
+                support["receipt"]["outcome"] == "invalid"
+                for support in counts["bundle_metrics"]["nysed_support"].values()
+            )
             or any(
                 type(metrics.get(key)) is not int or metrics[key] != counts[count_key]
                 for key, count_key in (
