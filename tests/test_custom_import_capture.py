@@ -4,23 +4,29 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from decimal import Decimal
 import gzip
-from io import BytesIO
 import json
-from pathlib import Path
 import subprocess
 import sys
+from dataclasses import replace
+from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
 from typing import get_type_hints
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from process.custom_import import CaptureError, CaptureLimits, CustomImportDefinition
-from process.custom_import import capture_stream, iter_records, load_json_definition, verify_capture
-
+from process.custom_import import (
+    CaptureError,
+    CaptureLimits,
+    CustomImportDefinition,
+    capture_stream,
+    iter_records,
+    load_json_definition,
+    verify_capture,
+)
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 
@@ -114,9 +120,13 @@ def test_capture_supports_gzip_replay_and_enforces_transport_limits():
     """Gzip is replayed from its sealed bytes and both byte limits fail closed."""
 
     stream = _stream(compression="gzip")
-    payload = gzip.compress(b"Provider ID,Provider Name\n1234567893,Synthetic Provider\n")
+    payload = gzip.compress(
+        b"Provider ID,Provider Name\n1234567893,Synthetic Provider\n"
+    )
     capture = _capture(payload, stream)
-    assert list(iter_records(capture, stream))[0].values["Provider ID"] == "1234567893"
+    assert (
+        next(iter(iter_records(capture, stream))).values["Provider ID"] == "1234567893"
+    )
 
     with pytest.raises(CaptureError, match="compressed-byte"):
         _capture(payload, stream, limits=CaptureLimits(maximum_compressed_bytes=1))
@@ -186,10 +196,15 @@ def test_json_decoder_is_incremental_strict_and_preserves_decimal_values():
     """Top-level JSON arrays stream flat objects without losing decimal precision."""
 
     stream = _stream(format_name="json")
-    payload = b'[{"npi":"1234567893","amount":12.50},{"npi":"1003000126","amount":0.01}]'
+    payload = (
+        b'[{"npi":"1234567893","amount":12.50},{"npi":"1003000126","amount":0.01}]'
+    )
 
     records = list(iter_records(_capture(payload, stream), stream))
-    assert [record.values["amount"] for record in records] == [Decimal("12.50"), Decimal("0.01")]
+    assert [record.values["amount"] for record in records] == [
+        Decimal("12.50"),
+        Decimal("0.01"),
+    ]
     with pytest.raises(CaptureError, match="top-level array"):
         list(iter_records(_capture(b'{"npi":"1234567893"}', stream), stream))
     with pytest.raises(CaptureError, match="duplicate JSON"):
@@ -272,7 +287,13 @@ def test_ndjson_decoder_rejects_nested_values_and_record_overruns():
         list(iter_records(_capture(b'{"npi":"\\ud800"}\n', stream), stream))
     tiny_limits = CaptureLimits(maximum_record_bytes=16, maximum_decoded_bytes=64)
     with pytest.raises(CaptureError, match="record exceeds"):
-        list(iter_records(_capture(b'{"npi":"1234567893"}\n', stream, limits=tiny_limits), stream, limits=tiny_limits))
+        list(
+            iter_records(
+                _capture(b'{"npi":"1234567893"}\n', stream, limits=tiny_limits),
+                stream,
+                limits=tiny_limits,
+            )
+        )
 
 
 def test_xml_decoder_allows_flat_direct_child_records_and_clears_completed_roots():
@@ -286,7 +307,10 @@ def test_xml_decoder_allows_flat_direct_child_records_and_clears_completed_roots
         b"<providers><provider><npi>1234567893</npi></provider>"
         b"<provider><npi>1003000126</npi></provider></providers>"
     )
-    assert [record.values["npi"] for record in iter_records(_capture(repeated_xml_payload, stream), stream)] == [
+    assert [
+        record.values["npi"]
+        for record in iter_records(_capture(repeated_xml_payload, stream), stream)
+    ] == [
         "1234567893",
         "1003000126",
     ]
@@ -296,7 +320,9 @@ def test_xml_decoder_rejects_entities_and_non_utf8_encodings():
     """XML declaration preflight rejects entities across plain and gzip captures."""
 
     stream = _stream(format_name="xml", record_path="provider")
-    entity_payload = b'<!DOCTYPE providers [<!ENTITY value "blocked">]><providers></providers>'
+    entity_payload = (
+        b'<!DOCTYPE providers [<!ENTITY value "blocked">]><providers></providers>'
+    )
     with pytest.raises(CaptureError, match="entity declarations"):
         list(iter_records(_capture(entity_payload, stream), stream))
     split_limits = CaptureLimits(read_chunk_bytes=3)
@@ -310,7 +336,11 @@ def test_xml_decoder_rejects_entities_and_non_utf8_encodings():
         )
     gzip_stream = _stream(format_name="xml", compression="gzip", record_path="provider")
     with pytest.raises(CaptureError, match="entity declarations"):
-        list(iter_records(_capture(gzip.compress(entity_payload), gzip_stream), gzip_stream))
+        list(
+            iter_records(
+                _capture(gzip.compress(entity_payload), gzip_stream), gzip_stream
+            )
+        )
     encoded_entity_payload = entity_payload.decode().encode("utf-16")
     with pytest.raises(CaptureError, match="valid UTF-8"):
         list(iter_records(_capture(encoded_entity_payload, stream), stream))
@@ -327,11 +357,17 @@ def test_xml_decoder_rejects_nested_or_unexpected_record_shapes():
     """Only flat records named by the direct-child selector can enter a stream."""
 
     stream = _stream(format_name="xml", record_path="provider")
-    nested_payload = b"<providers><provider><npi><value>123</value></npi></provider></providers>"
+    nested_payload = (
+        b"<providers><provider><npi><value>123</value></npi></provider></providers>"
+    )
     with pytest.raises(CaptureError, match="flat scalar"):
         list(iter_records(_capture(nested_payload, stream), stream))
     with pytest.raises(CaptureError, match="unexpected root child"):
-        list(iter_records(_capture(b"<providers><metadata /></providers>", stream), stream))
+        list(
+            iter_records(
+                _capture(b"<providers><metadata /></providers>", stream), stream
+            )
+        )
 
 
 def test_xml_record_annotation_can_be_resolved_under_python_314():
@@ -349,7 +385,13 @@ def test_decoder_limits_records_and_parquet_metadata_limits():
     limits = CaptureLimits(maximum_records=1)
     payload = json.dumps([{"npi": "1234567893"}, {"npi": "1003000126"}]).encode()
     with pytest.raises(CaptureError, match="record limit"):
-        list(iter_records(_capture(payload, json_stream, limits=limits), json_stream, limits=limits))
+        list(
+            iter_records(
+                _capture(payload, json_stream, limits=limits),
+                json_stream,
+                limits=limits,
+            )
+        )
 
     parquet_stream = _stream(format_name="parquet")
     parquet_payload = _parquet_payload({"npi": ["1234567893", "1003000126"]})
@@ -447,10 +489,17 @@ def test_parquet_decoder_rejects_duplicate_source_labels_without_collapsing_colu
 def test_parquet_decoder_supports_gzip_and_rejects_invalid_envelopes():
     """Random-access Parquet uses a bounded seekable replay buffer and fixed errors."""
 
-    payload = _parquet_payload({"Synthetic Source Label": ["retained only in test payload"]})
+    payload = _parquet_payload(
+        {"Synthetic Source Label": ["retained only in test payload"]}
+    )
     gzip_stream = _stream(format_name="parquet", compression="gzip")
-    gzip_records = list(iter_records(_capture(gzip.compress(payload), gzip_stream), gzip_stream))
-    assert gzip_records[0].values["Synthetic Source Label"] == "retained only in test payload"
+    gzip_records = list(
+        iter_records(_capture(gzip.compress(payload), gzip_stream), gzip_stream)
+    )
+    assert (
+        gzip_records[0].values["Synthetic Source Label"]
+        == "retained only in test payload"
+    )
 
     stream = _stream(format_name="parquet")
     invalid_envelope = b"BAD!" + payload[4:]
@@ -522,7 +571,9 @@ def test_parquet_metadata_preflight_rejects_external_references_and_excess_group
 
         @staticmethod
         def row_group(_index: int) -> None:
-            raise AssertionError("row groups must not be inspected after the fanout limit")
+            raise AssertionError(
+                "row groups must not be inspected after the fanout limit"
+            )
 
     limits = CaptureLimits()
     with pytest.raises(CaptureError, match="external file"):
@@ -558,7 +609,9 @@ def test_parquet_decoder_enforces_record_and_logical_byte_limits():
         {"source_value": ["x" * 500 for _ in range(16)]},
         use_dictionary=False,
     )
-    logical_limits = CaptureLimits(maximum_record_bytes=1024, maximum_decoded_bytes=2048)
+    logical_limits = CaptureLimits(
+        maximum_record_bytes=1024, maximum_decoded_bytes=2048
+    )
     with pytest.raises(CaptureError, match="decoded-byte"):
         list(
             iter_records(
@@ -574,9 +627,15 @@ def test_capture_rejects_unsafe_snapshot_tokens_and_nonbinary_sources():
 
     stream = _stream()
     with pytest.raises(CaptureError, match="control characters"):
-        capture_stream(BytesIO(b"Provider ID\n1234567893\n"), stream, source_snapshot_token="bad\n")
+        capture_stream(
+            BytesIO(b"Provider ID\n1234567893\n"), stream, source_snapshot_token="bad\n"
+        )
     with pytest.raises(CaptureError, match="valid UTF-8"):
-        capture_stream(BytesIO(b"Provider ID\n1234567893\n"), stream, source_snapshot_token="\ud800")
+        capture_stream(
+            BytesIO(b"Provider ID\n1234567893\n"),
+            stream,
+            source_snapshot_token="\ud800",
+        )
 
     class TextSource:
         """Minimal invalid source used to exercise binary transport enforcement."""

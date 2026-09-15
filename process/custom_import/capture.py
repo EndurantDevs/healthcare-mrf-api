@@ -10,28 +10,27 @@ labels intact for the later declarative mapping stage.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass
-from decimal import Decimal
 import codecs
 import csv
 import gzip
 import hashlib
-from io import BytesIO, TextIOWrapper
 import json
 import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from decimal import Decimal
+from io import BytesIO, TextIOWrapper
 from types import MappingProxyType
 from typing import Any, BinaryIO
-import xml.etree.ElementTree as ElementTree
+from xml.etree import ElementTree
 
-from ijson import common as ijson_common
-from ijson.backends import python as ijson_python
 import pyarrow as pa
 import pyarrow.parquet as pq
+from ijson import common as ijson_common
+from ijson.backends import python as ijson_python
 
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
-
 
 _DEFAULT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_SNAPSHOT_TOKEN_BYTES = 1024
@@ -75,6 +74,9 @@ class CaptureLimits:
                 raise ValueError(f"{name} must be a positive integer")
         if self.maximum_decoded_bytes < self.maximum_record_bytes:
             raise ValueError("maximum_decoded_bytes must cover one complete record")
+
+
+_DEFAULT_CAPTURE_LIMITS = CaptureLimits()
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,7 @@ def capture_stream(
     source_stream: SourceStream,
     *,
     source_snapshot_token: str,
-    limits: CaptureLimits = CaptureLimits(),
+    limits: CaptureLimits = _DEFAULT_CAPTURE_LIMITS,
 ) -> SealedCapture:
     """Read, bound, hash, and seal a source stream without interpreting fields."""
 
@@ -171,7 +173,7 @@ def verify_capture(
     capture: SealedCapture,
     stream: SourceStream,
     *,
-    limits: CaptureLimits = CaptureLimits(),
+    limits: CaptureLimits = _DEFAULT_CAPTURE_LIMITS,
 ) -> None:
     """Verify that a replay payload still matches its stream and sealed manifest."""
 
@@ -182,7 +184,9 @@ def verify_capture(
         or manifest.compression != stream.compression
         or manifest.stream_sha256 != _source_stream_sha256(stream)
     ):
-        raise CaptureError("capture manifest does not belong to the declared source stream")
+        raise CaptureError(
+            "capture manifest does not belong to the declared source stream"
+        )
     token = _validated_snapshot_token(manifest.source_snapshot_token)
     if not isinstance(capture.payload, bytes):
         raise CaptureError("sealed capture payload must be bytes")
@@ -191,16 +195,24 @@ def verify_capture(
     compressed_sha256 = hashlib.sha256(capture.payload).hexdigest()
     if compressed_sha256 != manifest.compressed_sha256:
         raise CaptureError("capture payload digest does not match the sealed manifest")
-    decoded_bytes, decoded_sha256 = _decoded_metrics(capture.payload, stream.compression, limits)
-    if decoded_bytes != manifest.decoded_bytes or decoded_sha256 != manifest.decoded_sha256:
+    decoded_bytes, decoded_sha256 = _decoded_metrics(
+        capture.payload, stream.compression, limits
+    )
+    if (
+        decoded_bytes != manifest.decoded_bytes
+        or decoded_sha256 != manifest.decoded_sha256
+    ):
         raise CaptureError("decoded capture digest does not match the sealed manifest")
-    if _capture_sha256(
-        stream=stream,
-        source_snapshot_token=token,
-        stream_sha256=manifest.stream_sha256,
-        compressed_sha256=compressed_sha256,
-        decoded_sha256=decoded_sha256,
-    ) != manifest.capture_sha256:
+    if (
+        _capture_sha256(
+            stream=stream,
+            source_snapshot_token=token,
+            stream_sha256=manifest.stream_sha256,
+            compressed_sha256=compressed_sha256,
+            decoded_sha256=decoded_sha256,
+        )
+        != manifest.capture_sha256
+    ):
         raise CaptureError("capture manifest digest does not match its provenance")
 
 
@@ -208,7 +220,7 @@ def iter_records(
     capture: SealedCapture,
     stream: SourceStream,
     *,
-    limits: CaptureLimits = CaptureLimits(),
+    limits: CaptureLimits = _DEFAULT_CAPTURE_LIMITS,
 ) -> Iterator[DecodedRecord]:
     """Yield validated source-label records from a verified sealed capture."""
 
@@ -265,7 +277,9 @@ def _read_source_payload(source: BinaryIO, limits: CaptureLimits) -> bytes:
         chunks.append(chunk)
 
 
-def _decoded_metrics(payload: bytes, compression: str, limits: CaptureLimits) -> tuple[int, str]:
+def _decoded_metrics(
+    payload: bytes, compression: str, limits: CaptureLimits
+) -> tuple[int, str]:
     """Measure and hash decoded content without retaining a second payload copy."""
 
     digest = hashlib.sha256()
@@ -314,18 +328,10 @@ def _capture_sha256(
 ) -> str:
     """Bind source identity, snapshot, and both payload forms into one digest."""
 
-    material = "\x00".join(
-        (
-            CONTRACT_VERSION,
-            "capture",
-            stream.stream_id,
-            stream.format,
-            stream.compression,
-            source_snapshot_token,
-            stream_sha256,
-            compressed_sha256,
-            decoded_sha256,
-        )
+    material = (
+        f"{CONTRACT_VERSION}\x00capture\x00{stream.stream_id}\x00{stream.format}\x00"
+        f"{stream.compression}\x00{source_snapshot_token}\x00{stream_sha256}\x00"
+        f"{compressed_sha256}\x00{decoded_sha256}"
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -369,10 +375,12 @@ def _iter_delimited_records(
     """Decode a headered CSV or TSV source one row at a time."""
 
     try:
-        with _open_decoded_payload(payload, stream.compression) as binary:
-            with TextIOWrapper(binary, encoding="utf-8", newline="") as text:
-                delimiter = "," if stream.format == "csv" else "\t"
-                yield from _iter_delimited_text_records(text, delimiter, limits)
+        with (
+            _open_decoded_payload(payload, stream.compression) as binary,
+            TextIOWrapper(binary, encoding="utf-8", newline="") as text,
+        ):
+            delimiter = "," if stream.format == "csv" else "\t"
+            yield from _iter_delimited_text_records(text, delimiter, limits)
     except (UnicodeDecodeError, csv.Error) as exc:
         raise CaptureError("delimited source payload is invalid") from exc
 
@@ -389,8 +397,12 @@ def _iter_delimited_text_records(
         source_labels = _validated_headers(next(reader, None), limits)
         for ordinal, row in enumerate(reader, start=1):
             if len(row) != len(source_labels):
-                raise CaptureError(f"record {ordinal} field count does not match its header")
-            yield _decoded_record(ordinal, dict(zip(source_labels, row, strict=True)), limits)
+                raise CaptureError(
+                    f"record {ordinal} field count does not match its header"
+                )
+            yield _decoded_record(
+                ordinal, dict(zip(source_labels, row, strict=True)), limits
+            )
 
 
 @contextmanager
@@ -405,7 +417,9 @@ def _csv_field_limit(limit: int) -> Iterator[None]:
             csv.field_size_limit(previous)
 
 
-def _validated_headers(headers: list[str] | None, limits: CaptureLimits) -> tuple[str, ...]:
+def _validated_headers(
+    headers: list[str] | None, limits: CaptureLimits
+) -> tuple[str, ...]:
     """Require unique non-empty source labels before rows are emitted."""
 
     if not headers:
@@ -429,7 +443,9 @@ def _iter_json_records(
     try:
         with _open_decoded_payload(payload, stream.compression) as binary:
             for ordinal, record in enumerate(
-                ijson_python.items(binary, "item", map_type=_DuplicateKeyDict, use_float=False),
+                ijson_python.items(
+                    binary, "item", map_type=_DuplicateKeyDict, use_float=False
+                ),
                 start=1,
             ):
                 yield _decoded_record(ordinal, record, limits)
@@ -513,9 +529,11 @@ def _iter_xml_records(
     if _has_forbidden_xml_declaration(captured_bytes, stream.compression, limits):
         raise CaptureError("XML source payload cannot contain entity declarations")
     try:
-        with _open_decoded_payload(captured_bytes, stream.compression) as binary:
-            with TextIOWrapper(binary, encoding="utf-8") as text:
-                yield from _iter_xml_text_records(text, record_tag, limits)
+        with (
+            _open_decoded_payload(captured_bytes, stream.compression) as binary,
+            TextIOWrapper(binary, encoding="utf-8") as text,
+        ):
+            yield from _iter_xml_text_records(text, record_tag, limits)
     except (ElementTree.ParseError, UnicodeDecodeError) as exc:
         raise CaptureError("XML source payload is invalid") from exc
 
@@ -569,7 +587,9 @@ def _open_parquet_reader(
             memory_map=False,
             buffer_size=0,
             pre_buffer=False,
-            thrift_string_size_limit=min(_MAX_PARQUET_FOOTER_BYTES, limits.maximum_decoded_bytes),
+            thrift_string_size_limit=min(
+                _MAX_PARQUET_FOOTER_BYTES, limits.maximum_decoded_bytes
+            ),
             thrift_container_size_limit=_MAX_PARQUET_THRIFT_CONTAINER_ITEMS,
             page_checksum_verification=True,
             arrow_extensions_enabled=False,
@@ -607,10 +627,14 @@ def _iter_parquet_batch_records(
             raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
         for row_index in range(record_batch.num_rows):
             if emitted_record_count >= expected_record_count:
-                raise CaptureError("Parquet source payload has inconsistent row metadata")
+                raise CaptureError(
+                    "Parquet source payload has inconsistent row metadata"
+                )
             emitted_record_count += 1
             scalar_values_by_label = {
-                source_labels[column_index]: record_batch.column(column_index)[row_index].as_py()
+                source_labels[column_index]: record_batch.column(column_index)[
+                    row_index
+                ].as_py()
                 for column_index in range(record_batch.num_columns)
             }
             yield _decoded_record(emitted_record_count, scalar_values_by_label, limits)
@@ -644,7 +668,9 @@ def _bounded_parquet_payload(
     try:
         with _open_decoded_payload(captured_bytes, compression) as decoded:
             while offset < expected_decoded_bytes:
-                chunk = decoded.read(min(limits.read_chunk_bytes, expected_decoded_bytes - offset))
+                chunk = decoded.read(
+                    min(limits.read_chunk_bytes, expected_decoded_bytes - offset)
+                )
                 if not chunk:
                     break
                 decoded_bytes[offset : offset + len(chunk)] = chunk
@@ -734,21 +760,29 @@ def _validated_parquet_metadata(
         group_record_count = _nonnegative_parquet_integer(row_group.num_rows)
         group_column_count = _nonnegative_parquet_integer(row_group.num_columns)
         if group_column_count != expected_columns:
-            raise CaptureError("Parquet source payload has inconsistent column metadata")
+            raise CaptureError(
+                "Parquet source payload has inconsistent column metadata"
+            )
         row_group_records += group_record_count
         if row_group_records > limits.maximum_records:
             raise CaptureError("Parquet source payload exceeds the record limit")
         for column_index in range(group_column_count):
             column = row_group.column(column_index)
             if column.file_path not in (None, ""):
-                raise CaptureError("Parquet source payload cannot reference an external file")
+                raise CaptureError(
+                    "Parquet source payload cannot reference an external file"
+                )
             if _nonnegative_parquet_integer(column.num_values) != group_record_count:
-                raise CaptureError("Parquet source payload has inconsistent row metadata")
+                raise CaptureError(
+                    "Parquet source payload has inconsistent row metadata"
+                )
             declared_uncompressed_bytes += _nonnegative_parquet_integer(
                 column.total_uncompressed_size
             )
             if declared_uncompressed_bytes > limits.maximum_decoded_bytes:
-                raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+                raise CaptureError(
+                    "Parquet source payload exceeds the decoded-byte limit"
+                )
     if row_group_records != record_count:
         raise CaptureError("Parquet source payload has inconsistent row metadata")
     return record_count
@@ -768,7 +802,10 @@ def _validate_parquet_batch_schema(
 ) -> None:
     """Ensure batch columns remain positional matches for the validated source schema."""
 
-    if batch.num_columns != len(source_labels) or tuple(batch.schema.names) != source_labels:
+    if (
+        batch.num_columns != len(source_labels)
+        or tuple(batch.schema.names) != source_labels
+    ):
         raise CaptureError("Parquet source payload has an inconsistent batch schema")
 
 
@@ -960,7 +997,9 @@ def _validated_scalar(value: Any, ordinal: int) -> Scalar:
         return value
     if value is None or isinstance(value, (int, Decimal, bool)):
         return value
-    raise CaptureError(f"record {ordinal} contains a nested or unsupported scalar value")
+    raise CaptureError(
+        f"record {ordinal} contains a nested or unsupported scalar value"
+    )
 
 
 def _record_size(record: Mapping[str, Scalar]) -> int:
