@@ -2,7 +2,7 @@
 """Track the exact serving revision of the six-table NPI result family.
 
 Revision ID: 20260914120000_npi_result_generation
-Revises: 20260911100000_hospital_price_tall_notes
+Revises: 20260914120000_custom_import_v1_schema
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "20260914120000_npi_result_generation"
-down_revision = "20260911100000_hospital_price_tall_notes"
+down_revision = "20260914120000_custom_import_v1_schema"
 branch_labels = None
 depends_on = None
 
