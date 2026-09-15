@@ -20,15 +20,11 @@ from db.models import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
 
 
 def _migration():
-    spec = importlib.util.spec_from_file_location(
-        "custom_import_v1_migration", MIGRATION_PATH
-    )
+    spec = importlib.util.spec_from_file_location("custom_import_v1_migration", MIGRATION_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -37,9 +33,7 @@ def _migration():
 
 def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync():
     assert CustomImportDataset.__runtime_schema_sync__ is False
-    assert isinstance(
-        CustomImportSchemaRevision.__table__.c.canonical_schema.type, sa.Text
-    )
+    assert isinstance(CustomImportSchemaRevision.__table__.c.canonical_schema.type, sa.Text)
     assert CustomImportSchemaRevision.__table__.c.schema_sha256.type.length == 32
     assert CustomImportField.__table__.c.projection_slot.nullable is False
     assert CustomImportSourceStream.__table__.c.record_path.nullable is True
@@ -82,10 +76,7 @@ def test_models_keep_schema_identity_distinct_from_definition_and_runtime_sync()
         foreign_key.name: tuple(element.parent.name for element in foreign_key.elements)
         for foreign_key in CustomImportRootScalar.__table__.foreign_key_constraints
     }
-    assert (
-        foreign_key_columns_by_name["custom_import_root_scalar_field_fkey"][-1]
-        == "projection_slot"
-    )
+    assert foreign_key_columns_by_name["custom_import_root_scalar_field_fkey"][-1] == "projection_slot"
 
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):
@@ -100,18 +91,12 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     normalized = "\n".join(" ".join(statement.split()) for statement in statements)
     schema = migration._quote(migration._schema())
     assert migration.down_revision == "20260911100000_hospital_price_tall_notes"
-    assert all(
-        f"CREATE TABLE {schema}.{name}" in normalized for name in migration._TABLE_NAMES
-    )
+    assert all(f"CREATE TABLE {schema}.{name}" in normalized for name in migration._TABLE_NAMES)
     assert "INSERT INTO" not in normalized
     assert "guard_custom_import_immutable_row" in normalized
-    assert (
-        "base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL" in normalized
-    )
+    assert "base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL" in normalized
     assert "event_kind = 'no_change' AND from_generation_id IS NOT NULL" in normalized
-    assert normalized.count("BEFORE UPDATE OR DELETE") == len(
-        migration._IMMUTABLE_TABLES
-    )
+    assert normalized.count("BEFORE UPDATE OR DELETE") == len(migration._IMMUTABLE_TABLES)
     assert len(migration._TABLE_DDL) == len(migration._TABLE_NAMES)
     assert all("mrf." in statement for statement in migration._TABLE_DDL)
     index_ddl = "\n".join(migration._INDEX_DDL)
@@ -120,19 +105,13 @@ def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch)
     assert "custom_import_entity_binding_lookup_idx" not in index_ddl
     assert "custom_import_winner_lookup_idx" in index_ddl
     source_stream_statement = next(
-        statement
-        for statement in migration._TABLE_DDL
-        if "custom_import_source_stream" in statement
+        statement for statement in migration._TABLE_DDL if "custom_import_source_stream" in statement
     )
     assert "record_path VARCHAR(63)" in source_stream_statement
     assert "decoder = 'xml' AND record_path IS NOT NULL" in source_stream_statement
     assert "decoder <> 'xml' AND record_path IS NULL" in source_stream_statement
-    function_statement = next(
-        statement for statement in statements if "CREATE FUNCTION" in statement
-    )
-    revoke_statement = next(
-        statement for statement in statements if "REVOKE ALL ON FUNCTION" in statement
-    )
+    function_statement = next(statement for statement in statements if "CREATE FUNCTION" in statement)
+    revoke_statement = next(statement for statement in statements if "REVOKE ALL ON FUNCTION" in statement)
     assert "REVOKE ALL ON FUNCTION" not in function_statement
     assert "CREATE FUNCTION" not in revoke_statement
 
@@ -152,17 +131,13 @@ def test_migration_downgrade_removes_only_v1_relations_in_reverse_dependency_ord
     schema = migration._quote(migration._schema())
     assert statements[0] == (f'DROP TABLE IF EXISTS {schema}."custom_import_winner"')
     assert statements[-2] == (f'DROP TABLE IF EXISTS {schema}."custom_import_dataset"')
-    assert statements[-1] == (
-        f"DROP FUNCTION IF EXISTS {schema}.guard_custom_import_immutable_row()"
-    )
+    assert statements[-1] == (f"DROP FUNCTION IF EXISTS {schema}.guard_custom_import_immutable_row()")
     assert len(statements) == len(migration._TABLE_CREATION_ORDER) + 1
 
 
 def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch):
     metadata = sa.MetaData()
-    table = sa.Table(
-        "custom_import_dataset", metadata, sa.Column("dataset_id", sa.BigInteger)
-    )
+    table = sa.Table("custom_import_dataset", metadata, sa.Column("dataset_id", sa.BigInteger))
     calls: list[str] = []
 
     class Inspector:
@@ -190,9 +165,7 @@ def test_runtime_sync_skips_migration_owned_table_before_inspection(monkeypatch)
         )
     }
 
-    maintenance._sync_structure(
-        None, sync_results_by_kind, add_columns=True, add_indexes=True
-    )
+    maintenance._sync_structure(None, sync_results_by_kind, add_columns=True, add_indexes=True)
 
     assert calls == []
     assert all(not result_values for result_values in sync_results_by_kind.values())

@@ -29,9 +29,7 @@ MAX_SELECTION_TERMS = 3
 MAX_ORDER_TERMS = 3
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
-_FIELD_TYPES = frozenset(
-    {"string", "integer", "decimal", "boolean", "date", "timestamp"}
-)
+_FIELD_TYPES = frozenset({"string", "integer", "decimal", "boolean", "date", "timestamp"})
 _FORMATS = frozenset({"csv", "tsv", "json", "ndjson", "xml", "parquet"})
 _COMPRESSIONS = frozenset({"none", "gzip"})
 _DIRECTIONS = frozenset({"asc", "desc"})
@@ -137,9 +135,7 @@ def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return object_by_key
 
 
-def _validate_wire_value(
-    value: Any, *, depth: int = 0, nodes: list[int] | None = None
-) -> Any:
+def _validate_wire_value(value: Any, *, depth: int = 0, nodes: list[int] | None = None) -> Any:
     if nodes is None:
         nodes = [0]
     nodes[0] += 1
@@ -150,16 +146,11 @@ def _validate_wire_value(
     if isinstance(value, float):
         raise DefinitionError("definitions cannot contain floating-point values")
     if isinstance(value, list):
-        return [
-            _validate_wire_value(item, depth=depth + 1, nodes=nodes) for item in value
-        ]
+        return [_validate_wire_value(item, depth=depth + 1, nodes=nodes) for item in value]
     if isinstance(value, dict):
         if not all(isinstance(key, str) for key in value):
             raise DefinitionError("definition object keys must be strings")
-        return {
-            key: _validate_wire_value(item, depth=depth + 1, nodes=nodes)
-            for key, item in value.items()
-        }
+        return {key: _validate_wire_value(item, depth=depth + 1, nodes=nodes) for key, item in value.items()}
     raise DefinitionError("definitions must contain JSON-compatible values only")
 
 
@@ -378,23 +369,15 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
     root_schema, root_fields, root_logical_key, entity_field = _parse_root(
         _required(schema, "root", "definition.schema")
     )
-    child_collections, child_fields = _parse_children(
-        schema.get("children", []), root_fields, root_logical_key
-    )
+    child_collections, child_fields = _parse_children(schema.get("children", []), root_fields, root_logical_key)
     _validate_field_identity(root_fields, child_fields)
     source_streams = _parse_streams(
         _required(definition, "streams", "definition"),
         {collection.name for collection in child_collections},
     )
-    aliases = _parse_aliases(
-        definition.get("aliases", {}), source_streams, root_fields, child_fields
-    )
-    query = _parse_query(
-        definition.get("query", {}), root_fields, child_fields, child_collections
-    )
-    selection_profiles = _parse_profiles(
-        definition.get("selection_profiles", []), query, (*root_fields, *child_fields)
-    )
+    aliases = _parse_aliases(definition.get("aliases", {}), source_streams, root_fields, child_fields)
+    query = _parse_query(definition.get("query", {}), root_fields, child_fields, child_collections)
+    selection_profiles = _parse_profiles(definition.get("selection_profiles", []), query, (*root_fields, *child_fields))
     schema_by_scope = {"root": root_schema, "children": schema.get("children", [])}
     return CustomImportDefinition(
         definition_revision=definition_revision,
@@ -445,9 +428,7 @@ def _parse_refresh_mode(definition: Mapping[str, Any]) -> str:
 def _parse_root(
     root_value: Any,
 ) -> tuple[Mapping[str, Any], tuple[Field, ...], tuple[str, ...], str]:
-    root_schema = _mapping(
-        root_value, "definition.schema.root", keys={"logical_key", "entity", "fields"}
-    )
+    root_schema = _mapping(root_value, "definition.schema.root", keys={"logical_key", "entity", "fields"})
     root_fields = _parse_fields(
         _required(root_schema, "fields", "definition.schema.root"),
         "definition.schema.root.fields",
@@ -460,18 +441,12 @@ def _parse_root(
             "definition.schema.root.logical_key",
         )
     )
-    if not logical_key_field_ids or len(logical_key_field_ids) != len(
-        set(logical_key_field_ids)
-    ):
-        raise DefinitionError(
-            "definition.schema.root.logical_key must be a non-empty unique array"
-        )
+    if not logical_key_field_ids or len(logical_key_field_ids) != len(set(logical_key_field_ids)):
+        raise DefinitionError("definition.schema.root.logical_key must be a non-empty unique array")
     for field_id in logical_key_field_ids:
         field = root_fields_by_id.get(field_id)
         if field is None or field.nullable:
-            raise DefinitionError(
-                "root logical-key fields must be declared required root fields"
-            )
+            raise DefinitionError("root logical-key fields must be declared required root fields")
     entity_mapping = _mapping(
         _required(root_schema, "entity", "definition.schema.root"),
         "definition.schema.root.entity",
@@ -514,9 +489,7 @@ def _parse_children(
         )
         child_collections.append(child_collection)
         child_field_definitions.extend(collection_fields)
-    if len({collection.name for collection in child_collections}) != len(
-        child_collections
-    ):
+    if len({collection.name for collection in child_collections}) != len(child_collections):
         raise DefinitionError("child collection names must be unique")
     return tuple(child_collections), tuple(child_field_definitions)
 
@@ -527,12 +500,8 @@ def _parse_child_collection(
     root_fields_by_id: Mapping[str, Field],
     root_key_field_ids: tuple[str, ...],
 ) -> tuple[ChildCollection, tuple[Field, ...]]:
-    child_mapping = _mapping(
-        child_definition_value, path, keys={"name", "parent_key", "child_key", "fields"}
-    )
-    collection_name = _identifier(
-        _required(child_mapping, "name", path), f"{path}.name"
-    )
+    child_mapping = _mapping(child_definition_value, path, keys={"name", "parent_key", "child_key", "fields"})
+    collection_name = _identifier(_required(child_mapping, "name", path), f"{path}.name")
     collection_fields = _parse_fields(
         _required(child_mapping, "fields", path),
         f"{path}.fields",
@@ -564,28 +533,16 @@ def _parse_parent_key(
     root_fields_by_id: Mapping[str, Field],
     root_key_field_ids: tuple[str, ...],
 ) -> tuple[KeyPart, ...]:
-    parent_key_definitions = _array(
-        _required(child_mapping, "parent_key", path), f"{path}.parent_key"
-    )
+    parent_key_definitions = _array(_required(child_mapping, "parent_key", path), f"{path}.parent_key")
     parent_key_parts: list[KeyPart] = []
     for ordinal, pair_definition_value in enumerate(parent_key_definitions):
         pair_path = f"{path}.parent_key[{ordinal}]"
-        pair_mapping = _mapping(
-            pair_definition_value, pair_path, keys={"child", "root"}
-        )
-        child_field_id = _identifier(
-            _required(pair_mapping, "child", pair_path), f"{pair_path}.child"
-        )
-        root_field_id = _identifier(
-            _required(pair_mapping, "root", pair_path), f"{pair_path}.root"
-        )
-        expected_root_field_id = (
-            root_key_field_ids[ordinal] if ordinal < len(root_key_field_ids) else None
-        )
+        pair_mapping = _mapping(pair_definition_value, pair_path, keys={"child", "root"})
+        child_field_id = _identifier(_required(pair_mapping, "child", pair_path), f"{pair_path}.child")
+        root_field_id = _identifier(_required(pair_mapping, "root", pair_path), f"{pair_path}.root")
+        expected_root_field_id = root_key_field_ids[ordinal] if ordinal < len(root_key_field_ids) else None
         if root_field_id != expected_root_field_id:
-            raise DefinitionError(
-                "child parent_key must preserve root logical-key order"
-            )
+            raise DefinitionError("child parent_key must preserve root logical-key order")
         child_field = child_fields_by_id.get(child_field_id)
         root_field = root_fields_by_id.get(root_field_id)
         if (
@@ -594,16 +551,10 @@ def _parse_parent_key(
             or child_field.nullable
             or child_field.value_type != root_field.value_type
         ):
-            raise DefinitionError(
-                "child parent keys must be required and type-compatible"
-            )
-        parent_key_parts.append(
-            KeyPart(child_field=child_field_id, root_field=root_field_id)
-        )
+            raise DefinitionError("child parent keys must be required and type-compatible")
+        parent_key_parts.append(KeyPart(child_field=child_field_id, root_field=root_field_id))
     if len(parent_key_parts) != len(root_key_field_ids):
-        raise DefinitionError(
-            "child parent_key must cover the complete root logical key"
-        )
+        raise DefinitionError("child parent_key must cover the complete root logical key")
     return tuple(parent_key_parts)
 
 
@@ -612,9 +563,7 @@ def _parse_child_key(
 ) -> tuple[str, ...]:
     child_key_field_ids = tuple(
         _identifier(field_id, f"{path}.child_key")
-        for field_id in _array(
-            _required(child_mapping, "child_key", path), f"{path}.child_key"
-        )
+        for field_id in _array(_required(child_mapping, "child_key", path), f"{path}.child_key")
     )
     if (
         not child_key_field_ids
@@ -623,16 +572,13 @@ def _parse_child_key(
     ):
         raise DefinitionError("child_key must contain one to three unique fields")
     if any(
-        field_id not in child_fields_by_id or child_fields_by_id[field_id].nullable
-        for field_id in child_key_field_ids
+        field_id not in child_fields_by_id or child_fields_by_id[field_id].nullable for field_id in child_key_field_ids
     ):
         raise DefinitionError("child-key fields must be declared required child fields")
     return child_key_field_ids
 
 
-def _parse_fields(
-    raw: Any, path: str, *, collection: str | None = None
-) -> tuple[Field, ...]:
+def _parse_fields(raw: Any, path: str, *, collection: str | None = None) -> tuple[Field, ...]:
     fields: list[Field] = []
     for ordinal, raw_field in enumerate(_array(raw, path)):
         item_path = f"{path}[{ordinal}]"
@@ -649,14 +595,10 @@ def _parse_fields(
             raise DefinitionError(f"{item_path}.nullable must be a boolean")
         projection = field.get("projection_slot")
         if projection is not None:
-            projection = _integer(
-                projection, f"{item_path}.projection_slot", minimum=1, maximum=20
-            )
+            projection = _integer(projection, f"{item_path}.projection_slot", minimum=1, maximum=20)
         fields.append(
             Field(
-                field_id=_identifier(
-                    _required(field, "id", item_path), f"{item_path}.id"
-                ),
+                field_id=_identifier(_required(field, "id", item_path), f"{item_path}.id"),
                 field_slot=_integer(
                     _required(field, "slot", item_path),
                     f"{item_path}.slot",
@@ -672,17 +614,13 @@ def _parse_fields(
     return tuple(fields)
 
 
-def _validate_field_identity(
-    root_fields: tuple[Field, ...], child_fields: tuple[Field, ...]
-) -> None:
+def _validate_field_identity(root_fields: tuple[Field, ...], child_fields: tuple[Field, ...]) -> None:
     fields = (*root_fields, *child_fields)
     if not root_fields:
         raise DefinitionError("schema.root.fields must not be empty")
     ids = [field.field_id for field in fields]
     slots = [field.field_slot for field in fields]
-    projections = [
-        field.projection_slot for field in fields if field.projection_slot is not None
-    ]
+    projections = [field.projection_slot for field in fields if field.projection_slot is not None]
     if len(ids) != len(set(ids)) or len(slots) != len(set(slots)):
         raise DefinitionError("field ids and stable field slots must be unique")
     if len(projections) != len(set(projections)) or len(projections) > MAX_HOT_FIELDS:
@@ -700,9 +638,7 @@ def _parse_streams(raw: Any, child_names: set[str]) -> tuple[SourceStream, ...]:
     return streams
 
 
-def _source_stream_from_mapping(
-    raw_stream: Any, ordinal: int, child_names: set[str]
-) -> SourceStream:
+def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[str]) -> SourceStream:
     """Parse one declared root or child stream and validate its local shape."""
 
     path = f"definition.streams[{ordinal}]"
@@ -731,29 +667,21 @@ def _source_stream_from_mapping(
         child_collection=child,
         format=format_name,
         compression=compression,
-        snapshot_token=_identifier(
-            _required(stream, "snapshot_token", path), f"{path}.snapshot_token"
-        ),
+        snapshot_token=_identifier(_required(stream, "snapshot_token", path), f"{path}.snapshot_token"),
     )
 
 
-def _validate_stream_coverage(
-    streams: tuple[SourceStream, ...], child_names: set[str]
-) -> None:
+def _validate_stream_coverage(streams: tuple[SourceStream, ...], child_names: set[str]) -> None:
     """Require one root stream and exactly one stream for each child collection."""
 
     root_streams = [stream for stream in streams if stream.record_kind == "root"]
-    child_collection_names = [
-        stream.child_collection for stream in streams if stream.record_kind == "child"
-    ]
+    child_collection_names = [stream.child_collection for stream in streams if stream.record_kind == "child"]
     if (
         len(root_streams) != 1
         or set(child_collection_names) != child_names
         or len(child_collection_names) != len(child_names)
     ):
-        raise DefinitionError(
-            "v1 requires exactly one root stream and one stream per child collection"
-        )
+        raise DefinitionError("v1 requires exactly one root stream and one stream per child collection")
 
 
 def _parse_aliases(
@@ -762,9 +690,7 @@ def _parse_aliases(
     root_fields: tuple[Field, ...],
     child_fields: tuple[Field, ...],
 ) -> tuple[FieldAlias, ...]:
-    aliases = _mapping(
-        raw, "definition.aliases", keys={stream.stream_id for stream in streams}
-    )
+    aliases = _mapping(raw, "definition.aliases", keys={stream.stream_id for stream in streams})
     root_ids = {field.field_id for field in root_fields}
     field_ids_by_child_collection = {field.collection: set() for field in child_fields}
     for field in child_fields:
@@ -773,14 +699,8 @@ def _parse_aliases(
     for stream in streams:
         labels = aliases.get(stream.stream_id, {})
         if not isinstance(labels, Mapping):
-            raise DefinitionError(
-                f"definition.aliases.{stream.stream_id} must be an object"
-            )
-        permitted = (
-            root_ids
-            if stream.record_kind == "root"
-            else field_ids_by_child_collection[stream.child_collection]
-        )
+            raise DefinitionError(f"definition.aliases.{stream.stream_id} must be an object")
+        permitted = root_ids if stream.record_kind == "root" else field_ids_by_child_collection[stream.child_collection]
         for label, field_id in labels.items():
             if (
                 not isinstance(label, str)
@@ -789,17 +709,11 @@ def _parse_aliases(
                 or any(ord(char) < 32 or ord(char) == 127 for char in label)
             ):
                 raise DefinitionError("source aliases must be bounded printable text")
-            field_id = _identifier(
-                field_id, f"definition.aliases.{stream.stream_id}.{label}"
-            )
+            field_id = _identifier(field_id, f"definition.aliases.{stream.stream_id}.{label}")
             if field_id not in permitted:
-                raise DefinitionError(
-                    "a source alias must target a field in its stream scope"
-                )
+                raise DefinitionError("a source alias must target a field in its stream scope")
             parsed_aliases.append(FieldAlias(stream.stream_id, label, field_id))
-    return tuple(
-        sorted(parsed_aliases, key=lambda alias: (alias.stream_id, alias.source_label))
-    )
+    return tuple(sorted(parsed_aliases, key=lambda alias: (alias.stream_id, alias.source_label)))
 
 
 def _parse_query(
@@ -809,30 +723,22 @@ def _parse_query(
     children: tuple[ChildCollection, ...],
 ) -> QueryContract:
     query = _mapping(raw, "definition.query", keys={"root_fields", "child", "order"})
-    root_ids = {
-        field.field_id for field in root_fields if field.projection_slot is not None
-    }
+    root_ids = {field.field_id for field in root_fields if field.projection_slot is not None}
     child_by_collection: dict[str, set[str]] = {}
     for field in child_fields:
         if field.projection_slot is not None:
             child_by_collection.setdefault(field.collection, set()).add(field.field_id)
     root_query_fields = tuple(
         _identifier(field_id, "definition.query.root_fields")
-        for field_id in _array(
-            query.get("root_fields", []), "definition.query.root_fields"
-        )
+        for field_id in _array(query.get("root_fields", []), "definition.query.root_fields")
     )
-    if len(root_query_fields) != len(set(root_query_fields)) or not set(
-        root_query_fields
-    ).issubset(root_ids):
+    if len(root_query_fields) != len(set(root_query_fields)) or not set(root_query_fields).issubset(root_ids):
         raise DefinitionError("query root fields must be unique projected root fields")
     raw_child = query.get("child")
     child_collection: str | None = None
     query_child_fields: tuple[str, ...] = ()
     if raw_child is not None:
-        child = _mapping(
-            raw_child, "definition.query.child", keys={"collection", "fields"}
-        )
+        child = _mapping(raw_child, "definition.query.child", keys={"collection", "fields"})
         child_collection = _identifier(
             _required(child, "collection", "definition.query.child"),
             "definition.query.child.collection",
@@ -846,37 +752,27 @@ def _parse_query(
                 "definition.query.child.fields",
             )
         )
-        if len(query_child_fields) != len(set(query_child_fields)) or not set(
-            query_child_fields
-        ).issubset(child_by_collection.get(child_collection, set())):
-            raise DefinitionError(
-                "query child fields must be unique projected fields in one collection"
-            )
-    order = _parse_sort_terms(
-        query.get("order", []), "definition.query.order", maximum=MAX_ORDER_TERMS
-    )
+        if len(query_child_fields) != len(set(query_child_fields)) or not set(query_child_fields).issubset(
+            child_by_collection.get(child_collection, set())
+        ):
+            raise DefinitionError("query child fields must be unique projected fields in one collection")
+    order = _parse_sort_terms(query.get("order", []), "definition.query.order", maximum=MAX_ORDER_TERMS)
     permitted = set(root_query_fields) | set(query_child_fields)
     if any(term.field_id not in permitted for term in order):
         raise DefinitionError("query order terms must use permitted query fields")
     return QueryContract(root_query_fields, child_collection, query_child_fields, order)
 
 
-def _parse_profiles(
-    raw: Any, query: QueryContract, fields: tuple[Field, ...]
-) -> tuple[SelectionProfile, ...]:
+def _parse_profiles(raw: Any, query: QueryContract, fields: tuple[Field, ...]) -> tuple[SelectionProfile, ...]:
     profile_definitions = _array(raw, "definition.selection_profiles")
     if len(profile_definitions) > MAX_SELECTION_PROFILES:
         raise DefinitionError("selection profile count exceeds v1 limit")
-    projected_field_ids = {
-        field.field_id for field in fields if field.projection_slot is not None
-    }
+    projected_field_ids = {field.field_id for field in fields if field.projection_slot is not None}
     permitted = set(query.root_fields) | set(query.child_fields)
     profiles: list[SelectionProfile] = []
     for ordinal, raw_profile in enumerate(profile_definitions):
         path = f"definition.selection_profiles[{ordinal}]"
-        profile = _mapping(
-            raw_profile, path, keys={"id", "selection", "context_dimensions"}
-        )
+        profile = _mapping(raw_profile, path, keys={"id", "selection", "context_dimensions"})
         terms = _parse_sort_terms(
             _required(profile, "selection", path),
             f"{path}.selection",
@@ -884,23 +780,13 @@ def _parse_profiles(
         )
         dimensions = tuple(
             _identifier(field_id, f"{path}.context_dimensions")
-            for field_id in _array(
-                profile.get("context_dimensions", []), f"{path}.context_dimensions"
-            )
+            for field_id in _array(profile.get("context_dimensions", []), f"{path}.context_dimensions")
         )
-        if len(dimensions) > MAX_CONTEXT_DIMENSIONS or len(dimensions) != len(
-            set(dimensions)
-        ):
-            raise DefinitionError(
-                "profile context dimensions must contain at most two unique fields"
-            )
+        if len(dimensions) > MAX_CONTEXT_DIMENSIONS or len(dimensions) != len(set(dimensions)):
+            raise DefinitionError("profile context dimensions must contain at most two unique fields")
         references = {term.field_id for term in terms} | set(dimensions)
-        if not references.issubset(projected_field_ids) or not references.issubset(
-            permitted
-        ):
-            raise DefinitionError(
-                "profile fields must be projected and use the one permitted query context"
-            )
+        if not references.issubset(projected_field_ids) or not references.issubset(permitted):
+            raise DefinitionError("profile fields must be projected and use the one permitted query context")
         profiles.append(
             SelectionProfile(
                 profile_id=_identifier(_required(profile, "id", path), f"{path}.id"),
@@ -927,9 +813,7 @@ def _parse_sort_terms(raw: Any, path: str, *, maximum: int) -> tuple[SortTerm, .
             raise DefinitionError(f"{term_path} has invalid direction or null ordering")
         terms.append(
             SortTerm(
-                field_id=_identifier(
-                    _required(term, "field", term_path), f"{term_path}.field"
-                ),
+                field_id=_identifier(_required(term, "field", term_path), f"{term_path}.field"),
                 direction=direction,
                 nulls=nulls,
             )
@@ -939,29 +823,15 @@ def _parse_sort_terms(raw: Any, path: str, *, maximum: int) -> tuple[SortTerm, .
     return tuple(terms)
 
 
-def _validate_revision_transition(
-    previous: CustomImportDefinition, current: CustomImportDefinition
-) -> None:
+def _validate_revision_transition(previous: CustomImportDefinition, current: CustomImportDefinition) -> None:
     if current.definition_revision <= previous.definition_revision:
         raise DefinitionError("definition revision must increase")
-    if (
-        current.schema_digest != previous.schema_digest
-        and current.schema_revision <= previous.schema_revision
-    ):
-        raise DefinitionError(
-            "schema/key/type/relationship changes require a new schema revision"
-        )
-    if (
-        current.schema_digest == previous.schema_digest
-        and current.schema_revision != previous.schema_revision
-    ):
+    if current.schema_digest != previous.schema_digest and current.schema_revision <= previous.schema_revision:
+        raise DefinitionError("schema/key/type/relationship changes require a new schema revision")
+    if current.schema_digest == previous.schema_digest and current.schema_revision != previous.schema_revision:
         raise DefinitionError("unchanged schema must retain its schema revision")
-    field_id_by_previous_slot = {
-        field.field_slot: field.field_id for field in previous.fields
-    }
-    field_id_by_current_slot = {
-        field.field_slot: field.field_id for field in current.fields
-    }
+    field_id_by_previous_slot = {field.field_slot: field.field_id for field in previous.fields}
+    field_id_by_current_slot = {field.field_slot: field.field_id for field in current.fields}
     if any(
         field_id_by_current_slot.get(slot) not in {None, field_id}
         for slot, field_id in field_id_by_previous_slot.items()
