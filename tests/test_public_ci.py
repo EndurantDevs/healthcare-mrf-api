@@ -26,6 +26,7 @@ JOB_LABELS = {
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
 }
+PRIVILEGED_JOB_IDS = {"dev-image-publication", "artifact-cleanup"}
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
         {"shard": str(index), "label": f"Python tests ({index + 1}/4)", "output": f"artifact_{index}"}
@@ -87,7 +88,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["permissions"] == {
         "contents": "read", "pull-requests": "read", "actions": "read",
     }
-    assert set(workflow["jobs"]) == set(JOB_LABELS)
+    assert set(workflow["jobs"]) == set(JOB_LABELS) | PRIVILEGED_JOB_IDS
     revision = workflow["env"]["CI_REVISION"]
     assert re.fullmatch(r"[0-9a-f]{40}", revision)
     assert set(revision) != {"0"}
@@ -96,11 +97,18 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+            + " && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' "
+            "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' && !(" + METADATA_ONLY + ") }}",
     }
-    for job_id, job in workflow["jobs"].items():
+    assert {
+        job_id
+        for job_id, job in workflow["jobs"].items()
+        if any(permission == "write" for permission in job.get("permissions", {}).values())
+    } == PRIVILEGED_JOB_IDS
+    for job_id in JOB_LABELS:
+        job = workflow["jobs"][job_id]
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
@@ -112,6 +120,33 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         assert not job.get("continue-on-error")
         assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
+
+    publication = workflow["jobs"]["dev-image-publication"]
+    assert publication["name"] == "${{ " + METADATA_ONLY + " && 'DEV image publication (metadata only)' || 'DEV image publication' }}"
+    assert publication["runs-on"] == "ubuntu-latest"
+    assert publication["timeout-minutes"] == 30
+    assert publication["needs"] == ["smoke", "source-validation"]
+    assert publication["if"] == "${{ !(" + METADATA_ONLY + ") && (success()) }}"
+    assert publication["permissions"] == {
+        "contents": "read", "pull-requests": "read", "actions": "read", "packages": "write",
+    }
+    assert publication["env"] == {"CI_REVISION": revision, "PYTHONDONTWRITEBYTECODE": "1"}
+    _assert_job_actions("dev-image-publication", publication, revision)
+
+    cleanup = workflow["jobs"]["artifact-cleanup"]
+    assert cleanup["name"] == "${{ " + METADATA_ONLY + " && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}"
+    assert cleanup["runs-on"] == "ubuntu-latest"
+    assert cleanup["timeout-minutes"] == 10
+    assert cleanup["needs"] == ["dev-image-publication"]
+    assert cleanup["if"] == "${{ !(" + METADATA_ONLY + ") && (always()) }}"
+    assert cleanup["permissions"] == {"contents": "read", "actions": "write"}
+    _assert_job_actions("artifact-cleanup", cleanup, revision)
+
+    # Publication is post-validation, while cleanup is limited to its terminal artifact role.
+    assert workflow["jobs"]["source-validation"]["needs"] == ["measurement"]
+    assert [step["run"] for step in cleanup["steps"] if "run" in step] == [
+        "python3 ci/scripts/artifact_cleanup.py"
+    ]
     job = workflow["jobs"]["smoke"]
     assert job["runs-on"] == "ubuntu-latest"
     assert "container" not in job
