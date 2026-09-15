@@ -11,14 +11,28 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date
-from sqlalchemy import ForeignKey, ForeignKeyConstraint, Integer, LargeBinary
-from sqlalchemy import Numeric, PrimaryKeyConstraint, SmallInteger, String
-from sqlalchemy import TIMESTAMP, Text, UniqueConstraint, text
+from sqlalchemy import (
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Integer,
+    LargeBinary,
+    Numeric,
+    PrimaryKeyConstraint,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
-
 
 __all__ = (
     "CustomImportCapture",
@@ -41,6 +55,7 @@ __all__ = (
     "CustomImportLease",
     "CustomImportPack",
     "CustomImportPublicationEvent",
+    "CustomImportRejection",
     "CustomImportRootRecord",
     "CustomImportRootRevision",
     "CustomImportRootScalar",
@@ -48,7 +63,6 @@ __all__ = (
     "CustomImportSelectionProfile",
     "CustomImportSourceStream",
     "CustomImportWinner",
-    "CustomImportRejection",
 )
 
 
@@ -102,7 +116,11 @@ def _scalar_check(name: str, *, root: bool = False) -> CheckConstraint:
         "string_value IS NULL AND integer_value IS NULL AND decimal_value IS NULL AND "
         "boolean_value IS NULL AND date_value IS NULL AND timestamp_value IS NULL"
     )
-    scope = "field_collection_slot = 0 AND " if root else "field_collection_slot = collection_slot AND "
+    scope = (
+        "field_collection_slot = 0 AND "
+        if root
+        else "field_collection_slot = collection_slot AND "
+    )
     return CheckConstraint(
         scope
         + "projection_slot > 0 AND value_state IN ('value', 'null') AND ((value_state = 'value' AND "
@@ -146,10 +164,20 @@ class CustomImportSchemaRevision(_CustomImportModel):
     __tablename__ = "custom_import_schema_revision"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("schema_revision_id", name="custom_import_schema_rev_pkey"),
-        UniqueConstraint("dataset_id", "revision_number", name="custom_import_schema_rev_number_key"),
-        UniqueConstraint("dataset_id", "schema_sha256", name="custom_import_schema_rev_hash_key"),
-        UniqueConstraint("schema_revision_id", "dataset_id", name="custom_import_schema_rev_owner_key"),
+        PrimaryKeyConstraint(
+            "schema_revision_id", name="custom_import_schema_rev_pkey"
+        ),
+        UniqueConstraint(
+            "dataset_id", "revision_number", name="custom_import_schema_rev_number_key"
+        ),
+        UniqueConstraint(
+            "dataset_id", "schema_sha256", name="custom_import_schema_rev_hash_key"
+        ),
+        UniqueConstraint(
+            "schema_revision_id",
+            "dataset_id",
+            name="custom_import_schema_rev_owner_key",
+        ),
         CheckConstraint(
             "revision_number > 0 AND " + _sha256_check("schema_sha256"),
             name="custom_import_schema_rev_shape_check",
@@ -159,7 +187,9 @@ class CustomImportSchemaRevision(_CustomImportModel):
     schema_revision_id = Column(BigInteger, primary_key=True, autoincrement=True)
     dataset_id = Column(
         BigInteger,
-        ForeignKey(_reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"),
+        ForeignKey(
+            _reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"
+        ),
         nullable=False,
     )
     revision_number = Column(Integer, nullable=False)
@@ -174,8 +204,12 @@ class CustomImportFieldSlot(_CustomImportModel):
     __tablename__ = "custom_import_field_slot"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("dataset_id", "field_slot", name="custom_import_field_slot_pkey"),
-        UniqueConstraint("dataset_id", "field_id", name="custom_import_field_slot_id_key"),
+        PrimaryKeyConstraint(
+            "dataset_id", "field_slot", name="custom_import_field_slot_pkey"
+        ),
+        UniqueConstraint(
+            "dataset_id", "field_id", name="custom_import_field_slot_id_key"
+        ),
         CheckConstraint(
             "field_slot > 0 AND field_slot < 32768 AND "
             "field_id ~ '^[a-z][a-z0-9_]{0,62}$'",
@@ -185,7 +219,9 @@ class CustomImportFieldSlot(_CustomImportModel):
 
     dataset_id = Column(
         BigInteger,
-        ForeignKey(_reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"),
+        ForeignKey(
+            _reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"
+        ),
         primary_key=True,
     )
     field_slot = Column(SmallInteger, primary_key=True)
@@ -200,13 +236,19 @@ class CustomImportChildCollection(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "schema_revision_id", "collection_slot", name="custom_import_child_collection_pkey"
+            "schema_revision_id",
+            "collection_slot",
+            name="custom_import_child_collection_pkey",
         ),
         UniqueConstraint(
-            "schema_revision_id", "collection_name", name="custom_import_child_collection_name_key"
+            "schema_revision_id",
+            "collection_name",
+            name="custom_import_child_collection_name_key",
         ),
         UniqueConstraint(
-            "schema_revision_id", "dataset_id", "collection_slot",
+            "schema_revision_id",
+            "dataset_id",
+            "collection_slot",
             name="custom_import_child_collection_owner_key",
         ),
         ForeignKeyConstraint(
@@ -219,8 +261,7 @@ class CustomImportChildCollection(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "collection_slot > 0 AND "
-            "collection_name ~ '^[a-z][a-z0-9_]{0,62}$'",
+            "collection_slot > 0 AND collection_name ~ '^[a-z][a-z0-9_]{0,62}$'",
             name="custom_import_child_collection_shape_check",
         ),
     )
@@ -240,17 +281,27 @@ class CustomImportField(_CustomImportModel):
     __tablename__ = "custom_import_field"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("schema_revision_id", "field_slot", name="custom_import_field_pkey"),
+        PrimaryKeyConstraint(
+            "schema_revision_id", "field_slot", name="custom_import_field_pkey"
+        ),
         UniqueConstraint(
-            "schema_revision_id", "collection_slot", "field_name",
+            "schema_revision_id",
+            "collection_slot",
+            "field_name",
             name="custom_import_field_name_key",
         ),
         UniqueConstraint(
-            "schema_revision_id", "dataset_id", "field_slot",
+            "schema_revision_id",
+            "dataset_id",
+            "field_slot",
             name="custom_import_field_owner_key",
         ),
         UniqueConstraint(
-            "schema_revision_id", "dataset_id", "field_slot", "field_type", "collection_slot",
+            "schema_revision_id",
+            "dataset_id",
+            "field_slot",
+            "field_type",
+            "collection_slot",
             "projection_slot",
             name="custom_import_field_projection_owner_key",
         ),
@@ -298,15 +349,23 @@ class CustomImportDefinitionRevision(_CustomImportModel):
     __tablename__ = "custom_import_definition_revision"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("definition_revision_id", name="custom_import_definition_rev_pkey"),
-        UniqueConstraint(
-            "dataset_id", "revision_number", name="custom_import_definition_rev_number_key"
+        PrimaryKeyConstraint(
+            "definition_revision_id", name="custom_import_definition_rev_pkey"
         ),
         UniqueConstraint(
-            "dataset_id", "definition_sha256", name="custom_import_definition_rev_hash_key"
+            "dataset_id",
+            "revision_number",
+            name="custom_import_definition_rev_number_key",
         ),
         UniqueConstraint(
-            "definition_revision_id", "dataset_id", "schema_revision_id",
+            "dataset_id",
+            "definition_sha256",
+            name="custom_import_definition_rev_hash_key",
+        ),
+        UniqueConstraint(
+            "definition_revision_id",
+            "dataset_id",
+            "schema_revision_id",
             name="custom_import_definition_rev_owner_key",
         ),
         ForeignKeyConstraint(
@@ -320,7 +379,8 @@ class CustomImportDefinitionRevision(_CustomImportModel):
         ),
         CheckConstraint(
             "contract_version = 'custom-import/v1' AND revision_number > 0 AND "
-            "refresh_mode IN ('upsert', 'snapshot') AND " + _sha256_check("definition_sha256"),
+            "refresh_mode IN ('upsert', 'snapshot') AND "
+            + _sha256_check("definition_sha256"),
             name="custom_import_definition_rev_shape_check",
         ),
     )
@@ -343,19 +403,28 @@ class CustomImportSourceStream(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "definition_revision_id", "stream_slot", name="custom_import_source_stream_pkey"
+            "definition_revision_id",
+            "stream_slot",
+            name="custom_import_source_stream_pkey",
         ),
         UniqueConstraint(
-            "definition_revision_id", "stream_id", name="custom_import_source_stream_id_key"
+            "definition_revision_id",
+            "stream_id",
+            name="custom_import_source_stream_id_key",
         ),
         UniqueConstraint(
-            "definition_revision_id", "dataset_id", "schema_revision_id", "stream_slot",
+            "definition_revision_id",
+            "dataset_id",
+            "schema_revision_id",
+            "stream_slot",
             name="custom_import_source_stream_owner_key",
         ),
         ForeignKeyConstraint(
             ["definition_revision_id", "dataset_id", "schema_revision_id"],
             [
-                _reference("custom_import_definition_revision", "definition_revision_id"),
+                _reference(
+                    "custom_import_definition_revision", "definition_revision_id"
+                ),
                 _reference("custom_import_definition_revision", "dataset_id"),
                 _reference("custom_import_definition_revision", "schema_revision_id"),
             ],
@@ -411,11 +480,18 @@ class CustomImportFieldAlias(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "definition_revision_id", "stream_slot", "alias_name",
+            "definition_revision_id",
+            "stream_slot",
+            "alias_name",
             name="custom_import_field_alias_pkey",
         ),
         ForeignKeyConstraint(
-            ["definition_revision_id", "dataset_id", "schema_revision_id", "stream_slot"],
+            [
+                "definition_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "stream_slot",
+            ],
             [
                 _reference("custom_import_source_stream", "definition_revision_id"),
                 _reference("custom_import_source_stream", "dataset_id"),
@@ -458,19 +534,28 @@ class CustomImportSelectionProfile(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "definition_revision_id", "profile_slot", name="custom_import_selection_profile_pkey"
+            "definition_revision_id",
+            "profile_slot",
+            name="custom_import_selection_profile_pkey",
         ),
         UniqueConstraint(
-            "definition_revision_id", "profile_id", name="custom_import_selection_profile_id_key"
+            "definition_revision_id",
+            "profile_id",
+            name="custom_import_selection_profile_id_key",
         ),
         UniqueConstraint(
-            "definition_revision_id", "dataset_id", "schema_revision_id", "profile_slot",
+            "definition_revision_id",
+            "dataset_id",
+            "schema_revision_id",
+            "profile_slot",
             name="custom_import_selection_profile_owner_key",
         ),
         ForeignKeyConstraint(
             ["definition_revision_id", "dataset_id", "schema_revision_id"],
             [
-                _reference("custom_import_definition_revision", "definition_revision_id"),
+                _reference(
+                    "custom_import_definition_revision", "definition_revision_id"
+                ),
                 _reference("custom_import_definition_revision", "dataset_id"),
                 _reference("custom_import_definition_revision", "schema_revision_id"),
             ],
@@ -489,7 +574,8 @@ class CustomImportSelectionProfile(_CustomImportModel):
         ),
         CheckConstraint(
             "profile_slot > 0 AND profile_slot <= 4 AND "
-            "profile_id ~ '^[a-z][a-z0-9_]{0,62}$' AND " + _sha256_check("profile_sha256"),
+            "profile_id ~ '^[a-z][a-z0-9_]{0,62}$' AND "
+            + _sha256_check("profile_sha256"),
             name="custom_import_selection_profile_shape_check",
         ),
     )
@@ -513,20 +599,31 @@ class CustomImportExecution(_CustomImportModel):
     __table_args__ = _table_args(
         PrimaryKeyConstraint("execution_id", name="custom_import_execution_pkey"),
         UniqueConstraint(
-            "definition_revision_id", "idempotency_key", name="custom_import_execution_request_key"
+            "definition_revision_id",
+            "idempotency_key",
+            name="custom_import_execution_request_key",
         ),
         UniqueConstraint(
-            "execution_id", "dataset_id", "definition_revision_id", "schema_revision_id",
+            "execution_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
             name="custom_import_execution_owner_key",
         ),
         UniqueConstraint(
-            "execution_id", "dataset_id", "definition_revision_id", "schema_revision_id", "capture_bundle_id",
+            "execution_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            "capture_bundle_id",
             name="custom_import_execution_bundle_key",
         ),
         ForeignKeyConstraint(
             ["definition_revision_id", "dataset_id", "schema_revision_id"],
             [
-                _reference("custom_import_definition_revision", "definition_revision_id"),
+                _reference(
+                    "custom_import_definition_revision", "definition_revision_id"
+                ),
                 _reference("custom_import_definition_revision", "dataset_id"),
                 _reference("custom_import_definition_revision", "schema_revision_id"),
             ],
@@ -534,7 +631,12 @@ class CustomImportExecution(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["capture_bundle_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "capture_bundle_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_capture_bundle", "capture_bundle_id"),
                 _reference("custom_import_capture_bundle", "dataset_id"),
@@ -575,14 +677,18 @@ class CustomImportLease(_CustomImportModel):
         PrimaryKeyConstraint("execution_id", name="custom_import_lease_pkey"),
         CheckConstraint(
             "fence >= 0 AND ((fence = 0 AND token_sha256 IS NULL AND expires_at IS NULL) "
-            "OR (fence > 0 AND " + _sha256_check("token_sha256") + " AND expires_at IS NOT NULL))",
+            "OR (fence > 0 AND "
+            + _sha256_check("token_sha256")
+            + " AND expires_at IS NOT NULL))",
             name="custom_import_lease_shape_check",
         ),
     )
 
     execution_id = Column(
         BigInteger,
-        ForeignKey(_reference("custom_import_execution", "execution_id"), ondelete="CASCADE"),
+        ForeignKey(
+            _reference("custom_import_execution", "execution_id"), ondelete="CASCADE"
+        ),
         primary_key=True,
     )
     fence = Column(BigInteger, nullable=False, server_default=text("0"))
@@ -598,15 +704,22 @@ class CustomImportCaptureBundle(_CustomImportModel):
     __tablename__ = "custom_import_capture_bundle"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("capture_bundle_id", name="custom_import_capture_bundle_pkey"),
+        PrimaryKeyConstraint(
+            "capture_bundle_id", name="custom_import_capture_bundle_pkey"
+        ),
         UniqueConstraint(
-            "capture_bundle_id", "dataset_id", "definition_revision_id", "schema_revision_id",
+            "capture_bundle_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
             name="custom_import_capture_bundle_owner_key",
         ),
         ForeignKeyConstraint(
             ["definition_revision_id", "dataset_id", "schema_revision_id"],
             [
-                _reference("custom_import_definition_revision", "definition_revision_id"),
+                _reference(
+                    "custom_import_definition_revision", "definition_revision_id"
+                ),
                 _reference("custom_import_definition_revision", "dataset_id"),
                 _reference("custom_import_definition_revision", "schema_revision_id"),
             ],
@@ -644,11 +757,18 @@ class CustomImportCapture(_CustomImportModel):
             "capture_bundle_id", "stream_slot", name="custom_import_capture_pkey"
         ),
         UniqueConstraint(
-            "capture_bundle_id", "definition_revision_id", "stream_slot",
+            "capture_bundle_id",
+            "definition_revision_id",
+            "stream_slot",
             name="custom_import_capture_owner_key",
         ),
         ForeignKeyConstraint(
-            ["capture_bundle_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "capture_bundle_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_capture_bundle", "capture_bundle_id"),
                 _reference("custom_import_capture_bundle", "dataset_id"),
@@ -659,7 +779,12 @@ class CustomImportCapture(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["definition_revision_id", "dataset_id", "schema_revision_id", "stream_slot"],
+            [
+                "definition_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "stream_slot",
+            ],
             [
                 _reference("custom_import_source_stream", "definition_revision_id"),
                 _reference("custom_import_source_stream", "dataset_id"),
@@ -670,7 +795,9 @@ class CustomImportCapture(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "byte_count >= 0 AND " + _sha256_check("content_sha256") + " AND "
+            "byte_count >= 0 AND "
+            + _sha256_check("content_sha256")
+            + " AND "
             + _sha256_check("manifest_sha256"),
             name="custom_import_capture_shape_check",
         ),
@@ -696,14 +823,25 @@ class CustomImportPack(_CustomImportModel):
     __table_args__ = _table_args(
         PrimaryKeyConstraint("pack_id", name="custom_import_pack_pkey"),
         UniqueConstraint(
-            "execution_id", "stream_slot", "pack_ordinal", name="custom_import_pack_execution_key"
+            "execution_id",
+            "stream_slot",
+            "pack_ordinal",
+            name="custom_import_pack_execution_key",
         ),
         UniqueConstraint(
-            "pack_id", "dataset_id", "definition_revision_id", "schema_revision_id",
+            "pack_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
             name="custom_import_pack_owner_key",
         ),
         ForeignKeyConstraint(
-            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_execution", "execution_id"),
                 _reference("custom_import_execution", "dataset_id"),
@@ -714,7 +852,13 @@ class CustomImportPack(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id", "capture_bundle_id"],
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "capture_bundle_id",
+            ],
             [
                 _reference("custom_import_execution", "execution_id"),
                 _reference("custom_import_execution", "dataset_id"),
@@ -736,7 +880,8 @@ class CustomImportPack(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "pack_ordinal >= 0 AND record_count >= 0 AND " + _sha256_check("pack_sha256"),
+            "pack_ordinal >= 0 AND record_count >= 0 AND "
+            + _sha256_check("pack_sha256"),
             name="custom_import_pack_shape_check",
         ),
     )
@@ -760,9 +905,16 @@ class CustomImportRejection(_CustomImportModel):
     __tablename__ = "custom_import_rejection"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("execution_id", "rejection_ordinal", name="custom_import_rejection_pkey"),
+        PrimaryKeyConstraint(
+            "execution_id", "rejection_ordinal", name="custom_import_rejection_pkey"
+        ),
         ForeignKeyConstraint(
-            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_execution", "execution_id"),
                 _reference("custom_import_execution", "dataset_id"),
@@ -815,14 +967,18 @@ class CustomImportRootRecord(_CustomImportModel):
     __table_args__ = _table_args(
         PrimaryKeyConstraint("root_record_id", name="custom_import_root_record_pkey"),
         UniqueConstraint(
-            "dataset_id", "key_contract_sha256", "logical_key_sha256",
+            "dataset_id",
+            "key_contract_sha256",
+            "logical_key_sha256",
             name="custom_import_root_record_key",
         ),
         UniqueConstraint(
             "root_record_id", "dataset_id", name="custom_import_root_record_owner_key"
         ),
         CheckConstraint(
-            _sha256_check("key_contract_sha256") + " AND " + _sha256_check("logical_key_sha256"),
+            _sha256_check("key_contract_sha256")
+            + " AND "
+            + _sha256_check("logical_key_sha256"),
             name="custom_import_root_record_shape_check",
         ),
     )
@@ -830,7 +986,9 @@ class CustomImportRootRecord(_CustomImportModel):
     root_record_id = Column(BigInteger, primary_key=True, autoincrement=True)
     dataset_id = Column(
         BigInteger,
-        ForeignKey(_reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"),
+        ForeignKey(
+            _reference("custom_import_dataset", "dataset_id"), ondelete="RESTRICT"
+        ),
         nullable=False,
     )
     key_contract_sha256 = Column(LargeBinary(32), nullable=False)
@@ -845,9 +1003,14 @@ class CustomImportRootRevision(_CustomImportModel):
     __tablename__ = "custom_import_root_revision"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("root_revision_id", name="custom_import_root_revision_pkey"),
+        PrimaryKeyConstraint(
+            "root_revision_id", name="custom_import_root_revision_pkey"
+        ),
         UniqueConstraint(
-            "root_revision_id", "dataset_id", "schema_revision_id", "root_record_id",
+            "root_revision_id",
+            "dataset_id",
+            "schema_revision_id",
+            "root_record_id",
             name="custom_import_root_revision_owner_key",
         ),
         ForeignKeyConstraint(
@@ -903,9 +1066,15 @@ class CustomImportChildRevision(_CustomImportModel):
     __tablename__ = "custom_import_child_revision"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("child_revision_id", name="custom_import_child_revision_pkey"),
+        PrimaryKeyConstraint(
+            "child_revision_id", name="custom_import_child_revision_pkey"
+        ),
         UniqueConstraint(
-            "child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot",
+            "child_revision_id",
+            "dataset_id",
+            "schema_revision_id",
+            "root_record_id",
+            "collection_slot",
             name="custom_import_child_revision_owner_key",
         ),
         ForeignKeyConstraint(
@@ -939,8 +1108,12 @@ class CustomImportChildRevision(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "source_ordinal >= 0 AND " + _sha256_check("parent_key_sha256") + " AND "
-            + _sha256_check("child_key_sha256") + " AND " + _sha256_check("payload_sha256"),
+            "source_ordinal >= 0 AND "
+            + _sha256_check("parent_key_sha256")
+            + " AND "
+            + _sha256_check("child_key_sha256")
+            + " AND "
+            + _sha256_check("payload_sha256"),
             name="custom_import_child_revision_shape_check",
         ),
     )
@@ -968,17 +1141,26 @@ class CustomImportFamilyRevision(_CustomImportModel):
     __tablename__ = "custom_import_family_revision"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("family_revision_id", name="custom_import_family_revision_pkey"),
+        PrimaryKeyConstraint(
+            "family_revision_id", name="custom_import_family_revision_pkey"
+        ),
         UniqueConstraint(
-            "dataset_id", "schema_revision_id", "root_record_id", "family_sha256",
+            "dataset_id",
+            "schema_revision_id",
+            "root_record_id",
+            "family_sha256",
             name="custom_import_family_revision_content_key",
         ),
         UniqueConstraint(
-            "family_revision_id", "dataset_id", "schema_revision_id", "root_record_id",
+            "family_revision_id",
+            "dataset_id",
+            "schema_revision_id",
+            "root_record_id",
             name="custom_import_family_revision_owner_key",
         ),
         UniqueConstraint(
-            "family_revision_id", "entity_binding_id",
+            "family_revision_id",
+            "entity_binding_id",
             name="custom_import_family_revision_entity_key",
         ),
         ForeignKeyConstraint(
@@ -1025,11 +1207,18 @@ class CustomImportFamilyChild(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "family_revision_id", "collection_slot", "child_revision_id",
+            "family_revision_id",
+            "collection_slot",
+            "child_revision_id",
             name="custom_import_family_child_pkey",
         ),
         ForeignKeyConstraint(
-            ["family_revision_id", "dataset_id", "schema_revision_id", "root_record_id"],
+            [
+                "family_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "root_record_id",
+            ],
             [
                 _reference("custom_import_family_revision", "family_revision_id"),
                 _reference("custom_import_family_revision", "dataset_id"),
@@ -1040,7 +1229,13 @@ class CustomImportFamilyChild(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"],
+            [
+                "child_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "root_record_id",
+                "collection_slot",
+            ],
             [
                 _reference("custom_import_child_revision", "child_revision_id"),
                 _reference("custom_import_child_revision", "dataset_id"),
@@ -1069,18 +1264,29 @@ class CustomImportGeneration(_CustomImportModel):
     __table_args__ = _table_args(
         PrimaryKeyConstraint("generation_id", name="custom_import_generation_pkey"),
         UniqueConstraint(
-            "dataset_id", "generation_sha256", name="custom_import_generation_content_key"
+            "dataset_id",
+            "generation_sha256",
+            name="custom_import_generation_content_key",
         ),
         UniqueConstraint("execution_id", name="custom_import_generation_execution_key"),
         UniqueConstraint(
             "generation_id", "dataset_id", name="custom_import_generation_dataset_key"
         ),
         UniqueConstraint(
-            "generation_id", "dataset_id", "definition_revision_id", "schema_revision_id",
+            "generation_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
             name="custom_import_generation_owner_key",
         ),
         ForeignKeyConstraint(
-            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id", "capture_bundle_id"],
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "capture_bundle_id",
+            ],
             [
                 _reference("custom_import_execution", "execution_id"),
                 _reference("custom_import_execution", "dataset_id"),
@@ -1101,8 +1307,11 @@ class CustomImportGeneration(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "root_count >= 0 AND family_count >= 0 AND " + _sha256_check("source_bundle_sha256")
-            + " AND " + _sha256_check("generation_sha256") + " AND "
+            "root_count >= 0 AND family_count >= 0 AND "
+            + _sha256_check("source_bundle_sha256")
+            + " AND "
+            + _sha256_check("generation_sha256")
+            + " AND "
             "((base_generation_id IS NULL AND base_dataset_id IS NULL) OR "
             "(base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL AND "
             "base_dataset_id = dataset_id))",
@@ -1131,13 +1340,24 @@ class CustomImportGenerationFamily(_CustomImportModel):
     __tablename__ = "custom_import_generation_family"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("generation_id", "root_record_id", name="custom_import_generation_family_pkey"),
+        PrimaryKeyConstraint(
+            "generation_id",
+            "root_record_id",
+            name="custom_import_generation_family_pkey",
+        ),
         UniqueConstraint(
-            "generation_id", "dataset_id", "family_revision_id",
+            "generation_id",
+            "dataset_id",
+            "family_revision_id",
             name="custom_import_generation_family_member_key",
         ),
         ForeignKeyConstraint(
-            ["generation_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_generation", "generation_id"),
                 _reference("custom_import_generation", "dataset_id"),
@@ -1148,7 +1368,12 @@ class CustomImportGenerationFamily(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["family_revision_id", "dataset_id", "schema_revision_id", "root_record_id"],
+            [
+                "family_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "root_record_id",
+            ],
             [
                 _reference("custom_import_family_revision", "family_revision_id"),
                 _reference("custom_import_family_revision", "dataset_id"),
@@ -1174,7 +1399,9 @@ class CustomImportRootScalar(_CustomImportModel):
     __tablename__ = "custom_import_root_scalar"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("root_revision_id", "field_slot", name="custom_import_root_scalar_pkey"),
+        PrimaryKeyConstraint(
+            "root_revision_id", "field_slot", name="custom_import_root_scalar_pkey"
+        ),
         ForeignKeyConstraint(
             ["root_revision_id", "dataset_id", "schema_revision_id", "root_record_id"],
             [
@@ -1188,8 +1415,12 @@ class CustomImportRootScalar(_CustomImportModel):
         ),
         ForeignKeyConstraint(
             [
-                "schema_revision_id", "dataset_id", "field_slot", "field_type",
-                "field_collection_slot", "projection_slot",
+                "schema_revision_id",
+                "dataset_id",
+                "field_slot",
+                "field_type",
+                "field_collection_slot",
+                "projection_slot",
             ],
             [
                 _reference("custom_import_field", "schema_revision_id"),
@@ -1210,7 +1441,9 @@ class CustomImportRootScalar(_CustomImportModel):
     schema_revision_id = Column(BigInteger, nullable=False)
     root_record_id = Column(BigInteger, nullable=False)
     field_slot = Column(SmallInteger, primary_key=True)
-    field_collection_slot = Column(SmallInteger, nullable=False, server_default=text("0"))
+    field_collection_slot = Column(
+        SmallInteger, nullable=False, server_default=text("0")
+    )
     projection_slot = Column(SmallInteger, nullable=False)
     field_type = Column(String(16), nullable=False)
     value_state = Column(String(8), nullable=False)
@@ -1228,9 +1461,17 @@ class CustomImportChildScalar(_CustomImportModel):
     __tablename__ = "custom_import_child_scalar"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("child_revision_id", "field_slot", name="custom_import_child_scalar_pkey"),
+        PrimaryKeyConstraint(
+            "child_revision_id", "field_slot", name="custom_import_child_scalar_pkey"
+        ),
         ForeignKeyConstraint(
-            ["child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"],
+            [
+                "child_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "root_record_id",
+                "collection_slot",
+            ],
             [
                 _reference("custom_import_child_revision", "child_revision_id"),
                 _reference("custom_import_child_revision", "dataset_id"),
@@ -1243,8 +1484,12 @@ class CustomImportChildScalar(_CustomImportModel):
         ),
         ForeignKeyConstraint(
             [
-                "schema_revision_id", "dataset_id", "field_slot", "field_type",
-                "field_collection_slot", "projection_slot",
+                "schema_revision_id",
+                "dataset_id",
+                "field_slot",
+                "field_type",
+                "field_collection_slot",
+                "projection_slot",
             ],
             [
                 _reference("custom_import_field", "schema_revision_id"),
@@ -1284,13 +1529,19 @@ class CustomImportEntityBinding(_CustomImportModel):
     __tablename__ = "custom_import_entity_binding"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("entity_binding_id", name="custom_import_entity_binding_pkey"),
+        PrimaryKeyConstraint(
+            "entity_binding_id", name="custom_import_entity_binding_pkey"
+        ),
         UniqueConstraint(
-            "dataset_id", "adapter_id", "canonical_value",
+            "dataset_id",
+            "adapter_id",
+            "canonical_value",
             name="custom_import_entity_binding_value_key",
         ),
         UniqueConstraint(
-            "entity_binding_id", "dataset_id", name="custom_import_entity_binding_owner_key"
+            "entity_binding_id",
+            "dataset_id",
+            name="custom_import_entity_binding_owner_key",
         ),
         ForeignKeyConstraint(
             ["dataset_id"],
@@ -1321,11 +1572,19 @@ class CustomImportWinner(_CustomImportModel):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint(
-            "generation_id", "profile_slot", "entity_binding_id", "context_key_sha256",
+            "generation_id",
+            "profile_slot",
+            "entity_binding_id",
+            "context_key_sha256",
             name="custom_import_winner_pkey",
         ),
         ForeignKeyConstraint(
-            ["generation_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_generation", "generation_id"),
                 _reference("custom_import_generation", "dataset_id"),
@@ -1336,7 +1595,12 @@ class CustomImportWinner(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["definition_revision_id", "dataset_id", "schema_revision_id", "profile_slot"],
+            [
+                "definition_revision_id",
+                "dataset_id",
+                "schema_revision_id",
+                "profile_slot",
+            ],
             [
                 _reference("custom_import_selection_profile", "definition_revision_id"),
                 _reference("custom_import_selection_profile", "dataset_id"),
@@ -1375,7 +1639,11 @@ class CustomImportWinner(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["family_revision_id", "context_collection_slot", "context_child_revision_id"],
+            [
+                "family_revision_id",
+                "context_collection_slot",
+                "context_child_revision_id",
+            ],
             [
                 _reference("custom_import_family_child", "family_revision_id"),
                 _reference("custom_import_family_child", "collection_slot"),
@@ -1399,7 +1667,9 @@ class CustomImportWinner(_CustomImportModel):
     profile_slot = Column(SmallInteger, primary_key=True)
     entity_binding_id = Column(BigInteger, primary_key=True)
     family_revision_id = Column(BigInteger, nullable=False)
-    context_collection_slot = Column(SmallInteger, nullable=False, server_default=text("0"))
+    context_collection_slot = Column(
+        SmallInteger, nullable=False, server_default=text("0")
+    )
     context_key_sha256 = Column(LargeBinary(32), primary_key=True)
     context_child_revision_id = Column(BigInteger)
 
@@ -1410,9 +1680,16 @@ class CustomImportCurrentGeneration(_CustomImportModel):
     __tablename__ = "custom_import_current_generation"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("dataset_id", name="custom_import_current_generation_pkey"),
+        PrimaryKeyConstraint(
+            "dataset_id", name="custom_import_current_generation_pkey"
+        ),
         ForeignKeyConstraint(
-            ["generation_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_generation", "generation_id"),
                 _reference("custom_import_generation", "dataset_id"),
@@ -1422,7 +1699,9 @@ class CustomImportCurrentGeneration(_CustomImportModel):
             name="custom_import_current_generation_fkey",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("pointer_version > 0", name="custom_import_current_generation_version_check"),
+        CheckConstraint(
+            "pointer_version > 0", name="custom_import_current_generation_version_check"
+        ),
     )
 
     dataset_id = Column(BigInteger, primary_key=True)
@@ -1439,9 +1718,16 @@ class CustomImportPublicationEvent(_CustomImportModel):
     __tablename__ = "custom_import_publication_event"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("publication_event_id", name="custom_import_publication_event_pkey"),
+        PrimaryKeyConstraint(
+            "publication_event_id", name="custom_import_publication_event_pkey"
+        ),
         ForeignKeyConstraint(
-            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_execution", "execution_id"),
                 _reference("custom_import_execution", "dataset_id"),
@@ -1452,7 +1738,12 @@ class CustomImportPublicationEvent(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["to_generation_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                "to_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
             [
                 _reference("custom_import_generation", "generation_id"),
                 _reference("custom_import_generation", "dataset_id"),
