@@ -451,6 +451,45 @@ async def test_unsafe_responses_fail_once(source_session, response):
 
 
 @pytest.mark.parametrize(
+    "response,reason",
+    [
+        (SourceResponse(_profile_body(name=None)), "new_york_nysed_field_schema_invalid"),
+        (SourceResponse(_profile_body(licenseNumber="000000")), "new_york_nysed_identity_mismatch"),
+    ],
+)
+async def test_malformed_complete_profiles_are_retained_as_invalid_support(source_session, response, reason):
+    session = source_session(response)
+    acquired = await _acquire(session)
+    receipt = _artifact(session, "result.json")
+
+    assert session.closed and len(session.requests) == 1
+    assert acquired["outcome"] == receipt["outcome"] == "invalid"
+    assert acquired["reason"] == receipt["reason"] == reason
+    assert acquired["source_record"] is None and acquired["facts"] == []
+    assert receipt["fact_count"] == 0
+    assert profile.read_invalid_acquisition(session.destination, receipt_sha256=acquired["receipt_sha256"]) == acquired
+
+
+async def test_invalid_support_replay_rejects_a_repinned_valid_profile(source_session):
+    session = source_session(SourceResponse(_profile_body(name=None)))
+    acquired = await _acquire(session)
+    response = _artifact(session, "response.json")
+    body = profile.encoded_json(_profile_body())
+    response.update(
+        body_base64=base64.b64encode(body).decode("ascii"),
+        content_sha256=hashlib.sha256(body).hexdigest(),
+        received_bytes=len(body),
+    )
+    (session.destination / "response.json").write_bytes(profile.encoded_json(response))
+    receipt = _artifact(session, "result.json")
+    receipt["response_sha256"] = profile._hash(response)
+    (session.destination / "result.json").write_bytes(profile.encoded_json(receipt))
+
+    with pytest.raises(ValueError, match="invalid_result_changed"):
+        profile.read_invalid_acquisition(session.destination, receipt_sha256=profile._hash(receipt))
+
+
+@pytest.mark.parametrize(
     "error", [TimeoutError(PUBLIC_HEADER), RuntimeError(PUBLIC_HEADER), asyncio.CancelledError(PUBLIC_HEADER)]
 )
 async def test_partial_failures_preserve_evidence_without_key(source_session, error):

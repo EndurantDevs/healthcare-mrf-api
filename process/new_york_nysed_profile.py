@@ -56,6 +56,17 @@ MONTHS = (
     "November",
     "December",
 )
+INVALID_PROFILE_REASONS = frozenset(
+    {
+        "new_york_nysed_field_schema_invalid",
+        "new_york_nysed_identity_mismatch",
+        "new_york_nysed_name_missing",
+    }
+)
+
+
+class InvalidProfileValue(ValueError):
+    """A complete NYSED payload cannot safely support any profile assertion."""
 
 
 def _require(condition, reason):
@@ -113,19 +124,22 @@ def _validated_profile(body, license_number):
     _require(isinstance(body, bytes) and 0 < len(body) <= MAX_RESPONSE_BYTES, "body_invalid")
     request_descriptor(license_number)
     profile_by_field = decoded_json_object(body)
-    text_by_field = {
-        field: _optional_text(profile_by_field, field, label)
-        if field in OPTIONAL_TEXT_FIELDS
-        else _wrapped_field(profile_by_field, field, label, str)
-        for field, label in TEXT_LABELS.items()
-    }
-    _require(
-        profile_by_field.get("professionCode") == PROFESSION_CODE
-        and text_by_field["profession"] == "Medicine (060)"
-        and text_by_field["licenseNumber"] == license_number,
-        "identity_mismatch",
-    )
-    _require(text_by_field["name"].strip().casefold() not in UNREPORTED, "name_missing")
+    try:
+        text_by_field = {
+            field: _optional_text(profile_by_field, field, label)
+            if field in OPTIONAL_TEXT_FIELDS
+            else _wrapped_field(profile_by_field, field, label, str)
+            for field, label in TEXT_LABELS.items()
+        }
+        _require(
+            profile_by_field.get("professionCode") == PROFESSION_CODE
+            and text_by_field["profession"] == "Medicine (060)"
+            and text_by_field["licenseNumber"] == license_number,
+            "identity_mismatch",
+        )
+        _require(text_by_field["name"].strip().casefold() not in UNREPORTED, "name_missing")
+    except ValueError as error:
+        raise InvalidProfileValue(str(error)) from error
     return profile_by_field, text_by_field
 
 
@@ -367,6 +381,19 @@ def held_acquisition_result(manifest_by_field, response_by_field):
     return {"outcome": "held", "reason": "no_profile_returned", "source_record": None, "facts": []}
 
 
+def invalid_acquisition_result(manifest_by_field, response_by_field, reason):
+    """Retain a complete malformed payload without deriving NYSED assertions.
+
+    This outcome is intentionally limited to known payload-validation reasons.
+    Transport, HTTP status, response-shape, and capture-integrity failures remain
+    hard failures before this function is reached.
+    """
+    descriptor = request_descriptor(manifest_by_field["license_number"])
+    _validated_response(response_by_field, descriptor)
+    _require(reason in INVALID_PROFILE_REASONS, "invalid_profile_reason")
+    return {"outcome": "invalid", "reason": reason, "source_record": None, "facts": []}
+
+
 def _retained_acquisition(destination, receipt_sha256, expected_outcome):
     _require(isinstance(receipt_sha256, str) and re.fullmatch(r"[a-f0-9]{64}", receipt_sha256), "receipt_pin_invalid")
     receipt = _read_artifact(destination / "result.json", MAX_METADATA_BYTES)
@@ -428,3 +455,17 @@ def read_held_acquisition(destination: Path, *, receipt_sha256: str):
         "held_result_changed",
     )
     return {**held, "receipt_sha256": receipt_sha256}
+
+
+def read_invalid_acquisition(destination: Path, *, receipt_sha256: str):
+    """Replay and re-prove the pinned payload remains invalid support evidence."""
+    manifest_by_field, response_by_field, receipt = _retained_acquisition(destination, receipt_sha256, "invalid")
+    try:
+        acquisition_result(manifest_by_field, response_by_field)
+    except InvalidProfileValue as error:
+        invalid = invalid_acquisition_result(manifest_by_field, response_by_field, str(error))
+    else:
+        raise ValueError("new_york_nysed_invalid_result_changed")
+    _require(type(receipt.get("fact_count")) is int and receipt["fact_count"] == 0, "invalid_result_changed")
+    _require(invalid["reason"] == receipt.get("reason"), "invalid_result_changed")
+    return {**invalid, "receipt_sha256": receipt_sha256}
