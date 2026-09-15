@@ -7302,8 +7302,8 @@ fn strict_u32le_members(bytes: &[u8], npi_count: usize) -> ProviderGraphV4Result
     }
     let mut members = Vec::with_capacity(bytes.len() / 4);
     let mut previous = None;
-    for member in bytes.chunks_exact(4) {
-        let key = u32::from_le_bytes(member.try_into().expect("fixed uint32 width"));
+    for member in bytes.as_chunks::<4>().0 {
+        let key = u32::from_le_bytes(*member);
         if previous.is_some_and(|value| key <= value) || key as usize >= npi_count {
             return Err(invalid(
                 "V4 inferred-taxonomy candidate members are outside the NPI scope",

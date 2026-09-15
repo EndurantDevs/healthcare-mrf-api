@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 METADATA_ONLY = (
     "github.event_name == 'pull_request' && github.event.action == 'edited' "
     "&& !github.event.changes.title && !github.event.changes.base"
@@ -26,6 +25,11 @@ JOB_LABELS = {
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
 }
+PRIVILEGED_JOB_IDS = {"dev-image-publication", "artifact-cleanup"}
+APPROVED_SHARED_CI_REVISION = "5a4beeabc1615f5979d7d0aa49ee85e267eed0ca"
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+ARTIFACT_DOWNLOAD_ACTION = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+ARTIFACT_UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
         {"shard": str(index), "label": f"Python tests ({index + 1}/4)", "output": f"artifact_{index}"}
@@ -74,11 +78,18 @@ def _assert_job_actions(job_id, job, revision) -> None:
     assert has_pinned_checkout or job_id in {"smoke", "source-validation"}
 
 
-def test_public_ci_is_hosted_read_only_and_runs_import_checks():
+def _load_public_workflow():
+    """Load the sole public validation workflow and its exact rendered text."""
+
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     assert sorted(path.name for path in workflows.iterdir()) == ["ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
-    workflow = yaml.safe_load(text)
+    return yaml.safe_load(text), text
+
+
+def _assert_public_workflow_contract(workflow, text, revision) -> None:
+    """Keep trigger, concurrency, and workflow-level permissions read-only."""
+
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
     assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
         "opened", "synchronize", "reopened", "edited",
@@ -87,8 +98,8 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["permissions"] == {
         "contents": "read", "pull-requests": "read", "actions": "read",
     }
-    assert set(workflow["jobs"]) == set(JOB_LABELS)
-    revision = workflow["env"]["CI_REVISION"]
+    assert set(workflow["jobs"]) == set(JOB_LABELS) | PRIVILEGED_JOB_IDS
+    assert revision == APPROVED_SHARED_CI_REVISION
     assert re.fullmatch(r"[0-9a-f]{40}", revision)
     assert set(revision) != {"0"}
     assert "inputs.ci_revision" not in text
@@ -96,11 +107,23 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+            + " && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' "
+            "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' && !(" + METADATA_ONLY + ") }}",
     }
-    for job_id, job in workflow["jobs"].items():
+
+
+def _assert_read_only_validation_jobs(workflow, revision) -> None:
+    """Require every validation job to remain bounded to public read access."""
+
+    assert {
+        job_id
+        for job_id, job in workflow["jobs"].items()
+        if any(permission == "write" for permission in job.get("permissions", {}).values())
+    } == PRIVILEGED_JOB_IDS
+    for job_id in JOB_LABELS:
+        job = workflow["jobs"][job_id]
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
@@ -112,6 +135,154 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         assert not job.get("continue-on-error")
         assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
+
+
+def _expected_image_publisher_setup_steps(revision, token, publish_if):
+    """Return the trusted checkout and pre-publication image steps."""
+
+    return [
+        {
+            "name": "Check out trusted image publisher",
+            "uses": CHECKOUT_ACTION,
+            "with": {
+                "repository": "EndurantDevs/endurant-ci",
+                "ref": revision,
+                "path": "ci",
+                "persist-credentials": False,
+            },
+        },
+        {
+            "name": "Authenticate DEV image input",
+            "id": "image",
+            "env": {"GH_TOKEN": token},
+            "run": "python3 ci/scripts/source_image.py prepare",
+        },
+        {
+            "name": "Download validated image archive",
+            "if": publish_if,
+            "uses": ARTIFACT_DOWNLOAD_ACTION,
+            "with": {
+                "artifact-ids": "${{ steps.image.outputs.artifact_id }}",
+                "digest-mismatch": "error",
+                "path": "${{ runner.temp }}/public-image-download",
+                "merge-multiple": True,
+            },
+        },
+        {
+            "name": "Stage DEV image publication intent",
+            "if": publish_if,
+            "env": {"GH_TOKEN": token},
+            "run": "python3 ci/scripts/source_image.py stage",
+        },
+    ]
+
+
+def _expected_image_publisher_completion_steps(token, publish_if):
+    """Return the exact publication, receipt, and reconciliation steps."""
+
+    return [
+        {
+            "name": "Upload DEV image publication intent",
+            "if": publish_if,
+            "uses": ARTIFACT_UPLOAD_ACTION,
+            "with": {
+                "name": "healthcare-public-image-intent-${{ github.run_id }}-${{ github.run_attempt }}",
+                "path": "${{ runner.temp }}/public-image-intent/intent.json",
+                "if-no-files-found": "error",
+                "retention-days": 90,
+            },
+        },
+        {
+            "name": "Publish validated DEV image",
+            "if": publish_if,
+            "env": {"GH_TOKEN": token},
+            "run": "python3 ci/scripts/source_image.py publish",
+        },
+        {
+            "name": "Upload DEV image receipt",
+            "if": publish_if,
+            "uses": ARTIFACT_UPLOAD_ACTION,
+            "with": {
+                "name": "healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}",
+                "path": "${{ runner.temp }}/public-image-receipt/image.json",
+                "if-no-files-found": "error",
+                "retention-days": 90,
+            },
+        },
+        {
+            "name": "Reconcile DEV image publication",
+            "if": "always() && steps.image.outputs.publish == 'true'",
+            "env": {"GH_TOKEN": token},
+            "run": "python3 ci/scripts/source_image.py reconcile",
+        },
+    ]
+
+
+def _expected_dev_image_publication_job(revision):
+    """Return the one allowed, source-bound DEV image publication job."""
+
+    publish_if = "steps.image.outputs.publish == 'true'"
+    token = "${{ github.token }}"
+    steps = _expected_image_publisher_setup_steps(revision, token, publish_if)
+    steps += _expected_image_publisher_completion_steps(token, publish_if)
+    return {
+        "name": "${{ " + METADATA_ONLY + " && 'DEV image publication (metadata only)' || 'DEV image publication' }}",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 30,
+        "needs": ["smoke", "source-validation"],
+        "permissions": {
+            "contents": "read",
+            "pull-requests": "read",
+            "actions": "read",
+            "packages": "write",
+        },
+        "env": {"CI_REVISION": revision, "PYTHONDONTWRITEBYTECODE": "1"},
+        "steps": steps,
+        "if": "${{ !(" + METADATA_ONLY + ") && (success()) }}",
+    }
+
+
+def _expected_artifact_cleanup_job(revision):
+    """Return the one allowed exact-identity cleanup job."""
+
+    return {
+        "name": "${{ " + METADATA_ONLY + " && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 10,
+        "needs": ["dev-image-publication"],
+        "if": "${{ !(" + METADATA_ONLY + ") && (always()) }}",
+        "permissions": {"contents": "read", "actions": "write"},
+        "steps": [
+            {
+                "name": "Check out trusted cleanup helper",
+                "uses": CHECKOUT_ACTION,
+                "with": {
+                    "repository": "EndurantDevs/endurant-ci",
+                    "ref": revision,
+                    "path": "ci",
+                    "persist-credentials": False,
+                },
+            },
+            {
+                "name": "Remove validated CI intermediates",
+                "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
+                "run": "python3 ci/scripts/artifact_cleanup.py",
+            },
+        ],
+    }
+
+
+def _assert_privileged_workflow_jobs(workflow, revision) -> None:
+    """Allow only the exact reviewed post-validation artifact operations."""
+
+    assert workflow["jobs"]["dev-image-publication"] == _expected_dev_image_publication_job(revision)
+    assert workflow["jobs"]["artifact-cleanup"] == _expected_artifact_cleanup_job(revision)
+    assert workflow["jobs"]["source-validation"]["needs"] == ["measurement"]
+
+
+def _assert_public_smoke_job(workflow, text) -> None:
+    """Keep the initial portable check independent of private infrastructure."""
+
     job = workflow["jobs"]["smoke"]
     assert job["runs-on"] == "ubuntu-latest"
     assert "container" not in job
@@ -122,6 +293,17 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert "python -m pytest -q" in commands
     assert "test_process_" in commands or "tests/process/" in commands
     assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
+
+
+def test_public_ci_is_hosted_read_only_and_runs_import_checks():
+    """Keep generated public CI isolated from private infrastructure and credentials."""
+
+    workflow, text = _load_public_workflow()
+    revision = workflow["env"]["CI_REVISION"]
+    _assert_public_workflow_contract(workflow, text, revision)
+    _assert_read_only_validation_jobs(workflow, revision)
+    _assert_privileged_workflow_jobs(workflow, revision)
+    _assert_public_smoke_job(workflow, text)
 
 
 def test_dependency_updates_target_the_development_branch():
