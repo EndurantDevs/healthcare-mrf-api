@@ -6,10 +6,9 @@ permissions:
   actions: read
 concurrency:
   group: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-    && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' && format('ci-push-{0}', github.run_id) ||
-    format('ci-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && !(github.event_name == 'pull_request' && github.event.action
-    == 'edited' && !github.event.changes.title && !github.event.changes.base) }}
+    && format('ci-metadata-{0}', github.event.pull_request.number) || github.event_name == 'push' && format('ci-push-{0}',
+    github.run_id) || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   smoke:
     name: portable import checks
@@ -59,7 +58,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -123,7 +122,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -146,7 +145,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -178,7 +177,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -260,7 +259,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -305,7 +304,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -337,7 +336,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -389,7 +388,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -433,7 +432,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -471,7 +470,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -527,7 +526,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -619,7 +618,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Resolve exact source event
@@ -649,20 +648,37 @@ jobs:
         if-no-files-found: error
         retention-days: 90
   source-validation:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'Validation complete (metadata only)' || 'Validation complete' }}
+    name: Validation complete
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (always()) }}
+    timeout-minutes: 45
+    if: ${{ always() }}
     needs:
     - measurement
-    permissions: {}
+    permissions:
+      actions: read
     steps:
     - name: Require complete public validation
       env:
+        GH_TOKEN: ${{ github.token }}
+        METADATA_ONLY: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title
+          && !github.event.changes.base }}
+        PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+        SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         RESULTS: ${{ toJSON(needs.*.result) }}
-      run: jq -e 'length > 0 and all(. == "success")' <<< "$RESULTS"
+      run: "if [ \"$METADATA_ONLY\" != true ]; then\n  jq -e 'length > 0 and all(. == \"success\")' <<< \"$RESULTS\"\n  exit\
+        \ 0\nfi\n\ndeadline=$((SECONDS + 2400))\nwhile :; do\n  if ! validation_state=\"$(\n    gh api \"repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&head_sha=$SOURCE_SHA&per_page=100\"\
+        \ \\\n      --jq '[.workflow_runs[]\n        | select(.name == \"CI\" and .display_title == \"CI\")\n        | select(any(.pull_requests[]?;\
+        \ .number == (env.PR_NUMBER | tonumber) and .head.sha == env.SOURCE_SHA and .base.sha == env.BASE_SHA))\n        |\
+        \ {run_started_at, created_at, id, run_attempt, status, conclusion}]\n        | sort_by([(.run_started_at // .created_at),\
+        \ .id, .run_attempt])\n        | last\n        | if . == null then \"pending\"\n          elif .status != \"completed\"\
+        \ then \"pending\"\n          elif .conclusion == \"success\" then \"success\"\n          else \"failed\"\n      \
+        \    end'\n  )\"; then\n    validation_state=pending\n  fi\n  case \"$validation_state\" in\n    success) exit 0 ;;\n\
+        \    failed)\n      printf 'No successful full validation exists for source %s at base %s.\\n' \"$SOURCE_SHA\" \"\
+        $BASE_SHA\" >&2\n      exit 1\n      ;;\n    pending)\n      if (( SECONDS >= deadline )); then\n        printf 'Timed\
+        \ out waiting for full validation of source %s at base %s.\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        exit 1\n\
+        \      fi\n      sleep 15\n      ;;\n    *)\n      printf 'Unexpected full-validation state: %s.\\n' \"$validation_state\"\
+        \ >&2\n      exit 1\n      ;;\n  esac\ndone\n"
   dev-image-publication:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'DEV image publication (metadata only)' || 'DEV image publication' }}
@@ -677,14 +693,14 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: cd806020e9a9c598baece06bbd15260333771787
+      CI_REVISION: 6a89249235dbf8716c020c56f31154171d0a8a0d
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
     - name: Check out trusted image publisher
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Authenticate DEV image input
@@ -750,7 +766,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: cd806020e9a9c598baece06bbd15260333771787
+        ref: 6a89249235dbf8716c020c56f31154171d0a8a0d
         path: ci
         persist-credentials: false
     - name: Remove validated CI intermediates
@@ -771,7 +787,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: cd806020e9a9c598baece06bbd15260333771787
+  CI_REVISION: 6a89249235dbf8716c020c56f31154171d0a8a0d
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

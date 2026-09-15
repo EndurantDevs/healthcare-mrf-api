@@ -43,8 +43,8 @@ MATRIX_ROWS_BY_JOB = {
 
 def _assert_job_label(job_id, job) -> None:
     """Keep skipped metadata contexts separate from every real shard label."""
-    if job_id == "smoke":
-        assert job["name"] == "portable import checks"
+    if job_id in {"smoke", "source-validation"}:
+        assert job["name"] == JOB_LABELS[job_id]
         return
     if job_id in MATRIX_ROWS_BY_JOB:
         assert job["name"] == "${{ " + METADATA_ONLY + f" && '{job_id} (metadata only)' || matrix.label " + "}}"
@@ -112,6 +112,43 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     )
 
 
+def _assert_source_validation_job(workflow) -> None:
+    """Keep metadata-only required validation tied to a completed full public run."""
+    job = workflow["jobs"]["source-validation"]
+    assert job["name"] == "Validation complete"
+    assert job["timeout-minutes"] == 45
+    assert job["if"] == "${{ always() }}"
+    assert job["permissions"] == {"actions": "read"}
+    step = job["steps"]
+    assert step == [{
+        "name": "Require complete public validation",
+        "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "METADATA_ONLY": "${{ " + METADATA_ONLY + " }}",
+            "PR_NUMBER": "${{ github.event.pull_request.number || '' }}",
+            "SOURCE_SHA": "${{ github.event.pull_request.head.sha || github.sha }}",
+            "BASE_SHA": "${{ github.event.pull_request.base.sha || '' }}",
+            "RESULTS": "${{ toJSON(needs.*.result) }}",
+        },
+        "run": step[0]["run"],
+    }]
+    run = step[0]["run"]
+    assert "if [ \"$METADATA_ONLY\" != true ]; then" in run
+    assert "jq -e 'length > 0 and all(. == \"success\")' <<< \"$RESULTS\"" in run
+    assert "if ! validation_state=\"$(" in run
+    assert "actions/workflows/ci.yml/runs?event=pull_request&head_sha=$SOURCE_SHA&per_page=100" in run
+    assert 'select(.name == "CI" and .display_title == "CI")' in run
+    assert (
+        "select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber) "
+        "and .head.sha == env.SOURCE_SHA and .base.sha == env.BASE_SHA))"
+    ) in run
+    assert "sort_by([(.run_started_at // .created_at), .id, .run_attempt])" in run
+    assert "validation_state=pending" in run
+    assert "deadline=$((SECONDS + 2400))" in run
+    assert "sleep 15" in run
+    assert run.endswith("done\n")
+
+
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
     assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
@@ -134,16 +171,18 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || github.event_name == 'push' "
+            + " && format('ci-metadata-{0}', github.event.pull_request.number) || github.event_name == 'push' "
             + "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ github.event_name == 'pull_request' && !(" + METADATA_ONLY + ") }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation", "artifact-cleanup"} else "success()"
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
+        elif job_id == "source-validation":
+            assert job["if"] == "${{ always() }}"
         else:
             assert job["if"] == "${{ !(" + METADATA_ONLY + ") && (" + condition + ") }}"
         assert "uses" not in job
@@ -159,6 +198,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
             assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
     _assert_smoke_job(workflow, text)
+    _assert_source_validation_job(workflow)
 
 
 def test_stale_artifact_cleanup_is_main_only_and_pinned():
