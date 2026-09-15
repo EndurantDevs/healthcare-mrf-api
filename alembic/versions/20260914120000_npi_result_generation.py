@@ -52,6 +52,25 @@ def _quoted(value: str) -> str:
     return f'"{value}"'
 
 
+def _existing_npi_tables(schema: str) -> tuple[str, ...]:
+    """Accept a complete serving family or an empty schema, never a subset."""
+
+    if op.get_context().as_sql:
+        return _NPI_TABLES
+    connection = op.get_bind()
+    existing_tables = tuple(
+        table_name
+        for table_name in _NPI_TABLES
+        if connection.execute(
+            sa.text("SELECT to_regclass(:relation_name) IS NOT NULL"),
+            {"relation_name": f"{_quoted(schema)}.{_quoted(table_name)}"},
+        ).scalar_one()
+    )
+    if existing_tables and existing_tables != _NPI_TABLES:
+        raise RuntimeError("NPI result tables must be all present or all absent")
+    return existing_tables
+
+
 def _shape_check() -> str:
     return (
         "singleton IS TRUE AND local_generation BETWEEN 0 AND 9223372036854775807 AND ("
@@ -108,9 +127,9 @@ def _create_revision_function(schema: str) -> None:
     op.execute(f"REVOKE ALL ON FUNCTION {function}() FROM PUBLIC;")
 
 
-def _create_revision_triggers(schema: str) -> None:
+def _create_revision_triggers(schema: str, table_names: tuple[str, ...]) -> None:
     function = f"{_quoted(schema)}.{_quoted(_REVISION_FUNCTION)}"
-    for table_name in _NPI_TABLES:
+    for table_name in table_names:
         table = f"{_quoted(schema)}.{_quoted(table_name)}"
         op.execute(
             f"CREATE TRIGGER {_quoted(_REVISION_TRIGGER)} "
@@ -124,6 +143,7 @@ def upgrade() -> None:
     """Install generationless state and transaction-bound revision tracking."""
 
     schema = _schema()
+    npi_tables = _existing_npi_tables(schema)
     op.create_table(
         _STATE_TABLE,
         sa.Column("singleton", sa.Boolean(), nullable=False),
@@ -162,7 +182,7 @@ def upgrade() -> None:
         )
     )
     _create_revision_function(schema)
-    _create_revision_triggers(schema)
+    _create_revision_triggers(schema, npi_tables)
     op.execute(f"REVOKE ALL ON TABLE {_quoted(schema)}.{_quoted(_STATE_TABLE)} FROM PUBLIC;")
 
 
@@ -170,6 +190,7 @@ def downgrade() -> None:
     """Refuse to erase any recorded NPI result revision or provenance."""
 
     schema = _schema()
+    npi_tables = _existing_npi_tables(schema)
     state = f"{_quoted(schema)}.{_quoted(_STATE_TABLE)}"
     retained = (
         op.get_bind()
@@ -183,7 +204,7 @@ def downgrade() -> None:
     )
     if retained:
         raise RuntimeError("NPI result generation evidence prevents downgrade")
-    for table_name in _NPI_TABLES:
+    for table_name in npi_tables:
         table = f"{_quoted(schema)}.{_quoted(table_name)}"
         op.execute(f"DROP TRIGGER {_quoted(_REVISION_TRIGGER)} ON {table};")
     op.execute(f"DROP FUNCTION {_quoted(schema)}.{_quoted(_REVISION_FUNCTION)}();")
