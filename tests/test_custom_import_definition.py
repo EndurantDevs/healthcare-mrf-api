@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import process.custom_import.contracts as contracts
+import process.custom_import.definition as custom_import_definition
 from process.custom_import import (
     CandidateRejected,
     CustomImportDefinition,
@@ -146,6 +147,20 @@ def test_definition_wire_parser_rejects_structural_and_encoding_boundaries():
         CustomImportDefinition.from_mapping({1: "not-a-definition"})
     with pytest.raises(DefinitionError, match="definition must be an object"):
         CustomImportDefinition.from_mapping([])
+
+
+def test_definition_wire_parser_converts_recursion_failures_to_structural_limits(monkeypatch):
+    def recursive_json(*_args, **_kwargs):
+        raise RecursionError("synthetic parser recursion")
+
+    monkeypatch.setattr(custom_import_definition.json, "loads", recursive_json)
+    with pytest.raises(DefinitionError, match="structural limits"):
+        load_json_definition("{}")
+
+    monkeypatch.undo()
+    deeply_nested_yaml = "[" * 512 + "0" + "]" * 512
+    with pytest.raises(DefinitionError, match="structural limits"):
+        load_yaml_definition(deeply_nested_yaml)
 
 
 def test_contract_exports_and_definition_indexes_are_usable(definition):

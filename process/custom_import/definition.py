@@ -70,9 +70,11 @@ def load_json_definition(serialized: str | bytes) -> Mapping[str, Any]:
     text = _bounded_text(serialized, "JSON")
     try:
         value = json.loads(text, object_pairs_hook=_json_object)
+        return _validate_wire_value(value)
     except json.JSONDecodeError as exc:
         raise DefinitionError(f"invalid JSON definition: {exc.msg}") from exc
-    return _validate_wire_value(value)
+    except RecursionError as exc:
+        raise DefinitionError("definition exceeds structural limits") from exc
 
 
 def load_yaml_definition(serialized: str | bytes) -> Mapping[str, Any]:
@@ -84,11 +86,13 @@ def load_yaml_definition(serialized: str | bytes) -> Mapping[str, Any]:
             if isinstance(event, yaml.events.AliasEvent):
                 raise DefinitionError("YAML aliases are not allowed")
         value = yaml.load(text, Loader=_StrictYamlLoader)
+        return _validate_wire_value(value)
     except DefinitionError:
         raise
     except yaml.YAMLError as exc:
         raise DefinitionError("invalid YAML definition") from exc
-    return _validate_wire_value(value)
+    except RecursionError as exc:
+        raise DefinitionError("definition exceeds structural limits") from exc
 
 
 def canonical_json(value: Mapping[str, Any]) -> str:
