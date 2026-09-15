@@ -193,6 +193,32 @@ def test_retained_direct_context_requires_singleton_identity(params_by_name):
         ptg_control._resolve_retained_direct_source_url(params_by_name)
 
 
+@pytest.mark.parametrize(
+    "params_by_name",
+    [
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": None,
+            "max_files": 1,
+        },
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": (
+                "https://example.com/rates.json?first=value&amp;second=value"
+            ),
+            "direct_source_index_url": "https://example.com/index.json",
+            "max_files": 1,
+        },
+    ],
+)
+def test_retained_direct_context_requires_contextual_resolution(params_by_name):
+    with pytest.raises(ValueError, match="direct source index context"):
+        ptg_control._resolve_retained_direct_source_url(params_by_name)
+
+
 @pytest.mark.asyncio
 async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(monkeypatch):
     marks = []
