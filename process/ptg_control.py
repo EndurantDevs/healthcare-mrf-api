@@ -24,6 +24,10 @@ from process.ptg import (
     full_rebuild_failure_metrics,
     main as ptg_main,
 )
+from process.ptg_parts.canonical import normalize_tic_source_url
+from process.ptg_parts.frozen_rate_binding import (
+    protected_frozen_tuple_presence,
+)
 from process.ptg_parts.ptg_source_worker_admission import (
     guard_ptg_worker_start,
 )
@@ -31,6 +35,9 @@ from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_e
 from process.ptg_frozen_control import (
     protected_rate_main_kwargs,
     validated_worker_rate_params,
+)
+from process.ptg_singleton_direct_control import (
+    protected_singleton_direct_presence,
 )
 from process.ptg_control_failures import ptg_failure_error
 from process.ptg_allowed_amount_blank_evidence import load_blank_failure_metrics
@@ -54,7 +61,89 @@ from process.ptg_wave_worker_claim_adapter import (
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
+_DIRECT_SOURCE_INDEX_URL_PARAM = "direct_source_index_url"
 _assert_expected_lane = assert_expected_ptg_lane
+
+
+def _resolve_retained_direct_source_url(
+    params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve a retained direct URL from trusted stored index context."""
+
+    resolved_params_by_name = dict(params_by_name)
+    source_index_url = resolved_params_by_name.pop(
+        _DIRECT_SOURCE_INDEX_URL_PARAM,
+        None,
+    )
+    if source_index_url is None:
+        return resolved_params_by_name
+    if _is_disallowed_direct_source_context(
+        resolved_params_by_name,
+        source_index_url,
+    ):
+        raise ValueError("direct source index context is not supported")
+    direct_url = _retained_direct_replay_url(resolved_params_by_name)
+    resolved_url = normalize_tic_source_url(
+        direct_url,
+        source_index_url=source_index_url,
+    )
+    if resolved_url == direct_url:
+        raise ValueError(
+            "direct source index context did not resolve the direct URL"
+        )
+    resolved_params_by_name["in_network_url"] = resolved_url
+    return resolved_params_by_name
+
+
+def _is_disallowed_direct_source_context(
+    params_by_name: dict[str, Any],
+    source_index_url: Any,
+) -> bool:
+    """Return whether protected or non-retained dispatch supplied context."""
+
+    return bool(
+        not isinstance(source_index_url, str)
+        or source_index_url != source_index_url.strip()
+        or not source_index_url
+        or protected_singleton_direct_presence(params_by_name)
+        or protected_frozen_tuple_presence(params_by_name)
+        or any(key.startswith("ordinary_cutover_") for key in params_by_name)
+    )
+
+
+def _retained_direct_replay_url(params_by_name: dict[str, Any]) -> str:
+    """Require one direct singleton with a bound retained import identity."""
+
+    direct_url = params_by_name.get("in_network_url")
+    source_file_import_id = params_by_name.get("source_file_import_id")
+    if (
+        not isinstance(direct_url, str)
+        or direct_url != direct_url.strip()
+        or not direct_url
+        or any(
+            params_by_name.get(selector) is not None
+            for selector in (
+                "allowed_url",
+                "toc_url",
+                "toc_urls",
+                "toc_list",
+                "file_url_contains",
+                "provider_ref_url",
+            )
+        )
+        or not isinstance(source_file_import_id, str)
+        or not source_file_import_id
+        or source_file_import_id != source_file_import_id.strip()
+        or params_by_name.get("import_id") != source_file_import_id
+        or type(params_by_name.get("max_files")) is not int
+        or params_by_name["max_files"] != 1
+    ):
+        raise ValueError(
+            "direct source index context requires retained direct replay"
+        )
+    return direct_url
+
+
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     """Run one PTG control task with cancellation and heartbeat handling."""
     bind_status_event_loop()
@@ -162,6 +251,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             task_payload,
             params_by_name,
         )
+        params_by_name = _resolve_retained_direct_source_url(params_by_name)
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params_by_name,
         )

@@ -73,6 +73,127 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ptg_control_resolves_retained_direct_context_before_engine(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_ptg_main(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    async def has_fake_marked_control_run(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+    async def passthrough_worker_validation(_task_payload, params_by_name):
+        return dict(params_by_name)
+
+    monkeypatch.setattr(
+        ptg_control,
+        "validated_worker_rate_params",
+        passthrough_worker_validation,
+    )
+
+    await ptg_control.ptg_control_start(
+        {},
+        {
+            "run_id": "run_ptg",
+            "params": {
+                "test_mode": True,
+                "import_id": "source-import",
+                "source_file_import_id": "source-import",
+                "source_key": "example_source_a",
+                "in_network_url": (
+                    "https://mrf.healthsparq.com/prd/rates.json.gz"
+                ),
+                "direct_source_index_url": (
+                    "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+                ),
+                "max_files": 1,
+            },
+        },
+    )
+
+    assert calls[0]["in_network_url"] == (
+        "https://mrf.healthsparq.com/example-tenant/prd/rates.json.gz"
+    )
+    assert calls[0]["toc_urls"] is None
+    assert "direct_source_index_url" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    "params_by_name",
+    [
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": (
+                "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+            ),
+            "ordinary_cutover_operation_id": "operation",
+        },
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": (
+                "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+            ),
+            "direct_rate_file_intent_sha256": "protected",
+        },
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": (
+                "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+            ),
+            "frozen_rate_file_set_contract": "protected",
+        },
+    ],
+)
+def test_retained_direct_context_rejects_protected_or_cutover_payloads(
+    params_by_name,
+):
+    with pytest.raises(ValueError, match="not supported"):
+        ptg_control._resolve_retained_direct_source_url(params_by_name)
+
+
+@pytest.mark.parametrize(
+    "params_by_name",
+    [
+        {
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": (
+                "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+            ),
+            "max_files": 1,
+        },
+        {
+            "import_id": "source-import",
+            "source_file_import_id": "source-import",
+            "in_network_url": "https://mrf.healthsparq.com/prd/rates.json.gz",
+            "direct_source_index_url": (
+                "https://mrf.healthsparq.com/example-tenant/prd/index.json"
+            ),
+            "max_files": 2,
+        },
+    ],
+)
+def test_retained_direct_context_requires_singleton_identity(params_by_name):
+    with pytest.raises(ValueError, match="requires retained direct replay"):
+        ptg_control._resolve_retained_direct_source_url(params_by_name)
+
+
+@pytest.mark.asyncio
 async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(monkeypatch):
     marks = []
     flushes = []
