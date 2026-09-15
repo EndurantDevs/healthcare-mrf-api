@@ -4,18 +4,21 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-import re
 from types import MappingProxyType
 from typing import Any
 
-from process.custom_import.definition import ChildCollection, CustomImportDefinition
-from process.custom_import.definition import DefinitionError, Field
-
+from process.custom_import.definition import (
+    ChildCollection,
+    CustomImportDefinition,
+    DefinitionError,
+    Field,
+)
 
 _NPI = re.compile(r"^[0-9]{10}$")
 
@@ -65,13 +68,17 @@ def validate_source_snapshot_tokens(
     shared_tokens: set[str] = set()
     for stream_id, observed in stream_tokens.items():
         if not isinstance(observed, (list, tuple)) or not observed:
-            raise SourceSnapshotError(f"stream {stream_id} has no bounded token observations")
+            raise SourceSnapshotError(
+                f"stream {stream_id} has no bounded token observations"
+            )
         stream_values = set(observed)
         if None in stream_values or "" in stream_values or len(stream_values) != 1:
             raise SourceSnapshotError(f"stream {stream_id} lacks one snapshot token")
         token = next(iter(stream_values))
         if not isinstance(token, str):
-            raise SourceSnapshotError(f"stream {stream_id} has a non-string snapshot token")
+            raise SourceSnapshotError(
+                f"stream {stream_id} has a non-string snapshot token"
+            )
         shared_tokens.add(token)
     if len(shared_tokens) != 1:
         raise SourceSnapshotError("source streams do not share one snapshot token")
@@ -97,12 +104,14 @@ def assemble_root_families(
         roots,
         root_fields_by_id,
     )
-    child_records_by_root_and_collection, child_candidate_error_codes = _admit_child_records(
-        definition,
-        children_by_collection,
-        root_records_by_key,
-        child_fields_by_collection,
-        rejection_codes_by_root_key,
+    child_records_by_root_and_collection, child_candidate_error_codes = (
+        _admit_child_records(
+            definition,
+            children_by_collection,
+            root_records_by_key,
+            child_fields_by_collection,
+            rejection_codes_by_root_key,
+        )
     )
     rejection_evidence_entries.extend(
         FamilyRejection(root_key, rejection_code)
@@ -117,7 +126,9 @@ def assemble_root_families(
             rejection_codes_by_root_key,
         ),
         rejections=tuple(rejection_evidence_entries),
-        candidate_errors=tuple(sorted(root_candidate_error_codes | child_candidate_error_codes)),
+        candidate_errors=tuple(
+            sorted(root_candidate_error_codes | child_candidate_error_codes)
+        ),
     )
 
 
@@ -128,13 +139,20 @@ def _validate_family_inputs(
 ) -> None:
     if not isinstance(roots, (list, tuple)):
         raise DefinitionError("roots must be a bounded record array")
-    expected_collection_names = {collection.name for collection in definition.child_collections}
+    expected_collection_names = {
+        collection.name for collection in definition.child_collections
+    }
     has_bounded_child_records = all(
         isinstance(child_records, (list, tuple))
         for child_records in children_by_collection.values()
     )
-    if set(children_by_collection) != expected_collection_names or not has_bounded_child_records:
-        raise DefinitionError("children must contain one bounded array per declared collection")
+    if (
+        set(children_by_collection) != expected_collection_names
+        or not has_bounded_child_records
+    ):
+        raise DefinitionError(
+            "children must contain one bounded array per declared collection"
+        )
 
 
 def _child_fields_by_collection(
@@ -197,11 +215,14 @@ def _admit_child_records(
     rejection_codes_by_root_key: dict[tuple[Any, ...], set[str]],
 ) -> tuple[dict[str, dict[tuple[Any, ...], list[Mapping[str, Any]]]], set[str]]:
     child_records_by_root_and_collection = {
-        collection.name: defaultdict(list) for collection in definition.child_collections
+        collection.name: defaultdict(list)
+        for collection in definition.child_collections
     }
     candidate_error_codes: set[str] = set()
     for collection in definition.child_collections:
-        child_keys_by_parent: dict[tuple[Any, ...], set[tuple[Any, ...]]] = defaultdict(set)
+        child_keys_by_parent: dict[tuple[Any, ...], set[tuple[Any, ...]]] = defaultdict(
+            set
+        )
         for child_record in children_by_collection[collection.name]:
             if not isinstance(child_record, Mapping):
                 candidate_error_codes.add("child_not_object")
@@ -246,13 +267,17 @@ def _assemble_accepted_families(
             children=MappingProxyType(
                 {
                     collection.name: tuple(
-                        child_records_by_root_and_collection[collection.name].get(root_key, ())
+                        child_records_by_root_and_collection[collection.name].get(
+                            root_key, ()
+                        )
                     )
                     for collection in definition.child_collections
                 }
             ),
         )
-        for root_key, root_record in sorted(root_records_by_key.items(), key=lambda pair: repr(pair[0]))
+        for root_key, root_record in sorted(
+            root_records_by_key.items(), key=lambda pair: repr(pair[0])
+        )
         if root_key not in rejection_codes_by_root_key
     )
 
@@ -268,7 +293,9 @@ def merge_families(
 
     if candidate.is_candidate_rejected:
         raise CandidateRejected(",".join(candidate.candidate_errors))
-    accepted_families_by_key = {family.root_key: family for family in candidate.families}
+    accepted_families_by_key = {
+        family.root_key: family for family in candidate.families
+    }
     root_keys_with_rejections = {
         entry.root_key for entry in candidate.rejections if entry.root_key is not None
     }
@@ -304,7 +331,9 @@ def _key(record: Mapping[str, Any], fields: tuple[str, ...]) -> tuple[Any, ...] 
     return tuple(values)
 
 
-def _parent_key(record: Mapping[str, Any], collection: ChildCollection) -> tuple[Any, ...] | None:
+def _parent_key(
+    record: Mapping[str, Any], collection: ChildCollection
+) -> tuple[Any, ...] | None:
     values: list[Any] = []
     for part in collection.parent_key:
         if part.child_field not in record or record[part.child_field] is None:
@@ -319,7 +348,10 @@ def _parent_key(record: Mapping[str, Any], collection: ChildCollection) -> tuple
 
 
 def _record_error(
-    record: Mapping[str, Any], fields: Mapping[str, Field], *, entity_field: str | None = None
+    record: Mapping[str, Any],
+    fields: Mapping[str, Field],
+    *,
+    entity_field: str | None = None,
 ) -> str | None:
     for field_id, field in fields.items():
         if field_id not in record:

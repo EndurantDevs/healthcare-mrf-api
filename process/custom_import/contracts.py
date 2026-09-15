@@ -30,7 +30,6 @@ from process.custom_import.family import (
     validate_source_snapshot_tokens,
 )
 
-
 __all__ = (
     "CONTRACT_VERSION",
     "CandidateRejected",
