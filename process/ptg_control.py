@@ -71,23 +71,21 @@ def _resolve_retained_direct_source_url(
     """Resolve a retained direct URL from trusted stored index context."""
 
     resolved_params_by_name = dict(params_by_name)
-    source_index_url = resolved_params_by_name.pop(
-        _DIRECT_SOURCE_INDEX_URL_PARAM,
-        None,
-    )
-    if source_index_url is None:
+    if _DIRECT_SOURCE_INDEX_URL_PARAM not in resolved_params_by_name:
         return resolved_params_by_name
+    source_index_url = resolved_params_by_name.pop(_DIRECT_SOURCE_INDEX_URL_PARAM)
     if _is_disallowed_direct_source_context(
         resolved_params_by_name,
         source_index_url,
     ):
         raise ValueError("direct source index context is not supported")
     direct_url = _retained_direct_replay_url(resolved_params_by_name)
+    baseline_url = normalize_tic_source_url(direct_url)
     resolved_url = normalize_tic_source_url(
         direct_url,
         source_index_url=source_index_url,
     )
-    if resolved_url == direct_url:
+    if resolved_url == baseline_url:
         raise ValueError(
             "direct source index context did not resolve the direct URL"
         )
