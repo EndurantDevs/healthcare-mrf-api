@@ -12,9 +12,9 @@ import re
 from uuid import uuid4
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
 
 revision = "20260914120000_npi_result_generation"
 down_revision = "20260911100000_hospital_price_tall_notes"
@@ -117,9 +117,7 @@ def _create_revision_triggers(schema: str) -> None:
             f"AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {table} "
             f"FOR EACH STATEMENT EXECUTE FUNCTION {function}();"
         )
-        op.execute(
-            f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {_quoted(_REVISION_TRIGGER)};"
-        )
+        op.execute(f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {_quoted(_REVISION_TRIGGER)};")
 
 
 def upgrade() -> None:
@@ -173,12 +171,16 @@ def downgrade() -> None:
 
     schema = _schema()
     state = f"{_quoted(schema)}.{_quoted(_STATE_TABLE)}"
-    retained = op.get_bind().execute(
-        sa.text(
-            f"SELECT EXISTS (SELECT 1 FROM {state} WHERE local_generation <> 0 "
-            "OR origin_generation IS NOT NULL OR canonical_publication_ref IS NOT NULL)"
+    retained = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"SELECT EXISTS (SELECT 1 FROM {state} WHERE local_generation <> 0 "
+                "OR origin_generation IS NOT NULL OR canonical_publication_ref IS NOT NULL)"
+            )
         )
-    ).scalar_one()
+        .scalar_one()
+    )
     if retained:
         raise RuntimeError("NPI result generation evidence prevents downgrade")
     for table_name in _NPI_TABLES:
