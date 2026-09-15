@@ -133,6 +133,31 @@ def test_definition_enforces_profile_and_projection_limits():
         CustomImportDefinition.from_mapping(raw)
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda raw: raw["streams"][0].update({"kind": "unsupported"}),
+            "kind must be root or child",
+        ),
+        (
+            lambda raw: raw.update({"streams": raw["streams"][:1]}),
+            "exactly one root stream",
+        ),
+    ],
+)
+def test_definition_rejects_invalid_streams_and_incomplete_child_coverage(
+    mutate, message
+):
+    """Stream-local validation and whole-definition coverage remain distinct."""
+
+    raw = _raw_definition()
+    mutate(raw)
+
+    with pytest.raises(DefinitionError, match=message):
+        CustomImportDefinition.from_mapping(raw)
+
+
 def test_source_tokens_must_be_complete_single_and_shared(definition):
     assert (
         validate_source_snapshot_tokens(
