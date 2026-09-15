@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, fields
 from datetime import datetime
-import json
+from typing import TYPE_CHECKING
 
 from process.provider_directory_rooted_graph_identity import (
     ROOTED_GRAPH_SCOPE_PATTERN,
@@ -22,6 +23,12 @@ from process.provider_directory_rooted_graph_store_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_STORAGE_CONTRACT_ID,
     RUN_PATTERN,
 )
+
+if TYPE_CHECKING:
+    from process.provider_directory_rooted_graph_twin_contract import (
+        ProviderDirectoryRootedGraphSealedRoot,
+        ProviderDirectoryRootedGraphTwinAttempt,
+    )
 
 
 PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID = (
