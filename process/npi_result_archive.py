@@ -48,10 +48,7 @@ _CAPTURE_TIMEOUT = "5s"
 _FREEZE_FUNCTION = "reject_npi_result_archive_mutation"
 _FREEZE_WRITE_TRIGGER = "npi_result_archive_write_guard"
 _FREEZE_TRUNCATE_TRIGGER = "npi_result_archive_truncate_guard"
-_FREEZE_FUNCTION_BODY = (
-    "BEGIN RAISE EXCEPTION 'npi_result_archive_is_frozen' "
-    "USING ERRCODE='55000'; END;"
-)
+_FREEZE_FUNCTION_BODY = "BEGIN RAISE EXCEPTION 'npi_result_archive_is_frozen' USING ERRCODE='55000'; END;"
 _MAX_METADATA_BYTES = 16_384
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SNAPSHOT = re.compile(r"[0-9A-Fa-f-]+\Z")
@@ -271,7 +268,7 @@ def _quoted(value: str) -> str:
 
 def _canonical_json(value: object) -> bytes:
     try:
-        encoded = json.dumps(
+        return json.dumps(
             value,
             sort_keys=True,
             separators=(",", ":"),
@@ -280,9 +277,6 @@ def _canonical_json(value: object) -> bytes:
         ).encode()
     except TypeError, ValueError:
         raise NpiResultArchiveError("NPI archive metadata is invalid") from None
-    if len(encoded) > _MAX_METADATA_BYTES:
-        raise NpiResultArchiveError("NPI archive metadata is too large")
-    return encoded
 
 
 def _source_metadata(value: object) -> tuple[dict[str, Any], str]:
@@ -290,6 +284,8 @@ def _source_metadata(value: object) -> tuple[dict[str, Any], str]:
         raise NpiResultArchiveError("NPI archive source metadata is invalid")
     metadata_dict = dict(value)
     encoded = _canonical_json(metadata_dict)
+    if len(encoded) > _MAX_METADATA_BYTES:
+        raise NpiResultArchiveError("NPI archive metadata is too large")
     return metadata_dict, hashlib.sha256(b"npi-result-source/v1\0" + encoded).hexdigest()
 
 
@@ -441,10 +437,14 @@ async def _npi_schema_identity(
         if column.get("attname") not in owned_sequence_columns:
             continue
         if default_expression is not None:
-            if not isinstance(default_expression, str) or re.fullmatch(
-                r"nextval\('(?:''|[^'])*'::regclass\)",
-                default_expression,
-            ) is None:
+            if (
+                not isinstance(default_expression, str)
+                or re.fullmatch(
+                    r"nextval\('(?:''|[^'])*'::regclass\)",
+                    default_expression,
+                )
+                is None
+            ):
                 raise NpiResultArchiveError("NPI owned sequence default is unsupported")
             column["default_expression"] = "npi-result-owned-sequence"
         normalized_sequence_columns.add(column["attname"])
@@ -560,9 +560,7 @@ async def capture_npi_source(
 
     _require_transaction(session)
     if (source_metadata is None) == (source_metadata_factory is None):
-        raise NpiResultArchiveError(
-            "NPI archive requires exactly one source metadata input"
-        )
+        raise NpiResultArchiveError("NPI archive requires exactly one source metadata input")
     schema = _schema_name(schema_name)
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     async with _bounded_catalog_work(session):
@@ -584,9 +582,7 @@ async def capture_npi_source(
         else:
             capture_authority = "tracked-generation"
         captured_metadata = (
-            await source_metadata_factory(session)
-            if source_metadata_factory is not None
-            else source_metadata
+            await source_metadata_factory(session) if source_metadata_factory is not None else source_metadata
         )
         metadata, metadata_sha256 = _source_metadata(captured_metadata)
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
@@ -644,9 +640,7 @@ async def _source_family_sequences(
 
     source_schema_oid = await _schema_oid(session, source_schema)
     return tuple(
-        sequence
-        for sequence in await _owned_sequences(session, source_schema_oid)
-        if sequence[2] in RELATION_NAMES
+        sequence for sequence in await _owned_sequences(session, source_schema_oid) if sequence[2] in RELATION_NAMES
     )
 
 
@@ -685,14 +679,11 @@ async def _advance_stage_sequence(
     sequence_name: str,
     owner_table: str,
     owner_column: str,
-) -> None:
+) -> int | None:
     """Set one stage-owned sequence to its copied table's maximum value."""
 
     maximum = await session.scalar(
-        text(
-            f"SELECT max({_quoted(owner_column)})::bigint "
-            f"FROM {_quoted(stage_schema)}.{_quoted(owner_table)}"
-        )
+        text(f"SELECT max({_quoted(owner_column)})::bigint FROM {_quoted(stage_schema)}.{_quoted(owner_table)}")
     )
     if maximum is not None:
         stage_sequence = f"{_quoted(stage_schema)}.{_quoted(sequence_name)}"
@@ -700,6 +691,47 @@ async def _advance_stage_sequence(
             text(f"SELECT pg_catalog.setval('{stage_sequence}'::regclass,:maximum,true)"),
             {"maximum": int(maximum)},
         )
+        return int(maximum)
+    return None
+
+
+async def _advance_and_verify_stage_sequences(
+    session: Any,
+    ownership: NpiStageOwnership,
+) -> None:
+    """Align every exact owned sequence with its restored owner column."""
+
+    observed_sequences = await _owned_sequences(session, ownership.schema_oid)
+    if observed_sequences != ownership.sequence_oids:
+        raise NpiResultArchiveError("NPI archive stage sequence ownership differs")
+    for sequence_name, sequence_oid, owner_table, owner_column in observed_sequences:
+        maximum = await _advance_stage_sequence(
+            session,
+            stage_schema=ownership.schema_name,
+            sequence_name=sequence_name,
+            owner_table=owner_table,
+            owner_column=owner_column,
+        )
+        stage_sequence = f"{_quoted(ownership.schema_name)}.{_quoted(sequence_name)}"
+        if maximum is None:
+            minimum = await session.scalar(
+                text("SELECT seqmin::bigint FROM pg_catalog.pg_sequence WHERE seqrelid=:sequence_oid"),
+                {"sequence_oid": sequence_oid},
+            )
+            if type(minimum) is not int:
+                raise NpiResultArchiveError("NPI archive stage sequence state is unavailable")
+            await session.execute(
+                text(f"SELECT pg_catalog.setval('{stage_sequence}'::regclass,:minimum,false)"),
+                {"minimum": minimum},
+            )
+            expected_value = minimum
+            is_expected_called = False
+        else:
+            expected_value = maximum
+            is_expected_called = True
+        state = (await session.execute(text(f"SELECT last_value::bigint, is_called FROM {stage_sequence}"))).one()
+        if state != (expected_value, is_expected_called):
+            raise NpiResultArchiveError("NPI archive stage sequence state differs")
 
 
 async def _verify_stage_sequence_owners(
@@ -713,9 +745,7 @@ async def _verify_stage_sequence_owners(
         (owner_table, owner_column)
         for _, _, owner_table, owner_column in await _owned_sequences(session, stage_schema_oid)
     }
-    source_owner_keys = {
-        (owner_table, owner_column) for _, _, owner_table, owner_column in source_sequences
-    }
+    source_owner_keys = {(owner_table, owner_column) for _, _, owner_table, owner_column in source_sequences}
     if observed_owner_keys != source_owner_keys:
         raise NpiResultArchiveError("NPI archive stage sequence ownership differs")
 
@@ -834,21 +864,27 @@ async def _freeze_seal(
     # in-place CREATE OR REPLACE. Bind catalog tuple versions as local seals;
     # ctid also detects changes within the preparing transaction. Do not bind
     # cmin: its header slot is reused by cmax, even after a rolled-back deletion.
-    catalog_versions = tuple(sorted(
-        [("function", function_oid, function_row["xmin"], function_row["ctid"])]
-        + [
-            ("trigger", int(trigger_row["oid"]), trigger_row["xmin"], trigger_row["ctid"])
-            for trigger_row in trigger_rows
-        ]
-    ))
-    return function_oid, tuple(
-        (
-            table_name,
-            triggers_by_table[table_name][_FREEZE_WRITE_TRIGGER],
-            triggers_by_table[table_name][_FREEZE_TRUNCATE_TRIGGER],
+    catalog_versions = tuple(
+        sorted(
+            [("function", function_oid, function_row["xmin"], function_row["ctid"])]
+            + [
+                ("trigger", int(trigger_row["oid"]), trigger_row["xmin"], trigger_row["ctid"])
+                for trigger_row in trigger_rows
+            ]
         )
-        for table_name in sorted(RELATION_NAMES)
-    ), catalog_versions
+    )
+    return (
+        function_oid,
+        tuple(
+            (
+                table_name,
+                triggers_by_table[table_name][_FREEZE_WRITE_TRIGGER],
+                triggers_by_table[table_name][_FREEZE_TRUNCATE_TRIGGER],
+            )
+            for table_name in sorted(RELATION_NAMES)
+        ),
+        catalog_versions,
+    )
 
 
 async def _read_freeze_function(
@@ -941,9 +977,7 @@ def _validate_freeze_triggers(
     for trigger_row in trigger_rows:
         table_name = str(trigger_row["table_name"])
         trigger_name = str(trigger_row["tgname"])
-        expected_type = (
-            30 if trigger_name == _FREEZE_WRITE_TRIGGER else 34
-        )
+        expected_type = 30 if trigger_name == _FREEZE_WRITE_TRIGGER else 34
         if (
             table_name not in RELATION_NAMES
             or trigger_row["tgenabled"] != "A"
@@ -957,8 +991,7 @@ def _validate_freeze_triggers(
             raise NpiResultArchiveError("NPI archive freeze trigger differs")
         triggers_by_table[table_name][trigger_name] = int(trigger_row["oid"])
     if set(triggers_by_table) != set(RELATION_NAMES) or any(
-        set(trigger_by_name)
-        != {_FREEZE_WRITE_TRIGGER, _FREEZE_TRUNCATE_TRIGGER}
+        set(trigger_by_name) != {_FREEZE_WRITE_TRIGGER, _FREEZE_TRUNCATE_TRIGGER}
         for trigger_by_name in triggers_by_table.values()
     ):
         raise NpiResultArchiveError("NPI archive freeze trigger set differs")
@@ -984,9 +1017,8 @@ async def capture_npi_stage_ownership(
     owned_oids = {relation_oid for _, relation_oid in relation_oids}
     sequence_oids = await _owned_sequences(session, schema_oid)
     sequence_bindings = [(owner_table, owner_column) for _, _, owner_table, owner_column in sequence_oids]
-    if (
-        len(set(sequence_bindings)) != len(sequence_bindings)
-        or any(owner_table not in RELATION_NAMES for owner_table, _ in sequence_bindings)
+    if len(set(sequence_bindings)) != len(sequence_bindings) or any(
+        owner_table not in RELATION_NAMES for owner_table, _ in sequence_bindings
     ):
         raise NpiResultArchiveError("NPI archive owned sequence set is invalid")
     owned_sequence_oids = {sequence_oid for _, sequence_oid, _, _ in sequence_oids}
@@ -1024,11 +1056,7 @@ async def _freeze_npi_clone(
 ) -> NpiStageOwnership:
     """Install immutable clone guards before durable prepared authority exists."""
 
-    if (
-        ownership.freeze_function_oid is not None
-        or ownership.freeze_trigger_oids
-        or ownership.freeze_catalog_versions
-    ):
+    if ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids or ownership.freeze_catalog_versions:
         raise NpiResultArchiveError("NPI archive clone is already frozen")
     async with _bounded_catalog_work(session):
         await _lock_family(
@@ -1037,9 +1065,7 @@ async def _freeze_npi_clone(
             "ACCESS EXCLUSIVE",
         )
         await verify_npi_stage_ownership(session, ownership)
-        freeze_function = (
-            f"{_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}"
-        )
+        freeze_function = f"{_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}"
         await session.execute(
             text(
                 f"CREATE FUNCTION {freeze_function}() RETURNS trigger "
@@ -1047,9 +1073,7 @@ async def _freeze_npi_clone(
                 f"AS $function$ {_FREEZE_FUNCTION_BODY} $function$"
             )
         )
-        await session.execute(
-            text(f"REVOKE ALL ON FUNCTION {freeze_function}() FROM PUBLIC")
-        )
+        await session.execute(text(f"REVOKE ALL ON FUNCTION {freeze_function}() FROM PUBLIC"))
         for table_name in RELATION_NAMES:
             await _install_freeze_triggers(
                 session,
@@ -1093,12 +1117,7 @@ async def _install_freeze_triggers(
             f"FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}()"
         )
     )
-    await session.execute(
-        text(
-            f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
-            f"{_quoted(_FREEZE_WRITE_TRIGGER)}"
-        )
-    )
+    await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)}"))
     await session.execute(
         text(
             f"CREATE TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} "
@@ -1106,12 +1125,7 @@ async def _install_freeze_triggers(
             f"EXECUTE FUNCTION {freeze_function}()"
         )
     )
-    await session.execute(
-        text(
-            f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
-            f"{_quoted(_FREEZE_TRUNCATE_TRIGGER)}"
-        )
-    )
+    await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)}"))
 
 
 async def verify_npi_stage_ownership(
@@ -1167,12 +1181,7 @@ async def cleanup_npi_stage(session: Any, ownership: NpiStageOwnership) -> None:
     if int(remaining or 0):
         raise NpiResultArchiveError("NPI archive owned schema is not empty")
     if ownership.freeze_function_oid is not None:
-        await session.execute(
-            text(
-                f"DROP FUNCTION {_quoted(ownership.schema_name)}."
-                f"{_quoted(_FREEZE_FUNCTION)}()"
-            )
-        )
+        await session.execute(text(f"DROP FUNCTION {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}()"))
     await session.execute(text(f"DROP SCHEMA {_quoted(ownership.schema_name)}"))
 
 
@@ -1248,10 +1257,7 @@ async def export_prepared_npi_archive(
 
     if not isinstance(prepared, NpiPreparedSource) or not callable(archive_copy):
         raise NpiResultArchiveError("NPI prepared source is invalid")
-    if (
-        prepared.ownership.freeze_function_oid is None
-        or not prepared.ownership.freeze_trigger_oids
-    ):
+    if prepared.ownership.freeze_function_oid is None or not prepared.ownership.freeze_trigger_oids:
         raise NpiResultArchiveError("NPI prepared source is not frozen")
     manifest = validate_npi_result_manifest(prepared.manifest)
     async with session_factory() as stage_session, stage_session.begin():
@@ -1548,6 +1554,7 @@ async def prepare_npi_activation(
         raise NpiResultArchiveError("NPI validation package identity is invalid")
     await verify_npi_stage_ownership(session, ownership)
     await _verify_stage_owner(session, ownership, sealed_owner_oid)
+    await _advance_and_verify_stage_sequences(session, ownership)
     tables = await _validate_stage_manifest(session, ownership, validated)
     digest_by_field = {
         "contract": VALIDATION_CONTRACT,
@@ -1648,30 +1655,14 @@ async def _remove_npi_clone_freeze(
 ) -> None:
     """Remove only the exact verified clone guards inside the cutover lock."""
 
-    if (
-        ownership.freeze_function_oid is None
-        or not ownership.freeze_trigger_oids
-    ):
+    if ownership.freeze_function_oid is None or not ownership.freeze_trigger_oids:
         return
     await verify_npi_stage_ownership(session, ownership)
     for table_name in RELATION_NAMES:
         relation = f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}"
-        await session.execute(
-            text(
-                f"DROP TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} ON {relation}"
-            )
-        )
-        await session.execute(
-            text(
-                f"DROP TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} ON {relation}"
-            )
-        )
-    await session.execute(
-        text(
-            f"DROP FUNCTION {_quoted(ownership.schema_name)}."
-            f"{_quoted(_FREEZE_FUNCTION)}()"
-        )
-    )
+        await session.execute(text(f"DROP TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} ON {relation}"))
+        await session.execute(text(f"DROP TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} ON {relation}"))
+    await session.execute(text(f"DROP FUNCTION {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}()"))
 
 
 def _validate_cutover_bindings(
@@ -1786,6 +1777,7 @@ async def activate_validated_npi_stage(
     _validate_cutover_bindings(ownership, validated_manifest, validation, cutover)
     await _lock_and_verify_activation(session, ownership, incumbent)
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
+    await _advance_and_verify_stage_sequences(session, ownership)
     current_authority = await read_npi_result_generation_authority(
         session,
         schema_name=incumbent.schema_name,

@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -46,11 +48,7 @@ def _is_owned_native_test_database(database_url) -> bool:
         return False
     if database_url.port == 5440:
         return host in _LOCAL_HOSTS and _LOCAL_DATABASE.fullmatch(database_name) is not None
-    return (
-        host in _CI_HOSTS
-        and database_url.port in (None, 5432)
-        and database_name == _CI_DATABASE
-    )
+    return host in _CI_HOSTS and database_url.port in (None, 5432) and database_name == _CI_DATABASE
 
 
 def _database_url() -> str:
@@ -67,7 +65,7 @@ def _database_url() -> str:
                 port=int(os.environ["HLTHPRT_DB_PORT"]),
                 database=os.environ["HLTHPRT_DB_DATABASE"],
             ).render_as_string(hide_password=False)
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             pytest.fail("pinned CI PostgreSQL configuration is invalid")
     database_url = make_url(raw_dsn)
     if not _is_owned_native_test_database(database_url):
@@ -79,27 +77,104 @@ def _asyncpg_database_url() -> str:
     return make_url(_database_url()).set(drivername="postgresql").render_as_string(hide_password=False)
 
 
+def _native_archive_tool(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        pytest.fail(f"required PostgreSQL archive tool is unavailable: {name}")
+    return path
+
+
+def _native_archive_environment() -> dict[str, str]:
+    database_url = make_url(_database_url())
+    environment = os.environ.copy()
+    environment["PGHOST"] = str(database_url.host or "")
+    environment["PGPORT"] = str(database_url.port or 5432)
+    environment["PGUSER"] = str(database_url.username or "")
+    environment["PGDATABASE"] = str(database_url.database or "")
+    if database_url.password is None:
+        environment.pop("PGPASSWORD", None)
+    else:
+        environment["PGPASSWORD"] = database_url.password
+    return environment
+
+
+def _run_archive_tool(arguments: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+
+def _dump_npi_stage(capture: archive.NpiStageCapture, dump_path: Path) -> None:
+    environment = _native_archive_environment()
+    result = _run_archive_tool(
+        [
+            _native_archive_tool("pg_dump"),
+            "--format=custom",
+            "--file",
+            str(dump_path),
+            f"--snapshot={capture.postgres_snapshot}",
+            *[f"--table={capture.ownership.schema_name}.{table_name}" for table_name in generation.RELATION_NAMES],
+        ],
+        environment,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _restore_npi_table_data(dump_path: Path, restore_list_path: Path, stage_schema: str) -> None:
+    environment = _native_archive_environment()
+    pg_restore = _native_archive_tool("pg_restore")
+    listing = _run_archive_tool([pg_restore, "--list", str(dump_path)], environment)
+    assert listing.returncode == 0, listing.stderr
+    selected_entries = []
+    selected_tables = set()
+    for line in listing.stdout.splitlines():
+        if ";" not in line:
+            continue
+        fields = line.split(";", 1)[1].split()
+        if len(fields) >= 7 and fields[2:4] == ["TABLE", "DATA"] and fields[4] == stage_schema:
+            if fields[5] in generation.RELATION_NAMES:
+                selected_entries.append(line)
+                selected_tables.add(fields[5])
+    assert selected_tables == set(generation.RELATION_NAMES)
+    restore_list_path.write_text("\n".join(selected_entries) + "\n")
+    restored = _run_archive_tool(
+        [
+            pg_restore,
+            "--exit-on-error",
+            "--no-owner",
+            "--no-acl",
+            f"--use-list={restore_list_path}",
+            "--dbname",
+            environment["PGDATABASE"],
+            str(dump_path),
+        ],
+        environment,
+    )
+    assert restored.returncode == 0, restored.stderr
+
+
 @pytest.mark.parametrize(
     ("dsn", "expected"),
     [
         (
-            "postgresql://postgres@127.0.0.1:5440/"
-            "hc_npi_archive_0123456789abcdef0123456789abcdef",
+            "postgresql://postgres@127.0.0.1:5440/hc_npi_archive_0123456789abcdef0123456789abcdef",
             True,
         ),
         (
-            "postgresql://postgres@localhost:5432/"
-            "ptg2_v3_lifecycle_test_ci_runner",
+            "postgresql://postgres@localhost:5432/ptg2_v3_lifecycle_test_ci_runner",
             True,
         ),
         (
-            "postgresql://postgres@postgres:5432/"
-            "ptg2_v3_lifecycle_test_ci_runner",
+            "postgresql://postgres@postgres:5432/ptg2_v3_lifecycle_test_ci_runner",
             True,
         ),
         (
-            "postgresql://postgres@127.0.0.1:5440/"
-            "ptg2_v3_lifecycle_test_ci_runner",
+            "postgresql://postgres@127.0.0.1:5440/ptg2_v3_lifecycle_test_ci_runner",
             False,
         ),
         ("postgresql://postgres@localhost:5432/another_database", False),
@@ -194,14 +269,9 @@ async def _add_owned_sequence(
 ) -> None:
     """Add a deliberately noncanonical serial name to prove catalog binding."""
 
+    await connection.execute(text(f'CREATE SEQUENCE "{schema_name}"."{sequence_name}" AS bigint'))
     await connection.execute(
-        text(f'CREATE SEQUENCE "{schema_name}"."{sequence_name}" AS bigint')
-    )
-    await connection.execute(
-        text(
-            f'ALTER SEQUENCE "{schema_name}"."{sequence_name}" '
-            f'OWNED BY "{schema_name}".npi.synthetic_id'
-        )
+        text(f'ALTER SEQUENCE "{schema_name}"."{sequence_name}" OWNED BY "{schema_name}".npi.synthetic_id')
     )
     await connection.execute(
         text(
@@ -595,10 +665,12 @@ async def _create_paired_metadata_source(
         await _create_family(connection, source_schema, populated=True)
         # The real serving schema also contains publication-ledger identity
         # sequences, which must not become part of the six-table clone.
-        await connection.execute(text(
-            f'CREATE TABLE "{source_schema}".unrelated_publication_ledger '
-            '(generation bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)'
-        ))
+        await connection.execute(
+            text(
+                f'CREATE TABLE "{source_schema}".unrelated_publication_ledger '
+                "(generation bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"
+            )
+        )
         await _add_owned_sequence(
             connection,
             source_schema,
@@ -684,10 +756,7 @@ async def _assert_frozen_paired_stage_rejects_write(
     with pytest.raises(DBAPIError, match="npi_result_archive_is_frozen"):
         async with sessions() as session, session.begin():
             await session.execute(
-                text(
-                    f'UPDATE "{prepared.ownership.schema_name}".npi '
-                    "SET marker='replacement' WHERE synthetic_id=1"
-                )
+                text(f"UPDATE \"{prepared.ownership.schema_name}\".npi SET marker='replacement' WHERE synthetic_id=1")
             )
 
 
@@ -733,18 +802,8 @@ async def _replace_frozen_paired_stage_row(
 
     stage_schema = prepared.ownership.schema_name
     async with sessions() as session, session.begin():
-        await session.execute(
-            text(
-                f'DROP TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
-                f'ON "{stage_schema}".npi'
-            )
-        )
-        await session.execute(
-            text(
-                f'UPDATE "{stage_schema}".npi SET marker=\'replacement\' '
-                "WHERE synthetic_id=1"
-            )
-        )
+        await session.execute(text(f'DROP TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" ON "{stage_schema}".npi'))
+        await session.execute(text(f"UPDATE \"{stage_schema}\".npi SET marker='replacement' WHERE synthetic_id=1"))
         await session.execute(
             text(
                 f'CREATE TRIGGER "{archive._FREEZE_WRITE_TRIGGER}" '
@@ -754,10 +813,7 @@ async def _replace_frozen_paired_stage_row(
             )
         )
         await session.execute(
-            text(
-                f'ALTER TABLE "{stage_schema}".npi ENABLE ALWAYS TRIGGER '
-                f'"{archive._FREEZE_WRITE_TRIGGER}"'
-            )
+            text(f'ALTER TABLE "{stage_schema}".npi ENABLE ALWAYS TRIGGER "{archive._FREEZE_WRITE_TRIGGER}"')
         )
 
 
@@ -881,31 +937,39 @@ async def _mutate_frozen_catalog(
     trigger = f'"{archive._FREEZE_WRITE_TRIGGER}"'
     freeze_function = f'"{stage_schema}"."{archive._FREEZE_FUNCTION}"()'
     if mutation == "disable_enable":
-        await session.execute(text(f'ALTER TABLE {relation} DISABLE TRIGGER {trigger}'))
+        await session.execute(text(f"ALTER TABLE {relation} DISABLE TRIGGER {trigger}"))
     elif mutation == "replace_trigger":
-        await session.execute(text(
-            f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
-            f'ON {relation} FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {freeze_function}'
-        ))
+        await session.execute(
+            text(
+                f"CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE "
+                f"ON {relation} FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION {freeze_function}"
+            )
+        )
     else:
-        await session.execute(text(
-            f'CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql '
-            'SECURITY DEFINER SET search_path=pg_catalog '
-            'AS $function$ BEGIN RETURN NULL; END; $function$'
-        ))
+        await session.execute(
+            text(
+                f"CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql "
+                "SECURITY DEFINER SET search_path=pg_catalog "
+                "AS $function$ BEGIN RETURN NULL; END; $function$"
+            )
+        )
     await session.execute(text(f"UPDATE {relation} SET marker='replacement' WHERE synthetic_id=1"))
     if mutation == "replace_trigger":
-        await session.execute(text(
-            f'CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE '
-            f'ON {relation} FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}'
-        ))
+        await session.execute(
+            text(
+                f"CREATE OR REPLACE TRIGGER {trigger} BEFORE INSERT OR UPDATE OR DELETE "
+                f"ON {relation} FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}"
+            )
+        )
     elif mutation == "replace_function":
-        await session.execute(text(
-            f'CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql '
-            'SECURITY DEFINER SET search_path=pg_catalog '
-            f'AS $function$ {archive._FREEZE_FUNCTION_BODY} $function$'
-        ))
-    await session.execute(text(f'ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {trigger}'))
+        await session.execute(
+            text(
+                f"CREATE OR REPLACE FUNCTION {freeze_function} RETURNS trigger LANGUAGE plpgsql "
+                "SECURITY DEFINER SET search_path=pg_catalog "
+                f"AS $function$ {archive._FREEZE_FUNCTION_BODY} $function$"
+            )
+        )
+    await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {trigger}"))
 
 
 def _install_timeout_observers(
@@ -970,9 +1034,7 @@ async def test_prepared_npi_export_keeps_long_validation_outside_capture_timeout
 
         async def archive_copy(capture):
             archive_captures.append(capture)
-            timeout_observations.append(
-                ("copy", await stage_sessions[-1].scalar(text("SHOW statement_timeout")))
-            )
+            timeout_observations.append(("copy", await stage_sessions[-1].scalar(text("SHOW statement_timeout"))))
 
         await archive.export_prepared_npi_archive(
             sessions,
@@ -1027,6 +1089,172 @@ async def test_npi_model_restore_layout_has_exact_owned_relations() -> None:
                 await connection.execute(
                     text(f'DROP SCHEMA IF EXISTS "{archive.npi_stage_schema(dataset_id)}" CASCADE')
                 )
+        finally:
+            await engine.dispose()
+
+
+async def _build_dumped_npi_archive(
+    sessions,
+    *,
+    source_dataset_id: UUID,
+    restore_dataset_id: UUID,
+    dump_path: Path,
+    restored_npi: int,
+):
+    source_schema = archive.npi_stage_schema(source_dataset_id)
+    async with sessions() as session, session.begin():
+        await _ensure_model_extensions(session)
+        await archive.precreate_npi_restore(session, dataset_id=source_dataset_id)
+        await session.execute(
+            text(f'INSERT INTO "{source_schema}".npi (npi) VALUES (:npi)'),
+            {"npi": restored_npi},
+        )
+        await _run_migration(await session.connection(), source_schema)
+
+    async def retain_prepared(_session, _prepared) -> None:
+        return None
+
+    prepared = await archive.prepare_npi_archive_source(
+        sessions,
+        schema_name=source_schema,
+        source_metadata={"release": "synthetic-data-only"},
+        dataset_id=restore_dataset_id,
+        on_prepared=retain_prepared,
+    )
+    assert prepared.manifest.capture_authority == "legacy-manual"
+    assert len(prepared.ownership.sequence_oids) == 1
+
+    async def dump_capture(capture) -> None:
+        _dump_npi_stage(capture, dump_path)
+
+    await archive.export_prepared_npi_archive(
+        sessions,
+        prepared=prepared,
+        archive_copy=dump_capture,
+    )
+    async with sessions() as session, session.begin():
+        await archive.cleanup_npi_stage(session, prepared.ownership)
+    return prepared.manifest
+
+
+async def _prepare_data_only_cutover(
+    sessions,
+    *,
+    restore_dataset_id: UUID,
+    destination_schema: str,
+    manifest,
+    dump_path: Path,
+    restore_list_path: Path,
+    restored_npi: int,
+):
+    stage_schema = archive.npi_stage_schema(restore_dataset_id)
+    async with sessions() as session, session.begin():
+        restored_ownership = await archive.precreate_npi_restore(session, dataset_id=restore_dataset_id)
+    _restore_npi_table_data(dump_path, restore_list_path, stage_schema)
+    sequence_name, _sequence_oid, owner_table, owner_column = restored_ownership.sequence_oids[0]
+    assert (owner_table, owner_column) == ("npi", "npi")
+    sequence_relation = f'"{stage_schema}"."{sequence_name}"'
+    async with sessions() as session, session.begin():
+        initial_state = await session.execute(text(f"SELECT last_value::bigint, is_called FROM {sequence_relation}"))
+        assert tuple(initial_state.one()) == (1, False)
+        await archive.validate_npi_stage(session, ownership=restored_ownership, manifest=manifest)
+        incumbent = await archive.capture_npi_incumbent(session, schema_name=destination_schema)
+        owner_oid = await session.scalar(text("SELECT current_user::regrole::oid"))
+        validation = await archive.prepare_npi_activation(
+            session,
+            ownership=restored_ownership,
+            manifest=manifest,
+            package_id="b" * 64,
+            sealed_owner_oid=owner_oid,
+        )
+        aligned_state = await session.execute(text(f"SELECT last_value::bigint, is_called FROM {sequence_relation}"))
+        assert tuple(aligned_state.one()) == (restored_npi, True)
+    return restored_ownership, incumbent, owner_oid, validation
+
+
+async def _activate_and_assert_restored_sequence(
+    sessions,
+    *,
+    ownership,
+    manifest,
+    incumbent,
+    validation,
+    owner_oid: int,
+):
+    sequence_name = ownership.sequence_oids[0][0]
+    sequence_relation = f'"{ownership.schema_name}"."{sequence_name}"'
+    async with sessions() as session, session.begin():
+        await session.execute(text(f"SELECT pg_catalog.setval('{sequence_relation}'::regclass,1,false)"))
+
+    async def record_activation(_session, _receipt) -> None:
+        return None
+
+    async with sessions() as session, session.begin():
+        receipt = await archive.activate_validated_npi_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            incumbent=incumbent,
+            validation_receipt=validation,
+            cutover=archive.NpiCutoverAuthority("b" * 64, owner_oid, owner_oid, "manual"),
+            on_activated=record_activation,
+        )
+    async with sessions() as session:
+        highest_npi = await session.scalar(text(f'SELECT max(npi) FROM "{incumbent.schema_name}".npi'))
+        next_npi = await session.scalar(
+            text("SELECT nextval(pg_get_serial_sequence(:table_name,'npi'))"),
+            {"table_name": f"{incumbent.schema_name}.npi"},
+        )
+    assert next_npi == highest_npi + 1
+    return receipt
+
+
+@pytest.mark.asyncio
+async def test_data_only_restore_advances_owned_sequence_before_activation(tmp_path: Path) -> None:
+    """Restore only table data, activate it, and allocate beyond the restored NPI."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    source_dataset_id = uuid4()
+    restore_dataset_id = uuid4()
+    destination_schema = "npi_data_restore_" + uuid4().hex
+    restored_npi = 1_999_999_999
+    cleanup_schemas = {
+        archive.npi_stage_schema(source_dataset_id),
+        archive.npi_stage_schema(restore_dataset_id),
+        destination_schema,
+    }
+    try:
+        async with engine.begin() as connection:
+            await _create_family(connection, destination_schema, populated=False)
+        manifest = await _build_dumped_npi_archive(
+            sessions,
+            source_dataset_id=source_dataset_id,
+            restore_dataset_id=restore_dataset_id,
+            dump_path=tmp_path / "npi-result.dump",
+            restored_npi=restored_npi,
+        )
+        ownership, incumbent, owner_oid, validation = await _prepare_data_only_cutover(
+            sessions,
+            restore_dataset_id=restore_dataset_id,
+            destination_schema=destination_schema,
+            manifest=manifest,
+            dump_path=tmp_path / "npi-result.dump",
+            restore_list_path=tmp_path / "npi-result-table-data.list",
+            restored_npi=restored_npi,
+        )
+        receipt = await _activate_and_assert_restored_sequence(
+            sessions,
+            ownership=ownership,
+            manifest=manifest,
+            incumbent=incumbent,
+            validation=validation,
+            owner_oid=owner_oid,
+        )
+        cleanup_schemas.add(receipt.predecessor_schema_name)
+    finally:
+        try:
+            await _drop_schemas(engine, cleanup_schemas)
         finally:
             await engine.dispose()
 
@@ -1086,9 +1314,7 @@ def _ordinary_index_suffixes(
 ) -> tuple[str, ...]:
     """Return ordinary rotation suffixes for indexes present in the test schema."""
 
-    all_indexes = tuple(
-        getattr(model_type, "__my_initial_indexes__", ()) or ()
-    ) + tuple(index_definitions)
+    all_indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(index_definitions)
     return tuple(
         definition.get("name", "_".join(definition["index_elements"]))
         for definition in all_indexes
@@ -1111,9 +1337,7 @@ async def _rotate_ordinary_model(
     from process.ext.utils import make_class
 
     staged_model = make_class(model_type, import_date)
-    index_definitions = tuple(
-        getattr(model_type, "__my_additional_indexes__", ()) or ()
-    )
+    index_definitions = tuple(getattr(model_type, "__my_additional_indexes__", ()) or ())
     await _create_ordinary_model_indexes(
         session,
         source_schema,
@@ -1215,12 +1439,8 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
                 source_schema,
                 ownership.schema_name,
             )
-        assert [
-            (receipt.model_name, receipt.table_name, receipt.schema_sha256)
-            for receipt in restored_receipts
-        ] == [
-            (receipt.model_name, receipt.table_name, receipt.schema_sha256)
-            for receipt in source_receipts
+        assert [(receipt.model_name, receipt.table_name, receipt.schema_sha256) for receipt in restored_receipts] == [
+            (receipt.model_name, receipt.table_name, receipt.schema_sha256) for receipt in source_receipts
         ]
     finally:
         try:

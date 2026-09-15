@@ -19,7 +19,6 @@ from process.npi_canonical_publication import (
     validate_npi_canonical_publication_receipt,
 )
 
-
 TABLE_NAME = "npi_result_generation"
 REVISION_FUNCTION = "advance_npi_result_generation"
 REVISION_TRIGGER = "npi_result_generation_revision_guard"
@@ -84,9 +83,7 @@ class NpiResultGenerationAuthority:
         return {
             "local_lineage_id": self.local_lineage_id,
             "local_generation": self.local_generation,
-            "serving_generation": (
-                None if self.serving_generation is None else self.serving_generation.as_dict()
-            ),
+            "serving_generation": (None if self.serving_generation is None else self.serving_generation.as_dict()),
             "relation_oids": None if self.relation_oids is None else list(self.relation_oids),
             "canonical_provenance": (
                 None if self.canonical_provenance is None else self.canonical_provenance.as_dict()
@@ -114,7 +111,7 @@ def _quoted(value: str) -> str:
 def _uuid_text(value: object) -> str:
     try:
         return str(UUID(str(value)))
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         raise ValueError("NPI result generation lineage is invalid") from None
 
 
@@ -150,13 +147,9 @@ def _relation_oids(value: object) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)) or len(value) != len(RELATION_NAMES):
         raise ValueError("NPI serving relation identity is invalid")
     normalized_oids = tuple(value)
-    if (
-        any(
-            type(relation_oid) is not int or not 0 < relation_oid <= _MAX_OID
-            for relation_oid in normalized_oids
-        )
-        or len(set(normalized_oids)) != len(normalized_oids)
-    ):
+    if any(
+        type(relation_oid) is not int or not 0 < relation_oid <= _MAX_OID for relation_oid in normalized_oids
+    ) or len(set(normalized_oids)) != len(normalized_oids):
         raise ValueError("NPI serving relation identity is invalid")
     return normalized_oids
 
@@ -193,14 +186,13 @@ def validate_npi_canonical_provenance(value: object) -> NpiCanonicalProvenance:
         raise ValueError("NPI canonical provenance is invalid")
     try:
         import_date = datetime.date.fromisoformat(str(value["import_date"]))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise ValueError("NPI canonical provenance is invalid") from None
     publication_ref = str(value["publication_ref"])
     chain_ref = str(value["chain_ref"])
     generation = _canonical_generation(value["publication_generation"])
-    if (
-        not re.fullmatch(r"nppub1_[A-Za-z0-9_-]{43}", publication_ref)
-        or not re.fullmatch(r"penpc1_[A-Za-z0-9_-]{43}", chain_ref)
+    if not re.fullmatch(r"nppub1_[A-Za-z0-9_-]{43}", publication_ref) or not re.fullmatch(
+        r"penpc1_[A-Za-z0-9_-]{43}", chain_ref
     ):
         raise ValueError("NPI canonical provenance is invalid")
     return NpiCanonicalProvenance(publication_ref, generation, chain_ref, import_date)
@@ -297,11 +289,7 @@ async def read_npi_result_generation_authority(
     """Read the one durable NPI result authority in a caller transaction."""
 
     schema = _schema_name(schema_name)
-    authority_row = (
-        (await session.execute(text(_state_projection(schema, lock=lock))))
-        .mappings()
-        .one_or_none()
-    )
+    authority_row = (await session.execute(text(_state_projection(schema, lock=lock)))).mappings().one_or_none()
     if authority_row is None:
         raise RuntimeError("NPI result generation authority is unavailable")
     return validate_npi_result_generation_authority(authority_row)
@@ -327,7 +315,7 @@ async def current_npi_relation_oids(session: Any, *, schema_name: str) -> tuple[
     try:
         names = tuple(str(row[0]) for row in rows)
         oids = _relation_oids(tuple(int(row[1]) for row in rows))
-    except (IndexError, TypeError, ValueError):
+    except IndexError, TypeError, ValueError:
         raise RuntimeError("NPI serving relations are unavailable") from None
     if names != RELATION_NAMES:
         raise RuntimeError("NPI serving relations are unavailable")
@@ -368,10 +356,7 @@ async def _matching_canonical_provenance(
                     "AS sealed USING (publication_ref) WHERE "
                     f"{oid_predicates} ORDER BY receipt.publication_generation DESC LIMIT 1"
                 ),
-                {
-                    f"relation_{ordinal}": relation_oid
-                    for ordinal, relation_oid in enumerate(relation_oids, 1)
-                },
+                {f"relation_{ordinal}": relation_oid for ordinal, relation_oid in enumerate(relation_oids, 1)},
             )
         )
         .mappings()
@@ -432,9 +417,7 @@ async def _write_bootstrap_authority(
                     "next_generation": next_generation,
                     "relation_oids": list(relation_oids),
                     "publication_ref": None if provenance is None else provenance.publication_ref,
-                    "publication_generation": (
-                        None if provenance is None else provenance.publication_generation
-                    ),
+                    "publication_generation": (None if provenance is None else provenance.publication_generation),
                     "chain_ref": None if provenance is None else provenance.chain_ref,
                     "import_date": None if provenance is None else provenance.import_date,
                 },
@@ -464,9 +447,7 @@ async def bootstrap_npi_result_generation(
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise ValueError("NPI result generation bootstrap requires a caller transaction")
     schema = _schema_name(schema_name)
-    relations = ", ".join(
-        f"{_quoted(schema)}.{_quoted(table_name)}" for table_name in RELATION_NAMES
-    )
+    relations = ", ".join(f"{_quoted(schema)}.{_quoted(table_name)}" for table_name in RELATION_NAMES)
     async with _bounded_bootstrap(session):
         await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
         relation_oids = await current_npi_relation_oids(session, schema_name=schema)
@@ -595,9 +576,7 @@ async def install_npi_stage_mutation_guards(
     function_schema = _schema_name(function_schema_name or schema)
     if len(stage_tables) != len(RELATION_NAMES) or len(set(stage_tables)) != len(stage_tables):
         raise ValueError("NPI result generation stage family is invalid")
-    guard_function = (
-        f"{_quoted(function_schema)}.{_quoted('guard_npi_canonical_publication_after_seal')}"
-    )
+    guard_function = f"{_quoted(function_schema)}.{_quoted('guard_npi_canonical_publication_after_seal')}"
     for stage_table_value in stage_tables:
         stage_table = _identifier(stage_table_value, field_name="stage table")
         relation = f"{_quoted(schema)}.{_quoted(stage_table)}"
@@ -613,7 +592,7 @@ async def install_npi_stage_mutation_guards(
             "CREATE TRIGGER npi_canonical_publication_postseal_truncate_guard "
             f"BEFORE TRUNCATE ON {relation} FOR EACH STATEMENT EXECUTE FUNCTION {guard_function}(); "
             f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER "
-            "npi_canonical_publication_postseal_truncate_guard;"
+            "npi_canonical_publication_postseal_truncate_guard;",
         )
     await install_npi_result_revision_guards(
         connection,
@@ -649,9 +628,7 @@ async def publish_local_npi_result_generation(
     )
     if live_oids is None:
         raise RuntimeError("NPI serving relations are unavailable")
-    relation_oids = _relation_oids(
-        tuple(live_oids[f"relation_{ordinal}"] for ordinal in range(1, 7))
-    )
+    relation_oids = _relation_oids(tuple(live_oids[f"relation_{ordinal}"] for ordinal in range(1, 7)))
     if relation_oids != fixed_receipt.relation_oids:
         raise RuntimeError("NPI publication relation identity differs")
     provenance = _provenance(fixed_receipt)
@@ -695,9 +672,7 @@ async def _adopted_generation_parameters(
         "origin_lineage_id": validated_source.origin_lineage_id,
         "origin_generation": validated_source.origin_generation,
         "published_at": validated_source.published_at,
-        "relation_oids": list(
-            await current_npi_relation_oids(session, schema_name=schema_name)
-        ),
+        "relation_oids": list(await current_npi_relation_oids(session, schema_name=schema_name)),
     }
 
 
@@ -717,11 +692,7 @@ async def publish_adopted_npi_result_generation(
         schema_name=schema,
         source_generation=source_generation,
     )
-    provenance = (
-        None
-        if canonical_provenance is None
-        else validate_npi_canonical_provenance(canonical_provenance)
-    )
+    provenance = None if canonical_provenance is None else validate_npi_canonical_provenance(canonical_provenance)
     updated_row = (
         (
             await session.execute(
