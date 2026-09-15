@@ -656,7 +656,7 @@ async def test_result_generation_migration_guards_only_a_complete_npi_family() -
 
     engine = create_async_engine(_database_url(), poolclass=NullPool)
     schema_name = "npi_generation_complete_" + uuid4().hex
-    relation = f'"{schema_name}"."npi_result_generation"'
+    state_relation = f'"{schema_name}"."npi_result_generation"'
     try:
         async with engine.begin() as connection:
             await _create_family(connection, schema_name, populated=True)
@@ -674,11 +674,12 @@ async def test_result_generation_migration_guards_only_a_complete_npi_family() -
                     {"schema_name": schema_name},
                 )
             ).all()
-            assert {row[0] for row in trigger_rows} == set(generation.RELATION_NAMES)
-            assert {row[1] for row in trigger_rows} == {"A"}
+            assert {trigger_row[0] for trigger_row in trigger_rows} == set(generation.RELATION_NAMES)
+            assert {trigger_row[1] for trigger_row in trigger_rows} == {"A"}
             await _run_migration_downgrade(connection, schema_name)
             assert (
-                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation}) is None
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": state_relation})
+                is None
             )
             for table_name in generation.RELATION_NAMES:
                 assert await connection.scalar(text(f'SELECT count(*) FROM "{schema_name}"."{table_name}"')) == 1
@@ -738,6 +739,30 @@ async def test_result_generation_migration_downgrade_rejects_a_partial_family() 
             )
             assert (
                 await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
+                is not None
+            )
+    finally:
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_result_generation_migration_downgrade_preserves_recorded_evidence() -> None:
+    """The empty-family compatibility path does not weaken retained-state refusal."""
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_generation_retained_" + uuid4().hex
+    relation = f'"{schema_name}"."npi_result_generation"'
+    try:
+        async with engine.begin() as connection:
+            await _create_family(connection, schema_name, populated=True)
+            await connection.execute(text(f"UPDATE {relation} SET local_generation = 1"))
+            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
+                await _run_migration_downgrade(connection, schema_name)
+            assert (
+                await connection.scalar(text("SELECT to_regclass(:relation_name)"), {"relation_name": relation})
                 is not None
             )
     finally:
