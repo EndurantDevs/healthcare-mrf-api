@@ -388,14 +388,17 @@ fn parse_wide_payers(
         {
             continue;
         }
+        let standard_charge_dollar = optional_decimal(
+            csv_value(record, payer.standard_charge_dollar),
+            "standard_charge_dollar",
+        )?;
+        let has_standard_charge_dollar = standard_charge_dollar.is_some();
+        let estimated_amount_value = csv_profile_value(record, payer.estimated_amount);
         let parsed = PayerChargeRow {
             payer_name: payer.payer_name.clone(),
             plan_name: optional_text(&payer.plan_name),
             negotiated_rate_term: payer.negotiated_rate_term.clone(),
-            standard_charge_dollar: optional_decimal(
-                csv_value(record, payer.standard_charge_dollar),
-                "standard_charge_dollar",
-            )?,
+            standard_charge_dollar,
             standard_charge_percentage: optional_decimal(
                 csv_value(record, payer.standard_charge_percentage),
                 "standard_charge_percentage",
@@ -404,10 +407,26 @@ fn parse_wide_payers(
                 record,
                 payer.standard_charge_algorithm,
             )),
-            estimated_amount: optional_decimal(
-                csv_profile_value(record, payer.estimated_amount),
-                "estimated_amount",
-            )?,
+            estimated_amount: match canonical_decimal_text(estimated_amount_value) {
+                None if estimated_amount_value.is_empty() => None,
+                None => {
+                    return Err(invalid(
+                        "estimated_amount must be an exact decimal number",
+                    ));
+                }
+                Some(value)
+                    if value == "0"
+                        && profile == CmsProfile::V2
+                        && has_standard_charge_dollar
+                        && !estimated_amount_value.starts_with('-') =>
+                {
+                    None
+                }
+                Some(value) if value == "0" || value.starts_with('-') => {
+                    return Err(invalid("estimated_amount must be greater than zero"));
+                }
+                Some(value) => Some(value),
+            },
             median_amount: optional_decimal(
                 csv_profile_value(record, payer.median_amount),
                 "median_amount",

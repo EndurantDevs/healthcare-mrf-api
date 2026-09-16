@@ -300,6 +300,77 @@ fn cms_csv_v2_tall_and_wide_preserve_declared_version_and_estimated_amount() {
 }
 
 #[test]
+fn cms_csv_v2_wide_zero_estimate_is_absent_only_with_a_positive_dollar() {
+    let mut records = csv_fixture_records(&fixture_v2_csv(InputFormat::WideCsv, "2.0.0"));
+    let dollar = csv_fixture_index(
+        &records[2],
+        "standard_charge|Payer, Inc.|Plan A|negotiated_dollar",
+    );
+    let algorithm = csv_fixture_index(
+        &records[2],
+        "standard_charge|Payer, Inc.|Plan A|negotiated_algorithm",
+    );
+    let estimated = csv_fixture_index(
+        &records[2],
+        "estimated_amount|Payer, Inc.|Plan A",
+    );
+    records[3][dollar] = "12.34".to_owned();
+    records[3][algorithm] = "Percent of billed charges".to_owned();
+    records[3][estimated] = ".0".to_owned();
+
+    let rows = run_fixture(
+        InputFormat::WideCsv,
+        &csv_fixture_bytes(&records),
+        false,
+    );
+    let payer = String::from_utf8(rows["payer_charge"].clone()).unwrap();
+    let payer = payer.trim_end().split('\t').collect::<Vec<_>>();
+    for (column, expected) in [
+        ("standard_charge_dollar", "12.34"),
+        ("standard_charge_algorithm", "Percent of billed charges"),
+        ("estimated_amount", "\\N"),
+    ] {
+        let index = PAYER_CHARGE_COPY_COLUMNS
+            .iter()
+            .position(|candidate| *candidate == column)
+            .unwrap();
+        assert_eq!(payer[index], expected);
+    }
+
+    for (dollar_value, estimated_value, expected) in [
+        ("", "0", "estimated_amount must be greater than zero"),
+        ("12.34", "-1", "estimated_amount must be greater than zero"),
+        ("12.34", "-0", "estimated_amount must be greater than zero"),
+        (
+            "12.34",
+            "not-a-number",
+            "estimated_amount must be an exact decimal number",
+        ),
+    ] {
+        records[3][dollar] = dollar_value.to_owned();
+        records[3][estimated] = estimated_value.to_owned();
+        assert_import_error(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            expected,
+        );
+    }
+
+    let mut tall = csv_fixture_records(&fixture_v2_csv(InputFormat::TallCsv, "2.0.0"));
+    let tall_dollar = csv_fixture_index(&tall[2], "standard_charge | negotiated_dollar");
+    let tall_estimated = csv_fixture_index(&tall[2], "estimated_amount");
+    tall[3][tall_dollar] = "12.34".to_owned();
+    tall[3][tall_estimated] = "0".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&tall),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "estimated_amount must be greater than zero",
+    );
+}
+
+#[test]
 fn cms_csv_v2_preserves_optional_forward_metadata_without_changing_profile() {
     let v3_records = csv_fixture_records(&fixture_tall_csv());
     let npi_index = csv_fixture_index(&v3_records[0], "type_2_npi");
