@@ -3026,6 +3026,18 @@ paths:
             type: integer
             enum: [1, 2]
           description: 1 = individual provider, 2 = organization
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: When taxonomy filters are present, match only the provider's primary NPPES taxonomy row.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Optional immutable plan release whose published in-network NPI scope constrains results.
         - name: provider_sex_code
           in: query
           schema:
@@ -3108,6 +3120,18 @@ paths:
           schema:
             type: string
           description: Comma-separated NUCC taxonomy codes to filter results
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: When taxonomy filters are present, match only the provider's primary NPPES taxonomy row.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Optional immutable plan release whose published in-network NPI scope constrains results.
         - name: plan_network
           in: query
           schema:
@@ -3121,6 +3145,12 @@ paths:
           description: |
             Exact NPPES provider sex code applied before distance ordering and
             limiting. Input is case-insensitive and normalized to uppercase.
+        - name: entity_type_code
+          in: query
+          schema:
+            type: integer
+            enum: [1, 2]
+          description: 1 = individual provider, 2 = organization. Applied before distance ordering and limiting.
         - name: classification
           in: query
           schema:
