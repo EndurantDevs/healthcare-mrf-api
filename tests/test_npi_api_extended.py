@@ -3083,3 +3083,123 @@ def test_dedupe_addresses_merges_nondiscriminating_site_key_with_fhir_overlay():
     assert (merged_address["lat"], merged_address["long"]) == (33.90559, -98.47978)
     assert merged_address["address_sources"] == ["nppes", "provider_directory_fhir"]
     assert len(merged_address["source_record_ids"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expects_primary_predicate"),
+    [(None, True), ("false", False)],
+)
+async def test_get_near_npi_filters_primary_taxonomy_and_entity_before_limit(
+    monkeypatch,
+    raw_primary_only,
+    expects_primary_predicate,
+):
+    sql_calls = []
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            sql_calls.append((sql_text, dict(params)))
+            if "COUNT(DISTINCT" in sql_text:
+                return [(1,)]
+            return [_build_near_row(5556667778)]
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    request_args_by_name = {
+        "long": "-87.0",
+        "lat": "41.0",
+        "classification": "Family Medicine",
+        "entity_type_code": "2",
+        "include_total": "true",
+        "limit": "1",
+    }
+    if raw_primary_only is not None:
+        request_args_by_name["primary_only"] = raw_primary_only
+
+    await npi_module.get_near_npi(
+        types.SimpleNamespace(args=request_args_by_name, app=types.SimpleNamespace())
+    )
+
+    primary_predicate = (
+        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+    )
+    result_sql = next(sql for sql, _params in sql_calls if "LIMIT :limit" in sql)
+    count_sql = next(sql for sql, _params in sql_calls if "COUNT(DISTINCT" in sql)
+    for sql in (result_sql, count_sql):
+        assert "d.entity_type_code = :entity_type_code" in sql
+        assert (primary_predicate in sql) is expects_primary_predicate
+    assert result_sql.index("d.entity_type_code = :entity_type_code") < result_sql.index(
+        "LIMIT :limit"
+    )
+    assert any(params.get("entity_type_code") == 2 for _sql, params in sql_calls)
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch):
+    sql_calls = []
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            sql_calls.append((sql_text, dict(params)))
+            if "COUNT(DISTINCT" in sql_text:
+                return [(0,)]
+            return []
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    async def fake_plan_scope(_session, raw_plan_release_id):
+        assert raw_plan_release_id == "hprelease_" + "0" * 26
+        return (
+            "SELECT npi FROM mrf.ptg2_v3_npi_scope "
+            "WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
+            {"plan_scope_snapshot_keys_0": [17]},
+        )
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", fake_plan_scope)
+
+    await npi_module.get_near_npi(
+        types.SimpleNamespace(
+            args={
+                "long": "-87.0",
+                "lat": "41.0",
+                "plan_release_id": "hprelease_" + "0" * 26,
+                "include_total": "true",
+                "limit": "1",
+            },
+            app=types.SimpleNamespace(),
+        )
+    )
+
+    scoped_sql = "a.npi IN (SELECT npi FROM mrf.ptg2_v3_npi_scope"
+    result_sql = next(sql for sql, _params in sql_calls if "LIMIT :limit" in sql)
+    count_sql = next(sql for sql, _params in sql_calls if "COUNT(DISTINCT" in sql)
+    assert scoped_sql in result_sql
+    assert scoped_sql in count_sql
+    assert all(
+        params["plan_scope_snapshot_keys_0"] == [17]
+        for _sql, params in sql_calls
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_args", "message"),
+    [
+        ({"primary_only": "sometimes"}, "primary_only.*boolean"),
+        ({"entity_type_code": "3"}, "entity_type_code must be either"),
+    ],
+)
+async def test_get_near_npi_rejects_invalid_provider_filters(request_args, message):
+    with pytest.raises(sanic.exceptions.InvalidUsage, match=message):
+        await npi_module.get_near_npi(
+            types.SimpleNamespace(args=request_args, app=types.SimpleNamespace())
+        )
