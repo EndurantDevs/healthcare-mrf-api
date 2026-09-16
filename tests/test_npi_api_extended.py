@@ -3196,6 +3196,10 @@ async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch)
     [
         ({"primary_only": "sometimes"}, "primary_only.*boolean"),
         ({"entity_type_code": "3"}, "entity_type_code must be either"),
+        (
+            {"entity_type_code": "2", "provider_sex_code": "F"},
+            "cannot be combined with entity_type_code=2",
+        ),
     ],
 )
 async def test_get_near_npi_rejects_invalid_provider_filters(request_args, message):
