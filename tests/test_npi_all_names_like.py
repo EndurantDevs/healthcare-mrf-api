@@ -523,7 +523,7 @@ def test_name_taxonomy_projection_disabled_emits_legacy_schema_sql(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("raw_primary_only", "expects_primary_predicate"),
-    [(None, True), ("false", False)],
+    [(None, True), ("true", True), ("false", False)],
 )
 async def test_get_all_applies_primary_taxonomy_to_page_and_count(
     monkeypatch,
@@ -655,6 +655,93 @@ async def test_plan_release_npi_scope_fails_closed_when_not_serving(monkeypatch)
 
     assert sql == "SELECT NULL::BIGINT AS npi WHERE FALSE"
     assert params == {}
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_rejects_invalid_release_id():
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="plan_release_id"):
+        await npi_module._plan_release_npi_scope(object(), "not-a-release")
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_requires_session():
+    with pytest.raises(RuntimeError, match="session not available"):
+        await npi_module._plan_release_npi_scope(
+            None,
+            "hprelease_" + "0" * 26,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        (
+            types.SimpleNamespace(network_tables_by_snapshot=lambda: None),
+            "incomplete network bindings",
+        ),
+        (
+            types.SimpleNamespace(
+                in_network_bindings=(types.SimpleNamespace(snapshot_id="snapshot"),),
+                network_tables_by_snapshot=lambda: {
+                    "snapshot": types.SimpleNamespace(shared_snapshot_key=None)
+                },
+            ),
+            "not bound to strict shared-block storage",
+        ),
+    ],
+)
+async def test_plan_release_npi_scope_rejects_incomplete_serving_bindings(
+    monkeypatch,
+    selection,
+    message,
+):
+    monkeypatch.setattr(
+        provider_search_sql,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await npi_module._plan_release_npi_scope(
+            object(),
+            "hprelease_" + "0" * 26,
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_fails_closed_without_network_bindings(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        provider_search_sql,
+        "resolve_plan_release_serving",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                in_network_bindings=(),
+                network_tables_by_snapshot=lambda: {},
+            )
+        ),
+    )
+
+    sql, params = await npi_module._plan_release_npi_scope(
+        object(),
+        "hprelease_" + "0" * 26,
+    )
+
+    assert sql == "SELECT NULL::BIGINT AS npi WHERE FALSE"
+    assert params == {}
+
+
+def test_taxonomy_cte_uses_scalar_codes_without_name_filter():
+    sql = npi_module._provider_taxonomy_matched_npi_cte(
+        "1=1",
+        code_placeholders=(":taxonomy_code",),
+        primary_only=True,
+    )
+
+    assert "IN (:taxonomy_code)" in sql
+    assert "healthcare_provider_primary_taxonomy_switch" in sql
 
 
 @pytest.mark.asyncio
