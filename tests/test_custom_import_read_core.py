@@ -9,8 +9,10 @@ import pytest
 from process.custom_import.read_core import (
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
+    CustomImportReadRequestError,
     CustomImportReadService,
     ExtensionReadAuthorization,
+    MAX_READ_TIMEOUT_MS,
     PinnedReadTarget,
     ReadCursorCodec,
     ReadCursorState,
@@ -42,6 +44,16 @@ def _cursor_state(*, expires_at: int = 1_100) -> ReadCursorState:
 
 def _codec() -> ReadCursorCodec:
     return ReadCursorCodec(b"c" * 32)
+
+
+@pytest.mark.parametrize("statement_timeout_ms", (False, 0, MAX_READ_TIMEOUT_MS + 1))
+def test_read_service_rejects_an_invalid_statement_timeout(statement_timeout_ms):
+    with pytest.raises(CustomImportReadRequestError, match="statement_timeout_ms"):
+        CustomImportReadService(
+            authorizer=None,
+            cursor_secret=b"s" * 32,
+            statement_timeout_ms=statement_timeout_ms,
+        )
 
 
 def test_cursor_rejects_tampering_scope_generation_and_expiry():
