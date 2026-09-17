@@ -294,6 +294,12 @@ def hospital_hpt_group_ids(hospital_id: str) -> tuple[str, ...]:
     return _group_ids_by_hospital_id().get(hospital_id, ())
 
 
+def warm_hospital_hpt_registry() -> None:
+    """Validate and materialize the fixed registry for this API worker."""
+
+    _group_ids_by_hospital_id()
+
+
 def selected_hospital_hpt_registry(
     params: dict[str, Any], *, runtime: bool = False
 ) -> tuple[dict[str, str], ...]:

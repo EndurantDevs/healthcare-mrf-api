@@ -148,6 +148,11 @@ async def test_worker_memory_listeners_are_worker_scoped(monkeypatch):
 
     monkeypatch.setattr(
         worker_memory,
+        "warm_hospital_hpt_registry",
+        lambda: call_names.append("warm_registry"),
+    )
+    monkeypatch.setattr(
+        worker_memory,
         "freeze_api_worker_heap",
         lambda: call_names.append("freeze"),
     )
@@ -158,7 +163,12 @@ async def test_worker_memory_listeners_are_worker_scoped(monkeypatch):
     )
     worker_memory.register_worker_memory_lifecycle(FakeApp())
 
-    assert set(listener_by_event) == {"after_server_start", "before_server_stop"}
+    assert set(listener_by_event) == {
+        "before_server_start",
+        "after_server_start",
+        "before_server_stop",
+    }
+    await listener_by_event["before_server_start"](object())
     await listener_by_event["after_server_start"](object())
     await listener_by_event["before_server_stop"](object())
-    assert call_names == ["freeze", "unfreeze"]
+    assert call_names == ["warm_registry", "freeze", "unfreeze"]

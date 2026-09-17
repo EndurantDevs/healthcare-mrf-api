@@ -385,6 +385,30 @@ async def test_get_all_broad_q_explicit_include_total_still_skips_slow_count(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("search_args", [{"q": "clinic"}, {"name_like": "clinic"}])
+async def test_get_all_broad_name_page_bounds_before_address_hydration(
+    monkeypatch,
+    search_args,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={**search_args, "limit": "5", "start": "10"}
+        )
+    )
+
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert "filtered_npi AS MATERIALIZED" not in page_sql
+    assert "SELECT b.npi" in page_sql
+    assert "FROM mrf.npi AS b" in page_sql
+    assert "AND EXISTS (" in page_sql
+    assert "ORDER BY b.npi" in page_sql
+    assert "LIMIT :limit OFFSET :start" in page_sql
+
+
+@pytest.mark.asyncio
 async def test_get_all_without_taxonomy_filters_skips_expensive_overlap(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
