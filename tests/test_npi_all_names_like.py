@@ -555,6 +555,60 @@ async def test_get_all_applies_primary_taxonomy_to_page_and_count(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expects_primary_predicate"),
+    [(None, True), ("false", False)],
+)
+async def test_get_all_location_first_classification_honors_primary_only(
+    monkeypatch,
+    raw_primary_only,
+    expects_primary_predicate,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    request_args_by_name = {
+        "classification": "Family Medicine",
+        "zip_code": "60601",
+        "include_total": "true",
+    }
+    if raw_primary_only is not None:
+        request_args_by_name["primary_only"] = raw_primary_only
+
+    await get_all(types.SimpleNamespace(args=request_args_by_name))
+
+    primary_predicate = (
+        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+    )
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    for sql in (page_sql, count_sql):
+        assert "AS provider_taxonomy_match ON TRUE" in sql
+        assert (primary_predicate in sql) is expects_primary_predicate
+
+
+@pytest.mark.asyncio
+async def test_get_all_classification_count_allows_non_primary_taxonomies(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "count_only": "1",
+                "format": "all",
+                "classification": "Family Medicine",
+                "primary_only": "false",
+            }
+        )
+    )
+
+    assert "CROSS JOIN LATERAL unnest" in conn.last_sql
+    assert "healthcare_provider_primary_taxonomy_switch" not in conn.last_sql
+
+
+@pytest.mark.asyncio
 async def test_get_all_rejects_invalid_primary_only():
     with pytest.raises(sanic.exceptions.InvalidUsage, match="primary_only.*boolean"):
         await get_all(
