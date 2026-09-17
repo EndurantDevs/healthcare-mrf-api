@@ -3,7 +3,7 @@
 """Index service-location provider searches by plan network.
 
 Revision ID: 20260917120000_entity_address_service_network
-Revises: 20260907220000_hospital_price_missing_plan
+Revises: 20260917130000_custom_import_generation_finality
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from db.migration_index_adoption import (
 from db.migration_index_catalog import _index_catalog_record
 
 revision = "20260917120000_entity_address_service_network"
-down_revision = "20260907220000_hospital_price_missing_plan"
+down_revision = "20260917130000_custom_import_generation_finality"
 branch_labels = None
 depends_on = None
 

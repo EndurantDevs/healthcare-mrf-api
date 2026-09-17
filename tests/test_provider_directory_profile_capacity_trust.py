@@ -34,8 +34,8 @@ from tests.test_provider_directory_profile_capacity_attestation import (
 
 UTC = datetime.timezone.utc
 EXECUTION_V2_FIXTURE = Path(__file__).resolve().parent / "fixtures/provider_directory_profile_execution_v2_golden.json"
-EXECUTION_V2_CANONICAL_SHA256 = "2aea70d19d3a4927eb5ca9e0fb45e9d5c356a677a8123ec1d8b16ccbb1c07935"
-EXECUTION_V2_FILE_SHA256 = "e8518483370e00ee74e3ce4b2b1e4adcfff0e76f1019f1c8f424c990df17a758"
+EXECUTION_V2_CANONICAL_SHA256 = "8d4b7703ffe89ee1b0ed59df8b99340696062c013121ec25a8ee7d7a74440577"
+EXECUTION_V2_FILE_SHA256 = "8d81c7bb2ed35d4aed2929dc0de8fa51e63bc5cb714ebd8f58bd18215a9623ed"
 
 
 def _active_key(
@@ -145,7 +145,7 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
         + "\n"
     ).encode("ascii")
     assert fixture_bytes == regenerated_bytes
-    assert len(fixture_bytes) == 27_811
+    assert len(fixture_bytes) == 27_808
     assert fixture_bytes.endswith(b"\n")
     assert not fixture_bytes.endswith(b"\n\n")
     assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)

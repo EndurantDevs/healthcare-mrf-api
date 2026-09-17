@@ -71,7 +71,7 @@ def test_migration_matches_serving_model_contract():
             "where": migration.INDEX_PREDICATE,
         }
     ]
-    assert migration.down_revision == "20260907220000_hospital_price_missing_plan"
+    assert migration.down_revision == "20260917130000_custom_import_generation_finality"
     assert migration._create_index_sql("fixture") == (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
         '"entity_address_unified_idx_service_plans_network_array" '
