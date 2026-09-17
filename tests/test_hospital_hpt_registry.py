@@ -15,8 +15,8 @@ from tests.hospital_hpt_registry_fallbacks import (
 from tests.hospital_price_control_support import acquisition_module, store_module
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
-    for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005429:001811 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 005975:006936 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236 000902:000901 003410:003409 004869:004870 005186:005187 005357:005358 006266:005582 006285:006284 006330:005919 006331:005920 006651:006652 003161:003159 003172:003160 001586:001587 001589:001590 001591:001592 001593:001594 001598:001596 001599:001597 001600:001612 001601:001602 001603:001604 001606:001607 001608:001609 001610:001611 001613:001614 001615:001616 000514:000511 004534:000825 004535:000826 001433:001435 001434:006080 006396:003096 006397:006395 000191:000190 000556:001528 000557:000558 000571:004809 000575:000577 000915:000916 001432:001416 002159:002158 004470:004236 004471:004237 004472:004238 005459:005427 006362:006363 006041:005093 000957:000956 000369:004907 000791:000790 001451:001452 001198:007129 001200:001773 001202:002924 001203:005479 001204:006589 005113:005116 005471:005469 006390:006573 006484:001013 006595:006613 006597:006598 006611:006608 006617:006614 006694:006693 006747:006538 007006:007005 007177:006691 006865:006864 006870:006869 000827:004573 000828:003656 001025:001024 004155:004156 005819:005820 006477:006475 004316:004315 004988:004987 003246:003245 003970:003969 006564:006565 006815:006692 001078:007241 004517:007241 007046:007241 007242:007241 007243:007241 007244:007241 007245:007241 007246:007241 007247:007241 007248:007241 007249:007241 007250:007241 007251:007241".split())
-} | {f"hospital-{alias}": f"hospital-{canonical}" for alias, canonical in (pair.split(":") for pair in "000030:002931 005457:002930 006332:002934 006354:002932 006639:002933 006738:006688 000767:000763 001835:001836 001837:001834 002614:002613 002615:002616 002618:002617 005625:005624 004759:004756 004769:004747 004770:004760".split())}
+    for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004418:004360 004667:004666 005329:005328 005429:001811 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 005975:006936 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236 000902:000901 003410:003409 004869:004870 005186:005187 005357:005358 006266:005582 006285:006284 006330:005919 006331:005920 006651:006652 003161:003159 003172:003160 001586:001587 001589:001590 001591:001592 001593:001594 001598:001596 001599:001597 001600:001612 001601:001602 001603:001604 001606:001607 001608:001609 001610:001611 001613:001614 001615:001616 000514:000511 004534:000825 004535:000826 001433:001435 001434:006080 006396:003096 006397:006395 000191:000190 000556:001528 000557:000558 000571:004809 000575:000577 000915:000916 001432:001416 002159:002158 004470:004236 004471:004237 004472:004238 005459:005427 006362:006363 006041:005093 000957:000956 000369:004907 000791:000790 001451:001452 001198:007129 001200:001773 001202:002924 001203:005479 001204:006589 005113:005116 005471:005469 006390:006573 006484:001013 006595:006613 006597:006598 006611:006608 006617:006614 006694:006693 006747:006538 007006:007005 007177:006691 006865:006864 006870:006869 000827:004573 000828:003656 001025:001024 004155:004156 005819:005820 006477:006475 004316:004315 004988:004987 003246:003245 003970:003969 006564:006565 006815:006692 001078:007241 004517:007241 007046:007241 007242:007241 007243:007241 007244:007241 007245:007241 007246:007241 007247:007241 007248:007241 007249:007241 007250:007241 007251:007241".split())
+} | {f"hospital-{alias}": f"hospital-{canonical}" for alias, canonical in (pair.split(":") for pair in "000030:002931 005457:002930 006332:002934 006354:002932 006639:002933 006738:006688 000767:000763 001835:001836 001837:001834 002614:002613 002615:002616 002618:002617 005625:005624 004759:004756 004769:004747 004770:004760 003648:005795 000207:006921 001415:006922 002329:006837 003517:006923".split())}
 _REVIEWED_LOCATOR_NAMES = {
     "hospital-000047": "Adair County Memorial Hospital",
     "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
@@ -53,15 +53,19 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
     "hospital-005086": "Philadelphia Post-Acute Partners LLC",
+    "hospital-005115": "Phoebe Putney",
     "hospital-005821": "Slidell Memorial Hospital - Main Campus",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
+    "hospital-005482": "Rockville General",
     "hospital-005915": "Mee Memorial Hospital",
+    "hospital-006733": "Union Hospital Terre Haute",
     "hospital-006345": "Summa Rehab Hospital, LLC",
     "hospital-003109": "Mesa Springs",
     "hospital-003110": "Mesa Springs Changes",
     "hospital-004749": "Ochsner Behavioral Health Acadiana - Broussard",
     "hospital-006677": "UCSF Parnassus",
     "hospital-006918": "USMD Hospital at Arlington LLC",
+    "hospital-007007": "Wagoner Community Hospital",
 }
 _NORTHSHORE_ALIAS_GROUPS = (
     ("hospital-002062", "hospital-002163", "Evanston Hospital"),
@@ -91,11 +95,11 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_900
+    assert len(registry.hospital_hpt_registry_groups()) == 6_895
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_714
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 143
+    assert sum("locator_name" in entry for entry in hospitals) == 1_712
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 157
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -196,6 +200,145 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     assert candidate.observation_id == "synthetic-observation"
 
 
+@pytest.mark.parametrize(("hospital_id", "unmatched_name", "location_names", "ordinal"), (
+    ("hospital-000296", "Ascension Seton Hays (Ascension Seton)",
+     ("Ascension Seton Hays", "Ascension Seton Bastrop"), 1),
+    ("hospital-006790", "University Hospitals Lake West Medical Center",
+     ("University Hospitals Lake West Medical Center", "Unrelated Campus",
+      "University Hospitals Lake West Medical Center Psychiatric Unit"), 2),
+))
+def test_reviewed_fallback_preserves_unlisted_facility_location(
+    hospital_id: str,
+    unmatched_name: str,
+    location_names: tuple[str, ...],
+    ordinal: int,
+):
+    """A reviewed shared file keeps an unlisted facility's own location identity."""
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"],
+        "synthetic-locator",
+        "synthetic-observation",
+        (hospital,),
+        (HospitalHptLocatorRecord(unmatched_name, "https://files.example/stale.csv"),),
+    ),))
+    assert candidate.initial_error_code is None
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert candidate.locator_name == hospital["name"]
+    store, _native = store_module()
+    assert store._location_ordinals((candidate,), tuple(enumerate(location_names))) == {
+        hospital_id: ordinal,
+    }
+
+
+def test_marion_fallback_keeps_east_unbound():
+    """Use the reviewed General source without assigning it to Marion Health East."""
+    hospital, = registry.selected_hospital_hpt_registry(
+        {"hospital_id": "hospital-003733"}
+    )
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation",
+        (hospital,), (
+            HospitalHptLocatorRecord(
+                "MARION GENERAL HOSPITAL", "https://files.example/old.xlsx"
+            ),
+            HospitalHptLocatorRecord(
+                "MARION HEALTH EAST", "https://files.example/old.xlsx"
+            ),
+        ),
+    ),))
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert candidate.locator_name == "MARION GENERAL HOSPITAL"
+    assert tuple(row["hospital_id"] for row in registry.load_hospital_hpt_registry()
+                 if row["cms_hpt_url"] == hospital["cms_hpt_url"]) == (
+        "hospital-003733",
+    )
+    store, _native = store_module()
+    assert store._location_ordinals((candidate,), ((0, "Marion General Hospital"),)) == {
+        "hospital-003733": 0,
+    }
+
+
+def test_schneck_shared_source_preserves_facility_locations():
+    """Keep the umbrella filewide and bind its two declared facility locations."""
+    hospital_ids = (
+        "hospital-005683", "hospital-005684", "hospital-005685",
+    )
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(hospital_ids)}
+    )
+    shared_url = (
+        "https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/"
+        "35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv"
+    )
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospitals[0]["cms_hpt_url"], "synthetic-locator", "synthetic-observation",
+        hospitals, (HospitalHptLocatorRecord("Schneck Medical Center", shared_url),),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert {candidate.source_url for candidate in candidates} == {shared_url}
+    assert tuple(candidate.locator_name for candidate in candidates) == (
+        "Schneck Medical Center",
+        "Schneck Medical Center Hospital",
+        "Schneck Medical Center Physician Practices",
+    )
+    store, _native = store_module()
+    assert store._location_ordinals(candidates, (
+        (0, "Schneck Medical Center Hospital"),
+        (1, "Schneck Medical Center Physician Practices"),
+    )) == {
+        "hospital-005683": None,
+        "hospital-005684": 0,
+        "hospital-005685": 1,
+    }
+
+
+def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
+    """Bind each shared-file facility to its own published location."""
+    name_by_hospital_id = {
+        "hospital-005748": "Sheltering Arms Institute",
+        "hospital-005526": "SAI OP",
+        "hospital-002523": "HANOVER SAI OP",
+        "hospital-000932": "BON AIR SAI OP",
+        "hospital-005391": "REYNOLDS SAI OP",
+        "hospital-003424": "LABURNUM SAI OP",
+        "hospital-004255": "MIDTOWN SAI OP",
+        "hospital-001217": "CHESTER SAI OP",
+        "hospital-003083": "HULL STREET SAI OP",
+    }
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(name_by_hospital_id)}
+    )
+    assert {
+        hospital["hospital_id"]: hospital["name"] for hospital in hospitals
+    } == name_by_hospital_id
+    assert all("locator_name" not in hospital for hospital in hospitals)
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        "https://shelteringarmsinstitute.com/cms-hpt.txt",
+        "synthetic-locator",
+        "synthetic-observation",
+        hospitals,
+        (HospitalHptLocatorRecord(
+            "Sheltering Arms Institute", "https://files.example/previous.csv"
+        ),),
+    ),))
+    assert all(
+        candidate.initial_error_code is None
+        and candidate.locator_name == name_by_hospital_id[candidate.hospital_id]
+        for candidate in candidates
+    )
+    store, _native = store_module()
+    locations = tuple(enumerate(name_by_hospital_id.values()))
+    assert store._location_ordinals(candidates, locations) == {
+        hospital_id: ordinal
+        for ordinal, hospital_id in enumerate(name_by_hospital_id)
+    }
+
+
 @pytest.mark.parametrize("hospital_id,name,locator_url,location_names,ordinal", (
     ("hospital-002218", "First Care Health Center", "https://www.firstcarehc.com/cms-hpt.txt",
      ("First Care Health Center",), 0),
@@ -214,6 +357,8 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     ("hospital-006469", "Texas Institute for Surgery at Texas Health Presbyterian Dallas",
      "https://www.texasinstituteforsurgery.com/cms-hpt.txt",
      ("Texas Institute for Surgery at Texas Health Dallas",) * 2, None),
+    ("hospital-006730", "UNION GENERAL HOSPITAL", "https://www.uniongen.org/cms-hpt.txt",
+     ("Union General Hospital",), 0),
     ("hospital-007197", "Wood County Hospital", "https://www.woodcountyhospital.org/cms-hpt.txt",
      ("Wood County Hospital",), 0),
 ))
@@ -240,18 +385,96 @@ def test_reviewed_sources_preserve_location_binding(hospital_id, name, locator_u
     assert store._location_ordinals((candidate,), locations) == {hospital_id: ordinal}
 
 
-def test_unproven_timeout_keeps_no_reviewed_source():
-    """An uncertain locator timeout does not authorize a reviewed source override."""
+def test_reviewed_johnson_publisher_fallback_preserves_singleton_identity():
+    """Use the reviewed publisher endpoint without widening Johnson's scope."""
     hospital, = registry.selected_hospital_hpt_registry({"hospital_id": "hospital-003267"})
-    assert hospital == {"hospital_id": "hospital-003267", "name": "Johnson County Hospital",
-                        "cms_hpt_url": "https://jchosp.com/cms-hpt.txt"}
+    assert hospital == {
+        "hospital_id": "hospital-003267",
+        "name": "Johnson County Hospital",
+        "cms_hpt_url": "https://jchosp.com/cms-hpt.txt",
+        "fallback_mrf_url": (
+            "https://secure.claraprice.net/price-transparency/"
+            "OPIU-1673956354318/machine-readable"
+        ),
+    }
+    assert registry.hospital_hpt_group_ids(hospital["hospital_id"]) == (
+        hospital["hospital_id"],
+    )
+    assert tuple(
+        entry
+        for entry in registry.load_hospital_hpt_registry()
+        if entry["cms_hpt_url"] == hospital["cms_hpt_url"]
+        or entry.get("fallback_mrf_url") == hospital["fallback_mrf_url"]
+    ) == (hospital,)
     acquisition = acquisition_module()
     candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
         hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation", (hospital,),
-        None, error_code="timeout", fetch_failed=False,
+        None, error_code="clientresponse", error_detail="401", fetch_failed=True,
     ),))
-    assert candidate.initial_error_code == "timeout"
-    assert candidate.source_url == hospital["cms_hpt_url"]
+    assert candidate.initial_error_code is None
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert (candidate.hospital_id, candidate.hospital_name, candidate.locator_name) == (
+        hospital["hospital_id"], hospital["name"], hospital["name"],
+    )
+
+
+def test_echn_shared_file_binds_manchester_and_rockville_separately():
+    """Reuse one ECHN file while publishing each facility's own location."""
+    hospital_ids = ("hospital-003709", "hospital-005482")
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(hospital_ids)}
+    )
+    locator_url = "https://echn.org/cms-hpt.txt"
+    shared_url = (
+        "https://hartfordhealthcare.org/file%20library/price%20data/"
+        "393859332_manchester-memorial-hospital_standardcharges.csv"
+    )
+    assert tuple(hospital["hospital_id"] for hospital in hospitals) == hospital_ids
+    assert hospitals[0] == {
+        "hospital_id": hospital_ids[0],
+        "name": "MANCHESTER MEMORIAL HOSPITAL",
+        "cms_hpt_url": locator_url,
+        "fallback_mrf_url": shared_url,
+    }
+    assert hospitals[1] == {
+        "hospital_id": hospital_ids[1],
+        "name": "Rockville General",
+        "cms_hpt_url": locator_url,
+        "locator_name": "Rockville General",
+        "fallback_mrf_url": shared_url,
+    }
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        locator_url, "synthetic-locator", "synthetic-observation", hospitals,
+        (
+            HospitalHptLocatorRecord("MANCHESTER MEMORIAL HOSPITAL", shared_url),
+            HospitalHptLocatorRecord(
+                "MANCHESTER MEMORIAL HOSPITAL | ROCKVILLE GENERAL", shared_url
+            ),
+        ),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert {candidate.source_url for candidate in candidates} == {shared_url}
+    assert all(candidate.initial_error_code is None for candidate in candidates)
+    fallback_candidates = acquisition.candidates_from_locators((
+        acquisition.LocatorResult(
+            locator_url,
+            "synthetic-locator",
+            "synthetic-observation",
+            hospitals,
+            None,
+            error_code="clientresponse",
+            error_detail="403",
+            fetch_failed=True,
+        ),
+    ))
+    assert {candidate.source_url for candidate in fallback_candidates} == {shared_url}
+    assert all(candidate.initial_error_code is None for candidate in fallback_candidates)
+    store, _native = store_module()
+    assert store._location_ordinals(fallback_candidates, (
+        (0, "Manchester Memorial Hospital"),
+        (1, "Rockville General"),
+    )) == {hospital_ids[0]: 0, hospital_ids[1]: 1}
 
 
 @pytest.mark.parametrize("signature", ("synthetic%2fvalue", "synthetic%2Fvalue"))
@@ -564,7 +787,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 465
+    assert len(aliases_by_id) == 471
     assert not {"hospital-000833", "hospital-001199", "hospital-006476"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
@@ -580,7 +803,7 @@ def test_northshore_aliases_preserve_four_facilities():
     locator_url = "https://www.endeavorhealth.org/cms-hpt.txt"
     canonical_ids = {"hospital-001877"} | {f"hospital-{number:06d}" for number in range(2060, 2069)}
     alias_ids = {alias for _canonical, alias, _name in _NORTHSHORE_ALIAS_GROUPS}
-    assert len(hospitals) == len(hospital_by_id) == 7_365
+    assert len(hospitals) == len(hospital_by_id) == 7_366
     assert {row["hospital_id"] for row in hospitals if row["cms_hpt_url"] == locator_url} == canonical_ids | alias_ids
     for canonical, alias, name in _NORTHSHORE_ALIAS_GROUPS:
         assert hospital_by_id[alias] == {
@@ -763,6 +986,35 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002"}
     ) == hospitals
+
+
+def test_warm_registry_materializes_group_lookup(monkeypatch):
+    hospitals = (
+        {
+            "hospital_id": "hospital-000001",
+            "name": "Example Hospital",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+        },
+        {
+            "hospital_id": "hospital-000002",
+            "name": "Example Hospital Alias",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+            "alias_of": "hospital-000001",
+        },
+    )
+    monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
+    registry._group_ids_by_hospital_id.cache_clear()
+    try:
+        registry.warm_hospital_hpt_registry()
+
+        assert registry.hospital_hpt_group_ids("hospital-000002") == (
+            "hospital-000001",
+            "hospital-000002",
+        )
+        assert registry._group_ids_by_hospital_id.cache_info().currsize == 1
+    finally:
+        registry._group_ids_by_hospital_id.cache_clear()
+
 
 @pytest.mark.parametrize(
     "extra_rows",

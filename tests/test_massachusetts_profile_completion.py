@@ -14,6 +14,8 @@ from sqlalchemy.orm import registry
 
 from process import control_lifecycle as lifecycle
 from process import massachusetts_profile_completion as completion
+from process import provider_profile_source_completion as shared_completion
+from process.provider_profile_source_store import SourceProfileStore
 from process.control_cancel import ImportCancelledError
 from tests.test_massachusetts_profile_store import _database, _metrics, _run, _seed_run
 
@@ -32,13 +34,13 @@ def _context():
 async def _completion_database(monkeypatch):
     async with _database(monkeypatch) as database:
         source_model = completion.store.ProviderProfileImportRun
-        control_table = completion.ImportRun.__table__.to_metadata(MetaData(), schema=source_model.__table__.schema)
+        control_table = shared_completion.ImportRun.__table__.to_metadata(MetaData(), schema=source_model.__table__.schema)
         control_model = type("CompletionControlRun", (), {})
         mapper_registry = registry()
         mapper_registry.map_imperatively(control_model, control_table)
-        monkeypatch.setattr(completion, "ImportRun", control_model)
-        monkeypatch.setattr(completion, "ProviderProfileImportRun", source_model)
-        monkeypatch.setattr(completion, "db", database)
+        monkeypatch.setattr(shared_completion, "ImportRun", control_model)
+        monkeypatch.setattr(shared_completion, "ProviderProfileImportRun", source_model)
+        monkeypatch.setattr(shared_completion, "db", database)
         await database.create_table(control_table, checkfirst=False)
         try:
             yield database
@@ -49,10 +51,10 @@ async def _completion_database(monkeypatch):
 async def _prepared_run(database, *, limit=None, control_changes=None, predecessor=None):
     candidate_run = await _seed_run(database, count=10000 if limit is None else 3, limit=limit, predecessor=predecessor)
     candidate_run["source_manifest"]["control_run_id"] = CONTROL_RUN_ID
-    source_table = completion.ProviderProfileImportRun.__table__
+    source_table = shared_completion.ProviderProfileImportRun.__table__
     await database.execute(update(source_table).where(source_table.c.run_id == candidate_run["run_id"]).values(
         source_manifest=candidate_run["source_manifest"]))
-    await database.insert(completion.ImportRun.__table__).values({
+    await database.insert(shared_completion.ImportRun.__table__).values({
         "run_id": CONTROL_RUN_ID, "importer": completion.IMPORTER, "status": "running", "progress": ATTEMPT,
         "metrics": {}, **(control_changes or {}),
     }).status()
@@ -60,8 +62,8 @@ async def _prepared_run(database, *, limit=None, control_changes=None, predecess
 
 
 async def _stored_state(database, candidate_run):
-    source_table = completion.ProviderProfileImportRun.__table__
-    control_table = completion.ImportRun.__table__
+    source_table = shared_completion.ProviderProfileImportRun.__table__
+    control_table = shared_completion.ImportRun.__table__
     source_row = await database.first(select(source_table).where(source_table.c.run_id == candidate_run["run_id"]))
     control_row = await database.first(select(control_table).where(control_table.c.run_id == CONTROL_RUN_ID))
     return dict(source_row._mapping), dict(control_row._mapping)
@@ -75,7 +77,7 @@ async def test_native_stopped_owner_recovers_stranded_run_without_changing_publi
         pointer = await completion.store.read_publication()
         incumbent_counts = await completion.store.retained_counts(incumbent["run_id"])
         candidate = await _prepared_run(database, limit=1, predecessor=incumbent["run_id"])
-        source_table = completion.ProviderProfileImportRun.__table__
+        source_table = shared_completion.ProviderProfileImportRun.__table__
         foreign_run_by_field = {**_run("f" * 64, limit=1), "source_key": "florida-mqa", "jurisdiction": "FL"}
         await database.insert(source_table).values(foreign_run_by_field).status()
         fresh = _run(limit=1, count=3, predecessor=incumbent["run_id"], resume_from=candidate["run_id"])
@@ -85,7 +87,7 @@ async def test_native_stopped_owner_recovers_stranded_run_without_changing_publi
         with pytest.raises(RuntimeError, match="resume_not_eligible"):
             await completion.store.read_resume_run(candidate["run_id"], max_providers=1, expected_current_run_id=incumbent["run_id"])
 
-        control_table = completion.ImportRun.__table__
+        control_table = shared_completion.ImportRun.__table__
         await database.execute(update(control_table).where(control_table.c.run_id == CONTROL_RUN_ID).values(status=terminal_status))
         _, owner_before = await _stored_state(database, candidate)
         retained = await completion.store.retained_counts(candidate["run_id"])
@@ -109,8 +111,8 @@ async def test_native_stopped_owner_recovers_stranded_run_without_changing_publi
 async def test_native_recovery_keeps_live_or_ambiguous_source_claim(monkeypatch, owner_case):
     async with _completion_database(monkeypatch) as database:
         candidate = await _prepared_run(database, limit=1)
-        control_table = completion.ImportRun.__table__
-        source_table = completion.ProviderProfileImportRun.__table__
+        control_table = shared_completion.ImportRun.__table__
+        source_table = shared_completion.ProviderProfileImportRun.__table__
         if owner_case in {"cli", "blank"}:
             candidate["source_manifest"]["control_run_id"] = None if owner_case == "cli" else " "
             await database.execute(update(source_table).where(source_table.c.run_id == candidate["run_id"]).values(source_manifest=candidate["source_manifest"]))
@@ -172,11 +174,11 @@ async def test_native_failure_after_pointer_write_rolls_back_both_runs(monkeypat
         job_context_by_field = _context()
         original_commit = completion._commit_control
 
-        async def failed_control_commit(attempt, result_by_field):
+        async def failed_control_commit(_self, attempt, result_by_field):
             await original_commit(attempt, result_by_field)
             raise RuntimeError("synthetic terminal update failure")
 
-        monkeypatch.setattr(completion, "_commit_control", failed_control_commit)
+        monkeypatch.setattr(shared_completion.SourceProfileCompletion, "_commit_control", failed_control_commit)
         with pytest.raises(RuntimeError, match="synthetic terminal update failure"):
             await completion.complete_run(job_context_by_field, {"run_id": CONTROL_RUN_ID}, candidate_run, _metrics())
         source_run, control_run = await _stored_state(database, candidate_run)
@@ -239,7 +241,7 @@ async def test_native_terminal_status_blocks_late_heartbeat_and_cancel(monkeypat
     async with _completion_database(monkeypatch) as database:
         candidate_run = await _prepared_run(database, limit=1)
         await completion.complete_run(_context(), {"run_id": CONTROL_RUN_ID}, candidate_run, _metrics(1))
-        monkeypatch.setattr(lifecycle, "ImportRun", completion.ImportRun)
+        monkeypatch.setattr(lifecycle, "ImportRun", shared_completion.ImportRun)
 
         async def execute_owned_update(statement):
             # Keep the production conditional UPDATE on this isolated database.
@@ -251,7 +253,7 @@ async def test_native_terminal_status_blocks_late_heartbeat_and_cancel(monkeypat
         assert await lifecycle.mark_control_run(
             CONTROL_RUN_ID, status="failed", phase_detail="late failure", progress_message="failed", **ATTEMPT,
         ) is False
-        control_table = completion.ImportRun.__table__
+        control_table = shared_completion.ImportRun.__table__
         canceled = await database.execute(update(control_table).where(
             control_table.c.run_id == CONTROL_RUN_ID, control_table.c.status.notin_(lifecycle._TERMINAL_STATUSES),
         ).values(status="canceling"))
@@ -265,8 +267,8 @@ async def test_native_terminal_status_blocks_late_heartbeat_and_cancel(monkeypat
 async def test_unmanaged_completion_cannot_publish(monkeypatch, limit):
     result_by_field = {"run_id": "a" * 64, "published": limit is None, "requested_licenses": 1}
     source_finisher = AsyncMock(return_value=result_by_field)
-    monkeypatch.setattr(completion.store, "publish_run", source_finisher)
-    monkeypatch.setattr(completion.store, "finish_unpublished_run", source_finisher)
+    monkeypatch.setattr(SourceProfileStore, "publish_run", source_finisher)
+    monkeypatch.setattr(SourceProfileStore, "finish_unpublished_run", source_finisher)
     job_context_by_field = {}
     run_by_field = {"run_id": result_by_field["run_id"], "source_manifest": {"max_providers": limit, "expected_current_run_id": None}}
     with pytest.raises(ValueError, match="control_attempt_missing"):
@@ -345,7 +347,7 @@ async def test_reconciliation_requires_exact_completed_source(monkeypatch, sourc
     async with _completion_database(monkeypatch) as database:
         candidate_run = await _prepared_run(database, limit=1)
         result_by_field = await completion.complete_run(_context(), {"run_id": CONTROL_RUN_ID}, candidate_run, _metrics(1))
-        source_table = completion.ProviderProfileImportRun.__table__
+        source_table = shared_completion.ProviderProfileImportRun.__table__
         await database.execute(update(source_table).where(source_table.c.run_id == candidate_run["run_id"]).values(source_changes))
         control_metrics_by_field = {key: value for key, value in result_by_field.items() if key != "terminal_progress"}
         assert await completion._reconcile_commit({"run_id": CONTROL_RUN_ID, **ATTEMPT}, candidate_run, control_metrics_by_field) is None
@@ -355,7 +357,7 @@ async def test_cancellation_during_reconciliation_finishes_committed_result(monk
     parent_task = asyncio.current_task()
     original_reconcile = completion._reconcile_commit
 
-    async def reconcile_with_late_cancellation(*args):
+    async def reconcile_with_late_cancellation(_self, *args):
         assert asyncio.current_task() is not parent_task
         parent_task.cancel()
         await asyncio.sleep(0)
@@ -364,7 +366,7 @@ async def test_cancellation_during_reconciliation_finishes_committed_result(monk
     async with _completion_database(monkeypatch) as database:
         candidate_run = await _prepared_run(database, limit=1)
         _fail_transaction_exit(monkeypatch, database, after_commit=True, failure=RuntimeError("ambiguous commit"))
-        monkeypatch.setattr(completion, "_reconcile_commit", reconcile_with_late_cancellation)
+        monkeypatch.setattr(shared_completion.SourceProfileCompletion, "_reconcile_commit", reconcile_with_late_cancellation)
         job_context_by_field = _context()
         completed = await completion.complete_run(job_context_by_field, {"run_id": CONTROL_RUN_ID}, candidate_run, _metrics(1))
         assert completed["published"] is False
@@ -378,12 +380,12 @@ async def test_reconciliation_database_error_is_not_proof(monkeypatch):
         raise RuntimeError("synthetic database outage")
         yield
 
-    monkeypatch.setattr(completion.db, "transaction", unavailable_transaction)
+    monkeypatch.setattr(shared_completion.db, "transaction", unavailable_transaction)
     assert await completion._reconcile_commit({}, {}, {}) is None
 
 
 async def test_cancelled_reconciliation_does_not_spin(monkeypatch):
-    monkeypatch.setattr(completion, "_reconcile_commit", AsyncMock(side_effect=asyncio.CancelledError))
+    monkeypatch.setattr(shared_completion.SourceProfileCompletion, "_reconcile_commit", AsyncMock(side_effect=asyncio.CancelledError))
     with pytest.raises(asyncio.CancelledError):
         await completion._shielded_reconciliation({}, {}, {})
 

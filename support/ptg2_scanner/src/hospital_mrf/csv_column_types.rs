@@ -36,6 +36,7 @@ struct TallCsvColumns {
     percentile_90: Option<usize>,
     allowed_count: Option<usize>,
     methodology: usize,
+    additional_payer_notes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]

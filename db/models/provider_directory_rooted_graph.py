@@ -19,6 +19,7 @@ from sqlalchemy import Text
 from sqlalchemy import TIMESTAMP
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -52,6 +53,40 @@ _ROOTED_ENDPOINT_SIGNATURE = (
     "ec925b980d5f937abd5ca144a2041dda0c2b224fbe3fa8b70ccbe088f2222140"
 )
 _SOURCE_AUTHORITY = "unitedhealthcare"
+_FAILURE_VALID = '"' + _SCHEMA.replace('"', '""') + '"."provider_directory_fhir_request_failure_coverage_valid"'
+
+
+def _acquisition_state_predicate() -> str:
+    """Keep null-proof history exact and bind new partials to their census."""
+
+    historical = (
+        "(status = 'building' AND rooted_graph_complete IS FALSE AND pending_count IS NULL "
+        "AND leased_count IS NULL AND completed_count IS NULL AND error_count IS NULL "
+        "AND resource_count IS NULL AND edge_count IS NULL AND insurance_plan_count IS NULL "
+        "AND insurance_plan_page_count IS NULL AND terminal_set_sha256 IS NULL "
+        "AND resource_set_sha256 IS NULL AND edge_set_sha256 IS NULL AND rooted_graph_sha256 IS NULL "
+        "AND sealed_at IS NULL) OR (status = 'sealed' AND rooted_graph_complete IS TRUE "
+        "AND pending_count = 0 AND leased_count = 0 AND completed_count > 0 AND error_count = 0 "
+        "AND resource_count >= 0 AND edge_count >= 0 AND insurance_plan_count >= 0 "
+        "AND insurance_plan_page_count > 0 AND terminal_set_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND resource_set_sha256 ~ '^[0-9a-f]{64}$' AND edge_set_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND rooted_graph_sha256 ~ '^[0-9a-f]{64}$' AND sealed_at IS NOT NULL)"
+    )
+    partial = historical.replace("rooted_graph_complete IS TRUE", "rooted_graph_complete = (error_count = 0)")
+    partial = partial.replace("error_count = 0 AND resource_count", "error_count >= 0 AND resource_count")
+    partial = partial.replace(
+        "insurance_plan_count >= 0 AND insurance_plan_page_count > 0",
+        "((insurance_plan_count IS NULL AND insurance_plan_page_count IS NULL AND error_count > 0) "
+        "OR (insurance_plan_count IS NOT NULL AND insurance_plan_page_count IS NOT NULL "
+        "AND insurance_plan_count >= 0 AND insurance_plan_page_count > 0))",
+    )
+    return (
+        f"((request_failure_coverage IS NULL AND ({historical})) OR "
+        "(request_failure_coverage IS NOT NULL AND status = 'sealed' "
+        f"AND {_FAILURE_VALID}(request_failure_coverage) AND ({partial}) "
+        "AND (request_failure_coverage ->> 'rooted_total_requests')::bigint = completed_count + error_count "
+        "AND (request_failure_coverage ->> 'rooted_failed_requests')::bigint = error_count))"
+    )
 
 
 def _reference(table_name: str, column_name: str) -> str:
@@ -140,8 +175,9 @@ class ProviderDirectoryRootedGraphAcquisition(Base, JSONOutputMixin):
             "AND root_source_id <> acquisition_source_id "
             "AND root_endpoint_id <> acquisition_endpoint_id) OR "
             "(root_dataset_variant = 'rooted_combined' "
-            "AND root_publication_contract_id = "
-            "'healthporta.provider-directory.rooted-graph-publication.v1' "
+            "AND root_publication_contract_id IN ("
+            "'healthporta.provider-directory.rooted-graph-publication.v1', "
+            "'healthporta.provider-directory.rooted-graph-publication.v2') "
             "AND root_source_id = acquisition_source_id "
             "AND root_endpoint_id = acquisition_endpoint_id)) "
             "AND max_work_items > root_resource_count "
@@ -160,23 +196,7 @@ class ProviderDirectoryRootedGraphAcquisition(Base, JSONOutputMixin):
             name="provider_directory_rooted_graph_acquisition_identity_check",
         ),
         CheckConstraint(
-            "(status = 'building' AND rooted_graph_complete IS FALSE AND "
-            "pending_count IS NULL AND leased_count IS NULL AND "
-            "completed_count IS NULL AND error_count IS NULL AND "
-            "resource_count IS NULL AND edge_count IS NULL AND "
-            "insurance_plan_count IS NULL AND insurance_plan_page_count IS NULL "
-            "AND terminal_set_sha256 IS NULL AND resource_set_sha256 IS NULL "
-            "AND edge_set_sha256 IS NULL AND rooted_graph_sha256 IS NULL "
-            "AND sealed_at IS NULL) OR "
-            "(status = 'sealed' AND rooted_graph_complete IS TRUE AND "
-            "pending_count = 0 AND leased_count = 0 AND completed_count > 0 "
-            "AND error_count = 0 AND resource_count >= 0 AND edge_count >= 0 "
-            "AND insurance_plan_count >= 0 AND insurance_plan_page_count > 0 "
-            "AND terminal_set_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND resource_set_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND edge_set_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND rooted_graph_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND sealed_at IS NOT NULL)",
+            _acquisition_state_predicate(),
             name="provider_directory_rooted_graph_acquisition_state_check",
         ),
     )
@@ -214,6 +234,7 @@ class ProviderDirectoryRootedGraphAcquisition(Base, JSONOutputMixin):
     used_edge_rows = Column(BigInteger, nullable=False, server_default=text("0"))
     used_payload_bytes = Column(BigInteger, nullable=False, server_default=text("0"))
     status = Column(String(16), nullable=False)
+    request_failure_coverage = Column(JSONB)
     rooted_graph_complete = Column(Boolean, nullable=False)
     endpoint_collection_complete = Column(Boolean, nullable=False)
     endpoint_complete = Column(Boolean, nullable=False)

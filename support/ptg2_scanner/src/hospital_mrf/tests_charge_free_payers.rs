@@ -1,5 +1,5 @@
 #[test]
-fn v2_charge_free_payers_are_omitted_and_v3_rejects_them() {
+fn charge_free_csv_payers_are_omitted_while_v3_json_rejects_them() {
     let mut v2_json: serde_json::Value =
         serde_json::from_slice(&fixture_v2_json("2.2.1")).unwrap();
     let charge = v2_json["standard_charge_information"][0]["standard_charges"][0]
@@ -55,16 +55,80 @@ fn v2_charge_free_payers_are_omitted_and_v3_rejects_them() {
     }
 
     let mut v3_tall = csv_fixture_records(&fixture_tall_csv());
+    v3_tall.push(v3_tall[3].clone());
     let dollar = v3_tall[2]
         .iter()
         .position(|header| header.contains("negotiated_dollar"))
         .unwrap();
     v3_tall[3][dollar].clear();
+    let plan = csv_fixture_index(&v3_tall[2], "plan_name");
+    v3_tall[3][plan].clear();
+    for (header, value) in [
+        ("median_amount", "10"),
+        ("10th_percentile", "8"),
+        ("90th_percentile", "12"),
+        ("count", "11"),
+    ] {
+        let index = csv_fixture_index(&v3_tall[2], header);
+        v3_tall[3][index] = value.to_owned();
+    }
+    let rows = run_fixture(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&v3_tall),
+        false,
+    );
+    assert_eq!(String::from_utf8(rows["payer_charge"].clone()).unwrap().lines().count(), 1);
+    assert!(!rows["charge"].is_empty());
+
+    let payer = csv_fixture_index(&v3_tall[2], "payer_name");
+    v3_tall[3][payer].clear();
+    let rows = run_fixture(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&v3_tall),
+        false,
+    );
+    assert_eq!(String::from_utf8(rows["payer_charge"].clone()).unwrap().lines().count(), 1);
+    assert!(!rows["charge"].is_empty());
+    let (directory, summary) = import_packed(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&v3_tall),
+        TEST_MAX_OUTPUT_BYTES,
+    );
+    let root = summary.root.as_ref().unwrap();
+    assert_eq!((root.service_count, root.charge_count, root.fact_count), (1, 2, 1));
+    assert_eq!((root.payer_plan_selector_key_count, root.payer_plan_selector_ref_count), (1, 1));
+    let blocks = super::packed_output_tests::payloads(
+        &directory.path().join("output/fact_block.copy"),
+    );
+    let facts = crate::hospital_price_block::decode_fact_block(&blocks[0], None, None, 0, 10)
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].plan_name.as_deref(), Some("Plan A"));
+
+    v3_tall[3][payer] = "all payers / all plans".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&v3_tall),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "plan_name must be a non-empty string",
+    );
+
+    v3_tall[3][payer] = "Payer, Inc.".to_owned();
+    v3_tall[3][plan] = "Plan A".to_owned();
     assert_import_error(
         InputFormat::TallCsv,
         &csv_fixture_bytes(&v3_tall),
         DEFAULT_MAX_FANOUT_ROWS,
         "payer information requires dollar, percentage, algorithm, or estimated charge",
+    );
+
+    v3_tall[3][plan].clear();
+    v3_tall[3][dollar] = "9.125".to_owned();
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&v3_tall),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "plan_name must be a non-empty string",
     );
 }
 
@@ -142,6 +206,99 @@ fn v3_tall_service_only_preserves_charges() {
             );
         }
     }
+}
+
+#[test]
+fn v3_tall_na_plan_is_service_only_only_without_payer_material() {
+    let mut records = csv_fixture_records(&fixture_tall_csv());
+    for field in [
+        "payer_name",
+        "standard_charge | negotiated_dollar",
+        "standard_charge | negotiated_percentage",
+        "standard_charge | negotiated_algorithm",
+        "median_amount",
+        "10th_percentile",
+        "90th_percentile",
+        "count",
+        "standard_charge | methodology",
+    ] {
+        let index = csv_fixture_index(&records[2], field);
+        records[3][index].clear();
+    }
+    let plan = csv_fixture_index(&records[2], "plan_name");
+    records[3][plan] = " \t#N/A \t".to_owned();
+    let actual = run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false);
+    records[3][plan].clear();
+    let expected = run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false);
+    assert_eq!(actual, expected);
+    assert!(actual["payer_charge"].is_empty());
+
+    records[3][plan] = "#N/A".to_owned();
+    let mut invalid = records.clone();
+    let payer = csv_fixture_index(&invalid[2], "payer_name");
+    invalid[3][payer] = "Payer, Inc.".to_owned();
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "invalid standard charge methodology",
+    );
+
+    for (field, value) in [
+        ("standard_charge | negotiated_dollar", "9.125"),
+        ("standard_charge | negotiated_percentage", "80"),
+        ("standard_charge | negotiated_algorithm", "Contract formula"),
+        ("median_amount", "10"),
+        ("10th_percentile", "8"),
+        ("90th_percentile", "12"),
+        ("count", "0"),
+        ("standard_charge | methodology", "fee schedule"),
+    ] {
+        let mut invalid = records.clone();
+        let index = csv_fixture_index(&invalid[2], field);
+        invalid[3][index] = value.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "payer_name must be a non-empty string",
+        );
+    }
+
+    for marker in ["#n/a", "N/A", "#N/A."] {
+        let mut invalid = records.clone();
+        invalid[3][plan] = marker.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "payer_name must be a non-empty string",
+        );
+    }
+
+    let mut invalid = records.clone();
+    for record in &mut invalid {
+        record.push(String::new());
+    }
+    *invalid[2].last_mut().unwrap() = "additional_payer_notes".to_owned();
+    *invalid[3].last_mut().unwrap() = "Payer note".to_owned();
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "payer_name must be a non-empty string",
+    );
+    *invalid[3].last_mut().unwrap() = "bad\0note".to_owned();
+    assert_historical_csv_error(InputFormat::TallCsv, &invalid, "contains NUL");
+
+    for field in [
+        "standard_charge | gross",
+        "standard_charge | discounted_cash",
+    ] {
+        let index = csv_fixture_index(&records[2], field);
+        records[3][index].clear();
+    }
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &records,
+        "standard charge requires gross, discounted cash, or payer information",
+    );
 }
 
 #[test]

@@ -246,7 +246,7 @@ async def complete_provider_directory_rooted_graph_error(
     error_code: str,
     database: Any = db,
 ) -> None:
-    """Record a stable terminal error; any such row prevents sealing."""
+    """Record an immutable terminal error, retaining its failure category."""
 
     if type(claim) is not ProviderDirectoryRootedGraphWorkClaim:
         raise ValueError("provider_directory_rooted_graph_claim_invalid")
@@ -308,6 +308,7 @@ def _summary_from_row(
             rooted_graph_complete=fields.get("rooted_graph_complete"),
             endpoint_collection_complete=fields.get("endpoint_collection_complete"),
             endpoint_complete=fields.get("endpoint_complete"),
+            request_failure_coverage=fields.get("request_failure_coverage"),
         )
     except (TypeError, ValueError) as error:
         raise ProviderDirectoryRootedGraphStoreError("state") from error
@@ -340,12 +341,15 @@ def _seal_census_sql() -> str:
              WHERE edge.acquisition_id = :acquisition_id
                AND work.status = 'completed'
         ), plan_census AS (
-            SELECT advertised_total::bigint AS insurance_plan_count,
-                   terminal_page_count AS insurance_plan_page_count
+            SELECT CASE WHEN status = 'completed' THEN advertised_total::bigint
+                        ELSE NULL END AS insurance_plan_count,
+                   CASE WHEN status = 'completed' THEN terminal_page_count
+                        ELSE NULL END AS insurance_plan_page_count
               FROM {table_ref(WORK_TABLE)}
              WHERE acquisition_id = :acquisition_id
                AND kind = 'full_insurance_plan_census'
-               AND status = 'completed'
+               AND (status = 'completed' OR
+                    (status = 'error' AND error_code = 'transport_timeout'))
         )
     """
 
@@ -353,7 +357,11 @@ def _seal_census_sql() -> str:
 def _seal_update_sql() -> str:
     return f"""
         UPDATE {table_ref(ACQUISITION_TABLE)} AS acquisition
-           SET status = 'sealed', rooted_graph_complete = true,
+           SET status = 'sealed',
+               rooted_graph_complete = (work_census.error_count = 0),
+               request_failure_coverage = {function_ref('provider_directory_rooted_graph_request_failure_coverage')}(
+                   acquisition.acquisition_id
+               ),
                pending_count = work_census.pending_count,
                leased_count = work_census.leased_count,
                completed_count = work_census.completed_count,
@@ -397,7 +405,7 @@ async def seal_provider_directory_rooted_graph_acquisition(
     *,
     database: Any = db,
 ) -> ProviderDirectoryRootedGraphAcquisitionSummary:
-    """Seal only a terminal error-free fixed point with a finite plan census."""
+    """Seal terminal known work only after the source failure-budget DB guard."""
 
     if type(identity) is not ProviderDirectoryRootedGraphAcquisitionIdentity:
         raise ValueError("provider_directory_rooted_graph_identity_invalid")

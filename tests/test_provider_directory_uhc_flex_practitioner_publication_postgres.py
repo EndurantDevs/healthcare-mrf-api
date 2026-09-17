@@ -267,6 +267,9 @@ async def _publication_test_scope(monkeypatch):
         await run_migration(engine, rooted_migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
         await run_migration(engine, retry_exhaustion_migration, "upgrade")
+        from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
+
+        await install_request_failure_budget(engine, schema_name)
         await database.connect()
         yield (
             url,

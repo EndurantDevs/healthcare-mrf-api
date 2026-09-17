@@ -38,7 +38,11 @@ from process.attributes import (process_attributes, process_benefits,
                                 save_attributes)
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
-from process.control_lifecycle import control_single_job_start as _control_single_job_start
+from process.control_lifecycle import (
+    _flush_terminal_status_events,
+    control_single_job_start as _control_single_job_start,
+    mark_control_run,
+)
 from process.ext.utils import db_startup
 from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
@@ -119,6 +123,10 @@ from process.pharmacy_license import (
 )
 from process.florida_mqa_profile import florida_mqa_profile
 from process.massachusetts_profile import massachusetts_borim_profile
+from process.kentucky_profile import kentucky_kbml_profile
+from process.tennessee_profile import tennessee_tdh_profile
+from process.rhode_island_profile import rhode_island_doh_profile
+from process.new_york_profile import new_york_nypp_profile
 from process.places_zcta import main as initiate_places_zcta
 from process.places_zcta import process_data as process_places_zcta_data
 from process.places_zcta import shutdown as places_zcta_shutdown
@@ -176,6 +184,36 @@ from process.serialization import deserialize_job, serialize_job
 
 
 control_single_job_start = arq_func(_control_single_job_start, max_tries=1)
+
+
+async def _hospital_price_control_single_job_start(ctx, task=None, **arq_metadata):
+    """Run only the control target assigned to the credential-bearing worker."""
+
+    if not isinstance(task, dict) or (
+        task.get("importer") != "hospital-prices"
+        or task.get("target_module") != "process.hospital_prices"
+        or task.get("target_function") != "process_data"
+        or task.get("call_style", "ctx_task") != "ctx_task"
+        or task.get("run_shutdown", False) is not False
+        or not isinstance(task.get("task"), dict)
+    ):
+        run_id = task.get("run_id") if isinstance(task, dict) else None
+        if type(run_id) is str and (run_id := run_id.strip()):
+            is_marked = await mark_control_run(
+                run_id,
+                status="failed",
+                phase_detail="hospital price control target rejected",
+                progress_message="target rejected",
+                error={
+                    "code": "control_target_rejected",
+                    "message": "HospitalPrices control target is not allowed",
+                },
+                expected_state=("hospital-prices", "queued"),
+            )
+            if is_marked:
+                await _flush_terminal_status_events(run_id)
+        raise ValueError("HospitalPrices control target is not allowed")
+    return await _control_single_job_start(ctx, task, **arq_metadata)
 
 
 class MRF:
@@ -683,6 +721,54 @@ class MassachusettsBORIMProfile:
     job_deserializer = deserialize_job
 
 
+class KentuckyKBMLProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:KentuckyKBMLProfile"
+    job_timeout = 24 * 60 * 60
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class TennesseeTDHProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:TennesseeTDHProfile"
+    job_timeout = 24 * 60 * 60
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class RhodeIslandDOHProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RhodeIslandDOHProfile"
+    job_timeout = 24 * 60 * 60
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class NewYorkNYPPProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:NewYorkNYPPProfile"
+    job_timeout = max(_worker_int_env("HLTHPRT_NYPP_DEADLINE_SECONDS", 0) + 300, 24 * 60 * 60)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class PartDFormularyNetwork:
     functions = [partd_formulary_network_start, partd_formulary_network_process_chunk]
     on_startup = db_startup
@@ -964,7 +1050,14 @@ class MRFSourceDiscovery:
 
 
 class HospitalPrices:
-    functions = [process_hospital_prices_data, control_single_job_start]
+    functions = [
+        process_hospital_prices_data,
+        arq_func(
+            _hospital_price_control_single_job_start,
+            name="control_single_job_start",
+            max_tries=1,
+        ),
+    ]
     on_startup = db_startup
     max_jobs = 1
     queue_read_limit = 2
@@ -1953,6 +2046,10 @@ process_group.add_command(partd_formulary_network, name="partd-formulary-network
 process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(florida_mqa_profile, name="florida-mqa-profile")
 process_group.add_command(massachusetts_borim_profile, name="massachusetts-borim-profile")
+process_group.add_command(kentucky_kbml_profile, name="kentucky-kbml-profile")
+process_group.add_command(tennessee_tdh_profile, name="tennessee-tdh-profile")
+process_group.add_command(rhode_island_doh_profile, name="rhode-island-doh-profile")
+process_group.add_command(new_york_nypp_profile, name="new-york-nypp-profile")
 process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(lodes, name="lodes")

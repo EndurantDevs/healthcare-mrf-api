@@ -33,10 +33,8 @@ from process.uhc_flex_practitioner_twin_store import (
 )
 from tests import provider_directory_uhc_flex_npi_cohort_pg_support as cohort_support
 from tests.formulary_fhir_twin_admission_pg_support import connect, run_migration
-from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
-    cohort_fixture,
-    MEMBER_NPIS,
-)
+from tests.nppes_public_evidence_process_support import _synthetic_npi
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import MEMBER_NPIS
 from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
     ENDPOINT_ID,
     PROJECTION_DATE,
@@ -72,7 +70,7 @@ async def _terminalize_retry_exhaustion(database, identity, exhausted_npi) -> No
 
 async def _partial_single_root(database):
     operation_key = "c" * 64
-    cohort = cohort_fixture()
+    cohort = cohort_support.cohort_fixture()
     intent_id = single_root_dataset_intent_id(
         cohort.cohort_id,
         PROJECTION_DATE,
@@ -89,6 +87,7 @@ async def _partial_single_root(database):
         database=database,
     ) == 1
     matched_npi, exhausted_npi = MEMBER_NPIS
+    unmatched_npis = tuple(npi for npi in cohort_support.MEMBER_NPIS if npi not in MEMBER_NPIS)
     await _terminalize_retry_exhaustion(database, identity, exhausted_npi)
     matched = await claim_uhc_flex_practitioner_work(
         identity.acquisition_id,
@@ -101,6 +100,14 @@ async def _partial_single_root(database):
         _query_result(matched_npi, True),
         database=database,
     )
+    for npi in unmatched_npis:
+        unmatched = await claim_uhc_flex_practitioner_work(
+            identity.acquisition_id, requested_npi=npi, database=database,
+        )
+        assert unmatched is not None
+        await complete_uhc_flex_practitioner_result(
+            unmatched, _query_result(npi, False), database=database,
+        )
     summary = await seal_uhc_flex_practitioner_acquisition(
         identity,
         database=database,
@@ -110,7 +117,7 @@ async def _partial_single_root(database):
         summary.unmatched_count,
         summary.error_count,
         summary.cohort_complete,
-    ) == (1, 0, 1, False)
+    ) == (1, len(unmatched_npis), 1, False)
     return await admit_uhc_flex_practitioner_single_root(
         identity.acquisition_id,
         semantic_projection_as_of=PROJECTION_DATE,
@@ -119,18 +126,23 @@ async def _partial_single_root(database):
     )
 
 
+def _configure_partial_cohort(monkeypatch) -> None:
+    """One failed logical request out of 100 is genuinely below the budget."""
+
+    npis = MEMBER_NPIS + tuple(int(_synthetic_npi(index)) for index in range(98))
+    monkeypatch.setattr(cohort_support, "PRACTITIONER_NPIS", npis)
+    monkeypatch.setattr(cohort_support, "MEMBER_NPIS", tuple(sorted(npis)))
+    content_proof = _bound_official_content_proof()
+    monkeypatch.setattr(cohort_support, "DATASET_HASH", content_proof["dataset_hash"])
+    monkeypatch.setattr(cohort_support, "CONTENT_PROOF_SHA256", content_proof["proof_sha256"])
+    monkeypatch.setattr(cohort_support, "_content_proof", lambda: content_proof)
+
+
 @pytest.mark.asyncio
 async def test_retry_exhausted_single_root_publishes_explicit_partial_dataset(
     monkeypatch,
 ) -> None:
-    content_proof = _bound_official_content_proof()
-    monkeypatch.setattr(cohort_support, "DATASET_HASH", content_proof["dataset_hash"])
-    monkeypatch.setattr(
-        cohort_support,
-        "CONTENT_PROOF_SHA256",
-        content_proof["proof_sha256"],
-    )
-    monkeypatch.setattr(cohort_support, "_content_proof", lambda: content_proof)
+    _configure_partial_cohort(monkeypatch)
     async with _publication_test_scope(monkeypatch) as test_scope:
         (
             url,

@@ -210,7 +210,25 @@ def public_hospital_price_item(
             )
         },
         "negotiated_prices": [
-            {field: value for field, value in fact.items() if field != "charge_key"}
+            {
+                field: fact.get(field)
+                for field in (
+                    "payer_name",
+                    "plan_name",
+                    "negotiated_rate_term",
+                    "negotiated_dollar",
+                    "negotiated_percentage",
+                    "negotiated_algorithm",
+                    "estimated_amount",
+                    "methodology",
+                    "median_amount",
+                    "percentile_10",
+                    "percentile_90",
+                    "allowed_count",
+                    "additional_payer_notes",
+                    "comparison_amount",
+                )
+            }
             for fact in facts
         ],
     }

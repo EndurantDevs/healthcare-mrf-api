@@ -53,6 +53,24 @@ class HospitalPriceQuery:
     plan_missing: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class HospitalPayerPlanQuery:
+    hospital_id: str
+    version_id: str | None
+    cursor: str | None
+    limit: int
+
+
+def validate_hospital_payer_plan_query(
+    hospital_id: object, *, version_id: object = None,
+    cursor: object = None, limit: object = None,
+) -> HospitalPayerPlanQuery:
+    """Validate bounded discovery using the shared facility/version constraints."""
+
+    parsed_limit = _validate_resource_query(hospital_id, version_id, cursor, limit)
+    return HospitalPayerPlanQuery(hospital_id, version_id, cursor, parsed_limit)
+
+
 def validate_hospital_price_plan(plan_name: object, plan_missing: object) -> object:
     """Decode an explicit absent-plan selector without inventing plan text."""
 
@@ -76,8 +94,7 @@ def validate_hospital_price_query(
 ) -> HospitalPriceQuery:
     """Validate one exact, bounded public query without normalization."""
 
-    if type(hospital_id) is not str or _HOSPITAL_ID_PATTERN.fullmatch(hospital_id) is None:
-        raise HospitalPriceNotFoundError("hospital price resource is unavailable")
+    parsed_limit = _validate_resource_query(hospital_id, version_id, cursor, limit)
     if type(code_type) is not str or code_type not in _CODE_TYPES:
         raise HospitalPriceInvalidRequestError("hospital price code type is invalid")
     if (
@@ -102,6 +119,19 @@ def validate_hospital_price_query(
             or len(field_text.encode("utf-8")) > 4096
         ):
             raise HospitalPriceInvalidRequestError(f"{field_name} is invalid")
+    return HospitalPriceQuery(
+        hospital_id, code_type, code, payer_name, plan_name,
+        version_id, cursor, parsed_limit, is_missing_plan,
+    )
+
+
+def _validate_resource_query(
+    hospital_id: object, version_id: object, cursor: object, limit: object,
+) -> int:
+    """Validate shared exact identity and bounded continuation fields."""
+
+    if type(hospital_id) is not str or _HOSPITAL_ID_PATTERN.fullmatch(hospital_id) is None:
+        raise HospitalPriceNotFoundError("hospital price resource is unavailable")
     if version_id is not None and (
         type(version_id) is not str or _VERSION_PATTERN.fullmatch(version_id) is None
     ):
@@ -118,13 +148,14 @@ def validate_hospital_price_query(
         raise HospitalPriceInvalidRequestError("hospital price limit is invalid")
     if parsed_limit > MAX_HOSPITAL_PRICE_LIMIT:
         raise HospitalPriceInvalidRequestError("hospital price limit is invalid")
-    return HospitalPriceQuery(
-        hospital_id, code_type, code, payer_name, plan_name,
-        version_id, cursor, parsed_limit, is_missing_plan,
-    )
+    return parsed_limit
 
 
-def _scope_digest(query: HospitalPriceQuery) -> bytes:
+def _scope_digest(query: HospitalPriceQuery | HospitalPayerPlanQuery) -> bytes:
+    if isinstance(query, HospitalPayerPlanQuery):
+        return hashlib.sha256(
+            b"healthporta.hospital-payer-plan-cursor.v1\0" + query.hospital_id.encode("utf-8")
+        ).digest()
     domain = b"healthporta.hospital-price-charge-cursor.v1\0"
     if query.plan_missing:
         domain = b"healthporta.hospital-price-charge-cursor.missing-plan.v1\0"
@@ -140,7 +171,7 @@ def _scope_digest(query: HospitalPriceQuery) -> bytes:
 
 
 def encode_hospital_price_cursor(
-    query: HospitalPriceQuery,
+    query: HospitalPriceQuery | HospitalPayerPlanQuery,
     version_id: str,
     after_key: int,
 ) -> str:
@@ -153,7 +184,9 @@ def encode_hospital_price_cursor(
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def decode_hospital_price_cursor(query: HospitalPriceQuery, version_id: str) -> int:
+def decode_hospital_price_cursor(
+    query: HospitalPriceQuery | HospitalPayerPlanQuery, version_id: str,
+) -> int:
     """Decode a canonical cursor or reject cross-query/version reuse."""
 
     if query.cursor is None:

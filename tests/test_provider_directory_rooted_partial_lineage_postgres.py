@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -25,39 +24,18 @@ from process.provider_directory_rooted_graph_single_root_contract import (
 from process.provider_directory_rooted_graph_twin_store import (
     admit_rooted_graph_single_root,
 )
-from tests.formulary_fhir_twin_admission_pg_support import (
-    connect,
-    load_migration,
-    run_migration,
-)
-from tests import provider_directory_uhc_flex_npi_cohort_pg_support as cohort_support
+from tests.formulary_fhir_twin_admission_pg_support import connect
 from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
     _complete_success,
 )
 from tests.test_provider_directory_uhc_flex_partial_publication_postgres import (
+    _configure_partial_cohort,
     _partial_single_root,
 )
 from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
     _publication_test_scope,
     ENDPOINT_ID,
 )
-from tests.test_provider_directory_uhc_flex_practitioner_twin_postgres import (
-    _bound_official_content_proof,
-)
-
-
-MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / ("20260830100000_provider_directory_rooted_partial_lineage.py")
-)
-CANONICAL_JSON_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / ("20260810110000_ptg_wave_receipt_authority.py")
-)
-
-
 async def _publish_and_verify_partial_rooted_graph(
     url,
     schema,
@@ -84,6 +62,8 @@ async def _publish_and_verify_partial_rooted_graph(
     assert rooted.readiness.rooted_graph_complete is True
     assert rooted.readiness.endpoint_collection_complete is False
     assert rooted.readiness.endpoint_complete is False
+    assert rooted.readiness.request_failure_coverage["failed_requests"] == 1
+    assert rooted.readiness.request_failure_coverage["resource_coverage"] == "unknown"
     assert (
         await database.scalar(
             f"SELECT {schema}.provider_directory_rooted_graph_dataset_ready("
@@ -113,16 +93,9 @@ async def test_partial_flex_root_admits_and_publishes_exact_rooted_readiness(
 ) -> None:
     """Carry one exhausted Flex member through exact rooted publication."""
 
-    content_proof = _bound_official_content_proof()
-    monkeypatch.setattr(cohort_support, "DATASET_HASH", content_proof["dataset_hash"])
-    monkeypatch.setattr(
-        cohort_support,
-        "CONTENT_PROOF_SHA256",
-        content_proof["proof_sha256"],
-    )
-    monkeypatch.setattr(cohort_support, "_content_proof", lambda: content_proof)
+    _configure_partial_cohort(monkeypatch)
     async with _publication_test_scope(monkeypatch) as test_scope:
-        url, schema, database, engine, _, _ = test_scope
+        url, schema, database, _, _, _ = test_scope
         monkeypatch.setattr(
             flex_publication,
             "register_uhc_flex_practitioner_source",
@@ -134,14 +107,6 @@ async def test_partial_flex_root_admits_and_publishes_exact_rooted_readiness(
             database=database,
             batch_size=1,
         )
-        migration = load_migration(MIGRATION_PATH, "rooted_partial_lineage")
-        await run_migration(engine, migration, "upgrade")
-        canonical = load_migration(CANONICAL_JSON_PATH, "rooted_partial_json")
-        canonical.install = lambda: canonical._install_receipt_verification_functions(
-            schema.strip('"')
-        )
-        await run_migration(engine, canonical, "install")
-
         async with database.transaction():
             current = await lock_exact_current_dataset(
                 database,

@@ -100,6 +100,61 @@ def test_invalid_schema_fails_at_module_load(monkeypatch):
         _load_module()
 
 
+def test_source_metadata_uses_only_explicit_location_bindings():
+    source_by_field = {
+        "version_id": "a" * 64, "source_hospital_name": "Synthetic hospital group",
+        "source_location_count": 2, "source_license_states": ["MI"],
+        "source_location_ordinal": 1, "location_name": "Synthetic hospital",
+        "hospital_address": "100 Example St, Example City, MI 49000",
+    }
+    bound = status_api._source_location_metadata(source_by_field)
+    assert bound["location_binding_status"] == "bound"
+    assert bound["source_location_ordinal"] == 1
+    assert bound["hospital_address"] == source_by_field["hospital_address"]
+    for changed in ({"source_location_ordinal": None}, {"hospital_address": None}, {"source_location_ordinal": 2}):
+        unresolved = status_api._source_location_metadata(source_by_field | changed)
+        assert unresolved["location_binding_status"] == "unresolved"
+        assert unresolved["hospital_address"] is None
+        assert unresolved["location_name"] is None
+        assert unresolved["source_location_ordinal"] is None
+    unpublished = status_api._source_location_metadata({})
+    assert unpublished["location_binding_status"] == "unpublished"
+    assert unpublished["source_license_states"] == []
+    assert unpublished["source_hospital_name"] is None
+
+
+def test_metadata_sql_preserves_the_default_status_query_cost():
+    assert "hospital_price_version_location" not in status_api._STATUS_SQL
+    assert "hospital_price_version_license" not in status_api._STATUS_SQL
+    sql = status_api._STATUS_METADATA_SQL
+    assert "binding.version_id = current.version_id" in sql
+    assert "binding.hospital_id = hospital.hospital_id" in sql
+    assert "location.location_ordinal = binding.source_location_ordinal" in sql
+    assert "license.version_id=version.version_id" in sql
+
+
+@pytest.mark.asyncio
+async def test_metadata_is_opt_in_and_uses_the_selected_publication(monkeypatch):
+    source_by_field = {
+        "hospital_id": "hospital-000001", "version_id": "a" * 64,
+        "source_hospital_name": "Synthetic hospital", "source_location_count": 1,
+        "source_location_ordinal": 0, "location_name": None,
+        "hospital_address": "100 Example St, Example City, MI 49000",
+    }
+    statements = []
+
+    async def read_rows(statement):
+        statements.append(statement)
+        return [source_by_field]
+
+    monkeypatch.setattr(status_api.db, "all", read_rows)
+    ordinary = await status_api.list_hospital_price_status_page(limit=1)
+    assert "metadata" not in ordinary["items"][0]
+    enriched = await status_api.list_hospital_price_status_page(limit=1, include_metadata=True)
+    assert enriched["items"][0]["metadata"]["hospital_address"] == source_by_field["hospital_address"]
+    assert statements == [status_api._STATUS_SQL, status_api._STATUS_METADATA_SQL]
+
+
 @pytest.mark.parametrize("value", [None, ""])
 def test_page_limit_uses_default_for_empty_values(value):
     assert (
@@ -122,6 +177,16 @@ def test_status_match_handles_success_and_attempt_statuses():
     assert status_api._is_status_match(published_item_by_field, "succeeded")
     assert not status_api._is_status_match(unpublished_item_by_field, "succeeded")
     assert status_api._is_status_match(published_item_by_field, "published")
+
+
+def test_summary_counts_publication_with_optional_metadata_absent():
+    summary = status_api._summary([{"latest_attempt": None, "publication": {}}])
+
+    assert summary["succeeded"] == 1
+    assert summary["unpublished"] == 0
+    assert summary["template_versions"] == {}
+    assert summary["source_formats"] == {}
+    assert summary["detected_schema_profiles"] == {}
 
 
 @pytest.mark.asyncio
@@ -263,6 +328,23 @@ async def test_query_status_and_cursor_are_stable():
         "hospital-000003",
     ]
     assert page["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_public_identity_query_does_not_match_hidden_source_url():
+    status_api.db.rows = []
+
+    hidden_source_page = await status_api.list_hospital_price_status_page(
+        query="a.example", identity_query_only=True
+    )
+    identity_page = await status_api.list_hospital_price_status_page(
+        query="hospital-000001", identity_query_only=True
+    )
+
+    assert hidden_source_page["items"] == []
+    assert [item["hospital_id"] for item in identity_page["items"]] == [
+        "hospital-000001"
+    ]
 
 
 @pytest.mark.parametrize(

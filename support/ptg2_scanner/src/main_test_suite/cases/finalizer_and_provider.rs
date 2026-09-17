@@ -2399,8 +2399,8 @@ fn v4_tax_identity_sidecar_is_token_only_complete_and_deterministic() {
         PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES as usize * 3
     );
     let rows = records
-        .chunks_exact(PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES as usize)
-        .collect::<Vec<_>>();
+        .as_chunks::<{ PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES as usize }>()
+        .0;
     assert!(rows.windows(2).all(|pair| pair[0][..16] < pair[1][..16]));
     assert_eq!(
         rows.iter()

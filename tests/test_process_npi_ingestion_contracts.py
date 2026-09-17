@@ -410,10 +410,11 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
     }
     shutdown_result_by_name = await npi_module.shutdown(shutdown_context_map)
 
-    receipt_mock = npi_module.insert_npi_publication_receipt
-    publication_input = receipt_mock.await_args.kwargs["publication_input"]
-    assert publication_input.row_counts == (1, 2, 3, 4, 5, 6)
-    assert publication_input.relation_oids == (11, 12, 13, 14, 15, 16)
+    _assert_npi_generation_published(
+        npi_module,
+        raw_connection,
+        publication_receipt,
+    )
     npi_module.mark_npi_publication_succeeded.assert_awaited_once()
     npi_module.raise_if_cancelled.assert_awaited()
     first_swap = next(
@@ -442,6 +443,25 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         shutdown_context_map["context"],
         suppress_errors=True,
     )
+
+
+def _assert_npi_generation_published(
+    npi_module,
+    raw_connection,
+    publication_receipt,
+) -> None:
+    """Assert shutdown records and publishes its canonical result generation."""
+
+    receipt_mock = npi_module.insert_npi_publication_receipt
+    publication_input = receipt_mock.await_args.kwargs["publication_input"]
+    assert publication_input.row_counts == (1, 2, 3, 4, 5, 6)
+    assert publication_input.relation_oids == (11, 12, 13, 14, 15, 16)
+    npi_module.publish_local_npi_result_generation.assert_awaited_once_with(
+        raw_connection,
+        schema_name="testschema",
+        receipt=publication_receipt,
+    )
+
 
 @pytest.mark.asyncio
 async def test_resolve_npi_address_archive_skips_sql_stamp_when_keys_loaded(monkeypatch, npi_module):

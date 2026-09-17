@@ -123,7 +123,12 @@ fn parse_tall_modifier_payer(
     )?;
     let standard_charge_algorithm =
         optional_text(csv_value(record, columns.standard_charge_algorithm));
-    let description = optional_text(csv_value(record, columns.common.additional_generic_notes));
+    let description = optional_text(csv_value(
+        record,
+        columns
+            .additional_payer_notes
+            .unwrap_or(columns.common.additional_generic_notes),
+    ));
     if payer_name.is_none()
         && plan_name.is_none()
         && standard_charge_dollar.is_none()
@@ -209,6 +214,19 @@ fn parse_tall_payer(
     columns: &TallCsvColumns,
     generic_notes: Option<&str>,
 ) -> io::Result<Option<PayerChargeRow>> {
+    let explicit_payer_notes = csv_profile_value(record, columns.additional_payer_notes);
+    if explicit_payer_notes.contains('\0') {
+        return Err(invalid("hospital MRF payer_charge COPY row contains NUL"));
+    }
+    let reject_unbound_explicit_note = || {
+        if explicit_payer_notes.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid(
+                "explicit additional_payer_notes requires a material payer charge",
+            ))
+        }
+    };
     let payer_columns = [
         Some(columns.payer_name),
         Some(columns.plan_name),
@@ -222,6 +240,17 @@ fn parse_tall_payer(
         columns.allowed_count,
     ];
     if columns.profile == CmsProfile::V3
+        && csv_value(record, columns.payer_name).is_empty()
+        && csv_value(record, columns.plan_name) == "#N/A"
+        && payer_columns[2..]
+            .iter()
+            .all(|column| csv_profile_value(record, *column).is_empty())
+        && csv_value(record, columns.methodology).is_empty()
+        && explicit_payer_notes.is_empty()
+    {
+        return Ok(None);
+    }
+    if columns.profile == CmsProfile::V3
         && csv_value(record, columns.payer_name) == "All Payers / All Plans"
         && csv_value(record, columns.plan_name).is_empty()
         && csv_value(record, columns.methodology).is_empty()
@@ -230,12 +259,14 @@ fn parse_tall_payer(
             .all(|column| csv_profile_value(record, *column).is_empty())
     {
         // A generic service-price label is not a payer; the charge must still validate.
+        reject_unbound_explicit_note()?;
         return Ok(None);
     }
     if payer_columns
         .iter()
         .all(|column| csv_profile_value(record, *column).is_empty())
     {
+        reject_unbound_explicit_note()?;
         let methodology = csv_value(record, columns.methodology).trim();
         if !(methodology.is_empty()
             || columns.profile == CmsProfile::V2
@@ -261,6 +292,7 @@ fn parse_tall_payer(
         && csv_profile_value(record, columns.allowed_count).trim() == "0"
         && generic_notes.is_some_and(|notes| !notes.trim().is_empty())
     {
+        reject_unbound_explicit_note()?;
         let methodology = csv_value(record, columns.methodology).trim();
         if !methodology.is_empty() {
             canonical_methodology(methodology, true)?;
@@ -304,15 +336,33 @@ fn parse_tall_payer(
             .map(|value| allowed_count(value, true))
             .transpose()?,
         methodology: csv_value(record, columns.methodology).to_owned(),
-        additional_payer_notes: generic_notes.and_then(optional_text),
+        additional_payer_notes: match columns.additional_payer_notes {
+            Some(_) => optional_text(explicit_payer_notes),
+            None => generic_notes.and_then(optional_text),
+        },
     };
     if columns.profile == CmsProfile::V3 && is_explicitly_uncontracted_csv_payer(&payer) {
         return Ok(None);
     }
-    if columns.profile == CmsProfile::V2 && !payer_has_charge(&payer) {
-        validate_charge_free_csv_payer(&payer)?;
-        return Ok(None);
+    let charge_free_v3_statistics = columns.profile == CmsProfile::V3
+        && payer.plan_name.as_deref() == Some("")
+        && !payer
+            .payer_name
+            .eq_ignore_ascii_case("All Payers / All Plans")
+        && (payer.median_amount.is_some()
+            || payer.percentile_10.is_some()
+            || payer.percentile_90.is_some()
+            || payer.allowed_count.is_some());
+    if !payer_has_charge(&payer) {
+        if columns.profile == CmsProfile::V2 {
+            validate_charge_free_csv_payer(&payer, generic_notes)?;
+            return Ok(None);
+        }
+        if charge_free_v3_statistics && validate_charge_free_csv_payer(&payer, generic_notes).is_ok() {
+            return Ok(None);
+        }
     }
+    // Tall generic notes can explain payer charges even with an extra payer-notes column.
     let payer = validate_csv_payer(
         payer,
         generic_notes,
@@ -349,14 +399,17 @@ fn parse_wide_payers(
         {
             continue;
         }
+        let standard_charge_dollar = optional_decimal(
+            csv_value(record, payer.standard_charge_dollar),
+            "standard_charge_dollar",
+        )?;
+        let has_standard_charge_dollar = standard_charge_dollar.is_some();
+        let estimated_amount_value = csv_profile_value(record, payer.estimated_amount);
         let parsed = PayerChargeRow {
             payer_name: payer.payer_name.clone(),
             plan_name: optional_text(&payer.plan_name),
             negotiated_rate_term: payer.negotiated_rate_term.clone(),
-            standard_charge_dollar: optional_decimal(
-                csv_value(record, payer.standard_charge_dollar),
-                "standard_charge_dollar",
-            )?,
+            standard_charge_dollar,
             standard_charge_percentage: optional_decimal(
                 csv_value(record, payer.standard_charge_percentage),
                 "standard_charge_percentage",
@@ -365,10 +418,26 @@ fn parse_wide_payers(
                 record,
                 payer.standard_charge_algorithm,
             )),
-            estimated_amount: optional_decimal(
-                csv_profile_value(record, payer.estimated_amount),
-                "estimated_amount",
-            )?,
+            estimated_amount: match canonical_decimal_text(estimated_amount_value) {
+                None if estimated_amount_value.is_empty() => None,
+                None => {
+                    return Err(invalid(
+                        "estimated_amount must be an exact decimal number",
+                    ));
+                }
+                Some(value)
+                    if value == "0"
+                        && profile == CmsProfile::V2
+                        && has_standard_charge_dollar
+                        && !estimated_amount_value.starts_with('-') =>
+                {
+                    None
+                }
+                Some(value) if value == "0" || value.starts_with('-') => {
+                    return Err(invalid("estimated_amount must be greater than zero"));
+                }
+                Some(value) => Some(value),
+            },
             median_amount: optional_decimal(
                 csv_profile_value(record, payer.median_amount),
                 "median_amount",
@@ -392,7 +461,7 @@ fn parse_wide_payers(
             )),
         };
         if !payer_has_charge(&parsed) {
-            validate_charge_free_csv_payer(&parsed)?;
+            validate_charge_free_csv_payer(&parsed, None)?;
             continue;
         }
         payers.push(validate_csv_payer(
@@ -428,9 +497,10 @@ fn parse_tall_records<R: Read>(
             flush_charge(&mut charge_accumulator, outputs, version_id)?;
             let mut modifier = parse_csv_modifier(&record, &columns.common)?;
             let payer = parse_tall_modifier_payer(&record, columns)?;
-            if payer.is_some() {
+            if payer.is_some() && columns.additional_payer_notes.is_none() {
                 modifier.additional_generic_notes = None;
-            } else if modifier.additional_generic_notes.is_none() {
+            }
+            if payer.is_none() && modifier.additional_generic_notes.is_none() {
                 return Err(invalid(
                     "CSV modifier information requires a payer adjustment or generic note",
                 ));
@@ -464,8 +534,8 @@ fn parse_tall_records<R: Read>(
             columns,
             raw_charge.additional_generic_notes.as_deref(),
         )?;
-        if payer.is_some() {
-            // Tall has one notes column; on a payer row it canonically belongs to that payer.
+        if payer.is_some() && columns.additional_payer_notes.is_none() {
+            // Legacy one-column tall notes belong to the payer; explicit columns stay separate.
             raw_charge.additional_generic_notes = None;
         }
         let payers = payer.into_iter().collect::<Vec<_>>();

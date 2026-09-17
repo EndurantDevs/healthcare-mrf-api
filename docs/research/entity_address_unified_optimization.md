@@ -10,7 +10,7 @@ from the importer.
 Run a dry-run plan:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
+./.venv/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --dry-run
 ```
@@ -19,7 +19,7 @@ Run the 1k-per-source bounded dev smoke through the deployment's authenticated
 operator API:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
+./.venv/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --case dev-bounded-smoke-1k
 ```
@@ -32,7 +32,7 @@ Run the full dev pilot only when PTG/openaddress jobs are not competing for the
 same database CPU and temp I/O:
 
 ```bash
-./venv314/bin/python scripts/research/ptg2_experiment.py run \
+./.venv/bin/python scripts/research/ptg2_experiment.py run \
   --suite docs/research/entity_address_unified_benchmark_suite.example.json \
   --case dev-full-run
 ```

@@ -16,11 +16,15 @@ from db.connection import db
 from process.control_lifecycle import mark_control_run
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
-from process.ptg_parts.ptg2_fast_candidate_audit import (
-    FastAuditHttpConfig,
-    FastAuditTarget,
-    FastCandidateAuditError,
-    run_fast_candidate_audit,
+from process.ptg_parts.frozen_rate_binding import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+)
+from process.ptg_parts.frozen_rate_candidate import (
+    validate_frozen_candidate_evidence,
+)
+from process.ptg_parts.frozen_rate_files import (
+    FrozenRateFileMismatchError,
+    FrozenRateFileValidationError,
 )
 from process.ptg_parts.ptg2_batch_candidate_audit import (
     BatchCandidateAuditContractError,
@@ -41,18 +45,23 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     load_held_candidate_audit_attestation,
     record_candidate_audit_attestation,
 )
+from process.ptg_parts.ptg2_candidate_audit_plan_store import (
+    load_persisted_audit_sample,
+)
 from process.ptg_parts.ptg2_candidate_layout_identity import (
     PTG2_CANDIDATE_ARCH_VERSION,
     PTG2_CANDIDATE_V3_GENERATION,
     validate_candidate_layout_identity,
 )
-from process.ptg_parts.ptg2_provider_quarantine import (
-    provider_identifier_quarantine_evidence,
-    validate_provider_identifier_quarantine_evidence,
-    validate_provider_identifier_quarantine,
+from process.ptg_parts.ptg2_fast_candidate_audit import (
+    FastAuditHttpConfig,
+    FastAuditTarget,
+    FastCandidateAuditError,
+    run_fast_candidate_audit,
 )
-from process.ptg_parts.ptg2_candidate_audit_plan_store import (
-    load_persisted_audit_sample,
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_candidate_invalid_price_exclusion_evidence,
+    validated_candidate_invalid_price_exclusion_policy,
 )
 from process.ptg_parts.ptg2_partitioned_candidate_audit import (
     PartitionFailureCallback,
@@ -61,28 +70,18 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit import (
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
 )
+from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_evidence,
+    validate_provider_identifier_quarantine,
+    validate_provider_identifier_quarantine_evidence,
+)
 from process.ptg_parts.ptg2_source_witness import (
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
     source_set_digest,
 )
 from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witness
-from process.ptg_parts.frozen_rate_candidate import (
-    validate_frozen_candidate_evidence,
-)
-from process.ptg_parts.frozen_rate_binding import (
-    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
-)
-from process.ptg_parts.frozen_rate_files import (
-    FrozenRateFileMismatchError,
-    FrozenRateFileValidationError,
-)
-from process.ptg_parts.ptg2_invalid_price_exclusion import (
-    validate_candidate_invalid_price_exclusion_evidence,
-    validated_candidate_invalid_price_exclusion_policy,
-)
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
-
 
 IMPORTER_NAME = "ptg-candidate-audit"
 ARCH_VERSION = PTG2_CANDIDATE_ARCH_VERSION
@@ -413,10 +412,19 @@ async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
         _row_mapping(database_source_row)
         for database_source_row in database_source_rows
     ]
+    return _candidate_raw_sources_from_records(source_records)
+
+
+def _candidate_raw_sources_from_records(
+    source_records: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Validate already-locked source rows for transaction-local callers."""
+
+    normalized_records = [dict(source_record) for source_record in source_records]
     try:
         source_ordinals = [
             int(source_record.get("source_key"))
-            for source_record in source_records
+            for source_record in normalized_records
         ]
     except (TypeError, ValueError) as exc:
         raise ValueError(
@@ -429,13 +437,29 @@ async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
             source_record.get("raw_container_sha256"),
             field="raw container digest",
         )
-        for source_record in source_records
+        for source_record in normalized_records
     )
     if not raw_digest_values:
         raise ValueError("candidate has no public raw source bindings")
     if len(raw_digest_values) != len(set(raw_digest_values)):
         raise ValueError("candidate raw source bindings are ambiguous")
-    return _CandidateRawSources(raw_digest_values, source_records)
+    return _CandidateRawSources(raw_digest_values, normalized_records)
+
+
+def validate_candidate_audit_target_state(
+    candidate_row: Mapping[str, Any],
+    *,
+    candidate_run_id: str,
+    source_records: Sequence[Mapping[str, Any]],
+) -> CandidateAuditTarget:
+    """Apply the release-audit target contract to caller-locked state."""
+
+    raw_sources = _candidate_raw_sources_from_records(source_records)
+    return _candidate_target_from_row(
+        candidate_row,
+        candidate_run_id=candidate_run_id,
+        raw_container_sha256=raw_sources,
+    )
 
 
 def _validated_candidate_quarantine(
@@ -1895,4 +1919,5 @@ __all__ = [
     "main",
     "run_batch_release_audit",
     "run_release_audit",
+    "validate_candidate_audit_target_state",
 ]

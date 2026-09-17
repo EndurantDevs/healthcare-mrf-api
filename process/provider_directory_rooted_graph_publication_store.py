@@ -153,6 +153,8 @@ def _identity_header_by_field(
         "root_cohort_id",
         "root_practitioner_resource_count",
         "cohort_complete",
+        "rooted_graph_complete",
+        "request_failure_coverage",
     )
     identity_by_field = {
         field_name: getattr(identity, field_name) for field_name in field_names
@@ -274,19 +276,29 @@ async def _insert_rooted_header(
     header_by_field: dict[str, object],
 ) -> int:
     columns = tuple(header_by_field)
+    placeholders = tuple(
+        "CAST(:request_failure_coverage AS jsonb)"
+        if column == "request_failure_coverage" else ":" + column
+        for column in columns
+    )
+    value_by_column = dict(header_by_field)
+    coverage = value_by_column.get("request_failure_coverage")
+    value_by_column["request_failure_coverage"] = (
+        None if coverage is None else canonical_json(coverage)
+    )
     return await database.status(
         f"""
         INSERT INTO {_table(_HEADER)} ({', '.join(columns)},
             dataset_hash, resource_hash_contract,
-            rooted_graph_complete, endpoint_collection_complete,
+            endpoint_collection_complete,
             endpoint_complete, status, is_current, created_at,
             validated_at, published_at, superseded_at
-        ) VALUES ({', '.join(':' + column for column in columns)},
-            NULL, :resource_hash_contract, true, false, false,
+        ) VALUES ({', '.join(placeholders)},
+            NULL, :resource_hash_contract, false, false,
             'building', false, transaction_timestamp(), NULL, NULL, NULL
         );
         """,
-        **header_by_field,
+        **value_by_column,
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     )
 

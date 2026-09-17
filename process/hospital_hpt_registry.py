@@ -18,9 +18,9 @@ from process.hospital_hpt_locator import hospital_mrf_selector
 HOSPITAL_HPT_REGISTRY_PATH = (
     Path(__file__).resolve().parents[1] / "specs/hospital_hpt_registry.yaml"
 )
-EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_365
+EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_366
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "fe78c14445f5e4b01ea473897cbbcdbaf78d765ef612d091aa1e4b1b9a1c9a70"
+    "a47876614fa8b714a6eff4c04937c72ebcb1d9905bb5e39f2f96d7e8445baace"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
@@ -292,6 +292,12 @@ def hospital_hpt_group_ids(hospital_id: str) -> tuple[str, ...]:
     """Return canonical-first IDs for one reviewed facility group."""
 
     return _group_ids_by_hospital_id().get(hospital_id, ())
+
+
+def warm_hospital_hpt_registry() -> None:
+    """Validate and materialize the fixed registry for this API worker."""
+
+    _group_ids_by_hospital_id()
 
 
 def selected_hospital_hpt_registry(

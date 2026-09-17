@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from textwrap import dedent
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -46,6 +46,17 @@ from api.provider_profile import (
     compose_provider_profile,
     compose_provider_profile_evidence,
     fetch_provider_profile_projection,
+)
+from api.provider_search_sql import (
+    broad_name_page_sql as _broad_name_page_sql,
+    build_provider_name_where as _build_provider_name_where,
+    is_location_first_taxonomy_filter as _is_location_first_taxonomy_filter,
+    plan_release_npi_scope as _plan_release_npi_scope,
+    provider_taxonomy_code_parameters as _provider_taxonomy_code_parameters,
+    provider_taxonomy_lateral_join as _provider_taxonomy_lateral_join,
+    provider_taxonomy_matched_npi_cte as _provider_taxonomy_matched_npi_cte,
+    taxonomy_classification_subquery as _taxonomy_classification_subquery,
+    taxonomy_codes_subquery as _taxonomy_codes_subquery,
 )
 from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        NPIAddress, NPIData, NPIDataOtherIdentifier,
@@ -404,6 +415,17 @@ def _is_truthy_arg(raw_value: Any, *, default: bool) -> bool:
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _is_boolean_query_arg(raw_value: Any, param_name: str, *, default: bool) -> bool:
+    if raw_value in (None, "", "null"):
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be boolean")
+
+
 def _normalize_text_filter(raw_value: Any, *, param_name: str, max_length: int = 128) -> Optional[str]:
     if raw_value in (None, "", "null"):
         return None
@@ -661,168 +683,6 @@ ORGANIZATION_LIKE_TEMPLATE = (
 )
 
 
-def _taxonomy_codes_subquery(conditions: str) -> str:
-    return (
-        dedent(
-            """
-            (
-                SELECT ARRAY_AGG(code) AS codes,
-                       ARRAY_AGG(int_code) AS int_codes
-                  FROM mrf.nucc_taxonomy
-                 WHERE {conditions}
-            ) AS q
-            """
-        )
-        .strip()
-        .format(conditions=conditions)
-    )
-
-
-def _provider_taxonomy_lateral_join(
-    address_alias: str = "c",
-    taxonomy_alias: str = "q",
-    code_placeholders: Sequence[str] = (),
-    provider_npi_sql: str | None = None,
-) -> str:
-    """Return an NPI-first taxonomy probe for selective provider searches."""
-
-    taxonomy_code_predicate = (
-        "provider_taxonomy.healthcare_provider_taxonomy_code "
-        f"IN ({', '.join(code_placeholders)})"
-        if code_placeholders
-        else "provider_taxonomy.healthcare_provider_taxonomy_code "
-        f"= ANY({taxonomy_alias}.codes)"
-    )
-    provider_npi = provider_npi_sql or f"{address_alias}.npi"
-    return f"""
-    JOIN LATERAL (
-        SELECT 1
-          FROM mrf.npi_taxonomy AS provider_taxonomy
-         WHERE provider_taxonomy.npi = {provider_npi}
-           AND {taxonomy_code_predicate}
-         LIMIT 1
-    ) AS provider_taxonomy_match ON TRUE
-    """
-
-
-def _provider_taxonomy_code_parameters(
-    taxonomy_codes: Sequence[str],
-    parameter_prefix: str,
-) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Return scalar taxonomy parameters that keep composite indexes usable."""
-
-    parameters_by_name = {
-        f"{parameter_prefix}_{index}": str(taxonomy_code).upper()
-        for index, taxonomy_code in enumerate(taxonomy_codes)
-    }
-    placeholders = tuple(
-        f":{parameter_name}" for parameter_name in parameters_by_name
-    )
-    return parameters_by_name, placeholders
-
-
-def _provider_taxonomy_matched_npi_cte(
-    taxonomy_conditions: str,
-    *,
-    code_placeholders: Sequence[str] = (),
-    npi_where: str = "",
-    npi_projection: str = "b.npi",
-) -> str:
-    """Materialize the smaller side of a provider/taxonomy intersection."""
-
-    if code_placeholders:
-        if npi_where:
-            if not ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION:
-                return f"""
-    taxonomy_matched_npi AS MATERIALIZED (
-        SELECT DISTINCT {npi_projection}
-          FROM mrf.npi_taxonomy AS provider_taxonomy
-          JOIN mrf.npi AS b
-            ON b.npi = provider_taxonomy.npi
-         WHERE provider_taxonomy.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})
-           AND ({npi_where})
-    )
-    """
-            return f"""
-    taxonomy_matched_npi AS MATERIALIZED (
-        SELECT {npi_projection}
-          FROM mrf.npi AS b
-         WHERE b.search_taxonomy_codes && ARRAY[{', '.join(code_placeholders)}]::varchar[]
-           AND ({npi_where})
-    )
-    """
-        taxonomy_match_sql = (
-            "WHERE provider_taxonomy.healthcare_provider_taxonomy_code "
-            f"IN ({', '.join(code_placeholders)})"
-        )
-    else:
-        taxonomy_match_sql = f"""
-          JOIN (
-                SELECT code
-                  FROM mrf.nucc_taxonomy
-                 WHERE {taxonomy_conditions}
-          ) AS matched_taxonomy
-            ON matched_taxonomy.code =
-               provider_taxonomy.healthcare_provider_taxonomy_code
-        """
-
-    return f"""
-    taxonomy_matched_npi AS MATERIALIZED (
-        SELECT DISTINCT fn.*
-          FROM filtered_npi AS fn
-          JOIN mrf.npi_taxonomy AS provider_taxonomy
-            ON provider_taxonomy.npi = fn.npi
-          {taxonomy_match_sql}
-    )
-    """
-
-
-def _is_location_first_taxonomy_filter(
-    use_taxonomy_filter: bool,
-    candidate_filters: Iterable[Any],
-) -> bool:
-    """Return whether selective candidates should drive taxonomy probes."""
-
-    return use_taxonomy_filter and any(
-        value not in (None, "", (), [], {})
-        for value in candidate_filters
-    )
-
-
-def _taxonomy_full_subquery(conditions: str) -> str:
-    return (
-        dedent(
-            """
-            (
-                SELECT code,
-                       int_code
-                  FROM mrf.nucc_taxonomy
-                 WHERE {conditions}
-            ) AS q
-            """
-        )
-        .strip()
-        .format(conditions=conditions)
-    )
-
-
-def _taxonomy_classification_subquery(conditions: str) -> str:
-    return (
-        dedent(
-            """
-            (
-                SELECT int_code,
-                       classification
-                  FROM mrf.nucc_taxonomy
-                 WHERE {conditions}
-            ) AS q
-            """
-        )
-        .strip()
-        .format(conditions=conditions)
-    )
-
-
 async def _get_taxonomy_codes_for_classification(classification: str, *, session=None) -> list[str]:
     key = str(classification or "").strip().lower()
     if not key:
@@ -885,7 +745,12 @@ def _classification_npi_values(taxonomy_npi_rows) -> list[int]:
     return npi_values
 
 
-async def _get_classification_npi_list(classification: str, *, session=None) -> list[int]:
+async def _get_classification_npi_list(
+    classification: str,
+    *,
+    primary_only: bool = True,
+    session=None,
+) -> list[int]:
     """Return the publication-scoped NPI list for one taxonomy classification."""
 
     classification_key = str(classification or "").strip().lower()
@@ -895,7 +760,7 @@ async def _get_classification_npi_list(classification: str, *, session=None) -> 
         session=session
     )
     cache_key = (
-        f"{publication_identity}|{classification_key}"
+        f"{publication_identity}|{classification_key}|{'primary' if primary_only else 'all'}"
         if publication_identity is not None
         else None
     )
@@ -912,8 +777,9 @@ async def _get_classification_npi_list(classification: str, *, session=None) -> 
     query = text(
         f"""
         SELECT DISTINCT t.npi
-          FROM {schema}.npi_taxonomy AS t
+         FROM {schema}.npi_taxonomy AS t
          WHERE t.healthcare_provider_taxonomy_code = ANY(:taxonomy_codes)
+           {"AND t.healthcare_provider_primary_taxonomy_switch = 'Y'" if primary_only else ""}
          ORDER BY t.npi
         """
     )
@@ -5371,6 +5237,7 @@ def _build_nearby_sql(
     ilike_clause: str,
     *,
     use_taxonomy_filter: bool,
+    primary_only: bool = False,
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
     cursor_clause: str = "",
@@ -5388,12 +5255,22 @@ def _build_nearby_sql(
         taxonomy_from = (
             ",\n"
             "                              (\n"
-            "                                  SELECT ARRAY_AGG(int_code) AS codes\n"
+            "                                  SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
+            "                                         ARRAY_AGG(int_code) AS codes\n"
             "                                    FROM mrf.nucc_taxonomy\n"
             f"                                   WHERE {taxonomy_conditions}\n"
             "                              ) AS g"
         )
         taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
+        if primary_only:
+            taxonomy_where += (
+                "\n                          AND EXISTS ("
+                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
+                "WHERE provider_taxonomy.npi = a.npi "
+                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
+                "AND UPPER(COALESCE("
+                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
+            )
     geo_type_clause = _nearby_geo_type_clause(address_table_sql)
     row_tiebreaker = (
         "a.location_key ASC"
@@ -5457,6 +5334,7 @@ def _build_nearby_count_sql(
     ilike_clause: str,
     *,
     use_taxonomy_filter: bool,
+    primary_only: bool = False,
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
     bbox_clause: str = "",
@@ -5469,12 +5347,22 @@ def _build_nearby_count_sql(
         taxonomy_from = (
             ",\n"
             "       (\n"
-            "           SELECT ARRAY_AGG(int_code) AS codes\n"
+            "           SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
+            "                  ARRAY_AGG(int_code) AS codes\n"
             "             FROM mrf.nucc_taxonomy\n"
             f"            WHERE {taxonomy_conditions}\n"
             "       ) AS g"
         )
         taxonomy_where = "\n   AND a.taxonomy_array && g.codes"
+        if primary_only:
+            taxonomy_where += (
+                "\n   AND EXISTS ("
+                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
+                "WHERE provider_taxonomy.npi = a.npi "
+                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
+                "AND UPPER(COALESCE("
+                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
+            )
     geo_type_clause = _nearby_geo_type_clause(address_table_sql)
     return _NEARBY_COUNT_SQL_TEMPLATE.format(
         taxonomy_from=taxonomy_from,
@@ -7106,33 +6994,19 @@ def _build_npi_where_clause(
     prefix = alias
     if prefix and not prefix.endswith("."):
         prefix = f"{prefix}."
-
-    clauses: list[str] = []
-    parameter_map: dict[str, object] = {}
-
-    if names_like:
-        name_clause, name_params = _names_like_filter_clause(alias, names_like)
-        if name_clause:
-            clauses.append(name_clause)
-            parameter_map.update(name_params)
-
-    if first_name:
-        clauses.append(f"LOWER(COALESCE({prefix}provider_first_name, '')) LIKE :first_name")
-        parameter_map["first_name"] = f"%{first_name.lower()}%"
-    if last_name:
-        clauses.append(f"LOWER(COALESCE({prefix}provider_last_name, '')) LIKE :last_name")
-        parameter_map["last_name"] = f"%{last_name.lower()}%"
-    if organization_name:
-        org_expr = ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix)
-        clauses.append(f"({org_expr} LIKE :organization_name)")
-        parameter_map["organization_name"] = f"%{organization_name.lower()}%"
-    if entity_type_code is not None:
-        clauses.append(f"{prefix}entity_type_code = :entity_type_code")
-        parameter_map["entity_type_code"] = entity_type_code
-
-    if not clauses:
-        return "", {}
-    return " AND ".join(clauses), parameter_map
+    name_clause, name_parameters = (
+        _names_like_filter_clause(alias, names_like) if names_like else ("", {})
+    )
+    return _build_provider_name_where(
+        prefix=prefix,
+        name_clause=name_clause,
+        name_parameters=name_parameters,
+        first_name=first_name,
+        last_name=last_name,
+        organization_name=organization_name,
+        organization_expression=ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix),
+        entity_type_code=entity_type_code,
+    )
 
 
 def _extract_name_filters(request) -> list[str]:
@@ -8996,6 +8870,7 @@ async def list_providers(request):
     request.args.get("npi")
     request.args.get("address_site_key")
     request.args.get("provider_sex_code")
+    request.args.get("plan_release_id")
     include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
     include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
     if _is_truthy_arg(request.args.get("debug"), default=False):
@@ -9061,6 +8936,12 @@ async def list_providers(request):
     medication_codes_raw = request.args.get("medication_codes")
     medication_code_system_raw = request.args.get("medication_code_system")
     year_raw = request.args.get("year")
+    plan_release_id_raw = request.args.get("plan_release_id")
+    is_primary_only = _is_boolean_query_arg(
+        request.args.get("primary_only"),
+        "primary_only",
+        default=True,
+    )
 
     city = city.upper() if city else None
     state = state.upper() if state else None
@@ -9216,6 +9097,8 @@ async def list_providers(request):
         "zip_code": zip_code,
         "entity_type_code": entity_type_code,
         "provider_sex_code": provider_sex_code,
+        "primary_only": is_primary_only,
+        "plan_release_id": str(plan_release_id_raw or "").strip() or None,
         "plan_network": plan_network_ids,
         "names_like": name_like_values,
         "codes": codes,
@@ -9262,6 +9145,7 @@ async def list_providers(request):
             "response_format",
             "procedure_internal_codes",
             "medication_internal_codes",
+            "plan_release_id",
         )
     )
     broad_name_total_deferred = bool(name_like_values) and not any(
@@ -9288,6 +9172,7 @@ async def list_providers(request):
             response_format,
             procedure_internal_codes,
             medication_internal_codes,
+            plan_release_id_raw,
         ]
     )
     inline_name_taxonomy_total = bool(
@@ -9381,6 +9266,10 @@ async def list_providers(request):
         address_required_columns,
         session=request_session,
     )
+    plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
+        request_session,
+        plan_release_id_raw,
+    )
 
     async def get_count(filters_by_name):
         """Count providers matching the normalized request filters."""
@@ -9404,6 +9293,7 @@ async def list_providers(request):
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
+        primary_only = bool(filters_by_name.get("primary_only"))
         is_unified_search = _is_unified_address_table(address_table_sql)
         provider_npi_sql = (
             "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
@@ -9479,6 +9369,8 @@ async def list_providers(request):
             address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_clauses.append(_address_npi_filter("c", address_table_sql))
+        if plan_member_sql is not None:
+            address_clauses.append(f"{provider_npi_sql} IN ({plan_member_sql})")
         if provider_sex_code is not None:
             address_clauses.append(
                 "EXISTS ("
@@ -9494,6 +9386,11 @@ async def list_providers(request):
         taxonomy_join = f"CROSS JOIN {taxonomy_subquery}"
         taxonomy_parameters_by_name: dict[str, str] = {}
         taxonomy_code_placeholders: tuple[str, ...] = ()
+        if primary_only and use_taxonomy_filter:
+            taxonomy_join += _provider_taxonomy_lateral_join(
+                provider_npi_sql=provider_npi_sql,
+                primary_only=True,
+            )
         if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_filters) == 1:
                 taxonomy_parameters_by_name, taxonomy_code_placeholders = (
@@ -9505,8 +9402,9 @@ async def list_providers(request):
                 taxonomy_join = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
                     provider_npi_sql=provider_npi_sql,
+                    primary_only=primary_only,
                 )
-            else:
+            elif not primary_only:
                 taxonomy_join += _provider_taxonomy_lateral_join(
                     provider_npi_sql=provider_npi_sql,
                 )
@@ -9536,6 +9434,8 @@ async def list_providers(request):
                         taxonomy_conditions,
                         code_placeholders=taxonomy_code_placeholders,
                         npi_where=npi_where if direct_name_taxonomy else "",
+                        primary_only=primary_only,
+                        is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
                     )
                 )
 
@@ -9609,6 +9509,7 @@ async def list_providers(request):
         query_parameters_by_name.update(dynamic_code_parameters)
         query_parameters_by_name.update(npi_params)
         query_parameters_by_name.update(taxonomy_parameters_by_name)
+        query_parameters_by_name.update(plan_scope_parameters)
         if phone_candidates_cte:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
@@ -9662,6 +9563,7 @@ async def list_providers(request):
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
+        primary_only = bool(filters_by_name.get("primary_only"))
 
         provider_npi_sql = (
             "COALESCE(c.npi, c.inferred_npi)"
@@ -9722,6 +9624,8 @@ async def list_providers(request):
             address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_clauses.append(_address_npi_filter("c", address_table_sql))
+        if plan_member_sql is not None:
+            address_clauses.append(f"{provider_npi_sql} IN ({plan_member_sql})")
         if provider_sex_code is not None:
             address_clauses.append(
                 "EXISTS ("
@@ -9739,13 +9643,31 @@ async def list_providers(request):
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_classification_subquery(taxonomy_conditions)
+        taxonomy_row_source = (
+            "CROSS JOIN LATERAL "
+            "unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) "
+            "AS code(int_code)"
+        )
+        taxonomy_int_code_sql = "code.int_code"
+        if primary_only:
+            taxonomy_row_source = (
+                "JOIN mrf.npi_taxonomy AS provider_taxonomy "
+                f"ON provider_taxonomy.npi = {provider_npi_sql} "
+                "AND UPPER(COALESCE("
+                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' "
+                "JOIN mrf.nucc_taxonomy AS primary_nucc "
+                "ON primary_nucc.code = "
+                "provider_taxonomy.healthcare_provider_taxonomy_code "
+                f"AND ({taxonomy_conditions})"
+            )
+            taxonomy_int_code_sql = "primary_nucc.int_code"
         query = text(
             f"""
             {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_taxonomy AS (
-                SELECT DISTINCT {provider_npi_sql} AS npi, code.int_code
+                SELECT DISTINCT {provider_npi_sql} AS npi, {taxonomy_int_code_sql} AS int_code
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
-                  CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)
+                  {taxonomy_row_source}
                  WHERE {' AND '.join(address_clauses)}
             )
             SELECT q.classification AS key,
@@ -9779,6 +9701,7 @@ async def list_providers(request):
         }
         query_parameters_by_name.update(dynamic_code_parameters)
         query_parameters_by_name.update(npi_params)
+        query_parameters_by_name.update(plan_scope_parameters)
         if phone_candidates_cte:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
@@ -9830,6 +9753,7 @@ async def list_providers(request):
         """Return a deterministic provider page for sitemap generation."""
         classification_npis = await _get_classification_npi_list(
             classification_value,
+            primary_only=is_primary_only,
             session=request_session,
         )
         if not classification_npis:
@@ -9908,6 +9832,7 @@ async def list_providers(request):
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
+        primary_only = bool(filters_by_name.get("primary_only"))
         is_unified_search = _is_unified_address_table(address_table_sql)
         provider_npi_sql = (
             "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
@@ -9979,6 +9904,8 @@ async def list_providers(request):
             address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_clauses.append(_address_npi_filter("c", address_table_sql))
+        if plan_member_sql is not None:
+            address_clauses.append(f"{provider_npi_sql} IN ({plan_member_sql})")
         if provider_sex_code is not None:
             address_clauses.append(
                 "EXISTS ("
@@ -10042,6 +9969,7 @@ async def list_providers(request):
             )
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
+        use_bounded_broad_name_page = broad_name_total_deferred and order_by == "npi"
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
@@ -10051,7 +9979,7 @@ async def list_providers(request):
                     "AS relevance_score"
                 )
             direct_name_taxonomy = bool(taxonomy_code_placeholders)
-            if not direct_name_taxonomy:
+            if not direct_name_taxonomy and not use_bounded_broad_name_page:
                 filtered_npi_cte = f"""
         filtered_npi AS MATERIALIZED (
             SELECT {filtered_npi_projection}
@@ -10066,6 +9994,8 @@ async def list_providers(request):
                         code_placeholders=taxonomy_code_placeholders,
                         npi_where=npi_where if direct_name_taxonomy else "",
                         npi_projection=filtered_npi_projection,
+                        primary_only=primary_only,
+                        is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
                     )
                 )
 
@@ -10076,6 +10006,11 @@ async def list_providers(request):
             f"FROM mrf.nucc_taxonomy WHERE {taxonomy_filter}"
             ") AS q"
         )
+        if primary_only and use_taxonomy_filter:
+            taxonomy_source += _provider_taxonomy_lateral_join(
+                provider_npi_sql=provider_npi_sql,
+                primary_only=True,
+            )
         if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_clauses) == 1:
                 taxonomy_parameters_by_name, taxonomy_code_placeholders = (
@@ -10087,8 +10022,9 @@ async def list_providers(request):
                 taxonomy_source = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
                     provider_npi_sql=provider_npi_sql,
+                    primary_only=primary_only,
                 )
-            else:
+            elif not primary_only:
                 taxonomy_source += _provider_taxonomy_lateral_join(
                     provider_npi_sql=provider_npi_sql,
                 )
@@ -10100,11 +10036,14 @@ async def list_providers(request):
                 f"    {phone_candidates_join}"
             )
         elif npi_where:
-            address_source = (
-                "filtered_npi as fn\n"
-                f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
-                f"    {phone_candidates_join}"
-            )
+            if use_bounded_broad_name_page:
+                address_source = f"{address_table_sql} as c"
+            else:
+                address_source = (
+                    "filtered_npi as fn\n"
+                    f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
+                    f"    {phone_candidates_join}"
+                )
         elif use_taxonomy_filter:
             address_source = (
                 f"{address_table_sql} as c\n"
@@ -10127,6 +10066,13 @@ async def list_providers(request):
             result_order_sql = (
                 "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
             )
+        elif use_bounded_broad_name_page:
+            eligible_npis_sql = _broad_name_page_sql(
+                npi_where, address_table_sql, provider_npi_sql, address_clauses
+            )
+            page_order_sql = "ORDER BY b.npi"
+            sub_s_relevance_projection = ""
+            result_order_sql = "ORDER BY sub_s.npi_code ASC"
         else:
             eligible_npis_sql = f"""
             SELECT DISTINCT {provider_npi_sql} AS npi
@@ -10232,6 +10178,7 @@ async def list_providers(request):
                 **npi_params,
                 **dynamic_code_parameters,
                 **taxonomy_parameters_by_name,
+                **plan_scope_parameters,
             }
             if order_by == "relevance":
                 query_parameters_by_name["relevance_q"] = relevance_q
@@ -10596,6 +10543,7 @@ async def list_providers(request):
                 response_format,
                 procedure_internal_codes,
                 medication_internal_codes,
+                plan_release_id_raw,
             ]
         )
         and not has_insurance
@@ -11122,9 +11070,23 @@ async def get_near_npi(request):
     medication_codes_raw = request.args.get("medication_codes")
     medication_code_system_raw = request.args.get("medication_code_system")
     year_raw = request.args.get("year")
+    plan_release_id_raw = request.args.get("plan_release_id")
+    is_primary_only = _is_boolean_query_arg(
+        request.args.get("primary_only"),
+        "primary_only",
+        default=True,
+    )
+    entity_type_code = _normalize_match_candidate_entity_type(
+        request.args.get("entity_type_code"),
+        None,
+    )
     provider_sex_code = normalize_provider_sex_code(
         request.args.get("provider_sex_code")
     )
+    if entity_type_code == 2 and provider_sex_code is not None:
+        raise sanic.exceptions.InvalidUsage(
+            "provider_sex_code cannot be combined with entity_type_code=2"
+        )
     request.args.get("q")
     if _extract_name_filters(request):
         raise sanic.exceptions.InvalidUsage(
@@ -11287,6 +11249,10 @@ async def get_near_npi(request):
         _public_address_serving_column_keys(),
         session=request_session,
     )
+    plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
+        request_session,
+        plan_release_id_raw,
+    )
 
     providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
     extra_filters: list[str] = []
@@ -11294,6 +11260,10 @@ async def get_near_npi(request):
         extra_filters.append("a.npi <> :exclude_npi")
     if plan_network_ids:
         extra_filters.append("a.plans_network_array && (:plan_network_array)")
+    if entity_type_code is not None:
+        extra_filters.append("d.entity_type_code = :entity_type_code")
+    if plan_member_sql is not None:
+        extra_filters.append(f"a.npi IN ({plan_member_sql})")
     if provider_sex_code is not None:
         extra_filters.append(
             "EXISTS ("
@@ -11392,6 +11362,8 @@ async def get_near_npi(request):
         "zip_codes": zip_codes,
         "plan_network_array": plan_network_ids,
         "provider_sex_code": provider_sex_code,
+        "entity_type_code": entity_type_code,
+        **plan_scope_parameters,
         **dynamic_code_parameters_by_name,
     }
 
@@ -11416,6 +11388,7 @@ async def get_near_npi(request):
                     extra_clause,
                     ilike_clause,
                     use_taxonomy_filter=bool(taxonomy_clauses),
+                    primary_only=is_primary_only,
                     address_table_sql=address_table_sql,
                     geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
                     cursor_clause=cursor_clause,
@@ -11483,6 +11456,7 @@ async def get_near_npi(request):
             extra_clause,
             ilike_clause,
             use_taxonomy_filter=bool(taxonomy_clauses),
+            primary_only=is_primary_only,
             address_table_sql=address_table_sql,
             geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
             bbox_clause=bbox_clause,

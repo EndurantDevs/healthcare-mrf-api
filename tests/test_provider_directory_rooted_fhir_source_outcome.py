@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ from api.provider_directory_rooted_fhir_publication import (
     ROOTED_FHIR_CATALOG_ENTRY_ID,
     ROOTED_FHIR_CATALOG_SOURCE_IDS,
     ROOTED_FHIR_PUBLICATION_FIELD,
+    ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID,
     ROOTED_FHIR_PUBLICATION_SUMMARY_CONTRACT_ID,
     ROOTED_FHIR_SOURCE_ID_GROUP,
     rooted_fhir_publication_summary,
@@ -182,6 +184,59 @@ def test_rooted_summary_marks_retry_exhaustion_partial_not_closed():
     assert summary["rooted_graph_complete"] is True
     assert summary["retry_exhausted_count"] == 8
     assert len(summary) == 27
+
+
+def _request_partial_readiness(inherited=1, rooted=1):
+    return replace(
+        readiness(retry_exhausted_count=inherited),
+        publication_contract_id="healthporta.provider-directory.rooted-graph-publication.v2",
+        rooted_graph_complete=rooted == 0,
+        request_failure_coverage={
+            "policy_id": "healthporta.fhir.request-failure-budget.v1",
+            "total_requests": 200,
+            "failed_requests": inherited + rooted,
+            "rooted_total_requests": 100,
+            "rooted_failed_requests": rooted,
+            "resource_coverage": "unknown",
+        },
+    )
+
+
+@pytest.mark.parametrize("inherited,rooted", [(1, 1), (0, 1), (1, 0)])
+def test_rooted_summary_reports_request_partial_without_resource_coverage(inherited, rooted):
+    proof = _request_partial_readiness(inherited, rooted)
+    summary = rooted_fhir_publication_summary(_current_dataset(proof), proof)
+    assert summary["contract_id"] == ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID
+    assert summary["publication_contract_id"] == proof.publication_contract_id
+    assert summary["state"] == "partial"
+    assert len(summary) == 28
+    assert summary["cohort_complete"] is (inherited == 0)
+    assert summary["rooted_graph_complete"] is (rooted == 0)
+    assert summary["retry_exhausted_count"] == inherited
+    assert summary["request_failure_coverage"] == proof.request_failure_coverage
+    assert summary["request_failure_coverage"] is not proof.request_failure_coverage
+    assert summary["endpoint_complete"] is False
+    assert summary["endpoint_collection_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_request_partial_catalog_warns_without_changing_runnable_or_profile(monkeypatch):
+    proof = _request_partial_readiness()
+    monkeypatch.setattr(
+        outcomes.db, "execute",
+        AsyncMock(return_value=_MappingResult([_rooted_dataset_row(proof)])),
+    )
+    monkeypatch.setattr(
+        catalog_outcomes, "load_provider_directory_rooted_graph_dataset_readiness",
+        AsyncMock(return_value=proof),
+    )
+    catalog = _direct_catalog()
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(catalog)
+    entry = enriched["items"][0]
+    assert "missing-resource coverage is unknown" in entry["coverage_warning"]
+    assert entry["runnable"] is catalog["items"][0]["runnable"]
+    assert "acquisition_blocked_reason" not in entry
+    assert entry[ROOTED_FHIR_PUBLICATION_FIELD]["state"] == "partial"
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ WORKERS=16
 TEST_MODE=0
 IMPORT_ID="${IMPORT_ID:-$(date +%Y%m%d)}"
 LOG_DIR="${LOG_DIR:-/tmp/healthporta_mrf_${IMPORT_ID}}"
-PYTHON_BIN="${PYTHON_BIN:-}"
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 
 usage() {
   cat <<'EOF'
@@ -27,10 +27,10 @@ Notes:
   - The finish worker is forced to HLTHPRT_MAX_MRF_FINISH_JOBS=1 because there
     is only one shutdown job.
   - Set PYTHON_BIN to override the Python executable. By default, the script
-    prefers venv314/bin/python, then venv/bin/python, then python.
+    uses .venv/bin/python and requires Python 3.14 or newer.
   - Prefer --workers 16 for dev-server/full-import runs. If you want one
     process with internal concurrency, use:
-      HLTHPRT_MAX_MRF_JOBS=16 HLTHPRT_MRF_QUEUE_READ_LIMIT=512 python main.py worker process.MRF --burst
+      HLTHPRT_MAX_MRF_JOBS=16 HLTHPRT_MRF_QUEUE_READ_LIMIT=512 .venv/bin/python main.py worker process.MRF --burst
 EOF
 }
 
@@ -64,17 +64,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "$LOG_DIR"
-
-if [[ -z "$PYTHON_BIN" ]]; then
-  if [[ -x venv314/bin/python ]]; then
-    PYTHON_BIN=venv314/bin/python
-  elif [[ -x venv/bin/python ]]; then
-    PYTHON_BIN=venv/bin/python
-  else
-    PYTHON_BIN=python
-  fi
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python executable not found or not executable: $PYTHON_BIN" >&2
+  echo "Create .venv with Python 3.14 or newer, or set PYTHON_BIN to an executable." >&2
+  exit 1
 fi
+if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 14))'; then
+  echo "Python 3.14 or newer is required: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR"
 
 queue_depth() {
   "$PYTHON_BIN" - "$1" <<'PY'

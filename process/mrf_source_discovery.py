@@ -9544,7 +9544,7 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
         candidates.extend(parser.candidates)
         embedded_source = "\n".join(parser.text_parts)
     except Exception:
-        LOGGER.debug("failed to parse HTML links with HTMLParser", exc_info=True)
+        logging.getLogger(__name__).debug("failed to parse HTML links with HTMLParser", exc_info=True)
     for url in _embedded_mrf_urls(embedded_source, base_url=base_url):
         candidates.append(
             {"attr": "text", "value": url, "label": Path(urlsplit(url).path).name}

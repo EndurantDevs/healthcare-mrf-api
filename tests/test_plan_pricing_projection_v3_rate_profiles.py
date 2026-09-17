@@ -73,6 +73,9 @@ def test_rate_profile_validation_preserves_exact_sorted_multiplicity() -> None:
         (1, 3),
         4,
     )
+    assert rate_profiles._validated_rate_profile(
+        _profile(membership_count=rate_profiles.MAX_PROVIDER_NPIS_PER_SET)
+    )[2] == rate_profiles.MAX_PROVIDER_NPIS_PER_SET
 
     invalid_profiles = (
         _profile(negotiated_rates=[]),
@@ -83,7 +86,9 @@ def test_rate_profile_validation_preserves_exact_sorted_multiplicity() -> None:
         _profile(rate_count=5),
         _profile(minimum_negotiated_rate=Decimal("9")),
         _profile(maximum_negotiated_rate=Decimal("31")),
-        _profile(membership_count=16_385),
+        _profile(
+            membership_count=rate_profiles.MAX_PROVIDER_NPIS_PER_SET + 1
+        ),
     )
     for invalid_profile_by_field in invalid_profiles:
         with pytest.raises(ValueError, match="rate profile is invalid"):

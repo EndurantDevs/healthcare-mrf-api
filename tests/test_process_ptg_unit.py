@@ -3213,6 +3213,109 @@ def test_ptg2_toc_parser_accepts_healthsparq_metadata_files(monkeypatch):
     )
 
 
+def _tenant_relative_healthsparq_urls() -> tuple[str, str, str]:
+    """Return one index and its incomplete and corrected file URLs."""
+
+    return (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/latest.json",
+        (
+            "https://mrf.healthsparq.com//prd/mrf/issuer/"
+            "rates.json.gz?token=value"
+        ),
+        (
+            "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/"
+            "rates.json.gz?token=value"
+        ),
+    )
+
+
+def _tenant_relative_standard_catalog_entries(toc_url: str, file_url: str):
+    """Parse a standard catalog entry with an incomplete file URL."""
+
+    return process_ptg.parse_toc_catalog_entries(
+        {
+            "reporting_structure": [
+                {
+                    "reporting_plans": [
+                        {
+                            "plan_name": "Synthetic Plan",
+                            "plan_id": "123456789",
+                            "plan_market_type": "group",
+                        }
+                    ],
+                    "in_network_files": [{"location": file_url}],
+                }
+            ]
+        },
+        toc_url,
+    )
+
+
+def _tenant_relative_flat_catalog_entries(toc_url: str, file_url: str):
+    """Parse a flat catalog entry with an incomplete file URL."""
+
+    return process_ptg.parse_toc_catalog_entries(
+        {"in-network negotiated rates": [{"url": file_url}]},
+        toc_url,
+    )
+
+
+def _tenant_relative_metadata_catalog_entries(toc_url: str, file_url: str):
+    """Parse a metadata catalog entry with an incomplete file URL."""
+
+    return process_ptg.parse_toc_catalog_entries(
+        {
+            "files": [
+                {
+                    "fileSchema": "IN_NETWORK_RATES",
+                    "filePath": file_url,
+                    "reportingPlans": [
+                        {
+                            "planName": "Synthetic Plan",
+                            "planId": "123456789",
+                            "planMarketType": "group",
+                        }
+                    ],
+                }
+            ]
+        },
+        toc_url,
+    )
+
+
+def test_ptg2_toc_parser_repairs_healthsparq_tenant_relative_file_urls():
+    """Use the same-host index tenant for incomplete HealthSparq file paths."""
+
+    toc_url, incomplete_url, corrected_url = _tenant_relative_healthsparq_urls()
+    catalog_entries = (
+        _tenant_relative_standard_catalog_entries(toc_url, incomplete_url)
+        + _tenant_relative_flat_catalog_entries(toc_url, incomplete_url)
+        + _tenant_relative_metadata_catalog_entries(toc_url, incomplete_url)
+    )
+
+    assert [
+        entry.original_url
+        for entry in catalog_entries
+        if entry.source_type == "in-network"
+    ] == [corrected_url, corrected_url, corrected_url]
+    deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(
+        [
+            {
+                "type": "in_network",
+                "url": incomplete_url,
+                "from_index_url": toc_url,
+            },
+            {
+                "type": "in_network",
+                "url": corrected_url,
+                "from_index_url": toc_url,
+            },
+        ]
+    )
+    assert duplicate_count == 1
+    assert deduped_jobs[0]["url"] == corrected_url
+
+
 @pytest.mark.parametrize("missing_key", ["planName", "planId", "planMarketType"])
 def test_healthsparq_plan_engine_hash_requires_complete_identity(missing_key):
     source_file_values_by_field = {

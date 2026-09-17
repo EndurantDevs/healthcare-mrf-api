@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Sequence
 from api import ptg2_candidate_audit_reverse as reverse_scope
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
+    CandidateAuditDecodedRetentionError,
 )
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_graph import ChallengeGraphScopeTooLarge
@@ -75,6 +76,29 @@ async def _load_direct_v4_scope(
                 raise
         else:
             return _provider_scope(provider_sets_by_npi)
+    return await _load_v4_code_first_scope(
+        session,
+        serving_tables,
+        challenges,
+        persisted_occurrences,
+        code_index,
+        schema_name=schema_name,
+        retention_budget=retention_budget,
+    )
+
+
+async def _load_v4_code_first_scope(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    challenges: Sequence[AuditBatchChallenge],
+    persisted_occurrences: Sequence[PersistedAuditOccurrence],
+    code_index: CandidateCodeIndex,
+    *,
+    schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget,
+) -> reverse_scope.CandidateProviderScope:
+    """Load the exact code/source scope through authenticated intersections."""
+
     direct_scope = await load_v4_candidate_scope(
         session,
         serving_tables,
@@ -112,15 +136,35 @@ async def _load_v4_scope(
         schema_name=schema_name,
     )
     if graph_root.representation == "pattern_v1":
-        provider_sets_by_npi = await load_v4_pattern_provider_scope(
+        retained_baseline = retention_budget.retained_bytes
+        try:
+            provider_sets_by_npi = await load_v4_pattern_provider_scope(
+                session,
+                serving_tables,
+                challenges,
+                persisted_occurrences,
+                schema_name=schema_name,
+                retention_budget=retention_budget,
+            )
+        except Exception as exc:
+            if not is_direct_graph_capacity_failure(exc):
+                raise
+        else:
+            return _provider_scope(provider_sets_by_npi)
+        if retention_budget.retained_bytes != retained_baseline:
+            raise CandidateAuditDecodedRetentionError(
+                "PTG2 pattern graph capacity fallback did not restore its "
+                "decoded retention budget"
+            )
+        return await _load_v4_code_first_scope(
             session,
             serving_tables,
             challenges,
             persisted_occurrences,
+            code_index,
             schema_name=schema_name,
             retention_budget=retention_budget,
         )
-        return _provider_scope(provider_sets_by_npi)
     return await _load_direct_v4_scope(
         session,
         serving_tables,

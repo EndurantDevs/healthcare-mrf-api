@@ -61,15 +61,15 @@ CSV. Do not put a `0001..9999` sweep in the monthly schedule.
 Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.0.1:5440`.
 
 ```bash
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10
-./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Meritain --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-payer-query Meritain --file-probe-limit 20 --concurrency 5
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query BRMS --check-urls --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Lucent --check-urls --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3
-./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query "ASR Health Benefits" --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10
+./.venv/bin/python main.py start mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Meritain --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --probe-files --file-probe-payer-query Meritain --file-probe-limit 20 --concurrency 5
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query BRMS --check-urls --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Lucent --check-urls --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3
+./.venv/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query "ASR Health Benefits" --crawl --concurrency 3
 ```
 
 Meritain, BRMS, and Lucent should create `mrf_plan` rows from client/group metadata during crawl.
@@ -80,7 +80,7 @@ CSV links are cataloged only and are intentionally excluded from automated inges
 One-time ASR group discovery:
 
 ```bash
-./venv314/bin/python scripts/research/discover_asr_health_benefits_groups.py --start 1 --end 9999 --concurrency 2 --write
+./.venv/bin/python scripts/research/discover_asr_health_benefits_groups.py --start 1 --end 9999 --concurrency 2 --write
 ```
 
 The discovery utility probes ASR group numbers with `HEAD` first and fetches JSON only for positive
@@ -169,8 +169,8 @@ Validated against local PostgreSQL on `127.0.0.1:5440`:
 ## Post-Deploy Checks
 
 ```bash
-./venv314/bin/python -m pytest tests/test_mrf_source_discovery.py tests/test_control_imports_api.py -q
-./venv314/bin/python -m pytest -q
+./.venv/bin/python -m pytest tests/test_mrf_source_discovery.py tests/test_control_imports_api.py -q
+./.venv/bin/python -m pytest -q
 git diff --check
 ```
 

@@ -347,8 +347,13 @@ class ProviderDirectoryRootedGraphAcquisitionSummary:
     rooted_graph_complete: bool
     endpoint_collection_complete: bool
     endpoint_complete: bool
+    request_failure_coverage: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
+        from process.provider_directory_rooted_graph_request_coverage import (
+            has_matching_rooted_request_coverage,
+        )
+
         hashes = (
             self.terminal_set_sha256,
             self.resource_set_sha256,
@@ -365,9 +370,13 @@ class ProviderDirectoryRootedGraphAcquisitionSummary:
             ACQUISITION_PATTERN.fullmatch(self.acquisition_id) is None
             or ROOTED_GRAPH_SCOPE_PATTERN.fullmatch(self.scope_id) is None
             or any(type(count) is not int or count < 0 for count in counts)
-            or self.error_count != 0
-            or any(SHA256_PATTERN.fullmatch(value) is None for value in hashes)
-            or self.rooted_graph_complete is not True
+            or not has_matching_rooted_request_coverage(
+                self.request_failure_coverage,
+                completed_count=self.completed_count,
+                error_count=self.error_count,
+            )
+            or any(SHA256_PATTERN.fullmatch(digest) is None for digest in hashes)
+            or self.rooted_graph_complete is not (self.error_count == 0)
             or self.endpoint_collection_complete is not False
             or self.endpoint_complete is not False
         ):

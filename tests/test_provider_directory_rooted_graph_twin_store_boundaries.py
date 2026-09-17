@@ -385,6 +385,8 @@ async def test_single_root_admission_rederives_identity_and_publishes_metadata(
         stored_by_kind["admission"] = admission
 
     async def read_admission(_database, _acquisition_id):
+        if "admission" not in stored_by_kind:
+            raise ProviderDirectoryRootedGraphTwinError("missing")
         return stored_by_kind["admission"]
 
     monkeypatch.setattr(twin_store, "_lock_logical_current", lock_current)
@@ -395,7 +397,7 @@ async def test_single_root_admission_rederives_identity_and_publishes_metadata(
     admission = await twin_store.admit_rooted_graph_single_root(
         candidate.acquisition_id,
         acquisition_operation_key=operation_key,
-        database=_ScriptedDatabase(scalars=(recorded_at,)),
+        database=_ScriptedDatabase(scalars=(recorded_at, None)),
     )
 
     assert admission.attempt_id is None

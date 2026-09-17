@@ -40,7 +40,9 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_RESULT_CONTRACT,
-    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit_report_validation import (
+    validated_partitioned_start_rate,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine_evidence,
@@ -101,6 +103,7 @@ def _partitioned_request_start_span(
     ):
         raise ValueError("batch audit report timing is invalid")
     remaining_start_count = request_count - 1
+    start_rate_limit = validated_partitioned_start_rate(http_by_field)
     full_request_waves, trailing_start_count = divmod(
         remaining_start_count,
         PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
@@ -108,7 +111,7 @@ def _partitioned_request_start_span(
     maximum_contract_start_span = (
         full_request_waves * PTG2_FAST_AUDIT_DEADLINE_SECONDS
         + trailing_start_count
-        / PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND
+        / start_rate_limit
         + 5.0
     )
     normalized_start_span = float(request_start_span_seconds)

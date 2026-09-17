@@ -10,6 +10,32 @@ from db.models import ProviderProfileProjection
 florida = importlib.import_module("process.florida_mqa_profile")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_publication_progress_counts_only_successful_staging(monkeypatch, write_fails):
+    """Staging progress cannot claim failed writes or a completed publication."""
+    events = []
+    database = _PublicationDb(scalar_results=[0, 0], all_results=[])
+    monkeypatch.setattr(florida, "db", database)
+    monkeypatch.setattr(florida, "enqueue_live_progress", lambda **event: events.append(event))
+    if write_fails:
+        async def failed_write(self):
+            raise RuntimeError("staging write failed")
+        monkeypatch.setattr(_Statement, "status", failed_write)
+    with pytest.raises(RuntimeError, match="staging write failed|stage_validation_failed"):
+        await florida._publish_projection_swap(
+            "a" * 32, _one_projection_row("a" * 32),
+            started_at=datetime(2026, 7, 27, tzinfo=UTC),
+            completion_metrics=_completion_metrics(1), allow_volume_drop=False,
+            min_first_publish_providers=1, min_publish_ratio=0.8,
+        )
+    assert len(events) == (0 if write_fails else 1)
+    if events:
+        assert events[0]["counters"] == {"staged_providers": 1}
+        assert events[0]["phase"] == "publishing"
+        assert events[0]["pct"] == 94
+
+
 class _Row:
     def __init__(self, **mapping):
         self._mapping = mapping

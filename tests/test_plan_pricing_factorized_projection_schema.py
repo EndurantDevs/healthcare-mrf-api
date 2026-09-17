@@ -6,18 +6,16 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-import pytest
 
 from tests.provider_directory_profile_capacity_v2_migration_support import (
     load_capacity_v2_migration,
 )
 
-
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions/20260828120000_plan_pricing_factorized_projection.py"
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260828120000_plan_pricing_factorized_projection.py"
 )
 
 
@@ -49,18 +47,11 @@ def test_factorized_migration_is_additive_bounded_and_authenticated(
     migration.upgrade()
 
     sql = " ".join(recorder.statements)
-    assert migration.revision == (
-        "20260828120000_plan_pricing_factorized_projection"
-    )
-    assert migration.down_revision == (
-        "20260829100000_activate_import_run_idempotency_scope"
-    )
+    assert migration.revision == ("20260828120000_plan_pricing_factorized_projection")
+    assert migration.down_revision == ("20260829100000_activate_import_run_idempotency_scope")
     assert "plan_pricing_card_v2" in sql
     assert "plan_pricing_factorized_v3" in sql
-    assert (
-        'CREATE TABLE "factorized_test".'
-        '"plan_pricing_provider_membership"' in sql
-    )
+    assert 'CREATE TABLE "factorized_test"."plan_pricing_provider_membership"' in sql
     assert 'CREATE TABLE "factorized_test"."plan_pricing_provider_cell"' in sql
     assert 'CREATE TABLE "factorized_test"."plan_pricing_rate_profile"' in sql
     assert 'CREATE TABLE "factorized_test"."plan_pricing_aggregate_pack"' in sql
@@ -105,7 +96,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
     sql = " ".join(recorder.statements)
     assert "cannot downgrade while factorized pricing projections exist" in sql
-    assert "DROP TABLE \"factorized_test\".\"plan_pricing_prewarm_shape\"" in sql
+    assert 'DROP TABLE "factorized_test"."plan_pricing_prewarm_shape"' in sql
     assert "DROP COLUMN provider_cell_count" in sql
     assert "DROP COLUMN provider_membership_count" in sql
     assert 'DROP TABLE "factorized_test"."plan_pricing_rate_profile"' in sql
@@ -115,18 +106,11 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def test_factorized_projection_precedes_the_unique_repository_head() -> None:
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == [
-        "20260907220000_hospital_price_missing_plan"
-    ]
-    factorized = script.get_revision(
-        "20260828120000_plan_pricing_factorized_projection"
+    assert script.get_heads() == ["20260917130000_custom_import_generation_finality"]
+    factorized = script.get_revision("20260828120000_plan_pricing_factorized_projection")
+    assert factorized.down_revision == ("20260829100000_activate_import_run_idempotency_scope")
+    assert (
+        script.get_revision("20260825150000_plan_pricing_card_projection").down_revision
+        == "20260826090000_hospital_price_packed_blocks"
     )
-    assert factorized.down_revision == (
-        "20260829100000_activate_import_run_idempotency_scope"
-    )
-    assert script.get_revision(
-        "20260825150000_plan_pricing_card_projection"
-    ).down_revision == "20260826090000_hospital_price_packed_blocks"
-    assert load_capacity_v2_migration().down_revision == (
-        "20260801010000_uhc_semantic_layout_identity"
-    )
+    assert load_capacity_v2_migration().down_revision == ("20260801010000_uhc_semantic_layout_identity")

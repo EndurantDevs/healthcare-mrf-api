@@ -164,7 +164,7 @@ async def test_partitioned_event_loop_contract():
 
 
 @pytest.mark.asyncio
-async def test_executes_nine_requests_at_two_starts_per_second_with_overlap(
+async def test_executes_nine_requests_at_fifty_starts_per_second_with_overlap(
     unused_tcp_port,
 ):
     starts: list[float] = []
@@ -180,7 +180,7 @@ async def test_executes_nine_requests_at_two_starts_per_second_with_overlap(
         request = contract.parse_partitioned_candidate_audit_request(
             await web_request.json()
         )
-        await asyncio.sleep(0.75)
+        await asyncio.sleep(0.03)
         counters_by_name["active"] -= 1
         result = contract.build_partitioned_candidate_audit_result(
             request=request,
@@ -188,7 +188,7 @@ async def test_executes_nine_requests_at_two_starts_per_second_with_overlap(
             validated_persisted_occurrence_count=len(
                 request.persisted_occurrences
             ),
-            duration_ms=750,
+            duration_ms=30,
             block_io=_block_io(),
             candidate_processing_io=_candidate_io(request),
         )
@@ -215,13 +215,35 @@ async def test_executes_nine_requests_at_two_starts_per_second_with_overlap(
     assert metrics.started_request_count == 9
     assert metrics.completed_request_count == 9
     assert metrics.failed_request_count == 0
-    assert metrics.peak_in_flight >= 2
-    assert counters_by_name["peak_active"] >= 2
+    assert metrics.peak_in_flight == 2
+    assert counters_by_name["peak_active"] == 2
     assert len(starts) == 9
     assert all(
-        later - earlier >= 0.45
+        later - earlier >= 0.015
         for earlier, later in zip(starts, starts[1:])
     )
+    assert metrics.start_span_seconds < 2
+
+
+@pytest.mark.asyncio
+async def test_fifty_request_start_gate_does_not_catch_up_after_a_stall(monkeypatch):
+    clock = types.SimpleNamespace(now=0.0)
+
+    async def sleep(seconds):
+        clock.now += seconds
+
+    monkeypatch.setattr(audit, "time", types.SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(audit.asyncio, "sleep", sleep)
+    gate = audit._RequestStartGate(50.0)
+    await gate.wait()
+    await gate.wait()
+    assert clock.now == pytest.approx(0.02)
+    clock.now = 1.0
+    await gate.wait()
+    await gate.wait()
+    assert clock.now == pytest.approx(1.02)
+
+
 @pytest.mark.asyncio
 async def test_transient_response_is_not_retried(unused_tcp_port):
     counters_by_name = {"request_count": 0}

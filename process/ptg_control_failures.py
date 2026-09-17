@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from process.ptg_frozen_control import frozen_rate_failure_payload
+from process.ptg_graph_resource_admission import V4GraphResourceAdmissionError
 from process.ptg_singleton_direct_control import (
     singleton_direct_failure_payload,
 )
@@ -88,6 +89,16 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
     integrity_failure = _integrity_failure_payload(error_leaves)
     if integrity_failure is not None:
         return integrity_failure
+    resource_failure = next(
+        (leaf for leaf in error_leaves if isinstance(leaf, V4GraphResourceAdmissionError)), None,
+    )
+    if resource_failure is not None:
+        return {
+            "code": "ptg_graph_resource_admission",
+            "message": str(resource_failure),
+            "retryable": False,
+            "resource_admission": dict(resource_failure.resource_admission),
+        }
     frozen_failure = frozen_rate_failure_payload(error_leaves)
     if frozen_failure is not None:
         return frozen_failure

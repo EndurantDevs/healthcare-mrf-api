@@ -42,7 +42,7 @@ terminal lineage, retained resources, proof shards, checkpoints, typed rows,
 and direct references. It performs no writes.
 
 ```bash
-./venv314/bin/python \
+./.venv/bin/python \
   scripts/smoke/provider_directory_terminal_root_retirement.py preview \
   --source-id SOURCE_ID \
   --endpoint-id ENDPOINT_ID \
@@ -60,7 +60,7 @@ apply fail closed.
 Run the apply with the same selectors and the exact preview token:
 
 ```bash
-./venv314/bin/python \
+./.venv/bin/python \
   scripts/smoke/provider_directory_terminal_root_retirement.py apply \
   --source-id SOURCE_ID \
   --endpoint-id ENDPOINT_ID \

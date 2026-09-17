@@ -31,7 +31,7 @@ from db.connection import db
 
 
 MAX_PROJECTION_BINDINGS = 16
-MAX_PROJECTION_CODE_ROWS = 65_536
+MAX_PROJECTION_CODE_ROWS = 262_144
 
 
 def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:

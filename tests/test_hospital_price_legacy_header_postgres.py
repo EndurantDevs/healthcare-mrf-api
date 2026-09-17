@@ -20,6 +20,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
@@ -56,6 +57,16 @@ async def test_postgres_v4_v2_requires_exact_current_csv_profile(monkeypatch) ->
     await prove_csv_profile_constraints(monkeypatch)
 
 
+@pytest.mark.asyncio
+async def test_postgres_csv_v3_label_is_current_parser_csv_only(monkeypatch) -> None:
+    """Run the Version=3 proof in the hosted PostgreSQL core inventory."""
+    from tests.test_hospital_price_csv_v3_label import (
+        prove_csv_v3_label_constraints,
+    )
+
+    await prove_csv_v3_label_constraints(monkeypatch)
+
+
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     """Keep legacy-only successor fields absent without relaxing v3."""
 
@@ -71,6 +82,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in model_sql
+    assert HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in model_sql
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
     assert (
@@ -507,6 +519,11 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         await _run_migration(engine, _load_migration(
             CSV_SHORT_V2_MIGRATION_PATH.with_name(
                 "20260907220000_hospital_price_missing_plan.py"
+            )
+        ), "upgrade")
+        await _run_migration(engine, _load_migration(
+            CSV_SHORT_V2_MIGRATION_PATH.with_name(
+                "20260911100000_hospital_price_tall_notes.py"
             )
         ), "upgrade")
         await _prove_current_headers(database_url, quoted)

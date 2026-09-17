@@ -21,8 +21,8 @@ from api.provider_profile_cms import (
     merge_cms_education_projection,
 )
 from api.provider_profile_states import (
-    canonicalize_training_category,
-    fetch_massachusetts_profile_projection,
+    canonicalize_exact_category,
+    fetch_additional_state_profile_projections,
     merge_state_profile_projection,
 )
 from api.provider_profile_composer_parts import (
@@ -74,12 +74,14 @@ async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
 
 async def fetch_provider_profile_projection(npi: int) -> dict[str, Any] | None:
     """Load independently published state and CMS facts without replacing either."""
-    state_projection, cms_projection, massachusetts_projection = await asyncio.gather(
+    state_projection, cms_projection, additional_state_projections = await asyncio.gather(
         fetch_state_profile_projection(npi), fetch_cms_education_projection(npi),
-        fetch_massachusetts_profile_projection(npi),
+        fetch_additional_state_profile_projections(npi),
     )
     projection = merge_cms_education_projection(npi, state_projection, cms_projection)
-    return merge_state_profile_projection(npi, projection, massachusetts_projection)
+    for state_projection in additional_state_projections:
+        projection = merge_state_profile_projection(npi, projection, state_projection)
+    return projection
 
 
 def compose_provider_profile(
@@ -104,7 +106,8 @@ def compose_provider_profile(
     _merge_fhir_profile_facts(categories, fhir_profile)
     _append_fhir_sources(profile, fhir_profile)
     canonicalize_education_category(categories["education"])
-    canonicalize_training_category(categories["training"])
+    for category in ("training", "specialties", "services", "certifications"):
+        canonicalize_exact_category(categories[category])
     canonicalize_language_category(
         categories["languages"],
         fhir_source_rows=_fhir_source_rows(fhir_profile),

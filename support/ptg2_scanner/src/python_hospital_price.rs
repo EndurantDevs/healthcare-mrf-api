@@ -155,6 +155,39 @@ fn hospital_price_decode_selector_page<'py>(
     )
 }
 
+#[pyfunction]
+fn hospital_price_decode_payer_plan_keys<'py>(
+    py: Python<'py>,
+    payload: &Bound<'py, PyBytes>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let payload = payload.as_bytes().to_vec();
+    let mut page = py
+        .detach(move || decode_selector_page(&payload))
+        .map_err(PyValueError::new_err)?;
+    if page.kind != crate::hospital_price_selector_block::HospitalPriceSelectorKind::PayerPlanToFact
+        || page.page_index != 0
+    {
+        return Err(PyValueError::new_err("hospital payer-plan dictionary page is invalid"));
+    }
+    page.entries.sort_unstable_by_key(|entry| selector_key_sha256(&entry.key));
+    let mut payloads = page.entries.iter().map(|entry| {
+        let HospitalPriceSelectorKey::PayerPlan { payer_name, plan_name } = &entry.key else {
+            return Err(PyValueError::new_err("hospital payer-plan dictionary key is invalid"));
+        };
+        hospital_price_dict(py, &[
+            ("payer_name", hospital_price_py_value(py, payer_name.as_str())),
+            ("plan_name", hospital_price_py_value(py, plan_name.as_deref())),
+            ("key_sha256", PyBytes::new(py, &selector_key_sha256(&entry.key)).into_any()),
+        ])
+    });
+    let items = hospital_price_dict_list(py, &mut payloads)?;
+    hospital_price_dict(py, &[
+        ("page_index", hospital_price_py_value(py, page.page_index)),
+        ("page_count", hospital_price_py_value(py, page.page_count)),
+        ("items", items.into_any()),
+    ])
+}
+
 fn hospital_price_code_payload<'py>(
     py: Python<'py>,
     code: &crate::hospital_price_service_block::HospitalPriceServiceCode,

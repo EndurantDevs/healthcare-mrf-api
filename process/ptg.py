@@ -475,6 +475,7 @@ from process.ptg_parts.ptg2_legacy_global_projection_queue import (
     mark_legacy_global_projection_dirty,
 )
 from process.ptg_parts.source_versions import _record_source_version
+from process.ptg_parts.ptg2_plan_months import upsert_plan_month_batches
 from process.ptg_parts.ptg2_plan_catalog_outbox import (
     drain_immutable_plan_catalog_outbox,
     enqueue_immutable_plan_catalog,
@@ -943,17 +944,8 @@ async def _write_fenced_ptg2_plan_months(
 ) -> None:
     """Write source-local plan months in an existing bounded unit of work."""
 
-    table = PTG2PlanMonth.__table__
-    statement = db.insert(table).values(plan_month_entries)
-    update_values_by_column = {
-        column.name: getattr(statement.excluded, column.name)
-        for column in table.c
-        if column.name not in set(PTG2PlanMonth.__my_index_elements__)
-    }
-    statement = statement.on_conflict_do_update(
-        index_elements=list(PTG2PlanMonth.__my_index_elements__),
-        set_=update_values_by_column,
-    )
+    if not plan_month_entries:
+        return
     schema_name = resolve_ptg2_schema()
     snapshot_ids = sorted(
         {
@@ -969,7 +961,7 @@ async def _write_fenced_ptg2_plan_months(
             schema_name=schema_name,
             snapshot_id=snapshot_id,
         )
-    await statement.status()
+    await upsert_plan_month_batches(plan_month_entries)
 
 
 async def _persist_plan_months_and_catalog_request(

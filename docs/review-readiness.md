@@ -18,7 +18,7 @@ import compatibility paths.
 ## Required Gates
 
 ```bash
-./venv314/bin/python -m pytest -q
+./.venv/bin/python -m pytest -q
 cargo fmt --check --manifest-path support/ptg2_scanner/Cargo.toml
 cargo check --all-targets --manifest-path support/ptg2_scanner/Cargo.toml
 cargo clippy --all-targets --manifest-path support/ptg2_scanner/Cargo.toml -- -D warnings
