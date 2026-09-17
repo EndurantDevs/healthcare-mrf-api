@@ -295,14 +295,22 @@ def _provider_membership_batches(
 
     pending_ids: list[str] = []
     pending_count = 0
+    pending_limit = 0
     for provider_set_id in provider_set_ids:
         provider_count = int(metadata_by_id[provider_set_id].provider_count)
-        if pending_ids and pending_count + provider_count > MAX_PROVIDER_NPIS_PER_SET:
+        candidate_limit = max(pending_limit, provider_count + 1)
+        if pending_ids and (
+            pending_count + provider_count > MAX_PROVIDER_NPIS_PER_SET
+            or (len(pending_ids) + 1) * candidate_limit
+            > MAX_PROVIDER_NPIS_PER_SET + 1
+        ):
             yield tuple(pending_ids)
             pending_ids = []
             pending_count = 0
+            pending_limit = 0
         pending_ids.append(provider_set_id)
         pending_count += provider_count
+        pending_limit = max(pending_limit, provider_count + 1)
     if pending_ids:
         yield tuple(pending_ids)
 
