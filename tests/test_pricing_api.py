@@ -25,6 +25,7 @@ from api.ptg2_candidate_audit import (
 )
 from api.ptg2_rate_option_refs import encode_rate_option_ref
 from api.ptg2_serving import PTG2LocationScopeError
+from api.provider_service_code_coverage import provider_service_code_coverage
 from process.terminology_synonyms import _procedure_rows
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
@@ -217,7 +218,7 @@ def make_request(results, args=None):
 
 
 @pytest.mark.asyncio
-async def test_get_pricing_provider_explains_partial_service_code_coverage():
+async def test_provider_profile_explains_partial_service_code_coverage():
     request = make_request(
         [
             FakeResult(
@@ -235,10 +236,10 @@ async def test_get_pricing_provider_explains_partial_service_code_coverage():
         args={"year": "2024"},
     )
 
-    result = json.loads((await get_pricing_provider(request, "1234567890")).body)
+    provider_payload = json.loads((await get_pricing_provider(request, "1234567890")).body)
 
-    assert result["summary"] == {"service_count": 8, "location_count": 9}
-    assert result["service_code_coverage"] == {
+    assert provider_payload["summary"] == {"service_count": 8, "location_count": 9}
+    assert provider_payload["service_code_coverage"] == {
         "source_distinct_code_count": 22,
         "published_detail_code_count": 8,
         "unpublished_detail_code_count": 14,
@@ -263,7 +264,7 @@ def test_service_code_coverage_states(
     status,
     ratio,
 ):
-    coverage = pricing_module._service_code_coverage(source_count, published_count)
+    coverage = provider_service_code_coverage(source_count, published_count)
 
     assert coverage["status"] == status
     assert coverage["detail_coverage_ratio"] == ratio
