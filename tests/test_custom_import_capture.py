@@ -9,7 +9,7 @@ import json
 import subprocess
 import sys
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -121,6 +121,46 @@ class _ParquetMetadataFixture:
         """Return the only metadata row group after its index is checked."""
 
         assert group_index == 0
+        return self.row_group_metadata
+
+
+@dataclass
+class _MutableParquetMetadataColumn:
+    """One configurable column-metadata fixture for footer rejection checks."""
+
+    num_values: int = 1
+    total_uncompressed_size: int = 1
+    file_path: str | None = None
+
+
+@dataclass
+class _MutableParquetMetadataRowGroup:
+    """One configurable row-group fixture with the Parquet metadata protocol."""
+
+    num_rows: int = 1
+    num_columns: int = 1
+    column_metadata: _MutableParquetMetadataColumn | None = None
+
+    def column(self, column_index: int) -> _MutableParquetMetadataColumn:
+        """Return the only synthetic column after enforcing the checked index."""
+
+        assert column_index == 0
+        return self.column_metadata or _MutableParquetMetadataColumn()
+
+
+@dataclass
+class _MutableParquetMetadataFixture:
+    """One configurable file-metadata fixture with a single row-group accessor."""
+
+    num_rows: int
+    num_row_groups: int
+    num_columns: int
+    row_group_metadata: _MutableParquetMetadataRowGroup
+
+    def row_group(self, row_group_index: int) -> _MutableParquetMetadataRowGroup:
+        """Return the only synthetic row group after enforcing the checked index."""
+
+        assert row_group_index == 0
         return self.row_group_metadata
 
 
@@ -1489,3 +1529,786 @@ def test_capture_rejects_nonprintable_snapshot_tokens_but_allows_printable_unico
         source_snapshot_token="snapshot caf\u00e9 20260914",
     )
     assert capture.manifest.source_snapshot_token == "snapshot caf\u00e9 20260914"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"maximum_records": 0},
+        {"maximum_fields_per_record": True},
+        {"read_chunk_bytes": -1},
+        {"maximum_decoded_bytes": 8, "maximum_record_bytes": 16},
+    ),
+    ids=("zero-records", "boolean-fields", "negative-read-chunk", "record-larger-than-payload"),
+)
+def test_capture_limits_reject_invalid_resource_contracts(kwargs):
+    """Every resource ceiling is a positive, internally consistent integer."""
+
+    with pytest.raises(ValueError):
+        CaptureLimits(**kwargs)
+
+
+def test_capture_replay_rejects_corrupted_persisted_forms_before_decoding():
+    """Stored capture facts must remain typed, length-bound, and provenance-bound."""
+
+    stream = _stream()
+    capture = _capture(b"Provider ID\n1234567893\n", stream)
+
+    malformed_payload = replace(capture, payload=bytearray(capture.payload))
+    with pytest.raises(CaptureError, match="payload must be bytes"):
+        verify_capture(malformed_payload, stream)
+
+    malformed_length = replace(capture, manifest=replace(capture.manifest, compressed_bytes=0))
+    with pytest.raises(CaptureError, match="length does not match"):
+        verify_capture(malformed_length, stream)
+
+    malformed_decoded_digest = replace(capture, manifest=replace(capture.manifest, decoded_sha256="0" * 64))
+    with pytest.raises(CaptureError, match="decoded capture digest"):
+        verify_capture(malformed_decoded_digest, stream)
+
+    malformed_provenance_digest = replace(capture, manifest=replace(capture.manifest, capture_sha256="0" * 64))
+    with pytest.raises(CaptureError, match="manifest digest"):
+        verify_capture(malformed_provenance_digest, stream)
+
+
+def test_capture_internal_dispatch_and_headers_fail_closed_for_invalid_shapes():
+    """A corrupted internal source shape cannot select a permissive decoder path."""
+
+    unsupported_stream = type("UnsupportedStream", (), {"format": "unsupported"})()
+    sealed = _capture(b"Provider ID\n1234567893\n", _stream())
+    with pytest.raises(CaptureError, match="unsupported source format"):
+        list(capture_module._iter_verified_records(sealed, unsupported_stream, limits=CaptureLimits()))
+
+    with pytest.raises(CaptureError, match="requires a header"):
+        capture_module._validated_headers(None, CaptureLimits())
+    with pytest.raises(CaptureError, match="field limit"):
+        capture_module._validated_headers(
+            ["first", "second"],
+            CaptureLimits(maximum_fields_per_record=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message", "limits"),
+    (
+        (b"", "payload is empty", CaptureLimits()),
+        (b"[", "payload is incomplete", CaptureLimits()),
+        (b"[1]", "records must be objects", CaptureLimits()),
+        (b"[{},]", "trailing comma", CaptureLimits()),
+        (b"[]!", "trailing data", CaptureLimits()),
+        (b"[{}x]", "trailing data", CaptureLimits()),
+        (b"[{},{}]", "record limit", CaptureLimits(maximum_records=1)),
+    ),
+    ids=("empty", "unterminated", "scalar-item", "trailing-comma", "after-array", "after-item", "record-limit"),
+)
+def test_json_framer_rejects_each_top_level_grammar_boundary(payload, message, limits):
+    """The byte framer denies malformed arrays before JSON values are materialized."""
+
+    framer = capture_module._BoundedJsonObjectFramer(limits)
+    with pytest.raises(CaptureError, match=message):
+        list(framer.feed(payload))
+        list(framer.finish())
+
+
+def test_json_framer_validates_transport_type_and_permits_structural_whitespace():
+    """Only binary transports enter the framer, while ordinary JSON whitespace remains valid."""
+
+    framer = capture_module._BoundedJsonObjectFramer(CaptureLimits())
+    with pytest.raises(CaptureError, match="must yield bytes"):
+        list(framer.feed(bytearray(b"[]")))
+
+    whitespace_framer = capture_module._BoundedJsonObjectFramer(CaptureLimits())
+    assert list(whitespace_framer.feed(b" \n[{} \t]")) == [b"{}"]
+    assert list(whitespace_framer.finish()) == []
+
+
+@pytest.mark.parametrize("format_name, payload", (("json", b'[{"value":NaN}]'), ("ndjson", b'{"value":NaN}\n')))
+def test_json_decoders_reject_nonfinite_constants_without_exposing_parser_details(format_name, payload):
+    """NaN and Infinity are not accepted as capture scalar values."""
+
+    stream = _stream(format_name=format_name)
+    with pytest.raises(CaptureError, match="invalid"):
+        list(iter_records(_capture(payload, stream), stream))
+
+
+def test_xml_collector_rejects_callback_shapes_that_cannot_form_flat_records():
+    """The Expat callbacks enforce root, record, field, and record-count boundaries."""
+
+    limits = CaptureLimits(maximum_fields_per_record=1, maximum_record_bytes=64, maximum_records=1)
+
+    multiple_root = capture_module._XmlRecordCollector("provider", limits)
+    multiple_root.start_element("providers", {"root_attribute": "synthetic"})
+    multiple_root.end_element("providers")
+    with pytest.raises(CaptureError, match="multiple root"):
+        multiple_root.start_element("providers", {})
+
+    attributed_record = capture_module._XmlRecordCollector("provider", limits)
+    attributed_record.start_element("providers", {})
+    with pytest.raises(CaptureError, match="cannot carry attributes"):
+        attributed_record.start_element("provider", {"record_attribute": "synthetic"})
+
+    duplicate_field = capture_module._XmlRecordCollector("provider", limits)
+    duplicate_field.start_element("providers", {})
+    duplicate_field.start_element("provider", {})
+    duplicate_field.start_element("npi", {})
+    duplicate_field.end_element("npi")
+    with pytest.raises(CaptureError, match="duplicate label"):
+        duplicate_field.start_element("npi", {})
+
+    field_limit = capture_module._XmlRecordCollector("provider", limits)
+    field_limit.start_element("providers", {})
+    field_limit.start_element("provider", {})
+    field_limit.start_element("first", {})
+    field_limit.end_element("first")
+    with pytest.raises(CaptureError, match="field limit"):
+        field_limit.start_element("second", {})
+
+    nested_field = capture_module._XmlRecordCollector("provider", limits)
+    nested_field.start_element("providers", {})
+    nested_field.start_element("provider", {})
+    nested_field.start_element("npi", {})
+    with pytest.raises(CaptureError, match="flat scalar"):
+        nested_field.start_element("nested", {})
+
+    orphan_field = capture_module._XmlRecordCollector("provider", limits)
+    orphan_field.start_element("providers", {})
+    orphan_field.depth = 2
+    with pytest.raises(CaptureError, match="flat scalar"):
+        orphan_field.start_element("field", {})
+
+    label_budget = capture_module._XmlRecordCollector(
+        "provider",
+        CaptureLimits(maximum_record_bytes=5, maximum_decoded_bytes=64),
+    )
+    label_budget.start_element("providers", {})
+    label_budget.start_element("provider", {})
+    with pytest.raises(CaptureError, match="byte limit"):
+        label_budget.start_element("npi", {})
+
+    record_limit = capture_module._XmlRecordCollector("provider", limits)
+    record_limit.start_element("providers", {})
+    record_limit.ordinal = 1
+    with pytest.raises(CaptureError, match="record limit"):
+        record_limit.start_element("provider", {})
+
+
+def test_xml_callbacks_bound_metadata_and_invalid_utf8():
+    """Namespaces, instructions, declarations, and text callbacks retain no unbounded parser state."""
+
+    collector = capture_module._XmlRecordCollector("provider", CaptureLimits())
+    collector.start_namespace(None, "urn:synthetic")
+    collector.start_namespace(None, "urn:synthetic")
+    collector.processing_instruction("synthetic", "not-retained")
+    assert collector.known_namespace_declarations == {("", "urn:synthetic")}
+    assert "pi:synthetic" in collector.known_names
+    assert capture_module._xml_name("urn:synthetic\x1ffield") == "{urn:synthetic}field"
+
+    collector.current_field = "field"
+    with pytest.raises(CaptureError, match="valid UTF-8"):
+        collector.character_data("\ud800")
+    with pytest.raises(CaptureError, match="entity declarations"):
+        collector.forbidden_declaration()
+    with pytest.raises(CaptureError, match="cannot resolve external"):
+        collector.forbidden_external_entity()
+
+    no_parser = capture_module._XmlRecordCollector("provider", CaptureLimits())
+    no_parser._clear_parser_intern()
+    parser_without_intern = type("ParserWithoutIntern", (), {})()
+    no_parser.parser = parser_without_intern
+    no_parser._clear_parser_intern()
+
+    malformed_end = capture_module._XmlRecordCollector("provider", CaptureLimits())
+    with pytest.raises(CaptureError, match="payload is invalid"):
+        malformed_end.end_element("provider")
+
+
+def test_xml_declaration_scanner_tracks_whitespace_case_and_false_prefixes_across_chunks():
+    """Declaration detection stays stateful across chunk boundaries without retaining source bytes."""
+
+    entity_scanner = capture_module._XmlDeclarationScanState()
+    assert entity_scanner.has_forbidden_declaration(b"<! \nEn") is False
+    assert entity_scanner.has_forbidden_declaration(b"tItY") is True
+
+    false_prefix_scanner = capture_module._XmlDeclarationScanState()
+    assert false_prefix_scanner.has_forbidden_declaration(b"<!dox<providers") is False
+
+    with pytest.raises(CaptureError, match="compression is invalid"):
+        capture_module._has_forbidden_xml_declaration(
+            b"not-a-gzip-stream",
+            "gzip",
+            CaptureLimits(),
+        )
+
+
+def test_decoded_record_rejects_invalid_internal_mapping_forms():
+    """All decoder adapters share the same bounded flat-record contract."""
+
+    limits = CaptureLimits(maximum_records=1, maximum_fields_per_record=1, maximum_record_bytes=16)
+    with pytest.raises(CaptureError, match="record limit"):
+        capture_module._decoded_record(2, {}, limits)
+    with pytest.raises(CaptureError, match="must be an object"):
+        capture_module._decoded_record(1, [], limits)
+    with pytest.raises(CaptureError, match="field limit"):
+        capture_module._decoded_record(1, {"first": "one", "second": "two"}, limits)
+
+    class DuplicateLabels(dict):
+        def __len__(self) -> int:
+            return 2
+
+        def items(self):
+            return iter((("npi", "first"), ("npi", "second")))
+
+    with pytest.raises(CaptureError, match="duplicate label"):
+        capture_module._decoded_record(1, DuplicateLabels(), CaptureLimits())
+
+
+def _compact_reader(payload: bytes) -> parquet_pages._CompactPageReader:
+    """Build one exact raw-header reader for compact-protocol boundary checks."""
+
+    return parquet_pages._CompactPageReader(payload, 0, len(payload))
+
+
+def test_parquet_compact_reader_enforces_fixed_width_and_collection_bounds():
+    """Every Compact wire type is consumed within the fixed header window or rejected."""
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"").read_byte()
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"x").advance(2)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"x").advance(-1)
+
+    assert _compact_reader(_compact_i32(-1)).read_i16() == -1
+    assert _compact_reader(_compact_i32(2)).read_i32() == 2
+    assert _compact_reader(_compact_i32(-3)).read_i64() == -3
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"\x0e").read_field(0)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"\x03\x00").read_field(0)
+
+    _compact_reader(b"x").skip_value(parquet_pages._COMPACT_BYTE, 0)
+    _compact_reader(_compact_i32(1)).skip_value(parquet_pages._COMPACT_I16, 0)
+    _compact_reader(_compact_i32(1)).skip_value(parquet_pages._COMPACT_I32, 0)
+    _compact_reader(_compact_i32(1)).skip_value(parquet_pages._COMPACT_I64, 0)
+    _compact_reader(b"x" * 8).skip_value(parquet_pages._COMPACT_DOUBLE, 0)
+    _compact_reader(b"\x00").skip_value(parquet_pages._COMPACT_MAP, 0)
+    _compact_reader(b"\x00").skip_value(parquet_pages._COMPACT_STRUCT, 0)
+    _compact_reader(b"x" * 16).skip_value(parquet_pages._COMPACT_UUID, 0)
+
+    extended_list = b"\xf3" + _compact_unsigned(1) + b"x"
+    _compact_reader(extended_list).skip_value(parquet_pages._COMPACT_LIST, 0)
+    populated_map = _compact_unsigned(1) + b"\x55" + _compact_i32(1) + _compact_i32(2)
+    _compact_reader(populated_map).skip_value(parquet_pages._COMPACT_MAP, 0)
+    _compact_reader(b"\x01").skip_value(parquet_pages._COMPACT_TRUE, 0, is_collection_item=True)
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"\x00").skip_value(parquet_pages._COMPACT_TRUE, 0, is_collection_item=True)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"\x1e").skip_value(parquet_pages._COMPACT_LIST, 0)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        _compact_reader(b"").skip_value(99, 0)
+
+
+def test_parquet_compact_helpers_reject_malformed_wire_boundaries():
+    """Malformed raw Compact envelopes and primitive values fail before page parsing."""
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid envelope"):
+        parquet_pages.parquet_footer_start(b"not-parquet")
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid footer"):
+        parquet_pages.parquet_footer_start(b"PAR1" + (0).to_bytes(4, "little") + b"PAR1")
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_header_depth(parquet_pages._MAX_HEADER_DEPTH + 1)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_collection_types(parquet_pages._COMPACT_STOP, parquet_pages._COMPACT_I32)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        list(parquet_pages._iter_compact_fields(_compact_reader(b"\x13\x03\x02"), 1))
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        list(parquet_pages._iter_compact_fields(_compact_reader(b"\x13" * 64), 1))
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_compact_type(parquet_pages._COMPACT_BYTE, parquet_pages._COMPACT_I32)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_compact_boolean_type(parquet_pages._COMPACT_I32)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_nonnegative_i32(_compact_reader(_compact_i32(-1)))
+
+
+def test_parquet_compact_helpers_validate_page_fact_shapes():
+    """V1, V2, and dictionary page facts retain bounded Compact shape validation."""
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_v1_page_fields(parquet_pages._V1PageFacts())
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_v2_page_facts(parquet_pages._V2PageFacts())
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_v2_page_facts(
+            parquet_pages._V2PageFacts(
+                number_of_values=1,
+                number_of_nulls=2,
+                number_of_rows=1,
+                value_encoding=0,
+                definition_level_bytes=0,
+                repetition_level_bytes=0,
+            )
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_v2_page_facts(
+            parquet_pages._V2PageFacts(
+                number_of_values=1,
+                number_of_nulls=0,
+                number_of_rows=2,
+                value_encoding=0,
+                definition_level_bytes=0,
+                repetition_level_bytes=0,
+            )
+        )
+
+    unknown_v1_field = _compact_reader(b"\x00")
+    parquet_pages._read_v1_field(
+        unknown_v1_field,
+        parquet_pages._V1PageFacts(),
+        99,
+        parquet_pages._COMPACT_STRUCT,
+        1,
+    )
+    unknown_v2_field = _compact_reader(b"\x00")
+    parquet_pages._read_v2_field(
+        unknown_v2_field,
+        parquet_pages._V2PageFacts(),
+        8,
+        parquet_pages._COMPACT_STRUCT,
+        1,
+    )
+    unknown_v2_extension = _compact_reader(b"\x00")
+    parquet_pages._read_v2_field(
+        unknown_v2_extension,
+        parquet_pages._V2PageFacts(),
+        99,
+        parquet_pages._COMPACT_STRUCT,
+        1,
+    )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_dictionary_page(_compact_reader(b"\x41\x00"), 1)
+
+
+def test_parquet_page_header_helpers_reject_inconsistent_outer_and_nested_facts():
+    """Raw page headers need one supported type, matching nested facts, and bounded spans."""
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_page_header_range(-1, 0, 1)
+    with pytest.raises(parquet_pages.ParquetPageError, match="unsupported page type"):
+        parquet_pages._read_outer_page_field(
+            _compact_reader(b""),
+            parquet_pages._PageHeaderFacts(),
+            6,
+            parquet_pages._COMPACT_I32,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_nested_page_field(
+            _compact_reader(b""),
+            parquet_pages._PageHeaderFacts(nested_field_id=5),
+            7,
+            parquet_pages._COMPACT_STRUCT,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._build_page_header(
+            parquet_pages._PageHeaderFacts(
+                page_type=parquet_pages._PAGE_TYPE_DATA,
+                uncompressed_page_size=1,
+                compressed_page_size=1,
+                nested_field_id=7,
+                num_values=1,
+            ),
+            1,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._require_outer_page_fields(parquet_pages._PageHeaderFacts())
+    with pytest.raises(parquet_pages.ParquetPageError, match="unsupported page type"):
+        parquet_pages._expected_nested_field(99)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_data_page_header_facts(
+            parquet_pages._PageHeaderFacts(page_type=parquet_pages._PAGE_TYPE_DATA)
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._validate_data_page_header_facts(
+            parquet_pages._PageHeaderFacts(
+                page_type=parquet_pages._PAGE_TYPE_DATA_V2,
+                compressed_page_size=1,
+                num_values=1,
+                definition_levels_byte_length=1,
+                repetition_levels_byte_length=1,
+            )
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="no metadata"):
+        parquet_pages.validate_page_layout(b"", None, pa.schema([]), maximum_decoded_bytes=64)
+
+
+def _chunk_context(**overrides):
+    """Create a small checked page-scan context for raw rejection-path tests."""
+
+    context_values_by_field = {
+        "expected_value_count": 1,
+        "expected_compressed_bytes": 8,
+        "expected_decoded_bytes": 8,
+        "dictionary_offset": None,
+        "first_data_offset": 4,
+        "page_header_limit": 8,
+        "page_decoded_limit": 8,
+        "data_type": pa.string(),
+        "maximum_decoded_bytes": 64,
+    }
+    context_values_by_field.update(overrides)
+    return parquet_pages._ChunkContext(**context_values_by_field)
+
+
+def _data_page_header(**overrides):
+    """Create one minimal supported data-page header for preflight boundary checks."""
+
+    header_values_by_field = {
+        "page_type": parquet_pages._PAGE_TYPE_DATA,
+        "header_size": 1,
+        "compressed_page_size": 1,
+        "uncompressed_page_size": 1,
+        "num_values": 1,
+        "value_encoding": parquet_pages._ENCODING_PLAIN,
+    }
+    header_values_by_field.update(overrides)
+    return parquet_pages._PageHeader(**header_values_by_field)
+
+
+def test_parquet_page_scan_rejects_invalid_spans_and_totals():
+    """Page spans and aggregate byte totals cannot contradict their checked footer claims."""
+
+    context = _chunk_context()
+    with pytest.raises(parquet_pages.ParquetPageError, match="decoded-byte"):
+        parquet_pages._validate_page_span(
+            _data_page_header(uncompressed_page_size=9),
+            4,
+            8,
+            context,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page metadata"):
+        parquet_pages._validate_page_span(_data_page_header(), 8, 8, context)
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page metadata"):
+        parquet_pages._validate_page_span(_data_page_header(compressed_page_size=4), 4, 6, context)
+
+    max_pages = parquet_pages._ChunkScanState(current_offset=4, page_count=parquet_pages._MAX_PAGE_COUNT)
+    with pytest.raises(parquet_pages.ParquetPageError, match="too many data pages"):
+        parquet_pages._record_page_totals(max_pages, _data_page_header(), context)
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._record_page_totals(
+            parquet_pages._ChunkScanState(current_offset=4),
+            _data_page_header(),
+            _chunk_context(expected_compressed_bytes=0),
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._record_page_totals(
+            parquet_pages._ChunkScanState(current_offset=4),
+            _data_page_header(),
+            _chunk_context(expected_decoded_bytes=0),
+        )
+
+
+def test_parquet_page_scan_rejects_invalid_dictionary_and_values():
+    """Dictionary ordering and per-page value counts stay consistent with the footer."""
+
+    context = _chunk_context()
+    with pytest.raises(parquet_pages.ParquetPageError, match="dictionary page metadata"):
+        parquet_pages._record_dictionary_page(
+            parquet_pages._ChunkScanState(current_offset=4, has_dictionary_page=True),
+            _data_page_header(page_type=parquet_pages._PAGE_TYPE_DICTIONARY),
+            _chunk_context(dictionary_offset=4),
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="dictionary page header"):
+        parquet_pages._record_dictionary_page(
+            parquet_pages._ChunkScanState(current_offset=4),
+            _data_page_header(page_type=parquet_pages._PAGE_TYPE_DICTIONARY, num_values=None),
+            _chunk_context(dictionary_offset=4),
+        )
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid data-page metadata"):
+        parquet_pages._require_first_data_offset(
+            parquet_pages._ChunkScanState(current_offset=5),
+            context,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid dictionary page metadata"):
+        parquet_pages._require_dictionary_for_data_encoding(parquet_pages._ENCODING_PLAIN_DICTIONARY, False)
+    parquet_pages._require_allowed_value_encoding(parquet_pages._ENCODING_RLE, pa.bool_())
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._record_data_page(
+            parquet_pages._ChunkScanState(current_offset=4),
+            _data_page_header(num_values=None),
+            context,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._record_data_page(
+            parquet_pages._ChunkScanState(current_offset=4, observed_value_count=1),
+            _data_page_header(),
+            context,
+        )
+
+
+@pytest.mark.parametrize(
+    "scan_state",
+    (
+        parquet_pages._ChunkScanState(current_offset=5),
+        parquet_pages._ChunkScanState(current_offset=4, observed_compressed_bytes=7),
+        parquet_pages._ChunkScanState(current_offset=4, observed_compressed_bytes=8, observed_decoded_bytes=7),
+        parquet_pages._ChunkScanState(
+            current_offset=4,
+            observed_compressed_bytes=8,
+            observed_decoded_bytes=8,
+            observed_value_count=0,
+        ),
+        parquet_pages._ChunkScanState(
+            current_offset=4,
+            observed_compressed_bytes=8,
+            observed_decoded_bytes=8,
+            observed_value_count=1,
+            has_dictionary_page=True,
+        ),
+    ),
+    ids=("offset", "compressed-total", "decoded-total", "value-total", "dictionary-presence"),
+)
+def test_parquet_page_scan_requires_exact_footer_reconciliation(scan_state):
+    """The page walk accepts a chunk only when every footer and raw-page total agrees."""
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._require_complete_chunk_scan(
+            scan_state,
+            _chunk_context(
+                expected_compressed_bytes=8,
+                expected_decoded_bytes=8,
+                expected_value_count=1,
+                dictionary_offset=None,
+            ),
+            4,
+        )
+
+
+def test_parquet_scalar_and_footer_integer_helpers_use_conservative_native_estimates():
+    """Scalar estimates cover every supported flat type and reject malformed footer values."""
+
+    assert parquet_pages._scalar_output_bytes(pa.bool_(), 99) == 1
+    assert parquet_pages._scalar_output_bytes(pa.null(), 99) == 0
+    assert parquet_pages._scalar_output_bytes(pa.binary(), 99) == 99
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid metadata"):
+        parquet_pages._nonnegative_integer(True)
+
+
+def test_parquet_footer_helpers_reject_invalid_chunk_claims():
+    """Footer-only claims are rejected before a raw page reader can seek to them."""
+
+    parquet_pages._require_empty_chunk(0, 0)
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent page metadata"):
+        parquet_pages._require_empty_chunk(1, 0)
+
+    class OutOfRangeChunk:
+        dictionary_page_offset = None
+        data_page_offset = 2
+
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page metadata"):
+        parquet_pages._make_chunk_range(OutOfRangeChunk(), 1, 8, 0, 0)
+
+    unsupported_payload_context = capture_module._open_decoded_payload(b"", "unsupported")
+    with pytest.raises(CaptureError, match="unsupported compression"):
+        unsupported_payload_context.__enter__()
+
+
+def test_decoder_normalizers_keep_corrupt_compressed_payloads_inside_capture_errors():
+    """Every format-specific decoder normalizes malformed gzip before a record is exposed."""
+
+    limits = CaptureLimits(maximum_decoded_bytes=64, maximum_record_bytes=16)
+    for format_name, decoder in (
+        ("json", capture_module._iter_json_records),
+        ("ndjson", capture_module._iter_ndjson_records),
+    ):
+        stream = _stream(format_name=format_name, compression="gzip")
+        with pytest.raises(CaptureError, match="compression is invalid"):
+            list(decoder(b"not-a-gzip-stream", stream, limits))
+
+    with pytest.raises(CaptureError, match="sealed capture"):
+        capture_module._bounded_parquet_payload(
+            gzip.compress(b"short"),
+            "gzip",
+            limits,
+            expected_decoded_bytes=8,
+            expected_decoded_sha256="0" * 64,
+        )
+    with pytest.raises(CaptureError, match="compression is invalid"):
+        capture_module._bounded_parquet_payload(
+            b"not-a-gzip-stream",
+            "gzip",
+            limits,
+            expected_decoded_bytes=1,
+            expected_decoded_sha256="0" * 64,
+        )
+
+
+def test_xml_and_parquet_native_adapters_reject_unreachable_record_shapes():
+    """Native parser and batch boundaries cannot turn malformed records into accepted values."""
+
+    no_path_stream = type("NoRecordPathStream", (), {"record_path": None})()
+    with pytest.raises(CaptureError, match="declared record path"):
+        list(capture_module._iter_xml_records(b"<providers />", no_path_stream, CaptureLimits()))
+
+    xml_stream = _stream(format_name="xml", record_path="provider")
+    with pytest.raises(CaptureError, match="XML source payload is invalid"):
+        list(capture_module._iter_xml_records(b"<providers>", xml_stream, CaptureLimits()))
+
+    batch = pa.record_batch([pa.array(["value"])], names=["source_value"])
+
+    class Batches:
+        def __init__(self, values):
+            self.values = values
+
+        def iter_batches(self, **kwargs):
+            assert kwargs == {
+                "batch_size": 1,
+                "use_threads": False,
+                "use_pandas_metadata": False,
+            }
+            return iter(self.values)
+
+    with pytest.raises(CaptureError, match="inconsistent row metadata"):
+        list(capture_module._iter_parquet_batch_records(Batches([batch]), ("source_value",), 0, CaptureLimits()))
+    with pytest.raises(CaptureError, match="inconsistent row metadata"):
+        list(capture_module._iter_parquet_batch_records(Batches([]), ("source_value",), 1, CaptureLimits()))
+    with pytest.raises(CaptureError, match="inconsistent batch schema"):
+        capture_module._validate_parquet_batch_schema(batch, ("different_label",))
+
+
+def test_parquet_schema_boundaries_reject_invalid_column_contracts():
+    """Schema facts are bounded before native batch readers allocate row values."""
+
+    with pytest.raises(CaptureError, match="at least one source column"):
+        capture_module._validated_parquet_schema(pa.schema([]), CaptureLimits())
+    with pytest.raises(CaptureError, match="field limit"):
+        capture_module._validated_parquet_schema(
+            pa.schema([pa.field("first", pa.string()), pa.field("second", pa.string())]),
+            CaptureLimits(maximum_fields_per_record=1),
+        )
+    with pytest.raises(CaptureError, match="has no metadata"):
+        capture_module._validated_parquet_metadata(None, expected_columns=1, limits=CaptureLimits())
+
+
+def test_parquet_metadata_rejects_column_and_row_claims():
+    """Footer metadata cannot overstate file columns, group columns, or record counts."""
+
+    with pytest.raises(CaptureError, match="inconsistent column metadata"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=0,
+                num_row_groups=0,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(),
+            ),
+            expected_columns=2,
+            limits=CaptureLimits(),
+        )
+    with pytest.raises(CaptureError, match="inconsistent column metadata"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=1,
+                num_row_groups=1,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(num_columns=2),
+            ),
+            expected_columns=1,
+            limits=CaptureLimits(),
+        )
+    with pytest.raises(CaptureError, match="record limit"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=1,
+                num_row_groups=1,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(num_rows=2),
+            ),
+            expected_columns=1,
+            limits=CaptureLimits(maximum_records=1),
+        )
+
+
+def test_parquet_metadata_rejects_value_and_size_claims():
+    """Footer metadata cannot overstate per-column values, bytes, or final row totals."""
+
+    with pytest.raises(CaptureError, match="inconsistent row metadata"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=1,
+                num_row_groups=1,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(
+                    column_metadata=_MutableParquetMetadataColumn(num_values=0)
+                ),
+            ),
+            expected_columns=1,
+            limits=CaptureLimits(),
+        )
+    with pytest.raises(CaptureError, match="decoded-byte"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=1,
+                num_row_groups=1,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(
+                    column_metadata=_MutableParquetMetadataColumn(total_uncompressed_size=9)
+                ),
+            ),
+            expected_columns=1,
+            limits=CaptureLimits(maximum_decoded_bytes=8, maximum_record_bytes=8),
+        )
+    with pytest.raises(CaptureError, match="inconsistent row metadata"):
+        capture_module._validated_parquet_metadata(
+            _MutableParquetMetadataFixture(
+                num_rows=2,
+                num_row_groups=1,
+                num_columns=1,
+                row_group_metadata=_MutableParquetMetadataRowGroup(num_rows=1),
+            ),
+            expected_columns=1,
+            limits=CaptureLimits(),
+        )
+    with pytest.raises(CaptureError, match="invalid metadata"):
+        capture_module._nonnegative_parquet_integer(True)
+
+
+def test_parquet_chunk_collection_rejects_footer_fanout_and_column_mismatches():
+    """Chunk collection checks file and row-group shape before reading page bytes."""
+
+    schema = pa.schema([pa.field("value", pa.string())])
+    mismatched_file = type("FileMetadata", (), {"num_row_groups": 0, "num_columns": 2})()
+    with pytest.raises(parquet_pages.ParquetPageError, match="column metadata"):
+        parquet_pages._collect_chunk_ranges(mismatched_file, schema, 8)
+
+    excessive_file = type(
+        "FileMetadata",
+        (),
+        {"num_row_groups": parquet_pages._MAX_CHUNK_RANGES + 1, "num_columns": 1},
+    )()
+    with pytest.raises(parquet_pages.ParquetPageError, match="too many page intervals"):
+        parquet_pages._collect_chunk_ranges(excessive_file, schema, 8)
+
+    mismatched_group = type("RowGroupMetadata", (), {"num_rows": 0, "num_columns": 2})()
+    with pytest.raises(parquet_pages.ParquetPageError, match="column metadata"):
+        parquet_pages._collect_row_group_ranges(mismatched_group, 0, 1, 8, [])
+
+    empty_column = type(
+        "ColumnMetadata",
+        (),
+        {"num_values": 0, "total_compressed_size": 0, "total_uncompressed_size": 0},
+    )()
+    empty_group = type(
+        "RowGroupMetadata",
+        (),
+        {
+            "num_rows": 0,
+            "num_columns": 1,
+            "column": lambda _self, _index: empty_column,
+        },
+    )()
+    ranges = []
+    parquet_pages._collect_row_group_ranges(empty_group, 0, 1, 8, ranges)
+    assert ranges == []
