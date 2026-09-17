@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import process.custom_import.capture as capture_module
+import process.custom_import.parquet_pages as parquet_pages
 from process.custom_import import (
     CaptureError,
     CaptureLimits,
@@ -81,11 +82,71 @@ def _capture(payload: bytes, stream, *, limits: CaptureLimits | None = None):
     )
 
 
+class _ParquetMetadataColumn:
+    """Minimal flat column metadata for capture metadata checks."""
+
+    def __init__(self, file_path: str | None) -> None:
+        self.file_path = file_path
+        self.num_values = 1
+        self.total_uncompressed_size = 1
+
+
+class _ParquetMetadataRowGroup:
+    """Minimal one-column row group for capture metadata checks."""
+
+    num_rows = 1
+    num_columns = 1
+
+    def __init__(self, file_path: str | None) -> None:
+        self.column_metadata = _ParquetMetadataColumn(file_path)
+
+    def column(self, column_index: int) -> _ParquetMetadataColumn:
+        """Return the only metadata column after its index is checked."""
+
+        assert column_index == 0
+        return self.column_metadata
+
+
+class _ParquetMetadataFixture:
+    """Minimal one-row file metadata with a configurable column reference."""
+
+    num_rows = 1
+    num_row_groups = 1
+    num_columns = 1
+
+    def __init__(self, file_path: str | None) -> None:
+        self.row_group_metadata = _ParquetMetadataRowGroup(file_path)
+
+    def row_group(self, group_index: int) -> _ParquetMetadataRowGroup:
+        """Return the only metadata row group after its index is checked."""
+
+        assert group_index == 0
+        return self.row_group_metadata
+
+
+class _ExcessParquetGroupMetadata:
+    """Metadata that must fail before any oversized row group is inspected."""
+
+    num_rows = 0
+    num_row_groups = 4_097
+    num_columns = 1
+
+    @staticmethod
+    def row_group(_group_index: int) -> None:
+        """Fail if the metadata preflight inspects row groups after its limit."""
+
+        raise AssertionError("row groups must not be inspected after the fanout limit")
+
+
 def _parquet_payload(
     columns: dict[str, object],
     *,
     row_group_size: int | None = None,
     use_dictionary: bool = True,
+    column_encoding: dict[str, str] | None = None,
+    data_page_version: str = "1.0",
+    data_page_size: int | None = None,
+    write_page_index: bool = False,
 ) -> bytes:
     """Encode a sealed-test Parquet payload with page checksums enabled."""
 
@@ -93,6 +154,10 @@ def _parquet_payload(
         pa.table(columns),
         row_group_size=row_group_size,
         use_dictionary=use_dictionary,
+        column_encoding=column_encoding,
+        data_page_version=data_page_version,
+        data_page_size=data_page_size,
+        write_page_index=write_page_index,
     )
 
 
@@ -101,6 +166,10 @@ def _write_parquet_table(
     *,
     row_group_size: int | None = None,
     use_dictionary: bool = True,
+    column_encoding: dict[str, str] | None = None,
+    data_page_version: str = "1.0",
+    data_page_size: int | None = None,
+    write_page_index: bool = False,
 ) -> bytes:
     """Build a small in-memory Parquet file without paths or ambient source state."""
 
@@ -111,9 +180,129 @@ def _write_parquet_table(
         compression="zstd",
         row_group_size=row_group_size,
         use_dictionary=use_dictionary,
+        column_encoding=column_encoding,
+        data_page_version=data_page_version,
+        data_page_size=data_page_size,
         write_page_checksum=True,
+        write_page_index=write_page_index,
     )
     return payload.getvalue()
+
+
+def _compact_unsigned(value: int) -> bytes:
+    """Encode one nonnegative Compact varint for a focused raw-header fixture."""
+
+    assert value >= 0
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            encoded.append(byte | 0x80)
+        else:
+            encoded.append(byte)
+            return bytes(encoded)
+
+
+def _compact_i32(value: int) -> bytes:
+    """Encode one Compact ZigZag i32 for a focused raw-header fixture."""
+
+    assert -(2**31) <= value < 2**31
+    return _compact_unsigned((value << 1) ^ (value >> 31))
+
+
+def _first_parquet_page_offset(column) -> int:
+    """Return the physical start of a generated column's first data or dictionary page."""
+
+    return column.dictionary_page_offset if column.dictionary_page_offset is not None else column.data_page_offset
+
+
+def _replace_generated_page_i32(
+    payload: bytearray,
+    *,
+    page_offset: int,
+    field_id: int,
+    replacement: int,
+) -> None:
+    """Replace one of PyArrow's ordered PageHeader i32 fields without shifting its body."""
+
+    position = page_offset
+    for expected_field_id in range(1, field_id + 1):
+        assert payload[position] == 0x15
+        position += 1
+        value_start = position
+        while payload[position] & 0x80:
+            position += 1
+        position += 1
+        if expected_field_id == field_id:
+            encoded = _compact_i32(replacement)
+            assert len(encoded) == position - value_start
+            payload[value_start:position] = encoded
+            return
+    raise AssertionError("PageHeader field was not found")
+
+
+def _replace_generated_dictionary_num_values(
+    payload: bytearray,
+    *,
+    page_offset: int,
+    original: int,
+    replacement: int,
+) -> None:
+    """Replace the ordered dictionary-entry count in a generated PageHeader without shifting bytes."""
+
+    marker = b"\x15" + _compact_i32(original) + b"\x15" + _compact_i32(0)
+    value_start = payload.index(marker, page_offset) + 1
+    value_end = value_start + len(_compact_i32(original))
+    encoded = _compact_i32(replacement)
+    assert len(encoded) == value_end - value_start
+    payload[value_start:value_end] = encoded
+
+
+def _metadata_with_column_overrides(metadata, overrides):
+    """Expose generated metadata with only the raw-page facts overridden for a direct preflight check."""
+
+    class Column:
+        def __init__(self, column, row_group_index: int, column_index: int) -> None:
+            self._column = column
+            self._row_group_index = row_group_index
+            self._column_index = column_index
+
+        def __getattr__(self, name: str):
+            return overrides.get(
+                (self._row_group_index, self._column_index, name),
+                getattr(self._column, name),
+            )
+
+    class RowGroup:
+        def __init__(self, row_group, row_group_index: int) -> None:
+            self._row_group = row_group
+            self._row_group_index = row_group_index
+
+        @property
+        def num_rows(self):
+            return self._row_group.num_rows
+
+        @property
+        def num_columns(self):
+            return self._row_group.num_columns
+
+        def column(self, column_index: int):
+            return Column(
+                self._row_group.column(column_index),
+                self._row_group_index,
+                column_index,
+            )
+
+    class FileMetadata:
+        num_row_groups = metadata.num_row_groups
+        num_columns = metadata.num_columns
+
+        @staticmethod
+        def row_group(row_group_index: int):
+            return RowGroup(metadata.row_group(row_group_index), row_group_index)
+
+    return FileMetadata()
 
 
 def test_capture_seals_and_replays_delimited_source_records():
@@ -756,12 +945,12 @@ def test_parquet_decoder_streams_flat_scalar_rows_across_batches_and_row_groups(
     assert records[-1].values["Active"] is True
 
 
-def test_parquet_dictionary_batches_do_not_expand_past_limits_before_rejection(monkeypatch):
-    """Dictionary output is read one row at a time before logical limits reject it."""
+def test_parquet_dictionary_batches_use_one_row_and_preflight_the_working_budget(monkeypatch):
+    """Dictionary output retains one-row streaming and rejects an over-budget working estimate."""
 
     stream = _stream(format_name="parquet")
-    payload = _parquet_payload({"source_value": ["x" * 16_384] * 256}, use_dictionary=True)
-    metadata = pq.ParquetFile(BytesIO(payload)).metadata
+    parquet_bytes = _parquet_payload({"source_value": ["x" * 16_384] * 256})
+    metadata = pq.ParquetFile(BytesIO(parquet_bytes)).metadata
     assert metadata is not None
     column = metadata.row_group(0).column(0)
     assert column.has_dictionary_page is True
@@ -771,6 +960,7 @@ def test_parquet_dictionary_batches_do_not_expand_past_limits_before_rejection(m
         maximum_record_bytes=20 * 1024,
         maximum_records=256,
     )
+    assert len(parquet_bytes) < restrictive_limits.maximum_decoded_bytes
     assert column.total_uncompressed_size < restrictive_limits.maximum_decoded_bytes
 
     requested_batch_sizes: list[int] = []
@@ -790,19 +980,311 @@ def test_parquet_dictionary_batches_do_not_expand_past_limits_before_rejection(m
         maximum_record_bytes=20 * 1024,
         maximum_records=256,
     )
-    records = list(iter_records(_capture(payload, stream, limits=permissive_limits), stream, limits=permissive_limits))
-    assert len(records) == 256
+    decoded_records = list(
+        iter_records(
+            _capture(parquet_bytes, stream, limits=permissive_limits),
+            stream,
+            limits=permissive_limits,
+        )
+    )
+    assert len(decoded_records) == 256
 
     with pytest.raises(CaptureError, match="decoded-byte"):
-        list(iter_records(_capture(payload, stream, limits=restrictive_limits), stream, limits=restrictive_limits))
+        list(
+            iter_records(
+                _capture(parquet_bytes, stream, limits=restrictive_limits),
+                stream,
+                limits=restrictive_limits,
+            )
+        )
 
-    assert requested_batch_sizes == [1, 1]
+    assert requested_batch_sizes == [1]
     assert materialized_batches
     assert all(batch_rows == 1 for batch_rows, _batch_bytes in materialized_batches)
     assert all(
-        batch_bytes <= min(restrictive_limits.maximum_decoded_bytes, restrictive_limits.maximum_record_bytes)
+        batch_bytes <= min(permissive_limits.maximum_decoded_bytes, permissive_limits.maximum_record_bytes)
         for _batch_rows, batch_bytes in materialized_batches
     )
+
+
+def test_parquet_delta_byte_array_rejects_before_native_batches(monkeypatch):
+    """Delta byte-array values are rejected from their raw data-page header before iteration."""
+
+    stream = _stream(format_name="parquet")
+    parquet_bytes = _parquet_payload(
+        {"source_value": ["x" * 16_384] * 256},
+        use_dictionary=False,
+        column_encoding={"source_value": "DELTA_BYTE_ARRAY"},
+    )
+    metadata = pq.ParquetFile(BytesIO(parquet_bytes)).metadata
+    assert metadata is not None
+    column = metadata.row_group(0).column(0)
+    assert column.has_dictionary_page is False
+    assert "DELTA_BYTE_ARRAY" in column.encodings
+
+    limits = CaptureLimits(
+        maximum_decoded_bytes=32 * 1024,
+        maximum_record_bytes=20 * 1024,
+        maximum_records=256,
+    )
+    assert len(parquet_bytes) < limits.maximum_decoded_bytes
+    assert column.total_uncompressed_size < limits.maximum_decoded_bytes
+    monkeypatch.setattr(
+        capture_module.pq.ParquetFile,
+        "iter_batches",
+        lambda *_args, **_kwargs: pytest.fail("raw page validation must run before batches"),
+    )
+
+    with pytest.raises(CaptureError, match="unsupported page encoding"):
+        list(iter_records(_capture(parquet_bytes, stream, limits=limits), stream, limits=limits))
+
+
+def test_parquet_page_header_total_mismatch_rejects_before_native_batches(monkeypatch):
+    """A raw page size larger than its footer total is rejected before batches are requested."""
+
+    stream = _stream(format_name="parquet")
+    payload = bytearray(_parquet_payload({"source_value": ["x" * 16_384] * 256}))
+    metadata = pq.ParquetFile(BytesIO(payload)).metadata
+    assert metadata is not None
+    column = metadata.row_group(0).column(0)
+    assert column.total_uncompressed_size < 32 * 1024
+    _replace_generated_page_i32(
+        payload,
+        page_offset=_first_parquet_page_offset(column),
+        field_id=2,
+        replacement=20_000,
+    )
+    limits = CaptureLimits(
+        maximum_decoded_bytes=32 * 1024,
+        maximum_record_bytes=20 * 1024,
+        maximum_records=256,
+    )
+    monkeypatch.setattr(
+        capture_module.pq.ParquetFile,
+        "iter_batches",
+        lambda *_args, **_kwargs: pytest.fail("raw page validation must run before batches"),
+    )
+
+    with pytest.raises(CaptureError, match="page metadata"):
+        list(iter_records(_capture(bytes(payload), stream, limits=limits), stream, limits=limits))
+
+
+def test_parquet_dictionary_entry_count_is_budgeted_before_native_batches(monkeypatch):
+    """A dictionary entry count contributes to the preflight working estimate before batches."""
+
+    stream = _stream(format_name="parquet")
+    payload = bytearray(_parquet_payload({"source_value": ["entry"]}))
+    metadata = pq.ParquetFile(BytesIO(payload)).metadata
+    assert metadata is not None
+    column = metadata.row_group(0).column(0)
+    assert column.has_dictionary_page is True
+    _replace_generated_dictionary_num_values(
+        payload,
+        page_offset=_first_parquet_page_offset(column),
+        original=1,
+        replacement=63,
+    )
+    limits = CaptureLimits(maximum_decoded_bytes=4096, maximum_record_bytes=1024)
+    monkeypatch.setattr(
+        capture_module.pq.ParquetFile,
+        "iter_batches",
+        lambda *_args, **_kwargs: pytest.fail("raw page validation must run before batches"),
+    )
+
+    with pytest.raises(CaptureError, match="decoded-byte"):
+        list(iter_records(_capture(bytes(payload), stream, limits=limits), stream, limits=limits))
+
+
+def test_parquet_page_header_rejects_oversized_and_malformed_compact_values():
+    """The bounded raw-header reader rejects oversized and unterminated Compact values."""
+
+    oversized_binary = b"x" * (64 * 1024)
+    oversized_header = (
+        b"\x15\x00\x15\x00\x15\x00\x2c"
+        b"\x15\x00\x15\x00\x15\x06\x15\x06\x00"
+        b"\x48" + _compact_unsigned(len(oversized_binary)) + oversized_binary + b"\x00"
+    )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_parquet_page_header(
+            oversized_header,
+            0,
+            len(oversized_header),
+            64 * 1024,
+        )
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_parquet_page_header(b"\x15\x80\x80\x80\x80\x80", 0, 6, 64)
+
+
+def test_parquet_page_header_bounds_unknown_compact_collections_and_dictionary_encoding():
+    """Unknown Compact collections stay bounded, and dictionary pages retain PLAIN values only."""
+
+    data_page_prefix = b"\x15\x00\x15\x00\x15\x00\x2c\x15\x00\x15\x00\x15\x06\x15\x06\x00"
+    collection_header = data_page_prefix + b"\x49\x21\x01\x02\x00"
+    header = parquet_pages._read_parquet_page_header(collection_header, 0, len(collection_header), 64)
+    assert header.page_type == 0
+
+    nested_collections = data_page_prefix + b"\x49" + b"\x19" * 16 + b"\x13\x00\x00"
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_parquet_page_header(nested_collections, 0, len(nested_collections), 64)
+
+    legacy_dictionary_header = b"\x15\x04\x15\x00\x15\x00\x4c\x15\x00\x15\x04\x00\x00"
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_parquet_page_header(
+            legacy_dictionary_header,
+            0,
+            len(legacy_dictionary_header),
+            64,
+        )
+
+    bit_packed_level_header = b"\x15\x00\x15\x00\x15\x00\x2c\x15\x00\x15\x00\x15\x08\x15\x06\x00\x00"
+    with pytest.raises(parquet_pages.ParquetPageError, match="invalid page header"):
+        parquet_pages._read_parquet_page_header(
+            bit_packed_level_header,
+            0,
+            len(bit_packed_level_header),
+            64,
+        )
+
+
+def test_parquet_page_layout_rejects_overlapping_offsets_and_inconsistent_counts():
+    """Raw chunk intervals and page counts must agree with the generated footer metadata."""
+
+    parquet_bytes = _parquet_payload(
+        {"first": ["one", "two"], "second": ["three", "four"]},
+        use_dictionary=False,
+    )
+    parquet_file = pq.ParquetFile(BytesIO(parquet_bytes))
+    metadata = parquet_file.metadata
+    assert metadata is not None
+    schema = parquet_file.schema_arrow
+    first = metadata.row_group(0).column(0)
+    second = metadata.row_group(0).column(1)
+
+    overlapping = _metadata_with_column_overrides(
+        metadata,
+        {(0, 1, "data_page_offset"): _first_parquet_page_offset(first)},
+    )
+    with pytest.raises(parquet_pages.ParquetPageError, match="overlapping"):
+        parquet_pages.validate_page_layout(
+            parquet_bytes,
+            overlapping,
+            schema,
+            maximum_decoded_bytes=CaptureLimits().maximum_decoded_bytes,
+        )
+
+    shifted = _metadata_with_column_overrides(
+        metadata,
+        {(0, 0, "data_page_offset"): first.data_page_offset + 1},
+    )
+    with pytest.raises(parquet_pages.ParquetPageError, match="page"):
+        parquet_pages.validate_page_layout(
+            parquet_bytes,
+            shifted,
+            schema,
+            maximum_decoded_bytes=CaptureLimits().maximum_decoded_bytes,
+        )
+
+    inconsistent_count = _metadata_with_column_overrides(
+        metadata,
+        {(0, 1, "num_values"): second.num_values + 1},
+    )
+    with pytest.raises(parquet_pages.ParquetPageError, match="inconsistent row metadata"):
+        parquet_pages.validate_page_layout(
+            parquet_bytes,
+            inconsistent_count,
+            schema,
+            maximum_decoded_bytes=CaptureLimits().maximum_decoded_bytes,
+        )
+
+
+@pytest.mark.parametrize(
+    ("use_dictionary", "data_page_version"),
+    (
+        pytest.param(False, "1.0", id="plain-v1"),
+        pytest.param(True, "1.0", id="dictionary-v1"),
+        pytest.param(False, "2.0", id="plain-v2"),
+        pytest.param(True, "2.0", id="dictionary-v2"),
+    ),
+)
+def test_parquet_page_preflight_accepts_default_scalar_layouts_across_row_groups(
+    use_dictionary,
+    data_page_version,
+):
+    """Default PyArrow scalar pages remain readable across V1, V2, and row-group boundaries."""
+
+    stream = _stream(format_name="parquet")
+    scalar_table = pa.table(
+        {
+            "source_value": [f"value-{index}" for index in range(8)],
+            "count": list(range(8)),
+            "active": [index % 2 == 0 for index in range(8)],
+            "amount": pa.array([Decimal("12.50")] * 8, type=pa.decimal128(10, 2)),
+        }
+    )
+    parquet_bytes = _write_parquet_table(
+        scalar_table,
+        row_group_size=2,
+        use_dictionary=use_dictionary,
+        data_page_version=data_page_version,
+        data_page_size=128,
+        write_page_index=True,
+    )
+    decoded_records = list(iter_records(_capture(parquet_bytes, stream), stream))
+
+    assert len(decoded_records) == 8
+    assert decoded_records[0].values == {
+        "source_value": "value-0",
+        "count": 0,
+        "active": True,
+        "amount": Decimal("12.50"),
+    }
+    assert decoded_records[-1].values["source_value"] == "value-7"
+
+
+def test_parquet_page_preflight_accepts_zero_entry_dictionary_and_empty_row_group():
+    """All-null dictionary pages and an empty row group retain normal streaming semantics."""
+
+    stream = _stream(format_name="parquet")
+    all_null_payload = _write_parquet_table(
+        pa.table({"source_value": pa.array([None, None, None], type=pa.string())}),
+    )
+    all_null_metadata = pq.ParquetFile(BytesIO(all_null_payload)).metadata
+    assert all_null_metadata is not None
+    assert all_null_metadata.row_group(0).column(0).has_dictionary_page is True
+    assert [record.values["source_value"] for record in iter_records(_capture(all_null_payload, stream), stream)] == [
+        None,
+        None,
+        None,
+    ]
+
+    empty_payload = _write_parquet_table(pa.table({"source_value": pa.array([], type=pa.string())}))
+    assert list(iter_records(_capture(empty_payload, stream), stream)) == []
+
+
+def test_parquet_page_preflight_accepts_multiple_plain_data_pages():
+    """The raw page walk accepts more than one plain page in a single row group."""
+
+    stream = _stream(format_name="parquet")
+    payload = _parquet_payload(
+        {"source_value": [f"value-{index:08d}" for index in range(2_000)]},
+        use_dictionary=False,
+        data_page_size=64,
+    )
+    metadata = pq.ParquetFile(BytesIO(payload)).metadata
+    assert metadata is not None
+    column = metadata.row_group(0).column(0)
+    position = column.data_page_offset
+    end = position + column.total_compressed_size
+    page_count = 0
+    while position < end:
+        header = parquet_pages._read_parquet_page_header(payload, position, end, 64 * 1024)
+        position += header.header_size + header.compressed_page_size
+        page_count += 1
+    assert page_count > 1
+
+    records = list(iter_records(_capture(payload, stream), stream))
+    assert len(records) == 2_000
+    assert records[-1].values["source_value"] == "value-00001999"
 
 
 @pytest.mark.parametrize(
@@ -898,115 +1380,29 @@ def test_parquet_outer_gzip_materialization_rechecks_its_sealed_metrics():
 
 
 def test_parquet_metadata_preflight_rejects_external_references_and_excess_groups():
-    """Metadata cannot turn a sealed single-file capture into a multi-file read."""
-
-    from process.custom_import import capture
-
-    class Column:
-        """Minimal metadata column with an impermissible external reference."""
-
-        file_path = "another-file.parquet"
-        has_dictionary_page = False
-        num_values = 1
-        total_uncompressed_size = 1
-
-    class RowGroup:
-        """Minimal flat row group used to exercise metadata preflight."""
-
-        num_rows = 1
-        num_columns = 1
-
-        @staticmethod
-        def column(_index: int) -> Column:
-            return Column()
-
-    class ExternalMetadata:
-        """One-row metadata object pointing outside the sealed capture."""
-
-        num_rows = 1
-        num_row_groups = 1
-        num_columns = 1
-
-        @staticmethod
-        def row_group(_index: int) -> RowGroup:
-            return RowGroup()
-
-    class ExcessGroupMetadata:
-        """Metadata that must fail before it tries to materialize any row group."""
-
-        num_rows = 0
-        num_row_groups = 4_097
-        num_columns = 1
-
-        @staticmethod
-        def row_group(_index: int) -> None:
-            raise AssertionError("row groups must not be inspected after the fanout limit")
-
-    class ValidColumn(Column):
-        """Minimal internal column used to assert metadata result facts."""
-
-        file_path = None
-
-    class ValidRowGroup(RowGroup):
-        """One valid row group using a non-dictionary column chunk."""
-
-        @staticmethod
-        def column(_index: int) -> ValidColumn:
-            return ValidColumn()
-
-    class DictionaryColumn(ValidColumn):
-        """A valid metadata chunk that exposes an actual dictionary page."""
-
-        has_dictionary_page = True
-
-    class DictionaryRowGroup(ValidRowGroup):
-        """One valid row group using a dictionary page."""
-
-        @staticmethod
-        def column(_index: int) -> DictionaryColumn:
-            return DictionaryColumn()
-
-    class ValidMetadata:
-        """One-row metadata object with the default non-dictionary result."""
-
-        num_rows = 1
-        num_row_groups = 1
-        num_columns = 1
-
-        @staticmethod
-        def row_group(_index: int) -> ValidRowGroup:
-            return ValidRowGroup()
-
-    class DictionaryMetadata(ValidMetadata):
-        """One-row metadata object that reports a dictionary page."""
-
-        @staticmethod
-        def row_group(_index: int) -> DictionaryRowGroup:
-            return DictionaryRowGroup()
+    """Metadata must remain bounded and point only inside the sealed source file."""
 
     limits = CaptureLimits()
     with pytest.raises(CaptureError, match="external file"):
-        capture._validated_parquet_metadata(
-            ExternalMetadata(),
+        capture_module._validated_parquet_metadata(
+            _ParquetMetadataFixture("another-file.parquet"),
             expected_columns=1,
             limits=limits,
         )
     with pytest.raises(CaptureError, match="row-group limit"):
-        capture._validated_parquet_metadata(
-            ExcessGroupMetadata(),
+        capture_module._validated_parquet_metadata(
+            _ExcessParquetGroupMetadata(),
             expected_columns=1,
             limits=limits,
         )
-    assert capture._validated_parquet_metadata(
-        ValidMetadata(),
-        expected_columns=1,
-        limits=limits,
-    ) == (1, False)
-    assert capture._validated_parquet_metadata(
-        DictionaryMetadata(),
-        expected_columns=1,
-        limits=limits,
-    ) == (1, True)
+    assert (
+        capture_module._validated_parquet_metadata(
+            _ParquetMetadataFixture(None),
+            expected_columns=1,
+            limits=limits,
+        )
+        == 1
+    )
 
 
 def test_parquet_decoder_enforces_record_and_logical_byte_limits():

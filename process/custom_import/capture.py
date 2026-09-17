@@ -31,6 +31,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
+from process.custom_import.parquet_pages import (
+    ParquetPageError,
+    parquet_footer_start,
+    validate_page_layout,
+)
 
 _DEFAULT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_SNAPSHOT_TOKEN_BYTES = 1024
@@ -38,7 +43,12 @@ _MAX_SOURCE_LABEL_BYTES = 255
 _MAX_PARQUET_FOOTER_BYTES = 1024 * 1024
 _MAX_PARQUET_ROW_GROUPS = 4_096
 _MAX_PARQUET_THRIFT_CONTAINER_ITEMS = 64 * 1024
-_PARQUET_BATCH_ROWS = 256
+# Parquet's page-level declared size does not bound its logical output: a
+# dictionary, delta, or future compact encoding can expand one page across
+# many Arrow rows.  Keep each native output batch to one record until the
+# reader exposes a pre-materialization decoded-output bound.  This trades
+# Parquet batch throughput for a concrete per-record native output ceiling.
+_PARQUET_BATCH_ROWS = 1
 _XML_UNFINISHED_TOKEN_FLOOR = 4 * 1024
 _XML_UNFINISHED_TOKEN_CEILING = 64 * 1024
 _XML_NAMESPACE_SEPARATOR = "\x1f"
@@ -781,18 +791,24 @@ def _iter_parquet_records(
     )
     _validate_parquet_envelope(decoded_payload)
     with _open_parquet_reader(decoded_payload, limits) as parquet_reader:
-        source_labels = _validated_parquet_schema(parquet_reader.schema_arrow, limits)
-        expected_record_count, dictionary_encoded = _validated_parquet_metadata(
+        schema = parquet_reader.schema_arrow
+        source_labels = _validated_parquet_schema(schema, limits)
+        expected_record_count = _validated_parquet_metadata(
             parquet_reader.metadata,
             expected_columns=len(source_labels),
             limits=limits,
+        )
+        _validate_parquet_page_preflight(
+            decoded_payload,
+            parquet_reader.metadata,
+            schema,
+            maximum_decoded_bytes=limits.maximum_decoded_bytes,
         )
         yield from _iter_parquet_batch_records(
             parquet_reader,
             source_labels,
             expected_record_count,
             limits,
-            batch_rows=_parquet_batch_rows(limits, dictionary_encoded=dictionary_encoded),
         )
 
 
@@ -834,15 +850,13 @@ def _iter_parquet_batch_records(
     source_labels: tuple[str, ...],
     expected_record_count: int,
     limits: CaptureLimits,
-    *,
-    batch_rows: int,
 ) -> Iterator[DecodedRecord]:
     """Validate bounded record batches before exposing capture scalar mappings."""
 
     emitted_record_count = 0
     logical_batch_bytes = 0
     for record_batch in parquet_reader.iter_batches(
-        batch_size=batch_rows,
+        batch_size=min(_PARQUET_BATCH_ROWS, limits.maximum_records),
         use_threads=False,
         use_pandas_metadata=False,
     ):
@@ -906,11 +920,30 @@ def _bounded_parquet_payload(
 def _validate_parquet_envelope(payload: bytes | memoryview) -> None:
     """Reject malformed or oversized Parquet footers before native metadata parsing."""
 
-    if len(payload) < 12 or payload[:4] != b"PAR1" or payload[-4:] != b"PAR1":
-        raise CaptureError("Parquet source payload has an invalid envelope")
-    footer_bytes = int.from_bytes(payload[-8:-4], byteorder="little")
-    if footer_bytes == 0 or footer_bytes > _MAX_PARQUET_FOOTER_BYTES or footer_bytes > len(payload) - 8:
-        raise CaptureError("Parquet source payload has an invalid footer")
+    try:
+        parquet_footer_start(payload)
+    except ParquetPageError as exc:
+        raise CaptureError(str(exc)) from exc
+
+
+def _validate_parquet_page_preflight(
+    payload: bytes | memoryview,
+    metadata: pq.FileMetaData | None,
+    schema: pa.Schema,
+    *,
+    maximum_decoded_bytes: int,
+) -> None:
+    """Translate raw-page preflight failures into the capture error boundary."""
+
+    try:
+        validate_page_layout(
+            payload,
+            metadata,
+            schema,
+            maximum_decoded_bytes=maximum_decoded_bytes,
+        )
+    except ParquetPageError as exc:
+        raise CaptureError(str(exc)) from exc
 
 
 def _validated_parquet_schema(
@@ -949,7 +982,7 @@ def _validated_parquet_metadata(
     *,
     expected_columns: int,
     limits: CaptureLimits,
-) -> tuple[int, bool]:
+) -> int:
     """Bound metadata-controlled allocation before iterating Parquet data pages."""
 
     if metadata is None:
@@ -966,7 +999,6 @@ def _validated_parquet_metadata(
 
     row_group_records = 0
     declared_uncompressed_bytes = 0
-    dictionary_encoded = False
     for row_group_index in range(row_group_count):
         row_group = metadata.row_group(row_group_index)
         group_record_count = _nonnegative_parquet_integer(row_group.num_rows)
@@ -982,36 +1014,12 @@ def _validated_parquet_metadata(
                 raise CaptureError("Parquet source payload cannot reference an external file")
             if _nonnegative_parquet_integer(column.num_values) != group_record_count:
                 raise CaptureError("Parquet source payload has inconsistent row metadata")
-            dictionary_encoded = _parquet_column_uses_dictionary(column) or dictionary_encoded
             declared_uncompressed_bytes += _nonnegative_parquet_integer(column.total_uncompressed_size)
             if declared_uncompressed_bytes > limits.maximum_decoded_bytes:
                 raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
     if row_group_records != record_count:
         raise CaptureError("Parquet source payload has inconsistent row metadata")
-    return record_count, dictionary_encoded
-
-
-def _parquet_column_uses_dictionary(column: pq.ColumnChunkMetaData) -> bool:
-    """Return whether a chunk can expand one dictionary value across many output rows."""
-
-    has_dictionary_page = getattr(column, "has_dictionary_page", None)
-    if not isinstance(has_dictionary_page, bool):
-        raise CaptureError("Parquet source payload has invalid metadata")
-    return has_dictionary_page
-
-
-def _parquet_batch_rows(limits: CaptureLimits, *, dictionary_encoded: bool) -> int:
-    """Choose an Arrow batch width that does not multiply dictionary output allocation."""
-
-    if dictionary_encoded:
-        # Column-chunk uncompressed bytes include a dictionary once, but Arrow
-        # expands that value for every selected row.  The metadata preflight
-        # cannot bound a mult-row decoded output batch, including its native
-        # fixed-width and offset buffers.  One row retains normal streaming
-        # semantics while avoiding that unbounded multiplier before the
-        # post-materialization ``nbytes`` and record checks below.
-        return 1
-    return min(_PARQUET_BATCH_ROWS, limits.maximum_records)
+    return record_count
 
 
 def _nonnegative_parquet_integer(value: object) -> int:
