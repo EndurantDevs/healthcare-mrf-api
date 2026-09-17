@@ -6667,6 +6667,12 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "taxonomy_plans_network",
             "where": "type='primary'",
         },
+        {
+            "index_elements": ("plans_network_array gin__int_ops",),
+            "using": "gin",
+            "name": "service_plans_network_array",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+        },
         # Composite ZIP+taxonomy lookup (requires the btree_gin extension) for
         # group-plan specialty enumeration: both the zip5 fallback expression
         # and the taxonomy overlap resolve inside ONE Index Cond, so a

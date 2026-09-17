@@ -3105,6 +3105,7 @@ def _assert_serving_stage_indexes(statements, index_context_map) -> None:
         "idx_service_phone_number_npi",
         "idx_service_address_key_npi",
         "idx_service_premise_key_npi",
+        "idx_service_plans_network_array",
         "idx_address_sources",
     ):
         assert index_name in joined
@@ -3235,6 +3236,12 @@ class _EntityAddressServingStage:
             "name": "ptg_plan_array",
         },
         {
+            "index_elements": ("plans_network_array gin__int_ops",),
+            "using": "gin",
+            "name": "service_plans_network_array",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+        },
+        {
             "index_elements": ("procedures_array gin__int_ops",),
             "using": "gin",
             "name": "procedures_array",
@@ -3290,6 +3297,14 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
         and "idx_geo_taxonomy" in statement
     )
     assert "taxonomy_array public.gist__intbig_ops" in geo_taxonomy_ddl
+    service_network_ddl = next(
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("CREATE INDEX")
+        and "idx_service_plans_network_array" in statement
+    )
+    assert "USING gin (plans_network_array gin__int_ops)" in service_network_ddl
+    assert "type IN ('primary', 'secondary', 'practice', 'site')" in service_network_ddl
 
 
 @pytest.mark.asyncio
@@ -3903,6 +3918,12 @@ def _assert_unified_address_index_contract(index_by_name):
         "where": "type='primary'",
     }
     assert index_by_name["taxonomy_plans_network"]["where"] == "type='primary'"
+    assert index_by_name["service_plans_network_array"] == {
+        "index_elements": ("plans_network_array gin__int_ops",),
+        "using": "gin",
+        "name": "service_plans_network_array",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+    }
     assert index_by_name["procedures_array"]["where"] == "type='primary'"
     assert index_by_name["medications_array"]["where"] == "type='primary'"
     assert index_by_name["geo_idx"]["where"] == (
