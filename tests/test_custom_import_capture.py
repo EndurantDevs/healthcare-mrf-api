@@ -1023,7 +1023,7 @@ def test_parquet_delta_byte_array_rejects_before_native_batches(monkeypatch):
     assert "DELTA_BYTE_ARRAY" in column.encodings
 
     limits = CaptureLimits(
-        maximum_decoded_bytes=32 * 1024,
+        maximum_decoded_bytes=128 * 1024,
         maximum_record_bytes=20 * 1024,
         maximum_records=256,
     )
@@ -1047,7 +1047,7 @@ def test_parquet_page_header_total_mismatch_rejects_before_native_batches(monkey
     metadata = pq.ParquetFile(BytesIO(payload)).metadata
     assert metadata is not None
     column = metadata.row_group(0).column(0)
-    assert column.total_uncompressed_size < 32 * 1024
+    assert column.total_uncompressed_size < 128 * 1024
     _replace_generated_page_i32(
         payload,
         page_offset=_first_parquet_page_offset(column),
@@ -1055,7 +1055,7 @@ def test_parquet_page_header_total_mismatch_rejects_before_native_batches(monkey
         replacement=20_000,
     )
     limits = CaptureLimits(
-        maximum_decoded_bytes=32 * 1024,
+        maximum_decoded_bytes=128 * 1024,
         maximum_record_bytes=20 * 1024,
         maximum_records=256,
     )
@@ -1073,7 +1073,7 @@ def test_parquet_dictionary_entry_count_is_budgeted_before_native_batches(monkey
     """A dictionary entry count contributes to the preflight working estimate before batches."""
 
     stream = _stream(format_name="parquet")
-    payload = bytearray(_parquet_payload({"source_value": ["entry"]}))
+    payload = bytearray(_parquet_payload({"source_value": [f"entry-{index:03d}" for index in range(100)]}))
     metadata = pq.ParquetFile(BytesIO(payload)).metadata
     assert metadata is not None
     column = metadata.row_group(0).column(0)
@@ -1081,10 +1081,10 @@ def test_parquet_dictionary_entry_count_is_budgeted_before_native_batches(monkey
     _replace_generated_dictionary_num_values(
         payload,
         page_offset=_first_parquet_page_offset(column),
-        original=1,
-        replacement=63,
+        original=100,
+        replacement=8_191,
     )
-    limits = CaptureLimits(maximum_decoded_bytes=4096, maximum_record_bytes=1024)
+    limits = CaptureLimits(maximum_decoded_bytes=128 * 1024, maximum_record_bytes=1024)
     monkeypatch.setattr(
         capture_module.pq.ParquetFile,
         "iter_batches",
@@ -1410,7 +1410,7 @@ def test_parquet_decoder_enforces_record_and_logical_byte_limits():
 
     stream = _stream(format_name="parquet")
     record_payload = _parquet_payload({"source_value": ["x" * 64]})
-    record_limits = CaptureLimits(maximum_record_bytes=32, maximum_decoded_bytes=4096)
+    record_limits = CaptureLimits(maximum_record_bytes=32, maximum_decoded_bytes=128 * 1024)
     with pytest.raises(CaptureError, match="record 1 exceeds"):
         list(
             iter_records(
@@ -1421,10 +1421,9 @@ def test_parquet_decoder_enforces_record_and_logical_byte_limits():
         )
 
     logical_payload = _parquet_payload(
-        {"source_value": ["x" * 500 for _ in range(16)]},
-        use_dictionary=False,
+        {"source_value": ["x" * 500 for _ in range(300)]},
     )
-    logical_limits = CaptureLimits(maximum_record_bytes=1024, maximum_decoded_bytes=2048)
+    logical_limits = CaptureLimits(maximum_record_bytes=1024, maximum_decoded_bytes=128 * 1024)
     with pytest.raises(CaptureError, match="decoded-byte"):
         list(
             iter_records(

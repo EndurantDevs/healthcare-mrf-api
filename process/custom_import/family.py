@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any
 
+from process.custom_import._source_text import _SourceTextValidationError, validate_snapshot_token
 from process.custom_import.definition import (
     ChildCollection,
     CustomImportDefinition,
@@ -71,16 +72,31 @@ def validate_source_snapshot_tokens(
     for stream_id, observed in stream_tokens.items():
         if not isinstance(observed, (list, tuple)) or not observed:
             raise SourceSnapshotError(f"stream {stream_id} has no bounded token observations")
-        if any(not isinstance(token, str) for token in observed):
-            raise SourceSnapshotError(f"stream {stream_id} has a non-string snapshot token")
-        stream_values = set(observed)
-        if None in stream_values or "" in stream_values or len(stream_values) != 1:
+        stream_values = {_validated_source_snapshot_token(stream_id, token) for token in observed}
+        if len(stream_values) != 1:
             raise SourceSnapshotError(f"stream {stream_id} lacks one snapshot token")
         token = next(iter(stream_values))
         shared_tokens.add(token)
     if len(shared_tokens) != 1:
         raise SourceSnapshotError("source streams do not share one snapshot token")
     return next(iter(shared_tokens))
+
+
+def _validated_source_snapshot_token(stream_id: str, value: Any) -> str:
+    """Map the shared retained-token contract to family-admission diagnostics."""
+
+    try:
+        return validate_snapshot_token(value)
+    except _SourceTextValidationError as exc:
+        message_by_reason = {
+            "not_string": "has a non-string snapshot token",
+            "empty": "lacks one snapshot token",
+            "invalid_utf8": "snapshot token must be valid UTF-8",
+            "byte_limit": "snapshot token exceeds the byte limit",
+            "non_printable": "snapshot token contains control characters or non-printable text",
+        }
+        message = f"stream {stream_id} {message_by_reason[exc.reason]}"
+        raise SourceSnapshotError(message) from exc
 
 
 def assemble_root_families(
