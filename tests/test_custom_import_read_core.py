@@ -8,13 +8,13 @@ import pytest
 
 from process.custom_import import read_core
 from process.custom_import.read_core import (
+    MAX_PAGE_OFFSET,
+    MAX_READ_TIMEOUT_MS,
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
     CustomImportReadRequestError,
     CustomImportReadService,
     ExtensionReadAuthorization,
-    MAX_PAGE_OFFSET,
-    MAX_READ_TIMEOUT_MS,
     PinnedReadTarget,
     ReadCursorCodec,
     ReadCursorState,
