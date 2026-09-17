@@ -55,7 +55,10 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
-from process.custom_import.publication import _capture_source_bundle_digest, seal_generation
+from process.custom_import.publication import (
+    _capture_source_bundle_digest,
+    seal_generation,
+)
 
 POSTGRES_DSN_ENV = "HLTHPRT_CUSTOM_IMPORT_POSTGRES_DSN"
 _TEST_DATABASE = re.compile(r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))", re.IGNORECASE)
