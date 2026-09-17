@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -749,3 +750,60 @@ async def test_queued_cancellation_expires_only_an_existing_lease_authority():
         )
     ).state == "canceled"
     assert lease.expires_at == with_authority.now
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_guards_handle_unbacked_transactions_and_disappearing_rows(monkeypatch):
+    transaction = object()
+    unbacked_session = SimpleNamespace(
+        get_transaction=lambda: transaction,
+        info={},
+    )
+    await lifecycle._mark_lifecycle_transaction(unbacked_session)
+    marker = unbacked_session.info[lifecycle._LIFECYCLE_TRANSACTION_MARKER]
+    assert marker.session_transaction is transaction
+    assert marker.root_transaction is None
+
+    clean_session = SimpleNamespace(
+        get_transaction=lambda: object(),
+        info={},
+    )
+    await lifecycle.require_separate_publication_transaction(clean_session)
+    assert clean_session.info == {}
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_execution_snapshot",
+        AsyncMock(return_value=SimpleNamespace(dataset_id=11)),
+    )
+    monkeypatch.setattr(lifecycle, "_lock_dataset", AsyncMock())
+    monkeypatch.setattr(lifecycle, "_lock_execution", AsyncMock(return_value=None))
+    with pytest.raises(lifecycle.ExecutionNotFound, match="404"):
+        await lifecycle._locked_lifecycle_execution(SimpleNamespace(), 404)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_storage_fails_when_required_rows_disappear(monkeypatch):
+    class _SequencedSession:
+        def __init__(self):
+            self.results = iter((_Result(), _Result(), _Result()))
+
+        async def execute(self, _statement):
+            return next(self.results)
+
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="lease could not be created"):
+        await lifecycle._lock_lease(_SequencedSession(), 7)
+
+    session = _SyntheticSession()
+    monkeypatch.setattr(lifecycle, "_lock_dataset", AsyncMock())
+    monkeypatch.setattr(lifecycle, "_insert_execution", AsyncMock(return_value=101))
+    monkeypatch.setattr(lifecycle, "_locked_submission_execution", AsyncMock(return_value=None))
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="row disappeared"):
+        await lifecycle.create_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="disappearing-row",
+            mechanism="queued",
+        )
