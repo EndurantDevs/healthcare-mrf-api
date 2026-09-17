@@ -14,12 +14,8 @@ def provider_service_code_coverage(
     """Explain CMS aggregate-versus-detail service-code coverage."""
 
     try:
-        source_count_value = (
-            None
-            if source_distinct_code_count is None
-            else float(source_distinct_code_count)
-        )
-    except (TypeError, ValueError):
+        source_count_value = None if source_distinct_code_count is None else float(source_distinct_code_count)
+    except TypeError, ValueError:
         source_count_value = None
     published_count = max(int(published_detail_code_count), 0)
     if source_count_value is None:
