@@ -782,7 +782,7 @@ def _iter_parquet_records(
     _validate_parquet_envelope(decoded_payload)
     with _open_parquet_reader(decoded_payload, limits) as parquet_reader:
         source_labels = _validated_parquet_schema(parquet_reader.schema_arrow, limits)
-        expected_record_count = _validated_parquet_metadata(
+        expected_record_count, dictionary_encoded = _validated_parquet_metadata(
             parquet_reader.metadata,
             expected_columns=len(source_labels),
             limits=limits,
@@ -792,6 +792,7 @@ def _iter_parquet_records(
             source_labels,
             expected_record_count,
             limits,
+            batch_rows=_parquet_batch_rows(limits, dictionary_encoded=dictionary_encoded),
         )
 
 
@@ -833,13 +834,15 @@ def _iter_parquet_batch_records(
     source_labels: tuple[str, ...],
     expected_record_count: int,
     limits: CaptureLimits,
+    *,
+    batch_rows: int,
 ) -> Iterator[DecodedRecord]:
     """Validate bounded record batches before exposing capture scalar mappings."""
 
     emitted_record_count = 0
     logical_batch_bytes = 0
     for record_batch in parquet_reader.iter_batches(
-        batch_size=min(_PARQUET_BATCH_ROWS, limits.maximum_records),
+        batch_size=batch_rows,
         use_threads=False,
         use_pandas_metadata=False,
     ):
@@ -946,7 +949,7 @@ def _validated_parquet_metadata(
     *,
     expected_columns: int,
     limits: CaptureLimits,
-) -> int:
+) -> tuple[int, bool]:
     """Bound metadata-controlled allocation before iterating Parquet data pages."""
 
     if metadata is None:
@@ -963,6 +966,7 @@ def _validated_parquet_metadata(
 
     row_group_records = 0
     declared_uncompressed_bytes = 0
+    dictionary_encoded = False
     for row_group_index in range(row_group_count):
         row_group = metadata.row_group(row_group_index)
         group_record_count = _nonnegative_parquet_integer(row_group.num_rows)
@@ -978,12 +982,36 @@ def _validated_parquet_metadata(
                 raise CaptureError("Parquet source payload cannot reference an external file")
             if _nonnegative_parquet_integer(column.num_values) != group_record_count:
                 raise CaptureError("Parquet source payload has inconsistent row metadata")
+            dictionary_encoded = _parquet_column_uses_dictionary(column) or dictionary_encoded
             declared_uncompressed_bytes += _nonnegative_parquet_integer(column.total_uncompressed_size)
             if declared_uncompressed_bytes > limits.maximum_decoded_bytes:
                 raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
     if row_group_records != record_count:
         raise CaptureError("Parquet source payload has inconsistent row metadata")
-    return record_count
+    return record_count, dictionary_encoded
+
+
+def _parquet_column_uses_dictionary(column: pq.ColumnChunkMetaData) -> bool:
+    """Return whether a chunk can expand one dictionary value across many output rows."""
+
+    has_dictionary_page = getattr(column, "has_dictionary_page", None)
+    if not isinstance(has_dictionary_page, bool):
+        raise CaptureError("Parquet source payload has invalid metadata")
+    return has_dictionary_page
+
+
+def _parquet_batch_rows(limits: CaptureLimits, *, dictionary_encoded: bool) -> int:
+    """Choose an Arrow batch width that does not multiply dictionary output allocation."""
+
+    if dictionary_encoded:
+        # Column-chunk uncompressed bytes include a dictionary once, but Arrow
+        # expands that value for every selected row.  The metadata preflight
+        # cannot bound a mult-row decoded output batch, including its native
+        # fixed-width and offset buffers.  One row retains normal streaming
+        # semantics while avoiding that unbounded multiplier before the
+        # post-materialization ``nbytes`` and record checks below.
+        return 1
+    return min(_PARQUET_BATCH_ROWS, limits.maximum_records)
 
 
 def _nonnegative_parquet_integer(value: object) -> int:

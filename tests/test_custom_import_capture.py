@@ -756,6 +756,55 @@ def test_parquet_decoder_streams_flat_scalar_rows_across_batches_and_row_groups(
     assert records[-1].values["Active"] is True
 
 
+def test_parquet_dictionary_batches_do_not_expand_past_limits_before_rejection(monkeypatch):
+    """Dictionary output is read one row at a time before logical limits reject it."""
+
+    stream = _stream(format_name="parquet")
+    payload = _parquet_payload({"source_value": ["x" * 16_384] * 256}, use_dictionary=True)
+    metadata = pq.ParquetFile(BytesIO(payload)).metadata
+    assert metadata is not None
+    column = metadata.row_group(0).column(0)
+    assert column.has_dictionary_page is True
+
+    restrictive_limits = CaptureLimits(
+        maximum_decoded_bytes=32 * 1024,
+        maximum_record_bytes=20 * 1024,
+        maximum_records=256,
+    )
+    assert column.total_uncompressed_size < restrictive_limits.maximum_decoded_bytes
+
+    requested_batch_sizes: list[int] = []
+    materialized_batches: list[tuple[int, int]] = []
+    original_iter_batches = capture_module.pq.ParquetFile.iter_batches
+
+    def observing_iter_batches(parquet_file, *args, **kwargs):
+        requested_batch_sizes.append(kwargs["batch_size"])
+        for record_batch in original_iter_batches(parquet_file, *args, **kwargs):
+            materialized_batches.append((record_batch.num_rows, record_batch.nbytes))
+            yield record_batch
+
+    monkeypatch.setattr(capture_module.pq.ParquetFile, "iter_batches", observing_iter_batches)
+
+    permissive_limits = CaptureLimits(
+        maximum_decoded_bytes=4 * 1024 * 1024 + 128 * 1024,
+        maximum_record_bytes=20 * 1024,
+        maximum_records=256,
+    )
+    records = list(iter_records(_capture(payload, stream, limits=permissive_limits), stream, limits=permissive_limits))
+    assert len(records) == 256
+
+    with pytest.raises(CaptureError, match="decoded-byte"):
+        list(iter_records(_capture(payload, stream, limits=restrictive_limits), stream, limits=restrictive_limits))
+
+    assert requested_batch_sizes == [1, 1]
+    assert materialized_batches
+    assert all(batch_rows == 1 for batch_rows, _batch_bytes in materialized_batches)
+    assert all(
+        batch_bytes <= min(restrictive_limits.maximum_decoded_bytes, restrictive_limits.maximum_record_bytes)
+        for _batch_rows, batch_bytes in materialized_batches
+    )
+
+
 @pytest.mark.parametrize(
     "column",
     [
@@ -857,6 +906,7 @@ def test_parquet_metadata_preflight_rejects_external_references_and_excess_group
         """Minimal metadata column with an impermissible external reference."""
 
         file_path = "another-file.parquet"
+        has_dictionary_page = False
         num_values = 1
         total_uncompressed_size = 1
 
@@ -892,6 +942,48 @@ def test_parquet_metadata_preflight_rejects_external_references_and_excess_group
         def row_group(_index: int) -> None:
             raise AssertionError("row groups must not be inspected after the fanout limit")
 
+    class ValidColumn(Column):
+        """Minimal internal column used to assert metadata result facts."""
+
+        file_path = None
+
+    class ValidRowGroup(RowGroup):
+        """One valid row group using a non-dictionary column chunk."""
+
+        @staticmethod
+        def column(_index: int) -> ValidColumn:
+            return ValidColumn()
+
+    class DictionaryColumn(ValidColumn):
+        """A valid metadata chunk that exposes an actual dictionary page."""
+
+        has_dictionary_page = True
+
+    class DictionaryRowGroup(ValidRowGroup):
+        """One valid row group using a dictionary page."""
+
+        @staticmethod
+        def column(_index: int) -> DictionaryColumn:
+            return DictionaryColumn()
+
+    class ValidMetadata:
+        """One-row metadata object with the default non-dictionary result."""
+
+        num_rows = 1
+        num_row_groups = 1
+        num_columns = 1
+
+        @staticmethod
+        def row_group(_index: int) -> ValidRowGroup:
+            return ValidRowGroup()
+
+    class DictionaryMetadata(ValidMetadata):
+        """One-row metadata object that reports a dictionary page."""
+
+        @staticmethod
+        def row_group(_index: int) -> DictionaryRowGroup:
+            return DictionaryRowGroup()
+
     limits = CaptureLimits()
     with pytest.raises(CaptureError, match="external file"):
         capture._validated_parquet_metadata(
@@ -905,6 +997,16 @@ def test_parquet_metadata_preflight_rejects_external_references_and_excess_group
             expected_columns=1,
             limits=limits,
         )
+    assert capture._validated_parquet_metadata(
+        ValidMetadata(),
+        expected_columns=1,
+        limits=limits,
+    ) == (1, False)
+    assert capture._validated_parquet_metadata(
+        DictionaryMetadata(),
+        expected_columns=1,
+        limits=limits,
+    ) == (1, True)
 
 
 def test_parquet_decoder_enforces_record_and_logical_byte_limits():
