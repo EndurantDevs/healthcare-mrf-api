@@ -23,7 +23,8 @@ import inspect
 import json
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
