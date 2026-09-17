@@ -291,7 +291,7 @@ def _provider_membership_batches(
     provider_set_ids: tuple[str, ...],
     metadata_by_id: Mapping[str, Any],
 ) -> Iterable[tuple[str, ...]]:
-    """Bound simultaneous membership hydration by declared NPI count."""
+    """Bound the declared membership count for each read."""
 
     pending_ids: list[str] = []
     pending_count = 0
