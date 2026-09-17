@@ -290,6 +290,9 @@ async def _seed_identity_schema(
     session: AsyncSession,
     suffix: str,
     semantic: str,
+    *,
+    canonical_schema: str = '{"synthetic":true}',
+    schema_sha256: bytes | None = None,
 ) -> tuple[CustomImportDataset, CustomImportSchemaRevision]:
     """Create the dataset, schema revision, and fixed field definitions."""
 
@@ -299,8 +302,8 @@ async def _seed_identity_schema(
     schema = CustomImportSchemaRevision(
         dataset_id=dataset.dataset_id,
         revision_number=1,
-        canonical_schema='{"synthetic":true}',
-        schema_sha256=digest(f"schema:{semantic}"),
+        canonical_schema=canonical_schema,
+        schema_sha256=digest(f"schema:{semantic}") if schema_sha256 is None else schema_sha256,
     )
     session.add(schema)
     await session.flush()
