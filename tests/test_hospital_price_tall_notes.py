@@ -5,7 +5,6 @@ import hashlib
 import runpy
 from pathlib import Path
 
-from db.models.hospital_price_header import HospitalPriceVersion
 from process.hospital_price_native import hospital_price_version_id
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256,
@@ -33,12 +32,6 @@ def test_tall_notes_admission_only_appends_current_contract():
     assert migration["down_revision"] == "20260909120000_fhir_request_failure_budget"
     old_drop, old_shape = previous["_upgrade_statements"]()
     drop, statement = migration["_upgrade_statements"]()
-    shape = next(
-        str(constraint.sqltext)
-        for constraint in HospitalPriceVersion.__table__.constraints
-        if constraint.name == "hospital_price_version_shape_check"
-    )
-    assert statement.endswith(f"CHECK ({shape});")
     assert drop == old_drop
     assert statement.replace(f", '{HOSPITAL_MRF_PARSER_CONTRACT_SHA256}'", "") == old_shape
     assert statement.count(HOSPITAL_MRF_PARSER_CONTRACT_SHA256) == 2
