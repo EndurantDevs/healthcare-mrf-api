@@ -240,6 +240,17 @@ fn parse_tall_payer(
         columns.allowed_count,
     ];
     if columns.profile == CmsProfile::V3
+        && csv_value(record, columns.payer_name).is_empty()
+        && csv_value(record, columns.plan_name) == "#N/A"
+        && payer_columns[2..]
+            .iter()
+            .all(|column| csv_profile_value(record, *column).is_empty())
+        && csv_value(record, columns.methodology).is_empty()
+        && explicit_payer_notes.is_empty()
+    {
+        return Ok(None);
+    }
+    if columns.profile == CmsProfile::V3
         && csv_value(record, columns.payer_name) == "All Payers / All Plans"
         && csv_value(record, columns.plan_name).is_empty()
         && csv_value(record, columns.methodology).is_empty()
