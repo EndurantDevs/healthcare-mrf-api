@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -300,6 +302,204 @@ async def test_pattern_v4_graph_failure_releases_budget_without_fallback(
     broad_scope_lookup.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_pattern_v4_capacity_falls_back_after_releasing_partial_results(
+    monkeypatch,
+):
+    """Reuse the exact code-first proof only after graph claims are released."""
+
+    challenges, provider_sets_by_npi, persisted = _pattern_scope_fixture()
+    baseline_bytes = 731
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    budget.claim(baseline_bytes, category="the caller baseline")
+    graph_lookup = AsyncMock(
+        side_effect=(
+            {challenges[0].npi: provider_sets_by_npi[challenges[0].npi]},
+            PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            ),
+        )
+    )
+    expected_scope = v4_scope.V4CandidateScope(
+        provider_set_keys_by_npi={challenge.npi: (5,) for challenge in challenges},
+        price_keys_by_occurrence={(7, 5, 0): (10,)},
+    )
+    fallback_calls = []
+
+    async def code_first(
+        _session,
+        _tables,
+        observed_challenges,
+        observed_occurrences,
+        _code_index_value,
+        **kwargs,
+    ):
+        assert sys.exception() is None
+        assert budget.retained_bytes == baseline_bytes
+        assert kwargs["retention_budget"] is budget
+        assert kwargs["retention_budget"].maximum_bytes == budget.maximum_bytes
+        assert tuple(observed_challenges) == challenges
+        assert tuple(observed_occurrences) == (persisted,)
+        fallback_calls.append(True)
+        return expected_scope
+
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(43, "pattern_v1", b"m" * 32)),
+    )
+    monkeypatch.setattr(scope_dispatch, "load_v4_candidate_scope", code_first)
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    observed = await reverse_scope.load_candidate_provider_scope(
+        AsyncMock(),
+        object(),
+        _v4_serving_tables(),
+        challenges,
+        (persisted,),
+        _code_index(),
+        schema_name="candidate_schema",
+        retention_budget=budget,
+    )
+
+    assert observed == reverse_scope.CandidateProviderScope(
+        provider_set_keys_by_npi=expected_scope.provider_set_keys_by_npi,
+        price_keys_by_occurrence=expected_scope.price_keys_by_occurrence,
+    )
+    assert fallback_calls == [True]
+    assert graph_lookup.await_count == 2
+    assert budget.retained_bytes == baseline_bytes
+
+
+@pytest.mark.asyncio
+async def test_pattern_v4_capacity_fallback_rejects_unreleased_claims(monkeypatch):
+    """Fail closed instead of reusing a budget held by the failed graph path."""
+
+    challenge = _challenge()
+    baseline_bytes = 731
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    budget.claim(baseline_bytes, category="the caller baseline")
+    code_first = AsyncMock()
+
+    async def leaking_pattern_scope(*_args, **_kwargs):
+        budget.claim(1, category="a leaked graph claim")
+        raise PTG2SharedBlockError(
+            "PTG V4 graph selection exceeds max_members"
+        )
+
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(43, "pattern_v1", b"m" * 32)),
+    )
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_pattern_provider_scope",
+        leaking_pattern_scope,
+    )
+    monkeypatch.setattr(scope_dispatch, "load_v4_candidate_scope", code_first)
+
+    with pytest.raises(
+        v4_scope.CandidateAuditDecodedRetentionError,
+        match="did not restore",
+    ):
+        await reverse_scope.load_candidate_provider_scope(
+            AsyncMock(),
+            object(),
+            _v4_serving_tables(),
+            (challenge,),
+            (),
+            _code_index(),
+            retention_budget=budget,
+        )
+
+    assert budget.retained_bytes == baseline_bytes + 1
+    code_first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pattern_v4_cancellation_never_falls_back(monkeypatch):
+    """Propagate cancellation without starting a second proof strategy."""
+
+    challenge = _challenge()
+    code_first = AsyncMock()
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(43, "pattern_v1", b"m" * 32)),
+    )
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_pattern_provider_scope",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    monkeypatch.setattr(scope_dispatch, "load_v4_candidate_scope", code_first)
+
+    with pytest.raises(asyncio.CancelledError):
+        await reverse_scope.load_candidate_provider_scope(
+            AsyncMock(),
+            object(),
+            _v4_serving_tables(),
+            (challenge,),
+            (),
+            _code_index(),
+        )
+
+    code_first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pattern_v4_code_first_capacity_failure_remains_terminal(monkeypatch):
+    """Propagate a bounded code-first rejection after graph capacity is spent."""
+
+    challenge = _challenge()
+    baseline_bytes = 731
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    budget.claim(baseline_bytes, category="the caller baseline")
+    code_first = AsyncMock(
+        side_effect=v4_scope.CandidateAuditDecodedRetentionError(
+            "code-first proof exceeds the byte limit"
+        )
+    )
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(43, "pattern_v1", b"m" * 32)),
+    )
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_pattern_provider_scope",
+        AsyncMock(
+            side_effect=PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            )
+        ),
+    )
+    monkeypatch.setattr(scope_dispatch, "load_v4_candidate_scope", code_first)
+
+    with pytest.raises(
+        v4_scope.CandidateAuditDecodedRetentionError,
+        match="code-first proof exceeds",
+    ):
+        await reverse_scope.load_candidate_provider_scope(
+            AsyncMock(),
+            object(),
+            _v4_serving_tables(),
+            (challenge,),
+            (),
+            _code_index(),
+            retention_budget=budget,
+        )
+
+    assert budget.retained_bytes == baseline_bytes
+    code_first.assert_awaited_once()
+    assert code_first.await_args.kwargs["retention_budget"] is budget
+    assert (
+        code_first.await_args.kwargs["retention_budget"].maximum_bytes
+        == budget.maximum_bytes
+    )
+
+
 @pytest.mark.parametrize(
     ("maximum_bytes", "safe_detail"),
     (
@@ -398,12 +598,21 @@ def _final_parity_harness():
     )
 
 
-def _install_final_parity_v4(monkeypatch, harness):
+def _install_final_parity_v4(
+    monkeypatch,
+    harness,
+    *,
+    fail_unfiltered=False,
+):
     async def graph_lookup(_session, _tables, npis, **kwargs):
         allowed = kwargs["allowed_provider_set_keys"]
         harness.graph_filters.append(
             None if allowed is None else set(allowed)
         )
+        if allowed is None and fail_unfiltered:
+            raise PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            )
         return {npi: (5,) for npi in npis}
 
     monkeypatch.setattr(
@@ -479,11 +688,13 @@ def _install_final_parity_batch(
     )
 
 
+@pytest.mark.parametrize("pattern_capacity_fallback", (False, True))
 @pytest.mark.asyncio
-async def test_pattern_and_direct_v4_produce_identical_final_audit_result(
+async def test_pattern_and_direct_v4_produce_identical_final_result(
     monkeypatch,
+    pattern_capacity_fallback,
 ):
-    """Preserve final matches while pattern layout defers its forward read."""
+    """Preserve final matches for graph-first and exact fallback paths."""
 
     challenge = _matched_challenge()
     occurrence = _final_parity_occurrence(challenge.npi)
@@ -496,7 +707,11 @@ async def test_pattern_and_direct_v4_produce_identical_final_audit_result(
         occurrence,
         code_index,
     )
-    _install_final_parity_v4(monkeypatch, harness)
+    _install_final_parity_v4(
+        monkeypatch,
+        harness,
+        fail_unfiltered=pattern_capacity_fallback,
+    )
 
     direct_result = await candidate_batch.audit_candidate_source_witness_batch(
         _TransactionSession(),
@@ -513,7 +728,12 @@ async def test_pattern_and_direct_v4_produce_identical_final_audit_result(
     assert pattern_result.matched_challenge_count == challenge.multiplicity
     assert pattern_result.persisted_audit_occurrence_count == 1
     assert pattern_result.validated_persisted_audit_occurrence_count == 1
-    assert harness.graph_filters == [{5}, None]
-    harness.direct_forward.assert_awaited_once()
-    harness.deferred_forward.assert_awaited_once()
+    if pattern_capacity_fallback:
+        assert harness.graph_filters == [{5}, None, {5}]
+        assert harness.direct_forward.await_count == 2
+        harness.deferred_forward.assert_not_awaited()
+    else:
+        assert harness.graph_filters == [{5}, None]
+        harness.direct_forward.assert_awaited_once()
+        harness.deferred_forward.assert_awaited_once()
     assert harness.hydration.await_count == 2
