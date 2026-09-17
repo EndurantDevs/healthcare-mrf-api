@@ -13,7 +13,6 @@ import pytest
 
 from process.custom_import import execution as lifecycle
 
-
 UTC = dt.UTC
 _WORKER = "synthetic-worker"
 _WORKER_A = "synthetic-worker-a"
@@ -91,22 +90,22 @@ class _SyntheticSession:
 
     def _insert(self, statement: Any) -> _Result:
         table_name = statement.table.name
-        values = _statement_values(statement)
+        column_values = _statement_values(statement)
         if table_name == "custom_import_execution":
-            request = (values["definition_revision_id"], values["idempotency_key"])
+            request = (column_values["definition_revision_id"], column_values["idempotency_key"])
             if request in self.execution_by_request:
                 return _Result()
             execution_id = self._next_execution_id
             self._next_execution_id += 1
             execution = SimpleNamespace(
                 execution_id=execution_id,
-                dataset_id=values["dataset_id"],
-                definition_revision_id=values["definition_revision_id"],
-                schema_revision_id=values["schema_revision_id"],
-                idempotency_key=values["idempotency_key"],
-                mechanism=values["mechanism"],
-                state=values["state"],
-                capture_bundle_id=values.get("capture_bundle_id"),
+                dataset_id=column_values["dataset_id"],
+                definition_revision_id=column_values["definition_revision_id"],
+                schema_revision_id=column_values["schema_revision_id"],
+                idempotency_key=column_values["idempotency_key"],
+                mechanism=column_values["mechanism"],
+                state=column_values["state"],
+                capture_bundle_id=column_values.get("capture_bundle_id"),
                 terminal_reason=None,
                 started_at=None,
                 finished_at=None,
@@ -116,12 +115,12 @@ class _SyntheticSession:
             self.execution_by_request[request] = execution
             return _Result(execution_id)
         if table_name == "custom_import_lease":
-            execution_id = values["execution_id"]
+            execution_id = column_values["execution_id"]
             self.leases.setdefault(
                 execution_id,
                 SimpleNamespace(
                     execution_id=execution_id,
-                    fence=values.get("fence", 0),
+                    fence=column_values.get("fence", 0),
                     token_sha256=None,
                     heartbeat_at=None,
                     expires_at=None,
@@ -136,6 +135,8 @@ class _SyntheticSession:
             return _Result(self.now)
         table_name = statement.get_final_froms()[0].name
         where = _where_values(statement)
+        if table_name == "custom_import_dataset":
+            return _Result(SimpleNamespace(dataset_id=where["dataset_id"]))
         if table_name == "custom_import_execution":
             if "execution_id" in where:
                 return _Result(self.executions.get(where["execution_id"]))
@@ -367,6 +368,44 @@ async def test_cancellation_wins_over_later_completion_but_allows_canceled_termi
 
 
 @pytest.mark.asyncio
+async def test_running_cancellation_reason_survives_a_default_canceled_acknowledgement():
+    session = _SyntheticSession()
+    submission = await _submission(session)
+    grant = await lifecycle.claim_execution(
+        session,
+        execution_id=submission.execution_id,
+        token=_WORKER,
+    )
+    assert grant is not None
+
+    cancellation = await lifecycle.request_cancellation(
+        session,
+        execution_id=submission.execution_id,
+        terminal_reason="operator_request",
+    )
+    canceled = await lifecycle.finish_execution(
+        session,
+        execution_id=submission.execution_id,
+        fence=grant.fence,
+        token=_WORKER,
+        terminal_state="canceled",
+    )
+
+    assert cancellation.changed is True
+    assert canceled.changed is True
+    assert session.executions[submission.execution_id].terminal_reason == "operator_request"
+
+
+def test_lifecycle_identifiers_and_fences_reject_postgresql_bigint_overflow():
+    assert lifecycle._positive_id(lifecycle.MAX_BIGINT, "synthetic_id") == lifecycle.MAX_BIGINT
+    assert lifecycle._fence(lifecycle.MAX_BIGINT) == lifecycle.MAX_BIGINT
+    with pytest.raises(ValueError, match="positive integer"):
+        lifecycle._positive_id(lifecycle.MAX_BIGINT + 1, "synthetic_id")
+    with pytest.raises(ValueError, match="positive integer"):
+        lifecycle._fence(lifecycle.MAX_BIGINT + 1)
+
+
+@pytest.mark.asyncio
 async def test_terminal_state_is_immutable_and_expiration_keeps_the_fence_and_digest():
     session = _SyntheticSession()
     submission = await _submission(session)
@@ -458,7 +497,7 @@ async def test_lock_loaders_force_refresh_of_preloaded_identity_map_rows():
 
 
 @pytest.mark.asyncio
-async def test_claim_reads_the_database_clock_only_after_execution_and_lease_locks():
+async def test_claim_locks_dataset_execution_and_lease_before_clock():
     session = _SyntheticSession()
     submission = await _submission(session)
     statement_offset = len(session.statements)
@@ -472,12 +511,27 @@ async def test_claim_reads_the_database_clock_only_after_execution_and_lease_loc
     assert grant is not None
     statements = session.statements[statement_offset:]
     clock_index = next(index for index, statement in enumerate(statements) if "clock_timestamp" in str(statement))
-    lock_tables = [
+    selected_tables = [
         statement.get_final_froms()[0].name
         for statement in statements[:clock_index]
         if getattr(statement, "is_select", False)
     ]
-    assert lock_tables == ["custom_import_execution", "custom_import_lease"]
+    locked_tables = [
+        statement.get_final_froms()[0].name
+        for statement in statements[:clock_index]
+        if getattr(statement, "_for_update_arg", None) is not None
+    ]
+    assert selected_tables == [
+        "custom_import_execution",
+        "custom_import_dataset",
+        "custom_import_execution",
+        "custom_import_lease",
+    ]
+    assert locked_tables == [
+        "custom_import_dataset",
+        "custom_import_execution",
+        "custom_import_lease",
+    ]
 
 
 @pytest.mark.asyncio
@@ -532,7 +586,7 @@ async def test_any_lifecycle_work_marks_same_transaction_publication_as_unsafe()
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_root_marker_blocks_a_second_session_until_the_outer_transaction_changes():
+async def test_lifecycle_marker_blocks_second_session_until_outer_transaction_changes():
     connection = _SyntheticConnection()
     lifecycle_session = _SyntheticSession(connection)
     await _submission(lifecycle_session)

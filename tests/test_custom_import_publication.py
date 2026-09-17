@@ -6,25 +6,31 @@ import json
 
 import pytest
 
+from process.custom_import.execution import MAX_BIGINT
 from process.custom_import.publication import (
     PublicationConflict,
     _event_document,
+    _generation_publication_request,
+    _increment_pointer_version,
     _pointer_version,
     _positive_integer,
+    _PublicationEventDetails,
 )
 
 
 def test_publication_event_is_canonical_and_domain_separated():
     canonical_event, digest = _event_document(
-        dataset_id=1,
-        definition_revision_id=2,
-        schema_revision_id=3,
-        execution_id=4,
-        event_kind="activated",
-        from_generation_id=None,
-        to_generation_id=5,
-        expected_pointer_version=0,
-        committed_pointer_version=1,
+        _PublicationEventDetails(
+            dataset_id=1,
+            definition_revision_id=2,
+            schema_revision_id=3,
+            execution_id=4,
+            event_kind="activated",
+            from_generation_id=None,
+            to_generation_id=5,
+            expected_pointer_version=0,
+            committed_pointer_version=1,
+        )
     )
 
     assert json.loads(canonical_event) == {
@@ -58,3 +64,22 @@ def test_pointer_version_rejects_ambiguous_values(value):
 def test_pointer_version_accepts_empty_and_existing_versions():
     assert _pointer_version(0) == 0
     assert _pointer_version(7) == 7
+
+
+def test_publication_identifiers_and_pointer_increment_reject_postgresql_bigint_overflow():
+    assert _positive_integer(MAX_BIGINT, "synthetic id") == MAX_BIGINT
+    assert _pointer_version(MAX_BIGINT) == MAX_BIGINT
+    with pytest.raises(PublicationConflict, match="positive integer"):
+        _positive_integer(MAX_BIGINT + 1, "synthetic id")
+    with pytest.raises(PublicationConflict, match="non-negative integer"):
+        _pointer_version(MAX_BIGINT + 1)
+    with pytest.raises(PublicationConflict, match="cannot advance"):
+        _increment_pointer_version(MAX_BIGINT)
+    with pytest.raises(PublicationConflict, match="cannot advance"):
+        _generation_publication_request(
+            event_kind="activated",
+            dataset_id=1,
+            target_generation_id=2,
+            expected_generation_id=None,
+            expected_pointer_version=MAX_BIGINT,
+        )
