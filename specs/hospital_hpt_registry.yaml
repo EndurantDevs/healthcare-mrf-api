@@ -994,6 +994,7 @@ hospitals:
 - hospital_id: hospital-000296
   name: Ascension Seton Bastrop
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  fallback_mrf_url: https://healthcare.ascension.org/-/media/project/ascension/healthcare/price-transparency-files/tx-csv/741109643-1619115383_ascension-seton_standardcharges.csv
 - hospital_id: hospital-000297
   name: Ascension Seton Hays
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -22702,6 +22703,7 @@ hospitals:
 - hospital_id: hospital-006790
   name: University Hospitals Lake West Medical Center Psychiatric Unit
   cms_hpt_url: https://uhhospitals.org/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/11435/341425870-1972689172_university-hospitals-health-system_standardcharges.csv
 - hospital_id: hospital-006791
   name: University Hospitals Parma Medical Center
   cms_hpt_url: https://uhhospitals.org/cms-hpt.txt
