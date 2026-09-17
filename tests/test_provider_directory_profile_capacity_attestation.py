@@ -32,9 +32,9 @@ from tests.provider_directory_profile_capacity_trust_fixtures import (
 UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-GOLDEN_ATTESTATION_ID = "ea31e51f96feb7619c31cdf948661e6f4d6760a541bb0667a91d6e06ccaf9a62"
-GOLDEN_SIGNATURE = "Yey_Q6nMPf4Ainxz9GywIOWuC3RucobryhAeYGEdozwnhFxoq7fv_H1g-XbpyQ1KZ9ig7dmg5P9LTkJOfkZCDA"
-GOLDEN_CANONICAL_BODY_SHA256 = "8960fdcc19033723ae2039f97897265f5a2573d2553056bd7e2bb40e4e114cf5"
+GOLDEN_ATTESTATION_ID = "4c731956c57157c9d0cf8e966f38961091e2b8f125f5b4153776968b6cb3f64a"
+GOLDEN_SIGNATURE = "WkAL6kvHrT7KGolpQSBSZ7eIjrgHy_TVevib53kI7zzD6xUpmogJ02OOxBP6tVjXcemAtsgO86jk8PTM6Rk1Bw"
+GOLDEN_CANONICAL_BODY_SHA256 = "adfd2f79e9401128193008109d2601c4b5d96f529faac85c5830fa453a52b57e"
 GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = "57272bff44e0909ec74309c4f5243475a4add19cdbfde838e6741f266469d86b"
 GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256 = "1e37d1bce5308cdb9111450b41be8015107672770c78b4c9ccc67839551083d1"
 
@@ -144,14 +144,14 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
     assert verified.database_system_identifier == "7527713908662902214"
     assert verified.runtime_witness.healthcare_source_commit == "12" * 20
     assert verified.runtime_witness.profile_migration_revision == (PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION)
-    assert verified.runtime_witness_sha256 == ("64245c2d42e678c148171c66fa61e8a4e1e4afec4e1b0db977461edf02a0b7e3")
+    assert verified.runtime_witness_sha256 == ("a3fedbde076c2415e5e41127588cbca16531354efa53a862f1e5832efe75c16d")
     assert verified.deployment_witness.preflight_transport == ("kubectl_exec_loopback_8080")
     assert verified.reservation_bytes_by_storage_class == {
         "data": 180_000_000_000,
         "temp": 20_000_000_000,
         "wal": 150_000_000_000,
     }
-    assert verified.lease_digest == ("6235752dcd36c07157ccfa37522ff60f56e50cc4fa8cc2cbd60a6ee268e16244")
+    assert verified.lease_digest == ("9f7235de2873e73b1658664b2a4e4e45c7b21dd97aa389d80ede6d926f6a3ecb")
     assert verified.public_key_fingerprint == ("05549452c2988321a6d9e7daa9a7704bf150aa556ea2ddb9c45c8fe92dc7f643")
     assert verified.tablespace_identity_hash == ("4c53f2792f1198c75a1e6a7ca1d03621924d19c72bd39f8997ede9c312371f0e")
     assert verified.volume_identity_hash == ("fd8a7e7f2a446dac51955276d6865c16954b4526c3b6cc0bd5d66320a798d975")

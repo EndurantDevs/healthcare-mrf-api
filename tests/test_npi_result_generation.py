@@ -18,14 +18,17 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     hospital_revision = "20260917100000_hospital_price_csv_v3_label"
     npi_revision = "20260914120000_npi_result_generation"
     finality_revision = "20260917130000_custom_import_generation_finality"
+    service_network_revision = "20260917120000_entity_address_service_network"
 
-    assert script.get_heads() == [finality_revision]
+    assert script.get_heads() == [service_network_revision]
     assert script.get_revision(hospital_revision).down_revision == "20260914120000_custom_import_v1_schema"
     assert script.get_revision(npi_revision).down_revision == hospital_revision
     assert script.get_revision(finality_revision).down_revision == npi_revision
+    assert script.get_revision(service_network_revision).down_revision == finality_revision
     assert [step.revision.revision for step in script._upgrade_revs("head", hospital_revision)] == [
         npi_revision,
         finality_revision,
+        service_network_revision,
     ]
 
 

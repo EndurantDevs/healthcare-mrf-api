@@ -64,7 +64,7 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     assert ScriptDirectory.from_config(alembic_config).get_heads() == [
-        "20260917130000_custom_import_generation_finality"
+        "20260917120000_entity_address_service_network"
     ]
     for table_name in (
         "plan_pricing_em_distance_candidate",
