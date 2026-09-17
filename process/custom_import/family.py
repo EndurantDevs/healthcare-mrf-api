@@ -341,35 +341,35 @@ def _parent_key(record: Mapping[str, Any], collection: ChildCollection) -> tuple
 
 
 def _record_error(
-    record: Mapping[str, Any],
+    source_record: Mapping[str, Any],
     fields: Mapping[str, Field],
     *,
     entity_field: str | None = None,
 ) -> str | None:
     for field_id, field in fields.items():
-        if field_id not in record:
+        if field_id not in source_record:
             if field.nullable:
                 continue
             return "required_field_missing"
-        value = record[field_id]
-        if value is None:
+        field_value = source_record[field_id]
+        if field_value is None:
             if field.nullable:
                 continue
             return "required_field_null"
         if field.value_type == "decimal":
-            decimal_value = normalize_source_decimal(value)
+            decimal_value = normalize_source_decimal(field_value)
             if decimal_value is None:
                 return "field_type_invalid"
             if field.projection_slot is not None and not is_decimal_scalar_storage_valid(decimal_value):
                 return "field_storage_invalid"
         else:
-            if not _is_value_type_valid(value, field.value_type):
+            if not _is_value_type_valid(field_value, field.value_type):
                 return "field_type_invalid"
-            if field.projection_slot is not None and not _is_scalar_storage_valid(field, value):
+            if field.projection_slot is not None and not _is_scalar_storage_valid(field, field_value):
                 return "field_storage_invalid"
     if entity_field is not None:
-        value = record.get(entity_field)
-        if not isinstance(value, str) or not _is_valid_npi(value):
+        entity_value = source_record.get(entity_field)
+        if not isinstance(entity_value, str) or not _is_valid_npi(entity_value):
             return "entity_binding_invalid"
     return None
 
