@@ -599,3 +599,153 @@ async def test_lifecycle_marker_blocks_second_session_until_outer_transaction_ch
     connection.root_transaction = object()
     publication_session._transaction = object()
     await lifecycle.require_separate_publication_transaction(publication_session)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        lambda: lifecycle._bounded_text("", "value", maximum=8),
+        lambda: lifecycle._bounded_text(" padded", "value", maximum=8),
+        lambda: lifecycle._idempotency_key("key\x7f"),
+        lambda: lifecycle._mechanism("other"),
+        lambda: lifecycle._lease_seconds(0),
+        lambda: lifecycle._persisted_digest("digest"),
+        lambda: lifecycle._persisted_digest(b"short"),
+        lambda: lifecycle._validate_execution_state(SimpleNamespace(state="unknown")),
+        lambda: lifecycle._validate_lease(SimpleNamespace(fence=-1, token_sha256=None, expires_at=None)),
+        lambda: lifecycle._validate_lease(SimpleNamespace(fence=0, token_sha256=b"x" * 32, expires_at=None)),
+        lambda: lifecycle._validate_lease(
+            SimpleNamespace(
+                fence=1,
+                token_sha256=b"x" * 32,
+                expires_at=dt.datetime(2026, 9, 17, 12, 0),
+            )
+        ),
+    ),
+)
+def test_lifecycle_validation_guards_fail_closed(operation):
+    with pytest.raises((ValueError, lifecycle.ExecutionInvariantError)):
+        operation()
+
+
+@pytest.mark.asyncio
+async def test_root_transaction_and_clean_session_guards_fail_closed():
+    class _NoConnection:
+        connection = None
+
+    class _ConnectionWithoutTransaction:
+        async def connection(self):
+            return SimpleNamespace(get_transaction=None)
+
+    class _ConnectionWithoutRoot:
+        async def connection(self):
+            return SimpleNamespace(get_transaction=lambda: None)
+
+    class _ConnectionWithoutInfo:
+        async def connection(self):
+            return SimpleNamespace(get_transaction=lambda: object(), info="invalid")
+
+    class _NoSessionTransaction:
+        info: dict[str, Any] = {}
+
+        def get_transaction(self):
+            return None
+
+    assert await lifecycle._root_transaction_context(_NoConnection()) == (None, None)
+    assert await lifecycle._root_transaction_context(_ConnectionWithoutTransaction()) == (None, None)
+    with pytest.raises(lifecycle.ExecutionTransactionRequired):
+        await lifecycle._root_transaction_context(_ConnectionWithoutRoot())
+    root, info = await lifecycle._root_transaction_context(_ConnectionWithoutInfo())
+    assert root is not None and info is None
+    with pytest.raises(lifecycle.ExecutionTransactionRequired):
+        await lifecycle._mark_lifecycle_transaction(_NoSessionTransaction())
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="clean session"):
+        lifecycle._require_clean_lifecycle_session(SimpleNamespace(new={object()}))
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_storage_guards_cover_disappearing_rows_and_exhausted_authority():
+    session = _SyntheticSession()
+    submission = await _submission(session)
+    await lifecycle._lock_execution_by_request(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        idempotency_key="synthetic-request",
+    )
+
+    class _MissingDatasetSession(_SyntheticSession):
+        def _select(self, statement):
+            if statement.get_final_froms()[0].name == "custom_import_dataset":
+                return _Result()
+            return super()._select(statement)
+
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="dataset does not exist"):
+        await lifecycle._lock_dataset(_MissingDatasetSession(), 11)
+    with pytest.raises(lifecycle.ExecutionNotFound):
+        await lifecycle._locked_lifecycle_execution(_SyntheticSession(), 404)
+    with pytest.raises(lifecycle.ExecutionNotFound):
+        await lifecycle._locked_heartbeat_execution(_SyntheticSession(), 404)
+
+    del session.leases[submission.execution_id]
+    assert (await lifecycle._lock_lease(session, submission.execution_id)).fence == 0
+    session.now = session.now.replace(tzinfo=None)
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="aware timestamp"):
+        await lifecycle._database_now(session)
+
+    empty = _SyntheticSession()
+    request = lifecycle._validated_execution_request(
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="missing",
+        mechanism="queued",
+        capture_bundle_id=None,
+    )
+    assert await lifecycle._locked_submission_execution(empty, request, None) is None
+
+    queued = _SyntheticSession()
+    queued_submission = await _submission(queued)
+    assert (
+        await lifecycle.resume_execution(
+            queued,
+            execution_id=queued_submission.execution_id,
+            token=_WORKER,
+        )
+        is None
+    )
+    queued.leases[queued_submission.execution_id].fence = lifecycle.MAX_FENCE
+    queued.leases[queued_submission.execution_id].token_sha256 = hashlib.sha256(_WORKER.encode()).digest()
+    queued.leases[queued_submission.execution_id].expires_at = queued.now
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="cannot advance"):
+        await lifecycle.claim_execution(
+            queued,
+            execution_id=queued_submission.execution_id,
+            token=_WORKER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_queued_cancellation_expires_only_an_existing_lease_authority():
+    without_authority = _SyntheticSession()
+    first = await _submission(without_authority)
+    assert (
+        await lifecycle.request_cancellation(
+            without_authority,
+            execution_id=first.execution_id,
+        )
+    ).state == "canceled"
+
+    with_authority = _SyntheticSession()
+    second = await _submission(with_authority)
+    lease = with_authority.leases[second.execution_id]
+    lease.fence = 1
+    lease.token_sha256 = hashlib.sha256(_WORKER.encode()).digest()
+    lease.expires_at = with_authority.now + dt.timedelta(seconds=60)
+    assert (
+        await lifecycle.request_cancellation(
+            with_authority,
+            execution_id=second.execution_id,
+        )
+    ).state == "canceled"
+    assert lease.expires_at == with_authority.now
