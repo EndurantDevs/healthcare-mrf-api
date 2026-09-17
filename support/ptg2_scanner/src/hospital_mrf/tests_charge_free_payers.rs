@@ -209,6 +209,99 @@ fn v3_tall_service_only_preserves_charges() {
 }
 
 #[test]
+fn v3_tall_na_plan_is_service_only_only_without_payer_material() {
+    let mut records = csv_fixture_records(&fixture_tall_csv());
+    for field in [
+        "payer_name",
+        "standard_charge | negotiated_dollar",
+        "standard_charge | negotiated_percentage",
+        "standard_charge | negotiated_algorithm",
+        "median_amount",
+        "10th_percentile",
+        "90th_percentile",
+        "count",
+        "standard_charge | methodology",
+    ] {
+        let index = csv_fixture_index(&records[2], field);
+        records[3][index].clear();
+    }
+    let plan = csv_fixture_index(&records[2], "plan_name");
+    records[3][plan] = " \t#N/A \t".to_owned();
+    let actual = run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false);
+    records[3][plan].clear();
+    let expected = run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false);
+    assert_eq!(actual, expected);
+    assert!(actual["payer_charge"].is_empty());
+
+    records[3][plan] = "#N/A".to_owned();
+    let mut invalid = records.clone();
+    let payer = csv_fixture_index(&invalid[2], "payer_name");
+    invalid[3][payer] = "Payer, Inc.".to_owned();
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "invalid standard charge methodology",
+    );
+
+    for (field, value) in [
+        ("standard_charge | negotiated_dollar", "9.125"),
+        ("standard_charge | negotiated_percentage", "80"),
+        ("standard_charge | negotiated_algorithm", "Contract formula"),
+        ("median_amount", "10"),
+        ("10th_percentile", "8"),
+        ("90th_percentile", "12"),
+        ("count", "0"),
+        ("standard_charge | methodology", "fee schedule"),
+    ] {
+        let mut invalid = records.clone();
+        let index = csv_fixture_index(&invalid[2], field);
+        invalid[3][index] = value.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "payer_name must be a non-empty string",
+        );
+    }
+
+    for marker in ["#n/a", "N/A", "#N/A."] {
+        let mut invalid = records.clone();
+        invalid[3][plan] = marker.to_owned();
+        assert_historical_csv_error(
+            InputFormat::TallCsv,
+            &invalid,
+            "payer_name must be a non-empty string",
+        );
+    }
+
+    let mut invalid = records.clone();
+    for record in &mut invalid {
+        record.push(String::new());
+    }
+    *invalid[2].last_mut().unwrap() = "additional_payer_notes".to_owned();
+    *invalid[3].last_mut().unwrap() = "Payer note".to_owned();
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &invalid,
+        "payer_name must be a non-empty string",
+    );
+    *invalid[3].last_mut().unwrap() = "bad\0note".to_owned();
+    assert_historical_csv_error(InputFormat::TallCsv, &invalid, "contains NUL");
+
+    for field in [
+        "standard_charge | gross",
+        "standard_charge | discounted_cash",
+    ] {
+        let index = csv_fixture_index(&records[2], field);
+        records[3][index].clear();
+    }
+    assert_historical_csv_error(
+        InputFormat::TallCsv,
+        &records,
+        "standard charge requires gross, discounted cash, or payer information",
+    );
+}
+
+#[test]
 fn v3_tall_service_only_rejects_values() {
     let records = service_only_tall_records();
     for field in [
