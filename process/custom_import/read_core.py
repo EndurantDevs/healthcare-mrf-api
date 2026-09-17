@@ -23,15 +23,18 @@ outside this package.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import hmac
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import and_, exists, func, not_, select
+from sqlalchemy import and_, exists, func, not_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -60,12 +63,14 @@ from process.custom_import.definition import (
     load_json_definition,
 )
 from process.custom_import.read_contracts import (
+    DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
     MAX_DETAIL_CHILDREN,
     MAX_FILTER_TERMS,
     MAX_ORDER_TERMS,
     MAX_PAGE_OFFSET,
     MAX_PAGE_SIZE,
+    MAX_READ_TIMEOUT_MS,
     READ_CORE_CONTRACT,
     CustomImportReadAuthorizationError,
     CustomImportReadCache,
@@ -104,6 +109,14 @@ _SCALAR_COLUMNS = {
     "date": "date_value",
     "timestamp": "timestamp_value",
 }
+_READ_TIMEOUT_SETTINGS = text(
+    """
+    SELECT current_setting('statement_timeout') AS timeout_text,
+           setting AS timeout_milliseconds
+    FROM pg_catalog.pg_settings
+    WHERE name = 'statement_timeout'
+    """
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,14 +300,18 @@ class CustomImportReadService:
         cursor_secret: bytes,
         cache: CustomImportReadCache | None = None,
         cursor_ttl_seconds: int = 300,
+        statement_timeout_ms: int = DEFAULT_READ_TIMEOUT_MS,
         now: Callable[[], int] | None = None,
     ) -> None:
         if type(cursor_ttl_seconds) is not int or not 1 <= cursor_ttl_seconds <= MAX_CURSOR_TTL_SECONDS:
             raise CustomImportReadRequestError("cursor_ttl_seconds is outside the read-core limit")
+        if type(statement_timeout_ms) is not int or not 1 <= statement_timeout_ms <= MAX_READ_TIMEOUT_MS:
+            raise CustomImportReadRequestError("statement_timeout_ms is outside the read-core limit")
         self._authorizer = authorizer
         self._cache = cache
         self._cursor_codec = ReadCursorCodec(cursor_secret)
         self._cursor_ttl_seconds = cursor_ttl_seconds
+        self._statement_timeout_ms = statement_timeout_ms
         self._now = time.time if now is None else now
 
     async def search(
@@ -307,43 +324,44 @@ class CustomImportReadService:
         """Search persisted winners after auth, eligibility, filtering, and exact count."""
 
         authorization_scope = self._authorize(authorization, request.target)
-        context = await _load_read_context(session, request.target)
-        plan = _normalize_search_plan(request, context)
-        trusted_now = self._trusted_now()
-        scope_digest = _scope_digest(authorization_scope)
-        offset = self._cursor_offset(request, plan, scope_digest, trusted_now)
-        cache_key = _cache_key("search", context.target, plan.fingerprint, scope_digest, offset)
-        cached_page = await _cached_search_page(self._cache, cache_key, context, plan, scope_digest, trusted_now)
-        if cached_page is not None:
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+            context = await _load_read_context(session, request.target)
+            plan = _normalize_search_plan(request, context)
+            trusted_now = self._trusted_now()
+            scope_digest = _scope_digest(authorization_scope)
+            offset = self._cursor_offset(request, plan, scope_digest, trusted_now)
+            cache_key = _cache_key("search", context.target, plan.fingerprint, scope_digest, offset)
+            cached_page = await _cached_search_page(self._cache, cache_key, context, plan, scope_digest, trusted_now)
+            if cached_page is not None:
+                await verify_current_generation(session, context.target, context.pointer_version)
+                return cached_page
+            statement = _filtered_winner_statement(context, plan.filters)
+            total = await _exact_count(session, statement)
+            selected_rows = await _page_winner_rows(session, statement, context, plan, offset)
+            page_items = await _hydrate_search_page_items(session, context, selected_rows)
             await verify_current_generation(session, context.target, context.pointer_version)
-            return cached_page
-        statement = _filtered_winner_statement(context, plan.filters)
-        total = await _exact_count(session, statement)
-        selected_rows = await _page_winner_rows(session, statement, context, plan, offset)
-        page_items = await _hydrate_search_page_items(session, context, selected_rows)
-        await verify_current_generation(session, context.target, context.pointer_version)
-        expires_at = trusted_now + self._cursor_ttl_seconds
-        next_cursor = self._next_search_cursor(
-            context,
-            plan,
-            scope_digest,
-            _PageWindow(
-                offset=offset,
+            expires_at = trusted_now + self._cursor_ttl_seconds
+            next_cursor = self._next_search_cursor(
+                context,
+                plan,
+                scope_digest,
+                _PageWindow(
+                    offset=offset,
+                    total=total,
+                    returned_count=len(page_items),
+                    issued_at=trusted_now,
+                    expires_at=expires_at,
+                ),
+            )
+            page = SearchPage(
+                target=context.target,
                 total=total,
-                returned_count=len(page_items),
-                issued_at=trusted_now,
+                items=page_items,
+                next_cursor=next_cursor,
                 expires_at=expires_at,
-            ),
-        )
-        page = SearchPage(
-            target=context.target,
-            total=total,
-            items=page_items,
-            next_cursor=next_cursor,
-            expires_at=expires_at,
-            query_fingerprint=plan.fingerprint,
-            authorization_scope_sha256=scope_digest,
-        )
+                query_fingerprint=plan.fingerprint,
+                authorization_scope_sha256=scope_digest,
+            )
         await _cache_result(self._cache, cache_key, page, expires_at)
         return page
 
@@ -358,17 +376,18 @@ class CustomImportReadService:
         """Hydrate all children in the exact family selected by one persisted winner."""
 
         authorization_scope = self._authorize(authorization, target)
-        context = await _load_read_context(session, target)
-        trusted_now = self._trusted_now()
-        scope_digest = _scope_digest(authorization_scope)
-        cache_key = _detail_cache_key(context.target, winner, scope_digest)
-        cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
-        if cached_detail is not None:
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+            context = await _load_read_context(session, target)
+            trusted_now = self._trusted_now()
+            scope_digest = _scope_digest(authorization_scope)
+            cache_key = _detail_cache_key(context.target, winner, scope_digest)
+            cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
+            if cached_detail is not None:
+                await verify_current_generation(session, context.target, context.pointer_version)
+                return cached_detail
+            selected_row = await _selected_winner_row(session, context, winner)
+            detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
             await verify_current_generation(session, context.target, context.pointer_version)
-            return cached_detail
-        selected_row = await _selected_winner_row(session, context, winner)
-        detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
-        await verify_current_generation(session, context.target, context.pointer_version)
         await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
         return detail
 
@@ -541,6 +560,75 @@ async def _cache_result(cache: CustomImportReadCache | None, cache_key: str, val
         await cache.set(cache_key, value, expires_at=expires_at)
     except Exception:
         return
+
+
+@asynccontextmanager
+async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+    """Apply one cumulative, caller-transaction-local database read budget."""
+
+    monotonic_deadline = time.monotonic() + timeout_ms / 1_000
+    try:
+        async with asyncio.timeout(timeout_ms / 1_000):
+            async with _local_statement_timeout(session, timeout_ms=timeout_ms):
+                yield
+                if time.monotonic() >= monotonic_deadline:
+                    raise TimeoutError
+    except TimeoutError:
+        raise CustomImportReadUnavailableError("bounded read is unavailable") from None
+    except DBAPIError as error:
+        if _is_statement_timeout(error):
+            raise CustomImportReadUnavailableError("bounded read is unavailable") from None
+        raise
+
+
+@asynccontextmanager
+async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+    """Temporarily narrow the caller's transaction-local statement timeout."""
+
+    previous_timeout_text, previous_timeout_ms = await _current_statement_timeout(session)
+    effective_timeout_ms = timeout_ms if previous_timeout_ms == 0 else min(timeout_ms, previous_timeout_ms)
+    await session.execute(select(func.set_config("statement_timeout", str(effective_timeout_ms), True)))
+    has_read_failed = False
+    try:
+        yield
+    except BaseException:
+        has_read_failed = True
+        raise
+    finally:
+        await _restore_statement_timeout(session, previous_timeout_text, has_read_failed=has_read_failed)
+
+
+async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int]:
+    timeout_row = (await session.execute(_READ_TIMEOUT_SETTINGS)).one_or_none()
+    if timeout_row is None or not isinstance(timeout_row.timeout_text, str):
+        raise CustomImportReadUnavailableError("bounded read is unavailable")
+    try:
+        previous_timeout_ms = int(timeout_row.timeout_milliseconds)
+    except TypeError, ValueError:
+        raise CustomImportReadUnavailableError("bounded read is unavailable") from None
+    if previous_timeout_ms < 0:
+        raise CustomImportReadUnavailableError("bounded read is unavailable")
+    return timeout_row.timeout_text, previous_timeout_ms
+
+
+async def _restore_statement_timeout(
+    session: AsyncSession,
+    previous_timeout_text: str,
+    *,
+    has_read_failed: bool,
+) -> None:
+    try:
+        await session.execute(select(func.set_config("statement_timeout", previous_timeout_text, True)))
+    except Exception:
+        if not has_read_failed:
+            raise
+
+
+def _is_statement_timeout(error: DBAPIError) -> bool:
+    """Recognize PostgreSQL query cancellation without inspecting messages."""
+
+    driver_error = error.orig
+    return any(getattr(driver_error, attribute, None) == "57014" for attribute in ("sqlstate", "pgcode"))
 
 
 async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) -> _ReadContext:
@@ -1464,6 +1552,7 @@ __all__ = (
     "CustomImportReadRequestError",
     "CustomImportReadService",
     "CustomImportReadUnavailableError",
+    "DEFAULT_READ_TIMEOUT_MS",
     "ExtensionReadAuthorization",
     "ExtensionReadAuthorizer",
     "ExtensionReadScope",
@@ -1472,6 +1561,7 @@ __all__ = (
     "MAX_FILTER_TERMS",
     "MAX_ORDER_TERMS",
     "MAX_PAGE_SIZE",
+    "MAX_READ_TIMEOUT_MS",
     "PinnedReadTarget",
     "READ_CORE_CONTRACT",
     "ReadChild",

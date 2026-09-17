@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import text
 
 from db.models.custom_import import (
     CustomImportChildScalar,
@@ -29,6 +30,7 @@ from process.custom_import.definition import (
 )
 from process.custom_import.publication import activate_generation, seal_generation
 from process.custom_import.read_core import (
+    CustomImportReadRequestError,
     CustomImportReadService,
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
@@ -499,13 +501,22 @@ async def _seed_read_fixture(session) -> _ReadFixture:
     )
 
 
-def _service(*, cache=None) -> CustomImportReadService:
+def _service(*, cache=None, statement_timeout_ms: int = 10_000) -> CustomImportReadService:
     return CustomImportReadService(
         authorizer=_AllowSyntheticRead(),
         cache=cache,
         cursor_secret=b"r" * 32,
         now=lambda: 1_000,
+        statement_timeout_ms=statement_timeout_ms,
     )
+
+
+async def _statement_timeout_ms(session) -> int:
+    timeout_ms = await session.scalar(
+        text("SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'")
+    )
+    assert isinstance(timeout_ms, int)
+    return timeout_ms
 
 
 async def _exact_counted_first_page(session, service, authorization, fixture: _ReadFixture):
@@ -604,6 +615,221 @@ async def test_read_core_uses_one_selected_child_and_exact_family_membership():
         await _assert_selected_child_filtering(session, service, authorization, fixture)
         await _assert_metric_states(session, service, authorization, fixture)
         await _assert_exact_family_detail(session, service, authorization, fixture, first_page)
+
+
+@pytest.mark.asyncio
+async def test_read_core_restores_caller_statement_timeout_after_reads_and_request_failure():
+    """The bounded read window never widens or leaks its transaction-local setting."""
+
+    async with transaction_session() as session, session.begin():
+        fixture = await _seed_read_fixture(session)
+        await session.execute(
+            text("SELECT set_config('statement_timeout', :timeout_text, true)"),
+            {"timeout_text": "17000"},
+        )
+        service = _service(statement_timeout_ms=5_000)
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        first_page = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(target=fixture.target, page_size=1),
+        )
+        assert await _statement_timeout_ms(session) == 17_000
+
+        await service.root_detail(
+            session,
+            authorization=authorization,
+            target=fixture.target,
+            winner=first_page.items[0].winner,
+        )
+        assert await _statement_timeout_ms(session) == 17_000
+
+        with pytest.raises(CustomImportReadRequestError, match="filter field"):
+            await service.search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(
+                    target=fixture.target,
+                    filters=(ReadFilter("undeclared_field", "eq", "synthetic"),),
+                ),
+            )
+        assert await _statement_timeout_ms(session) == 17_000
+
+        await session.execute(
+            text("SELECT set_config('statement_timeout', :timeout_text, true)"),
+            {"timeout_text": "700"},
+        )
+        async with read_core._bounded_read_window(session, timeout_ms=5_000):
+            assert await _statement_timeout_ms(session) == 700
+        assert await _statement_timeout_ms(session) == 700
+
+
+@pytest.mark.asyncio
+async def test_read_core_maps_database_timeout_and_never_caches_partial_page(monkeypatch):
+    """A real PostgreSQL cancellation fails closed and leaves rollback to the caller."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+        original_exact_count = read_core._exact_count
+
+        async def delayed_exact_count(delayed_session, statement):
+            await delayed_session.execute(text("SELECT pg_sleep(1)"))
+            return await original_exact_count(delayed_session, statement)
+
+        monkeypatch.setattr(read_core, "_exact_count", delayed_exact_count)
+        async with case.sessions() as session:
+            cache = _RecordingCache()
+            service = _service(cache=cache, statement_timeout_ms=20)
+            with pytest.raises(CustomImportReadUnavailableError, match="^bounded read is unavailable$"):
+                await service.search(
+                    session,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
+                    request=SearchRequest(target=fixture.target),
+                )
+
+            assert cache.set_calls == 0
+            assert cache.values == {}
+            assert session.in_transaction()
+            await session.rollback()
+            assert await session.scalar(text("SELECT 1")) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_core_applies_the_same_database_timeout_to_detail(monkeypatch):
+    """Detail hydration cannot bypass the common bounded read window."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        async with case.sessions() as session:
+            first_page = await _service().search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(target=fixture.target, page_size=1),
+            )
+            await session.rollback()
+            original_selected_winner_row = read_core._selected_winner_row
+
+            async def delayed_selected_winner_row(delayed_session, context, winner):
+                await delayed_session.execute(text("SELECT pg_sleep(1)"))
+                return await original_selected_winner_row(delayed_session, context, winner)
+
+            monkeypatch.setattr(read_core, "_selected_winner_row", delayed_selected_winner_row)
+            cache = _RecordingCache()
+            service = _service(cache=cache, statement_timeout_ms=20)
+            with pytest.raises(CustomImportReadUnavailableError, match="^bounded read is unavailable$"):
+                await service.root_detail(
+                    session,
+                    authorization=authorization,
+                    target=fixture.target,
+                    winner=first_page.items[0].winner,
+                )
+
+            assert cache.set_calls == 0
+            assert cache.values == {}
+            await session.rollback()
+            assert await session.scalar(text("SELECT 1")) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_core_enforces_one_cumulative_operation_deadline(monkeypatch):
+    """Individually short steps cannot collectively exceed the read budget."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+
+        async def delayed_exact_count(delayed_session, statement):
+            del delayed_session, statement
+            await asyncio.sleep(0.26)
+            return 2
+
+        async def delayed_page_winner_rows(delayed_session, statement, context, plan, offset):
+            del delayed_session, statement, context, plan, offset
+            await asyncio.sleep(0.26)
+            return ()
+
+        monkeypatch.setattr(read_core, "_exact_count", delayed_exact_count)
+        monkeypatch.setattr(read_core, "_page_winner_rows", delayed_page_winner_rows)
+        async with case.sessions() as session:
+            cache = _RecordingCache()
+            service = _service(cache=cache, statement_timeout_ms=500)
+            with pytest.raises(CustomImportReadUnavailableError, match="^bounded read is unavailable$"):
+                await service.search(
+                    session,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
+                    request=SearchRequest(target=fixture.target),
+                )
+
+            assert cache.set_calls == 0
+            assert cache.values == {}
+            assert await _statement_timeout_ms(session) == 0
+            assert await session.scalar(text("SELECT 1")) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_core_does_not_cache_when_timeout_restoration_fails(monkeypatch):
+    """A restoration failure rejects an otherwise complete page before caching."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+
+        async def failed_restoration(session, previous_timeout_text, *, has_read_failed):
+            del session, previous_timeout_text, has_read_failed
+            raise RuntimeError("synthetic restoration failure")
+
+        monkeypatch.setattr(read_core, "_restore_statement_timeout", failed_restoration)
+        async with case.sessions() as session:
+            cache = _RecordingCache()
+            service = _service(cache=cache)
+            with pytest.raises(RuntimeError, match="^synthetic restoration failure$"):
+                await service.search(
+                    session,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
+                    request=SearchRequest(target=fixture.target),
+                )
+
+            assert cache.set_calls == 0
+            assert cache.values == {}
+            await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_read_core_preserves_external_task_cancellation(monkeypatch):
+    """Caller cancellation remains distinct from the service-owned deadline."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+        delayed_step_started = asyncio.Event()
+
+        async def interrupted_exact_count(delayed_session, statement):
+            del delayed_session, statement
+            delayed_step_started.set()
+            await asyncio.sleep(60)
+            return 0
+
+        monkeypatch.setattr(read_core, "_exact_count", interrupted_exact_count)
+        async with case.sessions() as session:
+            cache = _RecordingCache()
+            read_task = asyncio.create_task(
+                _service(cache=cache).search(
+                    session,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
+                    request=SearchRequest(target=fixture.target),
+                )
+            )
+            await asyncio.wait_for(delayed_step_started.wait(), timeout=5)
+            read_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+
+            assert cache.set_calls == 0
+            assert cache.values == {}
+            assert await _statement_timeout_ms(session) == 0
 
 
 @pytest.mark.parametrize(

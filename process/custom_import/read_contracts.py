@@ -17,6 +17,8 @@ MAX_PAGE_SIZE = 100
 MAX_PAGE_OFFSET = 1_000_000
 MAX_CURSOR_TTL_SECONDS = 900
 MAX_DETAIL_CHILDREN = 1_000
+DEFAULT_READ_TIMEOUT_MS = 10_000
+MAX_READ_TIMEOUT_MS = 30_000
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$", flags=re.ASCII)
 _OPAQUE_VALUE = re.compile(r"^[A-Za-z0-9._~-]{1,512}$", flags=re.ASCII)
@@ -136,6 +138,7 @@ __all__ = (
     "CustomImportReadError",
     "CustomImportReadRequestError",
     "CustomImportReadUnavailableError",
+    "DEFAULT_READ_TIMEOUT_MS",
     "ExtensionReadAuthorization",
     "ExtensionReadAuthorizer",
     "ExtensionReadScope",
@@ -145,6 +148,7 @@ __all__ = (
     "MAX_ORDER_TERMS",
     "MAX_PAGE_OFFSET",
     "MAX_PAGE_SIZE",
+    "MAX_READ_TIMEOUT_MS",
     "PinnedReadTarget",
     "READ_CORE_CONTRACT",
     "canonical_read_document",
