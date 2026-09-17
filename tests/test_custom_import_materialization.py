@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 from collections.abc import Iterable
 from dataclasses import replace
@@ -253,6 +254,27 @@ def test_projection_rejects_lossy_values(definition):
     ):
         with pytest.raises(ScalarProjectionError, match="decimal field amount"):
             _child_projection(definition, 71, {"service_code": "A100", "amount": invalid_amount})
+
+
+def test_projection_normalizes_a_fitting_decimal_source_value(definition):
+    projected = _child_projection(
+        definition,
+        71,
+        {"service_code": "A100", "amount": "4.0000000000000"},
+    )
+
+    amount_projection = next(projection for projection in projected if projection.field_id == "amount")
+    assert amount_projection.scalar.decimal_value == Decimal("4")
+
+
+@pytest.mark.parametrize(
+    "amount",
+    (" 4", "4 ", "1_000", "٤", "4e0", "4E0"),
+    ids=("leading-space", "trailing-space", "underscore", "non-ascii-digit", "lower-exponent", "upper-exponent"),
+)
+def test_projection_rejects_noncanonical_decimal_source_text(definition, amount):
+    with pytest.raises(ScalarProjectionError, match="decimal field amount"):
+        _child_projection(definition, 71, {"service_code": "A100", "amount": amount})
 
 
 def test_hot_string_bound_is_utf8_byte_safe(definition):
@@ -644,6 +666,64 @@ def test_equal_semantic_tie_rejects_conflicting_typed_values(definition):
             generation=_generation(),
             child_collection_slots={"rates": 7},
             candidates=_validated_candidates((first, second)),
+        )
+
+
+@pytest.mark.parametrize("candidates", itertools.permutations(("a", "b", "c")))
+def test_losing_semantic_tie_conflicts_do_not_depend_on_input_order(definition, candidates):
+    first = _child_candidate(
+        family_revision_id=801,
+        child_revision_id=901,
+        semantic_suffix="same",
+        service_code="A",
+        amount=Decimal("4"),
+    )
+    preferred = replace(
+        first,
+        family_revision_id=802,
+        family_sha256=b"\x00" * 32,
+        context_child_revision_id=902,
+        context_child_key_sha256=b"\x00" * 32,
+    )
+    conflicting = replace(first, family_revision_id=803, context_child_revision_id=903)
+    candidates_by_label = {"a": first, "b": preferred, "c": conflicting}
+
+    materialization = materialize_winners(
+        definition,
+        generation=_generation(),
+        child_collection_slots={"rates": 7},
+        candidates=_validated_candidates(tuple(candidates_by_label[label] for label in candidates)),
+    )
+
+    assert len(materialization.winners) == 1
+    assert materialization.winners[0].family_revision_id == preferred.family_revision_id
+
+
+@pytest.mark.parametrize("candidates", itertools.permutations(("a", "b", "c")))
+def test_winning_semantic_tie_conflicts_reject_every_input_permutation(definition, candidates):
+    first = _child_candidate(
+        family_revision_id=801,
+        child_revision_id=901,
+        semantic_suffix="same",
+        service_code="A",
+        amount=Decimal("4"),
+    )
+    worse = replace(
+        first,
+        family_revision_id=802,
+        family_sha256=b"\xff" * 32,
+        context_child_revision_id=902,
+        context_child_key_sha256=b"\xff" * 32,
+    )
+    conflicting = replace(first, family_revision_id=803, context_child_revision_id=903)
+    candidates_by_label = {"a": first, "b": worse, "c": conflicting}
+
+    with pytest.raises(WinnerMaterializationError, match="conflicting physical identity"):
+        materialize_winners(
+            definition,
+            generation=_generation(),
+            child_collection_slots={"rates": 7},
+            candidates=_validated_candidates(tuple(candidates_by_label[label] for label in candidates)),
         )
 
 

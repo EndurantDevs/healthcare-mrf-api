@@ -523,6 +523,122 @@ def test_family_build_applies_each_declared_scalar_type():
         assert {entry.code for entry in result.rejections} == {"field_type_invalid"}
 
 
+def _definition_with_projected_root_decimal() -> CustomImportDefinition:
+    definition_document = copy.deepcopy(_raw_definition())
+    root_fields = definition_document["schema"]["root"]["fields"]
+    assert isinstance(root_fields, list)
+    root_fields.append({"id": "root_amount", "slot": 6, "type": "decimal", "nullable": False, "projection_slot": 5})
+    return CustomImportDefinition.from_mapping(definition_document)
+
+
+def _definition_with_projected_root_integer() -> CustomImportDefinition:
+    definition_document = copy.deepcopy(_raw_definition())
+    root_fields = definition_document["schema"]["root"]["fields"]
+    assert isinstance(root_fields, list)
+    root_fields.append({"id": "root_rank", "slot": 6, "type": "integer", "nullable": False, "projection_slot": 5})
+    return CustomImportDefinition.from_mapping(definition_document)
+
+
+@pytest.mark.parametrize(
+    "display_name",
+    ("Synthetic\x00Provider", "😺" * 513),
+    ids=("nul", "utf8-byte-limit"),
+)
+def test_family_build_rejects_root_projected_string_storage_shapes(definition, display_name):
+    result = assemble_root_families(definition, [_root(name=display_name)], {"rates": []})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_storage_invalid"}
+
+
+@pytest.mark.parametrize(
+    "service_code",
+    ("A\x000", "😺" * 513),
+    ids=("nul", "utf8-byte-limit"),
+)
+def test_family_build_rejects_child_projected_string_storage_shapes(definition, service_code):
+    result = assemble_root_families(definition, [_root()], {"rates": [_rate(code=service_code)]})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_storage_invalid"}
+
+
+@pytest.mark.parametrize("rank", (-(2**63) - 1, 2**63))
+def test_family_build_rejects_projected_integers_outside_bigint(rank):
+    definition = _definition_with_projected_root_integer()
+    result = assemble_root_families(definition, [{**_root(), "root_rank": rank}], {"rates": []})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_storage_invalid"}
+
+
+@pytest.mark.parametrize("rank", (-(2**63), 2**63 - 1))
+def test_family_build_accepts_projected_bigint_boundaries(rank):
+    definition = _definition_with_projected_root_integer()
+    result = assemble_root_families(definition, [{**_root(), "root_rank": rank}], {"rates": []})
+
+    assert len(result.families) == 1
+    assert result.rejections == ()
+
+
+@pytest.mark.parametrize(
+    "amount",
+    (Decimal("1000000000000000000"), "0.0000000000001"),
+    ids=("too-many-integer-digits", "too-many-fractional-digits"),
+)
+def test_family_build_rejects_root_projected_decimal_storage_shapes(amount):
+    definition = _definition_with_projected_root_decimal()
+    result = assemble_root_families(definition, [{**_root(), "root_amount": amount}], {"rates": []})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_storage_invalid"}
+
+
+@pytest.mark.parametrize(
+    "amount",
+    (Decimal("1000000000000000000"), "0.0000000000001"),
+    ids=("too-many-integer-digits", "too-many-fractional-digits"),
+)
+def test_family_build_rejects_child_projected_decimal_storage_shapes(definition, amount):
+    result = assemble_root_families(definition, [_root()], {"rates": [_rate(amount=amount)]})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_storage_invalid"}
+
+
+def test_family_build_accepts_fitting_normalized_decimal_source_text():
+    definition = _definition_with_projected_root_decimal()
+    result = assemble_root_families(
+        definition,
+        [{**_root(), "root_amount": "4.0000000000000"}],
+        {"rates": [_rate(amount="4.0000000000000")]},
+    )
+
+    assert len(result.families) == 1
+    assert result.rejections == ()
+
+
+def test_family_build_accepts_a_long_insignificant_decimal_zero_suffix():
+    definition = _definition_with_projected_root_decimal()
+    amount = "4." + ("0" * 50_000)
+    result = assemble_root_families(definition, [{**_root(), "root_amount": amount}], {"rates": []})
+
+    assert len(result.families) == 1
+    assert result.rejections == ()
+
+
+@pytest.mark.parametrize(
+    "amount",
+    (" 4", "4 ", "1_000", "٤", "4e0", "4E0"),
+    ids=("leading-space", "trailing-space", "underscore", "non-ascii-digit", "lower-exponent", "upper-exponent"),
+)
+def test_family_build_rejects_noncanonical_decimal_source_text(definition, amount):
+    result = assemble_root_families(definition, [_root()], {"rates": [_rate(amount=amount)]})
+
+    assert result.families == ()
+    assert {entry.code for entry in result.rejections} == {"field_type_invalid"}
+
+
 def test_invalid_children_and_duplicate_keys_reject_only_their_root_family(definition):
     invalid_child = _rate()
     invalid_child.pop("service_code")

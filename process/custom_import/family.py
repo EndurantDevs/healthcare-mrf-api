@@ -22,6 +22,16 @@ from process.custom_import.definition import (
 )
 
 _NPI = re.compile(r"^[0-9]{10}$")
+_DECIMAL_SOURCE_TEXT = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$", re.ASCII)
+
+# These are the conservative scalar-storage limits used by the materialized
+# projections.  Admission applies them to projected source fields so one bad
+# family is rejected before later persistence can abort an entire generation.
+MAX_SCALAR_STRING_UTF8_BYTES = 2_048
+MAX_SCALAR_INTEGER = 9_223_372_036_854_775_807
+MIN_SCALAR_INTEGER = -9_223_372_036_854_775_808
+MAX_SCALAR_DECIMAL_INTEGER_DIGITS = 18
+MAX_SCALAR_DECIMAL_SCALE = 12
 
 
 class SourceSnapshotError(ValueError):
@@ -346,8 +356,17 @@ def _record_error(
             if field.nullable:
                 continue
             return "required_field_null"
-        if not _is_value_type_valid(value, field.value_type):
-            return "field_type_invalid"
+        if field.value_type == "decimal":
+            decimal_value = normalize_source_decimal(value)
+            if decimal_value is None:
+                return "field_type_invalid"
+            if field.projection_slot is not None and not is_decimal_scalar_storage_valid(decimal_value):
+                return "field_storage_invalid"
+        else:
+            if not _is_value_type_valid(value, field.value_type):
+                return "field_type_invalid"
+            if field.projection_slot is not None and not _is_scalar_storage_valid(field, value):
+                return "field_storage_invalid"
     if entity_field is not None:
         value = record.get(entity_field)
         if not isinstance(value, str) or not _is_valid_npi(value):
@@ -361,17 +380,94 @@ def _is_value_type_valid(value: Any, value_type: str) -> bool:
     if value_type == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if value_type == "decimal":
-        if isinstance(value, bool):
-            return False
-        try:
-            return Decimal(str(value)).is_finite()
-        except InvalidOperation, ValueError:
-            return False
+        return normalize_source_decimal(value) is not None
     if value_type == "boolean":
         return isinstance(value, bool)
     if value_type == "date":
         return isinstance(value, date) and not isinstance(value, datetime)
     return isinstance(value, datetime) and value.tzinfo is not None
+
+
+def normalize_source_decimal(value: Any) -> Decimal | None:
+    """Return a finite source decimal after v1 lexical normalization.
+
+    Source text is deliberately limited to ``-?[0-9]+(?:\\.[0-9]+)?`` using
+    ASCII digits: no whitespace, underscores, non-ASCII numerals, plus sign,
+    or exponent spelling is accepted before :class:`~decimal.Decimal`
+    conversion.  Integer and already-parsed ``Decimal`` inputs represent the
+    same numeric domain; fractional trailing zeroes are removed without
+    changing the numeric value before storage-shape checks.
+    """
+
+    if isinstance(value, bool) or isinstance(value, float):
+        return None
+    if isinstance(value, Decimal):
+        decimal_value = value
+    elif isinstance(value, int):
+        decimal_value = Decimal(value)
+    elif isinstance(value, str):
+        if _DECIMAL_SOURCE_TEXT.fullmatch(value) is None:
+            return None
+        try:
+            decimal_value = Decimal(value)
+        except InvalidOperation, ValueError:
+            return None
+    else:
+        return None
+    if not decimal_value.is_finite():
+        return None
+    return _normalize_decimal_fraction(decimal_value)
+
+
+def _is_scalar_storage_valid(field: Field, value: Any) -> bool:
+    """Return whether one non-null projected source scalar fits native storage."""
+
+    if field.value_type == "string":
+        if not isinstance(value, str) or "\x00" in value:
+            return False
+        try:
+            return len(value.encode("utf-8")) <= MAX_SCALAR_STRING_UTF8_BYTES
+        except UnicodeEncodeError:
+            return False
+    if field.value_type == "integer":
+        return (
+            isinstance(value, int) and not isinstance(value, bool) and MIN_SCALAR_INTEGER <= value <= MAX_SCALAR_INTEGER
+        )
+    if field.value_type == "decimal":
+        decimal_value = normalize_source_decimal(value)
+        return decimal_value is not None and is_decimal_scalar_storage_valid(decimal_value)
+    return True
+
+
+def is_decimal_scalar_storage_valid(value: Decimal) -> bool:
+    """Return whether a normalized decimal fits the exact ``NUMERIC(30, 12)`` value range."""
+
+    if not isinstance(value, Decimal) or not value.is_finite():
+        return False
+    return _is_decimal_storage_valid(value)
+
+
+def _is_decimal_storage_valid(value: Decimal) -> bool:
+    scale = max(-value.as_tuple().exponent, 0)
+    integer_digits = 0 if value.is_zero() else max(value.adjusted() + 1, 0)
+    return scale <= MAX_SCALAR_DECIMAL_SCALE and integer_digits <= MAX_SCALAR_DECIMAL_INTEGER_DIGITS
+
+
+def _normalize_decimal_fraction(value: Decimal) -> Decimal:
+    """Remove only insignificant fractional zeroes without applying decimal context rounding."""
+
+    if value.is_zero():
+        return Decimal(0)
+    sign, digits, exponent = value.as_tuple()
+    maximum_trim = min(-exponent, len(digits)) if exponent < 0 else 0
+    trailing_zero_count = 0
+    for index in range(len(digits) - 1, len(digits) - maximum_trim - 1, -1):
+        if digits[index] != 0:
+            break
+        trailing_zero_count += 1
+    if trailing_zero_count == 0:
+        return value
+    return Decimal((sign, digits[:-trailing_zero_count], exponent + trailing_zero_count))
 
 
 def _is_valid_npi(value: str) -> bool:
