@@ -100,3 +100,5 @@ def test_finality_downgrade_removes_references_before_finality_tables(monkeypatc
     assert "LOCK TABLE" in normalized
     assert "IN SHARE ROW EXCLUSIVE MODE" in normalized
     assert "DROP COLUMN IF EXISTS rejection_id" in normalized
+    assert "code ~ '^[a-z][a-z0-9_]{0,62}$'" in normalized
+    assert "{{0,62}}" not in normalized

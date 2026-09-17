@@ -609,6 +609,7 @@ _MATERIALIZATION_IDENTITY_COLUMNS = frozenset(
         "base_generation_id",
         "capture_bundle_id",
         "child_revision_id",
+        "context_child_revision_id",
         "dataset_id",
         "definition_revision_id",
         "entity_binding_id",
