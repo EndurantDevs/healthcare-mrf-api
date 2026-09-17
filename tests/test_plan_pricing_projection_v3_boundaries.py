@@ -61,11 +61,16 @@ def _build_state() -> projection_types._BuildState:
 def test_provider_identities_fail_closed_and_ignore_unrequested_rows() -> None:
     """Validate ordinals and provider-set identities before staging."""
 
-    for ordinal in (True, -1):
+    for ordinal in (True, -1, "invalid"):
         with pytest.raises(ValueError, match="ordinal is invalid"):
             provider_stage._binding_ordinal(_binding(ordinal))
     with pytest.raises(ValueError, match="identity is invalid"):
         provider_stage._provider_set_ids_by_key(({"_ptg_provider_set_key": True},), {7})
+    with pytest.raises(ValueError, match="identity is invalid"):
+        provider_stage._provider_set_ids_by_key(
+            ({"_ptg_provider_set_key": "invalid"},),
+            {7},
+        )
     assert provider_stage._provider_set_ids_by_key(
         (
             {

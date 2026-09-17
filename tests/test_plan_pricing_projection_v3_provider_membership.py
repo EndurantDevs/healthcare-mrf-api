@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -140,6 +141,16 @@ async def test_declared_empty_provider_set_contributes_no_memberships(
     [
         ({}, {"1" * 32: ()}),
         (_provider_metadata(("1" * 32, 7, 1)), {"1" * 32: ()}),
+        (_provider_metadata(("1" * 32, 7, 0)), {}),
+        (
+            {
+                "1" * 32: SimpleNamespace(
+                    provider_set_key=True,
+                    provider_count=1,
+                )
+            },
+            {"1" * 32: (11,)},
+        ),
     ],
 )
 def test_provider_membership_requires_authoritative_count_parity(
@@ -151,6 +162,17 @@ def test_provider_membership_requires_authoritative_count_parity(
             [{"provider_set_key": 7, "provider_set_id": "1" * 32}],
             metadata_by_id,
             npis_by_set,
+        )
+
+
+def test_provider_membership_rejects_invalid_npis() -> None:
+    provider_set_id = "1" * 32
+
+    with pytest.raises(ValueError, match="membership exceeds its bound"):
+        provider_stage._validate_provider_set_memberships(
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            _provider_metadata((provider_set_id, 7, 1)),
+            {provider_set_id: (0,)},
         )
 
 
@@ -190,6 +212,55 @@ async def test_projection_membership_rejects_cumulative_count_before_hydration(
         )
 
     membership_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_accepts_empty_batch_without_hydration(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value={}),
+    )
+    membership_reader = AsyncMock()
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+
+    ordinal, memberships = await provider_stage._bounded_provider_memberships(
+        _ExecuteSession(),
+        _binding(3),
+        [],
+        projection._BuildState(hashlib.sha256()),
+    )
+
+    assert ordinal == 3
+    assert memberships == {}
+    membership_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_rejects_incomplete_hydration_batch(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value=_provider_metadata((provider_set_id, 7, 1))),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_provider_npis_for_sets",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(ValueError, match="membership is incomplete"):
+        await provider_stage._bounded_provider_memberships(
+            _ExecuteSession(),
+            _binding(),
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            projection._BuildState(hashlib.sha256()),
+        )
 
 
 @pytest.mark.asyncio

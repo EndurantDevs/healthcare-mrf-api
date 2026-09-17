@@ -1142,6 +1142,28 @@ async def test_provider_npi_exact_read_bypasses_v4_hot_prefixes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_provider_membership_read_modes_require_boolean_flags():
+    provider_set_id = "01" * 16
+    serving_tables = _strict_v3_tables(shared_snapshot_key=91)
+
+    with pytest.raises(ValueError, match="read mode is invalid"):
+        await ptg2_serving._provider_npis_for_sets(
+            object(),
+            serving_tables,
+            (provider_set_id,),
+            use_prefix_cache=1,
+        )
+    with pytest.raises(ValueError, match="read mode is invalid"):
+        await ptg2_serving._provider_npi_member_ids_by_set(
+            object(),
+            serving_tables,
+            (provider_set_id,),
+            limit_per_set=1,
+            use_hot_prefixes=1,
+        )
+
+
+@pytest.mark.asyncio
 async def test_filtered_provider_prefix_cache_reuses_identical_filter(
     monkeypatch,
 ):
