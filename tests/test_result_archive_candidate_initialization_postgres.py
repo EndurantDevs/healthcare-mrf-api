@@ -22,6 +22,7 @@ from db.migration_ptg2_frozen_source_file_binding import install_frozen_source_f
 from db.models._legacy import Base
 from process.ptg_parts import result_archive_candidate_initialization as initialization
 from process.ptg_parts import result_archive_candidate_preparation as preparation
+from process.ptg_parts import result_archive_receive_binding as receive_binding
 from process.ptg_parts.frozen_rate_binding import frozen_internal_run_id, frozen_rate_binding_from_params
 from process.ptg_parts.result_archive_source_authority import (
     PtgResultArchiveSourceAuthority,
@@ -322,6 +323,37 @@ async def _initialize_and_prepare(fixture: _NativeFixture):
     return initialized, prepared
 
 
+async def _receive_initialize_and_prepare(fixture: _NativeFixture):
+    async with _caller_transaction() as session:
+        frozen_params = await receive_binding.receive_frozen_binding_params(
+            session,
+            schema_name=fixture.destination_schema,
+            staging_schema_name=fixture.stage_schema,
+            source_snapshot_key=71,
+            destination_snapshot_id="received-candidate",
+            source_key="source_a",
+            authenticated_source_archive_metadata=fixture.authority,
+        )
+        initialized = await initialization.initialize_result_archive_candidate(
+            session,
+            schema_name=fixture.destination_schema,
+            staging_schema_name=fixture.stage_schema,
+            source_snapshot_key=71,
+            destination_snapshot_id="received-candidate",
+            frozen_binding_params=frozen_params,
+            authenticated_source_archive_metadata=fixture.authority,
+        )
+        prepared = await preparation.prepare_result_archive_candidate_evidence(
+            session,
+            schema_name=fixture.destination_schema,
+            staging_schema_name=fixture.stage_schema,
+            source_snapshot_key=71,
+            destination_snapshot_id="received-candidate",
+            frozen_binding_params=frozen_params,
+        )
+    return frozen_params, initialized, prepared
+
+
 async def _seed_preexisting_destination_source(fixture: _NativeFixture) -> None:
     """Seed the same semantic source with destination-local provenance."""
 
@@ -478,6 +510,83 @@ async def test_native_initialization_feeds_preparation_replays_and_preserves_sib
     assert prepared.destination_snapshot_id == "local-candidate"
     await _assert_local_candidate_boundary(fixture, destination)
     await _assert_destination_provenance_preserved(destination)
+
+
+@pytest.mark.asyncio
+async def test_native_receive_binding_feeds_destination_initialization_and_exact_replay(native_candidate) -> None:
+    fixture = native_candidate
+
+    frozen_params, initialized, prepared = await _receive_initialize_and_prepare(fixture)
+    replayed_params, replayed, replayed_preparation = await _receive_initialize_and_prepare(fixture)
+
+    filing_id = frozen_params["source_file_import_id"]
+    assert frozen_params == replayed_params
+    assert filing_id == frozen_params["import_id"]
+    assert filing_id.startswith("archive-")
+    assert len(filing_id.encode("utf-8")) == 64
+    assert filing_id != "source-filing"
+    assert initialized.destination_import_run_id == frozen_internal_run_id(filing_id)
+    assert initialized.destination_import_run_id.startswith("ptg2:archive-")
+    assert initialized.reused is False
+    assert replayed == initialization.InitializedResultArchiveCandidate(**{**initialized.__dict__, "reused": True})
+    assert prepared == replayed_preparation
+
+
+@pytest.mark.asyncio
+async def test_native_receive_binding_rejects_unapproved_source_without_destination_writes(native_candidate) -> None:
+    fixture = native_candidate
+    destination = _quoted(fixture.destination_schema)
+
+    async with _caller_transaction() as session:
+        with pytest.raises(
+            initialization.ResultArchiveCandidateInitializationError,
+            match="received source key differs",
+        ):
+            await receive_binding.receive_frozen_binding_params(
+                session,
+                schema_name=fixture.destination_schema,
+                staging_schema_name=fixture.stage_schema,
+                source_snapshot_key=71,
+                destination_snapshot_id="received-candidate",
+                source_key="different-source",
+                authenticated_source_archive_metadata=fixture.authority,
+            )
+
+    assert await db.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_snapshot") == 0
+    assert await db.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_import_run") == 0
+
+
+@pytest.mark.asyncio
+async def test_native_receive_binding_rejects_altered_staged_manifest_without_destination_writes(
+    native_candidate,
+) -> None:
+    fixture = native_candidate
+    stage = _quoted(fixture.stage_schema)
+    destination = _quoted(fixture.destination_schema)
+    await db.status(
+        f"UPDATE {stage}.ptg2_snapshot "
+        "SET manifest = jsonb_set(manifest::jsonb, '{frozen_rate_file_set_sha256}', "
+        "to_jsonb(CAST(:digest AS text)))::json",
+        digest="f" * 64,
+    )
+
+    async with _caller_transaction() as session:
+        with pytest.raises(
+            initialization.ResultArchiveCandidateInitializationError,
+            match="restored source authority does not match",
+        ):
+            await receive_binding.receive_frozen_binding_params(
+                session,
+                schema_name=fixture.destination_schema,
+                staging_schema_name=fixture.stage_schema,
+                source_snapshot_key=71,
+                destination_snapshot_id="received-candidate",
+                source_key="source_a",
+                authenticated_source_archive_metadata=fixture.authority,
+            )
+
+    assert await db.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_snapshot") == 0
+    assert await db.scalar(f"SELECT COUNT(*) FROM {destination}.ptg2_import_run") == 0
 
 
 @pytest.mark.asyncio
