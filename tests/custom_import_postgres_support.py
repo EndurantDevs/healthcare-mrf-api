@@ -1001,19 +1001,7 @@ async def _seed_child_revisions(
     """Create child revisions, family links, and scalar projections in one order."""
 
     child_revision_ids: list[int] = []
-    source_ordinals = material_spec.child_source_ordinals
-    if source_ordinals is None:
-        source_ordinals = tuple(range(len(material_spec.child_keys)))
-    if len(source_ordinals) != len(material_spec.child_keys):
-        raise ValueError("child source ordinals must align with child keys")
-    child_rows = tuple(
-        zip(
-            source_ordinals,
-            material_spec.child_keys,
-            child_payloads,
-            strict=True,
-        )
-    )
+    child_rows = _child_rows_for_material(material_spec, child_payloads)
     insertion_rows = tuple(reversed(child_rows)) if material_spec.reverse_insertion else child_rows
     for source_ordinal, child_key, child_payload in insertion_rows:
         canonical_parent_key = root_record.canonical_logical_key
@@ -1059,6 +1047,27 @@ async def _seed_child_revisions(
         )
         await session.flush()
     return tuple(child_revision_ids)
+
+
+def _child_rows_for_material(
+    material_spec: FamilyMaterialSpec,
+    child_payloads: tuple[str, ...],
+) -> tuple[tuple[int, str, str], ...]:
+    """Align child provenance positions with logical keys and payloads."""
+
+    source_ordinals = material_spec.child_source_ordinals
+    if source_ordinals is None:
+        source_ordinals = tuple(range(len(material_spec.child_keys)))
+    if len(source_ordinals) != len(material_spec.child_keys):
+        raise ValueError("child source ordinals must align with child keys")
+    return tuple(
+        zip(
+            source_ordinals,
+            material_spec.child_keys,
+            child_payloads,
+            strict=True,
+        )
+    )
 
 
 def _add_child_scalars(

@@ -1995,6 +1995,68 @@ async def _seed_contextual_winner_candidate(
     return attempt, material
 
 
+async def _seal_contextual_winner_baseline(session, graph: PublicationGraph):
+    base_attempt, base_material = await _seed_contextual_winner_candidate(
+        session,
+        graph,
+        base_generation_id=None,
+    )
+    base_seal = await seal_generation(
+        session,
+        dataset_id=graph.dataset_id,
+        generation_id=base_attempt.generation_id,
+        lease_fence=base_attempt.fence,
+        lease_token=base_attempt.token,
+    )
+    await activate_generation(
+        session,
+        dataset_id=graph.dataset_id,
+        target_generation_id=base_attempt.generation_id,
+        expected_generation_id=None,
+        expected_pointer_version=0,
+    )
+    return base_attempt, base_material, base_seal
+
+
+async def _assert_contextual_candidate_is_no_change(
+    session,
+    graph: PublicationGraph,
+    base_attempt: GenerationAttempt,
+    base_material: FamilyMaterial,
+    base_seal,
+    candidate_root_ordinal: int,
+    candidate_child_ordinals: tuple[int, ...],
+) -> None:
+    candidate_attempt, candidate_material = await _seed_contextual_winner_candidate(
+        session,
+        graph,
+        base_generation_id=base_attempt.generation_id,
+        prior_material=base_material,
+        root_source_ordinal=candidate_root_ordinal,
+        child_source_ordinals=candidate_child_ordinals,
+    )
+    assert candidate_material.child_revision_ids != base_material.child_revision_ids
+    receipt = await record_no_change(
+        session,
+        dataset_id=graph.dataset_id,
+        execution_id=candidate_attempt.execution_id,
+        expected_generation_id=base_attempt.generation_id,
+        expected_pointer_version=1,
+        candidate_generation_id=candidate_attempt.generation_id,
+        lease_fence=candidate_attempt.fence,
+        lease_token=candidate_attempt.token,
+    )
+    candidate_seal = await session.get(CustomImportGenerationSeal, candidate_attempt.generation_id)
+    assert candidate_seal is not None
+    candidate_materialization = candidate_seal.materialization_sha256.hex()
+    if candidate_root_ordinal == 0 and candidate_child_ordinals == (0,):
+        assert candidate_materialization == base_seal.materialization_sha256
+    else:
+        assert candidate_materialization != base_seal.materialization_sha256
+    assert candidate_seal.effective_output_sha256.hex() == base_seal.effective_output_sha256
+    assert receipt.event_kind == "no_change"
+
+
 @pytest.mark.parametrize(
     ("candidate_root_ordinal", "candidate_child_ordinals"),
     (
@@ -2016,60 +2078,19 @@ async def test_contextual_winner_provenance_does_not_prevent_no_change(
         async with case.sessions() as session:
             async with session.begin():
                 graph = await seed_publication_graph(session, context_collection_slot=1)
-                base_attempt, base_material = await _seed_contextual_winner_candidate(
-                    session,
-                    graph,
-                    base_generation_id=None,
-                )
-                base_seal = await seal_generation(
-                    session,
-                    dataset_id=graph.dataset_id,
-                    generation_id=base_attempt.generation_id,
-                    lease_fence=base_attempt.fence,
-                    lease_token=base_attempt.token,
-                )
-                await activate_generation(
-                    session,
-                    dataset_id=graph.dataset_id,
-                    target_generation_id=base_attempt.generation_id,
-                    expected_generation_id=None,
-                    expected_pointer_version=0,
-                )
+                base_attempt, base_material, base_seal = await _seal_contextual_winner_baseline(session, graph)
 
         async with case.sessions() as session:
             async with session.begin():
-                candidate_attempt, candidate_material = await _seed_contextual_winner_candidate(
+                await _assert_contextual_candidate_is_no_change(
                     session,
                     graph,
-                    base_generation_id=base_attempt.generation_id,
-                    prior_material=base_material,
-                    root_source_ordinal=candidate_root_ordinal,
-                    child_source_ordinals=candidate_child_ordinals,
+                    base_attempt,
+                    base_material,
+                    base_seal,
+                    candidate_root_ordinal,
+                    candidate_child_ordinals,
                 )
-                assert candidate_material.child_revision_ids != base_material.child_revision_ids
-
-                receipt = await record_no_change(
-                    session,
-                    dataset_id=graph.dataset_id,
-                    execution_id=candidate_attempt.execution_id,
-                    expected_generation_id=base_attempt.generation_id,
-                    expected_pointer_version=1,
-                    candidate_generation_id=candidate_attempt.generation_id,
-                    lease_fence=candidate_attempt.fence,
-                    lease_token=candidate_attempt.token,
-                )
-                candidate_seal = await session.get(
-                    CustomImportGenerationSeal,
-                    candidate_attempt.generation_id,
-                )
-                assert candidate_seal is not None
-                candidate_materialization = candidate_seal.materialization_sha256.hex()
-                if candidate_root_ordinal == 0 and candidate_child_ordinals == (0,):
-                    assert candidate_materialization == base_seal.materialization_sha256
-                else:
-                    assert candidate_materialization != base_seal.materialization_sha256
-                assert candidate_seal.effective_output_sha256.hex() == base_seal.effective_output_sha256
-                assert receipt.event_kind == "no_change"
 
 
 @pytest.mark.asyncio
