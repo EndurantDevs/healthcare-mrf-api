@@ -7450,9 +7450,48 @@ components:
       properties:
         service_count:
           type: integer
+          description: Number of distinct provider-service codes published in the CMS detail source and retained by the API.
         location_count:
           type: integer
       required: [service_count, location_count]
+    PricingProviderServiceCodeCoverage:
+      type: object
+      description: |
+        Reconciles the CMS provider aggregate with its separately published
+        provider-and-service detail. CMS excludes detail cells derived from 10
+        or fewer beneficiaries, so the aggregate can report more distinct codes
+        than the public detail source can identify.
+      properties:
+        source_distinct_code_count:
+          type: integer
+          nullable: true
+        published_detail_code_count:
+          type: integer
+        unpublished_detail_code_count:
+          type: integer
+          nullable: true
+        detail_coverage_ratio:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        complete:
+          type: boolean
+          nullable: true
+        status:
+          type: string
+          enum: [complete, partial, unknown, inconsistent]
+        limitation:
+          type: string
+          nullable: true
+      required:
+      - source_distinct_code_count
+      - published_detail_code_count
+      - unpublished_detail_code_count
+      - detail_coverage_ratio
+      - complete
+      - status
+      - limitation
     PricingProviderRecord:
       type: object
       properties:
@@ -7484,6 +7523,7 @@ components:
           type: number
         total_reported_service_codes:
           type: number
+          description: Total distinct HCPCS codes in the CMS provider aggregate, including codes that may be absent from the privacy-suppressed detail source.
         total_submitted_charges:
           type: number
         total_beneficiaries:
@@ -7508,6 +7548,8 @@ components:
           type: string
         summary:
           $ref: '#/components/schemas/PricingProviderSummary'
+        service_code_coverage:
+          $ref: '#/components/schemas/PricingProviderServiceCodeCoverage'
         legacy_field_aliases:
           $ref: '#/components/schemas/PricingLegacyFieldAliases'
     PricingProviderProcedureRecord:

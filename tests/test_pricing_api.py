@@ -34,6 +34,7 @@ assert MODULE_SPEC and MODULE_SPEC.loader
 MODULE_SPEC.loader.exec_module(pricing_module)
 
 get_provider_procedure = pricing_module.get_provider_procedure
+get_pricing_provider = pricing_module.get_pricing_provider
 get_provider_procedure_estimated_cost_level_internal = (
     pricing_module.get_provider_procedure_cost_level
 )
@@ -213,6 +214,59 @@ def make_request(results, args=None):
         args=args or {},
         ctx=types.SimpleNamespace(sa_session=session),
     )
+
+
+@pytest.mark.asyncio
+async def test_get_pricing_provider_explains_partial_service_code_coverage():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "year": 2024,
+                        "total_distinct_hcpcs_codes": 22.0,
+                    }
+                ]
+            ),
+            FakeResult(scalar=8),
+            FakeResult(scalar=9),
+        ],
+        args={"year": "2024"},
+    )
+
+    result = json.loads((await get_pricing_provider(request, "1234567890")).body)
+
+    assert result["summary"] == {"service_count": 8, "location_count": 9}
+    assert result["service_code_coverage"] == {
+        "source_distinct_code_count": 22,
+        "published_detail_code_count": 8,
+        "unpublished_detail_code_count": 14,
+        "detail_coverage_ratio": 0.363636,
+        "complete": False,
+        "status": "partial",
+        "limitation": "cms_provider_service_detail_privacy_suppression",
+    }
+
+
+@pytest.mark.parametrize(
+    ("source_count", "published_count", "status", "ratio"),
+    [
+        (None, 2, "unknown", None),
+        (0, 0, "complete", 1.0),
+        (2, 3, "inconsistent", 1.0),
+    ],
+)
+def test_service_code_coverage_states(
+    source_count,
+    published_count,
+    status,
+    ratio,
+):
+    coverage = pricing_module._service_code_coverage(source_count, published_count)
+
+    assert coverage["status"] == status
+    assert coverage["detail_coverage_ratio"] == ratio
 
 
 def _provider_prescription_queries(request):
