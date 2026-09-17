@@ -1043,6 +1043,7 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
                 "q": "clinic",
                 "codes": "207Q00000X",
                 "include_total": "true",
+                "plan_network": "424242424",
                 "limit": "10",
                 "start": "0",
             }
@@ -1061,7 +1062,17 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
         normalized_sql = " ".join(query_sql.lower().split())
         assert "taxonomy_matched_npi as materialized" in normalized_sql
         assert expected_join in normalized_sql
+        assert "c.type in ('primary', 'secondary', 'practice', 'site')" in normalized_sql
+        assert "plans_network_array && :plan_network_array" in normalized_sql
         assert "as provider_taxonomy_match on true" not in normalized_sql
+
+    network_params = [
+        params
+        for sql, params in conn.sql_calls
+        if "plans_network_array && :plan_network_array" in sql
+    ]
+    assert network_params
+    assert all(params["plan_network_array"] == [424242424] for params in network_params)
 
     assert {
         "index_elements": ("coalesce(npi, inferred_npi)",),
