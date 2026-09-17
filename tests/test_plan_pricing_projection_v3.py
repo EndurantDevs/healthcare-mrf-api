@@ -123,7 +123,7 @@ async def test_provider_set_membership_is_exactly_bounded(monkeypatch) -> None:
             projection._BuildState(hashlib.sha256()),
         )
 
-    assert provider_npis.await_args.kwargs["limit_per_set"] == (projection.MAX_PROVIDER_NPIS_PER_SET + 1)
+    provider_npis.assert_not_awaited()
 
 
 @pytest.mark.asyncio
