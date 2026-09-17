@@ -12,6 +12,7 @@ from api import ptg2_candidate_audit_scope_dispatch as scope_dispatch
 from api import ptg2_candidate_audit_v4 as v4_scope
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api.ptg2_v4_graph import V4GraphRoot
 from process.ptg_parts import ptg2_batch_candidate_audit as batch_transport
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
@@ -79,18 +80,21 @@ def _assert_pattern_scope(
     assert observed_scope.provider_set_keys_by_npi == provider_sets_by_npi
     assert observed_scope.price_keys_by_occurrence is None
     assert provider_sets_by_npi[persisted.npi][0] == persisted.provider_set_key
-    assert len(graph_calls) == 1
-    assert graph_calls[0]["npis"] == tuple(sorted(provider_sets_by_npi))
-    assert graph_calls[0]["allowed"] is None
-    assert graph_calls[0]["schema_name"] == "candidate_schema"
-    assert int(graph_calls[0]["max_members"]) > 0
+    assert [call["npis"] for call in graph_calls] == [
+        (npi,) for npi in sorted(provider_sets_by_npi)
+    ]
+    assert all(call["allowed"] is None for call in graph_calls)
+    assert all(
+        call["schema_name"] == "candidate_schema" for call in graph_calls
+    )
+    assert all(int(call["max_members"]) > 0 for call in graph_calls)
 
 
 @pytest.mark.asyncio
 async def test_pattern_v4_candidate_scope_loads_graph_before_forward(
     monkeypatch,
 ):
-    """Resolve the sparse pattern graph before any dense forward payload."""
+    """Resolve bounded pattern coordinates before any dense forward payload."""
 
     challenges, provider_sets_by_npi, persisted = _pattern_scope_fixture()
     root_lookup = AsyncMock(
@@ -145,6 +149,63 @@ async def test_pattern_v4_candidate_scope_loads_graph_before_forward(
 
 
 @pytest.mark.asyncio
+async def test_pattern_v4_bounds_each_npi_before_retaining_the_next(
+    monkeypatch,
+):
+    """Do not combine independent pattern fanout under one graph-member cap."""
+
+    requested_npis = (1_111_111_111, 2_222_222_222)
+    provider_sets_by_npi = {
+        requested_npis[0]: (5, 6, 7),
+        requested_npis[1]: (8, 9, 10),
+    }
+    transient_fixed_bytes = (
+        v4_scope._V4_GRAPH_TRANSIENT_MAP_BYTES
+        + 5 * v4_scope._V4_GRAPH_TRANSIENT_OWNER_BYTES
+    )
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=(
+            v4_scope._result_bytes_for_npis(len(requested_npis))
+            + transient_fixed_bytes
+            + 4 * v4_scope._V4_GRAPH_PEAK_MEMBER_BYTES
+            + 6 * v4_scope._V4_RESULT_MEMBERSHIP_BYTES
+        )
+    )
+    graph_calls: list[tuple[int, ...]] = []
+
+    async def graph_lookup(_session, _tables, npis, **kwargs):
+        normalized_npis = tuple(npis)
+        graph_calls.append(normalized_npis)
+        selected_member_count = sum(
+            len(provider_sets_by_npi[npi]) for npi in normalized_npis
+        )
+        if selected_member_count > int(kwargs["max_members"]):
+            raise PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            )
+        return {
+            npi: provider_sets_by_npi[npi] for npi in normalized_npis
+        }
+
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    observed = await v4_scope._load_pattern_provider_sets(
+        object(),
+        _v4_serving_tables(),
+        requested_npis,
+        budget,
+        schema_name="candidate_schema",
+    )
+
+    assert observed == provider_sets_by_npi
+    assert graph_calls == [(requested_npis[0],), (requested_npis[1],)]
+    assert budget.retained_bytes == (
+        v4_scope._result_bytes_for_npis(len(requested_npis))
+        + 6 * v4_scope._V4_RESULT_MEMBERSHIP_BYTES
+    )
+
+
+@pytest.mark.asyncio
 async def test_pattern_v4_graph_requires_exact_requested_npi_coverage(
     monkeypatch,
 ):
@@ -180,15 +241,29 @@ async def test_pattern_v4_graph_requires_exact_requested_npi_coverage(
 async def test_pattern_v4_graph_failure_releases_budget_without_fallback(
     monkeypatch,
 ):
-    """Fail closed and release transient graph-first retention exactly once."""
+    """Release earlier pattern results when a later coordinate fails."""
 
     challenge = _challenge()
+    later_challenge = AuditBatchChallenge(
+        code_system=challenge.code_system,
+        code=challenge.code,
+        npi=2_234_567_890,
+        source_artifact_key=challenge.source_artifact_key,
+        tuple_digest="c" * 64,
+        network_name_digests=challenge.network_name_digests,
+        multiplicity=1,
+    )
     baseline_bytes = 731
     budget = v4_scope.CandidateAuditDecodedRetentionBudget()
     budget.claim(baseline_bytes, category="the caller baseline")
     forward_scope = AsyncMock()
     broad_scope_lookup = AsyncMock()
-    graph_lookup = AsyncMock(side_effect=RuntimeError("pattern graph failed"))
+    graph_lookup = AsyncMock(
+        side_effect=(
+            {challenge.npi: (5,)},
+            RuntimeError("pattern graph failed"),
+        )
+    )
     monkeypatch.setattr(
         scope_dispatch,
         "load_v4_graph_root",
@@ -212,7 +287,7 @@ async def test_pattern_v4_graph_failure_releases_budget_without_fallback(
             broad_scope_lookup,
             object(),
             _v4_serving_tables(),
-            (challenge,),
+            (challenge, later_challenge),
             (),
             _code_index(),
             schema_name="candidate_schema",
@@ -220,7 +295,7 @@ async def test_pattern_v4_graph_failure_releases_budget_without_fallback(
         )
 
     assert budget.retained_bytes == baseline_bytes
-    graph_lookup.assert_awaited_once()
+    assert graph_lookup.await_count == 2
     forward_scope.assert_not_awaited()
     broad_scope_lookup.assert_not_awaited()
 
