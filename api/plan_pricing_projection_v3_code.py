@@ -19,6 +19,7 @@ from api.plan_pricing_projection_v4_occurrence import (
     store_rate_occurrences as _store_rate_occurrences,
 )
 from api.plan_pricing_projection_v3_provider import (
+    MAX_PROVIDER_NPIS_PER_SET,
     _binding_ordinal,
     _stage_code_provider_sets,
 )
@@ -373,7 +374,7 @@ def _validated_rate_profile(raw_profile: Mapping[str, Any]) -> tuple[Any, ...]:
         or sum(multiplicities) != rate_count
         or rates[0] != Decimal(profile_by_field["minimum_negotiated_rate"])
         or rates[-1] != Decimal(profile_by_field["maximum_negotiated_rate"])
-        or not 1 <= membership_count <= 16_384
+        or not 1 <= membership_count <= MAX_PROVIDER_NPIS_PER_SET
     ):
         raise ValueError("pricing projection rate profile is invalid")
     return (

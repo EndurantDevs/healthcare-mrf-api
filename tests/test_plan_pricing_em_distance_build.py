@@ -253,10 +253,14 @@ async def test_candidate_insert_and_binding_projection_keep_exact_inputs(
         object(), _selection(in_network_bindings=(binding, binding))
     )
     assert len(built) == 2
-    assert [limit for _payload, limit in calls] == [65_536, 65_532]
+    assert [limit for _payload, limit in calls] == [262_144, 262_140]
 
     async def overflowing(*_args, **_kwargs):
-        return SimpleNamespace(raw_code_row_count=65_537)
+        return SimpleNamespace(
+            raw_code_row_count=(
+                projection_build.MAX_PROJECTION_CODE_ROWS + 1
+            )
+        )
 
     monkeypatch.setattr(projection_build, "binding_projection", overflowing)
     with pytest.raises(ValueError, match="code-row bound"):

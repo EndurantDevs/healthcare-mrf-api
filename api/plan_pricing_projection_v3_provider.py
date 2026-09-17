@@ -238,32 +238,73 @@ def _validate_provider_set_memberships(
     metadata_by_id: Mapping[str, Any],
     npis_by_set: Mapping[str, tuple[int, ...]],
 ) -> None:
+    _validated_declared_membership_count(provider_sets, metadata_by_id)
     expected_key_by_id = {
         str(provider_set["provider_set_id"]): int(provider_set["provider_set_key"]) for provider_set in provider_sets
+    }
+    if set(npis_by_set) != set(expected_key_by_id):
+        raise ValueError("pricing projection provider membership is incomplete")
+    for provider_set_id in expected_key_by_id:
+        metadata = metadata_by_id[provider_set_id]
+        provider_npis = npis_by_set[provider_set_id]
+        if len(provider_npis) != metadata.provider_count:
+            raise ValueError("pricing projection provider membership is incomplete")
+        if (
+            any(type(npi) is not int or npi <= 0 for npi in provider_npis)
+            or len(set(provider_npis)) != len(provider_npis)
+        ):
+            raise ValueError("pricing projection provider membership exceeds its bound")
+
+
+def _validated_declared_membership_count(
+    provider_sets: list[dict[str, Any]],
+    metadata_by_id: Mapping[str, Any],
+) -> int:
+    """Validate authoritative counts before allocating provider memberships."""
+
+    expected_key_by_id = {
+        str(provider_set["provider_set_id"]): int(provider_set["provider_set_key"])
+        for provider_set in provider_sets
     }
     if (
         len(expected_key_by_id) != len(provider_sets)
         or set(metadata_by_id) != set(expected_key_by_id)
-        or set(npis_by_set) != set(expected_key_by_id)
     ):
         raise ValueError("pricing projection provider membership is incomplete")
+    declared_membership_count = 0
     for provider_set_id, provider_set_key in expected_key_by_id.items():
         metadata = metadata_by_id[provider_set_id]
-        provider_npis = npis_by_set[provider_set_id]
         if (
             type(metadata.provider_set_key) is not int
             or metadata.provider_set_key != provider_set_key
             or type(metadata.provider_count) is not int
             or metadata.provider_count < 0
-            or len(provider_npis) != metadata.provider_count
         ):
             raise ValueError("pricing projection provider membership is incomplete")
-        if (
-            len(provider_npis) > MAX_PROVIDER_NPIS_PER_SET
-            or any(type(npi) is not int or npi <= 0 for npi in provider_npis)
-            or len(set(provider_npis)) != len(provider_npis)
-        ):
+        if metadata.provider_count > MAX_PROVIDER_NPIS_PER_SET:
             raise ValueError("pricing projection provider membership exceeds its bound")
+        declared_membership_count += metadata.provider_count
+    return declared_membership_count
+
+
+def _provider_membership_batches(
+    provider_set_ids: tuple[str, ...],
+    metadata_by_id: Mapping[str, Any],
+) -> Iterable[tuple[str, ...]]:
+    """Bound simultaneous membership hydration by declared NPI count."""
+
+    pending_ids: list[str] = []
+    pending_count = 0
+    for provider_set_id in provider_set_ids:
+        provider_count = int(metadata_by_id[provider_set_id].provider_count)
+        if pending_ids and pending_count + provider_count > MAX_PROVIDER_NPIS_PER_SET:
+            yield tuple(pending_ids)
+            pending_ids = []
+            pending_count = 0
+        pending_ids.append(provider_set_id)
+        pending_count += provider_count
+    if pending_ids:
+        yield tuple(pending_ids)
 
 
 def _staged_membership_rows(
@@ -330,20 +371,42 @@ async def _bounded_provider_memberships(
         binding.serving_tables,
         provider_set_ids,
     )
-    npis_by_set = await serving._provider_npis_for_sets(
-        session,
-        binding.serving_tables,
-        provider_set_ids,
-        limit_per_set=MAX_PROVIDER_NPIS_PER_SET + 1,
+    declared_membership_count = _validated_declared_membership_count(
+        provider_sets,
+        metadata_by_id,
     )
+    if (
+        state.provider_membership_count + declared_membership_count
+        > MAX_PROJECTION_PROVIDER_MEMBERSHIPS
+    ):
+        raise ValueError("pricing projection membership bound exceeded")
+    npis_by_set: dict[str, tuple[int, ...]] = {}
+    for provider_set_id_batch in _provider_membership_batches(
+        provider_set_ids,
+        metadata_by_id,
+    ):
+        maximum_declared_count = max(
+            int(metadata_by_id[provider_set_id].provider_count)
+            for provider_set_id in provider_set_id_batch
+        )
+        batch_npis_by_set = await serving._provider_npis_for_sets(
+            session,
+            binding.serving_tables,
+            provider_set_id_batch,
+            limit_per_set=maximum_declared_count + 1,
+            use_prefix_cache=False,
+            use_hot_prefixes=False,
+        )
+        if set(batch_npis_by_set) != set(provider_set_id_batch):
+            raise ValueError("pricing projection provider membership is incomplete")
+        npis_by_set.update(batch_npis_by_set)
     _validate_provider_set_memberships(
         provider_sets,
         metadata_by_id,
         npis_by_set,
     )
-    membership_count = sum(map(len, npis_by_set.values()))
-    if state.provider_membership_count + membership_count > MAX_PROJECTION_PROVIDER_MEMBERSHIPS:
-        raise ValueError("pricing projection membership bound exceeded")
+    if sum(map(len, npis_by_set.values())) != declared_membership_count:
+        raise ValueError("pricing projection provider membership is incomplete")
     return binding_ordinal, npis_by_set
 
 

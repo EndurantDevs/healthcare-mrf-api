@@ -4,6 +4,7 @@ import asyncio
 import copy
 from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1070,6 +1071,72 @@ async def test_provider_npi_prefix_cache_reuses_and_grows_sealed_membership(
         ((provider_set_id,), 32),
         ((provider_set_id,), 64),
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_npi_uncached_read_bypasses_prefix_cache(monkeypatch):
+    """Projection reads neither trust nor retain process-global NPI prefixes."""
+
+    provider_set_id = "01" * 16
+    member_npis = (1000000001, 1000000002, 1000000003)
+    membership_loader = ProviderMembershipLoader(member_npis)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_provider_npi_member_ids_by_set",
+        membership_loader.load,
+    )
+    serving_tables = _strict_v3_tables(shared_snapshot_key=91)
+    cache_key = (91, provider_set_id)
+    cached_entry = (2, (1999999999,), True)
+    ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+    ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] = cached_entry
+    try:
+        npis_by_set = await ptg2_serving._provider_npis_for_sets(
+            object(),
+            serving_tables,
+            (provider_set_id,),
+            limit_per_set=2,
+            use_prefix_cache=False,
+        )
+        assert npis_by_set == {provider_set_id: member_npis[:2]}
+        assert membership_loader.calls == [((provider_set_id,), 2)]
+        assert ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE[cache_key] == cached_entry
+    finally:
+        ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_provider_npi_exact_read_bypasses_v4_hot_prefixes(monkeypatch):
+    """Projection reads use the cold exact graph even below the V4 hot target."""
+
+    provider_set_id = "01" * 16
+    hot_reader = AsyncMock(return_value={provider_set_id: ("npi:1000000001",)})
+    exact_members = {
+        provider_set_id: (
+            "npi:1000000001",
+            "npi:1000000002",
+            "npi:1000000003",
+        )
+    }
+    cold_reader = AsyncMock(return_value=exact_members)
+    monkeypatch.setattr(ptg2_serving, "_v4_npi_prefixes_by_set", hot_reader)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_cold_provider_npi_member_ids_by_set",
+        cold_reader,
+    )
+
+    observed = await ptg2_serving._provider_npi_member_ids_by_set(
+        object(),
+        _strict_v4_tables(),
+        (provider_set_id,),
+        limit_per_set=3,
+        use_hot_prefixes=False,
+    )
+
+    assert observed == exact_members
+    assert cold_reader.await_args.kwargs == {"limit_per_set": 3}
+    hot_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
