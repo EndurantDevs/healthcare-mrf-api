@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import pytest
 
+from process.custom_import import read_core
 from process.custom_import.read_core import (
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
     CustomImportReadRequestError,
     CustomImportReadService,
     ExtensionReadAuthorization,
+    MAX_PAGE_OFFSET,
     MAX_READ_TIMEOUT_MS,
     PinnedReadTarget,
     ReadCursorCodec,
@@ -54,6 +56,68 @@ def test_read_service_rejects_an_invalid_statement_timeout(statement_timeout_ms)
             cursor_secret=b"s" * 32,
             statement_timeout_ms=statement_timeout_ms,
         )
+
+
+def test_next_cursor_stops_before_exceeding_the_offset_limit():
+    service = CustomImportReadService(authorizer=None, cursor_secret=b"s" * 32)
+    context = read_core._ReadContext(
+        target=_target(),
+        pointer_version=1,
+        definition=None,
+        profile_slot=1,
+        profile_context_slot=0,
+        collection_slots_by_name={},
+        collection_names_by_slot={},
+    )
+    plan = read_core._SearchPlan(filters=(), order_terms=(), page_size=100, fingerprint="a" * 64)
+
+    allowed_cursor = service._next_search_cursor(
+        context,
+        plan,
+        "b" * 64,
+        read_core._PageWindow(
+            offset=MAX_PAGE_OFFSET - 100,
+            total=MAX_PAGE_OFFSET + 100,
+            returned_count=100,
+            issued_at=1_000,
+            expires_at=1_100,
+        ),
+    )
+    assert allowed_cursor is not None
+    assert (
+        service._cursor_codec.open(
+            allowed_cursor,
+            pinned_target=_target(),
+            query_fingerprint="a" * 64,
+            authorization_scope_sha256="b" * 64,
+            trusted_now=1_050,
+        ).offset
+        == MAX_PAGE_OFFSET
+    )
+
+    for offset, returned_count in ((MAX_PAGE_OFFSET, 1), (MAX_PAGE_OFFSET - 25, 50)):
+        assert (
+            service._next_search_cursor(
+                context,
+                plan,
+                "b" * 64,
+                read_core._PageWindow(
+                    offset=offset,
+                    total=MAX_PAGE_OFFSET + 100,
+                    returned_count=returned_count,
+                    issued_at=1_000,
+                    expires_at=1_100,
+                ),
+            )
+            is None
+        )
+
+
+def test_string_filter_rejects_invalid_unicode_without_exposing_the_value():
+    with pytest.raises(
+        CustomImportReadRequestError, match="^filter value for synthetic_field is not an indexed string$"
+    ):
+        read_core._normalized_string("\ud800", "synthetic_field")
 
 
 def test_cursor_rejects_tampering_scope_generation_and_expiry():

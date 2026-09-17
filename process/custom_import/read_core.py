@@ -454,7 +454,7 @@ class CustomImportReadService:
         """Issue the next offset only when the exact counted result has another page."""
 
         next_offset = page_window.offset + page_window.returned_count
-        if page_window.returned_count == 0 or next_offset >= page_window.total:
+        if page_window.returned_count == 0 or next_offset >= page_window.total or next_offset > MAX_PAGE_OFFSET:
             return None
         return self._cursor_codec.issue(
             ReadCursorState(
@@ -957,7 +957,13 @@ def _normalized_filter_value(
 
 
 def _normalized_string(value: object, field_id: str) -> tuple[str, str]:
-    if type(value) is not str or "\x00" in value or len(value.encode("utf-8")) > 2_048:
+    if type(value) is not str or "\x00" in value:
+        raise CustomImportReadRequestError(f"filter value for {field_id} is not an indexed string")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise CustomImportReadRequestError(f"filter value for {field_id} is not an indexed string") from None
+    if encoded_length > 2_048:
         raise CustomImportReadRequestError(f"filter value for {field_id} is not an indexed string")
     return value, value
 
