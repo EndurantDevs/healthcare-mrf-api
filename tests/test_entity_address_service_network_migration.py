@@ -11,10 +11,7 @@ import pytest
 from db.models import EntityAddressUnified
 
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic"
-    / "versions"
-    / "20260917120000_entity_address_service_network.py"
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260917120000_entity_address_service_network.py"
 )
 MIGRATION_SPEC = spec_from_file_location(
     "entity_address_service_network_migration",
