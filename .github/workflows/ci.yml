@@ -763,7 +763,7 @@ jobs:
     needs:
     - dev-image-publication
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
+      && (always()) }}
     permissions:
       contents: read
       actions: write
