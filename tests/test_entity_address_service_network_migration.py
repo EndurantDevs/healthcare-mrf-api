@@ -86,7 +86,7 @@ def test_upgrade_builds_or_repairs_then_analyzes(monkeypatch, initial_record):
     operations = _Operations()
     records = iter((initial_record, {"indisvalid": True}))
     monkeypatch.setattr(migration, "op", operations)
-    monkeypatch.setattr(migration, "_table_exists", lambda _schema: True)
+    monkeypatch.setattr(migration, "_has_table", lambda _schema: True)
     monkeypatch.setattr(migration, "_expected_index_shape", lambda _schema: "shape")
     monkeypatch.setattr(
         migration,
