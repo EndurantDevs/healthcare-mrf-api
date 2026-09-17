@@ -1043,7 +1043,6 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
                 "q": "clinic",
                 "codes": "207Q00000X",
                 "include_total": "true",
-                "plan_network": "424242424",
                 "limit": "10",
                 "start": "0",
             }
@@ -1062,22 +1061,42 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
         normalized_sql = " ".join(query_sql.lower().split())
         assert "taxonomy_matched_npi as materialized" in normalized_sql
         assert expected_join in normalized_sql
-        assert "c.type in ('primary', 'secondary', 'practice', 'site')" in normalized_sql
-        assert "plans_network_array && :plan_network_array" in normalized_sql
         assert "as provider_taxonomy_match on true" not in normalized_sql
-
-    network_params = [
-        params
-        for sql, params in conn.sql_calls
-        if "plans_network_array && :plan_network_array" in sql
-    ]
-    assert network_params
-    assert all(params["plan_network_array"] == [424242424] for params in network_params)
 
     assert {
         "index_elements": ("coalesce(npi, inferred_npi)",),
         "name": "coalesced_npi",
     } in npi_module.EntityAddressUnified.__my_additional_indexes__
+
+
+@pytest.mark.asyncio
+async def test_get_all_unified_network_filter_matches_serving_index(monkeypatch):
+    """Keep network SQL aligned with the serving partial-index predicate."""
+    conn = RecordingConnection()
+    monkeypatch.setattr(
+        npi_module,
+        "_address_serving_table_sql",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "plan_network": "424242424",
+                "include_total": "false",
+                "limit": "1",
+            }
+        )
+    )
+
+    page_sql, params = next(
+        call for call in conn.sql_calls if "plans_network_array &&" in call[0]
+    )
+    normalized_sql = " ".join(page_sql.lower().split())
+    assert "c.type in ('primary', 'secondary', 'practice', 'site')" in normalized_sql
+    assert "plans_network_array && :plan_network_array" in normalized_sql
+    assert params["plan_network_array"] == [424242424]
 
 
 @pytest.mark.asyncio
