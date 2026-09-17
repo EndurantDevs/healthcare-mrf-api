@@ -341,3 +341,30 @@ async def test_projection_membership_batches_by_declared_count(monkeypatch) -> N
         }
         for call in membership_reader.await_args_list
     )
+
+
+def test_projection_membership_batches_bound_heterogeneous_read_capacity(
+    monkeypatch,
+) -> None:
+    provider_set_ids = tuple(str(index) * 32 for index in range(1, 4))
+    metadata_by_id = {
+        provider_set_ids[0]: SimpleNamespace(provider_count=4),
+        provider_set_ids[1]: SimpleNamespace(provider_count=1),
+        provider_set_ids[2]: SimpleNamespace(provider_count=1),
+    }
+    monkeypatch.setattr(provider_stage, "MAX_PROVIDER_NPIS_PER_SET", 10)
+
+    batches = list(
+        provider_stage._provider_membership_batches(
+            provider_set_ids,
+            metadata_by_id,
+        )
+    )
+
+    assert batches == [provider_set_ids[:2], provider_set_ids[2:]]
+    for batch in batches:
+        maximum_limit = max(
+            metadata_by_id[provider_set_id].provider_count + 1
+            for provider_set_id in batch
+        )
+        assert len(batch) * maximum_limit <= 11
