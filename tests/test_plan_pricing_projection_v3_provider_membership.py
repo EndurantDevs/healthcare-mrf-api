@@ -188,6 +188,79 @@ def test_provider_membership_accepts_large_complete_set_within_bound() -> None:
 
 
 @pytest.mark.asyncio
+async def test_projection_membership_hydrates_observed_large_set(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    provider_count = 40_000
+    metadata_reader = AsyncMock(
+        return_value=_provider_metadata((provider_set_id, 7, provider_count))
+    )
+    membership_reader = AsyncMock(
+        return_value={provider_set_id: tuple(range(1, provider_count + 1))}
+    )
+    monkeypatch.setattr(serving, "_provider_set_metadata_for_ids", metadata_reader)
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+
+    ordinal, memberships = await provider_stage._bounded_provider_memberships(
+        _ExecuteSession(),
+        _binding(3),
+        [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+        projection._BuildState(hashlib.sha256()),
+    )
+
+    assert ordinal == 3
+    assert memberships == {
+        provider_set_id: tuple(range(1, provider_count + 1))
+    }
+    assert membership_reader.await_args.kwargs == {
+        "limit_per_set": provider_count + 1,
+        "use_prefix_cache": False,
+        "use_hot_prefixes": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_set_stage_preserves_all_sets_across_smaller_batches(
+    monkeypatch,
+) -> None:
+    class _MappingRows:
+        def mappings(self):
+            return iter(())
+
+    class _EmptySession:
+        async def execute(self, *_args, **_kwargs):
+            return _MappingRows()
+
+    monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
+    stage_batch = AsyncMock()
+    serving_rows = [
+        {
+            "_ptg_provider_set_key": key,
+            "provider_set_global_id_128": f"{key:032x}",
+        }
+        for key in range(1, 12)
+    ]
+
+    await provider_stage._stage_code_provider_sets(
+        _EmptySession(),
+        _binding(),
+        serving_rows,
+        set(range(1, 12)),
+        projection._BuildState(hashlib.sha256()),
+        stage_provider_set_batch=stage_batch,
+    )
+
+    batches = [call.args[2] for call in stage_batch.await_args_list]
+    assert list(map(len, batches)) == [10, 1]
+    assert [
+        provider_set["provider_set_key"]
+        for batch in batches
+        for provider_set in batch
+    ] == list(range(1, 12))
+
+
+@pytest.mark.asyncio
 async def test_projection_membership_rejects_cumulative_count_before_hydration(
     monkeypatch,
 ) -> None:
