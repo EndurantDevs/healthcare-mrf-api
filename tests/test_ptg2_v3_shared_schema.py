@@ -2,11 +2,11 @@
 
 import importlib.util
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -27,8 +27,8 @@ from db.models import (
     PTG2V3PriceAttr,
     PTG2V3ProviderGroup,
     PTG2V3ProviderSet,
-    PTG2V3SnapshotBlock,
     PTG2V3SnapshotBinding,
+    PTG2V3SnapshotBlock,
     PTG2V3SnapshotLayout,
     PTG2V3SnapshotScope,
     PTG2V3SnapshotSource,
@@ -39,15 +39,13 @@ from db.models._legacy import (
     _move_address_key_column_to_end,
     _resolve_ptg2_database_schema,
 )
-from process.ptg_parts.ptg2_shared_gc import (
-    require_migration_owned_tables,
-)
 from process.ptg_parts.ptg2_candidate_attestation import (
     candidate_attestation_digest,
 )
-
+from process.ptg_parts.ptg2_shared_gc import (
+    require_migration_owned_tables,
+)
 from tests.ptg2_v3_shared_schema_assertions import (
-    _OpRecorder,
     _assert_audit_attestation_types,
     _assert_block_provider_types,
     _assert_layout_audit_sql,
@@ -73,6 +71,7 @@ from tests.ptg2_v3_shared_schema_assertions import (
     _index_shapes,
     _load_migration,
     _normalized,
+    _OpRecorder,
     _primary_key,
     _record_upgrade,
 )
@@ -81,6 +80,7 @@ from tests.ptg2_v3_shared_schema_migrations import (
     HOLD_MIGRATION_PATH,
     MIGRATION_PATH,
 )
+
 
 @pytest.mark.parametrize(
     "migration_path",
@@ -143,8 +143,7 @@ def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):
     recorder.executed.clear()
     migration.downgrade()
     assert [_normalized(statement) for statement in recorder.executed] == [
-        "DROP INDEX IF EXISTS "
-        '"ptg_followup"."ptg2_v3_candidate_audit_attestation_snapshot_key_idx";'
+        'DROP INDEX IF EXISTS "ptg_followup"."ptg2_v3_candidate_audit_attestation_snapshot_key_idx";'
     ]
 
 
@@ -152,18 +151,14 @@ def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260914120000_npi_result_generation"
-    ]
+    assert ScriptDirectory.from_config(config).get_heads() == ["20260917130000_custom_import_generation_finality"]
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():
     migration = _load_migration(HOLD_MIGRATION_PATH)
     report_digest = b"r" * 32
 
-    assert migration.down_revision == (
-        "20260728130000_provider_directory_content_proof_shards"
-    )
+    assert migration.down_revision == ("20260728130000_provider_directory_content_proof_shards")
     assert migration._attestation_digest(report_digest) == (
         candidate_attestation_digest(
             report_digest,
@@ -200,8 +195,9 @@ async def _assert_v3_gc_schema_columns(database, schema_name):
         """,
         schema_name=schema_name,
     )
-    assert await database.scalar(
-        """
+    assert (
+        await database.scalar(
+            """
         SELECT COUNT(*)
           FROM information_schema.columns
          WHERE table_schema = :schema_name
@@ -211,8 +207,10 @@ async def _assert_v3_gc_schema_columns(database, schema_name):
                 ('ptg2_v3_candidate_audit_attestation', 'report')
            )
         """,
-        schema_name=schema_name,
-    ) == 2
+            schema_name=schema_name,
+        )
+        == 2
+    )
 
 
 async def _assert_v3_gc_foreign_keys(database, schema_name):
@@ -242,10 +240,7 @@ async def _assert_v3_gc_foreign_keys(database, schema_name):
 async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
     """Verify real postgres fresh v3 migrations have gc contract."""
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated "
-            "PostgreSQL test"
-        )
+        pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test")
 
     schema_name = f"ptg2_v3_schema_{uuid.uuid4().hex}"
     schema = f'"{schema_name}"'
@@ -319,15 +314,9 @@ def test_ptg2_models_support_db_schema_alias_without_cross_schema_fks():
     env["DB_SCHEMA"] = "ptg_legacy_schema"
     completed = _probe_db_schema_aliases(root, env)
 
-    schema_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("SCHEMAS=")
-    )
-    target_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("TARGETS=")
-    )
-    assert set(schema_line.removeprefix("SCHEMAS=").split(",")) == {
-        "ptg_legacy_schema"
-    }
+    schema_line = next(line for line in completed.stdout.splitlines() if line.startswith("SCHEMAS="))
+    target_line = next(line for line in completed.stdout.splitlines() if line.startswith("TARGETS="))
+    assert set(schema_line.removeprefix("SCHEMAS=").split(",")) == {"ptg_legacy_schema"}
     assert all(
         schema_target.startswith("ptg_legacy_schema.")
         for schema_target in target_line.removeprefix("TARGETS=").split(",")

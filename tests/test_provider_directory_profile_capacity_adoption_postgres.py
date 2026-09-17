@@ -7,9 +7,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -29,21 +29,18 @@ from tests.provider_directory_profile_delta_schema_fixtures import (
 from tests.provider_directory_profile_delta_test_support import _delta_database
 from tests.test_provider_directory_profile_capacity_preflight import _serving_state
 from tests.test_provider_directory_profile_capacity_preflight_postgres import (
-    UTC,
     _POSTGRES_DSN_ENV,
+    UTC,
     _assert_runtime_bound_lease_replay,
     _configure_database,
     importer,
 )
 
-
 _ALEMBIC_ADOPTION_BASE_REVISION = "20260610143000_address_checksums_bigint"
 
 
 def _install_invalid_lease_admission_stubs(monkeypatch, virtual_state):
-    monkeypatch.setattr(
-        importer, "_assert_profile_capacity_run_unconsumed", AsyncMock()
-    )
+    monkeypatch.setattr(importer, "_assert_profile_capacity_run_unconsumed", AsyncMock())
     monkeypatch.setattr(
         importer,
         "_profile_capacity_preflight_serving",
@@ -63,28 +60,18 @@ def _install_invalid_lease_admission_stubs(monkeypatch, virtual_state):
     monkeypatch.setattr(
         importer,
         "_profile_admission_workload",
-        AsyncMock(
-            return_value=types.SimpleNamespace(
-                database_identity=types.SimpleNamespace()
-            )
-        ),
+        AsyncMock(return_value=types.SimpleNamespace(database_identity=types.SimpleNamespace())),
     )
-    monkeypatch.setattr(
-        importer, "_profile_admission_inputs", lambda *_args: types.SimpleNamespace()
-    )
+    monkeypatch.setattr(importer, "_profile_admission_inputs", lambda *_args: types.SimpleNamespace())
     monkeypatch.setattr(
         importer,
         "_profile_admission_geometry",
         lambda *_args: types.SimpleNamespace(geometry=types.SimpleNamespace()),
     )
-    monkeypatch.setattr(
-        importer, "_validated_admission_run_id", lambda *_args: "run_" + "a" * 32
-    )
+    monkeypatch.setattr(importer, "_validated_admission_run_id", lambda *_args: "run_" + "a" * 32)
 
     def reject_invalid_lease(*_args):
-        raise lease.ProviderDirectoryCapacityLeaseError(
-            "invalid_signature", "signature"
-        )
+        raise lease.ProviderDirectoryCapacityLeaseError("invalid_signature", "signature")
 
     monkeypatch.setattr(importer, "_verified_admission_lease", reject_invalid_lease)
 
@@ -103,9 +90,7 @@ async def test_invalid_lease_does_not_adopt_missing_serving_generation(monkeypat
         )
         monkeypatch.setattr(importer, "db", database)
         _install_invalid_lease_admission_stubs(monkeypatch, _serving_state())
-        with pytest.raises(
-            lease.ProviderDirectoryCapacityLeaseError, match="invalid_signature"
-        ):
+        with pytest.raises(lease.ProviderDirectoryCapacityLeaseError, match="invalid_signature"):
             await importer._admit_provider_directory_profile_capacity(
                 run_id="run_" + "a" * 32,
                 control_run_id="run_" + "a" * 32,
@@ -114,12 +99,8 @@ async def test_invalid_lease_does_not_adopt_missing_serving_generation(monkeypat
                 resource_fence=types.SimpleNamespace(),
                 artifact_resource_types=frozenset({"Practitioner"}),
             )
-        serving_ref = profile.qualified_table(
-            schema, "provider_directory_profile_serving_generation"
-        )
-        assert (
-            await database.scalar(f"SELECT count(*)::bigint FROM {serving_ref};") == 0
-        )
+        serving_ref = profile.qualified_table(schema, "provider_directory_profile_serving_generation")
+        assert await database.scalar(f"SELECT count(*)::bigint FROM {serving_ref};") == 0
 
 
 def _adoption_candidate(template):
@@ -161,9 +142,7 @@ def _alembic_head_environment(dsn: str, schema: str) -> dict[str, str]:
         "DB_SCHEMA": schema,
     }
     environment.update(values_by_name)
-    environment.update(
-        {f"HLTHPRT_{name}": value for name, value in values_by_name.items()}
-    )
+    environment.update({f"HLTHPRT_{name}": value for name, value in values_by_name.items()})
     return environment
 
 
@@ -207,17 +186,11 @@ async def test_missing_state_adoption_is_exact_and_concurrency_safe(monkeypatch)
             affected_stage="adoption_affected_stage",
         )
         monkeypatch.setattr(importer, "db", database)
-        template = _serving_state(
-            published_at=datetime.datetime(2026, 8, 9, 8, 0, tzinfo=UTC)
-        )
+        template = _serving_state(published_at=datetime.datetime(2026, 8, 9, 8, 0, tzinfo=UTC))
         candidate_loader = AsyncMock(return_value=_adoption_candidate(template))
-        monkeypatch.setattr(
-            importer, "_profile_adoption_candidate_from_legacy", candidate_loader
-        )
+        monkeypatch.setattr(importer, "_profile_adoption_candidate_from_legacy", candidate_loader)
         projected = await importer._profile_capacity_preflight_serving(schema)
-        serving_ref = profile.qualified_table(
-            schema, "provider_directory_profile_serving_generation"
-        )
+        serving_ref = profile.qualified_table(schema, "provider_directory_profile_serving_generation")
         assert projected.payload["resolution"] == "legacy_adoption"
         assert await database.scalar(f"SELECT count(*) FROM {serving_ref};") == 0
         adopted_states = await asyncio.gather(
@@ -253,20 +226,12 @@ async def test_adoption_target_oid_drift_fails_before_insert(monkeypatch):
             if relation_read_counts[0] == 2:
                 profile_ref = profile.qualified_table(schema, profile.PROFILE_TABLE)
                 await database.status(f"DROP TABLE {profile_ref};")
-                await database.status(
-                    profile.profile_table_sql(
-                        schema, profile.PROFILE_TABLE, logged=True
-                    )
-                )
-                for statement in profile.profile_index_statements(
-                    schema, profile.PROFILE_TABLE, evidence=False
-                ):
+                await database.status(profile.profile_table_sql(schema, profile.PROFILE_TABLE, logged=True))
+                for statement in profile.profile_index_statements(schema, profile.PROFILE_TABLE, evidence=False):
                     await database.status(statement)
             return relation_oid
 
-        monkeypatch.setattr(
-            importer, "_provider_directory_relation_oid", relation_oid_with_drift
-        )
+        monkeypatch.setattr(importer, "_provider_directory_relation_oid", relation_oid_with_drift)
         with pytest.raises(RuntimeError, match="adoption_target_changed"):
             await importer._locked_profile_adoption_target_oids(
                 schema,
@@ -283,25 +248,17 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     if not dsn:
         pytest.skip(f"{_POSTGRES_DSN_ENV} is required")
     _configure_database(monkeypatch, dsn)
-    monkeypatch.setattr(
-        runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40
-    )
+    monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
     expected_heads = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
-    assert expected_heads == {
-        "20260914120000_npi_result_generation"
-    }
+    assert expected_heads == {"20260917130000_custom_import_generation_finality"}
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)
         await _upgrade_disposable_schema_to_head(dsn, schema)
         async with database.transaction():
-            await database.status(
-                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;"
-            )
+            await database.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")
             observation = await runtime.observe_profile_runtime(database)
             _assert_runtime_bound_lease_replay(observation)
-            transaction_read_only = await database.scalar(
-                "SELECT current_setting('transaction_read_only')::boolean;"
-            )
+            transaction_read_only = await database.scalar("SELECT current_setting('transaction_read_only')::boolean;")
     assert transaction_read_only is True
     assert observation == {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
