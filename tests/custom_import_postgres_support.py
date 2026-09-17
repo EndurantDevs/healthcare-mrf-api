@@ -232,6 +232,7 @@ class FamilyMaterialSpec:
     parent_mismatch: bool = False
     reverse_insertion: bool = False
     include_root_winner: bool = False
+    include_child_scalars: bool = True
     root_record_id: int | None = None
     entity_binding_id: int | None = None
     root_source_ordinal: int = 0
@@ -244,6 +245,7 @@ async def _seed_publication_identity(
     *,
     semantic_suffix: str | None = None,
     context_collection_slot: int | None = None,
+    include_selection_profile: bool = True,
 ) -> _PublicationSeed:
     """Seed the synthetic definition, capture, and source identity graph."""
 
@@ -255,6 +257,7 @@ async def _seed_publication_identity(
         schema,
         semantic,
         context_collection_slot=context_collection_slot,
+        include_selection_profile=include_selection_profile,
     )
     capture_bundle = await _seed_identity_capture_bundle(
         session,
@@ -359,8 +362,9 @@ async def _seed_identity_definition(
     semantic: str,
     *,
     context_collection_slot: int | None = None,
+    include_selection_profile: bool = True,
 ) -> CustomImportDefinitionRevision:
-    """Create the definition revision and its sole selection profile."""
+    """Create the definition revision and optionally its synthetic profile."""
 
     definition = CustomImportDefinitionRevision(
         dataset_id=dataset.dataset_id,
@@ -374,6 +378,8 @@ async def _seed_identity_definition(
     session.add(definition)
     await session.flush()
 
+    if not include_selection_profile:
+        return definition
     session.add(
         CustomImportSelectionProfile(
             definition_revision_id=definition.definition_revision_id,
@@ -1037,14 +1043,15 @@ async def _seed_child_revisions(
                 child_revision_id=child_revision.child_revision_id,
             )
         )
-        _add_child_scalars(
-            session,
-            graph,
-            root_record,
-            child_revision,
-            child_payload,
-            material_spec.reverse_insertion,
-        )
+        if material_spec.include_child_scalars:
+            _add_child_scalars(
+                session,
+                graph,
+                root_record,
+                child_revision,
+                child_payload,
+                material_spec.reverse_insertion,
+            )
         await session.flush()
     return tuple(child_revision_ids)
 
