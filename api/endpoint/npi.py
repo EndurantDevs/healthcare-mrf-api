@@ -743,7 +743,12 @@ def _classification_npi_values(taxonomy_npi_rows) -> list[int]:
     return npi_values
 
 
-async def _get_classification_npi_list(classification: str, *, session=None) -> list[int]:
+async def _get_classification_npi_list(
+    classification: str,
+    *,
+    primary_only: bool = True,
+    session=None,
+) -> list[int]:
     """Return the publication-scoped NPI list for one taxonomy classification."""
 
     classification_key = str(classification or "").strip().lower()
@@ -753,7 +758,7 @@ async def _get_classification_npi_list(classification: str, *, session=None) -> 
         session=session
     )
     cache_key = (
-        f"{publication_identity}|{classification_key}"
+        f"{publication_identity}|{classification_key}|{'primary' if primary_only else 'all'}"
         if publication_identity is not None
         else None
     )
@@ -770,8 +775,9 @@ async def _get_classification_npi_list(classification: str, *, session=None) -> 
     query = text(
         f"""
         SELECT DISTINCT t.npi
-          FROM {schema}.npi_taxonomy AS t
+         FROM {schema}.npi_taxonomy AS t
          WHERE t.healthcare_provider_taxonomy_code = ANY(:taxonomy_codes)
+           {"AND t.healthcare_provider_primary_taxonomy_switch = 'Y'" if primary_only else ""}
          ORDER BY t.npi
         """
     )
@@ -9759,6 +9765,7 @@ async def list_providers(request):
         """Return a deterministic provider page for sitemap generation."""
         classification_npis = await _get_classification_npi_list(
             classification_value,
+            primary_only=is_primary_only,
             session=request_session,
         )
         if not classification_npis:
@@ -10537,7 +10544,6 @@ async def list_providers(request):
                 response_format,
                 procedure_internal_codes,
                 medication_internal_codes,
-                is_primary_only,
                 plan_release_id_raw,
             ]
         )

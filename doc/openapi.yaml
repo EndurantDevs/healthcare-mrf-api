@@ -3031,7 +3031,7 @@ paths:
           schema:
             type: boolean
             default: true
-          description: When taxonomy filters are present, match only the provider's primary NPPES taxonomy row.
+          description: For taxonomy searches and classification counts, match only the provider's primary NPPES taxonomy row.
         - name: plan_release_id
           in: query
           schema:

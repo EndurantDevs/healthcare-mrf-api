@@ -164,7 +164,15 @@ async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expected_primary_only"),
+    [(None, True), ("false", False)],
+)
+async def test_get_all_sitemap_mode_allows_20000_limit(
+    monkeypatch,
+    raw_primary_only,
+    expected_primary_only,
+):
     class SitemapConnection:
         def __init__(self):
             self.calls = 0
@@ -179,7 +187,10 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
 
     conn = SitemapConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
-    async def fake_npi_list(*_args, **_kwargs):
+    primary_only_calls = []
+
+    async def fake_npi_list(*_args, **kwargs):
+        primary_only_calls.append(kwargs["primary_only"])
         return list(range(1_000_000_000, 1_000_030_000))
     monkeypatch.setattr(
         npi_module,
@@ -187,20 +198,21 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
         fake_npi_list,
     )
 
-    request = types.SimpleNamespace(
-        args={
-            "classification": "Pharmacy",
-            "view": "sitemap",
-            "limit": "20000",
-            "start": "0",
-            "include_total": "0",
-            "primary_only": "false",
-        }
-    )
+    request_args = {
+        "classification": "Pharmacy",
+        "view": "sitemap",
+        "limit": "20000",
+        "start": "0",
+        "include_total": "0",
+    }
+    if raw_primary_only is not None:
+        request_args["primary_only"] = raw_primary_only
+    request = types.SimpleNamespace(args=request_args)
     resp = await get_all(request)
     response_body = json.loads(resp.body)
 
     assert response_body["limit"] == 20000
+    assert primary_only_calls == [expected_primary_only]
     assert conn.calls == 1
     assert len(conn.last_params["page_npis"]) == 20000
     assert "mrf.addr_formatted_address_v2(" in conn.last_sql
