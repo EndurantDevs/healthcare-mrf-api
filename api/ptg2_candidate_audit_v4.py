@@ -300,7 +300,7 @@ async def _load_pattern_provider_sets(
     *,
     schema_name: str,
 ) -> dict[int, tuple[int, ...]]:
-    """Resolve one complete pattern projection with exact retained accounting."""
+    """Resolve each pattern coordinate within the shared result budget."""
 
     retained_result_bytes = _result_bytes_for_npis(
         len(requested_npis)
@@ -309,34 +309,40 @@ async def _load_pattern_provider_sets(
         retained_result_bytes,
         category="the V4 pattern provider result",
     )
-    reservation: _V4CoordinateReservation | None = None
+    provider_set_keys_by_npi: dict[int, tuple[int, ...]] = {}
     try:
-        reservation = _reserve_v4_pattern_projection(
-            len(requested_npis),
-            retention_budget,
-        )
-        provider_set_keys_by_npi = await _v4_sets_by_npi(
-            session,
-            serving_tables,
-            requested_npis,
-            allowed_provider_set_keys=None,
-            schema_name=schema_name,
-            max_members=reservation.maximum_graph_members,
-        )
-        if set(provider_set_keys_by_npi) != set(requested_npis):
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 pattern graph omitted a requested NPI"
+        for npi in sorted(requested_npis):
+            reservation = _reserve_v4_pattern_projection(
+                1,
+                retention_budget,
             )
-        retained_membership_bytes = sum(
-            len(provider_set_keys) * _V4_RESULT_MEMBERSHIP_BYTES
-            for provider_set_keys in provider_set_keys_by_npi.values()
-        )
-        retention_budget.release(
-            reservation.reservation_bytes - retained_membership_bytes
-        )
+            try:
+                coordinate_result = await _v4_sets_by_npi(
+                    session,
+                    serving_tables,
+                    (npi,),
+                    allowed_provider_set_keys=None,
+                    schema_name=schema_name,
+                    max_members=reservation.maximum_graph_members,
+                )
+                if set(coordinate_result) != {npi}:
+                    raise PTG2ManifestArtifactError(
+                        "PTG2 V4 pattern graph omitted a requested NPI"
+                    )
+                provider_set_keys = tuple(coordinate_result[npi])
+                retained_coordinate_bytes = (
+                    len(provider_set_keys) * _V4_RESULT_MEMBERSHIP_BYTES
+                )
+                retention_budget.release(
+                    reservation.reservation_bytes
+                    - retained_coordinate_bytes
+                )
+            except BaseException:
+                retention_budget.release(reservation.reservation_bytes)
+                raise
+            retained_result_bytes += retained_coordinate_bytes
+            provider_set_keys_by_npi[npi] = provider_set_keys
     except BaseException:
-        if reservation is not None:
-            retention_budget.release(reservation.reservation_bytes)
         retention_budget.release(retained_result_bytes)
         raise
     return provider_set_keys_by_npi
