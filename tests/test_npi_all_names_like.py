@@ -198,7 +198,7 @@ async def test_get_all_sitemap_mode_allows_20000_limit(
         fake_npi_list,
     )
 
-    request_args = {
+    request_args_by_name = {
         "classification": "Pharmacy",
         "view": "sitemap",
         "limit": "20000",
@@ -206,8 +206,8 @@ async def test_get_all_sitemap_mode_allows_20000_limit(
         "include_total": "0",
     }
     if raw_primary_only is not None:
-        request_args["primary_only"] = raw_primary_only
-    request = types.SimpleNamespace(args=request_args)
+        request_args_by_name["primary_only"] = raw_primary_only
+    request = types.SimpleNamespace(args=request_args_by_name)
     resp = await get_all(request)
     response_body = json.loads(resp.body)
 
