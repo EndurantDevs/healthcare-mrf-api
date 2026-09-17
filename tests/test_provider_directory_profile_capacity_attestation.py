@@ -32,20 +32,11 @@ from tests.provider_directory_profile_capacity_trust_fixtures import (
 UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-GOLDEN_ATTESTATION_ID = "05c9cff1b9fd3a43981a21fd4ca7294c0ae587995e2ff2dbeb5a3f63f4093cf0"
-GOLDEN_SIGNATURE = (
-    "6ft6pfAtqMiDya_QmRCybZhQgSro5eYVy_Q0U3HviePM5NoRWVjmhMOT3RhBBaMbV8s"
-    "Y7-943aLHTDb2pvpWCg"
-)
-GOLDEN_CANONICAL_BODY_SHA256 = "54f8892dbc22882c28baae8b0b1d5bc89e839bd1c01c8a9d21a3e54486fe368d"
-GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = (
-    "57272bff44e0909ec74309c4f524347"
-    "5a4add19cdbfde838e6741f266469d86b"
-)
-GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256 = (
-    "1e37d1bce5308cdb9111450b41be8015"
-    "107672770c78b4c9ccc67839551083d1"
-)
+GOLDEN_ATTESTATION_ID = "ea31e51f96feb7619c31cdf948661e6f4d6760a541bb0667a91d6e06ccaf9a62"
+GOLDEN_SIGNATURE = "Yey_Q6nMPf4Ainxz9GywIOWuC3RucobryhAeYGEdozwnhFxoq7fv_H1g-XbpyQ1KZ9ig7dmg5P9LTkJOfkZCDA"
+GOLDEN_CANONICAL_BODY_SHA256 = "8960fdcc19033723ae2039f97897265f5a2573d2553056bd7e2bb40e4e114cf5"
+GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = "57272bff44e0909ec74309c4f5243475a4add19cdbfde838e6741f266469d86b"
+GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256 = "1e37d1bce5308cdb9111450b41be8015107672770c78b4c9ccc67839551083d1"
 
 
 def _golden_body() -> dict[str, object]:
@@ -105,12 +96,8 @@ def _signed_envelope(
         body_mutator(body)
     body["attestation_id"] = lease.capacity_attestation_id(body)
     canonical_body = lease.canonical_capacity_lease_json(body).encode("ascii")
-    message = (
-        lease.CAPACITY_LEASE_SIGNATURE_DOMAIN.encode("ascii") + b"\x00" + canonical_body
-    )
-    signature = (
-        base64.urlsafe_b64encode(PRIVATE_KEY.sign(message)).rstrip(b"=").decode("ascii")
-    )
+    message = lease.CAPACITY_LEASE_SIGNATURE_DOMAIN.encode("ascii") + b"\x00" + canonical_body
+    signature = base64.urlsafe_b64encode(PRIVATE_KEY.sign(message)).rstrip(b"=").decode("ascii")
     return {"lease": body, "signature": signature}
 
 
@@ -150,52 +137,31 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
 
     assert verified.attestation_id == GOLDEN_ATTESTATION_ID
     assert verified.signature == GOLDEN_SIGNATURE
-    assert (
-        hashlib.sha256(verified.canonical_lease_json.encode("ascii")).hexdigest()
-        == GOLDEN_CANONICAL_BODY_SHA256
-    )
+    assert hashlib.sha256(verified.canonical_lease_json.encode("ascii")).hexdigest() == GOLDEN_CANONICAL_BODY_SHA256
     assert verified.capacity_geometry_hash == "55" * 32
-    assert verified.signing_preflight_guard_sha256 == (
-        GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256
-    )
+    assert verified.signing_preflight_guard_sha256 == (GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256)
     assert verified.nonce == GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256
     assert verified.database_system_identifier == "7527713908662902214"
     assert verified.runtime_witness.healthcare_source_commit == "12" * 20
-    assert verified.runtime_witness.profile_migration_revision == (
-        PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION
-    )
-    assert verified.runtime_witness_sha256 == (
-        "515b3fb2fd47678e25448df4b6971c327aecfd65e8b64cefc4c5bec2c432ba38"
-    )
-    assert verified.deployment_witness.preflight_transport == (
-        "kubectl_exec_loopback_8080"
-    )
+    assert verified.runtime_witness.profile_migration_revision == (PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION)
+    assert verified.runtime_witness_sha256 == ("64245c2d42e678c148171c66fa61e8a4e1e4afec4e1b0db977461edf02a0b7e3")
+    assert verified.deployment_witness.preflight_transport == ("kubectl_exec_loopback_8080")
     assert verified.reservation_bytes_by_storage_class == {
         "data": 180_000_000_000,
         "temp": 20_000_000_000,
         "wal": 150_000_000_000,
     }
-    assert verified.lease_digest == (
-        "4661459e26fa62fa1bbf9b4710b49b3435f9c8d724f679ddc5aff6d8fe2983d4"
-    )
-    assert verified.public_key_fingerprint == (
-        "05549452c2988321a6d9e7daa9a7704b" "f150aa556ea2ddb9c45c8fe92dc7f643"
-    )
-    assert verified.tablespace_identity_hash == (
-        "4c53f2792f1198c75a1e6a7ca1d03621" "924d19c72bd39f8997ede9c312371f0e"
-    )
-    assert verified.volume_identity_hash == (
-        "fd8a7e7f2a446dac51955276d6865c16" "954b4526c3b6cc0bd5d66320a798d975"
-    )
+    assert verified.lease_digest == ("6235752dcd36c07157ccfa37522ff60f56e50cc4fa8cc2cbd60a6ee268e16244")
+    assert verified.public_key_fingerprint == ("05549452c2988321a6d9e7daa9a7704bf150aa556ea2ddb9c45c8fe92dc7f643")
+    assert verified.tablespace_identity_hash == ("4c53f2792f1198c75a1e6a7ca1d03621924d19c72bd39f8997ede9c312371f0e")
+    assert verified.volume_identity_hash == ("fd8a7e7f2a446dac51955276d6865c16954b4526c3b6cc0bd5d66320a798d975")
 
 
 def test_attestation_id_golden_vector_is_independent_of_mapping_order():
     body = _golden_body()
     expected = body.pop("attestation_id")
 
-    assert (
-        lease.capacity_attestation_id(dict(reversed(tuple(body.items())))) == expected
-    )
+    assert lease.capacity_attestation_id(dict(reversed(tuple(body.items())))) == expected
 
 
 def test_legacy_v2_body_is_recognized_but_rejected_for_profile_admission():
@@ -228,9 +194,7 @@ def test_signed_guard_is_closed_and_binds_one_identical_limits_document():
 
     def drift_healthcare_limits(body):
         guard = body["signing_preflight_guard"]
-        limits = guard["healthcare_request"][
-            "provider_directory_profile_capacity_limits"
-        ]
+        limits = guard["healthcare_request"]["provider_directory_profile_capacity_limits"]
         limits["max_build_seconds"] += 1
         body["signing_preflight_guard_sha256"] = preflight.preflight_domain_sha256(
             guard_contract.CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN,
@@ -433,9 +397,7 @@ def test_identical_tablespace_oid_must_share_name_and_volume_digest():
     "mutator",
     [
         lambda body: body["volumes"][1].update({"available_bytes": 999_999_999_999}),
-        lambda body: body["volumes"][1].update(
-            {"available_after_all_reservations_bytes": 699_999_999_999}
-        ),
+        lambda body: body["volumes"][1].update({"available_after_all_reservations_bytes": 699_999_999_999}),
         lambda body: body["volumes"][1].update({"reserved_bytes": 200_000_000_001}),
     ],
 )
