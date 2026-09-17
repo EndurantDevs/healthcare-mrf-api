@@ -30,6 +30,11 @@ from xml.parsers import expat
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from process.custom_import._source_text import (
+    _SourceTextValidationError,
+    validate_snapshot_token,
+    validate_source_label,
+)
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
 from process.custom_import.parquet_pages import (
     ParquetPageError,
@@ -38,8 +43,6 @@ from process.custom_import.parquet_pages import (
 )
 
 _DEFAULT_READ_CHUNK_BYTES = 64 * 1024
-_MAX_SNAPSHOT_TOKEN_BYTES = 1024
-_MAX_SOURCE_LABEL_BYTES = 255
 _MAX_PARQUET_FOOTER_BYTES = 1024 * 1024
 _MAX_PARQUET_ROW_GROUPS = 4_096
 _MAX_PARQUET_THRIFT_CONTAINER_ITEMS = 64 * 1024
@@ -361,16 +364,21 @@ def _source_stream_sha256(stream: SourceStream) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def _validated_snapshot_token(value: str) -> str:
+def _validated_snapshot_token(value: object) -> str:
     """Require a bounded opaque source snapshot token that is safe to retain."""
 
-    if not isinstance(value, str) or not value:
-        raise CaptureError("source snapshot token must be a non-empty string")
-    if len(_utf8_bytes(value, "source snapshot token")) > _MAX_SNAPSHOT_TOKEN_BYTES:
-        raise CaptureError("source snapshot token exceeds the byte limit")
-    if not value.isprintable():
-        raise CaptureError("source snapshot token contains control characters or non-printable text")
-    return value
+    try:
+        return validate_snapshot_token(value)
+    except _SourceTextValidationError as exc:
+        if exc.reason in {"not_string", "empty"}:
+            message = "source snapshot token must be a non-empty string"
+        elif exc.reason == "invalid_utf8":
+            message = "source snapshot token must be valid UTF-8"
+        elif exc.reason == "byte_limit":
+            message = "source snapshot token exceeds the byte limit"
+        else:
+            message = "source snapshot token contains control characters or non-printable text"
+        raise CaptureError(message) from exc
 
 
 def _validated_manifest_size(value: object, *, maximum: int, label: str) -> int:
@@ -1339,13 +1347,18 @@ def _decoded_record(ordinal: int, value: Any, limits: CaptureLimits) -> DecodedR
 def _validated_source_label(value: Any) -> str:
     """Require a bounded, printable source label for deferred alias mapping."""
 
-    if not isinstance(value, str) or not value:
-        raise CaptureError("source record labels must be non-empty strings")
-    if len(_utf8_bytes(value, "source record label")) > _MAX_SOURCE_LABEL_BYTES:
-        raise CaptureError("source record label exceeds the byte limit")
-    if not value.isprintable():
-        raise CaptureError("source record label must be printable text")
-    return value
+    try:
+        return validate_source_label(value)
+    except _SourceTextValidationError as exc:
+        if exc.reason in {"not_string", "empty"}:
+            message = "source record labels must be non-empty strings"
+        elif exc.reason == "invalid_utf8":
+            message = "source record label must be valid UTF-8"
+        elif exc.reason == "byte_limit":
+            message = "source record label exceeds the byte limit"
+        else:
+            message = "source record label must be printable text"
+        raise CaptureError(message) from exc
 
 
 def _validated_scalar(value: Any, ordinal: int) -> Scalar:

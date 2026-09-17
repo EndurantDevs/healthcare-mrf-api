@@ -20,6 +20,11 @@ _MAX_PAGE_COUNT = 64 * 1024
 _MAX_PAGE_DECODED_BYTES = 16 * 1024 * 1024
 _SINGLE_ROW_ARROW_OVERHEAD_BYTES = 256
 _DICTIONARY_ENTRY_OVERHEAD_BYTES = 64
+# Arrow retains reader state while it decodes a row group and may read levels
+# in blocks larger than the requested one-row batch.  Budget that fixed state
+# once per row-group estimate, plus one allowance for every nonempty column.
+_READER_WORKING_BYTES = 64 * 1024
+_ACTIVE_COLUMN_WORKING_BYTES = 16 * 1024
 
 _COMPACT_STOP = 0
 _COMPACT_TRUE = 1
@@ -805,7 +810,7 @@ def _validate_chunk_ranges(
 ) -> None:
     """Scan each chunk and aggregate a conservative working estimate by row group."""
 
-    row_group_working_bytes = [0] * _nonnegative_integer(file_metadata.num_row_groups)
+    row_group_working_bytes = _row_group_reader_working_bytes(file_metadata, maximum_decoded_bytes)
     for chunk_range in chunk_ranges:
         row_group_metadata = file_metadata.row_group(chunk_range.row_group_index)
         column_metadata = row_group_metadata.column(chunk_range.column_index)
@@ -819,6 +824,17 @@ def _validate_chunk_ranges(
         row_group_working_bytes[chunk_range.row_group_index] += column_working_bytes
         if row_group_working_bytes[chunk_range.row_group_index] > maximum_decoded_bytes:
             raise ParquetPageError("Parquet source payload exceeds the decoded-byte limit")
+
+
+def _row_group_reader_working_bytes(file_metadata: Any, maximum_decoded_bytes: int) -> list[int]:
+    """Reserve reader state for every row-group estimate, including empty groups."""
+
+    if _READER_WORKING_BYTES > maximum_decoded_bytes:
+        raise ParquetPageError("Parquet source payload exceeds the decoded-byte limit")
+    row_group_count = _nonnegative_integer(file_metadata.num_row_groups)
+    # Empty row groups have no page decoder and therefore no per-column cost,
+    # but an opened reader still retains its fixed working state.
+    return [_READER_WORKING_BYTES] * row_group_count
 
 
 def _scan_chunk_pages(
@@ -1025,10 +1041,14 @@ def _require_complete_chunk_scan(
 
 
 def _estimate_chunk_working_bytes(scan_state: _ChunkScanState) -> int:
-    """Return the bounded page, dictionary, row, and Arrow-bookkeeping estimate."""
+    """Return one active column's bounded decoder and Arrow-working estimate."""
 
+    # This row-group admission estimate is not a process-wide native-memory
+    # guarantee: it cannot model allocation that occurs before preflight or
+    # unrelated Arrow state retained elsewhere in the process.
     return (
-        scan_state.dictionary_page_bytes
+        _ACTIVE_COLUMN_WORKING_BYTES
+        + scan_state.dictionary_page_bytes
         + scan_state.dictionary_entry_bytes
         + scan_state.maximum_data_page_bytes
         + scan_state.maximum_output_page_bytes

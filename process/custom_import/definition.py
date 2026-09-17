@@ -17,6 +17,8 @@ from typing import Any
 
 import yaml
 
+from process.custom_import._source_text import _SourceTextValidationError, validate_source_label
+
 CONTRACT_VERSION = "custom-import/v1"
 MAX_DEFINITION_BYTES = 1024 * 1024
 MAX_DEFINITION_DEPTH = 32
@@ -722,13 +724,10 @@ def _parse_aliases(
             raise DefinitionError(f"definition.aliases.{stream.stream_id} must be an object")
         permitted = root_ids if stream.record_kind == "root" else field_ids_by_child_collection[stream.child_collection]
         for label, field_id in labels.items():
-            if (
-                not isinstance(label, str)
-                or not label
-                or len(label.encode("utf-8")) > 255
-                or any(ord(char) < 32 or ord(char) == 127 for char in label)
-            ):
-                raise DefinitionError("source aliases must be bounded printable text")
+            try:
+                label = validate_source_label(label)
+            except _SourceTextValidationError as exc:
+                raise DefinitionError("source aliases must be bounded printable text") from exc
             field_id = _identifier(field_id, f"definition.aliases.{stream.stream_id}.{label}")
             if field_id not in permitted:
                 raise DefinitionError("a source alias must target a field in its stream scope")
