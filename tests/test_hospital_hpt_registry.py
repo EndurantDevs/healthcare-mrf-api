@@ -98,8 +98,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 6_895
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_712
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 154
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 683
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 157
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -229,6 +229,70 @@ def test_reviewed_fallback_preserves_unlisted_facility_location(
     store, _native = store_module()
     assert store._location_ordinals((candidate,), tuple(enumerate(location_names))) == {
         hospital_id: ordinal,
+    }
+
+
+def test_marion_fallback_keeps_east_unbound():
+    """Use the reviewed General source without assigning it to Marion Health East."""
+    hospital, = registry.selected_hospital_hpt_registry(
+        {"hospital_id": "hospital-003733"}
+    )
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"], "synthetic-locator", "synthetic-observation",
+        (hospital,), (
+            HospitalHptLocatorRecord(
+                "MARION GENERAL HOSPITAL", "https://files.example/old.xlsx"
+            ),
+            HospitalHptLocatorRecord(
+                "MARION HEALTH EAST", "https://files.example/old.xlsx"
+            ),
+        ),
+    ),))
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert candidate.locator_name == "MARION GENERAL HOSPITAL"
+    assert tuple(row["hospital_id"] for row in registry.load_hospital_hpt_registry()
+                 if row["cms_hpt_url"] == hospital["cms_hpt_url"]) == (
+        "hospital-003733",
+    )
+    store, _native = store_module()
+    assert store._location_ordinals((candidate,), ((0, "Marion General Hospital"),)) == {
+        "hospital-003733": 0,
+    }
+
+
+def test_schneck_shared_source_preserves_facility_locations():
+    """Keep the umbrella filewide and bind its two declared facility locations."""
+    hospital_ids = (
+        "hospital-005683", "hospital-005684", "hospital-005685",
+    )
+    hospitals = registry.selected_hospital_hpt_registry(
+        {"hospital_ids": list(hospital_ids)}
+    )
+    shared_url = (
+        "https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/"
+        "35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv"
+    )
+    acquisition = acquisition_module()
+    candidates = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospitals[0]["cms_hpt_url"], "synthetic-locator", "synthetic-observation",
+        hospitals, (HospitalHptLocatorRecord("Schneck Medical Center", shared_url),),
+    ),))
+    assert tuple(candidate.hospital_id for candidate in candidates) == hospital_ids
+    assert {candidate.source_url for candidate in candidates} == {shared_url}
+    assert tuple(candidate.locator_name for candidate in candidates) == (
+        "Schneck Medical Center",
+        "Schneck Medical Center Hospital",
+        "Schneck Medical Center Physician Practices",
+    )
+    store, _native = store_module()
+    assert store._location_ordinals(candidates, (
+        (0, "Schneck Medical Center Hospital"),
+        (1, "Schneck Medical Center Physician Practices"),
+    )) == {
+        "hospital-005683": None,
+        "hospital-005684": 0,
+        "hospital-005685": 1,
     }
 
 

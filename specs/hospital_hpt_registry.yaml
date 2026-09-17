@@ -12507,6 +12507,7 @@ hospitals:
 - hospital_id: hospital-003733
   name: MARION GENERAL HOSPITAL
   cms_hpt_url: https://www.marionhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cdn.accureg.net/trans/marion/35-0868130_Marion-General-Hospital_standardcharges.csv
 - hospital_id: hospital-003734
   name: Marion Regional Health-Winfield, Inc
   cms_hpt_url: https://www.nmhs.net/cms-hpt.txt
@@ -19002,11 +19003,11 @@ hospitals:
 - hospital_id: hospital-005684
   name: Schneck Medical Center Hospital
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
-  locator_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
+  fallback_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
 - hospital_id: hospital-005685
   name: Schneck Medical Center Physician Practices
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
-  locator_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
+  fallback_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
 - hospital_id: hospital-005686
   name: Schoolcraft Memorial Hospital
   cms_hpt_url: https://scmh.org/cms-hpt.txt
