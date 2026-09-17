@@ -227,13 +227,13 @@ async def test_finality_scan_window_rejects_expired_or_untyped_budgets():
     now = dt.datetime(2026, 9, 17, tzinfo=dt.UTC)
     with pytest.raises(PublicationConflict, match="lease expired"):
         async with publication._finality_scan_window(_FinalitySession("1s"), now=now, expires_at=now):
-            pass
+            pytest.fail("an expired finality window yielded")
 
     with pytest.raises(PublicationConflict, match="current statement timeout"):
         async with publication._finality_scan_window(
             _FinalitySession(1000), now=now, expires_at=now + dt.timedelta(seconds=1)
         ):
-            pass
+            pytest.fail("an untyped statement timeout yielded")
 
 
 @pytest.mark.asyncio
@@ -263,13 +263,23 @@ async def test_finality_scan_window_restores_prior_state_and_preserves_primary_f
         ):
             raise ValueError("primary failure")
 
+    failed_restore = _FinalitySession("5s", restore_error=RuntimeError("restore failed"))
     with pytest.raises(RuntimeError, match="restore failed"):
         async with publication._finality_scan_window(
-            _FinalitySession("5s", restore_error=RuntimeError("restore failed")),
+            failed_restore,
             now=now,
             expires_at=now + dt.timedelta(seconds=1),
         ):
-            pass
+            assert publication._FINALITY_SCAN_WINDOW_KEY in failed_restore.info
+
+    empty_session = _FinalitySession("5s")
+    async with publication._finality_scan_window(
+        empty_session,
+        now=now,
+        expires_at=now + dt.timedelta(seconds=1),
+    ):
+        assert publication._FINALITY_SCAN_WINDOW_KEY in empty_session.info
+    assert publication._FINALITY_SCAN_WINDOW_KEY not in empty_session.info
 
 
 @pytest.mark.asyncio
@@ -721,3 +731,82 @@ async def test_no_change_requires_a_current_pointer(monkeypatch):
     monkeypatch.setattr(publication, "_locked_pointer", AsyncMock(return_value=None))
     with pytest.raises(PublicationConflict, match="requires a current generation"):
         await publication._locked_no_change_candidate(SimpleNamespace(), request, SimpleNamespace())
+
+
+def test_family_child_must_belong_to_the_selected_generation():
+    generation_family = SimpleNamespace(family_revision_id=9)
+    family_child = SimpleNamespace(family_revision_id=9, collection_slot=0)
+    child_revision = SimpleNamespace(
+        canonical_parent_key="root",
+        parent_key_sha256=b"r" * 32,
+        child_key_sha256=b"c" * 32,
+    )
+    root_record = SimpleNamespace(
+        canonical_logical_key="root",
+        logical_key_sha256=b"r" * 32,
+    )
+
+    with pytest.raises(PublicationConflict, match="selected generation"):
+        publication._validate_and_add_family_child(
+            publication._new_digest("test-family-child"),
+            (generation_family, family_child, child_revision, root_record),
+            {},
+            {},
+            set(),
+            effective_output=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_root_scalar_materialization_hashes_each_retained_projection(monkeypatch):
+    scalar = custom_import_models.CustomImportRootScalar(
+        root_revision_id=1,
+        dataset_id=2,
+        schema_revision_id=3,
+        root_record_id=4,
+        field_slot=5,
+        field_collection_slot=0,
+        projection_slot=0,
+        field_type="string",
+        value_state="value",
+        string_value="synthetic",
+    )
+    root_record = SimpleNamespace(logical_key_sha256=b"r" * 32)
+
+    async def _records(_session, _statement):
+        yield SimpleNamespace(), SimpleNamespace(), scalar, root_record
+
+    monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation: object())
+    monkeypatch.setattr(publication, "_stream_materialization_records", _records)
+    digest = publication._new_digest("test-root-scalars")
+    assert await publication._add_root_scalar_material(SimpleNamespace(), digest, SimpleNamespace()) == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_sealing_returns_a_replay_found_after_authority_lock(monkeypatch):
+    receipt = SimpleNamespace(replayed=True)
+    snapshot = SimpleNamespace()
+    generation = SimpleNamespace()
+    monkeypatch.setattr(publication, "_begin_finality_operation", AsyncMock())
+    monkeypatch.setattr(publication, "_locked_dataset", AsyncMock())
+    monkeypatch.setattr(publication, "_generation_snapshot", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(
+        publication,
+        "_replayed_generation_seal",
+        AsyncMock(side_effect=(None, receipt)),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_lock_generation_sealing_authority",
+        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(), generation)),
+    )
+    assert (
+        await publication.seal_generation(
+            SimpleNamespace(),
+            dataset_id=1,
+            generation_id=2,
+            lease_fence=3,
+            lease_token=b"token",
+        )
+        is receipt
+    )
