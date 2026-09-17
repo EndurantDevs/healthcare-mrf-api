@@ -234,6 +234,8 @@ class FamilyMaterialSpec:
     include_root_winner: bool = False
     root_record_id: int | None = None
     entity_binding_id: int | None = None
+    root_source_ordinal: int = 0
+    child_source_ordinals: tuple[int, ...] | None = None
 
 
 async def _seed_publication_identity(
@@ -904,7 +906,7 @@ async def _seed_family_root(
         schema_revision_id=graph.schema_revision_id,
         root_record_id=root_record.root_record_id,
         pack_id=root_pack.pack_id,
-        source_ordinal=0,
+        source_ordinal=material_spec.root_source_ordinal,
         canonical_payload=f'{{"payload":"{suffix}"}}',
         payload_sha256=digest(f"synthetic-root-payload:{suffix}"),
     )
@@ -999,9 +1001,21 @@ async def _seed_child_revisions(
     """Create child revisions, family links, and scalar projections in one order."""
 
     child_revision_ids: list[int] = []
-    child_rows = tuple(enumerate(zip(material_spec.child_keys, child_payloads, strict=True)))
+    source_ordinals = material_spec.child_source_ordinals
+    if source_ordinals is None:
+        source_ordinals = tuple(range(len(material_spec.child_keys)))
+    if len(source_ordinals) != len(material_spec.child_keys):
+        raise ValueError("child source ordinals must align with child keys")
+    child_rows = tuple(
+        zip(
+            source_ordinals,
+            material_spec.child_keys,
+            child_payloads,
+            strict=True,
+        )
+    )
     insertion_rows = tuple(reversed(child_rows)) if material_spec.reverse_insertion else child_rows
-    for source_ordinal, (child_key, child_payload) in insertion_rows:
+    for source_ordinal, child_key, child_payload in insertion_rows:
         canonical_parent_key = root_record.canonical_logical_key
         parent_key_sha256 = root_record.logical_key_sha256
         if material_spec.parent_mismatch:

@@ -652,6 +652,15 @@ def _materialization_document(model: Any) -> dict[str, Any]:
     )
 
 
+def _effective_output_revision_document(model: Any) -> dict[str, Any]:
+    """Encode served revision content without source-position provenance."""
+
+    return _model_document(
+        model,
+        omit=(_MATERIALIZATION_IDENTITY_COLUMNS | _MATERIALIZATION_VOLATILE_COLUMNS | frozenset({"source_ordinal"})),
+    )
+
+
 def _new_digest(domain: str) -> hashlib._Hash:
     digest = hashlib.sha256()
     digest.update(b"custom-import/v1\x00")
@@ -869,7 +878,7 @@ async def _effective_output_materialization(
     _add_digest_record(digest, "definition", _materialization_document(definition))
     _add_digest_record(digest, "schema", _materialization_document(schema_revision))
     await _add_definition_shape_material(session, digest, generation)
-    await _add_family_material(session, digest, generation)
+    await _add_family_material(session, digest, generation, effective_output=True)
     await _add_root_scalar_material(session, digest, generation)
     await _add_child_scalar_material(session, digest, generation)
     await _add_winner_material(session, digest, generation)
@@ -1360,13 +1369,20 @@ async def _add_family_material(
     session: AsyncSession,
     digest: hashlib._Hash,
     generation: CustomImportGeneration,
+    *,
+    effective_output: bool = False,
 ) -> tuple[int, int]:
     """Hash families and children while enforcing exact child-key membership."""
 
     expected_child_counts_by_family: dict[int, int] = {}
     family_count = 0
     async for family_material_row in _stream_materialization_records(session, _family_material_statement(generation)):
-        _add_family_revision_material(digest, family_material_row, expected_child_counts_by_family)
+        _add_family_revision_material(
+            digest,
+            family_material_row,
+            expected_child_counts_by_family,
+            effective_output=effective_output,
+        )
         family_count += 1
 
     child_counts_by_family: dict[int, int] = {}
@@ -1381,6 +1397,7 @@ async def _add_family_material(
             expected_child_counts_by_family,
             child_counts_by_family,
             seen_child_logical_keys,
+            effective_output=effective_output,
         )
         family_child_count += 1
     if any(
@@ -1395,6 +1412,8 @@ def _add_family_revision_material(
     digest: hashlib._Hash,
     record: tuple[Any, ...],
     expected_child_counts_by_family: dict[int, int],
+    *,
+    effective_output: bool,
 ) -> None:
     """Hash one root family and retain only its declared child-count check."""
 
@@ -1410,7 +1429,12 @@ def _add_family_revision_material(
     )
     _add_digest_record(digest, "root_record", _materialization_document(root_record))
     _add_digest_record(digest, "family_revision", _materialization_document(family))
-    _add_digest_record(digest, "root_revision", _materialization_document(root_revision))
+    revision_document = (
+        _effective_output_revision_document(root_revision)
+        if effective_output
+        else _materialization_document(root_revision)
+    )
+    _add_digest_record(digest, "root_revision", revision_document)
     _add_digest_record(digest, "entity_binding", _materialization_document(entity_binding))
 
 
@@ -1420,6 +1444,8 @@ def _validate_and_add_family_child(
     expected_child_counts_by_family: dict[int, int],
     child_counts_by_family: dict[int, int],
     seen_child_logical_keys: set[tuple[int, int, bytes]],
+    *,
+    effective_output: bool,
 ) -> None:
     """Hash one child after checking its selected-root identity and uniqueness."""
 
@@ -1449,7 +1475,12 @@ def _validate_and_add_family_child(
             "root_key_sha256": _json_value(root_record.logical_key_sha256),
         },
     )
-    _add_digest_record(digest, "child_revision", _materialization_document(child_revision))
+    revision_document = (
+        _effective_output_revision_document(child_revision)
+        if effective_output
+        else _materialization_document(child_revision)
+    )
+    _add_digest_record(digest, "child_revision", revision_document)
 
 
 def _join_root_scalar(statement: Any) -> Any:
