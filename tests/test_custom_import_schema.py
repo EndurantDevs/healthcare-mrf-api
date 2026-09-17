@@ -89,15 +89,22 @@ def test_runtime_models_keep_generation_selection_and_lease_shapes_explicit():
     )
     assert "fence > 0 AND token_sha256 IS NOT NULL" in str(lease_shape.sqltext)
     assert "state" not in CustomImportGeneration.__table__.c
-    assert "custom_import_generation_execution_key" in {
-        constraint.name for constraint in CustomImportGeneration.__table__.constraints
-    }
+    generation_constraint_names = {constraint.name for constraint in CustomImportGeneration.__table__.constraints}
+    assert "custom_import_generation_execution_fence_key" in generation_constraint_names
+    assert "custom_import_generation_content_key" not in generation_constraint_names
+    assert "candidate_sha256" in CustomImportGeneration.__table__.c
     generation_shape = next(
         constraint
         for constraint in CustomImportGeneration.__table__.constraints
         if constraint.name == "custom_import_generation_shape_check"
     )
     assert "base_dataset_id IS NOT NULL" in str(generation_shape.sqltext)
+    producing_authority_shape = next(
+        constraint
+        for constraint in CustomImportGeneration.__table__.constraints
+        if constraint.name == "custom_import_generation_producing_authority_check"
+    )
+    assert "producing_fence IS NULL" in str(producing_authority_shape.sqltext)
     publication_event_shape = next(
         constraint
         for constraint in CustomImportPublicationEvent.__table__.constraints

@@ -9,7 +9,10 @@ work.  Lease authority is represented by a monotonic fence plus a SHA-256
 digest; raw lease tokens never enter the database or a returned value.
 
 A lifecycle transaction is scoped to one execution.  Callers that batch
-multiple executions must acquire them in a deterministic order.  Before any
+multiple executions must acquire them in a deterministic order.  State
+transitions serialize through the dataset before their execution and lease;
+the narrowly scoped heartbeat is deliberately execution-and-lease-only so one
+large finality scan cannot starve another live execution.  Before any
 generation publication, the underlying database transaction—not only a
 savepoint owned by an externally joined session—must end.
 """
@@ -20,6 +23,7 @@ import datetime as dt
 import hashlib
 import hmac
 from collections.abc import MutableMapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,13 +31,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.custom_import import CustomImportExecution, CustomImportLease
-
+from db.models.custom_import import CustomImportDataset, CustomImportExecution, CustomImportLease
 
 DEFAULT_LEASE_SECONDS = 300
 MAX_LEASE_SECONDS = 3_600
 MAX_TOKEN_BYTES = 4_096
-MAX_FENCE = 9_223_372_036_854_775_807
+MAX_BIGINT = 9_223_372_036_854_775_807
+MAX_FENCE = MAX_BIGINT
 
 EXECUTION_STATES = frozenset({"queued", "running", "canceling", "canceled", "failed", "completed", "no_change"})
 TERMINAL_STATES = frozenset({"canceled", "failed", "completed", "no_change"})
@@ -50,6 +54,18 @@ class _LifecycleTransactionMarker:
 
     session_transaction: object
     root_transaction: object | None
+
+
+@dataclass(frozen=True)
+class _ExecutionRequest:
+    """Validated immutable inputs for one idempotent execution submission."""
+
+    dataset_id: int
+    definition_revision_id: int
+    schema_revision_id: int
+    idempotency_key: str
+    mechanism: str
+    capture_bundle_id: int | None
 
 
 class ExecutionLifecycleError(RuntimeError):
@@ -157,7 +173,7 @@ async def _mark_lifecycle_transaction(session: AsyncSession) -> None:
         connection_info[_LIFECYCLE_TRANSACTION_MARKER] = marker
 
 
-def _matches_marker(
+def _is_matching_lifecycle_marker(
     marker: _LifecycleTransactionMarker,
     *,
     session_transaction: object | None,
@@ -171,13 +187,15 @@ def _matches_marker(
 async def require_separate_publication_transaction(session: AsyncSession) -> None:
     """Reject generation publication after any lifecycle work in this transaction.
 
-    Generic lifecycle operations lock an execution before its lease, while
-    publication locks a dataset before an execution.  Keeping those actions in
-    separate underlying database transactions avoids an inverted-lock
-    deadlock.  Committing only an ``AsyncSession`` savepoint joined to an
-    externally owned transaction is not sufficient.  The atomic no-change
-    path establishes its terminal result without calling a generic lifecycle
-    operation first.
+    Lifecycle state transitions and finality operations share the
+    dataset→execution→lease lock order, but lifecycle work may still change an
+    execution before a finality receipt exists.  Keeping those semantic
+    transitions in separate underlying database transactions makes the
+    boundary explicit.  Committing only an ``AsyncSession`` savepoint joined
+    to an externally owned transaction is not sufficient.  The atomic
+    no-change path establishes its terminal result without calling a generic
+    lifecycle operation first.  Heartbeats are intentionally excluded: they
+    only lock their own execution and lease and never acquire the dataset.
     """
 
     current_transaction = session.get_transaction()
@@ -188,7 +206,7 @@ async def require_separate_publication_transaction(session: AsyncSession) -> Non
         marker for marker in (session_marker, connection_marker) if isinstance(marker, _LifecycleTransactionMarker)
     )
     if any(
-        _matches_marker(
+        _is_matching_lifecycle_marker(
             marker,
             session_transaction=current_transaction,
             root_transaction=root_transaction,
@@ -205,9 +223,23 @@ async def require_separate_publication_transaction(session: AsyncSession) -> Non
 def _positive_id(value: Any, name: str, *, allow_none: bool = False) -> int | None:
     if value is None and allow_none:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_BIGINT:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _require_clean_lifecycle_session(session: AsyncSession) -> None:
+    """Keep autoflush from acquiring a lower-order lock before the dataset."""
+
+    for attribute in ("new", "dirty", "deleted"):
+        if getattr(session, attribute, ()):
+            raise ExecutionInvariantError(
+                "custom-import lifecycle requires a clean session before it acquires the dataset lock"
+            )
+
+
+def _no_autoflush(session: AsyncSession):
+    return getattr(session, "no_autoflush", nullcontext())
 
 
 def _bounded_text(value: Any, name: str, *, maximum: int, allow_none: bool = False) -> str | None:
@@ -241,7 +273,7 @@ def _terminal_state(value: Any) -> str:
 
 
 def _fence(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_BIGINT:
         raise ValueError("fence must be a positive integer")
     return value
 
@@ -286,7 +318,7 @@ def _validate_lease(lease: CustomImportLease) -> None:
     fence = getattr(lease, "fence", None)
     expires_at = getattr(lease, "expires_at", None)
     token_sha256 = getattr(lease, "token_sha256", None)
-    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 0:
+    if isinstance(fence, bool) or not isinstance(fence, int) or not 0 <= fence <= MAX_BIGINT:
         raise ExecutionInvariantError("lease fence is malformed")
     if fence == 0:
         if token_sha256 is not None or expires_at is not None:
@@ -297,12 +329,12 @@ def _validate_lease(lease: CustomImportLease) -> None:
         raise ExecutionInvariantError("claimed lease expiration is malformed")
 
 
-def _lease_is_unexpired(lease: CustomImportLease, now: dt.datetime) -> bool:
+def _is_lease_unexpired(lease: CustomImportLease, now: dt.datetime) -> bool:
     _validate_lease(lease)
     return lease.fence > 0 and lease.expires_at > now
 
 
-def _lease_matches(
+def _has_matching_lease_authority(
     lease: CustomImportLease,
     *,
     fence: int,
@@ -310,7 +342,7 @@ def _lease_matches(
     now: dt.datetime,
 ) -> bool:
     return (
-        _lease_is_unexpired(lease, now)
+        _is_lease_unexpired(lease, now)
         and lease.fence == fence
         and hmac.compare_digest(_persisted_digest(lease.token_sha256), token_sha256)
     )
@@ -319,32 +351,97 @@ def _lease_matches(
 async def _lock_execution(
     session: AsyncSession,
     execution_id: int,
+    *,
+    dataset_id: int | None = None,
 ) -> CustomImportExecution | None:
     await _mark_lifecycle_transaction(session)
-    result = await session.execute(
-        select(CustomImportExecution)
-        .where(CustomImportExecution.execution_id == execution_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
+    statement = select(CustomImportExecution).where(CustomImportExecution.execution_id == execution_id)
+    if dataset_id is not None:
+        statement = statement.where(CustomImportExecution.dataset_id == dataset_id)
+    with _no_autoflush(session):
+        result = await session.execute(statement.with_for_update().execution_options(populate_existing=True))
     return result.scalar_one_or_none()
 
 
 async def _lock_execution_by_request(
     session: AsyncSession,
     *,
+    dataset_id: int | None = None,
     definition_revision_id: int,
     idempotency_key: str,
 ) -> CustomImportExecution | None:
     await _mark_lifecycle_transaction(session)
-    result = await session.execute(
-        select(CustomImportExecution)
-        .where(CustomImportExecution.definition_revision_id == definition_revision_id)
+    statement = select(CustomImportExecution)
+    if dataset_id is not None:
+        statement = statement.where(CustomImportExecution.dataset_id == dataset_id)
+    statement = (
+        statement.where(CustomImportExecution.definition_revision_id == definition_revision_id)
         .where(CustomImportExecution.idempotency_key == idempotency_key)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    with _no_autoflush(session):
+        result = await session.execute(statement)
     return result.scalar_one_or_none()
+
+
+async def _execution_snapshot(session: AsyncSession, execution_id: int) -> CustomImportExecution | None:
+    """Read immutable execution ownership before taking the dataset lock."""
+
+    with _no_autoflush(session):
+        result = await session.execute(
+            select(CustomImportExecution)
+            .where(CustomImportExecution.execution_id == execution_id)
+            .execution_options(populate_existing=True)
+        )
+    return result.scalar_one_or_none()
+
+
+async def _lock_dataset(session: AsyncSession, dataset_id: int) -> CustomImportDataset:
+    """Acquire the common lifecycle/finality serialization parent first."""
+
+    await _mark_lifecycle_transaction(session)
+    with _no_autoflush(session):
+        result = await session.execute(
+            select(CustomImportDataset)
+            .where(CustomImportDataset.dataset_id == dataset_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    dataset = result.scalar_one_or_none()
+    if dataset is None:
+        raise ExecutionInvariantError("custom-import dataset does not exist")
+    return dataset
+
+
+async def _locked_lifecycle_execution(session: AsyncSession, execution_id: int) -> CustomImportExecution:
+    """Lock one execution only after locking its immutable dataset parent."""
+
+    snapshot = await _execution_snapshot(session, execution_id)
+    if snapshot is None:
+        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    await _lock_dataset(session, snapshot.dataset_id)
+    execution = await _lock_execution(session, execution_id, dataset_id=snapshot.dataset_id)
+    if execution is None:
+        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    return execution
+
+
+async def _locked_heartbeat_execution(session: AsyncSession, execution_id: int) -> CustomImportExecution:
+    """Lock a heartbeat target without the dataset-wide finality parent.
+
+    A heartbeat only extends its exact lease: it neither changes shared
+    dataset state nor gains authority to append or publish.  It may therefore
+    take execution then lease while every other lifecycle/finality writer uses
+    dataset→execution→lease.  Because this path never subsequently waits for
+    the dataset, a queued finality writer can wait for the heartbeat without a
+    lock cycle, and a long seal cannot starve unrelated live executions.
+    """
+
+    execution = await _lock_execution(session, execution_id)
+    if execution is None:
+        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    return execution
 
 
 async def _ensure_lease(session: AsyncSession, execution_id: int) -> None:
@@ -358,22 +455,20 @@ async def _ensure_lease(session: AsyncSession, execution_id: int) -> None:
 
 
 async def _lock_lease(session: AsyncSession, execution_id: int) -> CustomImportLease:
-    result = await session.execute(
+    statement = (
         select(CustomImportLease)
         .where(CustomImportLease.execution_id == execution_id)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    with _no_autoflush(session):
+        result = await session.execute(statement)
     lease = result.scalar_one_or_none()
     if lease is not None:
         return lease
     await _ensure_lease(session, execution_id)
-    result = await session.execute(
-        select(CustomImportLease)
-        .where(CustomImportLease.execution_id == execution_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
+    with _no_autoflush(session):
+        result = await session.execute(statement)
     lease = result.scalar_one_or_none()
     if lease is None:
         raise ExecutionInvariantError("execution lease could not be created")
@@ -381,7 +476,7 @@ async def _lock_lease(session: AsyncSession, execution_id: int) -> CustomImportL
 
 
 async def _database_now(session: AsyncSession) -> dt.datetime:
-    """Read current database time only after execution and lease rows are locked."""
+    """Read database time only after the operation's authoritative row locks."""
 
     result = await session.execute(select(func.clock_timestamp()))
     now = result.scalar_one()
@@ -390,31 +485,111 @@ async def _database_now(session: AsyncSession) -> dt.datetime:
     return now
 
 
-def _submission_matches(
+def _has_matching_submission(
     execution: CustomImportExecution,
-    *,
-    dataset_id: int,
-    definition_revision_id: int,
-    schema_revision_id: int,
-    mechanism: str,
-    capture_bundle_id: int | None,
+    request: _ExecutionRequest,
 ) -> bool:
     return (
-        execution.dataset_id == dataset_id
-        and execution.definition_revision_id == definition_revision_id
-        and execution.schema_revision_id == schema_revision_id
-        and execution.mechanism == mechanism
-        and execution.capture_bundle_id == capture_bundle_id
+        execution.dataset_id == request.dataset_id
+        and execution.definition_revision_id == request.definition_revision_id
+        and execution.schema_revision_id == request.schema_revision_id
+        and execution.mechanism == request.mechanism
+        and execution.capture_bundle_id == request.capture_bundle_id
     )
 
 
-def _submission_result(execution: CustomImportExecution, *, created: bool) -> ExecutionSubmission:
+def _submission_result(execution: CustomImportExecution, *, is_created: bool) -> ExecutionSubmission:
     state = _validate_execution_state(execution)
     return ExecutionSubmission(
         execution_id=execution.execution_id,
         state=state,
-        created=created,
+        created=is_created,
     )
+
+
+def _validated_execution_request(
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    capture_bundle_id: int | None,
+) -> _ExecutionRequest:
+    normalized_dataset_id = _positive_id(dataset_id, "dataset_id")
+    normalized_definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
+    normalized_schema_revision_id = _positive_id(schema_revision_id, "schema_revision_id")
+    normalized_capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id", allow_none=True)
+    normalized_idempotency_key = _idempotency_key(idempotency_key)
+    normalized_mechanism = _mechanism(mechanism)
+    return _ExecutionRequest(
+        dataset_id=normalized_dataset_id,
+        definition_revision_id=normalized_definition_revision_id,
+        schema_revision_id=normalized_schema_revision_id,
+        idempotency_key=normalized_idempotency_key,
+        mechanism=normalized_mechanism,
+        capture_bundle_id=normalized_capture_bundle_id,
+    )
+
+
+async def _insert_execution(session: AsyncSession, request: _ExecutionRequest) -> int | None:
+    insert_result = await session.execute(
+        pg_insert(CustomImportExecution)
+        .values(
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+            idempotency_key=request.idempotency_key,
+            mechanism=request.mechanism,
+            state="queued",
+            capture_bundle_id=request.capture_bundle_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=(
+                CustomImportExecution.definition_revision_id,
+                CustomImportExecution.idempotency_key,
+            )
+        )
+        .returning(CustomImportExecution.execution_id)
+    )
+    return insert_result.scalar_one_or_none()
+
+
+async def _locked_submission_execution(
+    session: AsyncSession,
+    request: _ExecutionRequest,
+    inserted_execution_id: int | None,
+) -> CustomImportExecution | None:
+    if inserted_execution_id is not None:
+        return await _lock_execution(session, inserted_execution_id, dataset_id=request.dataset_id)
+    snapshot = await _submission_snapshot(
+        session,
+        definition_revision_id=request.definition_revision_id,
+        idempotency_key=request.idempotency_key,
+    )
+    if snapshot is None or snapshot.dataset_id != request.dataset_id:
+        return snapshot
+    return await _lock_execution(
+        session,
+        snapshot.execution_id,
+        dataset_id=request.dataset_id,
+    )
+
+
+async def _submission_snapshot(
+    session: AsyncSession,
+    *,
+    definition_revision_id: int,
+    idempotency_key: str,
+) -> CustomImportExecution | None:
+    with _no_autoflush(session):
+        result = await session.execute(
+            select(CustomImportExecution)
+            .where(CustomImportExecution.definition_revision_id == definition_revision_id)
+            .where(CustomImportExecution.idempotency_key == idempotency_key)
+            .execution_options(populate_existing=True)
+        )
+    return result.scalar_one_or_none()
 
 
 async def create_execution(
@@ -435,62 +610,28 @@ async def create_execution(
     """
 
     _require_caller_transaction(session)
-    dataset_id = _positive_id(dataset_id, "dataset_id")
-    definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
-    schema_revision_id = _positive_id(schema_revision_id, "schema_revision_id")
-    capture_bundle_id = _positive_id(
-        capture_bundle_id,
-        "capture_bundle_id",
-        allow_none=True,
-    )
-    request_key = _idempotency_key(idempotency_key)
-    mechanism = _mechanism(mechanism)
-
-    # The INSERT itself can wait on a competing idempotency row, so mark the
-    # transaction before issuing the first lifecycle statement.
-    await _mark_lifecycle_transaction(session)
-    insert_result = await session.execute(
-        pg_insert(CustomImportExecution)
-        .values(
-            dataset_id=dataset_id,
-            definition_revision_id=definition_revision_id,
-            schema_revision_id=schema_revision_id,
-            idempotency_key=request_key,
-            mechanism=mechanism,
-            state="queued",
-            capture_bundle_id=capture_bundle_id,
-        )
-        .on_conflict_do_nothing(
-            index_elements=(
-                CustomImportExecution.definition_revision_id,
-                CustomImportExecution.idempotency_key,
-            )
-        )
-        .returning(CustomImportExecution.execution_id)
-    )
-    inserted_execution_id = insert_result.scalar_one_or_none()
-    created = inserted_execution_id is not None
-    if created:
-        execution = await _lock_execution(session, inserted_execution_id)
-    else:
-        execution = await _lock_execution_by_request(
-            session,
-            definition_revision_id=definition_revision_id,
-            idempotency_key=request_key,
-        )
-    if execution is None:
-        raise ExecutionInvariantError("idempotent execution row disappeared before it could be locked")
-    if not _submission_matches(
-        execution,
+    _require_clean_lifecycle_session(session)
+    request = _validated_execution_request(
         dataset_id=dataset_id,
         definition_revision_id=definition_revision_id,
         schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
         mechanism=mechanism,
         capture_bundle_id=capture_bundle_id,
-    ):
+    )
+
+    # The INSERT itself can wait on a competing idempotency row.  Serialize it
+    # beneath the dataset lock so no execution/lease lock precedes that parent.
+    await _lock_dataset(session, request.dataset_id)
+    inserted_execution_id = await _insert_execution(session, request)
+    is_created = inserted_execution_id is not None
+    execution = await _locked_submission_execution(session, request, inserted_execution_id)
+    if execution is None:
+        raise ExecutionInvariantError("idempotent execution row disappeared before it could be locked")
+    if not _has_matching_submission(execution, request):
         raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
     await _ensure_lease(session, execution.execution_id)
-    return _submission_result(execution, created=created)
+    return _submission_result(execution, is_created=is_created)
 
 
 async def _claim_or_resume_execution(
@@ -501,16 +642,14 @@ async def _claim_or_resume_execution(
     lease_seconds: int,
     allow_queued: bool,
 ) -> LeaseGrant | None:
-    execution = await _lock_execution(session, execution_id)
-    if execution is None:
-        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    execution = await _locked_lifecycle_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     _validate_lease(lease)
     if state not in _ACTIVE_STATES or (state == "queued" and not allow_queued):
         return None
-    if _lease_is_unexpired(lease, now):
+    if _is_lease_unexpired(lease, now):
         return None
     if lease.fence >= MAX_FENCE:
         raise ExecutionInvariantError("lease fence cannot advance further")
@@ -529,13 +668,13 @@ async def _claim_or_resume_execution(
         )
     )
     claimed_state = "running" if state == "queued" else state
-    execution_values: dict[str, Any] = {"state": claimed_state, "updated_at": now}
+    execution_update_dict: dict[str, Any] = {"state": claimed_state, "updated_at": now}
     if execution.started_at is None:
-        execution_values["started_at"] = now
+        execution_update_dict["started_at"] = now
     await session.execute(
         update(CustomImportExecution)
         .where(CustomImportExecution.execution_id == execution_id)
-        .values(**execution_values)
+        .values(**execution_update_dict)
     )
     return LeaseGrant(
         execution_id=execution_id,
@@ -559,6 +698,7 @@ async def claim_execution(
     """
 
     _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
     token_sha256 = lease_token_sha256(token)
     lease_seconds = _lease_seconds(lease_seconds)
@@ -581,6 +721,7 @@ async def resume_execution(
     """Take over an expired running or canceling execution with a new fence."""
 
     _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
     token_sha256 = lease_token_sha256(token)
     lease_seconds = _lease_seconds(lease_seconds)
@@ -604,18 +745,17 @@ async def heartbeat_execution(
     """Renew one unexpired lease only when the holder still owns its fence."""
 
     _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
     lease_seconds = _lease_seconds(lease_seconds)
 
-    execution = await _lock_execution(session, execution_id)
-    if execution is None:
-        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    execution = await _locked_heartbeat_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
-    if state not in _HEARTBEAT_STATES or not _lease_matches(
+    if state not in _HEARTBEAT_STATES or not _has_matching_lease_authority(
         lease,
         fence=fence,
         token_sha256=token_sha256,
@@ -652,6 +792,7 @@ async def request_cancellation(
     """
 
     _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
     terminal_reason = _bounded_text(
         terminal_reason,
@@ -659,9 +800,7 @@ async def request_cancellation(
         maximum=64,
         allow_none=True,
     )
-    execution = await _lock_execution(session, execution_id)
-    if execution is None:
-        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    execution = await _locked_lifecycle_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
@@ -688,12 +827,69 @@ async def request_cancellation(
             )
         return ExecutionTransition(execution_id=execution_id, state="canceled", changed=True)
 
+    canceling_fields_by_name: dict[str, Any] = {"state": "canceling", "updated_at": now}
+    if terminal_reason is not None:
+        canceling_fields_by_name["terminal_reason"] = terminal_reason
     await session.execute(
         update(CustomImportExecution)
         .where(CustomImportExecution.execution_id == execution_id)
-        .values(state="canceling", updated_at=now)
+        .values(**canceling_fields_by_name)
     )
     return ExecutionTransition(execution_id=execution_id, state="canceling", changed=True)
+
+
+def _terminal_transition_states(terminal_state: str) -> frozenset[str]:
+    if terminal_state == "canceled":
+        return frozenset({"running", "canceling"})
+    return frozenset({"running"})
+
+
+def _can_finish_execution(
+    state: str,
+    lease: CustomImportLease,
+    *,
+    terminal_state: str,
+    fence: int,
+    token_sha256: bytes,
+    now: dt.datetime,
+) -> bool:
+    return state in _terminal_transition_states(terminal_state) and _has_matching_lease_authority(
+        lease,
+        fence=fence,
+        token_sha256=token_sha256,
+        now=now,
+    )
+
+
+async def _apply_terminal_transition(
+    session: AsyncSession,
+    *,
+    execution_id: int,
+    terminal_state: str,
+    terminal_reason: str | None,
+    now: dt.datetime,
+) -> None:
+    terminal_fields_by_name: dict[str, Any] = {
+        "state": terminal_state,
+        "finished_at": now,
+        "updated_at": now,
+    }
+    # A cancellation request is the authoritative reason when the worker
+    # later acknowledges it without supplying a replacement reason.
+    if terminal_reason is not None:
+        terminal_fields_by_name["terminal_reason"] = terminal_reason
+    await session.execute(
+        update(CustomImportExecution)
+        .where(CustomImportExecution.execution_id == execution_id)
+        .values(**terminal_fields_by_name)
+    )
+    # Keep the holder digest and fence as an audit fence.  The database shape
+    # forbids clearing a claimed lease, and expiration invalidates the holder.
+    await session.execute(
+        update(CustomImportLease)
+        .where(CustomImportLease.execution_id == execution_id)
+        .values(expires_at=now, updated_at=now)
+    )
 
 
 async def finish_execution(
@@ -715,6 +911,7 @@ async def finish_execution(
     """
 
     _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
@@ -726,42 +923,28 @@ async def finish_execution(
         allow_none=True,
     )
 
-    execution = await _lock_execution(session, execution_id)
-    if execution is None:
-        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    execution = await _locked_lifecycle_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     if state in TERMINAL_STATES:
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
-    if terminal_state == "canceled":
-        allowed_states = {"running", "canceling"}
-    else:
-        allowed_states = {"running"}
-    if state not in allowed_states or not _lease_matches(
+    if not _can_finish_execution(
+        state,
         lease,
+        terminal_state=terminal_state,
         fence=fence,
         token_sha256=token_sha256,
         now=now,
     ):
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
 
-    await session.execute(
-        update(CustomImportExecution)
-        .where(CustomImportExecution.execution_id == execution_id)
-        .values(
-            state=terminal_state,
-            terminal_reason=terminal_reason,
-            finished_at=now,
-            updated_at=now,
-        )
-    )
-    # Keep the holder digest and fence as an audit fence.  The database shape
-    # forbids clearing a claimed lease, and expiration invalidates the holder.
-    await session.execute(
-        update(CustomImportLease)
-        .where(CustomImportLease.execution_id == execution_id)
-        .values(expires_at=now, updated_at=now)
+    await _apply_terminal_transition(
+        session,
+        execution_id=execution_id,
+        terminal_state=terminal_state,
+        terminal_reason=terminal_reason,
+        now=now,
     )
     return ExecutionTransition(execution_id=execution_id, state=terminal_state, changed=True)
 
@@ -782,6 +965,7 @@ __all__ = (
     "IdempotencyConflict",
     "LeaseGrant",
     "MAX_LEASE_SECONDS",
+    "MAX_BIGINT",
     "TERMINAL_STATES",
     "cancel_execution",
     "claim_execution",

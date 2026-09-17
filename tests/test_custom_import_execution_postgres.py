@@ -28,7 +28,6 @@ from db.models.custom_import import (
 )
 from process.custom_import import execution as lifecycle
 
-
 _DSN_ENV = "HLTHPRT_CUSTOM_IMPORT_POSTGRES_DSN"
 _RESULT = TypeVar("_RESULT")
 _LOCK_OBSERVATION_TIMEOUT_SECONDS = 5
@@ -90,11 +89,11 @@ async def _postgres_case() -> AsyncIterator[_PostgresCase]:
     engine = raw_engine.execution_options(schema_translate_map={"mrf": schema_name})
     sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     schema = _quoted_identifier(schema_name)
-    created_schema = False
+    is_schema_created = False
     try:
         async with raw_engine.begin() as connection:
             await connection.execute(text(f"CREATE SCHEMA {schema}"))
-        created_schema = True
+        is_schema_created = True
         async with engine.begin() as connection:
             await connection.run_sync(
                 lambda sync_connection: Base.metadata.create_all(
@@ -137,7 +136,7 @@ async def _postgres_case() -> AsyncIterator[_PostgresCase]:
                 )
         yield case
     finally:
-        if created_schema:
+        if is_schema_created:
             async with raw_engine.begin() as connection:
                 await connection.execute(text(f"DROP SCHEMA {schema} CASCADE"))
         await raw_engine.dispose()
@@ -186,6 +185,95 @@ async def _read_execution_and_lease(case: _PostgresCase, execution_id: int):
         return execution, lease
 
 
+async def _claim(
+    case: _PostgresCase,
+    execution_id: int,
+    token: str,
+    *,
+    lease_seconds: int = lifecycle.DEFAULT_LEASE_SECONDS,
+):
+    return await _in_transaction(
+        case,
+        lambda session: lifecycle.claim_execution(
+            session,
+            execution_id=execution_id,
+            token=token,
+            lease_seconds=lease_seconds,
+        ),
+    )
+
+
+async def _heartbeat(case: _PostgresCase, execution_id: int, fence: int, token: str):
+    return await _in_transaction(
+        case,
+        lambda session: lifecycle.heartbeat_execution(
+            session,
+            execution_id=execution_id,
+            fence=fence,
+            token=token,
+        ),
+    )
+
+
+async def _finish(
+    case: _PostgresCase,
+    execution_id: int,
+    fence: int,
+    token: str,
+    terminal_state: str,
+    *,
+    terminal_reason: str | None = None,
+):
+    return await _in_transaction(
+        case,
+        lambda session: lifecycle.finish_execution(
+            session,
+            execution_id=execution_id,
+            fence=fence,
+            token=token,
+            terminal_state=terminal_state,
+            terminal_reason=terminal_reason,
+        ),
+    )
+
+
+async def _request_cancellation(
+    case: _PostgresCase,
+    execution_id: int,
+    *,
+    terminal_reason: str | None = None,
+):
+    return await _in_transaction(
+        case,
+        lambda session: lifecycle.request_cancellation(
+            session,
+            execution_id=execution_id,
+            terminal_reason=terminal_reason,
+        ),
+    )
+
+
+async def _cancellation_with_stale_completion(
+    case: _PostgresCase,
+    execution_id: int,
+    fence: int,
+) -> tuple[object, object]:
+    async with case.sessions() as stale_session:
+        async with stale_session.begin():
+            preloaded = await stale_session.get(CustomImportExecution, execution_id)
+            assert preloaded is not None
+            assert preloaded.state == "running"
+            cancellation = await _request_cancellation(case, execution_id)
+            stale_completion = await lifecycle.finish_execution(
+                stale_session,
+                execution_id=execution_id,
+                fence=fence,
+                token=_WORKER,
+                terminal_state="completed",
+            )
+            return cancellation, stale_completion
+
+
 async def _backend_pid(session: AsyncSession) -> int:
     backend_pid = await session.scalar(text("SELECT pg_backend_pid()"))
     assert isinstance(backend_pid, int)
@@ -225,24 +313,9 @@ async def test_postgres_duplicate_claim_takeover_and_stale_worker_fences():
         assert first.created is True
         assert duplicate.created is False
 
-        grant = await _in_transaction(
-            case,
-            lambda session: lifecycle.claim_execution(
-                session,
-                execution_id=first.execution_id,
-                token=_WORKER_A,
-                lease_seconds=60,
-            ),
-        )
+        grant = await _claim(case, first.execution_id, _WORKER_A, lease_seconds=60)
         assert grant is not None
-        competing = await _in_transaction(
-            case,
-            lambda session: lifecycle.claim_execution(
-                session,
-                execution_id=first.execution_id,
-                token=_WORKER_B,
-            ),
-        )
+        competing = await _claim(case, first.execution_id, _WORKER_B)
         assert competing is None
 
         await _expire_lease(case, first.execution_id)
@@ -258,34 +331,9 @@ async def test_postgres_duplicate_claim_takeover_and_stale_worker_fences():
         assert takeover is not None
         assert takeover.fence == grant.fence + 1
 
-        stale_heartbeat = await _in_transaction(
-            case,
-            lambda session: lifecycle.heartbeat_execution(
-                session,
-                execution_id=first.execution_id,
-                fence=grant.fence,
-                token=_WORKER_A,
-            ),
-        )
-        current_heartbeat = await _in_transaction(
-            case,
-            lambda session: lifecycle.heartbeat_execution(
-                session,
-                execution_id=first.execution_id,
-                fence=takeover.fence,
-                token=_WORKER_B,
-            ),
-        )
-        stale_finish = await _in_transaction(
-            case,
-            lambda session: lifecycle.finish_execution(
-                session,
-                execution_id=first.execution_id,
-                fence=grant.fence,
-                token=_WORKER_A,
-                terminal_state="completed",
-            ),
-        )
+        stale_heartbeat = await _heartbeat(case, first.execution_id, grant.fence, _WORKER_A)
+        current_heartbeat = await _heartbeat(case, first.execution_id, takeover.fence, _WORKER_B)
+        stale_finish = await _finish(case, first.execution_id, grant.fence, _WORKER_A, "completed")
         execution, lease = await _read_execution_and_lease(case, first.execution_id)
 
         assert stale_heartbeat is None
@@ -301,70 +349,28 @@ async def test_postgres_duplicate_claim_takeover_and_stale_worker_fences():
 async def test_postgres_cancellation_refreshes_stale_identity_maps_and_terminal_state_is_immutable():
     async with _postgres_case() as case:
         submission = await _submit(case, key="synthetic-cancel")
-        grant = await _in_transaction(
-            case,
-            lambda session: lifecycle.claim_execution(
-                session,
-                execution_id=submission.execution_id,
-                token=_WORKER,
-            ),
-        )
+        grant = await _claim(case, submission.execution_id, _WORKER)
         assert grant is not None
 
-        async with case.sessions() as stale_session:
-            async with stale_session.begin():
-                preloaded = await stale_session.get(
-                    CustomImportExecution,
-                    submission.execution_id,
-                )
-                assert preloaded is not None
-                assert preloaded.state == "running"
-                cancellation = await _in_transaction(
-                    case,
-                    lambda session: lifecycle.request_cancellation(
-                        session,
-                        execution_id=submission.execution_id,
-                    ),
-                )
-                stale_completion = await lifecycle.finish_execution(
-                    stale_session,
-                    execution_id=submission.execution_id,
-                    fence=grant.fence,
-                    token=_WORKER,
-                    terminal_state="completed",
-                )
-                assert cancellation.changed is True
-                assert stale_completion.changed is False
-                assert stale_completion.state == "canceling"
+        cancellation, stale_completion = await _cancellation_with_stale_completion(
+            case,
+            submission.execution_id,
+            grant.fence,
+        )
+        assert cancellation.changed is True
+        assert stale_completion.changed is False
+        assert stale_completion.state == "canceling"
 
-        canceled = await _in_transaction(
+        canceled = await _finish(
             case,
-            lambda session: lifecycle.finish_execution(
-                session,
-                execution_id=submission.execution_id,
-                fence=grant.fence,
-                token=_WORKER,
-                terminal_state="canceled",
-                terminal_reason="requested",
-            ),
+            submission.execution_id,
+            grant.fence,
+            _WORKER,
+            "canceled",
+            terminal_reason="requested",
         )
-        cancel_after_terminal = await _in_transaction(
-            case,
-            lambda session: lifecycle.request_cancellation(
-                session,
-                execution_id=submission.execution_id,
-            ),
-        )
-        failed_after_terminal = await _in_transaction(
-            case,
-            lambda session: lifecycle.finish_execution(
-                session,
-                execution_id=submission.execution_id,
-                fence=grant.fence,
-                token=_WORKER,
-                terminal_state="failed",
-            ),
-        )
+        cancel_after_terminal = await _request_cancellation(case, submission.execution_id)
+        failed_after_terminal = await _finish(case, submission.execution_id, grant.fence, _WORKER, "failed")
         execution, lease = await _read_execution_and_lease(case, submission.execution_id)
         now = await _in_transaction(
             case,
@@ -380,6 +386,33 @@ async def test_postgres_cancellation_refreshes_stale_identity_maps_and_terminal_
         assert lease.token_sha256 == lifecycle.lease_token_sha256(_WORKER)
         assert lease.expires_at is not None
         assert lease.expires_at <= now
+
+
+@pytest.mark.asyncio
+async def test_postgres_running_cancellation_reason_survives_default_worker_acknowledgement():
+    async with _postgres_case() as case:
+        submission = await _submit(case, key="synthetic-cancel-reason")
+        grant = await _claim(case, submission.execution_id, _WORKER)
+        assert grant is not None
+
+        cancellation = await _request_cancellation(
+            case,
+            submission.execution_id,
+            terminal_reason="operator_request",
+        )
+        canceled = await _finish(
+            case,
+            submission.execution_id,
+            grant.fence,
+            _WORKER,
+            "canceled",
+        )
+        execution, _lease = await _read_execution_and_lease(case, submission.execution_id)
+
+        assert cancellation.changed is True
+        assert canceled.changed is True
+        assert execution.state == "canceled"
+        assert execution.terminal_reason == "operator_request"
 
 
 @pytest.mark.asyncio
@@ -434,7 +467,7 @@ async def test_postgres_overlapping_duplicate_submissions_wait_on_the_unique_key
 
 
 @pytest.mark.asyncio
-async def test_postgres_overlapping_claims_wait_on_the_execution_lock_and_grant_one_lease():
+async def test_postgres_overlapping_claims_wait_and_grant_one_lease():
     async with _postgres_case() as case:
         submission = await _submit(case, key="synthetic-overlapping-claim")
 
@@ -484,3 +517,55 @@ async def test_postgres_overlapping_claims_wait_on_the_execution_lock_and_grant_
         assert execution.state == "running"
         assert lease.fence == winning_claim.fence
         assert lease.token_sha256 == lifecycle.lease_token_sha256(_WORKER_A)
+
+
+@pytest.mark.asyncio
+async def test_claim_waits_on_dataset_before_execution_lock():
+    async with _postgres_case() as case:
+        submission = await _submit(case, key="synthetic-dataset-first-lock")
+        async with case.sessions() as dataset_holder, case.sessions() as claimant, case.sessions() as inspector:
+            holder_transaction = await dataset_holder.begin()
+            claimant_transaction = await claimant.begin()
+            inspection_transaction = None
+            claim_task = None
+            try:
+                await dataset_holder.execute(
+                    select(CustomImportDataset)
+                    .where(CustomImportDataset.dataset_id == case.dataset_id)
+                    .with_for_update()
+                )
+                claimant_backend_pid = await _backend_pid(claimant)
+                claim_task = asyncio.create_task(
+                    lifecycle.claim_execution(
+                        claimant,
+                        execution_id=submission.execution_id,
+                        token=_WORKER_A,
+                    )
+                )
+                await _wait_for_backend_lock(case, backend_pid=claimant_backend_pid)
+
+                inspection_transaction = await inspector.begin()
+                execution = (
+                    await inspector.execute(
+                        select(CustomImportExecution)
+                        .where(CustomImportExecution.execution_id == submission.execution_id)
+                        .with_for_update(nowait=True)
+                    )
+                ).scalar_one()
+                assert execution.execution_id == submission.execution_id
+                await inspection_transaction.commit()
+                inspection_transaction = None
+
+                await holder_transaction.commit()
+                claim = await asyncio.wait_for(claim_task, timeout=_LOCK_OBSERVATION_TIMEOUT_SECONDS)
+                await claimant_transaction.commit()
+                assert claim is not None
+                assert claim.fence == 1
+            finally:
+                await _cancel_task(claim_task)
+                if inspection_transaction is not None and inspection_transaction.is_active:
+                    await inspection_transaction.rollback()
+                if claimant_transaction.is_active:
+                    await claimant_transaction.rollback()
+                if holder_transaction.is_active:
+                    await holder_transaction.rollback()

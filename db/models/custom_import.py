@@ -20,6 +20,7 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     Numeric,
@@ -28,6 +29,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 
@@ -51,8 +53,10 @@ __all__ = (
     "CustomImportFieldAlias",
     "CustomImportFieldSlot",
     "CustomImportGeneration",
+    "CustomImportGenerationSeal",
     "CustomImportGenerationFamily",
     "CustomImportLease",
+    "CustomImportNoChangeSeal",
     "CustomImportPack",
     "CustomImportPublicationEvent",
     "CustomImportRejection",
@@ -782,9 +786,10 @@ class CustomImportPack(_CustomImportModel):
         PrimaryKeyConstraint("pack_id", name="custom_import_pack_pkey"),
         UniqueConstraint(
             "execution_id",
+            "producing_fence",
             "stream_slot",
             "pack_ordinal",
-            name="custom_import_pack_execution_key",
+            name="custom_import_pack_attempt_key",
         ),
         UniqueConstraint(
             "pack_id",
@@ -838,7 +843,10 @@ class CustomImportPack(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "pack_ordinal >= 0 AND record_count >= 0 AND " + _sha256_check("pack_sha256"),
+            "pack_ordinal >= 0 AND record_count >= 0 AND "
+            + _sha256_check("pack_sha256")
+            + " AND ((producing_fence IS NULL AND producing_token_sha256 IS NULL) OR "
+            "(producing_fence > 0 AND " + _sha256_check("producing_token_sha256") + "))",
             name="custom_import_pack_shape_check",
         ),
     )
@@ -853,6 +861,10 @@ class CustomImportPack(_CustomImportModel):
     capture_bundle_id = Column(BigInteger, nullable=False)
     record_count = Column(BigInteger, nullable=False)
     pack_sha256 = Column(LargeBinary(32), nullable=False)
+    # New rows are fenced by the finality migration.  Nullable storage keeps
+    # retained pre-finality evidence readable without fabricating authority.
+    producing_fence = Column(BigInteger)
+    producing_token_sha256 = Column(LargeBinary(32))
     created_at = _timestamp_column()
 
 
@@ -862,7 +874,13 @@ class CustomImportRejection(_CustomImportModel):
     __tablename__ = "custom_import_rejection"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        PrimaryKeyConstraint("execution_id", "rejection_ordinal", name="custom_import_rejection_pkey"),
+        PrimaryKeyConstraint("rejection_id", name="custom_import_rejection_pkey"),
+        UniqueConstraint(
+            "execution_id",
+            "producing_fence",
+            "rejection_ordinal",
+            name="custom_import_rejection_attempt_key",
+        ),
         ForeignKeyConstraint(
             [
                 "execution_id",
@@ -894,13 +912,17 @@ class CustomImportRejection(_CustomImportModel):
             "rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{0,62}$' AND "
             "(source_ordinal IS NULL OR source_ordinal >= 0) AND "
             "(field_slot IS NULL OR field_slot > 0) AND "
-            "(root_key_sha256 IS NULL OR " + _sha256_check("root_key_sha256") + ")",
+            "(root_key_sha256 IS NULL OR "
+            + _sha256_check("root_key_sha256")
+            + ") AND ((producing_fence IS NULL AND producing_token_sha256 IS NULL) OR "
+            "(producing_fence > 0 AND " + _sha256_check("producing_token_sha256") + "))",
             name="custom_import_rejection_shape_check",
         ),
     )
 
-    execution_id = Column(BigInteger, primary_key=True)
-    rejection_ordinal = Column(BigInteger, primary_key=True)
+    rejection_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    execution_id = Column(BigInteger, nullable=False)
+    rejection_ordinal = Column(BigInteger, nullable=False)
     dataset_id = Column(BigInteger, nullable=False)
     definition_revision_id = Column(BigInteger, nullable=False)
     schema_revision_id = Column(BigInteger, nullable=False)
@@ -912,6 +934,8 @@ class CustomImportRejection(_CustomImportModel):
     code = Column(String(63), nullable=False)
     field_slot = Column(SmallInteger)
     canonical_evidence = Column(Text, nullable=False)
+    producing_fence = Column(BigInteger)
+    producing_token_sha256 = Column(LargeBinary(32))
     created_at = _timestamp_column()
 
 
@@ -1093,7 +1117,9 @@ class CustomImportFamilyRevision(_CustomImportModel):
             "schema_revision_id",
             "root_record_id",
             "family_sha256",
-            name="custom_import_family_revision_content_key",
+            "producing_execution_id",
+            "producing_fence",
+            name="custom_import_family_revision_attempt_content_key",
         ),
         UniqueConstraint(
             "family_revision_id",
@@ -1128,7 +1154,11 @@ class CustomImportFamilyRevision(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "child_count >= 0 AND " + _sha256_check("family_sha256"),
+            "child_count >= 0 AND "
+            + _sha256_check("family_sha256")
+            + " AND ((producing_execution_id IS NULL AND producing_fence IS NULL "
+            "AND producing_token_sha256 IS NULL) OR (producing_execution_id > 0 "
+            "AND producing_fence > 0 AND " + _sha256_check("producing_token_sha256") + "))",
             name="custom_import_family_revision_shape_check",
         ),
     )
@@ -1141,6 +1171,9 @@ class CustomImportFamilyRevision(_CustomImportModel):
     entity_binding_id = Column(BigInteger, nullable=False)
     family_sha256 = Column(LargeBinary(32), nullable=False)
     child_count = Column(BigInteger, nullable=False)
+    producing_execution_id = Column(BigInteger)
+    producing_fence = Column(BigInteger)
+    producing_token_sha256 = Column(LargeBinary(32))
     created_at = _timestamp_column()
 
 
@@ -1201,18 +1234,17 @@ class CustomImportFamilyChild(_CustomImportModel):
 
 
 class CustomImportGeneration(_CustomImportModel):
-    """Immutable candidate output; publication state lives only in pointers/events."""
+    """One immutable per-fence candidate; finality owns content identity."""
 
     __tablename__ = "custom_import_generation"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint("generation_id", name="custom_import_generation_pkey"),
         UniqueConstraint(
-            "dataset_id",
-            "generation_sha256",
-            name="custom_import_generation_content_key",
+            "execution_id",
+            "producing_fence",
+            name="custom_import_generation_execution_fence_key",
         ),
-        UniqueConstraint("execution_id", name="custom_import_generation_execution_key"),
         UniqueConstraint("generation_id", "dataset_id", name="custom_import_generation_dataset_key"),
         UniqueConstraint(
             "generation_id",
@@ -1220,6 +1252,15 @@ class CustomImportGeneration(_CustomImportModel):
             "definition_revision_id",
             "schema_revision_id",
             name="custom_import_generation_owner_key",
+        ),
+        UniqueConstraint(
+            "generation_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            "execution_id",
+            "capture_bundle_id",
+            name="custom_import_generation_seal_reference_key",
         ),
         ForeignKeyConstraint(
             [
@@ -1252,12 +1293,17 @@ class CustomImportGeneration(_CustomImportModel):
             "root_count >= 0 AND family_count >= 0 AND "
             + _sha256_check("source_bundle_sha256")
             + " AND "
-            + _sha256_check("generation_sha256")
+            + _sha256_check("candidate_sha256")
             + " AND "
             "((base_generation_id IS NULL AND base_dataset_id IS NULL) OR "
             "(base_generation_id IS NOT NULL AND base_dataset_id IS NOT NULL AND "
             "base_dataset_id = dataset_id))",
             name="custom_import_generation_shape_check",
+        ),
+        CheckConstraint(
+            "(producing_fence IS NULL AND producing_token_sha256 IS NULL) OR "
+            "(producing_fence > 0 AND " + _sha256_check("producing_token_sha256") + ")",
+            name="custom_import_generation_producing_authority_check",
         ),
     )
 
@@ -1270,10 +1316,243 @@ class CustomImportGeneration(_CustomImportModel):
     base_generation_id = Column(BigInteger)
     base_dataset_id = Column(BigInteger)
     source_bundle_sha256 = Column(LargeBinary(32), nullable=False)
-    generation_sha256 = Column(LargeBinary(32), nullable=False)
+    # This is a worker-supplied attempt fingerprint, not content identity.
+    # The immutable generation seal's materialization_sha256 is the sole
+    # authoritative digest used by publication and no-change proof.
+    candidate_sha256 = Column(LargeBinary(32), nullable=False)
     root_count = Column(BigInteger, nullable=False)
     family_count = Column(BigInteger, nullable=False)
+    # These nullable fields are intentionally legacy-safe.  The follow-on
+    # finality migration's insert guard requires both fields on new rows,
+    # while retained generations from before fenced production stay readable
+    # but cannot become current without a matching immutable seal.
+    producing_fence = Column(BigInteger)
+    producing_token_sha256 = Column(LargeBinary(32))
     created_at = _timestamp_column()
+
+
+class CustomImportGenerationSeal(_CustomImportModel):
+    """One immutable finality receipt for a fully materialized generation."""
+
+    __tablename__ = "custom_import_generation_seal"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint("generation_id", name="custom_import_generation_seal_pkey"),
+        UniqueConstraint(
+            "generation_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            name="custom_import_generation_seal_owner_key",
+        ),
+        ForeignKeyConstraint(
+            [
+                "generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "execution_id",
+                "capture_bundle_id",
+            ],
+            [
+                _reference("custom_import_generation", "generation_id"),
+                _reference("custom_import_generation", "dataset_id"),
+                _reference("custom_import_generation", "definition_revision_id"),
+                _reference("custom_import_generation", "schema_revision_id"),
+                _reference("custom_import_generation", "execution_id"),
+                _reference("custom_import_generation", "capture_bundle_id"),
+            ],
+            name="custom_import_generation_seal_generation_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "capture_bundle_id",
+            ],
+            [
+                _reference("custom_import_execution", "execution_id"),
+                _reference("custom_import_execution", "dataset_id"),
+                _reference("custom_import_execution", "definition_revision_id"),
+                _reference("custom_import_execution", "schema_revision_id"),
+                _reference("custom_import_execution", "capture_bundle_id"),
+            ],
+            name="custom_import_generation_seal_execution_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "seal_contract = 'custom-import-generation-seal/v1' AND sealing_fence > 0 AND "
+            "root_count >= 0 AND family_count >= 0 AND generation_family_count >= 0 AND "
+            "family_child_count >= 0 AND winner_count >= 0 AND profile_count >= 0 AND "
+            "root_scalar_count >= 0 AND child_scalar_count >= 0 AND "
+            + _sha256_check("sealing_token_sha256")
+            + " AND "
+            + _sha256_check("materialization_sha256")
+            + " AND "
+            + _sha256_check("effective_output_sha256"),
+            name="custom_import_generation_seal_shape_check",
+        ),
+    )
+
+    generation_id = Column(BigInteger, primary_key=True)
+    dataset_id = Column(BigInteger, nullable=False)
+    definition_revision_id = Column(BigInteger, nullable=False)
+    schema_revision_id = Column(BigInteger, nullable=False)
+    execution_id = Column(BigInteger, nullable=False)
+    capture_bundle_id = Column(BigInteger, nullable=False)
+    seal_contract = Column(String(63), nullable=False)
+    sealing_fence = Column(BigInteger, nullable=False)
+    sealing_token_sha256 = Column(LargeBinary(32), nullable=False)
+    root_count = Column(BigInteger, nullable=False)
+    family_count = Column(BigInteger, nullable=False)
+    generation_family_count = Column(BigInteger, nullable=False)
+    family_child_count = Column(BigInteger, nullable=False)
+    winner_count = Column(BigInteger, nullable=False)
+    profile_count = Column(BigInteger, nullable=False)
+    root_scalar_count = Column(BigInteger, nullable=False)
+    child_scalar_count = Column(BigInteger, nullable=False)
+    materialization_sha256 = Column(LargeBinary(32), nullable=False)
+    # Source/provenance-inclusive receipt versus served-output equivalence.
+    effective_output_sha256 = Column(LargeBinary(32), nullable=False)
+    sealed_at = _timestamp_column()
+
+
+class CustomImportNoChangeSeal(_CustomImportModel):
+    """Immutable proof that one sealed candidate has the current effective output."""
+
+    __tablename__ = "custom_import_no_change_seal"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint("execution_id", name="custom_import_no_change_seal_pkey"),
+        UniqueConstraint(
+            "execution_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            name="custom_import_no_change_seal_owner_key",
+        ),
+        ForeignKeyConstraint(
+            [
+                "execution_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "capture_bundle_id",
+            ],
+            [
+                _reference("custom_import_execution", "execution_id"),
+                _reference("custom_import_execution", "dataset_id"),
+                _reference("custom_import_execution", "definition_revision_id"),
+                _reference("custom_import_execution", "schema_revision_id"),
+                _reference("custom_import_execution", "capture_bundle_id"),
+            ],
+            name="custom_import_no_change_seal_execution_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "candidate_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+                "execution_id",
+                "capture_bundle_id",
+            ],
+            [
+                _reference("custom_import_generation", "generation_id"),
+                _reference("custom_import_generation", "dataset_id"),
+                _reference("custom_import_generation", "definition_revision_id"),
+                _reference("custom_import_generation", "schema_revision_id"),
+                _reference("custom_import_generation", "execution_id"),
+                _reference("custom_import_generation", "capture_bundle_id"),
+            ],
+            name="custom_import_no_change_seal_candidate_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "candidate_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_generation_seal", "generation_id"),
+                _reference("custom_import_generation_seal", "dataset_id"),
+                _reference("custom_import_generation_seal", "definition_revision_id"),
+                _reference("custom_import_generation_seal", "schema_revision_id"),
+            ],
+            name="custom_import_no_change_seal_candidate_finality_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "base_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_generation", "generation_id"),
+                _reference("custom_import_generation", "dataset_id"),
+                _reference("custom_import_generation", "definition_revision_id"),
+                _reference("custom_import_generation", "schema_revision_id"),
+            ],
+            name="custom_import_no_change_seal_base_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "base_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_generation_seal", "generation_id"),
+                _reference("custom_import_generation_seal", "dataset_id"),
+                _reference("custom_import_generation_seal", "definition_revision_id"),
+                _reference("custom_import_generation_seal", "schema_revision_id"),
+            ],
+            name="custom_import_no_change_seal_base_finality_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "seal_contract = 'custom-import-no-change-seal/v1' AND base_pointer_version >= 0 AND "
+            "candidate_generation_id <> base_generation_id AND sealing_fence > 0 AND "
+            + _sha256_check("base_source_bundle_sha256")
+            + " AND "
+            + _sha256_check("candidate_source_bundle_sha256")
+            + " AND "
+            + _sha256_check("effective_output_sha256")
+            + " AND "
+            + _sha256_check("sealing_token_sha256")
+            + " AND "
+            + _sha256_check("receipt_sha256"),
+            name="custom_import_no_change_seal_shape_check",
+        ),
+    )
+
+    execution_id = Column(BigInteger, primary_key=True)
+    dataset_id = Column(BigInteger, nullable=False)
+    definition_revision_id = Column(BigInteger, nullable=False)
+    schema_revision_id = Column(BigInteger, nullable=False)
+    capture_bundle_id = Column(BigInteger, nullable=False)
+    base_generation_id = Column(BigInteger, nullable=False)
+    candidate_generation_id = Column(BigInteger, nullable=False)
+    base_pointer_version = Column(BigInteger, nullable=False)
+    seal_contract = Column(String(63), nullable=False)
+    base_source_bundle_sha256 = Column(LargeBinary(32), nullable=False)
+    candidate_source_bundle_sha256 = Column(LargeBinary(32), nullable=False)
+    effective_output_sha256 = Column(LargeBinary(32), nullable=False)
+    sealing_fence = Column(BigInteger, nullable=False)
+    sealing_token_sha256 = Column(LargeBinary(32), nullable=False)
+    canonical_receipt = Column(Text, nullable=False)
+    receipt_sha256 = Column(LargeBinary(32), nullable=False)
+    sealed_at = _timestamp_column()
 
 
 class CustomImportGenerationFamily(_CustomImportModel):
@@ -1629,6 +1908,22 @@ class CustomImportCurrentGeneration(_CustomImportModel):
             name="custom_import_current_generation_fkey",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            [
+                "generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_generation_seal", "generation_id"),
+                _reference("custom_import_generation_seal", "dataset_id"),
+                _reference("custom_import_generation_seal", "definition_revision_id"),
+                _reference("custom_import_generation_seal", "schema_revision_id"),
+            ],
+            name="custom_import_current_generation_seal_fkey",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("pointer_version > 0", name="custom_import_current_generation_version_check"),
     )
 
@@ -1680,6 +1975,22 @@ class CustomImportPublicationEvent(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
+            [
+                "to_generation_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_generation_seal", "generation_id"),
+                _reference("custom_import_generation_seal", "dataset_id"),
+                _reference("custom_import_generation_seal", "definition_revision_id"),
+                _reference("custom_import_generation_seal", "schema_revision_id"),
+            ],
+            name="custom_import_publication_event_to_seal_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
             ["from_generation_id", "dataset_id"],
             [
                 _reference("custom_import_generation", "generation_id"),
@@ -1696,7 +2007,9 @@ class CustomImportPublicationEvent(_CustomImportModel):
             "committed_pointer_version = expected_pointer_version + 1) OR "
             "(event_kind = 'no_change' AND from_generation_id IS NOT NULL AND "
             "from_generation_id = to_generation_id AND "
-            "committed_pointer_version = expected_pointer_version)) AND " + _sha256_check("event_sha256"),
+            "committed_pointer_version = expected_pointer_version)) AND "
+            "(finality_contract IS NULL OR finality_contract = 'custom-import-finality/v1') AND "
+            + _sha256_check("event_sha256"),
             name="custom_import_publication_event_shape_check",
         ),
     )
@@ -1711,6 +2024,38 @@ class CustomImportPublicationEvent(_CustomImportModel):
     to_generation_id = Column(BigInteger, nullable=False)
     expected_pointer_version = Column(BigInteger, nullable=False)
     committed_pointer_version = Column(BigInteger, nullable=False)
+    # Legacy events remain intentionally unmarked.  New finality events opt
+    # into partial uniqueness without making a populated v1 upgrade fail.
+    finality_contract = Column(String(63))
     canonical_event = Column(Text, nullable=False)
     event_sha256 = Column(LargeBinary(32), nullable=False)
     created_at = _timestamp_column()
+
+
+Index(
+    "custom_import_publication_event_identity_key",
+    CustomImportPublicationEvent.dataset_id,
+    CustomImportPublicationEvent.execution_id,
+    CustomImportPublicationEvent.event_kind,
+    func.coalesce(CustomImportPublicationEvent.from_generation_id, 0),
+    CustomImportPublicationEvent.to_generation_id,
+    CustomImportPublicationEvent.expected_pointer_version,
+    CustomImportPublicationEvent.committed_pointer_version,
+    unique=True,
+    postgresql_where=text("finality_contract = 'custom-import-finality/v1'"),
+)
+Index(
+    "custom_import_publication_event_pointer_version_key",
+    CustomImportPublicationEvent.dataset_id,
+    CustomImportPublicationEvent.committed_pointer_version,
+    unique=True,
+    postgresql_where=text(
+        "finality_contract = 'custom-import-finality/v1' AND event_kind IN ('activated', 'rolled_back')"
+    ),
+)
+Index(
+    "custom_import_publication_event_no_change_execution_key",
+    CustomImportPublicationEvent.execution_id,
+    unique=True,
+    postgresql_where=text("finality_contract = 'custom-import-finality/v1' AND event_kind = 'no_change'"),
+)
