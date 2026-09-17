@@ -779,7 +779,9 @@ async def test_root_scalar_materialization_hashes_each_retained_projection(monke
     monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation: object())
     monkeypatch.setattr(publication, "_stream_materialization_records", _records)
     digest = publication._new_digest("test-root-scalars")
+    digest_before_materialization = digest.digest()
     assert await publication._add_root_scalar_material(SimpleNamespace(), digest, SimpleNamespace()) == 1
+    assert digest.digest() != digest_before_materialization
 
 
 @pytest.mark.asyncio
