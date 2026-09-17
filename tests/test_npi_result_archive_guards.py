@@ -307,9 +307,7 @@ async def test_source_capture_rejects_inconsistent_authority(monkeypatch, failur
     elif failure == "drift":
         authority = replace(
             authority,
-            serving_generation=generation.NpiServingGeneration(
-                str(uuid4()), 1, datetime.datetime.now(datetime.UTC)
-            ),
+            serving_generation=generation.NpiServingGeneration(str(uuid4()), 1, datetime.datetime.now(datetime.UTC)),
             relation_oids=(20, 21, 22, 23, 24, 25),
         )
     monkeypatch.setattr(archive, "read_npi_result_generation_authority", AsyncMock(return_value=authority))
@@ -339,13 +337,16 @@ async def test_stage_sequence_paths_retain_exact_state(monkeypatch) -> None:
         stage_sequences_by_owner={("npi", "id"): ("stage_seq", 8)},
     )
     assert existing == "stage_seq"
-    assert await archive._advance_stage_sequence(
-        _session(scalar=AsyncMock(return_value=None)),
-        stage_schema="stage",
-        sequence_name="seq",
-        owner_table="npi",
-        owner_column="id",
-    ) is None
+    assert (
+        await archive._advance_stage_sequence(
+            _session(scalar=AsyncMock(return_value=None)),
+            stage_schema="stage",
+            sequence_name="seq",
+            owner_table="npi",
+            owner_column="id",
+        )
+        is None
+    )
 
     ownership = _ownership(sequences=(("seq", 20, "npi", "id"),))
     monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=()))
@@ -448,9 +449,7 @@ async def test_stage_ownership_rejects_catalog_drift(monkeypatch, failure) -> No
     if failure == "sequences":
         sequence_oids = (("a", 30, "npi", "id"), ("b", 31, "npi", "id"))
     monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=sequence_oids))
-    namespace_relations = (
-        [] if failure != "unexpected" else [{"oid": 999, "relkind": "r", "index_table_oid": None}]
-    )
+    namespace_relations = [] if failure != "unexpected" else [{"oid": 999, "relkind": "r", "index_table_oid": None}]
     monkeypatch.setattr(archive, "_namespace_relations", AsyncMock(return_value=namespace_relations))
     monkeypatch.setattr(archive, "_freeze_seal", AsyncMock(return_value=(None, (), ())))
     message_by_failure = {
@@ -473,8 +472,7 @@ async def test_stage_ownership_accepts_byte_catalog_kinds(monkeypatch) -> None:
         "_namespace_relations",
         AsyncMock(
             return_value=[
-                {"oid": oid, "relkind": b"r" if oid == 10 else "r", "index_table_oid": None}
-                for oid in range(10, 16)
+                {"oid": oid, "relkind": b"r" if oid == 10 else "r", "index_table_oid": None} for oid in range(10, 16)
             ]
         ),
     )
@@ -708,8 +706,7 @@ async def test_incumbent_capture_rejects_partial_and_changed_families(monkeypatc
     monkeypatch.setattr(archive, "_bounded_catalog_work", no_limits)
     monkeypatch.setattr(archive, "_lock_family", AsyncMock())
     partial_pairs = tuple(
-        (name, None if ordinal == 0 else ordinal + 10)
-        for ordinal, name in enumerate(generation.RELATION_NAMES)
+        (name, None if ordinal == 0 else ordinal + 10) for ordinal, name in enumerate(generation.RELATION_NAMES)
     )
     relation_pairs = AsyncMock(return_value=partial_pairs)
     monkeypatch.setattr(archive, "_relation_pairs", relation_pairs)
@@ -830,16 +827,17 @@ async def test_automatic_cutover_allows_empty_legacy_incumbent(monkeypatch) -> N
         tuple((name, None) for name in generation.RELATION_NAMES),
     )
     current = generation.NpiResultGenerationAuthority(str(uuid4()), 1, None, None, None)
-    source = generation.NpiServingGeneration(
-        str(uuid4()), 2, datetime.datetime(2026, 9, 14, tzinfo=datetime.UTC)
-    )
+    source = generation.NpiServingGeneration(str(uuid4()), 2, datetime.datetime(2026, 9, 14, tzinfo=datetime.UTC))
     monkeypatch.setattr(archive, "_has_populated_incumbent", AsyncMock(return_value=False))
-    assert await archive._admit_automatic_cutover(
-        _session(),
-        incumbent=incumbent,
-        current_authority=current,
-        source_generation=source,
-    ) is None
+    assert (
+        await archive._admit_automatic_cutover(
+            _session(),
+            incumbent=incumbent,
+            current_authority=current,
+            source_generation=source,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -860,9 +858,7 @@ async def test_relation_activation_rejects_identity_or_adoption_drift(monkeypatc
     adopted = generation.NpiResultGenerationAuthority(
         str(uuid4()),
         1,
-        generation.NpiServingGeneration(
-            str(uuid4()), 1, datetime.datetime(2026, 9, 14, tzinfo=datetime.UTC)
-        ),
+        generation.NpiServingGeneration(str(uuid4()), 1, datetime.datetime(2026, 9, 14, tzinfo=datetime.UTC)),
         tuple(range(10, 16)),
         None,
     )

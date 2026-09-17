@@ -186,11 +186,14 @@ async def test_matching_provenance_accepts_exact_receipt() -> None:
             )
         )
     )
-    assert await generation._matching_canonical_provenance(
-        session,
-        schema_name="mrf",
-        relation_oids=(10, 11, 12, 13, 14, 15),
-    ) == _provenance()
+    assert (
+        await generation._matching_canonical_provenance(
+            session,
+            schema_name="mrf",
+            relation_oids=(10, 11, 12, 13, 14, 15),
+        )
+        == _provenance()
+    )
 
 
 @pytest.mark.asyncio
