@@ -6503,16 +6503,12 @@ async def _provider_npis_for_sets(
 ) -> dict[str, tuple[int, ...]]:
     """Load bounded NPI prefixes for sealed provider sets."""
 
-    if type(use_prefix_cache) is not bool:
-        raise ValueError("PTG2 provider membership cache mode is invalid")
-    if type(use_hot_prefixes) is not bool:
-        raise ValueError("PTG2 provider membership prefix mode is invalid")
+    if type(use_prefix_cache) is not bool or type(use_hot_prefixes) is not bool:
+        raise ValueError("PTG2 provider membership read mode is invalid")
     provider_set_ids = _deduplicate_ptg2_manifest_ids(tuple(provider_set_global_ids))
     if limit_per_set is None or not use_prefix_cache:
         uncached_provider_set_ids = provider_set_ids
-        requested_limit = (
-            None if limit_per_set is None else max(int(limit_per_set), 1)
-        )
+        requested_limit = None if limit_per_set is None else max(int(limit_per_set), 1)
         npis_by_set: dict[str, tuple[int, ...]] = {}
     else:
         requested_limit = max(int(limit_per_set), 1)
@@ -6522,18 +6518,13 @@ async def _provider_npis_for_sets(
             requested_limit,
         )
         if not uncached_provider_set_ids:
-            return {
-                provider_set_id: npis_by_set.get(provider_set_id, ())
-                for provider_set_id in provider_set_ids
-            }
-    member_reader_kwargs = {"limit_per_set": requested_limit}
-    if not use_hot_prefixes:
-        member_reader_kwargs["use_hot_prefixes"] = False
+            return {provider_set_id: npis_by_set.get(provider_set_id, ()) for provider_set_id in provider_set_ids}
     member_ids_by_set = await _provider_npi_member_ids_by_set(
         session,
         serving_tables,
         uncached_provider_set_ids,
-        **member_reader_kwargs,
+        limit_per_set=requested_limit,
+        use_hot_prefixes=use_hot_prefixes,
     )
     for provider_set_id in uncached_provider_set_ids:
         npis = tuple(
@@ -6557,10 +6548,7 @@ async def _provider_npis_for_sets(
                     < requested_limit
                 ),
             )
-    return {
-        provider_set_id: npis_by_set.get(provider_set_id, ())
-        for provider_set_id in provider_set_ids
-    }
+    return {provider_set_id: npis_by_set.get(provider_set_id, ()) for provider_set_id in provider_set_ids}
 
 
 async def _provider_npi_member_ids_by_set(
@@ -6575,15 +6563,11 @@ async def _provider_npi_member_ids_by_set(
 
     _require_strict_shared_v3(serving_tables)
     if type(use_hot_prefixes) is not bool:
-        raise ValueError("PTG2 provider membership prefix mode is invalid")
+        raise ValueError("PTG2 provider membership read mode is invalid")
     if serving_tables.uses_v4_graph:
         with v4_graph_request_scope():
             hot_target = _v4_hot_prefix_limits(serving_tables).target
-            if (
-                use_hot_prefixes
-                and limit_per_set is not None
-                and max(int(limit_per_set), 1) <= hot_target
-            ):
+            if use_hot_prefixes and limit_per_set is not None and max(int(limit_per_set), 1) <= hot_target:
                 return await _v4_npi_prefixes_by_set(
                     session,
                     serving_tables,

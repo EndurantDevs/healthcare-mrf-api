@@ -248,7 +248,9 @@ class ProviderMembershipLoader:
         provider_set_ids,
         *,
         limit_per_set,
+        use_hot_prefixes=True,
     ):
+        assert type(use_hot_prefixes) is bool
         self.calls.append((tuple(provider_set_ids), limit_per_set))
         return {
             provider_set_id: tuple(
@@ -1111,14 +1113,14 @@ async def test_provider_npi_exact_read_bypasses_v4_hot_prefixes(monkeypatch):
 
     provider_set_id = "01" * 16
     hot_reader = AsyncMock(return_value={provider_set_id: ("npi:1000000001",)})
-    exact_members = {
+    exact_members_by_set = {
         provider_set_id: (
             "npi:1000000001",
             "npi:1000000002",
             "npi:1000000003",
         )
     }
-    cold_reader = AsyncMock(return_value=exact_members)
+    cold_reader = AsyncMock(return_value=exact_members_by_set)
     monkeypatch.setattr(ptg2_serving, "_v4_npi_prefixes_by_set", hot_reader)
     monkeypatch.setattr(
         ptg2_serving,
@@ -1134,7 +1136,7 @@ async def test_provider_npi_exact_read_bypasses_v4_hot_prefixes(monkeypatch):
         use_hot_prefixes=False,
     )
 
-    assert observed == exact_members
+    assert observed == exact_members_by_set
     assert cold_reader.await_args.kwargs == {"limit_per_set": 3}
     hot_reader.assert_not_awaited()
 
