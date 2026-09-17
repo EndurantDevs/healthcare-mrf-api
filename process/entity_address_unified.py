@@ -272,6 +272,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     # seq scan of the serving table (~3M pages, ~5.7s per location search).
     "premise_key",
     "taxonomy_plans_network",
+    "service_plans_network_array",
     "procedures_array",
     "medications_array",
     "geo_idx",
