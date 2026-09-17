@@ -462,7 +462,8 @@ async def test_group_plan_providers_pages_strict_v3_npi_scope(monkeypatch):
     assert [pricing_item["npi"] for pricing_item in pricing_response["providers"]["items"]] == [1234567890]
     sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "FROM mrf.ptg2_v3_npi_scope" in sql
-    assert "snapshot_key = ANY(:snapshot_keys)" in sql
+    assert "gm.snapshot_key = :page_snapshot_key_0" in sql
+    assert request.ctx.sa_session.executions[0][0][1]["page_snapshot_key_0"] == 17
 
 
 @pytest.mark.asyncio
@@ -492,6 +493,7 @@ async def test_group_plan_providers_pages_v4_npi_scope(monkeypatch):
     sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "FROM mrf.ptg2_v4_npi_scope" in sql
     assert "ptg2_v3_npi_scope" not in sql
+    assert "gm.snapshot_key = :page_snapshot_key_0" in sql
 
 
 @pytest.mark.asyncio
@@ -933,9 +935,16 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
         },
     ]
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
-    assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
-    assert "snapshot_key = ANY(:snapshot_keys)" in provider_sql
-    assert "(SELECT npi FROM" in provider_sql
+    provider_params = request.ctx.sa_session.executions[0][0][1]
+    assert provider_sql.count("FROM mrf.ptg2_v3_npi_scope gm") == 2
+    assert provider_sql.count("ORDER BY gm.npi") == 2
+    assert provider_sql.count("LIMIT :limit") == 3
+    assert "UNION ALL" in provider_sql
+    assert "snapshot_key = ANY(:snapshot_keys)" not in provider_sql
+    assert {
+        provider_params["page_snapshot_key_0"],
+        provider_params["page_snapshot_key_1"],
+    } == {41, 42}
 
 
 @pytest.mark.asyncio
@@ -969,8 +978,8 @@ async def test_group_providers_union_v3_v4_npis(monkeypatch):
     await group_plan_providers(request)
 
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
-    assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
-    assert "SELECT npi FROM mrf.ptg2_v4_npi_scope" in provider_sql
+    assert "FROM mrf.ptg2_v3_npi_scope gm" in provider_sql
+    assert "FROM mrf.ptg2_v4_npi_scope gm" in provider_sql
     assert "UNION ALL" in provider_sql
 
 
@@ -1059,7 +1068,6 @@ def _canonical_directory_request(selection):
     return make_request(
         [
             FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
-            FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
             FakeResult(rows=[address_by_field]),
         ],
         args={
@@ -1094,8 +1102,16 @@ def _assert_canonical_directory_response(response_by_field, selection, request):
     ]
     assert response_by_field["healthporta_plan_id"] == selection.healthporta_plan_id
     assert response_by_field["query"]["plan_release_id"] == selection.plan_release_id
-    address_sql = str(request.ctx.sa_session.executions[2][0][0])
-    address_parameters = request.ctx.sa_session.executions[2][0][1]
+    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
+    provider_parameters = request.ctx.sa_session.executions[0][0][1]
+    assert provider_sql.count("ORDER BY gm.npi") == 2
+    assert "UNION ALL" in provider_sql
+    assert {
+        provider_parameters["page_snapshot_key_0"],
+        provider_parameters["page_snapshot_key_1"],
+    } == {71, 72}
+    address_sql = str(request.ctx.sa_session.executions[1][0][0])
+    address_parameters = request.ctx.sa_session.executions[1][0][1]
     assert "eapb.plan_id = ANY(CAST(:plan_ids AS text[]))" in address_sql
     assert address_parameters["plan_ids"] == ["99-0000001", "990000001", "PLAN-B"]
     assert response_by_field["location_filter"]["plan_ids_considered"] == [
@@ -1208,8 +1224,11 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_postal_radius_rows)
     request = make_request(
         [
-            FakeResult(rows=[types.SimpleNamespace(npi=1073913877), types.SimpleNamespace(npi=1234567890)]),
-            FakeResult(rows=[types.SimpleNamespace(npi=1073913877), types.SimpleNamespace(npi=1003000126)]),
+            FakeResult(rows=[
+                types.SimpleNamespace(npi=1003000126),
+                types.SimpleNamespace(npi=1073913877),
+                types.SimpleNamespace(npi=1234567890),
+            ]),
             FakeResult(rows=[]),
         ],
         args={
@@ -1229,17 +1248,17 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
         1073913877,
         1234567890,
     ]
-    first_member_query_sql = str(request.ctx.sa_session.executions[0][0][0])
-    second_member_query_sql = str(request.ctx.sa_session.executions[1][0][0])
-    first_member_query_params = request.ctx.sa_session.executions[0][0][1]
-    assert "FROM mrf.ptg2_v3_npi_scope gm" in first_member_query_sql
-    assert "FROM mrf.ptg2_v3_npi_scope gm" in second_member_query_sql
-    assert "UNION ALL" not in first_member_query_sql
-    assert "UNION ALL" not in second_member_query_sql
-    assert "EXISTS (" in first_member_query_sql
-    assert first_member_query_params["split_snapshot_key"] == 41
-    assert first_member_query_params["limit"] == 10
-    assert first_member_query_params["location_zips"] == ["60601", "60602"]
+    member_query_sql = str(request.ctx.sa_session.executions[0][0][0])
+    member_query_params = request.ctx.sa_session.executions[0][0][1]
+    assert member_query_sql.count("FROM mrf.ptg2_v3_npi_scope gm") == 2
+    assert "UNION ALL" in member_query_sql
+    assert member_query_sql.count("EXISTS (") == 2
+    assert {
+        member_query_params["page_snapshot_key_0"],
+        member_query_params["page_snapshot_key_1"],
+    } == {41, 42}
+    assert member_query_params["limit"] == 10
+    assert member_query_params["location_zips"] == ["60601", "60602"]
 
 
 @pytest.mark.asyncio

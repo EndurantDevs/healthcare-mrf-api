@@ -48,6 +48,8 @@ from api.provider_profile import (
     fetch_provider_profile_projection,
 )
 from api.provider_search_sql import (
+    broad_name_page_sql as _broad_name_page_sql,
+    build_provider_name_where as _build_provider_name_where,
     is_location_first_taxonomy_filter as _is_location_first_taxonomy_filter,
     plan_release_npi_scope as _plan_release_npi_scope,
     provider_taxonomy_code_parameters as _provider_taxonomy_code_parameters,
@@ -6992,33 +6994,19 @@ def _build_npi_where_clause(
     prefix = alias
     if prefix and not prefix.endswith("."):
         prefix = f"{prefix}."
-
-    clauses: list[str] = []
-    parameter_map: dict[str, object] = {}
-
-    if names_like:
-        name_clause, name_params = _names_like_filter_clause(alias, names_like)
-        if name_clause:
-            clauses.append(name_clause)
-            parameter_map.update(name_params)
-
-    if first_name:
-        clauses.append(f"LOWER(COALESCE({prefix}provider_first_name, '')) LIKE :first_name")
-        parameter_map["first_name"] = f"%{first_name.lower()}%"
-    if last_name:
-        clauses.append(f"LOWER(COALESCE({prefix}provider_last_name, '')) LIKE :last_name")
-        parameter_map["last_name"] = f"%{last_name.lower()}%"
-    if organization_name:
-        org_expr = ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix)
-        clauses.append(f"({org_expr} LIKE :organization_name)")
-        parameter_map["organization_name"] = f"%{organization_name.lower()}%"
-    if entity_type_code is not None:
-        clauses.append(f"{prefix}entity_type_code = :entity_type_code")
-        parameter_map["entity_type_code"] = entity_type_code
-
-    if not clauses:
-        return "", {}
-    return " AND ".join(clauses), parameter_map
+    name_clause, name_parameters = (
+        _names_like_filter_clause(alias, names_like) if names_like else ("", {})
+    )
+    return _build_provider_name_where(
+        prefix=prefix,
+        name_clause=name_clause,
+        name_parameters=name_parameters,
+        first_name=first_name,
+        last_name=last_name,
+        organization_name=organization_name,
+        organization_expression=ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix),
+        entity_type_code=entity_type_code,
+    )
 
 
 def _extract_name_filters(request) -> list[str]:
@@ -9981,6 +9969,7 @@ async def list_providers(request):
             )
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
+        use_bounded_broad_name_page = broad_name_total_deferred and order_by == "npi"
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
@@ -9990,7 +9979,7 @@ async def list_providers(request):
                     "AS relevance_score"
                 )
             direct_name_taxonomy = bool(taxonomy_code_placeholders)
-            if not direct_name_taxonomy:
+            if not direct_name_taxonomy and not use_bounded_broad_name_page:
                 filtered_npi_cte = f"""
         filtered_npi AS MATERIALIZED (
             SELECT {filtered_npi_projection}
@@ -10047,11 +10036,14 @@ async def list_providers(request):
                 f"    {phone_candidates_join}"
             )
         elif npi_where:
-            address_source = (
-                "filtered_npi as fn\n"
-                f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
-                f"    {phone_candidates_join}"
-            )
+            if use_bounded_broad_name_page:
+                address_source = f"{address_table_sql} as c"
+            else:
+                address_source = (
+                    "filtered_npi as fn\n"
+                    f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
+                    f"    {phone_candidates_join}"
+                )
         elif use_taxonomy_filter:
             address_source = (
                 f"{address_table_sql} as c\n"
@@ -10074,6 +10066,13 @@ async def list_providers(request):
             result_order_sql = (
                 "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
             )
+        elif use_bounded_broad_name_page:
+            eligible_npis_sql = _broad_name_page_sql(
+                npi_where, address_table_sql, provider_npi_sql, address_clauses
+            )
+            page_order_sql = "ORDER BY b.npi"
+            sub_s_relevance_projection = ""
+            result_order_sql = "ORDER BY sub_s.npi_code ASC"
         else:
             eligible_npis_sql = f"""
             SELECT DISTINCT {provider_npi_sql} AS npi

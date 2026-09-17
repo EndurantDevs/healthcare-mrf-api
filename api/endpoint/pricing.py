@@ -8446,7 +8446,6 @@ async def group_plan_providers(request):
     # the member lookup from it instead.
     use_local_candidates = bool(specialty_filter.is_active and location_zips)
     candidate_cte = ""
-    provider_npis: list[int] | None = None
     if use_local_candidates:
         candidate_taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
             "addr.npi",
@@ -8490,68 +8489,43 @@ async def group_plan_providers(request):
             )
             """
     if use_local_candidates:
-        provider_sql = f"""
-            {candidate_cte}SELECT DISTINCT gm.npi
-              FROM {group_member_table} gm
-              JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
-             WHERE gm.npi BETWEEN :npi_min AND :npi_max
-               AND gm.npi > :cursor_npi
-             ORDER BY gm.npi
-             LIMIT :limit
-            """
-    elif has_location_filter and len(shared_snapshot_keys) > 1:
-        # Keep the fast single-source EXISTS plan for each network. A single
-        # combined scope across all layouts makes PostgreSQL sort and
-        # filter the combined stream, which is much slower for ZIP-radius
-        # lookups on plans with a few very uneven source snapshots.
-        # The first N rows from the sorted union must be within the first N
-        # rows of at least one source, so per-source overfetch just makes dense
-        # scope scans do extra location probes.
-        split_limit = limit
-        split_query_params_by_name = {**query_params_by_name, "limit": split_limit}
-        provider_npi_set: set[int] = set()
-        for split_snapshot_key in sorted(set(shared_snapshot_keys)):
-            split_npi_scope_table = npi_scope_table_by_snapshot_key[split_snapshot_key]
-            provider_sql = f"""
+        page_join_sql = "JOIN local_specialty_npis lsn ON lsn.npi = gm.npi"
+        page_filter_sql = ""
+    else:
+        page_join_sql = ""
+        page_filter_sql = taxonomy_where + provider_sex_where + location_where
+    bounded_member_streams = []
+    for stream_index, (stream_snapshot_key, stream_table) in enumerate(
+        sorted(npi_scope_table_by_snapshot_key.items())
+    ):
+        stream_key_parameter = f"page_snapshot_key_{stream_index}"
+        query_params_by_name[stream_key_parameter] = stream_snapshot_key
+        bounded_member_streams.append(
+            f"""(
                 SELECT DISTINCT gm.npi
-                  FROM {split_npi_scope_table} gm
-                 WHERE gm.npi BETWEEN :npi_min AND :npi_max
-                   AND gm.snapshot_key = :split_snapshot_key
-                   AND gm.npi > :cursor_npi{taxonomy_where}{provider_sex_where}{location_where}
+                  FROM {stream_table} gm
+                  {page_join_sql}
+                 WHERE gm.snapshot_key = :{stream_key_parameter}
+                   AND gm.npi BETWEEN :npi_min AND :npi_max
+                   AND gm.npi > :cursor_npi{page_filter_sql}
                  ORDER BY gm.npi
                  LIMIT :limit
-                """
-            split_parameters_by_name = {
-                **split_query_params_by_name,
-                "split_snapshot_key": split_snapshot_key,
-            }
-            split_rows = (
-                await session.execute(text(provider_sql), split_parameters_by_name)
-            ).fetchall()
-            provider_npi_set.update(
-                int(split_record.npi)
-                for split_record in split_rows
-                if split_record.npi is not None
-            )
-        provider_npis = sorted(provider_npi_set)[:limit]
-    else:
-        provider_sql = f"""
-            SELECT DISTINCT gm.npi
-              FROM {group_member_table} gm
-             WHERE gm.npi BETWEEN :npi_min AND :npi_max
-               AND gm.npi > :cursor_npi{taxonomy_where}{provider_sex_where}{location_where}
-             ORDER BY gm.npi
-             LIMIT :limit
-            """
-    if provider_npis is None:
-        provider_rows = (
-            await session.execute(text(provider_sql), query_params_by_name)
-        ).fetchall()
-        provider_npis = [
-            int(provider_record.npi)
-            for provider_record in provider_rows
-            if provider_record.npi is not None
-        ]
+            )"""
+        )
+    provider_sql = f"""
+        {candidate_cte}SELECT DISTINCT bounded_group_member.npi
+          FROM ({' UNION ALL '.join(bounded_member_streams)}) AS bounded_group_member
+         ORDER BY bounded_group_member.npi
+         LIMIT :limit
+        """
+    provider_rows = (
+        await session.execute(text(provider_sql), query_params_by_name)
+    ).fetchall()
+    provider_npis = [
+        int(provider_record.npi)
+        for provider_record in provider_rows
+        if provider_record.npi is not None
+    ]
 
     total_distinct = None
     is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")

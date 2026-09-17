@@ -15,6 +15,57 @@ from api.plan_release_serving import (
 from api.ptg2_serving import _ptg2_npi_scope_table
 
 
+def build_provider_name_where(
+    *,
+    prefix: str,
+    name_clause: str,
+    name_parameters: dict[str, object],
+    first_name: str | None,
+    last_name: str | None,
+    organization_name: str | None,
+    organization_expression: str,
+    entity_type_code: int | None,
+) -> tuple[str, dict[str, object]]:
+    """Combine normalized provider-name predicates and parameters."""
+
+    clauses = [name_clause] if name_clause else []
+    parameters_by_name = dict(name_parameters)
+    if first_name:
+        clauses.append(f"LOWER(COALESCE({prefix}provider_first_name, '')) LIKE :first_name")
+        parameters_by_name["first_name"] = f"%{first_name.lower()}%"
+    if last_name:
+        clauses.append(f"LOWER(COALESCE({prefix}provider_last_name, '')) LIKE :last_name")
+        parameters_by_name["last_name"] = f"%{last_name.lower()}%"
+    if organization_name:
+        clauses.append(f"({organization_expression} LIKE :organization_name)")
+        parameters_by_name["organization_name"] = f"%{organization_name.lower()}%"
+    if entity_type_code is not None:
+        clauses.append(f"{prefix}entity_type_code = :entity_type_code")
+        parameters_by_name["entity_type_code"] = entity_type_code
+    return " AND ".join(clauses), parameters_by_name
+
+
+def broad_name_page_sql(
+    npi_where: str,
+    address_table_sql: str,
+    provider_npi_sql: str,
+    address_clauses: Sequence[str],
+) -> str:
+    """Build a bounded NPI-ordered broad-name page with eligible addresses."""
+
+    return f"""
+    SELECT b.npi
+      FROM mrf.npi AS b
+     WHERE {npi_where}
+       AND EXISTS (
+           SELECT 1
+             FROM {address_table_sql} AS c
+            WHERE {provider_npi_sql} = b.npi
+              AND {' and '.join(address_clauses)}
+       )
+    """
+
+
 def taxonomy_codes_subquery(conditions: str) -> str:
     """Build the NUCC code-array subquery used by provider searches."""
 

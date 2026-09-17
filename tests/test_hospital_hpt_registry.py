@@ -987,6 +987,35 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
         {"hospital_id": "hospital-000002"}
     ) == hospitals
 
+
+def test_warm_registry_materializes_group_lookup(monkeypatch):
+    hospitals = (
+        {
+            "hospital_id": "hospital-000001",
+            "name": "Example Hospital",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+        },
+        {
+            "hospital_id": "hospital-000002",
+            "name": "Example Hospital Alias",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+            "alias_of": "hospital-000001",
+        },
+    )
+    monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
+    registry._group_ids_by_hospital_id.cache_clear()
+    try:
+        registry.warm_hospital_hpt_registry()
+
+        assert registry.hospital_hpt_group_ids("hospital-000002") == (
+            "hospital-000001",
+            "hospital-000002",
+        )
+        assert registry._group_ids_by_hospital_id.cache_info().currsize == 1
+    finally:
+        registry._group_ids_by_hospital_id.cache_clear()
+
+
 @pytest.mark.parametrize(
     "extra_rows",
     [

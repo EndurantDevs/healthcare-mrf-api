@@ -9,6 +9,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from process.hospital_hpt_registry import warm_hospital_hpt_registry
+
 
 logger = logging.getLogger(__name__)
 _FREEZE_ENV = "HLTHPRT_API_WORKER_GC_FREEZE_ENABLED"
@@ -96,8 +98,13 @@ def worker_memory_metrics() -> WorkerMemoryMetrics:
 def register_worker_memory_lifecycle(app: Any) -> None:
     """Install per-worker Sanic listeners without affecting CLI processes."""
 
+    app.listener("before_server_start")(_before_server_start)
     app.listener("after_server_start")(_after_server_start)
     app.listener("before_server_stop")(_before_server_stop)
+
+
+async def _before_server_start(_app: Any) -> None:
+    warm_hospital_hpt_registry()
 
 
 async def _after_server_start(_app: Any) -> None:
