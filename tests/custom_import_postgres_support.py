@@ -232,6 +232,8 @@ class FamilyMaterialSpec:
     parent_mismatch: bool = False
     reverse_insertion: bool = False
     include_root_winner: bool = False
+    root_record_id: int | None = None
+    entity_binding_id: int | None = None
 
 
 async def _seed_publication_identity(
@@ -239,12 +241,19 @@ async def _seed_publication_identity(
     suffix: str,
     *,
     semantic_suffix: str | None = None,
+    context_collection_slot: int | None = None,
 ) -> _PublicationSeed:
     """Seed the synthetic definition, capture, and source identity graph."""
 
     semantic = semantic_suffix or suffix
     dataset, schema = await _seed_identity_schema(session, suffix, semantic)
-    definition = await _seed_identity_definition(session, dataset, schema, semantic)
+    definition = await _seed_identity_definition(
+        session,
+        dataset,
+        schema,
+        semantic,
+        context_collection_slot=context_collection_slot,
+    )
     capture_bundle = await _seed_identity_capture_bundle(
         session,
         dataset,
@@ -346,6 +355,8 @@ async def _seed_identity_definition(
     dataset: CustomImportDataset,
     schema: CustomImportSchemaRevision,
     semantic: str,
+    *,
+    context_collection_slot: int | None = None,
 ) -> CustomImportDefinitionRevision:
     """Create the definition revision and its sole selection profile."""
 
@@ -368,9 +379,17 @@ async def _seed_identity_definition(
             schema_revision_id=schema.schema_revision_id,
             profile_slot=1,
             profile_id="synthetic_profile",
-            context_collection_slot=None,
-            canonical_profile='{"synthetic":true}',
-            profile_sha256=digest(f"profile:{semantic}"),
+            context_collection_slot=context_collection_slot,
+            canonical_profile=(
+                '{"synthetic":true}'
+                if context_collection_slot is None
+                else f'{{"context_collection_slot":{context_collection_slot},"synthetic":true}}'
+            ),
+            profile_sha256=digest(
+                f"profile:{semantic}"
+                if context_collection_slot is None
+                else f"profile:{semantic}:context:{context_collection_slot}"
+            ),
         )
     )
     await session.flush()
@@ -591,11 +610,17 @@ async def seed_publication_graph(
     session: AsyncSession,
     *,
     semantic_suffix: str | None = None,
+    context_collection_slot: int | None = None,
 ) -> PublicationGraph:
     """Insert a source-neutral graph, optionally with repeatable semantic rows."""
 
     suffix = uuid.uuid4().hex
-    seed = await _seed_publication_identity(session, suffix, semantic_suffix=semantic_suffix)
+    seed = await _seed_publication_identity(
+        session,
+        suffix,
+        semantic_suffix=semantic_suffix,
+        context_collection_slot=context_collection_slot,
+    )
     first_execution, first_generation = await _seed_completed_generation(session, seed, suffix, 1, None)
     second_execution, second_generation = await _seed_completed_generation(
         session,
@@ -783,7 +808,7 @@ async def seed_family_material(
         session,
         graph,
         root_pack,
-        material_spec.suffix,
+        material_spec,
         len(material_spec.child_keys),
     )
     resolved_child_payloads = _resolved_child_payloads(
@@ -860,7 +885,7 @@ async def _seed_family_root(
     session: AsyncSession,
     graph: PublicationGraph,
     root_pack: CustomImportPack,
-    suffix: str,
+    material_spec: FamilyMaterialSpec,
     child_count: int,
 ) -> tuple[
     CustomImportRootRecord,
@@ -870,20 +895,9 @@ async def _seed_family_root(
 ]:
     """Create a root record, its revision, binding, and family revision."""
 
-    root_record = CustomImportRootRecord(
-        dataset_id=graph.dataset_id,
-        key_contract_sha256=digest(f"synthetic-root-contract:{suffix}"),
-        canonical_logical_key=f'{{"root":"{suffix}"}}',
-        logical_key_sha256=digest(f"synthetic-root-key:{suffix}"),
-    )
-    entity_binding = CustomImportEntityBinding(
-        dataset_id=graph.dataset_id,
-        adapter_id="synthetic",
-        canonical_value=f"binding-{suffix}",
-        value_sha256=digest(f"synthetic-binding:{suffix}"),
-    )
-    session.add_all((root_record, entity_binding))
-    await session.flush()
+    suffix = material_spec.suffix
+    root_record = await _seed_or_reuse_root_record(session, graph, material_spec, suffix)
+    entity_binding = await _seed_or_reuse_entity_binding(session, graph, material_spec, suffix)
     root_revision = CustomImportRootRevision(
         dataset_id=graph.dataset_id,
         definition_revision_id=graph.definition_revision_id,
@@ -911,6 +925,54 @@ async def _seed_family_root(
     session.add(family)
     await session.flush()
     return root_record, entity_binding, root_revision, family
+
+
+async def _seed_or_reuse_root_record(
+    session: AsyncSession,
+    graph: PublicationGraph,
+    material_spec: FamilyMaterialSpec,
+    suffix: str,
+) -> CustomImportRootRecord:
+    """Return one stable root identity, optionally reusing an earlier family key."""
+
+    if material_spec.root_record_id is not None:
+        root_record = await session.get(CustomImportRootRecord, material_spec.root_record_id)
+        if root_record is None or root_record.dataset_id != graph.dataset_id:
+            raise ValueError("reused root record must belong to the synthetic dataset")
+        return root_record
+    root_record = CustomImportRootRecord(
+        dataset_id=graph.dataset_id,
+        key_contract_sha256=digest(f"synthetic-root-contract:{suffix}"),
+        canonical_logical_key=f'{{"root":"{suffix}"}}',
+        logical_key_sha256=digest(f"synthetic-root-key:{suffix}"),
+    )
+    session.add(root_record)
+    await session.flush()
+    return root_record
+
+
+async def _seed_or_reuse_entity_binding(
+    session: AsyncSession,
+    graph: PublicationGraph,
+    material_spec: FamilyMaterialSpec,
+    suffix: str,
+) -> CustomImportEntityBinding:
+    """Return one stable entity binding, optionally shared by equivalent families."""
+
+    if material_spec.entity_binding_id is not None:
+        entity_binding = await session.get(CustomImportEntityBinding, material_spec.entity_binding_id)
+        if entity_binding is None or entity_binding.dataset_id != graph.dataset_id:
+            raise ValueError("reused entity binding must belong to the synthetic dataset")
+        return entity_binding
+    entity_binding = CustomImportEntityBinding(
+        dataset_id=graph.dataset_id,
+        adapter_id="synthetic",
+        canonical_value=f"binding-{suffix}",
+        value_sha256=digest(f"synthetic-binding:{suffix}"),
+    )
+    session.add(entity_binding)
+    await session.flush()
+    return entity_binding
 
 
 def _resolved_child_payloads(

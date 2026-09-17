@@ -50,6 +50,7 @@ from process.custom_import.publication import (
     seal_generation,
 )
 from tests.custom_import_postgres_support import (
+    FamilyMaterial,
     FamilyMaterialSpec,
     GenerationAttempt,
     PublicationGraph,
@@ -1942,6 +1943,111 @@ async def _seal_ordered_family(
     )
 
 
+async def _seed_contextual_winner_candidate(
+    session,
+    graph: PublicationGraph,
+    *,
+    base_generation_id: int | None,
+    prior_material: FamilyMaterial | None = None,
+) -> tuple[GenerationAttempt, FamilyMaterial]:
+    """Create one nonempty contextual winner, optionally reusing its stable identities."""
+
+    suffix = "contextual-winner-family"
+    attempt = await seed_running_generation(
+        session,
+        graph,
+        suffix=("contextual-winner-base" if prior_material is None else "contextual-winner-candidate"),
+        base_generation_id=base_generation_id,
+        root_count=1,
+        family_count=1,
+    )
+    material = await seed_family_material(
+        session,
+        graph,
+        attempt,
+        FamilyMaterialSpec(
+            suffix=suffix,
+            child_keys=("contextual-winner-child",),
+            root_record_id=None if prior_material is None else prior_material.root_record_id,
+            entity_binding_id=None if prior_material is None else prior_material.entity_binding_id,
+        ),
+    )
+    await attach_generation_family(session, graph, attempt, material)
+    session.add(
+        CustomImportWinner(
+            generation_id=attempt.generation_id,
+            dataset_id=graph.dataset_id,
+            definition_revision_id=graph.definition_revision_id,
+            schema_revision_id=graph.schema_revision_id,
+            profile_slot=1,
+            entity_binding_id=material.entity_binding_id,
+            family_revision_id=material.family_revision_id,
+            context_collection_slot=1,
+            context_key_sha256=digest("contextual-winner-context"),
+            context_child_revision_id=material.child_revision_ids[0],
+        )
+    )
+    await session.flush()
+    return attempt, material
+
+
+@pytest.mark.asyncio
+async def test_contextual_winner_allocation_id_does_not_prevent_no_change():
+    """Equivalent child context keys remain no-change despite newly allocated child IDs."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as session:
+            async with session.begin():
+                graph = await seed_publication_graph(session, context_collection_slot=1)
+                base_attempt, base_material = await _seed_contextual_winner_candidate(
+                    session,
+                    graph,
+                    base_generation_id=None,
+                )
+                base_seal = await seal_generation(
+                    session,
+                    dataset_id=graph.dataset_id,
+                    generation_id=base_attempt.generation_id,
+                    lease_fence=base_attempt.fence,
+                    lease_token=base_attempt.token,
+                )
+                await activate_generation(
+                    session,
+                    dataset_id=graph.dataset_id,
+                    target_generation_id=base_attempt.generation_id,
+                    expected_generation_id=None,
+                    expected_pointer_version=0,
+                )
+
+        async with case.sessions() as session:
+            async with session.begin():
+                candidate_attempt, candidate_material = await _seed_contextual_winner_candidate(
+                    session,
+                    graph,
+                    base_generation_id=base_attempt.generation_id,
+                    prior_material=base_material,
+                )
+                assert candidate_material.child_revision_ids != base_material.child_revision_ids
+
+                receipt = await record_no_change(
+                    session,
+                    dataset_id=graph.dataset_id,
+                    execution_id=candidate_attempt.execution_id,
+                    expected_generation_id=base_attempt.generation_id,
+                    expected_pointer_version=1,
+                    candidate_generation_id=candidate_attempt.generation_id,
+                    lease_fence=candidate_attempt.fence,
+                    lease_token=candidate_attempt.token,
+                )
+                candidate_seal = await session.get(
+                    CustomImportGenerationSeal,
+                    candidate_attempt.generation_id,
+                )
+                assert candidate_seal is not None
+                assert candidate_seal.effective_output_sha256.hex() == base_seal.effective_output_sha256
+                assert receipt.event_kind == "no_change"
+
+
 @pytest.mark.asyncio
 async def test_effective_output_digest_is_stable_for_semantic_insertion_ties():
     """Equivalent served output retains one digest despite nonsemantic insertion order."""
@@ -3345,6 +3451,43 @@ async def _seed_finality_duplicate_legacy_events(case) -> None:
             execution_id,
             generation_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_finality_downgrade_restores_legacy_rejection_code_shape():
+    """A valid legacy rejection code remains insertable after downgrade."""
+
+    async with isolated_publication_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_downgrade_finality_schema, case.schema_name)
+            identity = await _finality_insert_minimal_identity(
+                connection,
+                case.schema_name,
+                label="legacy_rejection_code",
+            )
+            execution_id = await _finality_insert_legacy_completed_execution(
+                connection,
+                case.schema_name,
+                identity,
+            )
+            dataset_id, definition_revision_id, schema_revision_id, _capture_bundle_id = identity
+            rejection_code = await connection.scalar(
+                text(
+                    f"INSERT INTO {_finality_table(case.schema_name, 'custom_import_rejection')} "
+                    "(execution_id, rejection_ordinal, dataset_id, definition_revision_id, "
+                    "schema_revision_id, code, canonical_evidence) VALUES "
+                    "(:execution_id, 0, :dataset_id, :definition_revision_id, "
+                    ":schema_revision_id, 'invalid_child', '{\"reason\":\"synthetic\"}') "
+                    "RETURNING code"
+                ),
+                {
+                    "execution_id": execution_id,
+                    "dataset_id": dataset_id,
+                    "definition_revision_id": definition_revision_id,
+                    "schema_revision_id": schema_revision_id,
+                },
+            )
+        assert rejection_code == "invalid_child"
 
 
 async def _finality_upgraded_duplicate_event_receipt(case) -> tuple[int | None, object | None]:

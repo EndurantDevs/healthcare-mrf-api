@@ -1440,7 +1440,7 @@ def _restore_v1_attempt_output_identity(schema: str) -> None:
         "DROP CONSTRAINT IF EXISTS custom_import_rejection_shape_check, "
         "ADD CONSTRAINT custom_import_rejection_pkey PRIMARY KEY (execution_id, rejection_ordinal), "
         "ADD CONSTRAINT custom_import_rejection_shape_check CHECK "
-        "(rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{{0,62}}$' AND "
+        "(rejection_ordinal >= 0 AND code ~ '^[a-z][a-z0-9_]{0,62}$' AND "
         "(source_ordinal IS NULL OR source_ordinal >= 0) AND "
         "(field_slot IS NULL OR field_slot > 0) AND "
         "(root_key_sha256 IS NULL OR octet_length(root_key_sha256) = 32)), "
