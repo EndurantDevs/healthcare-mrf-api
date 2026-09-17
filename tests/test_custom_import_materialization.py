@@ -22,7 +22,10 @@ from db.models.custom_import import (
     CustomImportSelectionProfile,
     CustomImportWinner,
 )
-from process.custom_import.definition import CustomImportDefinition, load_json_definition
+from process.custom_import.definition import (
+    CustomImportDefinition,
+    load_json_definition,
+)
 from process.custom_import.materialization import (
     ChildScalarTarget,
     DefinitionIdentity,
@@ -41,7 +44,6 @@ from process.custom_import.materialization import (
     selection_profile_models,
     winner_materialization_models,
 )
-
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 _MISSING = object()
