@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import os
 
-from alembic import op
 from sqlalchemy import text
 
+from alembic import op
 from db.migration_index_adoption import (
     _create_temporary_index_table,
     _shape_from_catalog,
