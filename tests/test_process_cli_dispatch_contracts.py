@@ -191,6 +191,131 @@ def test_openaddresses_worker_preserves_legacy_job_name():
     assert registered.coroutine is process_cli.process_openaddresses_data
 
 
+@pytest.mark.asyncio
+async def test_hospital_price_worker_accepts_only_its_control_target(monkeypatch):
+    delegated = AsyncMock(return_value={"status": "succeeded"})
+    monkeypatch.setattr(process_cli, "_control_single_job_start", delegated)
+    context_by_field = {"redis": object()}
+    control_task_by_field = {
+        "importer": "hospital-prices",
+        "target_module": "process.hospital_prices",
+        "target_function": "process_data",
+        "run_shutdown": False,
+        "task": {"hospital_ids": ["hospital-000001"]},
+    }
+
+    assert await process_cli._hospital_price_control_single_job_start(
+        context_by_field, control_task_by_field, job_id="job-1"
+    ) == {"status": "succeeded"}
+    delegated.assert_awaited_once_with(
+        context_by_field, control_task_by_field, job_id="job-1"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_task_by_field",
+    [
+        None,
+        {},
+        {
+            "target_module": "asyncio",
+            "target_function": "create_subprocess_shell",
+            "call_style": "kwargs",
+        },
+        {
+            "importer": "hospital-prices",
+            "target_module": "process.hospital_prices",
+            "target_function": "process_data",
+            "task": None,
+        },
+    ],
+)
+async def test_hospital_price_worker_rejects_missing_or_arbitrary_targets(
+    control_task_by_field,
+):
+    with pytest.raises(ValueError, match="HospitalPrices control target is not allowed"):
+        await process_cli._hospital_price_control_single_job_start(
+            {}, control_task_by_field
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_marked", [True, False])
+async def test_hospital_price_worker_terminalizes_only_its_queued_run(
+    monkeypatch, is_marked
+):
+    marker = AsyncMock(return_value=is_marked)
+    flusher = AsyncMock()
+    monkeypatch.setattr(process_cli, "mark_control_run", marker)
+    monkeypatch.setattr(process_cli, "_flush_terminal_status_events", flusher)
+    task_by_field = {
+        "run_id": " run-hospital ",
+        "importer": "hospital-prices",
+        "target_module": "asyncio",
+        "target_function": "create_subprocess_shell",
+        "task": {},
+    }
+
+    with pytest.raises(ValueError, match="HospitalPrices control target is not allowed"):
+        await process_cli._hospital_price_control_single_job_start({}, task_by_field)
+
+    marker.assert_awaited_once_with(
+        "run-hospital",
+        status="failed",
+        phase_detail="hospital price control target rejected",
+        progress_message="target rejected",
+        error={
+            "code": "control_target_rejected",
+            "message": "HospitalPrices control target is not allowed",
+        },
+        expected_state=("hospital-prices", "queued"),
+    )
+    if is_marked:
+        flusher.assert_awaited_once_with("run-hospital")
+    else:
+        flusher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"target_module": "asyncio"},
+        {"target_function": "create_subprocess_shell"},
+        {"call_style": "kwargs"},
+        {"run_shutdown": True},
+        {"run_shutdown": 0},
+        {"importer": "npi"},
+        {"target_module": " process.hospital_prices"},
+    ],
+)
+async def test_hospital_price_worker_rejects_other_control_targets(override):
+    control_task_by_field = {
+        "importer": "hospital-prices",
+        "target_module": "process.hospital_prices",
+        "target_function": "process_data",
+        "call_style": "ctx_task",
+        "run_shutdown": False,
+        "task": {},
+        **override,
+    }
+
+    with pytest.raises(ValueError, match="HospitalPrices control target is not allowed"):
+        await process_cli._hospital_price_control_single_job_start(
+            {}, control_task_by_field
+        )
+
+
+def test_hospital_price_worker_registers_restricted_control_wrapper():
+    registered = process_cli.HospitalPrices.functions[1]
+
+    assert registered.name == "control_single_job_start"
+    assert registered.coroutine is process_cli._hospital_price_control_single_job_start
+    assert registered.max_tries == 1
+    assert registered is not process_cli.control_single_job_start
+
+
 @pytest.mark.parametrize(
     ("command", "target_name", "args", "expected"),
     [

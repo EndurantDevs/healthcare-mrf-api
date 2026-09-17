@@ -74,7 +74,7 @@ from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres im
 
 
 @asynccontextmanager
-async def _lifecycle_scope(monkeypatch):
+async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True):
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
     schema = quoted(schema_name)
@@ -102,6 +102,10 @@ async def _lifecycle_scope(monkeypatch):
         assert registration.endpoint_created and registration.source_created
         await run_migration(engine, migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
+        if request_failure_budget:
+            from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
+
+            await install_request_failure_budget(engine, schema_name)
         replay = await register_provider_directory_rooted_graph_source(
             database=database
         )

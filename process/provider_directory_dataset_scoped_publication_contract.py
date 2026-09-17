@@ -12,6 +12,7 @@ from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_VARIANT,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_LEGACY_ROOT_VARIANT,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
@@ -167,10 +168,9 @@ def _has_valid_exact_current_content(candidate: object) -> bool:
         return False
     return bool(
         exact_dataset_variant(candidate.dataset_id) == candidate.variant
-        and candidate.root_publication_contract_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT[
-            candidate.variant
-        ]
+        and has_matching_rooted_graph_root_publication(
+            candidate.variant, candidate.root_publication_contract_id
+        )
         and candidate.source_authority_id == UHC_FLEX_OFFICIAL_AUTHORITY_ID
         and candidate.endpoint_signature_sha256
         == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256

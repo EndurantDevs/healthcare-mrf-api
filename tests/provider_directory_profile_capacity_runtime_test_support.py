@@ -14,9 +14,7 @@ from process.provider_directory_profile_capacity_runtime_witness import (
 
 # This revision is signed into the neutral cross-repository execution golden.
 # Any repository head change requires regenerating that fixture and its hashes.
-PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION = (
-    "20260907220000_hospital_price_missing_plan"
-)
+PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION = "20260917130000_custom_import_generation_finality"
 _RUNTIME_WITNESS_BY_FIELD = {
     "healthcare_source_commit": "12" * 20,
     "healthcare_image_digest": "sha256:" + "13" * 32,
@@ -24,9 +22,7 @@ _RUNTIME_WITNESS_BY_FIELD = {
     CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD: "sha256:" + "15" * 32,
     "profile_migration_revision": PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
     "profile_schema_version": 1,
-    "profile_strategy_version": (
-        "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
-    ),
+    "profile_strategy_version": ("source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"),
     "postgres_server_version_num": 180002,
 }
 _DEPLOYMENT_WITNESS_BY_FIELD = {

@@ -77,7 +77,7 @@ def _fact(generation, suffix, *, category, value_by_field):
     }
 
 
-async def _seed_generation(database, generation, *, status="completed", school="Example Medical School"):
+async def _seed_generation(database, generation, *, status="completed", school="Example Medical School", portfolio=False):
     manifest_by_field = {
         "source": {"source_key": SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "MA",
                    "agency": "Massachusetts Board of Registration in Medicine", "coverage_scope": "full_physician_license",
@@ -86,6 +86,8 @@ async def _seed_generation(database, generation, *, status="completed", school="
         "full_cohort_licenses": 1, "requested_licenses": 1, "cohort_sha256": "a" * 64,
         "expected_current_run_id": None, "resume_from": None,
     }
+    if portfolio:
+        manifest_by_field["categories"].extend(["certifications", "specialties"])
     await database.insert(state_api.ProviderProfileImportRun.__table__).values({
         "run_id": generation, "source_key": SOURCE_KEY, "jurisdiction": "MA",
         "schema_version": SCHEMA_VERSION, "status": status, "source_manifest": manifest_by_field,
@@ -138,16 +140,16 @@ async def test_loader_snapshot_survives_concurrent_pointer_and_fact_change(monke
         try:
             async with database.engine.begin() as writer:
                 await writer.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
-                reader = asyncio.create_task(state_api.fetch_massachusetts_profile_projection(NPI))
+                reader = asyncio.create_task(state_api.fetch_additional_state_profile_projections(NPI))
                 await _wait_for_reader_gate(database, lock_key)
                 await writer.execute(text(f"UPDATE {schema}.provider_profile_source_publication SET current_run_id = :generation WHERE source_key = :source_key"), {"generation": new_generation, "source_key": SOURCE_KEY})
                 await writer.execute(text(f"DELETE FROM {schema}.fact_rows WHERE run_id = :generation"), {"generation": old_generation})
-            old_projection = await asyncio.wait_for(reader, timeout=5)
+            old_projection, = await asyncio.wait_for(reader, timeout=5)
             assert len(query_statements) == 1
             assert old_projection["generation_id"] == old_projection["source"]["registry_generation"] == old_generation
             assert old_projection["categories"]["education"]["items"][0]["value"]["institution"] == "Earlier Medical School"
             assert all(source_record["fact_id"].startswith(old_generation) for source_record in old_projection["evidence"]["records"])
-            new_projection = await state_api.fetch_massachusetts_profile_projection(NPI)
+            new_projection, = await state_api.fetch_additional_state_profile_projections(NPI)
             assert len(query_statements) == 2
             assert new_projection["generation_id"] == new_projection["source"]["registry_generation"] == new_generation
             assert new_projection["categories"]["education"]["items"][0]["value"]["institution"] == "Later Medical School"
@@ -165,19 +167,19 @@ async def test_loader_rejects_incomplete_pointed_run_in_postgresql(monkeypatch, 
         await _seed_generation(database, generation, status=status)
         await _point_to(database, generation)
         with pytest.raises(RuntimeError, match="state_profile_publication_invalid"):
-            await state_api.fetch_massachusetts_profile_projection(NPI)
+            await state_api.fetch_additional_state_profile_projections(NPI)
 
 
 async def test_loader_absent_pointer_and_optional_table_in_postgresql(monkeypatch):
     async with _database(monkeypatch) as (database, schema):
-        assert await state_api.fetch_massachusetts_profile_projection(NPI) is None
+        assert await state_api.fetch_additional_state_profile_projections(NPI) == []
         generation = uuid.uuid4().hex
         await _seed_generation(database, generation)
-        assert await state_api.fetch_massachusetts_profile_projection(NPI) is None
+        assert await state_api.fetch_additional_state_profile_projections(NPI) == []
         await _point_to(database, generation)
-        assert await state_api.fetch_massachusetts_profile_projection(1000000012) is None
+        assert await state_api.fetch_additional_state_profile_projections(1000000012) == []
         await database.status(f"DROP TABLE {schema}.provider_profile_source_publication")
-        assert await state_api.fetch_massachusetts_profile_projection(NPI) is None
+        assert await state_api.fetch_additional_state_profile_projections(NPI) == []
 
 
 async def _seed_incumbents(database):
@@ -225,3 +227,46 @@ async def test_native_composition_preserves_sources_and_isolates_evidence(monkey
                 assert public_item["assertion_count"] == 3
         assert (await profile_api.fetch_state_profile_projection(NPI))["generation_id"] == "florida-generation"
         assert (await cms_api.fetch_cms_education_projection(NPI))["generation_id"] == "cms-generation"
+
+
+async def test_native_portfolio_scope_preserves_incumbent_education_and_source_generations(monkeypatch):
+    from tests.test_massachusetts_profile_portfolio import _parse
+
+    async with _database(monkeypatch) as (database, schema):
+        legacy_generation, richer_generation = uuid.uuid4().hex, uuid.uuid4().hex
+        await _seed_generation(database, legacy_generation)
+        await _seed_generation(database, richer_generation, portfolio=True)
+        await _point_to(database, legacy_generation)
+        await _seed_incumbents(database)
+        before = await profile_api.fetch_provider_profile_projection(NPI)
+        legacy_profile = profile_api.compose_provider_profile(NPI, state_projection=before, fhir_profile=None)
+        assert legacy_profile["categories"]["certifications"]["availability"] == "unavailable"
+        _, parsed_facts = _parse(evidence={
+            "run_id": richer_generation, "artifact_id": "synthetic-artifact", "row_number": 1,
+            "source_url": "https://example.test/profile", "downloaded_at": "2026-09-08T00:00:00Z", "content_sha256": "a" * 64,
+        })
+        portfolio_facts = [fact for fact in parsed_facts if fact["category"] in {"certifications", "specialties"}]
+        await database.insert(state_api.ProviderProfileFact.__table__).values(portfolio_facts).status()
+        incumbent_projection, = await state_api.fetch_additional_state_profile_projections(NPI)
+        assert incumbent_projection["generation_id"] == legacy_generation
+        await database.status(f"UPDATE {schema}.provider_profile_source_publication SET current_run_id=:generation", generation=richer_generation)
+        after = await profile_api.fetch_provider_profile_projection(NPI)
+        profile = profile_api.compose_provider_profile(NPI, state_projection=after, fhir_profile=None)
+        assert profile["source_generations"] == {"state_regulator": "florida-generation", "cms_doctors": "cms-generation", SOURCE_KEY: richer_generation}
+        school, = profile["categories"]["education"]["items"]
+        assert school["assertion_count"] == 3 and school["value"] == legacy_profile["categories"]["education"]["items"][0]["value"]
+        assert profile["generation_id"] != legacy_profile["generation_id"]
+        for category in ("certifications", "specialties"):
+            assert profile["categories"][category]["availability"] == "available"
+            page = profile_api.compose_provider_profile(NPI, state_projection=after, fhir_profile=None,
+                                                       requested_categories=[category], page_category=category, page_limit=1)
+            evidence = profile_api.compose_provider_profile_evidence(state_projection=after, fhir_evidence=None,
+                                                                     provider_profile=page, page_category=category)
+            source_records = evidence["sources"][SOURCE_KEY]["records"]
+            profile_item, = page["categories"][category]["items"]
+            assert {evidence_record["source_record_id"] for evidence_record in source_records} == set(profile_item["source_record_ids"])
+            for source_record in source_records:
+                assert source_record["run_id"] == richer_generation
+                fact = next(fact for fact in portfolio_facts if fact["fact_id"] == source_record["fact_id"])
+                assert source_record["raw_fields"] == fact["source_json"]["raw_fields"]
+            assert evidence["sources"]["state_regulator"]["records"] == evidence["sources"]["cms_doctors"]["records"] == []

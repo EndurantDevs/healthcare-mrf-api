@@ -22,6 +22,10 @@ from process import provider_directory_rooted_graph_operator as operator
 from process import provider_directory_rooted_graph_operator_contract as contract
 from process import provider_directory_rooted_graph_single_root_contract as single_root
 from process import provider_directory_rooted_graph_twin_store as twin_store
+from process.fhir_request_failure_policy import (
+    FHIR_REQUEST_FAILURE_POLICY_ID,
+    FHIR_REQUEST_FAILURE_RESOURCE_COVERAGE,
+)
 from process.provider_directory_rooted_graph_acquisition_contract import (
     ProviderDirectoryRootedGraphAcquisitionConfig,
     ProviderDirectoryRootedGraphRootReceipt,
@@ -96,13 +100,13 @@ def _candidate():
     )
 
 
-def _receipt() -> ProviderDirectoryRootedGraphRootReceipt:
+def _receipt(completed_count: int = 3) -> ProviderDirectoryRootedGraphRootReceipt:
     candidate = _identity().candidate
     return ProviderDirectoryRootedGraphRootReceipt(
         acquisition_role="candidate",
         acquisition_id=candidate.acquisition_id,
         run_id=candidate.run_id,
-        completed_count=3,
+        completed_count=completed_count,
         resource_count=8,
         edge_count=5,
         rooted_graph_sha256="4" * 64,
@@ -206,17 +210,25 @@ async def test_single_root_acquisition_validates_role_and_seals(
     summary = ProviderDirectoryRootedGraphAcquisitionSummary(
         identity.acquisition_id,
         identity.scope_id,
-        3,
-        0,
+        2,
+        1,
         8,
         5,
         "1" * 64,
         "2" * 64,
         "3" * 64,
         "4" * 64,
-        True,
         False,
         False,
+        False,
+        request_failure_coverage={
+            "policy_id": FHIR_REQUEST_FAILURE_POLICY_ID,
+            "resource_coverage": FHIR_REQUEST_FAILURE_RESOURCE_COVERAGE,
+            "total_requests": 1003,
+            "failed_requests": 2,
+            "rooted_total_requests": 3,
+            "rooted_failed_requests": 1,
+        },
     )
     sealed_sources: list[tuple[object, ...]] = []
 
@@ -230,10 +242,12 @@ async def test_single_root_acquisition_validates_role_and_seals(
     monkeypatch.setattr(acquisition, "_acquire_root", acquire)
     monkeypatch.setattr(acquisition, "_require_sealed_roots", require)
     config = ProviderDirectoryRootedGraphAcquisitionConfig(enabled=True)
+    with pytest.raises(acquisition.ProviderDirectoryRootedGraphAcquisitionError):
+        acquisition._root_receipt(identity, summary, 1.25)
     root_receipt = await acquisition.acquire_rooted_graph_single_root(
         identity, config=config, database=object()
     )
-    assert root_receipt == _receipt()
+    assert root_receipt == _receipt(completed_count=2)
     assert sealed_sources == [("exact-source",)]
     with pytest.raises(ValueError):
         await acquisition.acquire_rooted_graph_single_root(object(), config=config)

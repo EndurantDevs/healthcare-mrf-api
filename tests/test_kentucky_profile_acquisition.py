@@ -3,6 +3,7 @@
 """Exercise exact Kentucky acquisition with synthetic HTTP and disposable registry data."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from contextlib import asynccontextmanager
 from html import escape
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 from sqlalchemy.engine import make_url
@@ -74,6 +76,7 @@ class ProfileSession:
         self.responses = list(responses)
         self.requests = []
         self.closed = False
+        self._retry_connection = True
 
     def get(self, url, **options):
         self.requests.append((url, options))
@@ -182,7 +185,7 @@ async def test_unsafe_schema_fails_before_database(monkeypatch, schema):
     transaction.assert_not_called()
 
 
-@pytest.mark.parametrize("license_number", ["C0007", "00042", "c0007", "A" * 31 + "1"])
+@pytest.mark.parametrize("license_number", ["0", "C0007", "00042", "c0007", "A" * 31 + "1"])
 async def test_public_get_preserves_literal_query_and_raw_utf8(license_number):
     body = _html(license_number)
     session = ProfileSession([ProfileResponse(body)])
@@ -314,6 +317,26 @@ async def test_replay_preserves_exact_envelopes_and_hashes_every_response_field(
     assert changed["responses_sha256"] == hashlib.sha256(acquisition.encoded_json(first)).hexdigest()
 
 
+async def test_retained_validation_honors_cancellation_before_next_file_or_transport(tmp_path, install_session):
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    acquisition.write_new_json(retained / "C0007.json", _envelope())
+    acquisition.write_new_json(retained / "00042.json", _envelope(content_sha256="0" * 64))
+    originals_by_name = {path.name: path.read_bytes() for path in retained.iterdir()}
+    session = install_session()
+
+    async def cancel_after_first(completed, total, *, phase):
+        assert total == 2 and phase == "checking_retained"
+        if completed == 1:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.acquire_profiles([{"license_number": number} for number in ("C0007", "00042")],
+                                           tmp_path / "new", cancel_after_first, retained=retained)
+    assert session.requests == [] and not (tmp_path / "new").exists()
+    assert {path.name: path.read_bytes() for path in retained.iterdir()} == originals_by_name
+
+
 @pytest.mark.parametrize("failure", ["changed", "dangling_symlink", "directory", "wrong_query", "truncated", "error"])
 async def test_invalid_retained_response_never_falls_back_to_http(tmp_path, install_session, failure):
     retained = tmp_path / "retained"
@@ -400,6 +423,88 @@ async def test_transport_failure_has_no_retry_and_preserves_prior_response(tmp_p
     assert [path.name for path in destination.iterdir()] == ["C0007.json"]
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_transient_http_status_retries_same_query_and_retains_only_success(tmp_path, install_session, status):
+    failed = ProfileResponse(status=status)
+    session = install_session(failed, ProfileResponse())
+    destination = tmp_path / "new"
+    metrics = await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert session.requests == [(acquisition.source_url("C0007"), {"allow_redirects": False})] * 2
+    assert failed.chunks_read == 0 and session.closed
+    response = acquisition.read_response(destination / "C0007.json", "C0007")
+    assert response["body_text"].encode() == _html() and response["status"] == 200
+    assert metrics["responses"] == 1 and metrics["response_bytes"] == len(_html())
+    assert metrics["responses_sha256"] == hashlib.sha256(acquisition.encoded_json(response)).hexdigest()
+
+
+async def test_transient_http_exhaustion_stops_at_three_attempts(tmp_path, install_session):
+    failures = [ProfileResponse(status=500) for _ in range(3)]
+    session = install_session(ProfileResponse(_html("00042")), *failures, ProfileResponse())
+    destination = tmp_path / "new"
+    with pytest.raises(acquisition.ProfileHTTPStatusError, match="kentucky_profile_http_failure:500") as caught:
+        await acquisition.acquire_profiles([{"license_number": "00042"}, {"license_number": "C0007"}], destination, AsyncMock())
+    assert caught.value.status == 500 and len(session.requests) == 4 and session.closed
+    assert session.requests[1:] == [(acquisition.source_url("C0007"), {"allow_redirects": False})] * 3
+    assert all(response.chunks_read == 0 for response in failures)
+    assert [path.name for path in destination.iterdir()] == ["00042.json"]
+    assert acquisition.read_response(destination / "00042.json", "00042")["body_text"].encode() == _html("00042")
+
+
+@pytest.mark.parametrize("response", [*(ProfileResponse(status=status) for status in (302, 403, 404, 429, 501, 505)),
+                                     ProfileResponse(content_type="application/json"), ProfileResponse(b"Service unavailable"),
+                                     ProfileResponse(_html("C007"))])
+async def test_terminal_http_or_invalid_body_is_not_retried_by_acquisition(tmp_path, install_session, response):
+    session = install_session(response, ProfileResponse())
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert len(session.requests) == 1 and session.closed and list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("during_spacing", [False, True])
+async def test_cancellation_before_http_retry_stops_without_another_request(tmp_path, install_session, monkeypatch, during_spacing):
+    session = install_session(ProfileResponse(status=500), ProfileResponse())
+    destination = tmp_path / "new"
+    cancellation = SimpleNamespace(requested=False)
+
+    async def request_cancellation(_delay):
+        cancellation.requested = bool(session.requests)
+
+    if during_spacing:
+        monkeypatch.setattr(acquisition, "asyncio", SimpleNamespace(
+            sleep=request_cancellation, get_running_loop=asyncio.get_running_loop,
+        ))
+
+    async def cancel_retry(_completed, _total):
+        if session.requests and (not during_spacing or cancellation.requested):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, cancel_retry)
+    assert len(session.requests) == 1 and session.closed and list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("control", ["absent", None, 0, "false"])
+async def test_retry_control_unavailable_fails_before_requests(tmp_path, install_session, control):
+    session = install_session(ProfileResponse())
+    if control == "absent":
+        del session._retry_connection
+    else:
+        session._retry_connection = control
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError, match="kentucky_profile_retry_control_unavailable"):
+        await acquisition.acquire_profiles([{"license_number": "C0007"}], destination, AsyncMock())
+    assert session.requests == [] and session.closed and list(destination.iterdir()) == []
+
+
+@pytest.mark.parametrize("control", [True, False])
+async def test_existing_boolean_retry_control_is_disabled(tmp_path, install_session, control):
+    session = install_session(ProfileResponse())
+    session._retry_connection = control
+    await acquisition.acquire_profiles([{"license_number": "C0007"}], tmp_path / "new", AsyncMock())
+    assert session._retry_connection is False and len(session.requests) == 1 and session.closed
+
+
 @pytest.mark.parametrize("failure_type", [acquisition.aiohttp.ServerDisconnectedError, acquisition.aiohttp.ClientOSError])
 async def test_real_client_connection_failure_is_not_retried(tmp_path, monkeypatch, failure_type):
     """Exercise aiohttp's retry loop with middleware that fails before any transport."""
@@ -441,9 +546,13 @@ async def test_total_cap_counts_replay_and_stops_before_overflow(tmp_path, insta
     assert len(session.requests) == 1
 
 
-async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, install_session, monkeypatch):
+@pytest.mark.parametrize("transient_failure", [False, True])
+async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, install_session, monkeypatch, transient_failure):
     licenses = ["C0007", "00042", "00043"]
-    session = install_session(*(ProfileResponse(_html(number)) for number in licenses))
+    responses = [ProfileResponse(_html(number)) for number in licenses]
+    if transient_failure:
+        responses.insert(0, ProfileResponse(status=500))
+    session = install_session(*responses)
     clock = SimpleNamespace(now=100.0)
     request_starts = []
     original_get = session.get
@@ -461,7 +570,193 @@ async def test_request_starts_are_sequential_and_two_seconds_apart(tmp_path, ins
         sleep=advance_clock, get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now),
     ))
     await acquisition.acquire_profiles([{"license_number": number} for number in licenses], tmp_path / "new", AsyncMock())
-    assert request_starts == [100.0, 102.0, 104.0]
+    assert request_starts == ([100.0, 102.0, 104.0, 106.0] if transient_failure else [100.0, 102.0, 104.0])
+
+
+def _narrowed_html(surname, *, returned_license="0", found=True, year="2001"):
+    body = _html("0", found=found).replace(b"FLD1=&amp;", f"FLD1={quote(surname)}&amp;".encode())
+    body = body.replace(b"Search Criterion: KY", f"Search Criterion: Last Name = {escape(surname)}; KY".encode())
+    body = body.replace(b">0</div>", f">{returned_license}</div>".encode())
+    return body.replace(b">2001</div>", f">{year}</div>".encode())
+
+
+def _narrowing_root():
+    return {"license_number": "0", "candidates": [
+        _candidate("0", last_name=surname, npi=npi)
+        for surname, npi in zip(("Example", "Other", "Sample", "Synthetic"),
+                                (1000000004, 1000000012, 1000000020, 1000000038), strict=True)]}
+
+
+def _narrowed_envelope(root, bodies):
+    attempt_by_field = {"truncated": True, "complete": False, "outcome": "response_too_large",
+               "observed_bytes": acquisition.MAX_PROFILE_BYTES + 1, "read_prefix_sha256": "a" * 64,
+               "license_number": "0", "source_url": acquisition.source_url("0"),
+               "downloaded_at": "2026-09-08T11:00:00+00:00", "status": 200, "content_type": "text/html"}
+    scope = acquisition._candidate_query_scope(root)
+    return {"schema_version": acquisition.NARROWED_SCHEMA, "source_key": acquisition.SOURCE_KEY,
+            "license_number": "0", "query_scope": scope, "oversized_attempt": attempt_by_field,
+            "responses": [_envelope("0", body=body, source_url=acquisition.source_url("0", last_name=query["last_name"]))
+                          for query, body in zip(scope["queries"], bodies, strict=True)]}
+
+
+async def test_narrowed_query_uses_same_bounded_status_retry(tmp_path, install_session, monkeypatch):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    root = _narrowing_root()
+    root["candidates"] = root["candidates"][:1]
+    prefix, body = b"x" * 2001, _narrowed_html("Example")
+    failed = ProfileResponse(status=500)
+    session = install_session(ProfileResponse(chunks=[prefix]), failed, ProfileResponse(body))
+    destination = tmp_path / "new"
+    metrics = await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert session.requests == [(acquisition.source_url("0"), {"allow_redirects": False}),
+                                *[(acquisition.source_url("0", last_name="Example"), {"allow_redirects": False})] * 2]
+    response = acquisition.read_response(destination / "0.json", "0", candidates=root["candidates"])
+    assert failed.chunks_read == 0 and session.closed
+    assert response["responses"][0]["body_text"].encode() == body
+    assert metrics["response_bytes"] == len(prefix) + len(body) and metrics["narrowed_queries"] == 1
+    assert metrics["retained_http_responses"] == 2 and not (destination / "0.narrowed/1.failed.json").exists()
+
+
+async def test_oversized_root_retains_all_four_queries_and_replays_without_http(tmp_path, install_session, monkeypatch):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    root = _narrowing_root()
+    root["candidates"].append(copy.deepcopy(root["candidates"][0]))
+    bodies = [_narrowed_html(candidate["last_name"], returned_license="01234", found=index == 0)
+              for index, candidate in enumerate(root["candidates"][:4])]
+    prefix = b"x" * 2017
+    session = install_session(ProfileResponse(chunks=[prefix[:1000], prefix[1000:]]), *(ProfileResponse(body) for body in bodies))
+    destination = tmp_path / "new"
+    metrics = await acquisition.acquire_profiles([root], destination, AsyncMock())
+    response = acquisition.read_response(destination / "0.json", "0", candidates=root["candidates"])
+    assert [url for url, _options in session.requests] == [acquisition.source_url("0"), *[
+        acquisition.source_url("0", last_name=candidate["last_name"]) for candidate in root["candidates"][:4]]]
+    assert response["query_scope"]["queries"][0]["candidate_indexes"] == [0, 4]
+    assert response["oversized_attempt"]["read_prefix_sha256"] == hashlib.sha256(prefix).hexdigest()
+    assert response["oversized_attempt"]["observed_bytes"] == len(prefix)
+    assert response["oversized_attempt"]["truncated"] is True and response["oversized_attempt"]["complete"] is False
+    assert "body_text" not in response["oversized_attempt"] and "content_sha256" not in response["oversized_attempt"]
+    assert [receipt["body_text"].encode() for receipt in response["responses"]] == bodies
+    assert metrics["responses"] == 1 and metrics["narrowed_queries"] == 4 and metrics["retained_http_responses"] == 5
+    assert metrics["response_bytes"] == len(prefix) + sum(map(len, bodies))
+    from process.kentucky_profile import _source_rows
+    record, facts = _source_rows(root, response, {"run_id": "a" * 64, "artifact_id": "b" * 64}, 1)
+    assert record["match_status"] == "identity_conflict" and record["matched_npi"] is None and facts == []
+    assert record["raw_payload"]["acquisition"] == response
+    session = install_session()
+    replay = await acquisition.acquire_profiles([root], tmp_path / "replay", AsyncMock(), retained=destination)
+    assert replay == {**metrics, "reused_responses": 1} and session.requests == []
+
+
+@pytest.mark.parametrize("surname", [None, "", " ", "Unknown%", "[Unknown]", "x" * 51])
+async def test_unsupported_candidate_never_queries_a_subset(tmp_path, install_session, monkeypatch, surname):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    root = _narrowing_root(); root["candidates"][-1]["last_name"] = surname
+    session = install_session(ProfileResponse(chunks=[b"x" * 2000, b"x"]))
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError, match="narrowing_surname_unsupported"):
+        await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert len(session.requests) == 1 and not (destination / "0.json").exists()
+    assert json.loads((destination / "0.narrowed/oversized.json").read_text())["truncated"] is True
+
+
+async def test_interrupted_narrowing_keeps_checkpoint_and_refuses_resume(tmp_path, install_session, monkeypatch):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    root = _narrowing_root()
+    session = install_session(ProfileResponse(chunks=[b"x" * 2000, b"x"]),
+                              ProfileResponse(_narrowed_html("Example")), asyncio.TimeoutError())
+    destination = tmp_path / "new"
+    with pytest.raises(asyncio.TimeoutError):
+        await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert len(session.requests) == 3 and (destination / "0.narrowed/1.json").is_file()
+    assert (destination / "0.narrowed/2.failed.json").is_file() and not (destination / "0.json").exists()
+    session = install_session()
+    with pytest.raises(ValueError, match="narrowed_checkpoint_incomplete"):
+        await acquisition.acquire_profiles([root], tmp_path / "replay", AsyncMock(), retained=destination)
+    assert session.requests == [] and not (tmp_path / "replay").exists()
+
+
+async def test_excess_candidate_surnames_fail_before_any_narrowed_request(tmp_path, install_session):
+    root = _narrowing_root()
+    candidate = root["candidates"][0]
+    root["candidates"] = [{**candidate, "last_name": f"Example {index}"}
+                          for index in range(acquisition.MAX_NARROWED_QUERIES)]
+    assert len(acquisition._candidate_query_scope(root)["queries"]) == acquisition.MAX_NARROWED_QUERIES
+    root["candidates"].append({**candidate, "last_name": "One additional surname"})
+    session = install_session(ProfileResponse(chunks=[b"x" * acquisition.MAX_PROFILE_BYTES, b"x"]))
+    destination = tmp_path / "new"
+    with pytest.raises(ValueError, match="narrowing_query_limit_exceeded"):
+        await acquisition.acquire_profiles([root], destination, AsyncMock())
+    assert len(session.requests) == 1
+    assert not (destination / "0.json").exists()
+    assert json.loads((destination / "0.narrowed" / "oversized.json").read_bytes())["complete"] is False
+
+
+async def test_same_text_without_typed_overflow_does_not_narrow(tmp_path, install_session):
+    session = install_session(ValueError("kentucky_profile_response_too_large"))
+    with pytest.raises(ValueError, match="response_too_large"):
+        await acquisition.acquire_profiles([_narrowing_root()], tmp_path / "new", AsyncMock())
+    assert len(session.requests) == 1 and list((tmp_path / "new").iterdir()) == []
+
+
+@pytest.mark.parametrize("change", ["candidate", "queries", "url", "body_hash", "truncation", "byte_count"])
+async def test_narrowed_replay_tampering_fails_before_http(tmp_path, install_session, change):
+    root = _narrowing_root()
+    envelope = _narrowed_envelope(root, [_narrowed_html(candidate["last_name"]) for candidate in root["candidates"]])
+    if change == "candidate":
+        root["candidates"][0]["middle_name"] = "Changed"
+    if change == "queries":
+        envelope["responses"].pop()
+    if change == "url":
+        envelope["responses"][0]["source_url"] = acquisition.source_url("0")
+    if change == "body_hash":
+        envelope["responses"][0]["content_sha256"] = "b" * 64
+    if change == "truncation":
+        envelope["oversized_attempt"]["complete"] = True
+    if change == "byte_count":
+        envelope["oversized_attempt"]["observed_bytes"] = 1
+    retained = tmp_path / "retained"; retained.mkdir()
+    acquisition.write_new_json(retained / "0.json", envelope)
+    session = install_session()
+    expected = {"candidate": "narrowed_response_changed", "queries": "narrowed_response_changed",
+                "url": "response_identity_invalid", "body_hash": "response_changed",
+                "truncation": "truncated_attempt_invalid", "byte_count": "truncated_attempt_invalid"}[change]
+    with pytest.raises(ValueError, match=expected):
+        await acquisition.acquire_profiles([root], tmp_path / "new", AsyncMock(), retained=retained)
+    assert session.requests == [] and not (tmp_path / "new").exists()
+
+
+async def test_overflow_consumed_prefix_counts_towards_unchanged_global_cap(tmp_path, install_session, monkeypatch):
+    monkeypatch.setattr(acquisition, "MAX_PROFILE_BYTES", 2000)
+    body = _narrowed_html("Example")
+    monkeypatch.setattr(acquisition, "MAX_ACQUISITION_BYTES", 2017 + len(body) - 1)
+    session = install_session(ProfileResponse(chunks=[b"x" * 2000, b"x" * 17]), ProfileResponse(body))
+    with pytest.raises(ValueError, match="acquisition_too_large"):
+        await acquisition.acquire_profiles([_narrowing_root()], tmp_path / "new", AsyncMock())
+    assert len(session.requests) == 2 and (tmp_path / "new/0.narrowed/1.json").is_file()
+    assert not (tmp_path / "new/0.json").exists()
+
+
+@pytest.mark.parametrize("outcome", ["empty", "identical", "conflict"])
+def test_narrowed_union_preserves_unknowns_and_conflicting_full_payloads(outcome):
+    from process.kentucky_profile import _source_rows
+    root = _narrowing_root()
+    bodies = [_narrowed_html(candidate["last_name"], found=outcome != "empty",
+                             year="2002" if outcome == "conflict" and index == 1 else "2001")
+              for index, candidate in enumerate(root["candidates"])]
+    envelope = _narrowed_envelope(root, bodies)
+    record, facts = _source_rows(root, envelope, {"run_id": "a" * 64, "artifact_id": "b" * 64}, 1)
+    assert len(record["raw_payload"]["acquisition"]["responses"]) == 4
+    if outcome == "identical":
+        assert len(record["raw_payload"]["profiles"]) == 1 and record["match_status"] == "deterministic"
+        assert len(facts) == 1 and facts[0]["npi"] == 1000000004
+        assert facts[0]["source_json"]["source_url"] == envelope["responses"][0]["source_url"]
+        assert facts[0]["source_json"]["content_sha256"] == envelope["responses"][0]["content_sha256"]
+    else:
+        assert record["matched_npi"] is None and facts == []
+        assert record["match_status"] == ("unmatched" if outcome == "empty" else "identity_conflict")
+        assert record["normalized_payload"]["visibility"] == "held_identity"
+        if outcome == "empty":
+            assert record["match_evidence"]["reason"] == "no_profile_within_candidate_name_queries"
 
 
 async def _create_registry_tables(database, schema):

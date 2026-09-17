@@ -77,7 +77,7 @@ async def test_classification_npi_cache_hit(monkeypatch):
         "_npi_canonical_publication_identity",
         AsyncMock(return_value=publication_identity),
     )
-    cache[f"{publication_identity}|hospital"] = (time.time(), [123])
+    cache[f"{publication_identity}|hospital|primary"] = (time.time(), [123])
 
     assert await npi_module._get_classification_npi_list("Hospital") == [123]
 

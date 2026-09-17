@@ -171,30 +171,6 @@ async def apply_in_timezone(
             database=scenario.database,
         )
     return apply_result, expected_retired_at
-    await scenario.connection.execute(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET status = 'superseded', is_current = false, "
-        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
-        CURRENT_DATASET_ID,
-    )
-    await scenario.connection.execute(
-        f"""INSERT INTO {schema}.provider_directory_endpoint_dataset
-            (dataset_id, endpoint_id, import_run_id, acquisition_root_run_id,
-             previous_dataset_id, status, is_current, resource_count, dataset_hash,
-             validated_at, published_at, publication_metadata_json) VALUES
-            ('dataset-replacement', $2, 'run-replacement', 'run-replacement', $3,
-             'published', true, 1, $4, transaction_timestamp(),
-             transaction_timestamp(), '{{}}'),
-             ('dataset-fresh-candidate', $2, 'run-fresh', 'run-fresh',
-             'dataset-replacement', 'acquiring', false, 0, NULL, NULL, NULL,
-             jsonb_build_object(
-                 'source_ids', jsonb_build_array(CAST($1 AS text))
-             ))""",
-        SOURCE_ID,
-        ENDPOINT_ID,
-        CURRENT_DATASET_ID,
-        "f" * 64,
-    )
 
 
 @pytest.mark.asyncio

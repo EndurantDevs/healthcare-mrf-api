@@ -174,8 +174,9 @@ def _candidate_io(request):
     }
 
 
-def _report(storage_generation="shared_blocks_v3"):
-    plan = _plan()
+def _validated_report_aggregate(plan):
+    """Validate synthetic responses matching every planned source occurrence."""
+
     partition_results = tuple(
         contract.build_partitioned_candidate_audit_result(
             request=request,
@@ -189,20 +190,27 @@ def _report(storage_generation="shared_blocks_v3"):
         )
         for request in plan.requests
     )
-    aggregate = contract.validate_partitioned_candidate_audit_results(
+    return contract.validate_partitioned_candidate_audit_results(
         plan,
         partition_results,
     )
+
+
+def _report(storage_generation="shared_blocks_v3", *, rate_limit=2.0):
+    """Build a valid report with current or historical request pacing."""
+
+    plan = _plan()
+    aggregate = _validated_report_aggregate(plan)
     request_count = plan.request_count
     metrics = audit.PartitionedAuditHttpMetrics(
         planned_request_count=request_count,
         started_request_count=request_count,
         completed_request_count=request_count,
         peak_in_flight=2,
-        start_times=[index * 0.5 for index in range(request_count)],
+        start_times=[index / rate_limit for index in range(request_count)],
     )
     completed_at = datetime.datetime.now(datetime.timezone.utc)
-    return build_partitioned_audit_report(
+    report = build_partitioned_audit_report(
         PartitionedAuditReportInput(
             audit_target=_target(storage_generation),
             plan=plan,
@@ -232,10 +240,13 @@ def _report(storage_generation="shared_blocks_v3"):
             completed_at=completed_at,
         )
     )
+    report["http"]["request_start_rate_limit_per_second"] = rate_limit
+    return report
 
 
-def test_partitioned_report_validates_dynamic_request_count_and_wall_time():
-    report = _report()
+@pytest.mark.parametrize("rate_limit", [2.0, 50.0])
+def test_partitioned_report_validates_dynamic_request_count_and_wall_time(rate_limit):
+    report = _report(rate_limit=rate_limit)
 
     evidence = validate_batch_candidate_release_audit_report(
         report,
@@ -306,6 +317,8 @@ def _partitioned_timing_report(
     *,
     duration_seconds=916,
     request_start_span_seconds=900,
+    rate_limit=2.0,
+    request_count=243,
 ):
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     return {
@@ -320,9 +333,10 @@ def _partitioned_timing_report(
                 .PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
             ),
         },
-        "checks": {"batch_requests_executed": 243},
+        "checks": {"batch_requests_executed": request_count},
         "http": {
             "request_start_span_seconds": request_start_span_seconds,
+            "request_start_rate_limit_per_second": rate_limit,
         },
     }, completed_at
 
@@ -334,6 +348,20 @@ def test_partitioned_report_timing_uses_measured_request_start_span():
         report_by_field,
         evaluated_at=completed_at,
     ) == completed_at
+
+
+def test_partitioned_report_timing_preserves_legacy_trailing_start_allowance():
+    report, completed_at = _partitioned_timing_report(
+        duration_seconds=20,
+        request_start_span_seconds=5.4,
+        request_count=2,
+    )
+    assert report_sections.validate_report_timing(
+        report, evaluated_at=completed_at,
+    ) == completed_at
+    report["http"]["request_start_rate_limit_per_second"] = 50.0
+    with pytest.raises(ValueError, match="timing is invalid"):
+        report_sections.validate_report_timing(report, evaluated_at=completed_at)
 
 
 @pytest.mark.parametrize(
@@ -439,6 +467,41 @@ def test_single_request_partitioned_http_metrics_require_zero_start_span():
             report["http"],
             expected_request_count=1,
         )
+
+
+def test_fifty_request_metrics_accept_rounding_and_reject_forged_rate():
+    metrics = _report(rate_limit=50.0)["http"]
+    for name in (
+        "batch_api_planned_http_requests",
+        "batch_api_actual_http_requests",
+        "batch_api_completed_http_requests",
+    ):
+        metrics[name] = 2
+    span = 0.02000049
+    metrics["request_start_span_seconds"] = round(span, 6)
+    metrics["request_start_rate_actual_per_second"] = round(1 / span, 6)
+    validate_partitioned_http_metrics(metrics, expected_request_count=2)
+    metrics["request_start_rate_actual_per_second"] = 49.9
+    with pytest.raises(ValueError, match="HTTP accounting"):
+        validate_partitioned_http_metrics(metrics, expected_request_count=2)
+
+
+@pytest.mark.parametrize("rate_limit", [None, True, "50", 0, 10, 51, float("inf"), float("nan")])
+def test_partitioned_report_rejects_unknown_or_invalid_rate_limit(rate_limit):
+    metrics = _report()["http"]
+    metrics["request_start_rate_limit_per_second"] = rate_limit
+    with pytest.raises(ValueError, match="HTTP accounting"):
+        validate_partitioned_http_metrics(metrics, expected_request_count=9)
+
+
+@pytest.mark.parametrize("rate_limit", [2.0, 50.0])
+def test_partitioned_report_rejects_consistent_metrics_above_recorded_limit(rate_limit):
+    metrics = _report(rate_limit=rate_limit)["http"]
+    span = 8 / (rate_limit + 1)
+    metrics["request_start_span_seconds"] = round(span, 6)
+    metrics["request_start_rate_actual_per_second"] = round(8 / span, 6)
+    with pytest.raises(ValueError, match="HTTP accounting"):
+        validate_partitioned_http_metrics(metrics, expected_request_count=9)
 
 
 @pytest.mark.parametrize(

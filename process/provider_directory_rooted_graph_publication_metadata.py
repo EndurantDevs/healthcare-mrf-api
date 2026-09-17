@@ -108,6 +108,7 @@ def _publication_resource_metadata(
     *,
     cohort_complete: bool,
     retry_exhausted_count: int,
+    request_failure_coverage: dict[str, object] | None,
 ) -> dict[str, Any]:
     resource_types = list(PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES)
     metadata_by_field = {
@@ -119,12 +120,17 @@ def _publication_resource_metadata(
             for resource_type in PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES
         },
         "cohort_complete": cohort_complete,
-        "rooted_graph_complete": True,
+        "rooted_graph_complete": (
+            request_failure_coverage is None
+            or request_failure_coverage["rooted_failed_requests"] == 0
+        ),
         "endpoint_collection_complete": False,
         "endpoint_complete": False,
     }
-    if not cohort_complete:
+    if not cohort_complete or request_failure_coverage is not None:
         metadata_by_field["retry_exhausted_count"] = retry_exhausted_count
+    if request_failure_coverage is not None:
+        metadata_by_field["request_failure_coverage"] = request_failure_coverage
     return metadata_by_field
 
 
@@ -143,6 +149,7 @@ def rooted_graph_publication_metadata_sections(
             resource_count_by_type,
             cohort_complete=identity.cohort_complete,
             retry_exhausted_count=identity.retry_exhausted_count,
+            request_failure_coverage=identity.request_failure_coverage,
         ),
     }
 

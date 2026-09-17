@@ -85,7 +85,14 @@ def _row_fields(row: Any) -> dict[str, Any]:
     mapping = row._mapping if hasattr(row, "_mapping") else row
     if not isinstance(mapping, Mapping):
         raise ProviderDirectoryRootedGraphTwinError("state")
-    return dict(mapping)
+    values_by_column = dict(mapping)
+    for name in ("reviewed_root_policy_json", "request_failure_coverage"):
+        if type(values_by_column.get(name)) is str:
+            try:
+                values_by_column[name] = json.loads(values_by_column[name])
+            except ValueError:
+                raise ProviderDirectoryRootedGraphTwinError("state") from None
+    return values_by_column
 
 
 def _timestamp(value: object) -> datetime:
@@ -98,7 +105,7 @@ def _root_from_row(row: Any) -> ProviderDirectoryRootedGraphSealedRoot:
     values = _row_fields(row)
     if (
         values.get("status") != "sealed"
-        or values.get("rooted_graph_complete") is not True
+        or values.get("rooted_graph_complete") is not (values.get("error_count") == 0)
         or values.get("endpoint_collection_complete") is not False
         or values.get("endpoint_complete") is not False
         or values.get("sealed_at") is None
@@ -237,16 +244,21 @@ async def _insert_authority(
 ) -> None:
     columns = tuple(name for name in _ADMISSION_COLUMNS if name != "admitted_at")
     placeholders = tuple(
-        "CAST(:reviewed_root_policy_json AS jsonb)"
-        if name == "reviewed_root_policy_json"
-        else ":" + name
+        (
+            f"CAST(:{name} AS jsonb)"
+            if name in {"reviewed_root_policy_json", "request_failure_coverage"}
+            else ":" + name
+        )
         for name in columns
     )
     values_by_column = {name: getattr(admission, name) for name in columns}
-    policy = values_by_column.get("reviewed_root_policy_json")
-    values_by_column["reviewed_root_policy_json"] = (
-        None if policy is None else json.dumps(policy, separators=(",", ":"), sort_keys=True)
-    )
+    for name in ("reviewed_root_policy_json", "request_failure_coverage"):
+        document = values_by_column[name]
+        values_by_column[name] = (
+            None
+            if document is None
+            else json.dumps(document, separators=(",", ":"), sort_keys=True)
+        )
     await database.status(
         f"INSERT INTO {_table(ADMISSION_TABLE)} ({', '.join(columns)}) VALUES "
         f"({', '.join(placeholders)}) ON CONFLICT DO NOTHING;",
@@ -266,6 +278,36 @@ async def _read_admission(
             publication_acquisition_id=publication_acquisition_id,
         )
     )
+
+
+async def _store_single_root_authority(
+    database: Any,
+    expected: ProviderDirectoryRootedGraphTwinAdmission,
+) -> ProviderDirectoryRootedGraphTwinAdmission:
+    """Replay exact authority; require today's source proof for a fresh insert."""
+
+    try:
+        stored = await _read_admission(database, expected.publication_acquisition_id)
+    except ProviderDirectoryRootedGraphTwinError as error:
+        if error.code != "missing":
+            raise
+    else:
+        _require_exact(stored, expected, _ADMISSION_IDENTITY_COLUMNS)
+        return stored
+    computed = await database.scalar(
+        f"SELECT {_table('provider_directory_rooted_graph_request_failure_coverage')}"
+        "(:acquisition_id);",
+        acquisition_id=expected.publication_acquisition_id,
+    )
+    coverage = _row_fields({"request_failure_coverage": computed})[
+        "request_failure_coverage"
+    ]
+    if coverage != expected.request_failure_coverage:
+        raise ProviderDirectoryRootedGraphTwinError("state")
+    await _insert_authority(database, expected)
+    stored = await _read_admission(database, expected.publication_acquisition_id)
+    _require_exact(stored, expected, _ADMISSION_IDENTITY_COLUMNS)
+    return stored
 
 
 def _candidate_root(
@@ -397,12 +439,7 @@ async def admit_rooted_graph_single_root(
                 acquisition_operation_key=acquisition_operation_key,
                 admitted_at=transaction_time,
             )
-            await _insert_authority(database, expected)
-            stored_admission = await _read_admission(
-                database,
-                publication_acquisition_id,
-            )
-            _require_exact(stored_admission, expected, _ADMISSION_IDENTITY_COLUMNS)
+            stored_admission = await _store_single_root_authority(database, expected)
     if not is_root_current:
         raise ProviderDirectoryRootedGraphTwinError("stale")
     if stored_admission is None:

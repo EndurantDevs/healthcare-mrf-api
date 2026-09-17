@@ -38,11 +38,33 @@ response, creates a new artifact directory, and requires the same publication
 predecessor. Never reuse an execution ID or remove another active run to force a
 resume.
 
+A completed full acquisition that is still the current publication can be
+reprocessed with `{"reprocess_from": "<profile-run-id>", "max_providers": 100}`
+for bounded validation, followed by a new full request with `max_providers`
+omitted. This mode validates the original manifest, complete frozen cohort and
+every retained response before claiming a new run. It copies only verified
+responses into a new directory and never opens an HTTP transport; missing or
+changed files fail the run. Facts retain their original source observation times
+while the retained manifest and record preserve acquisition lineage. Reprocessing
+can apply the currently supported fact categories to the original bytes without
+claiming a newer observation of the state profile.
+
+The current categories are education, training, certifications and specialties.
+Other original fields, including languages, remain retained without adding new
+public fact types. Retention keeps acquisition ancestors while their published
+or otherwise retained descendants need them.
+
+`resume_from` and `reprocess_from` are mutually exclusive. A failed reprocessing
+attempt cannot enter the network-capable failed-run resume path; a new retained
+request must validate the current completed parent again. Use a fresh idempotency
+key for a different parent, bound or mode; a repeated retained-only key returns
+its original request, including a terminal result. Unknown options are rejected.
+
 Publication requires one retained record per requested license, no transport or
 integrity failures, and a full cohort. At least half of requested licenses must
 resolve to full-license profiles. The first publication additionally requires
-10,000 matched providers with public facts; later publications must preserve at
-least 80% of both the incumbent matched-provider and received-profile counts.
+10,000 matched providers with public education or training facts; later publications
+must preserve at least 80% of both the incumbent matched-provider and received-profile counts.
 These guards have no partial-publication or volume-drop override.
 
 The source pointer, source completion, and exact managed run attempt succeed

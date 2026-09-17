@@ -60,8 +60,10 @@ pub fn decode_u32_le(bytes: &[u8]) -> Result<Vec<u32>, &'static str> {
         return Err("PTG V4 packed u32 page length must be divisible by four");
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("exact u32 chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -245,6 +247,7 @@ mod python_api {
         m.add_function(wrap_pyfunction!(decode_u32_le_py, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_selector_sha256, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_selector_page, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_decode_payer_plan_keys, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         Ok(())

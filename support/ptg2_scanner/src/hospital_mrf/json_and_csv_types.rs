@@ -302,7 +302,7 @@ fn emit_json_service(
                 JsonDrugUnit::String(unit) => {
                     profile_evidence
                         .invalidate_v3("CMS JSON v3 drug unit must be a number");
-                    positive_decimal(&unit.0, "drug unit")?
+                    nonnegative_decimal(&unit.0, "drug unit")?
                 }
             };
             (Some(unit), Some(drug.drug_type))

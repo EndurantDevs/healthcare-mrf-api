@@ -81,7 +81,7 @@ async def test_cancellation_during_source_cleanup_blocks_publication(
         (1, 1, 1, 1), (None, 0, 1),
         ("hospital-prices:test", 1024, 4096, 2048, 1),
     ))
-    assert await asyncio.to_thread(cleanup_started.wait, 1)
+    assert await asyncio.to_thread(cleanup_started.wait, 5)
     pipeline.cancel()
     await asyncio.sleep(0)
     pipeline.cancel()

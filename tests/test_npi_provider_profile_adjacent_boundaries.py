@@ -126,6 +126,18 @@ async def test_classification_lookups_handle_empty_cache_and_row_variants(
         "Family Medicine",
         session=session,
     ) == [1000000004, 1000000005]
+    assert "healthcare_provider_primary_taxonomy_switch = 'Y'" in str(
+        session.execute.await_args.args[0]
+    )
+
+    await npi._get_classification_npi_list(
+        "Family Medicine",
+        primary_only=False,
+        session=session,
+    )
+    assert "healthcare_provider_primary_taxonomy_switch" not in str(
+        session.execute.await_args.args[0]
+    )
 
 
 def test_schema_caches_fail_closed_and_expire_deterministically(monkeypatch):

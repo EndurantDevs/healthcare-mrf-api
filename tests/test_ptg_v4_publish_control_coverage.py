@@ -24,6 +24,8 @@ from tests.ptg_v4_publish_control_support import (
     assignment,
     installed_source_activation_transaction,
     prepared_layout_arguments,
+)
+from tests.ptg_v4_publish_control_support import (
     source_session as _source_session,
 )
 
@@ -70,17 +72,10 @@ async def _publish_layout(**overrides):
         "graph_artifact_entries": (),
         "provider_identifier_quarantine": {},
     }
-    if (
-        overrides.get("provider_graph_v4")
-        and "tax_identity_source_artifacts" not in overrides
-    ):
-        layout_arguments_by_name["tax_identity_source_artifacts"] = (
-            {"authenticated_test_evidence": True},
-        )
+    if overrides.get("provider_graph_v4") and "tax_identity_source_artifacts" not in overrides:
+        layout_arguments_by_name["tax_identity_source_artifacts"] = ({"authenticated_test_evidence": True},)
     layout_arguments_by_name.update(overrides)
-    return await publication.publish_strict_shared_v3_layout(
-        **layout_arguments_by_name
-    )
+    return await publication.publish_strict_shared_v3_layout(**layout_arguments_by_name)
 
 
 @pytest.mark.asyncio
@@ -90,15 +85,18 @@ async def test_publication_normalizes_v3_and_v4_evidence(monkeypatch) -> None:
     _patch_publication_pipeline(monkeypatch, publish_result="published")
     assert await _publish_layout() == "published"
     raw_hash = "a" * 64
-    assert await _publish_layout(
-        provider_graph_v4=True,
-        expected_raw_source_sha256=(raw_hash,),
-        compressed_acquisition_entries=(
-            {"raw_sha256": raw_hash, "byte_count": "41"},
-            {"raw_sha256": raw_hash, "byte_count": 41},
-        ),
-        empty_npi_tin_only_normalization_count=0,
-    ) == "published"
+    assert (
+        await _publish_layout(
+            provider_graph_v4=True,
+            expected_raw_source_sha256=(raw_hash,),
+            compressed_acquisition_entries=(
+                {"raw_sha256": raw_hash, "byte_count": "41"},
+                {"raw_sha256": raw_hash, "byte_count": 41},
+            ),
+            empty_npi_tin_only_normalization_count=0,
+        )
+        == "published"
+    )
     forwarded = publication._publish_prepared_shared_layout.await_args.kwargs
     assert forwarded["compressed_acquisition_bytes"] == 41
     assert forwarded["empty_npi_tin_only_normalization_count"] == 0
@@ -153,9 +151,7 @@ async def test_publication_requires_source_local_tax_evidence(monkeypatch) -> No
         await _publish_layout(
             provider_graph_v4=True,
             expected_raw_source_sha256=(raw_hash,),
-            compressed_acquisition_entries=(
-                {"raw_sha256": raw_hash, "byte_count": 41},
-            ),
+            compressed_acquisition_entries=({"raw_sha256": raw_hash, "byte_count": 41},),
             empty_npi_tin_only_normalization_count=0,
             tax_identity_source_artifacts=(),
         )
@@ -180,13 +176,9 @@ async def test_prepared_layout_guards_schema_and_v4_resource_proof(monkeypatch) 
 
     monkeypatch.setattr(publication, "resolve_ptg2_schema", lambda: "mrf")
     with pytest.raises(RuntimeError, match="resource evidence"):
-        await publication._publish_prepared_shared_layout(
-            **prepared_layout_arguments(provider_graph_v4=True)
-        )
+        await publication._publish_prepared_shared_layout(**prepared_layout_arguments(provider_graph_v4=True))
     with pytest.raises(RuntimeError, match="configured PostgreSQL schema"):
-        await publication._publish_prepared_shared_layout(
-            **prepared_layout_arguments(schema_name="other")
-        )
+        await publication._publish_prepared_shared_layout(**prepared_layout_arguments(schema_name="other"))
 
 
 @pytest.mark.asyncio
@@ -310,8 +302,8 @@ async def test_source_pointer_cas_covers_noop_success_and_conflict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_source_pointer_wrappers_lock_before_activation(monkeypatch) -> None:
-    """Resolve the configured schema and fence the snapshot before activation."""
+async def test_source_pointer_wrapper_uses_transactional_activation(monkeypatch) -> None:
+    """Resolve the configured schema and delegate to transactional activation."""
 
     evidence = installed_source_activation_transaction(monkeypatch)
     activation_result = await source_pointers.activate_ptg2_source_candidate(
@@ -319,14 +311,19 @@ async def test_source_pointer_wrappers_lock_before_activation(monkeypatch) -> No
         snapshot_id=" Snapshot ",
     )
     assert activation_result == {"status": "promoted"}
-    assert evidence.writable_lock.await_args.kwargs == {
+    assert evidence.activation.await_args.args == (evidence.session,)
+    assert evidence.activation.await_args.kwargs == {
         "schema_name": "tenant",
+        "source_key": "source",
         "snapshot_id": "Snapshot",
+        "expected_current_snapshot_id": None,
+        "expected_audit_only_attestation_digest": None,
+        "rollback_owner_id": None,
     }
-    assert evidence.activation.await_args.kwargs["source_key"] == "source"
-    dirty_statement, dirty_parameters = evidence.session.execute.await_args.args
-    assert "ptg2_legacy_global_pointer_projection_queue" in str(dirty_statement)
-    assert dirty_parameters == {"source_key": "source"}
+    assert evidence.projection_dirty.await_args.kwargs == {
+        "schema_name": "tenant",
+        "source_key": "source",
+    }
     assert evidence.events == [
         "transaction-begin",
         "activate",
@@ -350,9 +347,7 @@ async def test_attempt_fence_translates_guards_and_supports_status_sessions() ->
         allow_reconciled=True,
     )
     assert status_session.status.await_args.kwargs["allow_reconciled"] is True
-    rejected = SimpleNamespace(
-        execute=AsyncMock(side_effect=RuntimeError("PTG2_ATTEMPT_FENCE_RECONCILED"))
-    )
+    rejected = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("PTG2_ATTEMPT_FENCE_RECONCILED")))
     with pytest.raises(fence.StaleMetadataFenceError):
         await fence.lock_writable_snapshot(
             rejected,

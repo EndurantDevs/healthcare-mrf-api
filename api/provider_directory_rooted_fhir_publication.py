@@ -10,7 +10,6 @@ from typing import Any
 from process.import_status_events import isoformat_utc
 from process.provider_directory_rooted_graph_publication_contract import (
     ProviderDirectoryRootedGraphDatasetReadiness,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
@@ -20,6 +19,9 @@ from process.provider_directory_rooted_graph_source_contract import (
 ROOTED_FHIR_PUBLICATION_FIELD = "rooted_fhir_publication"
 ROOTED_FHIR_PUBLICATION_SUMMARY_CONTRACT_ID = (
     "healthporta.provider-directory.rooted-fhir-publication-summary.v1"
+)
+ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID = (
+    "healthporta.provider-directory.rooted-fhir-publication-summary.v2"
 )
 ROOTED_FHIR_CATALOG_ENTRY_ID = "uhc"
 ROOTED_FHIR_CATALOG_SOURCE_IDS = (
@@ -88,12 +90,11 @@ def rooted_fhir_publication_summary(
     published_at = isoformat_utc(getattr(dataset, "published_at"))
     if not isinstance(published_at, str):
         return _summary_state("not_ready")
-    state = "closed" if readiness.cohort_complete else "partial"
+    coverage = readiness.request_failure_coverage
+    state = "closed" if readiness.cohort_complete and coverage is None else "partial"
     summary_by_field = {
         **_summary_state(state),
-        "publication_contract_id": (
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
-        ),
+        "publication_contract_id": readiness.publication_contract_id,
         "publication_kind": readiness.publication_kind,
         "source_id": readiness.source_id,
         "endpoint_id": readiness.endpoint_id,
@@ -120,6 +121,9 @@ def rooted_fhir_publication_summary(
     }
     if state == "partial":
         summary_by_field["retry_exhausted_count"] = readiness.retry_exhausted_count
+    if coverage is not None:
+        summary_by_field["contract_id"] = ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID
+        summary_by_field["request_failure_coverage"] = dict(coverage)
     return summary_by_field
 
 
@@ -131,5 +135,6 @@ __all__ = (
     "ROOTED_FHIR_CATALOG_SOURCE_IDS",
     "ROOTED_FHIR_PUBLICATION_FIELD",
     "ROOTED_FHIR_PUBLICATION_SUMMARY_CONTRACT_ID",
+    "ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID",
     "ROOTED_FHIR_SOURCE_ID_GROUP",
 )

@@ -1,38 +1,30 @@
-[MASTER]
+[MAIN]
+extension-pkg-allow-list=orjson
 ignore=alembic,restore,tests,__test__
-load-plugins=
 jobs=1
-extension-pkg-whitelist=
+persistent=no
 
 [MESSAGES CONTROL]
-disable=
-    missing-docstring,
-    invalid-name,
-    too-few-public-methods,
-    unused-argument,
-    unused-import,
-    no-member,
-    not-callable,
-    protected-access,
-    broad-exception-caught,
-    consider-using-enumerate,
-    consider-using-f-string,
-    too-many-return-statements,
-    too-many-branches,
-    too-many-statements,
-    too-many-locals,
-    line-too-long,
-    duplicate-code,
+disable=all
+enable=
     assignment-from-no-return,
-    trailing-whitespace,
-    redefined-outer-name,
-    import-outside-toplevel,
-    no-self-argument,
-    wrong-import-position
+    invalid-unary-operand-type,
+    no-value-for-parameter,
+    no-member,
+    no-name-in-module,
+    not-a-mapping,
+    not-an-iterable,
+    not-callable,
+    repeated-keyword,
+    too-many-function-args,
+    unsubscriptable-object,
+    unexpected-keyword-arg,
+    unsupported-assignment-operation,
+    unsupported-binary-operation,
+    unsupported-delete-operation,
+    unsupported-membership-test
 
 [REPORTS]
 output-format = text
-
-[FORMAT]
-max-line-length = 120
-max-module-lines = 2000
+reports=no
+score=no

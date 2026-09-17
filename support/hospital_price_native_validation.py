@@ -43,8 +43,12 @@ HOSPITAL_MRF_PACKED_V6_PARSER_CONTRACT_SHA256 = hashlib.sha256(
     b"hospital-mrf-copy-v2-v3-packed-v6-resource-bounded:"
     b"hospital-mrf-packed-blocks-v4"
 ).hexdigest()
+HOSPITAL_MRF_PACKED_V7_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    b"hospital-mrf-copy-v2-v3-packed-v7-resource-bounded:"
+    b"hospital-mrf-packed-blocks-v5"
+).hexdigest()
 HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v5"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v7"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v8"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"
@@ -105,6 +109,7 @@ _SOURCE_SCHEMA_VERSIONS = {
             "2.0.0",
             "2.2.0",
             "2.2.1",
+            "3",
             "3.0.0",
             "3.0.1",
             "4.0.0",
@@ -118,6 +123,7 @@ _SOURCE_SCHEMA_VERSIONS = {
             "2.0.0",
             "2.2.0",
             "2.2.1",
+            "3",
             "3.0.0",
             "3.0.1",
             "4.0.0",
@@ -502,7 +508,7 @@ def validate_hospital_parser_summary(
     output_path = _validated_output_directory(output_directory)
     artifacts = _validated_artifact_tuple(summary_fields["artifacts"], output_path)
     if (
-        summary_fields["schema_version"] in {"3.0.0", "3.0.1", "4.0.0"}
+        summary_fields["schema_version"] in {"3", "3.0.0", "3.0.1", "4.0.0"}
         and not next(artifact.rows for artifact in artifacts if artifact.kind == "npi")
         and not (
             source_format in {"csv-tall", "csv-wide"}

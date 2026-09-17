@@ -35,6 +35,15 @@ from db.models import (
     db,
 )
 from process.control_lifecycle import mark_control_run
+from process.entity_address_cutover_contract import (
+    EntityAddressCutoverCallbacks,
+    apply_transaction_sql_settings,
+    entity_address_cutover_transaction,
+    entity_address_tuned_transaction,
+    postgres_sqlstate,
+    require_caller_owned_cutover_transaction,
+    run_publish_validation_operations,
+)
 from process.ext import address_alias_sql
 from process.ext.address_format import (
     ADDRESS_FORMAT_FUNCTION,
@@ -829,6 +838,12 @@ def _runtime_config_metrics(context: dict) -> dict:
 
 
 async def _status_with_entity_address_tuning(statement: str) -> int | None:
+    transaction_binding = getattr(db, "_transaction_binding", None)
+    if callable(transaction_binding) and transaction_binding() is not None:
+        settings = _entity_address_sql_settings()
+        async with entity_address_tuned_transaction(db, settings, _sql_literal, logger):
+            rowcount = await db.status(statement)
+        return _coerce_rowcount(rowcount)
     settings = _entity_address_sql_settings()
     acquire = getattr(db, "acquire", None)
     if not settings or not callable(acquire):
@@ -836,11 +851,11 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
         return _coerce_rowcount(rowcount)
 
     async with db.acquire() as conn:
-        for index, (name, value) in enumerate(settings):
+        for index, (name, setting_value) in enumerate(settings):
             savepoint = f"entity_address_sql_setting_{index}"
             await conn.status(f"SAVEPOINT {savepoint};")
             try:
-                await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+                await conn.status(f"SET LOCAL {name} = {_sql_literal(setting_value)};")
                 await conn.status(f"RELEASE SAVEPOINT {savepoint};")
             except Exception as exc:
                 await conn.status(f"ROLLBACK TO SAVEPOINT {savepoint};")
@@ -849,7 +864,7 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
                     logger.warning(
                         "Skipping unprivileged entity-address SQL setting %s=%s: %s",
                         name,
-                        value,
+                        setting_value,
                         exc,
                     )
                     continue
@@ -1380,7 +1395,7 @@ def _stage_index_statements(
 def _is_postgis_unavailable_error(exc: Exception) -> bool:
     root_error = getattr(exc, "orig", None) or getattr(exc, "__cause__", None) or exc
     message = str(root_error).lower()
-    sqlstate = _postgres_sqlstate(exc)
+    sqlstate = postgres_sqlstate(exc)
     mentions_postgis = any(
         term in message for term in ("st_makepoint", "geography", "postgis")
     )
@@ -2353,25 +2368,8 @@ async def _acquire_cutover_locks(
     )
 
 
-def _postgres_sqlstate(error: BaseException) -> str | None:
-    original = getattr(error, "orig", None)
-    candidates = (
-        error,
-        original,
-        getattr(error, "__cause__", None),
-        getattr(original, "__cause__", None),
-    )
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
-        if sqlstate:
-            return str(sqlstate)
-    return None
-
-
 def _is_retryable_cutover_lock_error(error: BaseException) -> bool:
-    return isinstance(error, _CutoverLockUnavailable) or _postgres_sqlstate(error) == "55P03"
+    return isinstance(error, _CutoverLockUnavailable) or postgres_sqlstate(error) == "55P03"
 
 
 async def _run_entity_address_cutover(
@@ -2381,16 +2379,18 @@ async def _run_entity_address_cutover(
     relation_names: list[str],
     required_names: list[str],
     context: dict,
+    *,
+    callbacks: EntityAddressCutoverCallbacks | None = None,
+    require_caller_owned_transaction: bool = False,
 ) -> None:
-    lock_timeout = (
-        _env_sql_setting(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT",
-            DEFAULT_CUTOVER_LOCK_TIMEOUT,
-        )
-        or DEFAULT_CUTOVER_LOCK_TIMEOUT
-    )
-    async with db.transaction():
-        await db.status(f"SET LOCAL lock_timeout = {_sql_literal(lock_timeout)};")
+    """Atomically publish an address stage with local semantic fences."""
+
+    lock_timeout = _env_sql_setting(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", DEFAULT_CUTOVER_LOCK_TIMEOUT
+    ) or DEFAULT_CUTOVER_LOCK_TIMEOUT
+    if require_caller_owned_transaction:
+        require_caller_owned_cutover_transaction(db)
+    async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal):
         await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
         expected_alias_generation = int(context.get("address_alias_generation") or 0)
         current_alias_generation = await _address_alias_generation(db_schema)
@@ -2404,6 +2404,8 @@ async def _run_entity_address_cutover(
             db_schema,
             [swap.live_cls.__main_table__ for swap in swaps],
         )
+        if callbacks is not None and callbacks.before_cutover is not None:
+            await callbacks.before_cutover()
         for swap in swaps:
             await _swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
         for label, statement in patch_statements:
@@ -2423,6 +2425,8 @@ async def _run_entity_address_cutover(
                 "geo assurance candidate does not match the published table and sources"
             )
         context["geo_assurance_active_table_oid"] = int(active_table_oid)
+        if callbacks is not None and callbacks.after_publish is not None:
+            await callbacks.after_publish()
 
 
 def _entity_address_cutover_plan(
@@ -6344,19 +6348,7 @@ async def _project_geo_assurance_transaction(
 
 
 async def _apply_entity_address_transaction_settings() -> None:
-    for name, value in _entity_address_sql_settings():
-        try:
-            async with db.transaction():
-                await db.status(f"SET LOCAL {name} = {_sql_literal(value)};")
-        except Exception as exc:
-            if "permission denied to set parameter" not in str(exc).lower():
-                raise
-            logger.warning(
-                "Skipping unprivileged entity-address SQL setting %s=%s: %s",
-                name,
-                value,
-                exc,
-            )
+    await apply_transaction_sql_settings(db, _entity_address_sql_settings(), _sql_literal, logger)
 
 
 async def _drop_stage_secondary_indexes(stage_cls, db_schema: str) -> int:
@@ -6795,8 +6787,9 @@ async def _validate_publish_integrity(
     expected_base_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     residual_alias_source_rows, stale_alias_generation_rows = (
         int(metric_value or 0)
-        for metric_value in await asyncio.gather(
-            db.scalar(
+        for metric_value in await run_publish_validation_operations(
+            db,
+            lambda: db.scalar(
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{stage_table} AS staged
@@ -6805,7 +6798,7 @@ async def _validate_publish_integrity(
                  AND active.revoked_at IS NULL;
                 """
             ),
-            db.scalar(
+            lambda: db.scalar(
                 f"""
                 SELECT count(*)
                 FROM {db_schema}.{stage_table}
@@ -6873,8 +6866,9 @@ async def _validate_publish_integrity(
             archive_identity_mismatch_rows,
         ) = (
             int(metric_value or 0)
-            for metric_value in await asyncio.gather(
-                db.scalar(
+            for metric_value in await run_publish_validation_operations(
+                db,
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6884,7 +6878,7 @@ async def _validate_publish_integrity(
                    AND a.merged_into IS NOT NULL;
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6902,7 +6896,7 @@ async def _validate_publish_integrity(
                    );
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6913,7 +6907,7 @@ async def _validate_publish_integrity(
                    AND (a.lat IS NULL OR a.long IS NULL);
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6926,7 +6920,7 @@ async def _validate_publish_integrity(
                    );
                 """
                 ),
-                db.scalar(
+                lambda: db.scalar(
                     f"""
                 SELECT COUNT(*)
                   FROM {db_schema}.{stage_table} AS t
@@ -6965,8 +6959,9 @@ async def _validate_publish_integrity(
         practice_null_address_key_by_source_rows,
         fallback_archive_identity_mismatch_rows_raw,
         invalid_coordinate_rows,
-    ) = await asyncio.gather(
-        db.scalar(
+    ) = await run_publish_validation_operations(
+        db,
+        lambda: db.scalar(
             f"""
             SELECT COUNT(*)
               FROM {db_schema}.{stage_table}
@@ -6974,7 +6969,7 @@ async def _validate_publish_integrity(
                AND address_key IS NULL;
             """
         ),
-        db.all(
+        lambda: db.all(
             f"""
         SELECT COALESCE(source, 'unknown') AS source, COUNT(*)::bigint AS rows
           FROM {db_schema}.{stage_table} AS t
@@ -6986,7 +6981,7 @@ async def _validate_publish_integrity(
          LIMIT 20;
         """
         ),
-        db.scalar(
+        lambda: db.scalar(
             f"""
               SELECT COUNT(*)
               FROM {db_schema}.{stage_table}
@@ -6994,7 +6989,7 @@ async def _validate_publish_integrity(
                AND COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
             """
         ),
-        _invalid_coordinate_count(db_schema, stage_table),
+        lambda: _invalid_coordinate_count(db_schema, stage_table),
     )
     practice_null_address_key_rows = int(practice_null_address_key_rows_raw or 0)
     integrity_metric_map["practice_null_address_key_rows"] = practice_null_address_key_rows

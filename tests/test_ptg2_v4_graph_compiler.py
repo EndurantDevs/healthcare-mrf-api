@@ -403,7 +403,7 @@ async def test_wrapper_surfaces_typed_resource_admission_failure(
     npi_scope, inferred_taxonomy = await _compiler_inputs(tmp_path, artifacts)
     output = tmp_path / "compiled"
 
-    with pytest.raises(V4GraphResourceAdmissionError, match="factor edge count"):
+    with pytest.raises(V4GraphResourceAdmissionError, match="factor edge count") as failure:
         await compile_provider_graph_v4_rust(
             graph_artifact_entries=artifacts,
             provider_set_key_map_path=provider_map,
@@ -414,6 +414,8 @@ async def test_wrapper_surfaces_typed_resource_admission_failure(
             options={"max_factor_edges": 1},
         )
     assert not output.exists()
+    assert failure.value.resource_admission["max_factor_edges"] == 1
+    assert failure.value.resource_admission["factor_edge_count"] > 1
 
     with pytest.raises(RuntimeError, match="unknown option"):
         await compile_provider_graph_v4_rust(

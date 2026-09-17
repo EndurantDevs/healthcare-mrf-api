@@ -9,6 +9,33 @@ import yaml
 OPENAPI_PATH = Path("doc/openapi.yaml")
 
 
+def test_hospital_facility_search_publishes_source_hidden_contract():
+    document = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = document["paths"]["/hospital-prices/facilities"]["get"]
+    assert operation["operationId"] == "searchHospitalPriceFacilities"
+    assert {parameter["name"] for parameter in operation["parameters"]} == {
+        "q",
+        "published",
+        "cursor",
+        "limit",
+        "include_metadata",
+    }
+    response_schema = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    item = response_schema["properties"]["items"]["items"]
+    assert set(item["required"]) == {
+        "hospital_id",
+        "alias_hospital_ids",
+        "name",
+        "publication",
+    }
+    assert set(item["properties"]) == set(item["required"]) | {"metadata"}
+    assert item["properties"]["publication"]["nullable"] is True
+    assert "cms_hpt_url" not in str(item)
+    assert "attempt" not in str(item)
+
+
 def test_hospital_price_response_publishes_nested_contract():
     document = yaml.safe_load(OPENAPI_PATH.read_text())
     response_schema = document["paths"][
@@ -63,3 +90,16 @@ def test_hospital_price_response_publishes_nested_contract():
         "code_type",
         "code",
     }
+
+
+def test_payer_plan_discovery_contract_preserves_missing_plans():
+    document = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = document["paths"]["/hospital-prices/facilities/{hospital_id}/payer-plans"]["get"]
+    assert {parameter["name"] for parameter in operation["parameters"]} == {
+        "hospital_id", "version_id", "cursor", "limit",
+    }
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert set(schema["required"]) == {"hospital_id", "version", "pagination", "items"}
+    item = schema["properties"]["items"]["items"]
+    assert set(item["required"]) == {"payer_name", "plan_name", "plan_missing"}
+    assert item["properties"]["plan_name"]["nullable"] is True

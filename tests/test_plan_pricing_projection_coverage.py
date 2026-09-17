@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import hashlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -279,6 +280,106 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
             [_binding(), _binding(ordinal=1, source_key="another-source")],
         )
     assert len(binding_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_all_codes_accepts_large_distinct_sources_within_bound(
+    monkeypatch,
+):
+    _install_binding_sources(monkeypatch)
+    bindings = [
+        _binding(),
+        _binding(ordinal=1, source_key="another-source"),
+    ]
+    remaining_limits = []
+
+    async def large_projection(
+        _session,
+        binding,
+        *,
+        maximum_code_rows,
+        serving_tables,
+    ):
+        remaining_limits.append(maximum_code_rows)
+        return SimpleNamespace(
+            binding=binding,
+            raw_code_row_count=projection_build.MAX_PROJECTION_CODE_ROWS // 2,
+            code_rows_by_identity={("CPT", str(binding["ordinal"])): [{}]},
+        )
+
+    materialize = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(
+        projection_build,
+        "binding_projection",
+        large_projection,
+    )
+    monkeypatch.setattr(
+        projection_build,
+        "materialize_factorized_projection",
+        materialize,
+    )
+
+    await projection_build._materialize_all_codes(
+        object(),
+        PROJECTION_ID,
+        bindings,
+    )
+
+    assert remaining_limits == [262_144, 131_072]
+    assert [
+        projection.binding for projection in materialize.call_args.args[2]
+    ] == bindings
+
+
+@pytest.mark.asyncio
+async def test_materialize_all_codes_rejects_distinct_sources_over_shared_bound(
+    monkeypatch,
+):
+    _install_binding_sources(monkeypatch)
+    bindings = [
+        _binding(),
+        _binding(ordinal=1, source_key="another-source"),
+    ]
+    remaining_limits = []
+
+    async def overflowing_projection(
+        _session,
+        binding,
+        *,
+        maximum_code_rows,
+        serving_tables,
+    ):
+        remaining_limits.append(maximum_code_rows)
+        return SimpleNamespace(
+            binding=binding,
+            raw_code_row_count=(
+                projection_build.MAX_PROJECTION_CODE_ROWS // 2
+                + int(binding["ordinal"])
+            ),
+            code_rows_by_identity={("CPT", str(binding["ordinal"])): [{}]},
+        )
+
+    materialize = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(
+        projection_build,
+        "binding_projection",
+        overflowing_projection,
+    )
+    monkeypatch.setattr(
+        projection_build,
+        "materialize_factorized_projection",
+        materialize,
+    )
+
+    with pytest.raises(ValueError, match="code-row bound"):
+        await projection_build._materialize_all_codes(
+            object(),
+            PROJECTION_ID,
+            bindings,
+        )
+
+    assert remaining_limits == [262_144, 131_072]
+    materialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

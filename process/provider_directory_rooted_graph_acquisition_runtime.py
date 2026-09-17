@@ -169,13 +169,14 @@ async def provider_directory_rooted_graph_census_state(
     *,
     database: Any = db,
 ) -> str:
-    """Distinguish a completed census from every non-claimable state."""
+    """Distinguish completed and proven timeout terminals from other states."""
 
     fields = row_fields(
         await database.first(
             f"""
             SELECT count(*)::bigint AS census_count,
-                   min(status) AS census_status
+                   min(status) AS census_status,
+                   min(error_code) AS census_error_code
               FROM {table_ref(WORK_TABLE)}
              WHERE acquisition_id = :acquisition_id
                AND kind = 'full_insurance_plan_census';
@@ -187,7 +188,13 @@ async def provider_directory_rooted_graph_census_state(
     status = fields.get("census_status")
     if count == 0 and status is None:
         return "absent"
-    if count == 1 and status in CENSUS_STATES - {"absent"}:
+    if (
+        count == 1
+        and status == "error"
+        and fields.get("census_error_code") == "transport_timeout"
+    ):
+        return "timeout_skipped"
+    if count == 1 and status in CENSUS_STATES - {"absent", "timeout_skipped"}:
         return status
     raise ProviderDirectoryRootedGraphAcquisitionError("state")
 

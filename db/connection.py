@@ -221,11 +221,7 @@ class Database:
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"
             ) from _ASYNC_IMPORT_ERROR
 
-        requested_db = (
-            self._database_override
-            or os.getenv("HLTHPRT_DB_DATABASE_OVERRIDE")
-            or os.getenv("HLTHPRT_DB_DATABASE", "postgres")
-        )
+        requested_db = self._requested_database_name()
 
         if self.engine is not None:
             if requested_db == self._database_name:
@@ -264,6 +260,78 @@ class Database:
             autoflush=False,
         )
         self._database_name = requested_db
+
+    def _requested_database_name(self) -> str:
+        """Return the configured database identity without opening a connection."""
+
+        return (
+            self._database_override
+            or os.getenv("HLTHPRT_DB_DATABASE_OVERRIDE")
+            or os.getenv("HLTHPRT_DB_DATABASE", "postgres")
+        )
+
+    @staticmethod
+    def _session_database_name(session: AsyncSession) -> str | None:
+        """Read a session bind's database name when SQLAlchemy exposes one."""
+
+        bind = getattr(session, "bind", None)
+        if bind is None:
+            get_bind = getattr(session, "get_bind", None)
+            if callable(get_bind):
+                bind = get_bind()
+        database_name = getattr(getattr(bind, "url", None), "database", None)
+        return None if database_name is None else str(database_name)
+
+    @staticmethod
+    def _has_bound_request_session() -> bool:
+        """Return whether this task already owns a request-scoped session."""
+
+        try:
+            current_session()
+        except RuntimeError:
+            return False
+        return True
+
+    def _validate_existing_session_binding(self, session: AsyncSession) -> None:
+        """Fail closed before exposing a caller-owned transaction to helpers."""
+
+        if not isinstance(session, AsyncSession):
+            raise TypeError("bind_existing_session requires an AsyncSession")
+        if _TRANSACTION.get():
+            raise RuntimeError(
+                "cannot bind an existing session while a database transaction is already bound"
+            )
+        if self._has_bound_request_session():
+            raise RuntimeError(
+                "cannot bind an existing session while a request session is already bound"
+            )
+        if not session.in_transaction():
+            raise RuntimeError("bind_existing_session requires an active caller transaction")
+        if session.in_nested_transaction():
+            raise RuntimeError("bind_existing_session rejects a nested caller transaction")
+        self._validate_existing_session_database(session)
+
+    def _validate_existing_session_database(self, session: AsyncSession) -> None:
+        """Reject a mismatched database when the SQLAlchemy bind names one."""
+
+        expected_database_name = self._requested_database_name()
+        bound_database_name = self._session_database_name(session)
+        if (
+            bound_database_name is not None
+            and expected_database_name
+            and bound_database_name != expected_database_name
+        ):
+            raise RuntimeError("bind_existing_session database identity does not match")
+
+    @staticmethod
+    def _require_active_borrowed_transaction(session: AsyncSession) -> None:
+        """Prevent a callback from silently ending or leaking the caller transaction."""
+
+        if not session.in_transaction():
+            raise RuntimeError("borrowed caller transaction ended before bridge exit")
+        if session.in_nested_transaction():
+            raise RuntimeError("borrowed caller transaction left a nested transaction active")
+
     def select(self, *columns: Any):
         """Build a select statement bound to this database helper."""
         columns = _coerce_columns(columns)
@@ -390,6 +458,45 @@ class Database:
                 "Transaction-bound database helpers cannot run in a child asyncio task"
             )
         return binding
+
+    @asynccontextmanager
+    async def bind_existing_session(self, session: AsyncSession) -> AsyncIterator[AsyncSession]:
+        """Temporarily bind one trusted caller-owned SQLAlchemy transaction.
+
+        This narrow in-process bridge is only for a prepared native publication
+        callback sharing a coordinator's final transaction.  The caller owns
+        transport, heavy validation, the outer transaction, and session
+        lifecycle.  Peer-provided callbacks, network work, and arbitrary SQL
+        are outside this bridge's scope.
+
+        The binding is task-local.  It neither creates an engine nor commits,
+        rolls back, closes the caller session, or alters the module-level
+        database object.
+        """
+
+        if _ASYNC_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SQLAlchemy async support requires SQLAlchemy >= 1.4"
+            ) from _ASYNC_IMPORT_ERROR
+        self._validate_existing_session_binding(session)
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("bind_existing_session requires an asyncio task")
+        token = _TRANSACTION.set(
+            _TRANSACTION.get()
+            + (
+                _TransactionBinding(
+                    database_id=id(self),
+                    session=session,
+                    owner_task=owner_task,
+                ),
+            )
+        )
+        try:
+            yield session
+            self._require_active_borrowed_transaction(session)
+        finally:
+            _TRANSACTION.reset(token)
 
     @asynccontextmanager
     async def _execution_session(self) -> AsyncIterator[AsyncSession]:

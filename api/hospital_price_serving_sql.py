@@ -27,7 +27,8 @@ VERSION_SQL = text(
     current.service_count AS current_service_count,
     current.charge_count AS current_charge_count,
     current.payer_charge_count AS current_fact_count,
-    root.format_version, root.service_count, root.charge_count, root.fact_count
+    root.format_version, root.service_count, root.charge_count, root.fact_count,
+    root.code_selector_key_count, root.payer_plan_selector_key_count
     FROM unnest(CAST(:hospital_ids AS varchar[])) WITH ORDINALITY
       requested(hospital_id, group_ordinal)
     JOIN {_SCHEMA}.hospital_price_hospital hospital
@@ -192,12 +193,37 @@ FACT_BLOCK_SQL = text(
          AND block.block_ordinal=selected.block_ordinal
        ORDER BY block.block_ordinal"""
 )
+PAYER_PLAN_CATALOG_SQL = text(
+    f"""SELECT block_ordinal, logical_first, logical_count, page_index,
+               page_count, key_sha256, parent_sha256, payload
+        FROM {_SCHEMA}.hospital_price_data_block
+        WHERE version_id=:version_id AND block_kind=4 AND page_index=0
+          AND logical_first <= :after_key + 1
+        ORDER BY logical_first DESC LIMIT 1"""
+)
+PAYER_PLAN_LEGACY_CATALOG_SQL = text(
+    f"""WITH selected AS (
+        SELECT block_ordinal, logical_first, logical_count, page_index,
+               page_count, key_sha256, parent_sha256, payload
+        FROM {_SCHEMA}.hospital_price_data_block
+        WHERE version_id=:version_id AND block_kind=4 AND page_index=0
+          AND logical_first > :after_key
+        ORDER BY logical_first LIMIT 1
+    ) SELECT selected.*, EXISTS (
+        SELECT 1 FROM {_SCHEMA}.hospital_price_data_block successor
+        WHERE successor.version_id=:version_id AND successor.block_kind=4
+          AND successor.page_index=0
+          AND successor.logical_first > selected.logical_first
+    ) AS has_more FROM selected"""
+)
 
 
 __all__ = (
     "CODE_SELECTOR_SQL",
     "FACT_BLOCK_SQL",
     "PAYER_SELECTOR_SQL",
+    "PAYER_PLAN_CATALOG_SQL",
+    "PAYER_PLAN_LEGACY_CATALOG_SQL",
     "SERVICE_BLOCK_SQL",
     "VERSION_SQL",
 )

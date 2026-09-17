@@ -424,19 +424,20 @@ class _ShutdownRawConnection:
             raise
         self.events.append("transaction:commit")
 
-    async def execute(self, statement: str, *_args):
-        self.events.append(statement)
+    async def execute(self, statement: object, *_args):
+        self.events.append(str(statement))
         return "OK"
 
-    async def fetchval(self, statement: str, *_args):
-        self.events.append(statement)
-        if "search_taxonomy_codes" in statement and "FULL OUTER JOIN" in statement:
+    async def fetchval(self, statement: object, *_args):
+        statement_text = str(statement)
+        self.events.append(statement_text)
+        if "search_taxonomy_codes" in statement_text and "FULL OUTER JOIN" in statement_text:
             return False
-        if "count(*)::bigint" in statement:
+        if "count(*)::bigint" in statement_text:
             return next(
                 count
                 for stage_name, count in self.count_by_stage.items()
-                if stage_name in statement
+                if stage_name in statement_text
             )
         return 1
 
@@ -470,6 +471,7 @@ def _install_shutdown_success_collaborators(monkeypatch, npi_module, raw_connect
     monkeypatch.setattr(npi_module, "canonical_relation_oids", AsyncMock(return_value=(11, 12, 13, 14, 15, 16)))
     publication_receipt = SimpleNamespace(publication_ref="nppub1_" + "b" * 43)
     monkeypatch.setattr(npi_module, "insert_npi_publication_receipt", AsyncMock(return_value=publication_receipt))
+    monkeypatch.setattr(npi_module, "publish_local_npi_result_generation", AsyncMock())
     monkeypatch.setattr(npi_module, "npi_publication_metrics", lambda receipt: {"publication_ref": receipt.publication_ref})
     publication_commit = npi_module.NpiCanonicalPublicationCommit(
         publication_receipt,

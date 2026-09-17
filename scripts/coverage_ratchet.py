@@ -94,6 +94,13 @@ def _compare_policy(
             and field == "coverage"
             and reference.get(field) == "7.15.2"
             and candidate.get(field) == "7.16.0"
+        ) or (
+            field == "rust"
+            and reference.get(field) == "1.97.1"
+            and candidate.get(field) == "1.98.1"
+            and reference.get("cargo_llvm_cov")
+            == candidate.get("cargo_llvm_cov")
+            == "0.8.7"
         )
         if (
             not is_transition_upgrade

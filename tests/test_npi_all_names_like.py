@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 import sanic.exceptions
 
+from api import provider_search_sql
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import get_all
 
@@ -163,7 +164,15 @@ async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expected_primary_only"),
+    [(None, True), ("false", False)],
+)
+async def test_get_all_sitemap_mode_allows_20000_limit(
+    monkeypatch,
+    raw_primary_only,
+    expected_primary_only,
+):
     class SitemapConnection:
         def __init__(self):
             self.calls = 0
@@ -178,7 +187,10 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
 
     conn = SitemapConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
-    async def fake_npi_list(*_args, **_kwargs):
+    primary_only_calls = []
+
+    async def fake_npi_list(*_args, **kwargs):
+        primary_only_calls.append(kwargs["primary_only"])
         return list(range(1_000_000_000, 1_000_030_000))
     monkeypatch.setattr(
         npi_module,
@@ -186,19 +198,21 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
         fake_npi_list,
     )
 
-    request = types.SimpleNamespace(
-        args={
-            "classification": "Pharmacy",
-            "view": "sitemap",
-            "limit": "20000",
-            "start": "0",
-            "include_total": "0",
-        }
-    )
+    request_args_by_name = {
+        "classification": "Pharmacy",
+        "view": "sitemap",
+        "limit": "20000",
+        "start": "0",
+        "include_total": "0",
+    }
+    if raw_primary_only is not None:
+        request_args_by_name["primary_only"] = raw_primary_only
+    request = types.SimpleNamespace(args=request_args_by_name)
     resp = await get_all(request)
     response_body = json.loads(resp.body)
 
     assert response_body["limit"] == 20000
+    assert primary_only_calls == [expected_primary_only]
     assert conn.calls == 1
     assert len(conn.last_params["page_npis"]) == 20000
     assert "mrf.addr_formatted_address_v2(" in conn.last_sql
@@ -371,6 +385,30 @@ async def test_get_all_broad_q_explicit_include_total_still_skips_slow_count(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("search_args", [{"q": "clinic"}, {"name_like": "clinic"}])
+async def test_get_all_broad_name_page_bounds_before_address_hydration(
+    monkeypatch,
+    search_args,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={**search_args, "limit": "5", "start": "10"}
+        )
+    )
+
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert "filtered_npi AS MATERIALIZED" not in page_sql
+    assert "SELECT b.npi" in page_sql
+    assert "FROM mrf.npi AS b" in page_sql
+    assert "AND EXISTS (" in page_sql
+    assert "ORDER BY b.npi" in page_sql
+    assert "LIMIT :limit OFFSET :start" in page_sql
+
+
+@pytest.mark.asyncio
 async def test_get_all_without_taxonomy_filters_skips_expensive_overlap(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
@@ -400,6 +438,7 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
             "codes": "207Q00000X",
             "provider_sex_code": "f",
             "include_total": "false",
+            "primary_only": "false",
             "limit": "10",
             "start": "0",
         }
@@ -433,6 +472,7 @@ async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(mon
             "q": "clinic",
             "codes": "207Q00000X",
             "include_total": "false",
+            "primary_only": "false",
             "limit": "10",
             "start": "0",
         }
@@ -472,6 +512,7 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
                 "q": "clinic",
                 "codes": "207Q00000X",
                 "include_total": "true",
+                "primary_only": "false",
                 "limit": "10",
                 "start": "10",
             }
@@ -507,11 +548,290 @@ def test_name_taxonomy_projection_disabled_emits_legacy_schema_sql(monkeypatch):
         "1=1",
         code_placeholders=(":taxonomy_code",),
         npi_where="LOWER(COALESCE(b.provider_last_name, '')) LIKE :q",
+        is_projection_enabled=False,
     )
 
     assert "search_taxonomy_codes" not in sql
     assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in sql
     assert "provider_taxonomy.healthcare_provider_taxonomy_code IN (:taxonomy_code)" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expects_primary_predicate"),
+    [(None, True), ("true", True), ("false", False)],
+)
+async def test_get_all_applies_primary_taxonomy_to_page_and_count(
+    monkeypatch,
+    raw_primary_only,
+    expects_primary_predicate,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    request_args_by_name = {
+        "codes": "207Q00000X",
+        "include_total": "true",
+        "limit": "10",
+        "start": "0",
+    }
+    if raw_primary_only is not None:
+        request_args_by_name["primary_only"] = raw_primary_only
+
+    await get_all(types.SimpleNamespace(args=request_args_by_name))
+
+    primary_predicate = (
+        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+    )
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    assert (primary_predicate in page_sql) is expects_primary_predicate
+    assert (primary_predicate in count_sql) is expects_primary_predicate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_primary_only", "expects_primary_predicate"),
+    [(None, True), ("false", False)],
+)
+async def test_get_all_location_first_classification_honors_primary_only(
+    monkeypatch,
+    raw_primary_only,
+    expects_primary_predicate,
+):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    request_args_by_name = {
+        "classification": "Family Medicine",
+        "zip_code": "60601",
+        "include_total": "true",
+    }
+    if raw_primary_only is not None:
+        request_args_by_name["primary_only"] = raw_primary_only
+
+    await get_all(types.SimpleNamespace(args=request_args_by_name))
+
+    primary_predicate = (
+        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+    )
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    for sql in (page_sql, count_sql):
+        assert "AS provider_taxonomy_match ON TRUE" in sql
+        assert (primary_predicate in sql) is expects_primary_predicate
+
+
+@pytest.mark.asyncio
+async def test_get_all_classification_count_allows_non_primary_taxonomies(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "count_only": "1",
+                "format": "all",
+                "classification": "Family Medicine",
+                "primary_only": "false",
+            }
+        )
+    )
+
+    assert "CROSS JOIN LATERAL unnest" in conn.last_sql
+    assert "healthcare_provider_primary_taxonomy_switch" not in conn.last_sql
+
+
+@pytest.mark.asyncio
+async def test_get_all_rejects_invalid_primary_only():
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="primary_only.*boolean"):
+        await get_all(
+            types.SimpleNamespace(
+                args={"codes": "207Q00000X", "primary_only": "sometimes"}
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(
+        npi_module,
+        "_plan_release_npi_scope",
+        AsyncMock(
+            return_value=(
+                "SELECT npi FROM mrf.ptg2_v3_npi_scope "
+                "WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
+                {"plan_scope_snapshot_keys_0": [17]},
+            )
+        ),
+    )
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "plan_release_id": "hprelease_" + "0" * 26,
+                "include_total": "true",
+                "limit": "10",
+                "start": "0",
+            }
+        )
+    )
+
+    scoped_sql = "IN (SELECT npi FROM mrf.ptg2_v3_npi_scope"
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    assert scoped_sql in page_sql
+    assert scoped_sql in count_sql
+    assert all(
+        params["plan_scope_snapshot_keys_0"] == [17]
+        for _sql, params in conn.sql_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_unions_v3_and_v4(monkeypatch):
+    plan_release_id = "hprelease_" + "0" * 26
+    bindings = (
+        types.SimpleNamespace(snapshot_id="snapshot-v3"),
+        types.SimpleNamespace(snapshot_id="snapshot-v4"),
+    )
+    tables_by_snapshot = {
+        "snapshot-v3": types.SimpleNamespace(
+            shared_snapshot_key=11,
+            uses_v4_graph=False,
+        ),
+        "snapshot-v4": types.SimpleNamespace(
+            shared_snapshot_key=22,
+            uses_v4_graph=True,
+        ),
+    }
+    selection = types.SimpleNamespace(
+        in_network_bindings=bindings,
+        network_tables_by_snapshot=lambda: tables_by_snapshot,
+    )
+    resolver = AsyncMock(return_value=selection)
+    monkeypatch.setattr(provider_search_sql, "resolve_plan_release_serving", resolver)
+
+    sql, params = await npi_module._plan_release_npi_scope(
+        object(),
+        plan_release_id,
+    )
+
+    assert resolver.await_count == 1
+    assert resolver.await_args.args[1] == plan_release_id
+    assert "mrf.ptg2_v3_npi_scope" in sql
+    assert "mrf.ptg2_v4_npi_scope" in sql
+    assert sorted(params.values()) == [[11], [22]]
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_fails_closed_when_not_serving(monkeypatch):
+    monkeypatch.setattr(
+        provider_search_sql,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=None),
+    )
+
+    sql, params = await npi_module._plan_release_npi_scope(
+        object(),
+        "hprelease_" + "0" * 26,
+    )
+
+    assert sql == "SELECT NULL::BIGINT AS npi WHERE FALSE"
+    assert params == {}
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_rejects_invalid_release_id():
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="plan_release_id"):
+        await npi_module._plan_release_npi_scope(object(), "not-a-release")
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_requires_session():
+    with pytest.raises(RuntimeError, match="session not available"):
+        await npi_module._plan_release_npi_scope(
+            None,
+            "hprelease_" + "0" * 26,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        (
+            types.SimpleNamespace(network_tables_by_snapshot=lambda: None),
+            "incomplete network bindings",
+        ),
+        (
+            types.SimpleNamespace(
+                in_network_bindings=(types.SimpleNamespace(snapshot_id="snapshot"),),
+                network_tables_by_snapshot=lambda: {
+                    "snapshot": types.SimpleNamespace(shared_snapshot_key=None)
+                },
+            ),
+            "not bound to strict shared-block storage",
+        ),
+    ],
+)
+async def test_plan_release_npi_scope_rejects_incomplete_serving_bindings(
+    monkeypatch,
+    selection,
+    message,
+):
+    monkeypatch.setattr(
+        provider_search_sql,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await npi_module._plan_release_npi_scope(
+            object(),
+            "hprelease_" + "0" * 26,
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_release_npi_scope_fails_closed_without_network_bindings(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        provider_search_sql,
+        "resolve_plan_release_serving",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                in_network_bindings=(),
+                network_tables_by_snapshot=lambda: {},
+            )
+        ),
+    )
+
+    sql, params = await npi_module._plan_release_npi_scope(
+        object(),
+        "hprelease_" + "0" * 26,
+    )
+
+    assert sql == "SELECT NULL::BIGINT AS npi WHERE FALSE"
+    assert params == {}
+
+
+def test_taxonomy_cte_uses_scalar_codes_without_name_filter():
+    sql = npi_module._provider_taxonomy_matched_npi_cte(
+        "1=1",
+        code_placeholders=(":taxonomy_code",),
+        primary_only=True,
+    )
+
+    assert "IN (:taxonomy_code)" in sql
+    assert "healthcare_provider_primary_taxonomy_switch" in sql
 
 
 @pytest.mark.asyncio

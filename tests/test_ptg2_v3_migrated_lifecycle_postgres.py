@@ -79,9 +79,7 @@ from process.ptg_parts.source_pointers import _stage_ptg2_source_candidate
 
 ROOT = Path(__file__).resolve().parents[1]
 OPT_IN_DSN_ENV = "HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN"
-DISPOSABLE_DATABASE_PATTERN = re.compile(
-    r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$"
-)
+DISPOSABLE_DATABASE_PATTERN = re.compile(r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$")
 SCHEMA_NAME = "mrf"
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
@@ -227,9 +225,7 @@ async def _assert_migration_heads() -> None:
     expected_heads = set(ScriptDirectory.from_config(alembic_config).get_heads())
     observed_heads = {
         str(version_record[0])
-        for version_record in await db.all(
-            f"SELECT version_num FROM {_quoted(SCHEMA_NAME)}.alembic_version"
-        )
+        for version_record in await db.all(f"SELECT version_num FROM {_quoted(SCHEMA_NAME)}.alembic_version")
     }
     assert observed_heads == expected_heads, (
         "the disposable database must have migration head applied: "
@@ -252,8 +248,7 @@ async def _assert_required_migration_tables() -> None:
         )
     }
     assert REQUIRED_TABLES <= observed_tables, (
-        "the migrated disposable schema is missing production tables: "
-        f"{sorted(REQUIRED_TABLES - observed_tables)}"
+        f"the migrated disposable schema is missing production tables: {sorted(REQUIRED_TABLES - observed_tables)}"
     )
     assert await db.scalar(
         """
@@ -303,19 +298,12 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
     await _assert_required_migration_tables()
     await _assert_required_jsonb_columns()
     for table_name in EMPTY_BEFORE_WRITE_TABLES:
-        assert await _count(table_name) == 0, (
-            f"refusing to use non-empty disposable table {SCHEMA_NAME}.{table_name}"
-        )
+        assert await _count(table_name) == 0, f"refusing to use non-empty disposable table {SCHEMA_NAME}.{table_name}"
 
 
 async def _count(table_name: str) -> int:
     assert table_name in REQUIRED_TABLES or table_name in FINAL_EMPTY_TABLES
-    return int(
-        await db.scalar(
-            f"SELECT COUNT(*) FROM {_quoted(SCHEMA_NAME)}.{_quoted(table_name)}"
-        )
-        or 0
-    )
+    return int(await db.scalar(f"SELECT COUNT(*) FROM {_quoted(SCHEMA_NAME)}.{_quoted(table_name)}") or 0)
 
 
 async def _insert_logical_snapshot_prerequisites(
@@ -403,9 +391,7 @@ async def _stage_candidate(
         },
         shared_snapshot_key=snapshot_key,
         coverage_scope_id=COVERAGE_SCOPE_ID,
-        coverage_plan_scopes=[
-            SharedLogicalPlanScope(plan_id, "ein", "group")
-        ],
+        coverage_plan_scopes=[SharedLogicalPlanScope(plan_id, "ein", "group")],
     )
     assert staged["status"] == "validated"
     assert staged["candidate_attributes"]["manifest"]["activation"] == {
@@ -422,14 +408,10 @@ def _graph_artifacts(
     provider_set_id: bytes,
     provider_group_id: bytes,
 ) -> list[dict[str, object]]:
-    npi_ids = tuple(
-        b"\0" * 8 + int(npi).to_bytes(8, "big", signed=False) for npi in NPIS
-    )
+    npi_ids = tuple(b"\0" * 8 + int(npi).to_bytes(8, "big", signed=False) for npi in NPIS)
     graph_members_by_artifact = {
         "provider_group_npi": {provider_group_id: npi_ids},
-        "provider_npi_group": {
-            npi_id: (provider_group_id,) for npi_id in npi_ids
-        },
+        "provider_npi_group": {npi_id: (provider_group_id,) for npi_id in npi_ids},
         "provider_inverted": {provider_group_id: (provider_set_id,)},
         "provider_forward": {provider_set_id: (provider_group_id,)},
     }
@@ -441,9 +423,7 @@ def _graph_artifacts(
         sidecar_metadata_map.update(
             {
                 "name": name,
-                "path": str(
-                    (directory / str(sidecar_metadata_map["path"])).resolve()
-                ),
+                "path": str((directory / str(sidecar_metadata_map["path"])).resolve()),
                 "source_shard_id": "migrated-lifecycle-shard",
             }
         )
@@ -456,22 +436,26 @@ def _release_audit_contract(
     snapshot_id: str,
     source_key: str,
     plan_id: str,
-    raw_container_sha256: str,
+    raw_container_sha256: str | tuple[str, ...],
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
 ):
     """Build the immutable target and request for one release audit."""
 
+    raw_source_digests = (raw_container_sha256,) if isinstance(raw_container_sha256, str) else raw_container_sha256
+    storage_generation = "shared_blocks_v3" if isinstance(raw_container_sha256, str) else "shared_blocks_v4"
+
     audit_target = BatchAuditReportTarget(
         snapshot_id=snapshot_id,
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type="group",
-        raw_container_sha256=(raw_container_sha256,),
+        raw_container_sha256=raw_source_digests,
         source_witness=dict(source_witness),
         audit_sample=dict(audit_sample),
         provider_identifier_quarantine=dict(provider_identifier_quarantine),
+        storage_generation=storage_generation,
     )
     audit_request = build_audit_batch_request(
         snapshot_id=snapshot_id,
@@ -482,10 +466,8 @@ def _release_audit_contract(
             audit_sample_digest=str(audit_sample["sample_digest"]),
             source_witness_sample_digest=str(source_witness["sample_digest"]),
             source_witness_payload_sha256=str(source_witness["payload_sha256"]),
-            raw_container_sha256=(raw_container_sha256,),
-            source_witness_occurrence_count=int(
-                source_witness["occurrence_witness_count"]
-            ),
+            raw_container_sha256=raw_source_digests,
+            source_witness_occurrence_count=int(source_witness["occurrence_witness_count"]),
         ),
     )
     return audit_target, audit_request
@@ -497,7 +479,7 @@ async def _release_report(
     snapshot_id: str,
     source_key: str,
     plan_id: str,
-    raw_container_sha256: str,
+    raw_container_sha256: str | tuple[str, ...],
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
@@ -550,9 +532,7 @@ def _build_asgi_app() -> Sanic:
     app = Sanic(f"ptg2-v3-migrated-lifecycle-{uuid.uuid4().hex}")
     db.init_app(app)
     app.blueprint(control_blueprint)
-    app.blueprint(
-        Blueprint.group([pricing.blueprint], version_prefix="/api/v")
-    )
+    app.blueprint(Blueprint.group([pricing.blueprint], version_prefix="/api/v"))
     return app
 
 
@@ -652,10 +632,7 @@ def _assert_exact_price_and_membership(
     assert all(item["reported_code"] == code for item in items)
     assert all(item["provider_count"] == len(NPIS) for item in items)
     assert all(item["negotiation_arrangement"] == "FFS" for item in items)
-    assert all(
-        [price["negotiated_rate"] for price in item["prices"]] == [rate]
-        for item in items
-    )
+    assert all([price["negotiated_rate"] for price in item["prices"]] == [rate] for item in items)
     provenance = payload["provenance"]
     assert provenance["snapshot_id"] == snapshot_id
     assert provenance["plan_id"] == plan_id
@@ -754,12 +731,8 @@ def _set_lifecycle_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT", "lean_provider_key_v1")
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
-    monkeypatch.setenv(
-        "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864"
-    )
-    monkeypatch.setenv(
-        "HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216"
-    )
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864")
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_TOTAL_SORT_MEMORY_BYTES", "16777216")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
     monkeypatch.setenv("HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID", COVERAGE_SCOPE_ID.hex())
@@ -815,16 +788,12 @@ class _MigratedLifecycleScenario:
             )
         ]
         assert len(self.serving_records) == 2
-        provider_set_ids = {
-            serving_record[1] for serving_record in self.serving_records
-        }
+        provider_set_ids = {serving_record[1] for serving_record in self.serving_records}
         assert len(provider_set_ids) == 1
         self.provider_set_id = next(iter(provider_set_ids))
 
     def _bind_source_evidence(self) -> None:
-        self.artifact_digest = hashlib.sha256(
-            self.scan["artifact"].read_bytes()
-        ).hexdigest()
+        self.artifact_digest = hashlib.sha256(self.scan["artifact"].read_bytes()).hexdigest()
         self.source_trace_row, source_trace_set_row = _ptg2_source_trace_rows(
             None,
             "https://example.test/migrated-lifecycle-source.json",
@@ -897,8 +866,7 @@ class _MigratedLifecycleScenario:
             )
         assert self.first_reservation.reused is False
         self.stage_table = await _create_serving_stage_table(
-            f"lifecycle_{self.first_reservation.snapshot_key}_"
-            f"{uuid.uuid4().hex[:8]}"
+            f"lifecycle_{self.first_reservation.snapshot_key}_{uuid.uuid4().hex[:8]}"
         )
 
     async def _fill_price_stage(self) -> None:
@@ -955,9 +923,7 @@ class _MigratedLifecycleScenario:
         self.code_dictionary_entries = attach_v3_dictionary_contract(
             self.scan["code_dictionary_frames"],
             source_identity=self.identity,
-            source_run_contract_sha256=self.serving_run_entries[0][
-                "source_run_contract_sha256"
-            ],
+            source_run_contract_sha256=self.serving_run_entries[0]["source_run_contract_sha256"],
             scanner_summary=self.scanner_summary,
         )
         metadata_payload = metadata_path.read_bytes()
@@ -972,9 +938,7 @@ class _MigratedLifecycleScenario:
                 "source_type": self.identity.source_type,
                 "identity_kind": self.identity.identity_kind,
                 "identity_sha256": self.identity.identity_sha256,
-                "source_run_contract_sha256": self.serving_run_entries[0][
-                    "source_run_contract_sha256"
-                ],
+                "source_run_contract_sha256": self.serving_run_entries[0]["source_run_contract_sha256"],
             },
         )
 
@@ -1000,9 +964,7 @@ class _MigratedLifecycleScenario:
                 ),
             ),
             expected_raw_source_sha256=(self.artifact_digest,),
-            provider_identifier_quarantine=self.scanner_summary[
-                "provider_identifier_quarantine"
-            ],
+            provider_identifier_quarantine=self.scanner_summary["provider_identifier_quarantine"],
             scratch_parent=self.tmp_path,
         )
         assert self.publication.snapshot_key == self.first_reservation.snapshot_key
@@ -1012,9 +974,7 @@ class _MigratedLifecycleScenario:
         assert serving_index["storage_generation"] == "shared_blocks_v3"
         assert serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
         assert serving_index["provider_graph"]["npi_count"] == len(NPIS)
-        await _drop_ptg2_snapshot_table_names(
-            _ptg2_manifest_stage_table_names(self.stage_table)
-        )
+        await _drop_ptg2_snapshot_table_names(_ptg2_manifest_stage_table_names(self.stage_table))
         self.stage_table = None
 
     async def _stage_first_candidate(self) -> None:
@@ -1073,20 +1033,13 @@ class _MigratedLifecycleScenario:
             source_key=SOURCE_A,
             plan_id=PLAN_A,
         )
-        assert self.candidate_audit["audit_sample"]["sample_digest"] == (
-            self.publication.serving_index["audit_sample"]["sample_digest"]
+        assert (
+            self.candidate_audit["audit_sample"]["sample_digest"]
+            == (self.publication.serving_index["audit_sample"]["sample_digest"])
         )
-        assert self.candidate_audit["pagination"]["total"] == len(
-            self.candidate_audit["items"]
-        )
-        assert {
-            int(audit_item["tuple"]["npi"])
-            for audit_item in self.candidate_audit["items"]
-        } <= set(NPIS)
-        assert {
-            audit_item["tuple"]["negotiated_rate"]
-            for audit_item in self.candidate_audit["items"]
-        } == {125.5, 250}
+        assert self.candidate_audit["pagination"]["total"] == len(self.candidate_audit["items"])
+        assert {int(audit_item["tuple"]["npi"]) for audit_item in self.candidate_audit["items"]} <= set(NPIS)
+        assert {audit_item["tuple"]["negotiated_rate"] for audit_item in self.candidate_audit["items"]} == {125.5, 250}
         assert self.candidate_audit["provenance"]["snapshot_id"] == self.snapshot_a
         assert self.candidate_audit["source_set"] == self.source_set
 
@@ -1126,9 +1079,7 @@ class _MigratedLifecycleScenario:
             raw_container_sha256=self.artifact_digest,
             audit_sample=self.candidate_audit["audit_sample"],
             source_witness=self.publication.serving_index["source_witness"],
-            provider_identifier_quarantine=self.publication.serving_index[
-                "provider_identifier_quarantine"
-            ],
+            provider_identifier_quarantine=self.publication.serving_index["provider_identifier_quarantine"],
         )
         response = await _asgi_request(
             self.client,
@@ -1202,9 +1153,7 @@ class _MigratedLifecycleScenario:
         await self._fail_reused_candidate()
 
     async def _reserve_reused_layout(self) -> None:
-        self.physical_counts_before_reuse = await _physical_counts(
-            self.publication.snapshot_key
-        )
+        self.physical_counts_before_reuse = await _physical_counts(self.publication.snapshot_key)
         await _insert_logical_snapshot_prerequisites(
             snapshot_id=self.snapshot_b,
             plan_id=PLAN_B,
@@ -1256,9 +1205,7 @@ class _MigratedLifecycleScenario:
             snapshot_key=self.publication.snapshot_key,
             serving_index=serving_index,
         )
-        assert await _physical_counts(self.publication.snapshot_key) == (
-            self.physical_counts_before_reuse
-        )
+        assert await _physical_counts(self.publication.snapshot_key) == (self.physical_counts_before_reuse)
 
     async def _assert_reused_candidate(self) -> None:
         bindings = await db.all(
@@ -1297,21 +1244,19 @@ class _MigratedLifecycleScenario:
                 import_run_id=f"run-{self.snapshot_b}",
                 snapshot_id=self.snapshot_b,
                 import_month=datetime.date(2026, 7, 1),
-                started_at=datetime.datetime.now(
-                    datetime.timezone.utc
-                ).replace(tzinfo=None),
-                error=(
-                    "intentional terminal state for shared-layout "
-                    "removal coverage"
-                ),
+                started_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+                error=("intentional terminal state for shared-layout removal coverage"),
             )
         )
-        assert await db.scalar(
-            f"""SELECT status
+        assert (
+            await db.scalar(
+                f"""SELECT status
                   FROM {_quoted(SCHEMA_NAME)}.ptg2_snapshot
                  WHERE snapshot_id = :snapshot_id""",
-            snapshot_id=self.snapshot_b,
-        ) == "failed"
+                snapshot_id=self.snapshot_b,
+            )
+            == "failed"
+        )
 
     async def remove_candidates(self) -> None:
         await self._remove_reused_candidate()
@@ -1332,9 +1277,7 @@ class _MigratedLifecycleScenario:
         assert removal["deleted_v3_snapshot_bindings"] == 1
         assert removal["deleted_snapshots"] == 1
         assert removal["released_shared_layouts"] == 0
-        assert await _physical_counts(self.publication.snapshot_key) == (
-            self.physical_counts_before_reuse
-        )
+        assert await _physical_counts(self.publication.snapshot_key) == (self.physical_counts_before_reuse)
 
     async def _assert_surviving_candidate(self) -> None:
         surviving_prices = await _cold_price_read(
@@ -1405,10 +1348,7 @@ class _MigratedLifecycleScenario:
                   FROM {_quoted(SCHEMA_NAME)}.ptg2_v3_block
                  ORDER BY block_hash"""
         )
-        block_size_by_hash = {
-            bytes(block_record[0]): int(block_record[1])
-            for block_record in block_rows
-        }
+        block_size_by_hash = {bytes(block_record[0]): int(block_record[1]) for block_record in block_rows}
         assert block_size_by_hash
         response = await _asgi_request(
             self.client,
@@ -1438,9 +1378,7 @@ class _MigratedLifecycleScenario:
 
     async def cleanup(self) -> None:
         if self.stage_table is not None:
-            await _drop_ptg2_snapshot_table_names(
-                _ptg2_manifest_stage_table_names(self.stage_table)
-            )
+            await _drop_ptg2_snapshot_table_names(_ptg2_manifest_stage_table_names(self.stage_table))
         await db.disconnect()
 
 
@@ -1454,8 +1392,7 @@ async def test_v3_lifecycle_fails_closed(
     dsn = os.getenv(OPT_IN_DSN_ENV)
     if not dsn:
         pytest.skip(
-            f"set {OPT_IN_DSN_ENV} to a pre-migrated disposable "
-            "ptg2_v3_lifecycle_test_<unique-suffix> database"
+            f"set {OPT_IN_DSN_ENV} to a pre-migrated disposable ptg2_v3_lifecycle_test_<unique-suffix> database"
         )
 
     scenario = _MigratedLifecycleScenario(tmp_path, monkeypatch)

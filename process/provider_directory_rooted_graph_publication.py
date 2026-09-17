@@ -17,7 +17,7 @@ from process.provider_directory_dataset_scoped_publication import (
     ROOTED_COMBINED_VARIANT,
 )
 from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
+    has_matching_rooted_graph_root_publication,
 )
 from process.provider_directory_rooted_graph_publication_contract import (
     canonical_json,
@@ -31,6 +31,7 @@ from process.provider_directory_rooted_graph_publication_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_ROOT_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_OUTPUT_RESOURCES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
 )
 from process.provider_directory_rooted_graph_publication_metadata import (
@@ -127,10 +128,9 @@ def _has_valid_dataset_identity_lineage(candidate: object) -> bool:
     return bool(
         candidate.root_dataset_variant
         in {LEGACY_PRACTITIONER_VARIANT, ROOTED_COMBINED_VARIANT}
-        and candidate.root_publication_contract_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT[
-            candidate.root_dataset_variant
-        ]
+        and has_matching_rooted_graph_root_publication(
+            candidate.root_dataset_variant, candidate.root_publication_contract_id
+        )
         and has_same_root_pair == is_rooted_variant
         and candidate.source_id == pair.rooted_source_id
         and candidate.endpoint_id == pair.rooted_endpoint_id
@@ -145,6 +145,10 @@ def _has_valid_dataset_identity_lineage(candidate: object) -> bool:
 
 
 def _has_valid_dataset_identity_content(candidate: object) -> bool:
+    from process.provider_directory_rooted_graph_request_coverage import (
+        has_matching_rooted_publication_coverage,
+    )
+
     tail = _dataset_identity_tail(candidate)
     expected_dataset_id = _identifier(
         "pdrgpd_", (candidate.publication_contract_id, *tail)
@@ -169,7 +173,16 @@ def _has_valid_dataset_identity_content(candidate: object) -> bool:
     )
     return bool(
         candidate.publication_contract_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+        == (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID
+            if candidate.request_failure_coverage is not None
+            else PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+        )
+        and has_matching_rooted_publication_coverage(
+            candidate.request_failure_coverage,
+            retry_exhausted_count=candidate.retry_exhausted_count,
+            rooted_graph_complete=candidate.rooted_graph_complete,
+        )
         and candidate.dataset_id == expected_dataset_id
         and candidate.acquisition_root_run_id == expected_root_id
         and all(
@@ -212,6 +225,8 @@ class ProviderDirectoryRootedGraphDatasetIdentity:
     publication_contract_id: str = (
         PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
     )
+    request_failure_coverage: dict[str, object] | None = None
+    rooted_graph_complete: bool = True
 
     def __post_init__(self) -> None:
         """Reject forged deterministic identities before any database write."""
@@ -319,10 +334,15 @@ def build_rooted_graph_dataset_identity(
     if not _has_matching_admission_lineage(admission, current_root):
         raise ValueError("provider_directory_rooted_graph_dataset_admission_invalid")
     tail = _identity_tail_from_authority(admission, current_root)
+    coverage = admission.request_failure_coverage
+    contract = (
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID
+        if coverage is not None else PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+    )
     return ProviderDirectoryRootedGraphDatasetIdentity(
         dataset_id=_identifier(
             "pdrgpd_",
-            (PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID, *tail),
+            (contract, *tail),
         ),
         acquisition_root_run_id=_identifier(
             "pdrgpr_",
@@ -349,6 +369,9 @@ def build_rooted_graph_dataset_identity(
         semantic_projection_as_of=current_root.semantic_projection_as_of,
         operation_key=current_root.operation_key,
         rooted_graph_sha256=admission.rooted_graph_sha256,
+        publication_contract_id=contract,
+        request_failure_coverage=coverage,
+        rooted_graph_complete=(coverage is None or coverage["rooted_failed_requests"] == 0),
     )
 
 
@@ -386,6 +409,7 @@ def _has_valid_publication_metadata_inputs(
         and identity.root_cohort_id == admission.root_cohort_id
         and identity.root_practitioner_resource_count == admission.root_resource_count
         and identity.rooted_graph_sha256 == admission.rooted_graph_sha256
+        and identity.request_failure_coverage == admission.request_failure_coverage
         and set(resource_counts)
         == set(PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES)
         and all(type(count) is int and count >= 0 for count in resource_counts.values())

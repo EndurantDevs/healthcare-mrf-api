@@ -86,6 +86,8 @@ def _readiness_from_row(
             rooted_graph_complete=fields.get("rooted_graph_complete"),
             endpoint_collection_complete=fields.get("endpoint_collection_complete"),
             endpoint_complete=fields.get("endpoint_complete"),
+            request_failure_coverage=fields.get("request_failure_coverage"),
+            publication_contract_id=fields.get("publication_contract_id"),
         )
     except (TypeError, ValueError):
         raise ProviderDirectoryRootedGraphPublicationError("state") from None
@@ -125,7 +127,8 @@ def _readiness_select(filter_sql: str) -> str:
                COALESCE((parent.publication_metadata_json::jsonb
                    ->> 'retry_exhausted_count')::bigint, 0)
                    AS retry_exhausted_count,
-               header.rooted_graph_complete,
+               header.rooted_graph_complete, header.publication_contract_id,
+               header.request_failure_coverage,
                header.endpoint_collection_complete, header.endpoint_complete
           FROM {_table('provider_directory_rooted_graph_dataset')} AS header
           JOIN {_table('provider_directory_endpoint_dataset')} AS parent

@@ -74,7 +74,7 @@ def _committed_target_result(
 
     context = control_context.get("context")
     if (
-        target_module not in {"process.npi", "process.massachusetts_profile"}
+        target_module not in {"process.npi", "process.massachusetts_profile", "process.kentucky_profile", "process.tennessee_profile", "process.rhode_island_profile", "process.new_york_profile"}
         or not isinstance(context, dict)
         or context.get("control_run_terminal_committed") is not True
     ):
@@ -927,6 +927,7 @@ async def mark_control_run(
     database_state_committed: bool = False,
     database_heartbeat_at: object = None,
     database_finished_at: object = None,
+    expected_state: tuple[str, str] | None = None,
 ):
     """Persist and publish one authoritative control-run lifecycle transition."""
 
@@ -993,6 +994,11 @@ async def mark_control_run(
     )
     if should_update_database:
         stmt = update(ImportRun).where(ImportRun.run_id == run_id)
+        if expected_state is not None:
+            stmt = stmt.where(
+                ImportRun.importer == expected_state[0],
+                ImportRun.status == expected_state[1],
+            )
         if status == "running":
             stmt = stmt.where(
                 ImportRun.status.notin_(

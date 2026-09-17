@@ -131,11 +131,15 @@ fn is_explicitly_uncontracted_csv_payer(payer: &PayerChargeRow) -> bool {
         })
 }
 
-fn validate_charge_free_csv_payer(payer: &PayerChargeRow) -> io::Result<()> {
+fn validate_charge_free_csv_payer(
+    payer: &PayerChargeRow,
+    generic_notes: Option<&str>,
+) -> io::Result<()> {
     let methodology = optional_text(&payer.methodology)
         .map(|value| canonical_methodology(&value, true))
         .transpose()?;
-    let has_notes = payer.additional_payer_notes.is_some();
+    let has_notes = payer.additional_payer_notes.is_some()
+        || generic_notes.is_some_and(|notes| !notes.trim().is_empty());
     if methodology.as_deref() == Some("other") && !has_notes {
         return Err(invalid("methodology other requires explanatory notes"));
     }

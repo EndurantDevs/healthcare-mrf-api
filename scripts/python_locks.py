@@ -25,11 +25,11 @@ def input_header(root: Path, input_name: str) -> str:
 
 
 def validate(root: Path) -> None:
-    """Reject a stale lock before pip can install its hashed artifacts."""
+    """Reject a stale lock before uv can install its hashed artifacts."""
     for lock_name, input_names in LOCK_INPUTS.items():
         recorded = re.findall(r"^# Input: .+$", (root / lock_name).read_text(), re.M)
         if recorded != [input_header(root, name) for name in input_names]:
-            raise ValueError(f"{lock_name} is stale; run python scripts/python_locks.py compile")
+            raise ValueError(f"{lock_name} is stale; run uv run scripts/python_locks.py compile")
 
 
 def compile_locks(root: Path) -> None:
@@ -44,10 +44,10 @@ def compile_locks(root: Path) -> None:
                 candidate.write_bytes(current.read_bytes())
             subprocess.run([
                 "uv", "pip", "compile", str(root / input_names[-1]),
-                "--python-version", "3.14.6", "--universal", "--generate-hashes",
+                "--python-version", "3.14.7", "--universal", "--generate-hashes",
                 "--only-binary", ":all:", "--emit-build-options", "--no-annotate",
                 "--no-header", "--no-strip-extras", "--no-python-downloads",
-                "--output-file", str(candidate), "--quiet",
+                "--upgrade", "--output-file", str(candidate), "--quiet",
             ], check=True)
             if "\n".join(input_header(root, name) for name in input_names) != header:
                 raise ValueError(f"{lock_name} inputs changed during compilation")

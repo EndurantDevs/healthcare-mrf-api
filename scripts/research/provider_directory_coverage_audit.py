@@ -12,7 +12,7 @@ Provider Directory import:
 
 Example:
 
-  ./venv314/bin/python scripts/research/provider_directory_coverage_audit.py \
+  ./.venv/bin/python scripts/research/provider_directory_coverage_audit.py \
     --host 127.0.0.1 --port 5440 --database healthporta --schema mrf --format markdown
 """
 

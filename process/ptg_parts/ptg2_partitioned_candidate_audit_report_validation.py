@@ -97,12 +97,34 @@ def _is_start_rate_consistent_with_span(
     if normalized_span == 0:
         return False
     expected_start_rate = (expected_request_count - 1) / normalized_span
-    return math.isclose(
+    if math.isclose(
         float(start_rate),
         expected_start_rate,
         rel_tol=0.0,
         abs_tol=0.000003,
+    ):
+        return True
+    # Both fields are independently rounded to six decimal places.
+    rounding_error = 0.0000005
+    return normalized_span > rounding_error and (
+        (expected_request_count - 1) / (normalized_span + rounding_error)
+        - rounding_error
+        <= float(start_rate)
+        <= (expected_request_count - 1) / (normalized_span - rounding_error)
+        + rounding_error
     )
+
+
+def validated_partitioned_start_rate(http_metrics_by_name: Mapping[str, Any]) -> float:
+    """Accept the current pacing limit and retained reports from the earlier limit."""
+
+    limit = http_metrics_by_name.get("request_start_rate_limit_per_second")
+    if not _is_valid_nonnegative_number(limit) or limit not in (
+        2.0,
+        PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND,
+    ):
+        raise ValueError("batch audit report HTTP accounting is invalid")
+    return float(limit)
 
 
 def validate_partitioned_http_metrics(
@@ -117,6 +139,7 @@ def validate_partitioned_http_metrics(
         "request_start_rate_actual_per_second"
     )
     start_span = http_metrics_by_name.get("request_start_span_seconds")
+    start_rate_limit = validated_partitioned_start_rate(http_metrics_by_name)
     expected_metrics_by_name = {
         "batch_api_planned_http_requests": expected_request_count,
         "batch_api_actual_http_requests": expected_request_count,
@@ -124,9 +147,7 @@ def validate_partitioned_http_metrics(
         "batch_api_failed_http_requests": 0,
         "retry_count": 0,
         "max_concurrency": maximum_concurrency,
-        "request_start_rate_limit_per_second": (
-            PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND
-        ),
+        "request_start_rate_limit_per_second": start_rate_limit,
         "request_start_rate_actual_per_second": start_rate,
         "request_start_span_seconds": start_span,
         "method": "POST",
@@ -136,7 +157,7 @@ def validate_partitioned_http_metrics(
         expected_request_count,
         PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
     )
-    minimum_start_span = (expected_request_count - 1) / 2.0 - 0.1
+    minimum_start_span = (expected_request_count - 1) / start_rate_limit - 0.1
     if (
         http_metrics_by_name != expected_metrics_by_name
         or type(maximum_concurrency) is not int
@@ -146,7 +167,7 @@ def validate_partitioned_http_metrics(
             start_span,
             expected_request_count=expected_request_count,
         )
-        or float(start_rate) > 2.1
+        or float(start_rate) > start_rate_limit + 0.1
         or (
             expected_request_count > 1
             and float(start_span) < minimum_start_span
@@ -156,6 +177,7 @@ def validate_partitioned_http_metrics(
 
 
 __all__ = [
+    "validated_partitioned_start_rate",
     "validate_endpoint_duration",
     "validate_partitioned_batch_binding",
     "validate_partitioned_http_metrics",

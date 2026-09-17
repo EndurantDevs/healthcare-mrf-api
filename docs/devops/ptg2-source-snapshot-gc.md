@@ -45,7 +45,7 @@ backlog without limit.
 Dry-run first:
 
 ```bash
-./venv314/bin/python -m process.ptg_parts.ptg2_source_snapshot_gc \
+./.venv/bin/python -m process.ptg_parts.ptg2_source_snapshot_gc \
   --schema mrf \
   --max-snapshots 400 \
   --max-tables 2000 \
@@ -56,7 +56,7 @@ Dry-run first:
 Execute only after reviewing the dry-run counts:
 
 ```bash
-./venv314/bin/python -m process.ptg_parts.ptg2_source_snapshot_gc \
+./.venv/bin/python -m process.ptg_parts.ptg2_source_snapshot_gc \
   --schema mrf \
   --max-snapshots 400 \
   --max-tables 2000 \

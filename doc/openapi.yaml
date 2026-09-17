@@ -2108,6 +2108,260 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /hospital-prices/facilities:
+    get:
+      operationId: searchHospitalPriceFacilities
+      summary: Search canonical facilities with hospital-price catalog status
+      description: |
+        Returns one canonical facility per reviewed identity group. Alternate
+        project IDs are retained in `alias_hospital_ids`. Publication metadata
+        is null until that facility has a last-known-good packed dataset.
+        Source URLs and import-attempt details are never returned.
+        With `include_metadata=true`, metadata reports the same publication's
+        source header and only an explicitly bound physical address. An unresolved
+        binding is not a missing hospital: it means a physical address cannot be
+        assigned safely. Source license states describe the file, not an address.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Case-insensitive facility name or hospital ID search.
+        - name: published
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+          description: Restrict results by last-known-good publication presence.
+        - name: include_metadata
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+          description: Opt in to source-version-bound header and physical address evidence. Omitted or false preserves the original response shape.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            pattern: '^hospital-[0-9]{6}$'
+          description: Canonical hospital ID returned by the previous page; reuse only with the same `q` and `published` filters.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Source-hidden canonical facility page
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `private, no-store`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [hospital_id, alias_hospital_ids, name, publication]
+                      properties:
+                        hospital_id:
+                          type: string
+                          pattern: '^hospital-[0-9]{6}$'
+                        alias_hospital_ids:
+                          type: array
+                          items:
+                            type: string
+                            pattern: '^hospital-[0-9]{6}$'
+                        name:
+                          type: string
+                        metadata:
+                          type: object
+                          additionalProperties: false
+                          required: [source_hospital_name, source_location_count, source_license_states, location_binding_status, source_location_ordinal, location_name, hospital_address]
+                          properties:
+                            source_hospital_name:
+                              type: string
+                              nullable: true
+                            source_location_count:
+                              type: integer
+                              minimum: 1
+                              nullable: true
+                            source_license_states:
+                              type: array
+                              items:
+                                type: string
+                                pattern: '^[A-Z]{2}$'
+                            location_binding_status:
+                              type: string
+                              enum: [bound, unresolved, unpublished]
+                            source_location_ordinal:
+                              type: integer
+                              minimum: 0
+                              nullable: true
+                            location_name:
+                              type: string
+                              nullable: true
+                            hospital_address:
+                              type: string
+                              nullable: true
+                        publication:
+                          type: object
+                          nullable: true
+                          required: [version_id, source_format, schema_version, detected_schema_profile, last_updated_on, last_success_at, service_count, charge_count, payer_charge_count]
+                          properties:
+                            version_id:
+                              type: string
+                              pattern: '^[0-9a-f]{64}$'
+                            source_format:
+                              type: string
+                              enum: [json, csv-tall, csv-wide]
+                            schema_version:
+                              type: string
+                            detected_schema_profile:
+                              type: string
+                              nullable: true
+                              enum: [cms-v2, cms-v3]
+                            last_updated_on:
+                              type: string
+                              format: date
+                            last_success_at:
+                              type: string
+                              format: date-time
+                            service_count:
+                              type: integer
+                              minimum: 0
+                            charge_count:
+                              type: integer
+                              minimum: 0
+                            payer_charge_count:
+                              type: integer
+                              minimum: 0
+                  next_cursor:
+                    type: string
+                    nullable: true
+                    pattern: '^hospital-[0-9]{6}$'
+        '400':
+          description: Invalid query, cursor, filter, or pagination input
+        '503':
+          description: Hospital-price catalog serving is unavailable
+  /hospital-prices/facilities/{hospital_id}/payer-plans:
+    get:
+      operationId: getHospitalPayerPlans
+      summary: Discover observed exact payer and plan pairs
+      description: |
+        Enumerates exact payer/plan pairs observed together in one published
+        packed version without reading price facts. Null plans remain explicit
+        and can be selected in prices with `plan_missing=true`. Pages are bounded
+        to one selector block and may contain fewer than limit items while still
+        having a next cursor. Continue until next_cursor is null. Reuse the exact
+        version_id when reading prices. No source URLs are exposed.
+        Legacy packed versions return one exact pair per page using their
+        original interleaved selector ordinals, without scanning price facts.
+      parameters:
+        - name: hospital_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^hospital-[0-9]{6}$'
+        - name: version_id
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{96}$'
+          description: Opaque facility-and-version-bound continuation. Restart after HTTP 409 when the current publication changes.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: Source-hidden payer/plan discovery page
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `private, no-store`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hospital_id, version, pagination, items]
+                properties:
+                  hospital_id:
+                    type: string
+                    pattern: '^hospital-[0-9]{6}$'
+                  version:
+                    type: object
+                    required: [version_id, source_format, schema_version]
+                    properties:
+                      version_id:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
+                      source_format:
+                        type: string
+                        enum: [json, csv-tall, csv-wide]
+                      schema_version:
+                        type: string
+                  pagination:
+                    type: object
+                    required: [unit, limit, scanned, next_cursor]
+                    properties:
+                      unit:
+                        type: string
+                        enum: [payer_plans]
+                      limit:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                      scanned:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+                      next_cursor:
+                        type: string
+                        nullable: true
+                        pattern: '^[A-Za-z0-9_-]{96}$'
+                  items:
+                    type: array
+                    maxItems: 100
+                    items:
+                      type: object
+                      required: [payer_name, plan_name, plan_missing]
+                      properties:
+                        payer_name:
+                          type: string
+                        plan_name:
+                          type: string
+                          nullable: true
+                        plan_missing:
+                          type: boolean
+        '400':
+          description: Invalid or cross-resource cursor or query
+        '404':
+          description: Unknown, unpublished, or unbound requested version
+        '409':
+          description: Current publication changed; restart pagination
+        '503':
+          description: Packed serving is unavailable or invalid
   /hospital-prices/facilities/{hospital_id}/prices:
     get:
       operationId: getHospitalPrices
@@ -2772,6 +3026,18 @@ paths:
             type: integer
             enum: [1, 2]
           description: 1 = individual provider, 2 = organization
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: For taxonomy searches and classification counts, match only the provider's primary NPPES taxonomy row.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Optional immutable plan release whose published in-network NPI scope constrains results.
         - name: provider_sex_code
           in: query
           schema:
@@ -2854,6 +3120,18 @@ paths:
           schema:
             type: string
           description: Comma-separated NUCC taxonomy codes to filter results
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: When taxonomy filters are present, match only the provider's primary NPPES taxonomy row.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Optional immutable plan release whose published in-network NPI scope constrains results.
         - name: plan_network
           in: query
           schema:
@@ -2867,6 +3145,12 @@ paths:
           description: |
             Exact NPPES provider sex code applied before distance ordering and
             limiting. Input is case-insensitive and normalized to uppercase.
+        - name: entity_type_code
+          in: query
+          schema:
+            type: integer
+            enum: [1, 2]
+          description: 1 = individual provider, 2 = organization. Applied before distance ordering and limiting.
         - name: classification
           in: query
           schema:
@@ -7166,9 +7450,48 @@ components:
       properties:
         service_count:
           type: integer
+          description: Number of distinct provider-service codes published in the CMS detail source and retained by the API.
         location_count:
           type: integer
       required: [service_count, location_count]
+    PricingProviderServiceCodeCoverage:
+      type: object
+      description: |
+        Reconciles the CMS provider aggregate with its separately published
+        provider-and-service detail. CMS excludes detail cells derived from 10
+        or fewer beneficiaries, so the aggregate can report more distinct codes
+        than the public detail source can identify.
+      properties:
+        source_distinct_code_count:
+          type: integer
+          nullable: true
+        published_detail_code_count:
+          type: integer
+        unpublished_detail_code_count:
+          type: integer
+          nullable: true
+        detail_coverage_ratio:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        complete:
+          type: boolean
+          nullable: true
+        status:
+          type: string
+          enum: [complete, partial, unknown, inconsistent]
+        limitation:
+          type: string
+          nullable: true
+      required:
+      - source_distinct_code_count
+      - published_detail_code_count
+      - unpublished_detail_code_count
+      - detail_coverage_ratio
+      - complete
+      - status
+      - limitation
     PricingProviderRecord:
       type: object
       properties:
@@ -7200,6 +7523,7 @@ components:
           type: number
         total_reported_service_codes:
           type: number
+          description: Total distinct HCPCS codes in the CMS provider aggregate, including codes that may be absent from the privacy-suppressed detail source.
         total_submitted_charges:
           type: number
         total_beneficiaries:
@@ -7224,6 +7548,8 @@ components:
           type: string
         summary:
           $ref: '#/components/schemas/PricingProviderSummary'
+        service_code_coverage:
+          $ref: '#/components/schemas/PricingProviderServiceCodeCoverage'
         legacy_field_aliases:
           $ref: '#/components/schemas/PricingLegacyFieldAliases'
     PricingProviderProcedureRecord:

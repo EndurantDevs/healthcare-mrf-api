@@ -194,6 +194,10 @@ def single_root_operation_payload(
             cohort_complete=False,
             retry_exhausted_count=current.retry_exhausted_count,
         )
+    if admission.request_failure_coverage is not None:
+        operation_by_field["request_failure_coverage"] = (
+            admission.request_failure_coverage
+        )
     return operation_by_field
 
 

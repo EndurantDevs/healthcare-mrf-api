@@ -128,6 +128,14 @@ class ProviderDirectoryRootedGraphHTTPBounds:
             raise ValueError("provider_directory_rooted_graph_http_bounds_invalid")
 
 
+@dataclass(slots=True)
+class _QueryBudget:
+    """Keep failed page requests and partial bodies inside one query's caps."""
+
+    requests_remaining: int
+    bytes_remaining: int
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ProviderDirectoryRootedGraphHTTPResult:
     """One finite transport result ready for canonical witness reduction."""
@@ -411,6 +419,7 @@ async def _read_body(
     declared_length: int | None,
     page_limit: int,
     query_remaining: int,
+    budget: _QueryBudget | None = None,
 ) -> bytes:
     if declared_length is not None:
         if declared_length > page_limit:
@@ -430,6 +439,8 @@ async def _read_body(
         if len(chunk) > query_remaining - len(body):
             raise ProviderDirectoryRootedGraphHTTPError("query_limit")
         body.extend(chunk)
+        if budget is not None:
+            budget.bytes_remaining -= len(chunk)
     if not body or (declared_length is not None and len(body) < declared_length):
         raise ProviderDirectoryRootedGraphHTTPError(
             "payload_truncated",

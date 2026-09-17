@@ -82,6 +82,25 @@ SELECT hospital.hospital_id,
   LEFT JOIN {_SCHEMA}.hospital_price_version AS version
     ON version.version_id = current.version_id
 """
+_STATUS_METADATA_SQL = _STATUS_SQL.replace(
+    "version.last_updated_on",
+    f"""version.last_updated_on, version.source_hospital_name,
+       version.location_count AS source_location_count,
+       binding.source_location_ordinal,
+       location.location_name,
+       location.hospital_address,
+       ARRAY(SELECT DISTINCT license.state
+             FROM {_SCHEMA}.hospital_price_version_license license
+             WHERE license.version_id=version.version_id
+             ORDER BY license.state) AS source_license_states""",
+) + f"""
+  LEFT JOIN {_SCHEMA}.hospital_price_version_hospital AS binding
+    ON binding.version_id = current.version_id
+   AND binding.hospital_id = hospital.hospital_id
+  LEFT JOIN {_SCHEMA}.hospital_price_version_location AS location
+    ON location.version_id = binding.version_id
+   AND location.location_ordinal = binding.source_location_ordinal
+"""
 
 
 def hospital_price_page_limit(value: Any) -> int:
@@ -153,30 +172,57 @@ def _latest_row(
 def _status_item(
     hospitals: tuple[Mapping[str, str], ...],
     rows_by_hospital_id: Mapping[str, Mapping[str, Any]],
+    include_metadata: bool = False,
 ) -> dict[str, Any]:
-    hospital = hospitals[0]
-    rows = [
+    hospital_by_field = hospitals[0]
+    hospital_rows = [
         rows_by_hospital_id.get(alias["hospital_id"], {}) for alias in hospitals
     ]
-    attempt_row = _latest_row(rows, "attempt_id", "started_at")
-    publication_row = _latest_row(rows, "version_id", "last_success_at")
-    return {
-        "hospital_id": hospital["hospital_id"],
+    attempt_row = _latest_row(hospital_rows, "attempt_id", "started_at")
+    publication_row = _latest_row(hospital_rows, "version_id", "last_success_at")
+    status_by_field = {
+        "hospital_id": hospital_by_field["hospital_id"],
         "alias_hospital_ids": [
             alias["hospital_id"] for alias in hospitals[1:]
         ],
-        "name": hospital["name"],
-        "cms_hpt_url": hospital["cms_hpt_url"],
+        "name": hospital_by_field["name"],
+        "cms_hpt_url": hospital_by_field["cms_hpt_url"],
         "facility_anchor_id": next(
             (
-                row.get("facility_anchor_id")
-                for row in rows
-                if row.get("facility_anchor_id")
+                hospital_row.get("facility_anchor_id")
+                for hospital_row in hospital_rows
+                if hospital_row.get("facility_anchor_id")
             ),
             None,
         ),
         "latest_attempt": _attempt_item(attempt_row),
         "publication": _publication_item(publication_row),
+    }
+    if include_metadata:
+        status_by_field["metadata"] = _source_location_metadata(publication_row)
+    return status_by_field
+
+
+def _source_location_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only a stored hospital-to-location binding, never a source cross product."""
+
+    is_published = bool(row.get("version_id"))
+    is_bound = (
+        is_published and type(row.get("source_location_ordinal")) is int
+        and row["source_location_ordinal"] >= 0
+        and type(row.get("source_location_count")) is int
+        and row["source_location_ordinal"] < row["source_location_count"]
+        and isinstance(row.get("hospital_address"), str)
+        and bool(row["hospital_address"].strip())
+    )
+    return {
+        "source_hospital_name": row.get("source_hospital_name") if is_published else None,
+        "source_location_count": row.get("source_location_count") if is_published else None,
+        "source_license_states": list(row.get("source_license_states") or []) if is_published else [],
+        "location_binding_status": "bound" if is_bound else "unresolved" if is_published else "unpublished",
+        "source_location_ordinal": row["source_location_ordinal"] if is_bound else None,
+        "location_name": row.get("location_name") if is_bound else None,
+        "hospital_address": row["hospital_address"] if is_bound else None,
     }
 
 
@@ -195,6 +241,26 @@ def _is_status_match(item: Mapping[str, Any], status: str | None) -> bool:
     if status == "succeeded":
         return item.get("publication") is not None
     return _item_status(item) == status
+
+
+def _is_registry_group_match(
+    hospitals: tuple[Mapping[str, str], ...],
+    normalized_query: str,
+    *,
+    identity_query_only: bool,
+) -> bool:
+    if not normalized_query:
+        return True
+    fields = ("hospital_id", "name") if identity_query_only else None
+    registry_values = (
+        (hospital.get(field, "") for field in fields)
+        if fields is not None
+        else hospital.values()
+        for hospital in hospitals
+    )
+    return normalized_query in "\n".join(
+        value for hospital_values in registry_values for value in hospital_values
+    ).casefold()
 
 
 def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
@@ -246,6 +312,8 @@ async def list_hospital_price_status_page(
     status: str | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_HOSPITAL_PRICE_PAGE_SIZE,
+    identity_query_only: bool = False,
+    include_metadata: bool = False,
 ) -> dict[str, Any]:
     """Return reviewed registry rows with latest attempt and LKG kept separate."""
 
@@ -259,7 +327,7 @@ async def list_hospital_price_status_page(
     normalized_query = str(query or "").strip().casefold()
     hospital_groups, status_rows = await asyncio.gather(
         asyncio.to_thread(hospital_hpt_registry_groups),
-        db.all(_STATUS_SQL),
+        db.all(_STATUS_METADATA_SQL if include_metadata else _STATUS_SQL),
     )
     rows_by_hospital_id = {
         str(mapping.get("hospital_id")): mapping
@@ -267,15 +335,13 @@ async def list_hospital_price_status_page(
         if mapping.get("hospital_id")
     }
     status_items = [
-        _status_item(hospitals, rows_by_hospital_id)
+        _status_item(hospitals, rows_by_hospital_id, include_metadata)
         for hospitals in hospital_groups
-        if not normalized_query
-        or normalized_query
-        in "\n".join(
-            registry_value
-            for hospital in hospitals
-            for registry_value in hospital.values()
-        ).casefold()
+        if _is_registry_group_match(
+            hospitals,
+            normalized_query,
+            identity_query_only=identity_query_only,
+        )
     ]
     summary = _summary(status_items)
     status_items = [

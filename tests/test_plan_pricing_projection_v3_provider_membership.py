@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -89,6 +90,12 @@ async def test_provider_set_membership_keeps_complete_set_semantics(
     assert state.provider_membership_count == 3
     assert state.staged_provider_set_count == 2
     assert state.content_digest.digest() == expected_digest.digest()
+    provider_reader = serving._provider_npis_for_sets
+    assert provider_reader.await_args.kwargs == {
+        "limit_per_set": 3,
+        "use_prefix_cache": False,
+        "use_hot_prefixes": False,
+    }
     assert "plan_pricing_provider_npi_pending_stage" in session.calls[0][0]
     assert all(
         "plan_pricing_provider_membership" not in statement
@@ -134,6 +141,16 @@ async def test_declared_empty_provider_set_contributes_no_memberships(
     [
         ({}, {"1" * 32: ()}),
         (_provider_metadata(("1" * 32, 7, 1)), {"1" * 32: ()}),
+        (_provider_metadata(("1" * 32, 7, 0)), {}),
+        (
+            {
+                "1" * 32: SimpleNamespace(
+                    provider_set_key=True,
+                    provider_count=1,
+                )
+            },
+            {"1" * 32: (11,)},
+        ),
     ],
 )
 def test_provider_membership_requires_authoritative_count_parity(
@@ -146,3 +163,281 @@ def test_provider_membership_requires_authoritative_count_parity(
             metadata_by_id,
             npis_by_set,
         )
+
+
+def test_provider_membership_rejects_invalid_npis() -> None:
+    provider_set_id = "1" * 32
+
+    with pytest.raises(ValueError, match="membership exceeds its bound"):
+        provider_stage._validate_provider_set_memberships(
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            _provider_metadata((provider_set_id, 7, 1)),
+            {provider_set_id: (0,)},
+        )
+
+
+def test_provider_membership_accepts_large_complete_set_within_bound() -> None:
+    provider_set_id = "1" * 32
+    provider_count = provider_stage.MAX_PROVIDER_NPIS_PER_SET
+
+    provider_stage._validate_provider_set_memberships(
+        [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+        _provider_metadata((provider_set_id, 7, provider_count)),
+        {provider_set_id: tuple(range(1, provider_count + 1))},
+    )
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_hydrates_observed_large_set(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    provider_count = 40_000
+    metadata_reader = AsyncMock(
+        return_value=_provider_metadata((provider_set_id, 7, provider_count))
+    )
+    membership_reader = AsyncMock(
+        return_value={provider_set_id: tuple(range(1, provider_count + 1))}
+    )
+    monkeypatch.setattr(serving, "_provider_set_metadata_for_ids", metadata_reader)
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+
+    ordinal, memberships = await provider_stage._bounded_provider_memberships(
+        _ExecuteSession(),
+        _binding(3),
+        [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+        projection._BuildState(hashlib.sha256()),
+    )
+
+    assert ordinal == 3
+    assert memberships == {
+        provider_set_id: tuple(range(1, provider_count + 1))
+    }
+    assert membership_reader.await_args.kwargs == {
+        "limit_per_set": provider_count + 1,
+        "use_prefix_cache": False,
+        "use_hot_prefixes": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_set_stage_preserves_all_sets_across_smaller_batches(
+    monkeypatch,
+) -> None:
+    class _MappingRows:
+        def mappings(self):
+            return iter(())
+
+    class _EmptySession:
+        async def execute(self, *_args, **_kwargs):
+            return _MappingRows()
+
+    monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
+    stage_batch = AsyncMock()
+    serving_rows = [
+        {
+            "_ptg_provider_set_key": key,
+            "provider_set_global_id_128": f"{key:032x}",
+        }
+        for key in range(1, 12)
+    ]
+
+    await provider_stage._stage_code_provider_sets(
+        _EmptySession(),
+        _binding(),
+        serving_rows,
+        set(range(1, 12)),
+        projection._BuildState(hashlib.sha256()),
+        stage_provider_set_batch=stage_batch,
+    )
+
+    batches = [call.args[2] for call in stage_batch.await_args_list]
+    assert list(map(len, batches)) == [10, 1]
+    assert [
+        provider_set["provider_set_key"]
+        for batch in batches
+        for provider_set in batch
+    ] == list(range(1, 12))
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_rejects_cumulative_count_before_hydration(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    metadata_reader = AsyncMock(
+        return_value=_provider_metadata((provider_set_id, 7, 2))
+    )
+    membership_reader = AsyncMock()
+    monkeypatch.setattr(serving, "_provider_set_metadata_for_ids", metadata_reader)
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+    state = projection._BuildState(hashlib.sha256())
+    state.provider_membership_count = (
+        provider_stage.MAX_PROJECTION_PROVIDER_MEMBERSHIPS - 1
+    )
+
+    with pytest.raises(ValueError, match="membership bound exceeded"):
+        await provider_stage._bounded_provider_memberships(
+            _ExecuteSession(),
+            _binding(),
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            state,
+        )
+
+    membership_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_accepts_empty_batch_without_hydration(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value={}),
+    )
+    membership_reader = AsyncMock()
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+
+    ordinal, memberships = await provider_stage._bounded_provider_memberships(
+        _ExecuteSession(),
+        _binding(3),
+        [],
+        projection._BuildState(hashlib.sha256()),
+    )
+
+    assert ordinal == 3
+    assert memberships == {}
+    membership_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_rejects_incomplete_hydration_batch(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value=_provider_metadata((provider_set_id, 7, 1))),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_provider_npis_for_sets",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(ValueError, match="membership is incomplete"):
+        await provider_stage._bounded_provider_memberships(
+            _ExecuteSession(),
+            _binding(),
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            projection._BuildState(hashlib.sha256()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_rejects_underdeclared_exact_membership(
+    monkeypatch,
+) -> None:
+    provider_set_id = "1" * 32
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value=_provider_metadata((provider_set_id, 7, 1))),
+    )
+    exact_reader = AsyncMock(
+        return_value={
+            provider_set_id: (
+                serving._ptg2_npi_member_id(11),
+                serving._ptg2_npi_member_id(12),
+            )
+        }
+    )
+    monkeypatch.setattr(serving, "_provider_npi_member_ids_by_set", exact_reader)
+
+    with pytest.raises(ValueError, match="membership is incomplete"):
+        await provider_stage._bounded_provider_memberships(
+            _ExecuteSession(),
+            _binding(),
+            [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
+            projection._BuildState(hashlib.sha256()),
+        )
+
+    assert exact_reader.await_args.kwargs == {
+        "limit_per_set": 2,
+        "use_hot_prefixes": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_projection_membership_batches_by_declared_count(monkeypatch) -> None:
+    first_id = "1" * 32
+    second_id = "2" * 32
+    monkeypatch.setattr(provider_stage, "MAX_PROVIDER_NPIS_PER_SET", 3)
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(
+            return_value=_provider_metadata(
+                (first_id, 7, 2),
+                (second_id, 8, 2),
+            )
+        ),
+    )
+    membership_reader = AsyncMock(
+        side_effect=[{first_id: (11, 12)}, {second_id: (13, 14)}]
+    )
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", membership_reader)
+
+    _ordinal, memberships = await provider_stage._bounded_provider_memberships(
+        _ExecuteSession(),
+        _binding(),
+        [
+            {"provider_set_key": 7, "provider_set_id": first_id},
+            {"provider_set_key": 8, "provider_set_id": second_id},
+        ],
+        projection._BuildState(hashlib.sha256()),
+    )
+
+    assert memberships == {first_id: (11, 12), second_id: (13, 14)}
+    assert [call.args[2] for call in membership_reader.await_args_list] == [
+        (first_id,),
+        (second_id,),
+    ]
+    assert all(
+        call.kwargs
+        == {
+            "limit_per_set": 3,
+            "use_prefix_cache": False,
+            "use_hot_prefixes": False,
+        }
+        for call in membership_reader.await_args_list
+    )
+
+
+def test_projection_membership_batches_bound_heterogeneous_read_capacity(
+    monkeypatch,
+) -> None:
+    provider_set_ids = tuple(str(index) * 32 for index in range(1, 4))
+    metadata_by_id = {
+        provider_set_ids[0]: SimpleNamespace(provider_count=4),
+        provider_set_ids[1]: SimpleNamespace(provider_count=1),
+        provider_set_ids[2]: SimpleNamespace(provider_count=1),
+    }
+    monkeypatch.setattr(provider_stage, "MAX_PROVIDER_NPIS_PER_SET", 10)
+
+    batches = list(
+        provider_stage._provider_membership_batches(
+            provider_set_ids,
+            metadata_by_id,
+        )
+    )
+
+    assert batches == [provider_set_ids[:2], provider_set_ids[2:]]
+    for batch in batches:
+        maximum_limit = max(
+            metadata_by_id[provider_set_id].provider_count + 1
+            for provider_set_id in batch
+        )
+        assert len(batch) * maximum_limit <= 11

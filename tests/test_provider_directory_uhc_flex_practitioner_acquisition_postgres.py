@@ -246,7 +246,7 @@ async def _complete_baseline(database, baseline):
         _matched(first_npi),
         database=database,
     )
-    with pytest.raises(DBAPIError, match="acquisition_incomplete"):
+    with pytest.raises(UHCFlexPractitionerStoreError, match="state is invalid"):
         await seal_uhc_flex_practitioner_acquisition(baseline, database=database)
     await _release_and_retry(database, baseline, second_npi)
     summary = await seal_uhc_flex_practitioner_acquisition(

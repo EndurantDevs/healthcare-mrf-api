@@ -697,6 +697,7 @@ hospitals:
   name: Angleton Danbury Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
   locator_name: UTMB Health Angleton Danbury Hospital
+  alias_of: hospital-006921
 - hospital_id: hospital-000208
   name: Animas Surgical Hospital
   cms_hpt_url: https://www.animassurgical.com/cms-hpt.txt
@@ -993,6 +994,7 @@ hospitals:
 - hospital_id: hospital-000296
   name: Ascension Seton Bastrop
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  fallback_mrf_url: https://healthcare.ascension.org/-/media/project/ascension/healthcare/price-transparency-files/tx-csv/741109643-1619115383_ascension-seton_standardcharges.csv
 - hospital_id: hospital-000297
   name: Ascension Seton Hays
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -2445,6 +2447,7 @@ hospitals:
 - hospital_id: hospital-000719
   name: BARTLETT - Psychiatric Unit
   cms_hpt_url: https://www.bartletthospital.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbBRHJUNEAUAK&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-000720
   name: Bartlett Anesthesia Services
   cms_hpt_url: https://www.bartletthospital.org/cms-hpt.txt
@@ -3166,7 +3169,6 @@ hospitals:
 - hospital_id: hospital-000932
   name: BON AIR SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-000933
   name: Bon Secours Community Hospital
@@ -4121,7 +4123,6 @@ hospitals:
 - hospital_id: hospital-001217
   name: CHESTER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-001218
   name: Chestnut Hill Mental Health Center, Inc.
@@ -4768,6 +4769,7 @@ hospitals:
   name: Clear Lake Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
   locator_name: UTMB Health Clear Lake Hospital
+  alias_of: hospital-006922
 - hospital_id: hospital-001416
   name: Clear Vista Health and Wellness
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
@@ -7805,6 +7807,7 @@ hospitals:
 - hospital_id: hospital-002329
   name: Galveston Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
+  alias_of: hospital-006837
 - hospital_id: hospital-002330
   name: Garden City Hospital
   cms_hpt_url: https://gch.org/cms-hpt.txt
@@ -8455,7 +8458,6 @@ hospitals:
 - hospital_id: hospital-002523
   name: HANOVER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-002524
   name: Hansford County Hospital District
@@ -10360,7 +10362,6 @@ hospitals:
 - hospital_id: hospital-003083
   name: HULL STREET SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003084
   name: Humboldt County Memorial Hospital
@@ -10972,6 +10973,7 @@ hospitals:
 - hospital_id: hospital-003267
   name: Johnson County Hospital
   cms_hpt_url: https://jchosp.com/cms-hpt.txt
+  fallback_mrf_url: https://secure.claraprice.net/price-transparency/OPIU-1673956354318/machine-readable
 - hospital_id: hospital-003268
   name: Johnson Memorial Health
   cms_hpt_url: https://johnsonmemorial.org/cms-hpt.txt
@@ -11479,7 +11481,6 @@ hospitals:
 - hospital_id: hospital-003424
   name: LABURNUM SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003425
   name: Lackey Memorial Hospital
@@ -11796,6 +11797,7 @@ hospitals:
   name: League City Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
   locator_name: UTMB Health League City Hospital
+  alias_of: hospital-006923
 - hospital_id: hospital-003518
   name: League City Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
@@ -12216,6 +12218,7 @@ hospitals:
 - hospital_id: hospital-003648
   name: LTACH
   cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt
+  alias_of: hospital-005795
   locator_name: Silver Lake Hospital LTACH
 - hospital_id: hospital-003649
   name: Lubbock Heart & Surgical Hospital
@@ -12423,6 +12426,7 @@ hospitals:
 - hospital_id: hospital-003709
   name: MANCHESTER MEMORIAL HOSPITAL
   cms_hpt_url: https://echn.org/cms-hpt.txt
+  fallback_mrf_url: https://hartfordhealthcare.org/file%20library/price%20data/393859332_manchester-memorial-hospital_standardcharges.csv
 - hospital_id: hospital-003710
   name: MANGUM CITY HOSPITAL AUTHORITY
   cms_hpt_url: https://mangumregional.net/cms-hpt.txt
@@ -12503,6 +12507,7 @@ hospitals:
 - hospital_id: hospital-003733
   name: MARION GENERAL HOSPITAL
   cms_hpt_url: https://www.marionhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://cdn.accureg.net/trans/marion/35-0868130_Marion-General-Hospital_standardcharges.csv
 - hospital_id: hospital-003734
   name: Marion Regional Health-Winfield, Inc
   cms_hpt_url: https://www.nmhs.net/cms-hpt.txt
@@ -14254,7 +14259,6 @@ hospitals:
 - hospital_id: hospital-004255
   name: MIDTOWN SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-004256
   name: Midwest Medical Center
@@ -14803,6 +14807,7 @@ hospitals:
 - hospital_id: hospital-004418
   name: Mt Graham Regional Medical Center
   cms_hpt_url: https://www.mtgraham.org/cms-hpt.txt
+  alias_of: hospital-004360
 - hospital_id: hospital-004419
   name: Mt. Ascutney Hospital and Health Center
   cms_hpt_url: https://www.mtascutneyhospital.org/cms-hpt.txt
@@ -17115,6 +17120,7 @@ hospitals:
 - hospital_id: hospital-005115
   name: Phoebe Putney Memorial Hospital & North Campus
   cms_hpt_url: https://phoebehealth.com/cms-hpt.txt
+  locator_name: Phoebe Putney
 - hospital_id: hospital-005116
   name: Phoebe Putney North Campus
   cms_hpt_url: https://phoebehealth.com/cms-hpt.txt
@@ -17904,6 +17910,7 @@ hospitals:
 - hospital_id: hospital-005358
   name: Rehabilitation Hospital of Indiana
   cms_hpt_url: https://www.rhirehab.com/cms-hpt.txt
+  fallback_mrf_url: https://www.rhirehab.com/media/2612/2026-rhi-machine_readable-file.csv
 - hospital_id: hospital-005359
   name: Rehabilitation Hospital of Kingsport, a joint venture of Ballad Health and Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -18020,7 +18027,6 @@ hospitals:
 - hospital_id: hospital-005391
   name: REYNOLDS SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005392
   name: Rhode Island Hospital
@@ -18323,6 +18329,8 @@ hospitals:
 - hospital_id: hospital-005482
   name: Rockville General
   cms_hpt_url: https://echn.org/cms-hpt.txt
+  locator_name: Rockville General
+  fallback_mrf_url: https://hartfordhealthcare.org/file%20library/price%20data/393859332_manchester-memorial-hospital_standardcharges.csv
 - hospital_id: hospital-005483
   name: ROCKY MTN HOSP FOR CHILDREN
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
@@ -18467,7 +18475,6 @@ hospitals:
 - hospital_id: hospital-005526
   name: SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
-  locator_name: Sheltering Arms Institute
   fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005527
   name: Saint Agnes Medical Center
@@ -18996,11 +19003,11 @@ hospitals:
 - hospital_id: hospital-005684
   name: Schneck Medical Center Hospital
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
-  locator_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
+  fallback_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
 - hospital_id: hospital-005685
   name: Schneck Medical Center Physician Practices
   cms_hpt_url: https://www.schneckmed.org/cms-hpt.txt
-  locator_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
+  fallback_mrf_url: https://d188lfxfyq6i9j.cloudfront.net/general-uploads/PDF-Assets/35-1163135_Jackson-County-Schneck-Memorial-Hospital_standardcharges.csv
 - hospital_id: hospital-005686
   name: Schoolcraft Memorial Hospital
   cms_hpt_url: https://scmh.org/cms-hpt.txt
@@ -19808,6 +19815,7 @@ hospitals:
 - hospital_id: hospital-005925
   name: Southwest Arkansas Regional Medical Center
   cms_hpt_url: https://www.swarmc.org/cms-hpt.txt
+  fallback_mrf_url: https://www.swarmc.org/wp-content/uploads/2026/05/994554436_southwest-arkansas-regional-medical-center_standardcharges-1.csv
 - hospital_id: hospital-005926
   name: Southwest General Health Center
   cms_hpt_url: https://www.swgeneral.com/cms-hpt.txt
@@ -22508,6 +22516,7 @@ hospitals:
 - hospital_id: hospital-006730
   name: UNION GENERAL HOSPITAL
   cms_hpt_url: https://www.uniongen.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbUGHFARMERVILLELA&type=CDMWithoutLabel
 - hospital_id: hospital-006731
   name: union hospital
   cms_hpt_url: https://my.clevelandclinic.org/cms-hpt.txt
@@ -22517,6 +22526,7 @@ hospitals:
 - hospital_id: hospital-006733
   name: Union Hospital Inc
   cms_hpt_url: https://union.health/cms-hpt.txt
+  locator_name: Union Hospital Terre Haute
 - hospital_id: hospital-006734
   name: Union Hospital Regional
   cms_hpt_url: https://union.health/cms-hpt.txt
@@ -22694,6 +22704,7 @@ hospitals:
 - hospital_id: hospital-006790
   name: University Hospitals Lake West Medical Center Psychiatric Unit
   cms_hpt_url: https://uhhospitals.org/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/11435/341425870-1972689172_university-hospitals-health-system_standardcharges.csv
 - hospital_id: hospital-006791
   name: University Hospitals Parma Medical Center
   cms_hpt_url: https://uhhospitals.org/cms-hpt.txt
@@ -23066,6 +23077,7 @@ hospitals:
 - hospital_id: hospital-006906
   name: Upson Regional Medical Center
   cms_hpt_url: https://urmc.org/cms-hpt.txt
+  fallback_mrf_url: https://hospitalpricedisclosure.com/download.aspx?ci=S5WFReNwWX5BkPqChnLG0w*-*
 - hospital_id: hospital-006907
   name: Upstate Community Hospital
   cms_hpt_url: https://www.upstate.edu/cms-hpt.txt
@@ -23392,6 +23404,7 @@ hospitals:
 - hospital_id: hospital-007007
   name: Wagoner Orthopedic Center
   cms_hpt_url: https://wagonerhospital.com/cms-hpt.txt
+  locator_name: Wagoner Community Hospital
 - hospital_id: hospital-007008
   name: WakeMed Cary Hospital
   cms_hpt_url: https://www.wakemed.org/cms-hpt.txt
@@ -24616,3 +24629,6 @@ hospitals:
 - hospital_id: hospital-007365
   name: "Hale County Hospital"
   cms_hpt_url: https://www.halecountyhospital.com/cms-hpt.txt
+- hospital_id: hospital-007366
+  name: "Silver Lake Hospital Dual Diagnosis"
+  cms_hpt_url: https://www.silverlakehospital.org/cms-hpt.txt

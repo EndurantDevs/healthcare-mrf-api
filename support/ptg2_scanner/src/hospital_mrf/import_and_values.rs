@@ -164,7 +164,7 @@ fn import_hospital_mrf_with_output_mode(
             HOSPITAL_MRF_SCHEMA_REVISION,
         ),
         HospitalMrfOutputMode::Packed => (
-            "hospital-mrf-copy-v2-v3-packed-v7",
+            "hospital-mrf-copy-v2-v3-packed-v8",
             HOSPITAL_MRF_PACKED_SCHEMA_REVISION,
         ),
     };
@@ -321,6 +321,16 @@ fn positive_decimal(value: &str, field: &str) -> io::Result<String> {
     Ok(canonical)
 }
 
+fn nonnegative_decimal(value: &str, field: &str) -> io::Result<String> {
+    let Some(canonical) = canonical_decimal_text(value.trim()) else {
+        return Err(invalid(format!("{field} must be an exact decimal number")));
+    };
+    if canonical.starts_with('-') {
+        return Err(invalid(format!("{field} must be zero or greater")));
+    }
+    Ok(canonical)
+}
+
 fn optional_decimal(value: &str, field: &str) -> io::Result<Option<String>> {
     match optional_text(value) {
         Some(value) => positive_decimal(&value, field).map(Some),
@@ -446,11 +456,8 @@ fn canonical_drug_type(value: &str, normalize_case: bool) -> io::Result<String> 
 }
 
 fn canonical_billing_class(value: &str, normalize_case: bool) -> io::Result<String> {
-    let value = if normalize_case {
-        value.trim().to_ascii_lowercase()
-    } else {
-        value.to_owned()
-    };
+    let value = if normalize_case { value.trim() } else { value };
+    let value = value.to_ascii_lowercase();
     match value.as_str() {
         "professional" | "facility" | "both" => Ok(value),
         "hospital" | "facilty" if normalize_case => Ok("facility".to_owned()),

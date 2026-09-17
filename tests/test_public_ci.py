@@ -25,6 +25,8 @@ JOB_LABELS = {
     "address-canonical-db-tests": "${{ matrix.label }}",
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
+    "dev-image-publication": "DEV image publication",
+    "artifact-cleanup": "CI artifact cleanup",
 }
 MATRIX_ROWS_BY_JOB = {
     "python-tests": [
@@ -32,17 +34,25 @@ MATRIX_ROWS_BY_JOB = {
         for index in range(4)
     ],
     "address-canonical-db-tests": [
-        {"shard": "core", "label": "Database tests (core)", "output": "artifact_core"},
-        {"shard": "provider-directory", "label": "Database tests (directory)", "output": "artifact_provider_directory"},
-        {"shard": "provider-profile", "label": "Database tests (profiles)", "output": "artifact_provider_profile"},
+        {"shard": shard, "label": f"Database tests ({label})", "output": f"artifact_{shard.replace('-', '_')}"}
+        for shard, label in (
+            ("core-services", "services"),
+            ("core-imports", "imports"),
+            ("core-ptg", "PTG"),
+            ("directory-source", "directory source"),
+            ("directory-storage", "directory storage"),
+            ("directory-address", "directory address"),
+            ("profile-storage", "profile storage"),
+            ("profile-publication", "profile publication"),
+        )
     ],
 }
 
 
 def _assert_job_label(job_id, job) -> None:
     """Keep skipped metadata contexts separate from every real shard label."""
-    if job_id == "smoke":
-        assert job["name"] == "portable import checks"
+    if job_id in {"smoke", "source-validation"}:
+        assert job["name"] == JOB_LABELS[job_id]
         return
     if job_id in MATRIX_ROWS_BY_JOB:
         assert job["name"] == "${{ " + METADATA_ONLY + f" && '{job_id} (metadata only)' || matrix.label " + "}}"
@@ -74,9 +84,82 @@ def _assert_job_actions(job_id, job, revision) -> None:
     assert has_pinned_checkout or job_id in {"smoke", "source-validation"}
 
 
+def _assert_smoke_job(workflow, workflow_text) -> None:
+    """Require the portable smoke job to use the pinned public toolchain."""
+    job = workflow["jobs"]["smoke"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert "container" not in job
+    assert "services" not in job
+    assert not job.get("continue-on-error")
+    setup = next(step for step in job["steps"] if step.get("name") == "Install Python")
+    assert setup == {
+        "name": "Install Python",
+        "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "with": {"python-version": "3.14.7"},
+    }
+    bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
+    assert bootstrap["run"] == (
+        "printf '%s\\n' 'uv==0.12.12 "
+        "--hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n"
+        "  python -m pip install --disable-pip-version-check --no-deps "
+        "--only-binary=:all: --require-hashes -r /dev/stdin\n"
+        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
+    )
+    commands = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "scripts/ci/public_hygiene.py" in commands
+    assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
+    assert "uv pip install --python .venv/bin/python" in commands
+    assert ".venv/bin/python -m pytest -q" in commands
+    assert "python -m pip install" not in "\n".join(
+        step.get("run", "") for step in job["steps"] if step is not bootstrap
+    )
+    assert "test_process_" in commands or "tests/process/" in commands
+    assert all(
+        token not in workflow_text
+        for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
+    )
+
+
+def _assert_source_validation_job(workflow) -> None:
+    """Keep metadata-only required validation tied to a completed full public run."""
+    job = workflow["jobs"]["source-validation"]
+    assert job["name"] == "Validation complete"
+    assert job["timeout-minutes"] == 45
+    assert job["if"] == "${{ always() }}"
+    assert job["permissions"] == {"actions": "read"}
+    step = job["steps"]
+    assert step == [{
+        "name": "Require complete public validation",
+        "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "METADATA_ONLY": "${{ " + METADATA_ONLY + " }}",
+            "PR_NUMBER": "${{ github.event.pull_request.number || '' }}",
+            "SOURCE_SHA": "${{ github.event.pull_request.head.sha || github.sha }}",
+            "BASE_SHA": "${{ github.event.pull_request.base.sha || '' }}",
+            "RESULTS": "${{ toJSON(needs.*.result) }}",
+        },
+        "run": step[0]["run"],
+    }]
+    run = step[0]["run"]
+    assert "if [ \"$METADATA_ONLY\" != true ]; then" in run
+    assert "jq -e 'length > 0 and all(. == \"success\")' <<< \"$RESULTS\"" in run
+    assert "if ! validation_state=\"$(" in run
+    assert "actions/workflows/ci.yml/runs?event=pull_request&head_sha=$SOURCE_SHA&per_page=100" in run
+    assert 'select(.name == "CI" and .display_title == "CI")' in run
+    assert (
+        "select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber) "
+        "and .head.sha == env.SOURCE_SHA and .base.sha == env.BASE_SHA))"
+    ) in run
+    assert "sort_by([(.run_started_at // .created_at), .id, .run_attempt])" in run
+    assert "validation_state=pending" in run
+    assert "deadline=$((SECONDS + 2400))" in run
+    assert "sleep 15" in run
+    assert run.endswith("done\n")
+
+
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
-    assert sorted(path.name for path in workflows.iterdir()) == ["ci.yml"]
+    assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
@@ -96,32 +179,67 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["concurrency"] == {
         "group": (
             "${{ " + METADATA_ONLY
-            + " && format('ci-metadata-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
+            + " && format('ci-metadata-{0}', github.event.pull_request.number) || github.event_name == 'push' "
+            + "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
-        "cancel-in-progress": "${{ !(" + METADATA_ONLY + ") && github.ref != 'refs/heads/main' }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
         condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
+        elif job_id == "source-validation":
+            assert job["if"] == "${{ always() }}"
         else:
             assert job["if"] == "${{ !(" + METADATA_ONLY + ") && (" + condition + ") }}"
         assert "uses" not in job
         assert job["runs-on"] == "ubuntu-latest"
         assert not job.get("continue-on-error")
-        assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
+        if job_id == "dev-image-publication":
+            assert job["permissions"] == {
+                "contents": "read", "pull-requests": "read", "actions": "read", "packages": "write",
+            }
+        elif job_id == "artifact-cleanup":
+            assert job["permissions"] == {"contents": "read", "actions": "write"}
+        else:
+            assert all(permission in {"read", "none"} for permission in job.get("permissions", {}).values())
         _assert_job_actions(job_id, job, revision)
-    job = workflow["jobs"]["smoke"]
+    _assert_smoke_job(workflow, text)
+    _assert_source_validation_job(workflow)
+
+
+def test_stale_artifact_cleanup_is_main_only_and_pinned():
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/artifact-cleanup.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    revision = yaml.safe_load((path.parent / "ci.yml").read_text())["env"]["CI_REVISION"]
+    assert workflow.get("on", workflow.get(True)) == {
+        "schedule": [{"cron": "47 2 * * *"}], "workflow_dispatch": None,
+    }
+    assert workflow["permissions"] == {
+        "contents": "read", "pull-requests": "read", "actions": "write",
+    }
+    assert workflow["concurrency"] == {
+        "group": "public-artifact-cleanup", "cancel-in-progress": False,
+    }
+    assert set(workflow["jobs"]) == {"stale-cleanup"}
+    job = workflow["jobs"]["stale-cleanup"]
+    assert job["if"] == (
+        "github.repository == 'EndurantDevs/healthcare-mrf-api' "
+        "&& github.ref == 'refs/heads/main'"
+    )
     assert job["runs-on"] == "ubuntu-latest"
-    assert "container" not in job
-    assert "services" not in job
-    assert not job.get("continue-on-error")
-    commands = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "scripts/ci/public_hygiene.py" in commands
-    assert "python -m pytest -q" in commands
-    assert "test_process_" in commands or "tests/process/" in commands
-    assert all(token not in text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted"))
+    assert job["timeout-minutes"] == 30
+    assert job["steps"] == [
+        {"name": "Check out trusted artifact lifecycle",
+         "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+         "with": {"repository": "EndurantDevs/endurant-ci",
+                  "ref": revision, "path": "ci",
+                  "persist-credentials": False}},
+        {"name": "Delete only obsolete authenticated artifacts",
+         "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
+         "run": "python3 ci/scripts/artifact_cleanup.py --stale"},
+    ]
 
 
 def test_dependency_updates_target_the_development_branch():
@@ -170,11 +288,14 @@ def test_public_test_matrices_fail_fast_and_preserve_all_shards():
         _assert_matrix_artifact_identity(job_id, job)
 
 
-def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
+def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
-    jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
     publisher = jobs["measurement"]
-    assert set(publisher["needs"]) == set(JOB_LABELS) - {"smoke", "measurement", "source-validation"}
+    assert set(publisher["needs"]) == set(JOB_LABELS) - {
+        "smoke", "measurement", "source-validation", "dev-image-publication", "artifact-cleanup",
+    }
     download = next(step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts")
     identities = [" ".join(selector.split()) for selector in download["with"]["artifact-ids"].split(",")]
     expected_ids = [f"${{{{ needs.python-tests.outputs.artifact_{index} }}}}" for index in range(4)]
@@ -182,11 +303,23 @@ def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
         "${{ needs.capacity-evidence.outputs.artifact_id }}", "${{ needs.rust-scanner.outputs.artifact_id }}",
     ])
     expected_ids.extend(
-        "${{ needs.address-canonical-db-tests.outputs." + row["output"] + " }}"
-        for row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
+        "${{ needs.address-canonical-db-tests.outputs." + matrix_row["output"] + " }}"
+        for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 9
+    assert len(set(identities)) == 14
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
+    assert jobs["dev-image-publication"]["needs"] == [
+        "smoke", "source-validation", "container-package", "measurement",
+    ]
+    assert jobs["dev-image-publication"]["env"] == {
+        "CI_REVISION": workflow["env"]["CI_REVISION"],
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "IMAGE_ARTIFACT_ID": "${{ needs.container-package.outputs.image_artifact_id }}",
+        "MEASUREMENT_ARTIFACT_ID": "${{ needs.measurement.outputs.measurement_artifact_id }}",
+    }
+    assert jobs["artifact-cleanup"]["needs"] == [
+        "dev-image-publication", "container-package", "measurement",
+    ]

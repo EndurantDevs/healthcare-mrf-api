@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from process.ptg_graph_resource_admission import (
+    V4GraphResourceAdmissionError,
+    graph_admission_environment_name,
+)
+
 import asyncio
 import contextlib
 import hashlib
@@ -329,10 +334,6 @@ class _CompilerSummaryExpectation:
     options: Mapping[str, int]
     tax_identity: Mapping[str, Any] | None
     taxonomy_rule_count: int | None
-
-
-class V4GraphResourceAdmissionError(RuntimeError):
-    """The compiler rejected declared factor scale before opening the model."""
 
 
 @dataclass
@@ -1584,11 +1585,11 @@ def _resource_admission_option_defaults() -> dict[str, int]:
 
     return {
         "max_estimated_model_bytes": _positive_env_int(
-            PTG2_V4_GRAPH_MAX_MODEL_BYTES_ENV,
+            graph_admission_environment_name(PTG2_V4_GRAPH_MAX_MODEL_BYTES_ENV),
             PTG2_V4_GRAPH_DEFAULT_MAX_MODEL_BYTES,
         ),
         "max_factor_edges": _positive_env_int(
-            PTG2_V4_GRAPH_MAX_FACTOR_EDGES_ENV,
+            graph_admission_environment_name(PTG2_V4_GRAPH_MAX_FACTOR_EDGES_ENV),
             PTG2_V4_GRAPH_DEFAULT_MAX_FACTOR_EDGES,
         ),
     }
@@ -4834,14 +4835,13 @@ async def compile_provider_graph_v4_rust(
                 await stderr_task
         if return_code != 0:
             error_tail = _read_error_tail(stderr_path)
-            error_type = (
-                V4GraphResourceAdmissionError
-                if "resource_admission:" in error_tail
-                else RuntimeError
-            )
-            raise error_type(
-                f"V4 graph compiler exited with status {return_code}: {error_tail}"
-            )
+            if "resource_admission:" in error_tail:
+                raise V4GraphResourceAdmissionError(
+                    error_tail, input_bytes=expected_input_bytes,
+                    factor_edges=expected_factor_edges, factor_owners=expected_factor_owners,
+                    options=effective_options,
+                )
+            raise RuntimeError(f"V4 graph compiler exited with status {return_code}: {error_tail}")
         if not progress_state.terminal:
             raise RuntimeError(
                 "V4 graph compiler exited without a terminal progress event"

@@ -77,12 +77,7 @@ def _bound_official_content_proof() -> dict[str, object]:
     proof_builder.observe_rows(
         [
             (resource_type, resource_id, payload_hash, "{}", "synthetic")
-            for resource_type, resource_id, payload_hash in (
-                ("Practitioner", "practitioner-1", "1" * 64),
-                ("Practitioner", "practitioner-2", "2" * 64),
-                ("Practitioner", "practitioner-3", "3" * 64),
-                ("Organization", "organization-1", "4" * 64),
-            )
+            for resource_type, resource_id, payload_hash in cohort_support.official_resource_specs()
         ],
         input_lineage=[{
             "source_file_id": "synthetic-file",
@@ -103,14 +98,14 @@ def _bound_official_content_proof() -> dict[str, object]:
             canonical_contract_id="synthetic-canonical-v1",
         ),
         UhcCanonicalNpiProof(
-            evidence_count=2,
-            distinct_npis=2,
+            evidence_count=len(cohort_support.MEMBER_NPIS),
+            distinct_npis=len(cohort_support.MEMBER_NPIS),
             proof_sha256="a" * 64,
             shards=({
                 "source_id": cohort_support.UHC_PROVIDER_FILE_SOURCE_ID,
                 "source_file_id": "synthetic-file",
                 "range_ordinal": 0,
-                "row_count": 2,
+                "row_count": len(cohort_support.MEMBER_NPIS),
                 "input_sha256": "b" * 64,
                 "artifact_sha256": "6" * 64,
                 "layout_sha256": "e" * 64,

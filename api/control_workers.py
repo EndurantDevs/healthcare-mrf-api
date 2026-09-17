@@ -84,6 +84,10 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:ProviderDirectoryFHIR", "process.ProviderDirectoryFHIR", ("provider-directory-fhir",)),
     WorkerSpec("arq:FloridaMQAProfile", "process.FloridaMQAProfile", ("florida-mqa-profile",)),
     WorkerSpec("arq:MassachusettsBORIMProfile", "process.MassachusettsBORIMProfile", ("massachusetts-borim-profile",)),
+    WorkerSpec("arq:KentuckyKBMLProfile", "process.KentuckyKBMLProfile", ("kentucky-kbml-profile",)),
+    WorkerSpec("arq:TennesseeTDHProfile", "process.TennesseeTDHProfile", ("tennessee-tdh-profile",)),
+    WorkerSpec("arq:RhodeIslandDOHProfile", "process.RhodeIslandDOHProfile", ("rhode-island-doh-profile",)),
+    WorkerSpec("arq:NewYorkNYPPProfile", "process.NewYorkNYPPProfile", ("new-york-nypp-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),
     WorkerSpec("arq:PlacesZcta", "process.PlacesZcta", ("places-zcta",)),
@@ -884,12 +888,12 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
-def _worker_job_container(
+def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
-    image: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    """Build the container and volume records for one worker Job."""
+) -> tuple[list[dict[str, Any]], str]:
+    """Build the explicit environment for one worker Job."""
+
     env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
@@ -917,7 +921,31 @@ def _worker_job_container(
                 "value": "68719476736",
             }
         )
+    if spec.worker_class == "process.HospitalPrices":
+        env_list.append(
+            {
+                "name": "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS",
+                "value": (
+                    "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,"
+                    "shelteringarmsinstitute.com,bilh.org,ajh.org,bidmilton.org,"
+                    "bidneedham.org,bidplymouth.org,bidmc.org,exeterhospital.org,"
+                    "mountauburnhospital.org,nebh.org,winchesterhospital.org,"
+                    "www.northwell.edu"
+                ),
+            }
+        )
     env_list.extend(_worker_job_secret_env(spec.worker_class))
+    return env_list, run_id
+
+
+def _worker_job_container(
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+    image: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Build the container and volume records for one worker Job."""
+
+    env_list, run_id = _worker_job_environment(spec, launch_request)
 
     container_dict: dict[str, Any] = {
         "name": "worker",
@@ -1124,28 +1152,31 @@ def _worker_job_pod_security_context(
     return security_context_dict
 
 
-def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    profile = _worker_job_resource_profile(spec, payload or {})
+def _worker_job_resources(spec: WorkerSpec, payload_by_field: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = _worker_job_resource_profile(spec, payload_by_field or {})
     if profile:
         return profile
-    if spec.worker_class == "process.MassachusettsBORIMProfile":
+    if spec.worker_class == "process.TennesseeTDHProfile":
+        return {"requests": {"cpu": "1", "memory": "4Gi"},
+                "limits": {"cpu": "4", "memory": "8Gi"}}
+    if spec.worker_class in {"process.MassachusettsBORIMProfile", "process.KentuckyKBMLProfile", "process.RhodeIslandDOHProfile"}:
         return {"requests": {"cpu": "500m", "memory": "512Mi"},
                 "limits": {"cpu": "4", "memory": "4Gi"}}
     requests_dict = {
-        key: value
-        for key, value in {
+        key: resource_value
+        for key, resource_value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_REQUEST", "").strip(),
             "memory": os.getenv("HLTHPRT_WORKER_JOB_MEMORY_REQUEST", "").strip(),
         }.items()
-        if value
+        if resource_value
     }
     limits_dict = {
-        key: value
-        for key, value in {
+        key: resource_value
+        for key, resource_value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_LIMIT", "").strip(),
             "memory": os.getenv("HLTHPRT_WORKER_JOB_MEMORY_LIMIT", "").strip(),
         }.items()
-        if value
+        if resource_value
     }
     resource_dict: dict[str, Any] = {}
     if requests_dict:
