@@ -320,6 +320,7 @@ def strict_snapshot_tables(snapshot_id="ptg2:test", *, v4=False):
         "ptg2:test": 17,
         "ptg2:test:ndc": 41,
         "ptg2:test:c2": 42,
+        "ptg2:test:rx": 43,
     }
     return types.SimpleNamespace(
         uses_shared_blocks=True,
@@ -945,6 +946,98 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
         provider_params["page_snapshot_key_0"],
         provider_params["page_snapshot_key_1"],
     } == {41, 42}
+
+
+ADVERSARIAL_SNAPSHOT_PAIRS = [
+    ("ptg_ndc", "ptg2:test:ndc"),
+    ("ptg_c2", "ptg2:test:c2"),
+    ("ptg_rx", "ptg2:test:rx"),
+]
+ADVERSARIAL_PROVIDER_STREAMS = [
+    [1000000001, 1000000002, 1000000003, 1000000004, 1000000005, 1000000006],
+    [1000000001, 1000000003, 1000000007, 1000000008],
+    [1000000002, 1000000003, 1000000009],
+]
+
+
+async def fake_adversarial_snapshot_pairs(_session, _plan_fields):
+    return ADVERSARIAL_SNAPSHOT_PAIRS
+
+
+async def fake_adversarial_serving_tables(_session, snapshot_id):
+    return strict_snapshot_tables(snapshot_id)
+
+
+def adversarial_provider_pages(cursor, limit):
+    eligible_streams = [
+        [npi for npi in provider_stream if npi > cursor]
+        for provider_stream in ADVERSARIAL_PROVIDER_STREAMS
+    ]
+    unbounded_page = sorted(set().union(*map(set, eligible_streams)))[:limit]
+    bounded_page = sorted(
+        set().union(
+            *(set(eligible_stream[:limit]) for eligible_stream in eligible_streams)
+        )
+    )[:limit]
+    return bounded_page, unbounded_page
+
+
+@pytest.mark.asyncio
+async def test_group_plan_provider_stream_limits_preserve_distinct_page_and_total(
+    monkeypatch,
+):
+    """Overlapping and skewed streams keep the global page and unbounded total."""
+    cursor = 1000000001
+    limit = 3
+    bounded_page, unbounded_page = adversarial_provider_pages(cursor, limit)
+    assert bounded_page == unbounded_page == [
+        1000000002,
+        1000000003,
+        1000000004,
+    ]
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_network_snapshots_for_plan",
+        fake_adversarial_snapshot_pairs,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        fake_adversarial_serving_tables,
+    )
+    request = make_request(
+        [
+            FakeResult(
+                rows=[types.SimpleNamespace(npi=npi) for npi in bounded_page]
+            ),
+            FakeResult(
+                scalar=len(set().union(*map(set, ADVERSARIAL_PROVIDER_STREAMS)))
+            ),
+        ],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "cursor": str(cursor),
+            "count": "true",
+            "enrich": "0",
+            "limit": str(limit),
+        },
+    )
+
+    response_payload = json.loads((await group_plan_providers(request)).body)
+
+    assert [
+        provider["npi"] for provider in response_payload["providers"]["items"]
+    ] == bounded_page
+    assert response_payload["providers"]["total_distinct"] == 9
+    page_sql = str(request.ctx.sa_session.executions[0][0][0])
+    count_sql = str(request.ctx.sa_session.executions[1][0][0])
+    assert page_sql.count("ORDER BY gm.npi") == len(ADVERSARIAL_SNAPSHOT_PAIRS)
+    assert page_sql.count("LIMIT :limit") == len(ADVERSARIAL_SNAPSHOT_PAIRS) + 1
+    assert "SELECT COUNT(DISTINCT gm.npi)" in count_sql
+    assert "LIMIT" not in count_sql
+    assert "cursor_npi" not in count_sql
 
 
 @pytest.mark.asyncio
