@@ -33,12 +33,9 @@ from tests.test_provider_directory_profile_capacity_attestation import (
 )
 
 UTC = datetime.timezone.utc
-EXECUTION_V2_FIXTURE = (
-    Path(__file__).resolve().parent
-    / "fixtures/provider_directory_profile_execution_v2_golden.json"
-)
-EXECUTION_V2_CANONICAL_SHA256 = "6f4355e826dcae31353d10603ee64c78bc568da7be78315ce99a53ae5bd1bff8"
-EXECUTION_V2_FILE_SHA256 = "bc36a10b6a95d57d293ef31e11a6cb1c7444c30b4597b619f0208ae628f8e179"
+EXECUTION_V2_FIXTURE = Path(__file__).resolve().parent / "fixtures/provider_directory_profile_execution_v2_golden.json"
+EXECUTION_V2_CANONICAL_SHA256 = "2aea70d19d3a4927eb5ca9e0fb45e9d5c356a677a8123ec1d8b16ccbb1c07935"
+EXECUTION_V2_FILE_SHA256 = "e8518483370e00ee74e3ce4b2b1e4adcfff0e76f1019f1c8f424c990df17a758"
 
 
 def _active_key(
@@ -148,7 +145,7 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
         + "\n"
     ).encode("ascii")
     assert fixture_bytes == regenerated_bytes
-    assert len(fixture_bytes) == 27_799
+    assert len(fixture_bytes) == 27_811
     assert fixture_bytes.endswith(b"\n")
     assert not fixture_bytes.endswith(b"\n\n")
     assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)
@@ -163,16 +160,11 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     execution = selection.validated_profile_execution(task_map)
     assert execution.generation == 11
-    assert (
-        execution.capacity_attestation
-        == task_map["provider_directory_profile_capacity_attestation"]
-    )
+    assert execution.capacity_attestation == task_map["provider_directory_profile_capacity_attestation"]
     verified = _verify(dict(execution.capacity_attestation))
     assert (
         verified.attestation_id
-        == task_map["provider_directory_profile_capacity_attestation"]["lease"][
-            "attestation_id"
-        ]
+        == task_map["provider_directory_profile_capacity_attestation"]["lease"]["attestation_id"]
     )
 
 
@@ -205,16 +197,12 @@ def test_trust_rejects_legacy_shape_duplicate_json_and_oversize():
         runtime.ProviderDirectoryProfileCapacityConfigurationError,
         match="trust_json_invalid",
     ):
-        runtime.configured_capacity_lease_trust(
-            '{"contract_id":"one","contract_id":"two"}'
-        )
+        runtime.configured_capacity_lease_trust('{"contract_id":"one","contract_id":"two"}')
     with pytest.raises(
         runtime.ProviderDirectoryProfileCapacityConfigurationError,
         match="trust_document_too_large",
     ):
-        runtime.configured_capacity_lease_trust(
-            "x" * (CAPACITY_TRUST_MAX_DOCUMENT_BYTES + 1)
-        )
+        runtime.configured_capacity_lease_trust("x" * (CAPACITY_TRUST_MAX_DOCUMENT_BYTES + 1))
 
 
 @pytest.mark.parametrize(
@@ -260,9 +248,7 @@ def test_trust_key_count_and_active_identity_are_bounded():
         }
         for index in range(CAPACITY_TRUST_MAX_KEYS + 1)
     ]
-    too_many_keys[-1].update(
-        {"status": "active", "retired_at": None, "verify_until": None}
-    )
+    too_many_keys[-1].update({"status": "active", "retired_at": None, "verify_until": None})
     with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(
             _trust_payload(
@@ -271,9 +257,7 @@ def test_trust_key_count_and_active_identity_are_bounded():
             )
         )
     with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
-        runtime.validated_capacity_lease_trust(
-            _trust_payload(active_key_id="unknown-key")
-        )
+        runtime.validated_capacity_lease_trust(_trust_payload(active_key_id="unknown-key"))
 
 
 @pytest.mark.parametrize(
@@ -311,10 +295,7 @@ def test_assigned_lease_selects_active_or_still_valid_retired_key():
 
     assert active_verified.key_id == "capacity-key-2026-07"
     assert retired_verified.key_id == active_verified.key_id
-    assert (
-        retired_verified.public_key_fingerprint
-        == active_verified.public_key_fingerprint
-    )
+    assert retired_verified.public_key_fingerprint == active_verified.public_key_fingerprint
 
 
 def test_retired_key_cannot_verify_post_retirement_or_overlong_lease():
