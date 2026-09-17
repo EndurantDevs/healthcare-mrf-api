@@ -98,7 +98,7 @@ def test_native_v4_v2_rejects_unbound_or_multiple_metadata_rows(tmp_path):
             _validate_packed_summary(summary, tmp_path)
 
 
-@pytest.mark.parametrize("schema_version", ("3.0.1", "4.0.0"))
+@pytest.mark.parametrize("schema_version", ("3", "3.0.1", "4.0.0"))
 @pytest.mark.parametrize("source_format", ("csv-tall", "csv-wide"))
 def test_native_summary_accepts_producer_declared_current_csv_only(
     tmp_path, source_format, schema_version
@@ -126,7 +126,7 @@ def test_native_summary_allows_legacy_without_npi_but_keeps_v3_strict(tmp_path):
     with pytest.raises(ValueError, match="v3 NPI"):
         _validate_packed_summary(summary, tmp_path)
 
-    for schema_version in ("3.0.1", "4.0.0"):
+    for schema_version in ("3", "3.0.1", "4.0.0"):
         summary.update(schema_version=schema_version, format="csv-tall")
         with pytest.raises(ValueError, match="v3 NPI"):
             _validate_packed_summary(summary, tmp_path)

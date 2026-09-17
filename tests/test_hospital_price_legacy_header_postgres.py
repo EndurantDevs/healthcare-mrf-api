@@ -57,6 +57,16 @@ async def test_postgres_v4_v2_requires_exact_current_csv_profile(monkeypatch) ->
     await prove_csv_profile_constraints(monkeypatch)
 
 
+@pytest.mark.asyncio
+async def test_postgres_csv_v3_label_is_current_parser_csv_only(monkeypatch) -> None:
+    """Run the Version=3 proof in the hosted PostgreSQL core inventory."""
+    from tests.test_hospital_price_csv_v3_label import (
+        prove_csv_v3_label_constraints,
+    )
+
+    await prove_csv_v3_label_constraints(monkeypatch)
+
+
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     """Keep legacy-only successor fields absent without relaxing v3."""
 
