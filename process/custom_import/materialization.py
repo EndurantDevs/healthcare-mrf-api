@@ -25,7 +25,7 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from db.models.custom_import import (
@@ -45,6 +45,13 @@ from process.custom_import.definition import (
     SelectionProfile,
     canonical_json,
     canonical_sha256,
+)
+from process.custom_import.family import (
+    MAX_SCALAR_INTEGER,
+    MAX_SCALAR_STRING_UTF8_BYTES,
+    MIN_SCALAR_INTEGER,
+    is_decimal_scalar_storage_valid,
+    normalize_source_decimal,
 )
 
 __all__ = (
@@ -75,13 +82,6 @@ __all__ = (
 
 _CONTEXT_DIGEST_PREFIX = b"custom-import/v1\x00winner-context\x00"
 _MAX_CONTEXT_BYTES = 8_192
-# This leaves a conservative margin below PostgreSQL btree tuple limits even
-# for incompressible UTF-8 text and the composite scalar indexes.
-_MAX_STRING_UTF8_BYTES = 2_048
-_MAX_INTEGER = 9_223_372_036_854_775_807
-_MIN_INTEGER = -9_223_372_036_854_775_808
-_MAX_DECIMAL_INTEGER_DIGITS = 18
-_MAX_DECIMAL_SCALE = 12
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _FIELD_TYPES = frozenset({"string", "integer", "decimal", "boolean", "date", "timestamp"})
 
@@ -234,8 +234,9 @@ class ValidatedWinnerCandidateStream:
 
     Its producer must build it only after proving every emitted root family and
     child context belongs to the immutable ``generation``.  Winner selection
-    intentionally consumes this source once and does not retain every input to
-    repeat membership or duplicate validation in memory.
+    intentionally consumes this source once.  It retains only selected winners
+    and bounded conflict state for their semantic tie keys; it never repeats
+    membership validation or materializes the input stream.
     """
 
     generation: GenerationIdentity
@@ -322,6 +323,8 @@ class _SelectedWinner:
     canonical_context_key: str
     context_key_sha256: bytes
     candidate: _NormalizedWinnerCandidate
+    has_physical_tie_conflict: bool = False
+    has_typed_tie_conflict: bool = False
 
 
 def project_root_scalars(
@@ -546,6 +549,7 @@ def _select_winners(
             selected_winner_by_context,
             canonical_context_by_digest,
         )
+    _raise_selected_winner_tie_conflicts(selected_winner_by_context)
     return selected_winner_by_context
 
 
@@ -743,7 +747,7 @@ def _typed_scalar(field: Field, raw_scalar: object) -> TypedScalar:
         if (
             not isinstance(raw_scalar, str)
             or "\x00" in raw_scalar
-            or _utf8_size(raw_scalar, field.field_id) > _MAX_STRING_UTF8_BYTES
+            or _utf8_size(raw_scalar, field.field_id) > MAX_SCALAR_STRING_UTF8_BYTES
         ):
             raise ScalarProjectionError(f"projected string field {field.field_id} exceeds its storage shape")
         return TypedScalar(field_type="string", value_state="value", string_value=raw_scalar)
@@ -751,7 +755,7 @@ def _typed_scalar(field: Field, raw_scalar: object) -> TypedScalar:
         if (
             isinstance(raw_scalar, bool)
             or not isinstance(raw_scalar, int)
-            or not _MIN_INTEGER <= raw_scalar <= _MAX_INTEGER
+            or not MIN_SCALAR_INTEGER <= raw_scalar <= MAX_SCALAR_INTEGER
         ):
             raise ScalarProjectionError(f"projected integer field {field.field_id} is outside BIGINT storage")
         return TypedScalar(field_type="integer", value_state="value", integer_value=raw_scalar)
@@ -779,17 +783,10 @@ def _typed_scalar(field: Field, raw_scalar: object) -> TypedScalar:
 
 
 def _decimal(value: object, field_id: str) -> Decimal:
-    if isinstance(value, (bool, float)):
-        raise ScalarProjectionError(f"projected decimal field {field_id} is not finite")
-    try:
-        decimal_value = Decimal(str(value))
-    except (InvalidOperation, ValueError) as exc:
-        raise ScalarProjectionError(f"projected decimal field {field_id} is not finite") from exc
-    if not decimal_value.is_finite():
-        raise ScalarProjectionError(f"projected decimal field {field_id} is not finite")
-    scale = max(-decimal_value.as_tuple().exponent, 0)
-    integer_digits = 0 if decimal_value.is_zero() else max(decimal_value.adjusted() + 1, 0)
-    if scale > _MAX_DECIMAL_SCALE or integer_digits > _MAX_DECIMAL_INTEGER_DIGITS:
+    decimal_value = normalize_source_decimal(value)
+    if decimal_value is None:
+        raise ScalarProjectionError(f"projected decimal field {field_id} has invalid source text")
+    if not is_decimal_scalar_storage_valid(decimal_value):
         raise ScalarProjectionError(f"projected decimal field {field_id} exceeds NUMERIC(30, 12) storage")
     return decimal_value
 
@@ -1077,7 +1074,16 @@ def _replace_winner_when_better(
             fields_by_id,
         )
         if comparison == 0:
-            _validate_retained_winner_tie(selected_winner.candidate, candidate)
+            physical_conflict, typed_conflict = _winner_tie_conflicts(selected_winner.candidate, candidate)
+            selected_winner_by_context[winner_context] = _SelectedWinner(
+                profile_id=selected_winner.profile_id,
+                profile_slot=selected_winner.profile_slot,
+                canonical_context_key=selected_winner.canonical_context_key,
+                context_key_sha256=selected_winner.context_key_sha256,
+                candidate=selected_winner.candidate,
+                has_physical_tie_conflict=selected_winner.has_physical_tie_conflict or physical_conflict,
+                has_typed_tie_conflict=selected_winner.has_typed_tie_conflict or typed_conflict,
+            )
             return
         if comparison > 0:
             return
@@ -1090,17 +1096,27 @@ def _replace_winner_when_better(
     )
 
 
-def _validate_retained_winner_tie(
+def _winner_tie_conflicts(
     retained_candidate: _NormalizedWinnerCandidate,
     incoming_candidate: _NormalizedWinnerCandidate,
-) -> None:
-    """Reject an equal semantic tie that would choose a physical row by input order."""
+) -> tuple[bool, bool]:
+    """Return physical and typed conflicts for two equal selected candidates."""
 
-    if _physical_candidate_identity(retained_candidate.candidate) != _physical_candidate_identity(
-        incoming_candidate.candidate
-    ):
+    return (
+        _physical_candidate_identity(retained_candidate.candidate)
+        != _physical_candidate_identity(incoming_candidate.candidate),
+        retained_candidate.values_by_field != incoming_candidate.values_by_field,
+    )
+
+
+def _raise_selected_winner_tie_conflicts(
+    selected_winner_by_context: Mapping[tuple[int, int, str], _SelectedWinner],
+) -> None:
+    """Reject only ties that remain at the deterministic winning semantic key."""
+
+    if any(winner.has_physical_tie_conflict for winner in selected_winner_by_context.values()):
         raise WinnerMaterializationError("equal semantic winner tie has conflicting physical identity")
-    if retained_candidate.values_by_field != incoming_candidate.values_by_field:
+    if any(winner.has_typed_tie_conflict for winner in selected_winner_by_context.values()):
         raise WinnerMaterializationError("equal semantic winner tie has conflicting typed values")
 
 
