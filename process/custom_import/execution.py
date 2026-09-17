@@ -194,8 +194,9 @@ async def require_separate_publication_transaction(session: AsyncSession) -> Non
     boundary explicit.  Committing only an ``AsyncSession`` savepoint joined
     to an externally owned transaction is not sufficient.  The atomic
     no-change path establishes its terminal result without calling a generic
-    lifecycle operation first.  Heartbeats are intentionally excluded: they
-    only lock their own execution and lease and never acquire the dataset.
+    lifecycle operation first.  Heartbeats use a narrower lock scope for
+    concurrency, but their execution and lease row locks remain held until the
+    root transaction ends, so publication still requires a new transaction.
     """
 
     current_transaction = session.get_transaction()
