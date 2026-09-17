@@ -6,16 +6,38 @@ import json
 
 import pytest
 
+from db.models.custom_import import CustomImportChildRevision, CustomImportRootRevision
 from process.custom_import.execution import MAX_BIGINT
 from process.custom_import.publication import (
     PublicationConflict,
+    _effective_output_revision_document,
     _event_document,
     _generation_publication_request,
     _increment_pointer_version,
+    _materialization_document,
     _pointer_version,
     _positive_integer,
     _PublicationEventDetails,
 )
+
+
+@pytest.mark.parametrize(
+    ("revision", "source_ordinal"),
+    (
+        (CustomImportRootRevision(source_ordinal=7), 7),
+        (CustomImportChildRevision(source_ordinal=9), 9),
+    ),
+    ids=("root", "child"),
+)
+def test_effective_output_revision_document_omits_only_source_position(revision, source_ordinal):
+    materialization_document = _materialization_document(revision)
+    effective_output_document = _effective_output_revision_document(revision)
+
+    assert materialization_document["source_ordinal"] == source_ordinal
+    assert "source_ordinal" not in effective_output_document
+    assert effective_output_document == {
+        key: value for key, value in materialization_document.items() if key != "source_ordinal"
+    }
 
 
 def test_publication_event_is_canonical_and_domain_separated():

@@ -2063,7 +2063,11 @@ async def test_contextual_winner_provenance_does_not_prevent_no_change(
                     candidate_attempt.generation_id,
                 )
                 assert candidate_seal is not None
-                assert candidate_seal.materialization_sha256 != base_seal.materialization_sha256
+                candidate_materialization = candidate_seal.materialization_sha256.hex()
+                if candidate_root_ordinal == 0 and candidate_child_ordinals == (0,):
+                    assert candidate_materialization == base_seal.materialization_sha256
+                else:
+                    assert candidate_materialization != base_seal.materialization_sha256
                 assert candidate_seal.effective_output_sha256.hex() == base_seal.effective_output_sha256
                 assert receipt.event_kind == "no_change"
 
