@@ -267,9 +267,8 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "service_address_key_npi",
     "service_premise_key_npi",
     "address_sources",
-    # The API phone-fallback lookup filters "address_key = ANY(..) OR
-    # premise_key = ANY(..)"; without a premise_key index the OR forces a full
-    # seq scan of the serving table (~3M pages, ~5.7s per location search).
+    # The phone fallback filters "address_key = ANY(..) OR premise_key = ANY(..)";
+    # without a premise_key index the OR scans the serving table.
     "premise_key",
     "taxonomy_plans_network",
     "service_plans_network_array",

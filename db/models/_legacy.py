@@ -6673,13 +6673,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "service_plans_network_array",
             "where": "type IN ('primary', 'secondary', 'practice', 'site')",
         },
-        # Composite ZIP+taxonomy lookup (requires the btree_gin extension) for
-        # group-plan specialty enumeration: both the zip5 fallback expression
-        # and the taxonomy overlap resolve inside ONE Index Cond, so a
-        # dense-metro specialty+radius query reads ~1k matching rows instead
-        # of heap-fetching every address in the radius (measured 114ms -> 58ms
-        # on dev). A standalone taxonomy GIN is deliberately NOT registered:
-        # the planner prefers it alone and regresses to a 300k-row scan.
+        # ZIP+taxonomy (btree_gin) keeps both predicates in one Index Cond; standalone taxonomy GIN scans broadly.
         {
             "index_elements": (
                 "(COALESCE(zip5, LEFT(COALESCE(postal_code, ''), 5)))",

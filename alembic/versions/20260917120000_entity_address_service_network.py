@@ -61,7 +61,7 @@ def _analyze_sql(schema: str) -> str:
     return f"ANALYZE {_qt(schema, TABLE_NAME)}"
 
 
-def _table_exists(schema: str) -> bool:
+def _has_table(schema: str) -> bool:
     return bool(
         op.get_bind()
         .execute(
@@ -72,7 +72,7 @@ def _table_exists(schema: str) -> bool:
     )
 
 
-def _same_name_relation_exists(schema: str) -> bool:
+def _has_same_name_relation(schema: str) -> bool:
     return bool(
         op.get_bind()
         .execute(
@@ -112,7 +112,7 @@ def _expected_index_shape(schema: str):
 def _matching_index_record(schema: str, expected_shape):
     record = _index_catalog_record(op, INDEX_NAME, TABLE_NAME, schema)
     if record is None:
-        if _same_name_relation_exists(schema):
+        if _has_same_name_relation(schema):
             raise RuntimeError(f"existing_schema_index_mismatch:{schema}.{INDEX_NAME}")
         return None
     if not all(record[field] for field in ("indisvalid", "indisready", "indislive")):
@@ -123,6 +123,8 @@ def _matching_index_record(schema: str, expected_shape):
 
 
 def upgrade() -> None:
+    """Create or repair the live serving index without blocking writers."""
+
     schema = _schema()
     context = op.get_context()
     op.execute(ENSURE_EXTENSION_SQL)
@@ -131,7 +133,7 @@ def upgrade() -> None:
             op.execute(_create_index_sql(schema))
         op.execute(_analyze_sql(schema))
         return
-    if not _table_exists(schema):
+    if not _has_table(schema):
         return
     expected_shape = _expected_index_shape(schema)
     existing_record = _matching_index_record(schema, expected_shape)
@@ -146,6 +148,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Drop only the service-location plan-network index."""
+
     schema = _schema()
     with op.get_context().autocommit_block():
         op.execute(_drop_index_sql(schema))
