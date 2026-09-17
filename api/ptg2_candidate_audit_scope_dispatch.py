@@ -137,7 +137,6 @@ async def _load_v4_scope(
     )
     if graph_root.representation == "pattern_v1":
         retained_baseline = retention_budget.retained_bytes
-        pattern_capacity_failed = False
         try:
             provider_sets_by_npi = await load_v4_pattern_provider_scope(
                 session,
@@ -150,8 +149,7 @@ async def _load_v4_scope(
         except Exception as exc:
             if not is_direct_graph_capacity_failure(exc):
                 raise
-            pattern_capacity_failed = True
-        if not pattern_capacity_failed:
+        else:
             return _provider_scope(provider_sets_by_npi)
         if retention_budget.retained_bytes != retained_baseline:
             raise CandidateAuditDecodedRetentionError(

@@ -302,16 +302,14 @@ async def test_pattern_v4_graph_failure_releases_budget_without_fallback(
     broad_scope_lookup.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_pattern_v4_capacity_falls_back_after_releasing_partial_results(
+def _install_partial_pattern_capacity_failure(
     monkeypatch,
+    challenges,
+    provider_sets_by_npi,
+    persisted,
+    budget,
+    baseline_bytes,
 ):
-    """Reuse the exact code-first proof only after graph claims are released."""
-
-    challenges, provider_sets_by_npi, persisted = _pattern_scope_fixture()
-    baseline_bytes = 731
-    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
-    budget.claim(baseline_bytes, category="the caller baseline")
     graph_lookup = AsyncMock(
         side_effect=(
             {challenges[0].npi: provider_sets_by_npi[challenges[0].npi]},
@@ -350,6 +348,29 @@ async def test_pattern_v4_capacity_falls_back_after_releasing_partial_results(
     )
     monkeypatch.setattr(scope_dispatch, "load_v4_candidate_scope", code_first)
     monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+    return expected_scope, graph_lookup, fallback_calls
+
+
+@pytest.mark.asyncio
+async def test_pattern_v4_capacity_falls_back_after_releasing_partial_results(
+    monkeypatch,
+):
+    """Reuse the exact code-first proof only after graph claims are released."""
+
+    challenges, provider_sets_by_npi, persisted = _pattern_scope_fixture()
+    baseline_bytes = 731
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    budget.claim(baseline_bytes, category="the caller baseline")
+    expected_scope, graph_lookup, fallback_calls = (
+        _install_partial_pattern_capacity_failure(
+            monkeypatch,
+            challenges,
+            provider_sets_by_npi,
+            persisted,
+            budget,
+            baseline_bytes,
+        )
+    )
 
     observed = await reverse_scope.load_candidate_provider_scope(
         AsyncMock(),
