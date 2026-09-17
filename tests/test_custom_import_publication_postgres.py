@@ -1949,6 +1949,8 @@ async def _seed_contextual_winner_candidate(
     *,
     base_generation_id: int | None,
     prior_material: FamilyMaterial | None = None,
+    root_source_ordinal: int = 0,
+    child_source_ordinals: tuple[int, ...] = (0,),
 ) -> tuple[GenerationAttempt, FamilyMaterial]:
     """Create one nonempty contextual winner, optionally reusing its stable identities."""
 
@@ -1970,6 +1972,8 @@ async def _seed_contextual_winner_candidate(
             child_keys=("contextual-winner-child",),
             root_record_id=None if prior_material is None else prior_material.root_record_id,
             entity_binding_id=None if prior_material is None else prior_material.entity_binding_id,
+            root_source_ordinal=root_source_ordinal,
+            child_source_ordinals=child_source_ordinals,
         ),
     )
     await attach_generation_family(session, graph, attempt, material)
@@ -1991,9 +1995,22 @@ async def _seed_contextual_winner_candidate(
     return attempt, material
 
 
+@pytest.mark.parametrize(
+    ("candidate_root_ordinal", "candidate_child_ordinals"),
+    (
+        (0, (0,)),
+        (7, (0,)),
+        (0, (9,)),
+        (7, (9,)),
+    ),
+    ids=("allocation-only", "root-reordered", "child-reordered", "root-and-child-reordered"),
+)
 @pytest.mark.asyncio
-async def test_contextual_winner_allocation_id_does_not_prevent_no_change():
-    """Equivalent child context keys remain no-change despite newly allocated child IDs."""
+async def test_contextual_winner_provenance_does_not_prevent_no_change(
+    candidate_root_ordinal: int,
+    candidate_child_ordinals: tuple[int, ...],
+):
+    """Equivalent output ignores allocation IDs and source-position provenance."""
 
     async with isolated_publication_case() as case:
         async with case.sessions() as session:
@@ -2026,6 +2043,8 @@ async def test_contextual_winner_allocation_id_does_not_prevent_no_change():
                     graph,
                     base_generation_id=base_attempt.generation_id,
                     prior_material=base_material,
+                    root_source_ordinal=candidate_root_ordinal,
+                    child_source_ordinals=candidate_child_ordinals,
                 )
                 assert candidate_material.child_revision_ids != base_material.child_revision_ids
 
@@ -2044,6 +2063,7 @@ async def test_contextual_winner_allocation_id_does_not_prevent_no_change():
                     candidate_attempt.generation_id,
                 )
                 assert candidate_seal is not None
+                assert candidate_seal.materialization_sha256 != base_seal.materialization_sha256
                 assert candidate_seal.effective_output_sha256.hex() == base_seal.effective_output_sha256
                 assert receipt.event_kind == "no_change"
 
@@ -3455,7 +3475,7 @@ async def _seed_finality_duplicate_legacy_events(case) -> None:
 
 @pytest.mark.asyncio
 async def test_finality_downgrade_restores_legacy_rejection_code_shape():
-    """A valid legacy rejection code remains insertable after downgrade."""
+    """A valid legacy rejection survives upgrade and a later downgrade."""
 
     async with isolated_publication_case() as case:
         async with case.engine.begin() as connection:
@@ -3487,7 +3507,20 @@ async def test_finality_downgrade_restores_legacy_rejection_code_shape():
                     "schema_revision_id": schema_revision_id,
                 },
             )
-        assert rejection_code == "invalid_child"
+            assert rejection_code == "invalid_child"
+            await connection.run_sync(_upgrade_finality_schema, case.schema_name)
+            await connection.run_sync(_downgrade_finality_schema, case.schema_name)
+            retained_rejection = (
+                await connection.execute(
+                    text(
+                        f"SELECT rejection_ordinal, code, canonical_evidence "
+                        f"FROM {_finality_table(case.schema_name, 'custom_import_rejection')} "
+                        "WHERE execution_id = :execution_id"
+                    ),
+                    {"execution_id": execution_id},
+                )
+            ).one()
+        assert retained_rejection == (0, "invalid_child", '{"reason":"synthetic"}')
 
 
 async def _finality_upgraded_duplicate_event_receipt(case) -> tuple[int | None, object | None]:
