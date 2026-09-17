@@ -99,7 +99,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_712
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 685
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 152
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 154
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -198,6 +198,38 @@ def test_reviewed_publisher_replacement_preserves_singleton_identity():
     )
     assert candidate.locator_url == hospital["cms_hpt_url"]
     assert candidate.observation_id == "synthetic-observation"
+
+
+@pytest.mark.parametrize(("hospital_id", "unmatched_name", "location_names", "ordinal"), (
+    ("hospital-000296", "Ascension Seton Hays (Ascension Seton)",
+     ("Ascension Seton Hays", "Ascension Seton Bastrop"), 1),
+    ("hospital-006790", "University Hospitals Lake West Medical Center",
+     ("University Hospitals Lake West Medical Center", "Unrelated Campus",
+      "University Hospitals Lake West Medical Center Psychiatric Unit"), 2),
+))
+def test_reviewed_fallback_preserves_unlisted_facility_location(
+    hospital_id: str,
+    unmatched_name: str,
+    location_names: tuple[str, ...],
+    ordinal: int,
+):
+    """A reviewed shared file keeps an unlisted facility's own location identity."""
+    hospital, = registry.selected_hospital_hpt_registry({"hospital_id": hospital_id})
+    acquisition = acquisition_module()
+    candidate, = acquisition.candidates_from_locators((acquisition.LocatorResult(
+        hospital["cms_hpt_url"],
+        "synthetic-locator",
+        "synthetic-observation",
+        (hospital,),
+        (HospitalHptLocatorRecord(unmatched_name, "https://files.example/stale.csv"),),
+    ),))
+    assert candidate.initial_error_code is None
+    assert candidate.source_url == hospital["fallback_mrf_url"]
+    assert candidate.locator_name == hospital["name"]
+    store, _native = store_module()
+    assert store._location_ordinals((candidate,), tuple(enumerate(location_names))) == {
+        hospital_id: ordinal,
+    }
 
 
 def test_sheltering_arms_fallbacks_preserve_distinct_location_bindings():
