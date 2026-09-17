@@ -1074,17 +1074,17 @@ class SnowflakeAcquisitionConnector:
         if not isinstance(credentials, SnowflakeKeyPairCredentials):
             raise SnowflakeConnectorError("credential provider returned an invalid key-pair value")
         result: object | None = None
-        acquisition_succeeded = False
+        is_acquisition_complete = False
         try:
             result = self._adapter.fetch_parquet(statement, credentials)
             if not isinstance(result, SnowflakeParquetResult):
                 raise SnowflakeConnectorError("adapter returned an invalid Parquet result")
             acquisition = _seal_acquisition(statement, result, capture_limits=self._capture_limits)
-            acquisition_succeeded = True
+            is_acquisition_complete = True
             return acquisition
         finally:
             if result is not None:
-                if acquisition_succeeded:
+                if is_acquisition_complete:
                     _close_adapter_result_after_success(result)
                 else:
                     _close_adapter_result_after_failure(result)
