@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+from dataclasses import dataclass
 from typing import Any, Mapping
 
+from process.ptg_parts import result_archive_candidate_initialization as initialization
 from process.ptg_parts.canonical import canonical_json_dumps
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
@@ -25,10 +27,20 @@ from process.ptg_parts.frozen_rate_binding import (
 from process.ptg_parts.frozen_rate_candidate import validate_frozen_candidate_evidence
 from process.ptg_parts.ptg2_invalid_price_exclusion import INVALID_PRICE_EXCLUSION_POLICY_FIELD
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
-from process.ptg_parts import result_archive_candidate_initialization as initialization
 from process.ptg_parts.result_archive_source_authority import validate_ptg_result_archive_source_authority
 
 RESULT_ARCHIVE_RECEIVE_BINDING_CONTRACT = "ptg_result_archive_receive_binding_v1"
+
+
+@dataclass(frozen=True)
+class _ReceiveContext:
+    destination_schema: str
+    staging_schema: str
+    snapshot_key: int
+    destination_snapshot: str
+    source_key: str
+    source_receipt: Mapping[str, Any]
+    destination_filing_id: str
 
 
 def _destination_filing_id(
@@ -64,7 +76,7 @@ def _received_parameters(
 
     source_binding = initialization._mapping(staged.get("binding_payload"))
     source_manifest = initialization._mapping(staged.get("manifest"))
-    parameters = {
+    parameter_mapping = {
         "import_id": destination_filing_id,
         "source_file_import_id": destination_filing_id,
         "source_key": source_key,
@@ -77,11 +89,11 @@ def _received_parameters(
         "frozen_rate_file_count": source_binding.get("frozen_rate_file_count"),
     }
     if INVALID_PRICE_EXCLUSION_POLICY_FIELD in source_binding:
-        parameters[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = copy.deepcopy(
+        parameter_mapping[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = copy.deepcopy(
             source_binding[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
         )
     try:
-        normalized = normalize_protected_frozen_rate_params(parameters)
+        normalized = normalize_protected_frozen_rate_params(parameter_mapping)
         local_binding = frozen_rate_binding_from_params(normalized)
     except ValueError as error:
         raise initialization.ResultArchiveCandidateInitializationError(
@@ -92,6 +104,82 @@ def _received_parameters(
             "archive candidate initialization received frozen input is unavailable"
         )
     return normalized, local_binding
+
+
+def _validated_receive_context(
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_id: str,
+    source_key: str,
+    authenticated_source_archive_metadata: Mapping[str, Any],
+) -> _ReceiveContext:
+    destination_schema = initialization._required_schema(schema_name, field_name="schema_name")
+    staging_schema = initialization._required_schema(
+        staging_schema_name,
+        field_name="staging_schema_name",
+    )
+    if destination_schema == staging_schema:
+        raise ValueError("staging_schema_name must differ from schema_name")
+    if destination_schema != resolve_ptg2_schema():
+        raise ValueError("schema_name must match the configured PTG schema")
+    if type(source_snapshot_key) is not int or source_snapshot_key < 0:
+        raise ValueError("source_snapshot_key must be non-negative")
+    destination_snapshot = initialization._required_snapshot_id(
+        destination_snapshot_id,
+        field_name="destination snapshot",
+    )
+    selected_source_key = initialization._required_source_key(source_key)
+    source_receipt = validate_ptg_result_archive_source_authority(authenticated_source_archive_metadata)
+    if initialization._required_source_key(source_receipt["source_key"]) != selected_source_key:
+        raise initialization.ResultArchiveCandidateInitializationError(
+            "archive candidate initialization received source key differs"
+        )
+    destination_filing_id = _destination_filing_id(
+        schema_name=destination_schema,
+        destination_snapshot_id=destination_snapshot,
+        source_key=selected_source_key,
+        source_receipt=source_receipt,
+    )
+    if (
+        destination_snapshot == source_receipt["snapshot_id"]
+        or destination_filing_id == source_receipt["source_file_import_id"]
+    ):
+        raise initialization.ResultArchiveCandidateInitializationError(
+            "archive candidate initialization requires new local attempt identities"
+        )
+    return _ReceiveContext(
+        destination_schema=destination_schema,
+        staging_schema=staging_schema,
+        snapshot_key=source_snapshot_key,
+        destination_snapshot=destination_snapshot,
+        source_key=selected_source_key,
+        source_receipt=source_receipt,
+        destination_filing_id=destination_filing_id,
+    )
+
+
+def _validate_received_source_evidence(
+    *,
+    authenticated: initialization._AuthenticatedStagedCandidate,
+    local_binding: Mapping[str, Any],
+    source_receipt: Mapping[str, Any],
+) -> None:
+    source_binding = initialization._source_binding_for_receipt(
+        local_binding,
+        source_receipt["source_file_import_id"],
+    )
+    validate_frozen_candidate_evidence(
+        authenticated.source_manifest,
+        candidate_run_id=frozen_internal_run_id(source_receipt["source_file_import_id"]),
+        database_binding=source_binding,
+        database_sources=authenticated.source_records,
+    )
+    if initialization._mapping(authenticated.source_manifest).get(FROZEN_RATE_FILE_BINDING_OPTION) != source_binding:
+        raise initialization.ResultArchiveCandidateInitializationError(
+            "archive candidate initialization received source binding differs"
+        )
 
 
 async def receive_frozen_binding_params(
@@ -112,75 +200,36 @@ async def receive_frozen_binding_params(
 
     initialization._require_transaction(session)
     try:
-        destination_schema = initialization._required_schema(schema_name, field_name="schema_name")
-        staging_schema = initialization._required_schema(
-            staging_schema_name,
-            field_name="staging_schema_name",
+        context = _validated_receive_context(
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_id=destination_snapshot_id,
+            source_key=source_key,
+            authenticated_source_archive_metadata=authenticated_source_archive_metadata,
         )
-        if destination_schema == staging_schema:
-            raise ValueError("staging_schema_name must differ from schema_name")
-        if destination_schema != resolve_ptg2_schema():
-            raise ValueError("schema_name must match the configured PTG schema")
-        if type(source_snapshot_key) is not int or source_snapshot_key < 0:
-            raise ValueError("source_snapshot_key must be non-negative")
-        snapshot_key = source_snapshot_key
-        destination_snapshot = initialization._required_snapshot_id(
-            destination_snapshot_id,
-            field_name="destination snapshot",
-        )
-        selected_source_key = initialization._required_source_key(source_key)
-        source_receipt = validate_ptg_result_archive_source_authority(authenticated_source_archive_metadata)
-        if initialization._required_source_key(source_receipt["source_key"]) != selected_source_key:
-            raise initialization.ResultArchiveCandidateInitializationError(
-                "archive candidate initialization received source key differs"
-            )
-        destination_filing_id = _destination_filing_id(
-            schema_name=destination_schema,
-            destination_snapshot_id=destination_snapshot,
-            source_key=selected_source_key,
-            source_receipt=source_receipt,
-        )
-        if (
-            destination_snapshot == source_receipt["snapshot_id"]
-            or destination_filing_id == source_receipt["source_file_import_id"]
-        ):
-            raise initialization.ResultArchiveCandidateInitializationError(
-                "archive candidate initialization requires new local attempt identities"
-            )
         staged = await initialization._locked_staged_candidate_row(
             session,
-            staging_schema=staging_schema,
-            source_snapshot_key=snapshot_key,
+            staging_schema=context.staging_schema,
+            source_snapshot_key=context.snapshot_key,
         )
         parameters, local_binding = _received_parameters(
             staged=staged,
-            destination_filing_id=destination_filing_id,
-            source_key=selected_source_key,
+            destination_filing_id=context.destination_filing_id,
+            source_key=context.source_key,
         )
         authenticated = await initialization._authenticated_staged_candidate(
             session,
-            staging_schema=staging_schema,
-            source_snapshot_key=snapshot_key,
+            staging_schema=context.staging_schema,
+            source_snapshot_key=context.snapshot_key,
             local_binding=local_binding,
-            source_receipt=source_receipt,
+            source_receipt=context.source_receipt,
         )
-        source_binding = initialization._source_binding_for_receipt(
-            local_binding,
-            source_receipt["source_file_import_id"],
+        _validate_received_source_evidence(
+            authenticated=authenticated,
+            local_binding=local_binding,
+            source_receipt=context.source_receipt,
         )
-        validate_frozen_candidate_evidence(
-            authenticated.source_manifest,
-            candidate_run_id=frozen_internal_run_id(source_receipt["source_file_import_id"]),
-            database_binding=source_binding,
-            database_sources=authenticated.source_records,
-        )
-        if (
-            initialization._mapping(authenticated.source_manifest).get(FROZEN_RATE_FILE_BINDING_OPTION)
-            != source_binding
-        ):
-            raise initialization.ResultArchiveCandidateInitializationError(
-                "archive candidate initialization received source binding differs"
-            )
         return parameters
     except asyncio.CancelledError:
         raise
