@@ -34,9 +34,17 @@ MATRIX_ROWS_BY_JOB = {
         for index in range(4)
     ],
     "address-canonical-db-tests": [
-        {"shard": "core", "label": "Database tests (core)", "output": "artifact_core"},
-        {"shard": "provider-directory", "label": "Database tests (directory)", "output": "artifact_provider_directory"},
-        {"shard": "provider-profile", "label": "Database tests (profiles)", "output": "artifact_provider_profile"},
+        {"shard": shard, "label": f"Database tests ({label})", "output": f"artifact_{shard.replace('-', '_')}"}
+        for shard, label in (
+            ("core-services", "services"),
+            ("core-imports", "imports"),
+            ("core-ptg", "PTG"),
+            ("directory-source", "directory source"),
+            ("directory-storage", "directory storage"),
+            ("directory-address", "directory address"),
+            ("profile-storage", "profile storage"),
+            ("profile-publication", "profile publication"),
+        )
     ],
 }
 
@@ -178,7 +186,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     }
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
-        condition = "always()" if job_id in {"measurement", "source-validation", "artifact-cleanup"} else "success()"
+        condition = "always()" if job_id in {"measurement", "source-validation"} else "success()"
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
         elif job_id == "source-validation":
@@ -204,6 +212,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
 def test_stale_artifact_cleanup_is_main_only_and_pinned():
     path = Path(__file__).resolve().parents[1] / ".github/workflows/artifact-cleanup.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    revision = yaml.safe_load((path.parent / "ci.yml").read_text())["env"]["CI_REVISION"]
     assert workflow.get("on", workflow.get(True)) == {
         "schedule": [{"cron": "47 2 * * *"}], "workflow_dispatch": None,
     }
@@ -225,7 +234,7 @@ def test_stale_artifact_cleanup_is_main_only_and_pinned():
         {"name": "Check out trusted artifact lifecycle",
          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
          "with": {"repository": "EndurantDevs/endurant-ci",
-                  "ref": "88930b1a4c1926edfe4a0dd9dbba041058e59795", "path": "ci",
+                  "ref": revision, "path": "ci",
                   "persist-credentials": False}},
         {"name": "Delete only obsolete authenticated artifacts",
          "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
@@ -279,7 +288,7 @@ def test_public_test_matrices_fail_fast_and_preserve_all_shards():
         _assert_matrix_artifact_identity(job_id, job)
 
 
-def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
+def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
     publisher = jobs["measurement"]
@@ -297,9 +306,13 @@ def test_publisher_requires_every_matrix_result_and_nine_immutable_artifacts():
         for row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 9
+    assert len(set(identities)) == 14
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
-    assert jobs["dev-image-publication"]["needs"] == ["smoke", "source-validation"]
-    assert jobs["artifact-cleanup"]["needs"] == ["dev-image-publication"]
+    assert jobs["dev-image-publication"]["needs"] == [
+        "smoke", "source-validation", "container-package", "measurement",
+    ]
+    assert jobs["artifact-cleanup"]["needs"] == [
+        "dev-image-publication", "container-package", "measurement",
+    ]

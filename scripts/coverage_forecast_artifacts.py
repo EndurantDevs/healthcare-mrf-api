@@ -47,7 +47,16 @@ SHARD_SPEC_BY_KIND = {
         "coverage_prefix": ".coverage.postgres.",
         "provenance_prefix": ".coverage-provenance.postgres.",
         "report_name": "python",
-        "shards": ("core", "provider-directory", "provider-profile"),
+        "shards": (
+            "core-services",
+            "core-imports",
+            "core-ptg",
+            "directory-source",
+            "directory-storage",
+            "directory-address",
+            "profile-storage",
+            "profile-publication",
+        ),
     },
 }
 

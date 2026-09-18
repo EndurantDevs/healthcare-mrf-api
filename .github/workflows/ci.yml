@@ -58,7 +58,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -122,7 +122,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -145,7 +145,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -177,7 +177,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -259,7 +259,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -304,7 +304,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -336,7 +336,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -388,7 +388,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -405,6 +405,7 @@ jobs:
 
         test -z "$(git ls-files --others --exclude-standard)"'
     - name: Upload tested DEV image
+      id: image-artifact
       if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
@@ -413,6 +414,8 @@ jobs:
         if-no-files-found: error
         retention-days: 1
         compression-level: 0
+    outputs:
+      image_artifact_id: ${{ steps.image-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   security:
@@ -432,7 +435,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -470,7 +473,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -526,20 +529,24 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
     - name: Install PostgreSQL client
-      run: "sudo apt-get update -qq\nsudo apt-get install --yes --no-install-recommends ca-certificates curl\nsudo install\
-        \ -d -m 0755 /usr/share/postgresql-common/pgdg\nsudo curl --fail --location --silent --show-error \\\n  --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc\
-        \ \\\n  https://www.postgresql.org/media/keys/ACCC4CF8.asc\n. /etc/os-release\nprintf '%s\\n' \\\n  'Types: deb' \\\
-        \n  'URIs: https://apt.postgresql.org/pub/repos/apt' \\\n  \"Suites: ${VERSION_CODENAME}-pgdg\" \\\n  'Components:\
-        \ main' \\\n  'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' |\n  sudo tee /etc/apt/sources.list.d/pgdg.sources\
-        \ >/dev/null\nsudo apt-get update -qq\nsudo apt-get install --yes --no-install-recommends postgresql-client-18\nprintf\
-        \ '%s\\n' /usr/lib/postgresql/18/bin >> \"$GITHUB_PATH\"\nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\"\
-        \ --version | grep -Eq \"^$tool \\\\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
+      run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
+        \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
+        \ ca-certificates curl\nsudo install -d -m 0755 /usr/share/postgresql-common/pgdg\nsudo curl --fail --location --silent\
+        \ --show-error --retry 3 --retry-delay 2 --retry-all-errors \\\n  --connect-timeout 15 --max-time 60 \\\n  --output\
+        \ /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \\\n  https://www.postgresql.org/media/keys/ACCC4CF8.asc\n\
+        . /etc/os-release\nprintf '%s\\n' \\\n  'Types: deb' \\\n  'URIs: https://apt.postgresql.org/pub/repos/apt' \\\n \
+        \ \"Suites: ${VERSION_CODENAME}-pgdg\" \\\n  'Components: main' \\\n  'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc'\
+        \ |\n  sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30\
+        \ -o Acquire::https::Timeout=30 update -qq\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30\
+        \ install --yes --no-install-recommends postgresql-client-18\nprintf '%s\\n' /usr/lib/postgresql/18/bin >> \"$GITHUB_PATH\"\
+        \nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\" --version | grep -Eq \"^$tool \\\
+        \\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -577,22 +584,42 @@ jobs:
 
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     outputs:
-      artifact_core: ${{ steps.coverage-output.outputs.artifact_core }}
-      artifact_provider_directory: ${{ steps.coverage-output.outputs.artifact_provider_directory }}
-      artifact_provider_profile: ${{ steps.coverage-output.outputs.artifact_provider_profile }}
+      artifact_core_services: ${{ steps.coverage-output.outputs.artifact_core_services }}
+      artifact_core_imports: ${{ steps.coverage-output.outputs.artifact_core_imports }}
+      artifact_core_ptg: ${{ steps.coverage-output.outputs.artifact_core_ptg }}
+      artifact_directory_source: ${{ steps.coverage-output.outputs.artifact_directory_source }}
+      artifact_directory_storage: ${{ steps.coverage-output.outputs.artifact_directory_storage }}
+      artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
+      artifact_profile_storage: ${{ steps.coverage-output.outputs.artifact_profile_storage }}
+      artifact_profile_publication: ${{ steps.coverage-output.outputs.artifact_profile_publication }}
     strategy:
       fail-fast: true
       matrix:
         include:
-        - shard: core
-          label: Database tests (core)
-          output: artifact_core
-        - shard: provider-directory
-          label: Database tests (directory)
-          output: artifact_provider_directory
-        - shard: provider-profile
-          label: Database tests (profiles)
-          output: artifact_provider_profile
+        - shard: core-services
+          label: Database tests (services)
+          output: artifact_core_services
+        - shard: core-imports
+          label: Database tests (imports)
+          output: artifact_core_imports
+        - shard: core-ptg
+          label: Database tests (PTG)
+          output: artifact_core_ptg
+        - shard: directory-source
+          label: Database tests (directory source)
+          output: artifact_directory_source
+        - shard: directory-storage
+          label: Database tests (directory storage)
+          output: artifact_directory_storage
+        - shard: directory-address
+          label: Database tests (directory address)
+          output: artifact_directory_address
+        - shard: profile-storage
+          label: Database tests (profile storage)
+          output: artifact_profile_storage
+        - shard: profile-publication
+          label: Database tests (profile publication)
+          output: artifact_profile_publication
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   measurement:
@@ -623,7 +650,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Resolve exact source event
@@ -637,21 +664,27 @@ jobs:
       with:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
           }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_directory
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_provider_profile }}
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
+          }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
     - name: Validate and bind public measurement
       run: python3 ci/scripts/healthcare/measurement.py
     - name: Upload public measurement
+      id: measurement-artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: healthcare-public-measurement-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/healthcare-public-measurement/
         include-hidden-files: true
         if-no-files-found: error
-        retention-days: 90
+        retention-days: 1
+    outputs:
+      measurement_artifact_id: ${{ steps.measurement-artifact.outputs.artifact-id }}
   source-validation:
     name: Validation complete
     runs-on: ubuntu-latest
@@ -693,26 +726,30 @@ jobs:
     needs:
     - smoke
     - source-validation
+    - container-package
+    - measurement
     permissions:
       contents: read
       pull-requests: read
       actions: read
       packages: write
     env:
-      CI_REVISION: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+      CI_REVISION: 7982a6df07b05d048b5f1843910d4d07fa78d5af
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
     - name: Check out trusted image publisher
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Authenticate DEV image input
       id: image
       env:
         GH_TOKEN: ${{ github.token }}
+        IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
+        MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
       run: python3 ci/scripts/source_image.py prepare
     - name: Download validated image archive
       if: steps.image.outputs.publish == 'true'
@@ -734,7 +771,7 @@ jobs:
         name: healthcare-public-image-intent-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-intent/intent.json
         if-no-files-found: error
-        retention-days: 90
+        retention-days: 1
     - name: Publish validated DEV image
       if: steps.image.outputs.publish == 'true'
       env:
@@ -742,17 +779,20 @@ jobs:
       run: python3 ci/scripts/source_image.py publish
     - name: Upload DEV image receipt
       if: steps.image.outputs.publish == 'true'
+      id: receipt-artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-receipt/image.json
         if-no-files-found: error
-        retention-days: 90
+        retention-days: 1
     - name: Reconcile DEV image publication
       if: always() && steps.image.outputs.publish == 'true'
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 ci/scripts/source_image.py reconcile
+    outputs:
+      receipt_artifact_id: ${{ steps.receipt-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   artifact-cleanup:
@@ -762,8 +802,10 @@ jobs:
     timeout-minutes: 10
     needs:
     - dev-image-publication
+    - container-package
+    - measurement
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (always()) }}
+      && (success()) }}
     permissions:
       contents: read
       actions: write
@@ -772,13 +814,16 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+        ref: 7982a6df07b05d048b5f1843910d4d07fa78d5af
         path: ci
         persist-credentials: false
     - name: Remove validated CI intermediates
       env:
         GH_TOKEN: ${{ github.token }}
         PYTHONDONTWRITEBYTECODE: '1'
+        IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
+        MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
+        IMAGE_RECEIPT_ARTIFACT_ID: ${{ needs.dev-image-publication.outputs.receipt_artifact_id }}
       run: python3 ci/scripts/artifact_cleanup.py
 'on':
   pull_request:
@@ -793,7 +838,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 4e7baeb33ecd9d32cb45de10347ba06c148aa348
+  CI_REVISION: 7982a6df07b05d048b5f1843910d4d07fa78d5af
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
