@@ -290,7 +290,8 @@ def test_public_test_matrices_fail_fast_and_preserve_all_shards():
 
 def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts():
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
-    jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
     publisher = jobs["measurement"]
     assert set(publisher["needs"]) == set(JOB_LABELS) - {
         "smoke", "measurement", "source-validation", "dev-image-publication", "artifact-cleanup",
@@ -313,6 +314,12 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
     assert jobs["dev-image-publication"]["needs"] == [
         "smoke", "source-validation", "container-package", "measurement",
     ]
+    assert jobs["dev-image-publication"]["env"] == {
+        "CI_REVISION": workflow["env"]["CI_REVISION"],
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "IMAGE_ARTIFACT_ID": "${{ needs.container-package.outputs.image_artifact_id }}",
+        "MEASUREMENT_ARTIFACT_ID": "${{ needs.measurement.outputs.measurement_artifact_id }}",
+    }
     assert jobs["artifact-cleanup"]["needs"] == [
         "dev-image-publication", "container-package", "measurement",
     ]
