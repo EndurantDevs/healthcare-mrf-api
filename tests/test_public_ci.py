@@ -303,8 +303,8 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
         "${{ needs.capacity-evidence.outputs.artifact_id }}", "${{ needs.rust-scanner.outputs.artifact_id }}",
     ])
     expected_ids.extend(
-        "${{ needs.address-canonical-db-tests.outputs." + row["output"] + " }}"
-        for row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
+        "${{ needs.address-canonical-db-tests.outputs." + matrix_row["output"] + " }}"
+        for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
     assert len(set(identities)) == 14
