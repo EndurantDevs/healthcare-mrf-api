@@ -466,7 +466,7 @@ def test_cli_writes_rust_provenance_with_actual_producer_versions(
     ]
 
 
-def test_python_forecast_combines_only_the_eight_bound_coverage_files(tmp_path: Path) -> None:
+def test_python_forecast_combines_only_the_thirteen_bound_coverage_files(tmp_path: Path) -> None:
     """The healthcare topology replays all four main, capacity, and PG producers."""
 
     (tmp_path / artifacts.BASELINE_NAME).write_text(
@@ -497,9 +497,14 @@ def test_python_forecast_combines_only_the_eight_bound_coverage_files(tmp_path: 
         "main": [f".coverage.main.{index}" for index in range(4)],
         "capacity": [".coverage.capacity"],
         "postgres": [
-            ".coverage.postgres.core",
-            ".coverage.postgres.provider-directory",
-            ".coverage.postgres.provider-profile",
+            ".coverage.postgres.core-services",
+            ".coverage.postgres.core-imports",
+            ".coverage.postgres.core-ptg",
+            ".coverage.postgres.directory-source",
+            ".coverage.postgres.directory-storage",
+            ".coverage.postgres.directory-address",
+            ".coverage.postgres.profile-storage",
+            ".coverage.postgres.profile-publication",
         ],
     }
 
