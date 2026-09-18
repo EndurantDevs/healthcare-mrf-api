@@ -763,3 +763,373 @@ def test_complete_ties_use_semantic_hashes_not_input_or_allocation_order(definit
         < (second.family_sha256, second.context_child_key_sha256)
         else second.family_revision_id
     )
+
+
+def test_winner_context_renders_each_native_scalar_canonically():
+    assert materialization_module._context_value(TypedScalar("decimal", "value", decimal_value=Decimal("-0"))) == "0"
+    assert (
+        materialization_module._context_value(TypedScalar("decimal", "value", decimal_value=Decimal("12.3400")))
+        == "12.34"
+    )
+    assert (
+        materialization_module._context_value(TypedScalar("date", "value", date_value=date(2026, 9, 18)))
+        == "2026-09-18"
+    )
+    assert (
+        materialization_module._context_value(
+            TypedScalar(
+                "timestamp",
+                "value",
+                timestamp_value=datetime.fromisoformat("2026-09-18T03:04:05+02:00"),
+            )
+        )
+        == "2026-09-18T01:04:05Z"
+    )
+    assert materialization_module._context_value(TypedScalar("boolean", "value", boolean_value=True)) is True
+    assert materialization_module._context_value(TypedScalar("string", "null")) is None
+
+
+@pytest.mark.parametrize(
+    ("context", "message"),
+    (
+        (None, "malformed"),
+        ("", "malformed"),
+        ("x" * 8_193, "malformed"),
+        ("\ud800", "malformed"),
+        ("{", "malformed"),
+        ("[]", "malformed"),
+        ('{"b":1, "a":2}', "canonical"),
+        ('{"value":NaN}', "malformed"),
+    ),
+    ids=(
+        "wrong-type",
+        "empty",
+        "oversize",
+        "invalid-unicode",
+        "invalid-json",
+        "non-mapping",
+        "noncanonical",
+        "nonfinite-number",
+    ),
+)
+def test_winner_models_reject_malformed_canonical_contexts(definition, context, message):
+    materialization = _child_profile_winners(definition)
+    forged = replace(materialization.winners[0], canonical_context_key=context)
+
+    with pytest.raises(WinnerMaterializationError, match=message):
+        winner_materialization_models(replace(materialization, winners=(forged,)))
+
+
+def test_winner_models_reject_malformed_materialization_metadata(definition):
+    materialization = _child_profile_winners(definition)
+    invalid_values = (
+        object(),
+        replace(materialization, generation=None),
+        replace(materialization, profile_count=True),
+        replace(materialization, profile_count=-1),
+        replace(materialization, profile_count=99),
+        replace(materialization, profile_context_slots=[7]),
+        replace(materialization, profile_context_slots=()),
+        replace(materialization, profile_context_slots=(True,)),
+        replace(materialization, profile_context_slots=(-1,)),
+    )
+
+    for invalid in invalid_values:
+        with pytest.raises(WinnerMaterializationError):
+            winner_materialization_models(invalid)
+
+
+def test_winner_models_reject_each_immutable_winner_binding_mismatch(definition):
+    materialization = _child_profile_winners(definition)
+    winner = materialization.winners[0]
+    other_generation = replace(materialization.generation, generation_id=202)
+    root_winner = replace(
+        winner,
+        context_collection_slot=0,
+        context_child_revision_id=None,
+        canonical_context_key='{"dimensions":[],"profile_id":"synthetic_profile","scope":"root"}',
+    )
+    root_winner = replace(
+        root_winner,
+        context_key_sha256=materialization_module._context_digest(root_winner.canonical_context_key),
+    )
+    invalid_cases = (
+        (object(), materialization, "generation binding"),
+        (replace(winner, generation=other_generation), materialization, "generation binding"),
+        (replace(winner, profile_slot=0), materialization, "profile slot"),
+        (replace(winner, context_collection_slot=0), materialization, "context collection"),
+        (replace(winner, entity_binding_id=0), materialization, "entity_binding_id"),
+        (replace(winner, family_revision_id=False), materialization, "family_revision_id"),
+        (replace(winner, context_key_sha256=b"short"), materialization, "32 bytes"),
+        (replace(winner, context_key_sha256=b"x" * 32), materialization, "context digest"),
+        (
+            replace(root_winner, context_child_revision_id=9),
+            replace(materialization, profile_context_slots=(0,)),
+            "root winner contexts",
+        ),
+        (replace(winner, context_child_revision_id=0), materialization, "context_child_revision_id"),
+    )
+
+    for invalid_winner, materialization_context, message in invalid_cases:
+        with pytest.raises(ValueError, match=message):
+            winner_materialization_models(replace(materialization_context, winners=(invalid_winner,)))
+
+
+def test_winner_models_reject_duplicate_lookup_keys(definition):
+    materialization = _child_profile_winners(definition)
+    winner = materialization.winners[0]
+
+    with pytest.raises(WinnerMaterializationError, match="repeat a lookup key"):
+        winner_materialization_models(replace(materialization, winners=(winner, winner)))
+
+
+def test_definition_validation_rejects_duplicate_immutable_bindings(definition):
+    duplicate_field = replace(definition, root_fields=(*definition.root_fields, definition.root_fields[0]))
+    duplicate_profile = replace(
+        definition,
+        selection_profiles=(*definition.selection_profiles, definition.selection_profiles[0]),
+    )
+
+    with pytest.raises(WinnerMaterializationError, match="field identities are not unique"):
+        materialization_module._validated_definition(duplicate_field)
+    with pytest.raises(WinnerMaterializationError, match="selection profile identities are not unique"):
+        materialization_module._validated_definition(duplicate_profile)
+
+
+def test_definition_validation_rejects_each_bounded_shape(definition):
+    field = definition.root_fields[0]
+    profile = definition.selection_profiles[0]
+    oversized_hot_fields = tuple(
+        replace(field, field_id=f"synthetic_{index}", field_slot=100 + index, projection_slot=index + 1)
+        for index in range(materialization_module.MAX_HOT_FIELDS + 1)
+    )
+    oversized_profiles = tuple(
+        replace(profile, profile_id=f"synthetic_{index}")
+        for index in range(materialization_module.MAX_SELECTION_PROFILES + 1)
+    )
+    oversized_order = replace(
+        definition.query,
+        order_terms=tuple(definition.query.order_terms[0] for _ in range(materialization_module.MAX_ORDER_TERMS + 1)),
+    )
+    duplicate_projection = replace(
+        definition,
+        root_fields=(
+            *definition.root_fields,
+            replace(
+                definition.root_fields[0],
+                field_id="synthetic_duplicate_projection",
+                field_slot=100,
+                projection_slot=definition.root_fields[0].projection_slot,
+            ),
+        ),
+    )
+    invalid_definitions = (
+        (
+            replace(definition, root_fields=oversized_hot_fields, child_fields=(), selection_profiles=()),
+            "hot projection count",
+        ),
+        (replace(definition, selection_profiles=oversized_profiles), "selection profile count"),
+        (replace(definition, query=oversized_order), "query order terms"),
+        (duplicate_projection, "hot projection slots"),
+    )
+
+    with pytest.raises(TypeError, match="CustomImportDefinition"):
+        materialization_module._validated_definition(object())
+    for invalid, message in invalid_definitions:
+        with pytest.raises(WinnerMaterializationError, match=message):
+            materialization_module._validated_definition(invalid)
+
+
+def test_selection_profile_validation_rejects_each_invalid_contract(definition):
+    profile = definition.selection_profiles[0]
+    term = profile.selection_terms[0]
+    invalid_profiles = (
+        object(),
+        replace(profile, profile_id="Not_Snake_Case"),
+        replace(
+            profile,
+            selection_terms=tuple(term for _ in range(materialization_module.MAX_SELECTION_TERMS + 1)),
+        ),
+        replace(
+            profile,
+            context_dimensions=tuple("service_code" for _ in range(materialization_module.MAX_CONTEXT_DIMENSIONS + 1)),
+        ),
+        replace(profile, selection_terms=(term, term)),
+        replace(profile, selection_terms=(replace(term, direction="sideways"),)),
+        replace(profile, context_dimensions=(profile.context_dimensions[0], profile.context_dimensions[0])),
+    )
+
+    for invalid in invalid_profiles:
+        with pytest.raises(WinnerMaterializationError):
+            materialization_module._validate_profile(invalid, definition.fields_by_id, definition)
+
+
+def test_child_scope_validation_rejects_missing_mismatched_and_duplicate_slots(definition):
+    for invalid, message in (
+        (None, "slots are required"),
+        ({}, "do not match"),
+        ({"rates": 0}, "positive integer"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            materialization_module._validated_child_collection_slots(definition, invalid)
+
+    second_collection = replace(definition.child_collections[0], name="supplemental_rates")
+    two_collection_definition = replace(
+        definition,
+        child_collections=(*definition.child_collections, second_collection),
+    )
+    with pytest.raises(WinnerMaterializationError, match="must be unique"):
+        materialization_module._validated_child_collection_slots(
+            two_collection_definition,
+            {"rates": 7, "supplemental_rates": 7},
+        )
+
+    missing_query_collection = replace(
+        definition,
+        query=replace(definition.query, child_collection=None),
+    )
+    with pytest.raises(WinnerMaterializationError, match="no declared child collection"):
+        materialization_module._profile_scopes(missing_query_collection, {"rates": 7})
+
+
+def test_projection_row_validation_rejects_invalid_rows_and_owners(definition):
+    root = _root_projection(definition)[0]
+    child = _child_projection(definition, 71, {"service_code": "A100"})[0]
+    invalid_cases = (
+        {"root_scalars": (object(),)},
+        {"child_scalars": (object(),), "child_collection_slots": {"rates": 7}},
+        {"root_scalars": (root, root)},
+        {"child_scalars": (child, child), "child_collection_slots": {"rates": 7}},
+        {
+            "child_scalars": (replace(child, target=replace(child.target, collection_slot=8)),),
+            "child_collection_slots": {"rates": 7},
+        },
+        {
+            "root_scalars": (root,),
+            "child_scalars": (replace(child, target=replace(child.target, dataset_id=12)),),
+            "child_collection_slots": {"rates": 7},
+        },
+    )
+
+    for invalid in invalid_cases:
+        with pytest.raises(ScalarProjectionError):
+            scalar_projection_models(definition, **invalid)
+
+
+def test_projection_validation_rejects_each_binding_mismatch(definition):
+    row = _root_projection(definition)[0]
+    invalid_rows = (
+        (replace(row, field_slot=0), "field_slot"),
+        (replace(row, projection_slot=True), "projection_slot"),
+        (replace(row, scalar=object()), "no typed scalar"),
+        (replace(row, field_id="undeclared"), "not declared"),
+        (replace(row, field_slot=row.field_slot + 1), "immutable field binding"),
+    )
+
+    for invalid, message in invalid_rows:
+        with pytest.raises(ValueError, match=message):
+            materialization_module._validate_projection(definition, invalid, root=True)
+
+    with pytest.raises(ScalarProjectionError, match="hot projection slot"):
+        materialization_module._validate_projection_pair({1: 10}, {}, replace(row, projection_slot=1, field_slot=11))
+    with pytest.raises(ScalarProjectionError, match="stable field slot"):
+        materialization_module._validate_projection_pair({}, {10: 1}, replace(row, projection_slot=2, field_slot=10))
+
+
+def test_typed_scalar_validation_rejects_ambiguous_storage():
+    invalid_scalars = (
+        (TypedScalar("string", "unknown"), "value_state"),
+        (TypedScalar("unsupported", "null"), "unsupported field type"),
+        (TypedScalar("string", "null", string_value="unexpected"), "cannot contain"),
+        (TypedScalar("string", "value"), "exactly one typed value"),
+        (TypedScalar("string", "value", string_value="one", integer_value=2), "exactly one typed value"),
+    )
+
+    for invalid, message in invalid_scalars:
+        with pytest.raises(ScalarProjectionError, match=message):
+            materialization_module._validate_typed_scalar(invalid)
+
+    with pytest.raises(ScalarProjectionError, match="not UTF-8 encodable"):
+        materialization_module._utf8_size("\ud800", "synthetic")
+    with pytest.raises(ScalarProjectionError, match="unsupported type"):
+        materialization_module._typed_scalar(replace(_typed_definition().root_fields[0], value_type="unsupported"), 1)
+
+
+def test_candidate_validation_rejects_invalid_identity_scope_and_values(definition):
+    child = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="invalid",
+        service_code="A",
+    )
+    root = replace(
+        child,
+        context_collection_slot=0,
+        context_child_revision_id=None,
+        context_child_key_sha256=None,
+        values_by_field={"npi": "1234567893"},
+    )
+    invalid_candidates = (
+        (object(), "WinnerCandidate identities"),
+        (replace(child, context_collection_slot=8), "declared root or child scope"),
+        (
+            replace(root, context_child_revision_id=401, context_child_key_sha256=_digest("unexpected-child")),
+            "root winner contexts",
+        ),
+        (replace(child, values_by_field=object()), "must be a mapping"),
+        (replace(child, values_by_field={"display_name": "not permitted"}), "missing required context field"),
+        (replace(child, values_by_field={"service_code": "\ud800"}), "not UTF-8 encodable"),
+    )
+
+    for invalid, message in invalid_candidates:
+        with pytest.raises(WinnerMaterializationError, match=message):
+            materialize_winners(
+                definition,
+                generation=_generation(),
+                child_collection_slots={"rates": 7},
+                candidates=_validated_candidates((invalid,)),
+            )
+
+    non_query_field = replace(
+        definition.root_fields[-1],
+        field_id="internal_note",
+        field_slot=6,
+        projection_slot=None,
+        nullable=True,
+    )
+    non_query_definition = replace(definition, root_fields=(*definition.root_fields, non_query_field))
+    non_query_candidate = replace(child, values_by_field={**child.values_by_field, "internal_note": "not permitted"})
+    with pytest.raises(WinnerMaterializationError, match="non-query field"):
+        materialize_winners(
+            non_query_definition,
+            generation=_generation(),
+            child_collection_slots={"rates": 7},
+            candidates=_validated_candidates((non_query_candidate,)),
+        )
+
+    empty = materialize_winners(
+        definition,
+        generation=_generation(),
+        child_collection_slots={"rates": 7},
+        candidates=_validated_candidates((root,)),
+    )
+    assert empty.winners == ()
+
+
+@pytest.mark.asyncio
+async def test_persistence_helpers_require_transaction_and_flush_contracts():
+    class NoTransaction:
+        def add_all(self, _models) -> None:
+            return None
+
+        def in_transaction(self) -> bool:
+            return False
+
+    with pytest.raises(TypeError, match="AsyncSession-style transaction"):
+        materialization_module._add_models(object(), (), "synthetic")
+    with pytest.raises(WinnerMaterializationError, match="active caller transaction"):
+        materialization_module._add_models(NoTransaction(), (), "synthetic")
+    with pytest.raises(TypeError, match="AsyncSession-style flush"):
+        await materialization_module._flush(object(), "synthetic")
+    with pytest.raises(ValueError, match="must be a mapping"):
+        materialization_module._require_mapping([], "synthetic", ValueError)
