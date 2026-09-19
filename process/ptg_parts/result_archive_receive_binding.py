@@ -19,17 +19,26 @@ from typing import Any, Mapping
 from process.ptg_parts import result_archive_candidate_initialization as initialization
 from process.ptg_parts.canonical import canonical_json_dumps
 from process.ptg_parts.frozen_rate_binding import (
-    FROZEN_RATE_FILE_BINDING_OPTION,
     frozen_internal_run_id,
     frozen_rate_binding_from_params,
     normalize_protected_frozen_rate_params,
 )
 from process.ptg_parts.frozen_rate_candidate import validate_frozen_candidate_evidence
+from process.ptg_parts.frozen_rate_files import FrozenRateFileMismatchError
 from process.ptg_parts.ptg2_invalid_price_exclusion import INVALID_PRICE_EXCLUSION_POLICY_FIELD
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
-from process.ptg_parts.result_archive_source_authority import validate_ptg_result_archive_source_authority
+from process.ptg_parts.result_archive_source_authority import (
+    PtgResultArchiveSourceAuthorityError,
+    validate_ptg_result_archive_source_authority,
+)
 
 RESULT_ARCHIVE_RECEIVE_BINDING_CONTRACT = "ptg_result_archive_receive_binding_v1"
+_RECEIVE_BINDING_ERRORS = (
+    TypeError,
+    ValueError,
+    FrozenRateFileMismatchError,
+    PtgResultArchiveSourceAuthorityError,
+)
 
 
 @dataclass(frozen=True)
@@ -176,10 +185,6 @@ def _validate_received_source_evidence(
         database_binding=source_binding,
         database_sources=authenticated.source_records,
     )
-    if initialization._mapping(authenticated.source_manifest).get(FROZEN_RATE_FILE_BINDING_OPTION) != source_binding:
-        raise initialization.ResultArchiveCandidateInitializationError(
-            "archive candidate initialization received source binding differs"
-        )
 
 
 async def receive_frozen_binding_params(
@@ -235,7 +240,7 @@ async def receive_frozen_binding_params(
         raise
     except initialization.ResultArchiveCandidateInitializationError:
         raise
-    except (TypeError, ValueError, RuntimeError) as error:
+    except _RECEIVE_BINDING_ERRORS as error:
         raise initialization.ResultArchiveCandidateInitializationError(
             "archive candidate initialization receive binding is invalid"
         ) from error
