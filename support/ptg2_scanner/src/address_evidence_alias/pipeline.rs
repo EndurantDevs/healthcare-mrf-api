@@ -164,11 +164,10 @@ fn pair_matches(
 fn raw_geo_index(rows: &[ArchiveRow]) -> HashMap<String, Vec<u32>> {
     let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
-        if !row.merged {
-            if let Some(geo) = &row.raw_geo {
+        if !row.merged
+            && let Some(geo) = &row.raw_geo {
                 groups.entry(geo.clone()).or_default().push(index as u32);
             }
-        }
     }
     groups
 }

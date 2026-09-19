@@ -92,18 +92,18 @@ pub fn int_list(value: Option<&Value>) -> Vec<i64> {
     match value {
         Some(Value::Array(items)) => {
             for item in items {
-                if let Some(text) = normalize_string(Some(item)) {
-                    if let Some(number) = parse_integer_text(text.trim()) {
-                        out.push(number);
-                    }
+                if let Some(text) = normalize_string(Some(item))
+                    && let Some(number) = parse_integer_text(text.trim())
+                {
+                    out.push(number);
                 }
             }
         }
         Some(item) => {
-            if let Some(text) = normalize_string(Some(item)) {
-                if let Some(number) = parse_integer_text(text.trim()) {
-                    out.push(number);
-                }
+            if let Some(text) = normalize_string(Some(item))
+                && let Some(number) = parse_integer_text(text.trim())
+            {
+                out.push(number);
             }
         }
         None => {}

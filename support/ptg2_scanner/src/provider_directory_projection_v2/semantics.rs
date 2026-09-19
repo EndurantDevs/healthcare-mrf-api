@@ -180,13 +180,14 @@ fn profile_addresses(resource: &Map<String, Value>, resource_type: &str) -> io::
         Some(_) => return Err(invalid_field("address")),
     };
     let position = normalized_position(resource.get("position"))?;
-    if resource_type == "Location" && !addresses.is_empty() {
-        if let Some(position) = position {
-            addresses[0]
-                .as_object_mut()
-                .expect("normalized address object")
-                .insert("geocode_evidence".to_owned(), position);
-        }
+    if resource_type == "Location"
+        && !addresses.is_empty()
+        && let Some(position) = position
+    {
+        addresses[0]
+            .as_object_mut()
+            .expect("normalized address object")
+            .insert("geocode_evidence".to_owned(), position);
     }
     Ok(addresses)
 }
@@ -387,10 +388,10 @@ fn summary_npi(
             .filter(|character| character.is_ascii_digit())
             .collect::<String>();
         let npi = digits.parse::<i64>().ok().filter(valid_npi);
-        if digits.len() == 10 {
-            if let Some(npi) = npi {
-                candidates.push((system != "http://hl7.org/fhir/sid/us-npi", ordinal, npi));
-            }
+        if digits.len() == 10
+            && let Some(npi) = npi
+        {
+            candidates.push((system != "http://hl7.org/fhir/sid/us-npi", ordinal, npi));
         }
     }
     if let Some((_system_rank, _ordinal, npi)) = candidates.into_iter().min() {

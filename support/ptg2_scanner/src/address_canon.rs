@@ -424,15 +424,15 @@ fn parse_unit_at(value: &str, start: usize) -> UnitMatch {
             }
         }
         let value_start = pos;
-        if let Some(ch) = value[pos..].chars().next() {
-            if ch.is_ascii_alphanumeric() {
-                pos += ch.len_utf8();
-                while let Some(ch) = value[pos..].chars().next() {
-                    if ch.is_ascii_alphanumeric() || ch == '-' {
-                        pos += ch.len_utf8();
-                    } else {
-                        break;
-                    }
+        if let Some(ch) = value[pos..].chars().next()
+            && ch.is_ascii_alphanumeric()
+        {
+            pos += ch.len_utf8();
+            while let Some(ch) = value[pos..].chars().next() {
+                if ch.is_ascii_alphanumeric() || ch == '-' {
+                    pos += ch.len_utf8();
+                } else {
+                    break;
                 }
             }
         }
@@ -455,12 +455,12 @@ fn parse_unit_at(value: &str, start: usize) -> UnitMatch {
         }
         if saw_suffix_whitespace {
             let suffix_start = suffix_pos;
-            if let Some(ch) = value[suffix_pos..].chars().next() {
-                if ch.is_ascii_alphanumeric() {
-                    suffix_pos += ch.len_utf8();
-                    suffix_value = Some(&value[suffix_start..suffix_pos]);
-                    pos = suffix_pos;
-                }
+            if let Some(ch) = value[suffix_pos..].chars().next()
+                && ch.is_ascii_alphanumeric()
+            {
+                suffix_pos += ch.len_utf8();
+                suffix_value = Some(&value[suffix_start..suffix_pos]);
+                pos = suffix_pos;
             }
         }
         if suffix_value.is_none() {
@@ -487,15 +487,15 @@ fn parse_unit_at(value: &str, start: usize) -> UnitMatch {
 fn parse_floor_unit_at(value: &str, start: usize) -> UnitMatch {
     let mut pos = start;
     let value_start = pos;
-    if let Some(ch) = value[pos..].chars().next() {
-        if ch.is_ascii_alphanumeric() {
-            pos += ch.len_utf8();
-            while let Some(ch) = value[pos..].chars().next() {
-                if ch.is_ascii_alphanumeric() {
-                    pos += ch.len_utf8();
-                } else {
-                    break;
-                }
+    if let Some(ch) = value[pos..].chars().next()
+        && ch.is_ascii_alphanumeric()
+    {
+        pos += ch.len_utf8();
+        while let Some(ch) = value[pos..].chars().next() {
+            if ch.is_ascii_alphanumeric() {
+                pos += ch.len_utf8();
+            } else {
+                break;
             }
         }
     }
@@ -640,10 +640,10 @@ fn strip_duplicate_tail_unit(street_text: String, unit: &str) -> String {
         return street_text;
     }
 
-    if let Some((tail_unit, start)) = tail_unit(&street_text) {
-        if tail_unit == unit {
-            return street_text[..start].to_string();
-        }
+    if let Some((tail_unit, start)) = tail_unit(&street_text)
+        && tail_unit == unit
+    {
+        return street_text[..start].to_string();
     }
 
     street_text

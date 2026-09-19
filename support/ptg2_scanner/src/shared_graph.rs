@@ -1135,14 +1135,13 @@ impl<'a> BlockStream<'a> {
         local_id: Option<u32>,
         dense_map: &DenseMap,
     ) -> SharedGraphResult<u32> {
-        if let Some(local_id) = local_id {
-            if let Some(table) = self
+        if let Some(local_id) = local_id
+            && let Some(table) = self
                 .translations
                 .get(artifact_index)
                 .and_then(Option::as_ref)
-            {
-                return table.key(local_id);
-            }
+        {
+            return table.key(local_id);
         }
         dense_map.key(member)
     }
