@@ -10079,8 +10079,6 @@ async def list_providers(request):
               FROM {address_source}
              WHERE {' and '.join(address_clauses)}
             """
-            # Keep missing network values on the selective GIN path instead of
-            # scanning the provider-order index in search of a first match.
             page_order_sql = "ORDER BY npi + 0" if plan_network_ids else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
