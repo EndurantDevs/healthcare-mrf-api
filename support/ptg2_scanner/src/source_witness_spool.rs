@@ -16,9 +16,9 @@ pub struct SourceWitnessScratchBudget {
 
 impl SourceWitnessScratchBudget {
     pub fn from_env() -> io::Result<Arc<Self>> {
-        let configured_limit = std::env::var(SOURCE_WITNESS_SPOOL_MAX_BYTES_ENV).ok();
+        let configured_limit = crate::env::var(SOURCE_WITNESS_SPOOL_MAX_BYTES_ENV).ok();
         let byte_limit = parse_scratch_byte_limit(configured_limit.as_deref())?;
-        let configured_scratch_root = std::env::var_os(SOURCE_WITNESS_SCRATCH_DIR_ENV)
+        let configured_scratch_root = crate::env::var_os(SOURCE_WITNESS_SCRATCH_DIR_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         #[cfg(not(test))]
@@ -32,7 +32,7 @@ impl SourceWitnessScratchBudget {
             }
         };
         #[cfg(test)]
-        let scratch_root = configured_scratch_root.unwrap_or_else(std::env::temp_dir);
+        let scratch_root = configured_scratch_root.unwrap_or_else(crate::env::temp_dir);
         Self::new(byte_limit, scratch_root)
     }
 
