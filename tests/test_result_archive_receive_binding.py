@@ -10,7 +10,10 @@ import pytest
 
 from process.ptg_parts import result_archive_candidate_initialization as initialization
 from process.ptg_parts import result_archive_receive_binding as subject
+from process.ptg_parts.frozen_rate_binding import FROZEN_RATE_FILE_BINDING_OPTION
+from process.ptg_parts.frozen_rate_files import FrozenRateFileMismatchError
 from process.ptg_parts.ptg2_invalid_price_exclusion import INVALID_PRICE_EXCLUSION_POLICY_FIELD
+from process.ptg_parts.result_archive_source_authority import PtgResultArchiveSourceAuthorityError
 
 
 class _TransactionSession:
@@ -207,10 +210,10 @@ def test_receive_context_rejects_source_owned_attempt_identity(monkeypatch, coll
         )
 
 
-def test_received_source_evidence_rejects_manifest_binding_mismatch(monkeypatch) -> None:
+def test_received_source_evidence_uses_candidate_validator_for_binding_mismatch(monkeypatch) -> None:
     expected_binding_mapping = {"source_file_import_id": "source-filing"}
     authenticated = SimpleNamespace(
-        source_manifest={subject.FROZEN_RATE_FILE_BINDING_OPTION: {"different": True}},
+        source_manifest={FROZEN_RATE_FILE_BINDING_OPTION: {"different": True}},
         source_records=(),
     )
     monkeypatch.setattr(
@@ -218,16 +221,64 @@ def test_received_source_evidence_rejects_manifest_binding_mismatch(monkeypatch)
         "_source_binding_for_receipt",
         lambda _local_binding, _source_filing: expected_binding_mapping,
     )
-    monkeypatch.setattr(subject, "validate_frozen_candidate_evidence", lambda *_args, **_kwargs: None)
-
     with pytest.raises(
-        initialization.ResultArchiveCandidateInitializationError,
-        match="received source binding differs",
+        FrozenRateFileMismatchError,
+        match="cannot be treated as legacy",
     ):
         subject._validate_received_source_evidence(
             authenticated=authenticated,
             local_binding={},
             source_receipt={"source_file_import_id": "source-filing"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "domain_error",
+    [
+        FrozenRateFileMismatchError("frozen evidence differs"),
+        PtgResultArchiveSourceAuthorityError("source authority differs"),
+    ],
+)
+async def test_receive_binding_normalizes_known_domain_rejections(monkeypatch, domain_error) -> None:
+    def reject(**_kwargs):
+        raise domain_error
+
+    monkeypatch.setattr(subject, "_validated_receive_context", reject)
+
+    with pytest.raises(
+        initialization.ResultArchiveCandidateInitializationError,
+        match="receive binding is invalid",
+    ) as captured:
+        await subject.receive_frozen_binding_params(
+            _TransactionSession(),
+            schema_name="mrf",
+            staging_schema_name="stage",
+            source_snapshot_key=1,
+            destination_snapshot_id="destination-snapshot",
+            source_key="source-a",
+            authenticated_source_archive_metadata={},
+        )
+
+    assert captured.value.__cause__ is domain_error
+
+
+@pytest.mark.asyncio
+async def test_receive_binding_preserves_unexpected_runtime_error(monkeypatch) -> None:
+    def reject(**_kwargs):
+        raise RuntimeError("schema configuration conflicts")
+
+    monkeypatch.setattr(subject, "_validated_receive_context", reject)
+
+    with pytest.raises(RuntimeError, match="schema configuration conflicts"):
+        await subject.receive_frozen_binding_params(
+            _TransactionSession(),
+            schema_name="mrf",
+            staging_schema_name="stage",
+            source_snapshot_key=1,
+            destination_snapshot_id="destination-snapshot",
+            source_key="source-a",
+            authenticated_source_archive_metadata={},
         )
 
 
