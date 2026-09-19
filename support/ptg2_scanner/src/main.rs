@@ -5,6 +5,67 @@ mod finalizer_assignment;
 mod source_witness;
 mod source_witness_spool;
 
+mod runtime_env {
+    pub use std::env::{args, current_dir, temp_dir, VarError};
+
+    #[cfg(not(test))]
+    pub use std::env::{var, var_os};
+
+    #[cfg(test)]
+    use std::collections::HashMap;
+    #[cfg(test)]
+    use std::ffi::OsString;
+    #[cfg(test)]
+    use std::sync::{OnceLock, RwLock};
+
+    #[cfg(test)]
+    fn overrides() -> &'static RwLock<HashMap<String, Option<OsString>>> {
+        static OVERRIDES: OnceLock<RwLock<HashMap<String, Option<OsString>>>> = OnceLock::new();
+        OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    #[cfg(test)]
+    pub fn var_os(name: &str) -> Option<OsString> {
+        overrides()
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| std::env::var_os(name))
+    }
+
+    #[cfg(test)]
+    pub fn var(name: &str) -> Result<String, VarError> {
+        match var_os(name) {
+            Some(value) => value.into_string().map_err(VarError::NotUnicode),
+            None => Err(VarError::NotPresent),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn replace_test_var(
+        name: &'static str,
+        value: Option<OsString>,
+    ) -> Option<Option<OsString>> {
+        overrides().write().unwrap().insert(name.to_string(), value)
+    }
+
+    #[cfg(test)]
+    pub fn restore_test_var(name: &'static str, previous: Option<Option<OsString>>) {
+        let mut overrides = overrides().write().unwrap();
+        match previous {
+            Some(value) => {
+                overrides.insert(name.to_string(), value);
+            }
+            None => {
+                overrides.remove(name);
+            }
+        }
+    }
+}
+
+use runtime_env as env;
+
 use assigned_stream::AssignedFixedRecordStream;
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use finalizer_assignment::{assign_v3_partition, preflight_owned_serving_inputs};
@@ -17,8 +78,11 @@ use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
 use ptg2_scanner::address_evidence_alias::{
     derive_evidence_alias_candidates, ADDRESS_EVIDENCE_ALIAS_NATIVE_CONTRACT,
 };
+#[cfg(not(test))]
 use ptg2_scanner::config::{
     env_bool, env_usize, env_usize_allow_zero, progress_interval, split_interval,
+};
+use ptg2_scanner::config::{
     DEFAULT_COMPACT_COPY_ROTATE_BYTES, DEFAULT_COMPACT_RUST_WORKERS,
     DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PARSE_IN_WORKERS, DEFAULT_PROGRESS_BYTES,
     DEFAULT_PROGRESS_OBJECTS, DEFAULT_RAW_CHUNK_BYTES, DEFAULT_SPLIT_NEGOTIATED_RATES,
@@ -72,8 +136,8 @@ use ptg2_scanner::shared_graph::{
 #[cfg(test)]
 use ptg2_scanner::tax_identity::TinTokenPolicy;
 use ptg2_scanner::tax_identity::{
-    load_tin_token_policy_from_env, TaxIdentityObservation, TaxIdentityObservationV2,
-    TaxIdentityState, TaxIdentityStateV2, TIN_TOKEN_SECRET_FILE_ENV,
+    load_tin_token_policy_with, TaxIdentityObservation, TaxIdentityObservationV2, TaxIdentityState,
+    TaxIdentityStateV2, TIN_TOKEN_SECRET_FILE_ENV,
 };
 use ptg2_scanner::tax_identity_sidecar_v2::{
     TaxIdentitySidecarV2Header, TaxIdentitySidecarV2Record, TAX_IDENTITY_SIDECAR_V2_FORMAT,
@@ -110,7 +174,6 @@ use std::any::Any;
 use std::cell::Cell;
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
-use std::env;
 use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -147,6 +210,48 @@ const RATE_SCHEDULE_OBSERVE_ENV: &str = "HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE";
 const PROVIDER_GRAPH_V4_ENV: &str = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4";
 const PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV: &str =
     "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH";
+
+#[cfg(test)]
+fn split_interval(name: &str, default_value: usize) -> usize {
+    env_usize(name, default_value)
+}
+
+#[cfg(test)]
+fn progress_interval(name: &str, default_value: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_value)
+}
+
+#[cfg(test)]
+fn env_usize(name: &str, default_value: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_value)
+}
+
+#[cfg(test)]
+fn env_usize_allow_zero(name: &str, default_value: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default_value)
+}
+
+#[cfg(test)]
+fn env_bool(name: &str, default_value: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default_value,
+        },
+        Err(_) => default_value,
+    }
+}
 
 thread_local! {
     static SIDECAR_LOCK_WAIT_MICROS: Cell<u128> = const { Cell::new(0) };
@@ -1288,7 +1393,7 @@ fn configured_shared_dedupe(
         ));
     }
     if factor_mode {
-        let policy = load_tin_token_policy_from_env()?;
+        let policy = load_tin_token_policy_with(|name| env::var(name))?;
         return Ok(if paired_tax_identity {
             SharedDedupe::new_with_v4_paired_tax_identity(
                 worker_count,

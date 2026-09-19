@@ -214,7 +214,7 @@ fn summary_validation_checks_every_contract_shape_timing_and_copy_frame() {
     .expect("valid proof");
 
     macro_rules! reject {
-        ($field:ident, $value:expr) => {{
+        ($field:ident, $value:expr_2021) => {{
             let mut summary = spool.summary.clone();
             summary.$field = $value;
             assert_summary_rejected(summary, &spool.copy_bytes);
