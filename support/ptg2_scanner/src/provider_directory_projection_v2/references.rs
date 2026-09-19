@@ -88,25 +88,25 @@ fn normalized_reference(reference: &Map<String, Value>) -> io::Result<Value> {
             normalized.insert(field.to_owned(), Value::String(text));
         }
     }
-    if let Some(identifier) = reference.get("identifier") {
-        if !identifier.is_null() {
-            let identifier = identifier
-                .as_object()
-                .ok_or_else(|| invalid_field("reference_identifier"))?;
-            let mut normalized_identifier = Map::new();
-            for field in ["system", "value"] {
-                if let Some(text) = optional_text(identifier, field, 2048)? {
-                    normalized_identifier.insert(field.to_owned(), Value::String(text));
-                }
+    if let Some(identifier) = reference.get("identifier")
+        && !identifier.is_null()
+    {
+        let identifier = identifier
+            .as_object()
+            .ok_or_else(|| invalid_field("reference_identifier"))?;
+        let mut normalized_identifier = Map::new();
+        for field in ["system", "value"] {
+            if let Some(text) = optional_text(identifier, field, 2048)? {
+                normalized_identifier.insert(field.to_owned(), Value::String(text));
             }
-            if !normalized_identifier.contains_key("value") {
-                return Err(invalid_field("reference_identifier"));
-            }
-            normalized.insert(
-                "identifier".to_owned(),
-                Value::Object(normalized_identifier),
-            );
         }
+        if !normalized_identifier.contains_key("value") {
+            return Err(invalid_field("reference_identifier"));
+        }
+        normalized.insert(
+            "identifier".to_owned(),
+            Value::Object(normalized_identifier),
+        );
     }
     if !(normalized.contains_key("reference")
         || normalized.contains_key("identifier")

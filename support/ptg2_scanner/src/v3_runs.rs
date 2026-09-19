@@ -2996,24 +2996,24 @@ fn merge_sorted_runs<T: ServingSortRecord, W: Write>(
     while let Some(Reverse((record, run_index))) = heap.pop() {
         let is_duplicate =
             previous.is_some_and(|previous_record| record.same_identity(&previous_record));
-        if let Some(previous_record) = previous {
-            if is_duplicate {
-                if record.provider_count() != previous_record.provider_count() {
-                    return Err(io::Error::new(
+        if let Some(previous_record) = previous
+            && is_duplicate
+        {
+            if record.provider_count() != previous_record.provider_count() {
+                return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "duplicate serving identity has conflicting provider_count values {} and {}",
                             previous_record.provider_count(), record.provider_count()
                         ),
                     ));
-                }
-                duplicate_records = duplicate_records.checked_add(1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "duplicate record count overflow",
-                    )
-                })?;
             }
+            duplicate_records = duplicate_records.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate record count overflow",
+                )
+            })?;
         }
         if !is_duplicate || !dedupe {
             record.write_to(output)?;
@@ -3104,24 +3104,24 @@ fn merge_tagged_sorted_runs<W: Write>(
     let mut output_records = 0u64;
     let mut duplicate_records = 0u64;
     while let Some(Reverse((record, run_index))) = heap.pop() {
-        if let Some(previous_record) = previous {
-            if record.same_identity(&previous_record) {
-                if record.record.provider_count != previous_record.record.provider_count {
-                    return Err(io::Error::new(
+        if let Some(previous_record) = previous
+            && record.same_identity(&previous_record)
+        {
+            if record.record.provider_count != previous_record.record.provider_count {
+                return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "duplicate tagged serving identity has conflicting provider_count values {} and {}",
                             previous_record.record.provider_count, record.record.provider_count
                         ),
                     ));
-                }
-                duplicate_records = duplicate_records.checked_add(1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "duplicate tagged record count overflow",
-                    )
-                })?;
             }
+            duplicate_records = duplicate_records.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate tagged record count overflow",
+                )
+            })?;
         }
         record.write_to(output, codec)?;
         output_records = output_records.checked_add(1).ok_or_else(|| {

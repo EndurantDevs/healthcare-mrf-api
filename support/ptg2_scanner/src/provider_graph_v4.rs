@@ -1839,12 +1839,12 @@ fn merge_tax_identity_artifact(
                 tin_hmac_sha256: token,
                 source_bitmap: vec![0; factors.source_bitmap_bytes],
             });
-        if let (Some(left), Some(right)) = (merged.tin_hmac_sha256, token) {
-            if left != right {
-                return Err(invalid(
-                    "V4 provider group has conflicting full tax identity HMACs",
-                ));
-            }
+        if let (Some(left), Some(right)) = (merged.tin_hmac_sha256, token)
+            && left != right
+        {
+            return Err(invalid(
+                "V4 provider group has conflicting full tax identity HMACs",
+            ));
         }
         if record.state.priority() > merged.state.priority() {
             merged.state = record.state;
