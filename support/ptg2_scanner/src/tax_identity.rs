@@ -147,10 +147,6 @@ impl TaxIdentityObservation {
     }
 }
 
-pub fn load_tin_token_policy_from_env() -> io::Result<TinTokenPolicy> {
-    load_tin_token_policy_with(env::var::<&'static str>)
-}
-
 #[doc(hidden)]
 pub fn load_tin_token_policy_with(
     mut read_var: impl FnMut(&'static str) -> Result<String, env::VarError>,
