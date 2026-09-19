@@ -148,14 +148,21 @@ impl TaxIdentityObservation {
 }
 
 pub fn load_tin_token_policy_from_env() -> io::Result<TinTokenPolicy> {
-    let policy_id = env::var(TIN_TOKEN_POLICY_ID_ENV).map_err(|_| {
+    load_tin_token_policy_with(|name| env::var(name))
+}
+
+#[doc(hidden)]
+pub fn load_tin_token_policy_with(
+    mut read_var: impl FnMut(&str) -> Result<String, env::VarError>,
+) -> io::Result<TinTokenPolicy> {
+    let policy_id = read_var(TIN_TOKEN_POLICY_ID_ENV).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "PTG TIN token policy id must be configured",
         )
     })?;
     validate_token_policy_id(&policy_id)?;
-    let secret_path = env::var(TIN_TOKEN_SECRET_FILE_ENV).map_err(|_| {
+    let secret_path = read_var(TIN_TOKEN_SECRET_FILE_ENV).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "PTG TIN token secret file must be configured",

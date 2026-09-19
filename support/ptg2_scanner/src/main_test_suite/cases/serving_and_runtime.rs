@@ -2467,6 +2467,7 @@ fn manifest_copy_merge_dedupes_price_set_atoms_by_full_pair() {
 }
 #[test]
 fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
+    let _env_lock = scanner_env_lock().lock().unwrap();
     let base =
         std::env::temp_dir().join(format!("ptg2-merge-parallel-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&base);
@@ -2497,8 +2498,8 @@ fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
     )
     .unwrap();
 
-    std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS");
-    std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES");
+    let sort_workers = TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS");
+    let chunk_bytes = TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES");
     merge_manifest_copy_files(
         "provider_group_member",
         &serial_output,
@@ -2509,8 +2510,10 @@ fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
     )
     .unwrap();
 
-    std::env::set_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS", "2");
-    std::env::set_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES", "1");
+    drop(sort_workers);
+    drop(chunk_bytes);
+    let _sort_workers = TestEnvVar::set("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS", "2");
+    let _chunk_bytes = TestEnvVar::set("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES", "1");
     merge_manifest_copy_files(
         "provider_group_member",
         &parallel_output,
@@ -2520,9 +2523,6 @@ fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
         ],
     )
     .unwrap();
-    std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS");
-    std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES");
-
     let serial = std::fs::read_to_string(&serial_output).unwrap();
     let parallel = std::fs::read_to_string(&parallel_output).unwrap();
     assert_eq!(parallel, serial);

@@ -6,35 +6,50 @@ mod cases {
 
     struct TestEnvVar {
         name: &'static str,
-        previous: Option<String>,
+        previous: Option<Option<std::ffi::OsString>>,
     }
 
     impl TestEnvVar {
         fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var(name).ok();
-            std::env::set_var(name, value);
+            let previous = env::replace_test_var(name, Some(value.into()));
             Self { name, previous }
         }
 
         fn remove(name: &'static str) -> Self {
-            let previous = std::env::var(name).ok();
-            std::env::remove_var(name);
+            let previous = env::replace_test_var(name, None);
             Self { name, previous }
         }
     }
 
     impl Drop for TestEnvVar {
         fn drop(&mut self) {
-            match self.previous.as_deref() {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
+            env::restore_test_var(self.name, self.previous.take());
         }
     }
 
     fn scanner_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_env_overrides_restore_and_reach_worker_threads() {
+        const NAME: &str = "PTG2_SCANNER_TEST_ENV_OVERRIDE";
+        let _lock = scanner_env_lock().lock().unwrap();
+        let inherited = env::var_os(NAME);
+        let outer = TestEnvVar::set(NAME, "outer");
+        assert_eq!(env::var(NAME).as_deref(), Ok("outer"));
+        assert_eq!(
+            thread::spawn(|| env::var(NAME)).join().unwrap().as_deref(),
+            Ok("outer")
+        );
+        {
+            let _removed = TestEnvVar::remove(NAME);
+            assert!(matches!(env::var(NAME), Err(env::VarError::NotPresent)));
+        }
+        assert_eq!(env::var(NAME).as_deref(), Ok("outer"));
+        drop(outer);
+        assert_eq!(env::var_os(NAME), inherited);
     }
 
     #[derive(Clone)]

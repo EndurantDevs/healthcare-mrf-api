@@ -201,14 +201,21 @@ fn environment_loader_requires_both_policy_and_exact_raw_secret() {
     let temp = tempfile::tempdir().unwrap();
     let secret_path = temp.path().join("secret");
     fs::write(&secret_path, [0x42; 32]).unwrap();
-    env::remove_var(TIN_TOKEN_POLICY_ID_ENV);
-    env::remove_var(TIN_TOKEN_SECRET_FILE_ENV);
-    assert!(load_tin_token_policy_from_env().is_err());
-
-    env::set_var(TIN_TOKEN_POLICY_ID_ENV, "ptg-tin-hmac-sha256-v1:release-1");
-    assert!(load_tin_token_policy_from_env().is_err());
-    env::set_var(TIN_TOKEN_SECRET_FILE_ENV, &secret_path);
-    let loaded = load_tin_token_policy_from_env().unwrap();
+    let policy_id = "ptg-tin-hmac-sha256-v1:release-1";
+    let lookup = |configured_policy: Option<&str>, configured_secret: Option<&str>| {
+        load_tin_token_policy_with(|name| match name {
+            TIN_TOKEN_POLICY_ID_ENV => configured_policy
+                .map(str::to_string)
+                .ok_or(env::VarError::NotPresent),
+            TIN_TOKEN_SECRET_FILE_ENV => configured_secret
+                .map(str::to_string)
+                .ok_or(env::VarError::NotPresent),
+            _ => Err(env::VarError::NotPresent),
+        })
+    };
+    assert!(lookup(None, None).is_err());
+    assert!(lookup(Some(policy_id), None).is_err());
+    let loaded = lookup(Some(policy_id), secret_path.to_str()).unwrap();
     assert_eq!(loaded.policy_id(), "ptg-tin-hmac-sha256-v1:release-1");
     assert_eq!(
         loaded.token_for_ein(b"123456789").tin_id_128,
@@ -217,8 +224,6 @@ fn environment_loader_requires_both_policy_and_exact_raw_secret() {
             .token_for_ein(b"123456789")
             .tin_id_128
     );
-    env::remove_var(TIN_TOKEN_POLICY_ID_ENV);
-    env::remove_var(TIN_TOKEN_SECRET_FILE_ENV);
 }
 
 #[test]
