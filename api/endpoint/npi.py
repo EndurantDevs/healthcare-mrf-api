@@ -10093,7 +10093,7 @@ async def list_providers(request):
             sub_s_total_projection = ", pn.provider_total AS _provider_total"
         else:
             page_npis_sql = f"""
-            {eligible_npis_sql}
+            {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if plan_network_ids else eligible_npis_sql}
             {page_order_sql}
             LIMIT :limit OFFSET :start
             """
