@@ -1285,7 +1285,7 @@ fn configured_shared_dedupe(
         ));
     }
     if factor_mode {
-        let policy = load_tin_token_policy_with(|name| env::var(name))?;
+        let policy = load_tin_token_policy_with(env::READ_VAR)?;
         return Ok(if paired_tax_identity {
             SharedDedupe::new_with_v4_paired_tax_identity(
                 worker_count,
@@ -3765,10 +3765,10 @@ impl ManifestPairSpool {
             self.write_dense_sidecar_external(path, chunk_bytes, &mut finalize_progress)
         };
         finalize_progress.flush();
-        if result.is_ok() {
-            if let Some(progress) = completion_progress {
-                progress.record_scan_finalize_job_completed();
-            }
+        if result.is_ok()
+            && let Some(progress) = completion_progress
+        {
+            progress.record_scan_finalize_job_completed();
         }
         result
     }
@@ -5556,80 +5556,80 @@ impl DictionaryCopySinks {
 
     fn maybe_rotate_silent(&mut self) -> io::Result<Vec<CopyFileEvent>> {
         let mut events = Vec::new();
-        if let Some(sink) = self.manifest_price_atom.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_atom.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_price_set_atom.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_set_atom.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_price_set_summary.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_set_summary.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_provider_group_member.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_provider_group_member.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_code_count.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_code_count.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_provider_set_dictionary.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_provider_set_dictionary.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.procedure.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.procedure.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_code_set.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_code_set.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_atom.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_atom.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_set_entry.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_set_entry.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set_component.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set_component.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set_entry.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set_entry.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_entry_component.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_entry_component.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_group_member.as_mut() {
-            if let Some(event) = sink.maybe_rotate_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_group_member.as_mut()
+            && let Some(event) = sink.maybe_rotate_silent()?
+        {
+            events.push(event);
         }
         Ok(events)
     }
@@ -5686,80 +5686,80 @@ impl DictionaryCopySinks {
 
     fn finish_silent(mut self) -> io::Result<Vec<CopyFileEvent>> {
         let mut events = Vec::new();
-        if let Some(sink) = self.manifest_price_atom.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_atom.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_price_set_atom.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_set_atom.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_price_set_summary.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_price_set_summary.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_provider_group_member.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_provider_group_member.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_code_count.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_code_count.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.manifest_provider_set_dictionary.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.manifest_provider_set_dictionary.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.procedure.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.procedure.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_code_set.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_code_set.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_atom.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_atom.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.price_set_entry.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.price_set_entry.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set_component.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set_component.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_set_entry.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_set_entry.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_entry_component.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_entry_component.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
-        if let Some(sink) = self.provider_group_member.take() {
-            if let Some(event) = sink.finish_silent()? {
-                events.push(event);
-            }
+        if let Some(sink) = self.provider_group_member.take()
+            && let Some(event) = sink.finish_silent()?
+        {
+            events.push(event);
         }
         Ok(events)
     }
@@ -11524,13 +11524,13 @@ fn validate_procedure_for_rate_dispatch(procedure: &Map<String, Value>) -> io::R
             None => unreachable!("required procedure fields were checked above"),
         }
     }
-    if let Some(value) = procedure.get("negotiation_arrangement") {
-        if !matches!(value, Value::String(_) | Value::Null) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "negotiation_arrangement must be a JSON string or null",
-            ));
-        }
+    if let Some(value) = procedure.get("negotiation_arrangement")
+        && !matches!(value, Value::String(_) | Value::Null)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiation_arrangement must be a JSON string or null",
+        ));
     }
     for field_name in ["billing_code_type_version", "name", "description"] {
         validate_optional_string_value(procedure.get(field_name), field_name)?;
@@ -11861,10 +11861,10 @@ fn finish_worker_outputs(
 ) -> io::Result<(Vec<CopyFileEvent>, ServingRunMetrics)> {
     let mut events = Vec::new();
     let mut serving_run_metrics = ServingRunMetrics::default();
-    if let Some(copy_writer) = compact_copy_writer {
-        if let Some(event) = copy_writer.finish_silent()? {
-            events.push(event);
-        }
+    if let Some(copy_writer) = compact_copy_writer
+        && let Some(event) = copy_writer.finish_silent()?
+    {
+        events.push(event);
     }
     if let Some(copy_writer) = manifest_serving_copy_writer {
         let (serving_events, metrics) = copy_writer.finish_silent()?;
@@ -12120,15 +12120,15 @@ fn compact_worker_loop(
             semantic_progress.record_rate_chunk_completed();
         }
         let write_started_at = Instant::now();
-        if let Some(copy_writer) = compact_copy_writer.as_mut() {
-            if let Some(event) = copy_writer.maybe_rotate_silent()? {
-                config.event_tx.send(event).map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("compact copy event queue closed: {err}"),
-                    )
-                })?;
-            }
+        if let Some(copy_writer) = compact_copy_writer.as_mut()
+            && let Some(event) = copy_writer.maybe_rotate_silent()?
+        {
+            config.event_tx.send(event).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("compact copy event queue closed: {err}"),
+                )
+            })?;
         }
         if let Some(copy_writer) = manifest_serving_copy_writer.as_mut() {
             for event in copy_writer.maybe_rotate_silent()? {
@@ -14512,21 +14512,21 @@ impl CompactTopLevelArrayIndexer {
             match byte {
                 b'{' | b'[' => self.depth += 1,
                 b']' => {
-                    if let Some((key, array_depth, array_offset)) = self.active_array {
-                        if self.depth == array_depth {
-                            set_top_level_array_range(
-                                key,
-                                TopLevelArrayRange {
-                                    offset: array_offset,
-                                    length: absolute_offset
-                                        .saturating_sub(array_offset)
-                                        .saturating_add(1),
-                                },
-                                &mut self.provider_references,
-                                &mut self.in_network,
-                            )?;
-                            self.active_array = None;
-                        }
+                    if let Some((key, array_depth, array_offset)) = self.active_array
+                        && self.depth == array_depth
+                    {
+                        set_top_level_array_range(
+                            key,
+                            TopLevelArrayRange {
+                                offset: array_offset,
+                                length: absolute_offset
+                                    .saturating_sub(array_offset)
+                                    .saturating_add(1),
+                            },
+                            &mut self.provider_references,
+                            &mut self.in_network,
+                        )?;
+                        self.active_array = None;
                     }
                     self.depth = self.depth.saturating_sub(1);
                 }
@@ -14607,11 +14607,11 @@ fn scan_compact_top_level_array_ranges(
     json_reader
         .consume_trailing_whitespace()
         .map_err(to_io_error)?;
-    let result = indexer
+
+    indexer
         .lock()
         .map_err(|_| io::Error::other("top-level range indexer mutex is poisoned"))?
-        .finish();
-    result
+        .finish()
 }
 
 fn build_indexed_top_level_reorder(
@@ -23253,16 +23253,16 @@ impl V4FinalizerPackLaneWriter {
             ));
         };
         let coordinate = (row.block_key, row.fragment_no);
-        if let Some(previous) = state.previous_coordinate {
-            if coordinate <= previous {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "V4 finalizer pack coordinates are not strictly ordered for object kind {:?}",
-                        row.object_kind
-                    ),
-                ));
-            }
+        if let Some(previous) = state.previous_coordinate
+            && coordinate <= previous
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "V4 finalizer pack coordinates are not strictly ordered for object kind {:?}",
+                    row.object_kind
+                ),
+            ));
         }
         state.previous_coordinate = Some(coordinate);
         state.references.push(V4FinalizerMapReference {

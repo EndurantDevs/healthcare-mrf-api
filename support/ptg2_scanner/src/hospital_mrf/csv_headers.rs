@@ -129,11 +129,10 @@ fn parse_csv_metadata(
             }
             _ => None,
         };
-        if let Some(key) = key {
-            if fields.insert(key.clone(), index).is_some() {
+        if let Some(key) = key
+            && fields.insert(key.clone(), index).is_some() {
                 return Err(invalid(format!("duplicate general CSV header {key}")));
             }
-        }
         if header.trim().eq_ignore_ascii_case(ATTESTATION_TEXT) {
             if attestation_index.replace(index).is_some() {
                 return Err(invalid("duplicate attestation header"));

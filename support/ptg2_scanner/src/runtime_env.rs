@@ -3,6 +3,9 @@ pub use std::env::{args, current_dir, temp_dir, VarError};
 #[cfg(not(test))]
 pub use std::env::{var, var_os};
 
+#[cfg(not(test))]
+pub const READ_VAR: fn(&'static str) -> Result<String, VarError> = std::env::var::<&'static str>;
+
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(test)]
@@ -33,6 +36,9 @@ pub fn var(name: &str) -> Result<String, VarError> {
         None => Err(VarError::NotPresent),
     }
 }
+
+#[cfg(test)]
+pub const READ_VAR: fn(&'static str) -> Result<String, VarError> = var;
 
 #[cfg(test)]
 pub fn replace_test_var(name: &'static str, value: Option<OsString>) -> Option<Option<OsString>> {

@@ -131,13 +131,13 @@ impl TinTokenPolicy {
 
 impl TaxIdentityObservation {
     pub fn merge(self, other: Self) -> io::Result<Self> {
-        if let (Some(left), Some(right)) = (self.tin_hmac_sha256, other.tin_hmac_sha256) {
-            if left != right {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "provider group has conflicting supported tax identities",
-                ));
-            }
+        if let (Some(left), Some(right)) = (self.tin_hmac_sha256, other.tin_hmac_sha256)
+            && left != right
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group has conflicting supported tax identities",
+            ));
         }
         if state_priority(other.state) > state_priority(self.state) {
             Ok(other)
@@ -148,12 +148,12 @@ impl TaxIdentityObservation {
 }
 
 pub fn load_tin_token_policy_from_env() -> io::Result<TinTokenPolicy> {
-    load_tin_token_policy_with(|name| env::var(name))
+    load_tin_token_policy_with(env::var::<&'static str>)
 }
 
 #[doc(hidden)]
 pub fn load_tin_token_policy_with(
-    mut read_var: impl FnMut(&str) -> Result<String, env::VarError>,
+    mut read_var: impl FnMut(&'static str) -> Result<String, env::VarError>,
 ) -> io::Result<TinTokenPolicy> {
     let policy_id = read_var(TIN_TOKEN_POLICY_ID_ENV).map_err(|_| {
         io::Error::new(
