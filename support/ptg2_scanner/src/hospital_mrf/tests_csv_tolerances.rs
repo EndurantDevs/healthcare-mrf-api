@@ -512,10 +512,21 @@ include!("tests_metadata_address.rs");
     fn csv_two_digit_years_use_the_2000s() {
         assert_eq!(canonical_csv_date("10/1/25").unwrap(), "2025-10-01");
         assert_eq!(canonical_csv_date("12/11/25").unwrap(), "2025-12-11");
-        for value in ["10/1/2", "10/1/025", "25-10-01"] {
+        assert_eq!(canonical_csv_date("06-30-26").unwrap(), "2026-06-30");
+        assert_eq!(canonical_csv_date("02-29-24").unwrap(), "2024-02-29");
+        for value in [
+            "10/1/2",
+            "10/1/025",
+            "25-10-01",
+            "06-12-26",
+            "6-30-26",
+            "13-30-26",
+            "02-30-24",
+        ] {
             assert!(canonical_csv_date(value).is_err());
         }
         assert!(canonical_json_date("10/1/25").is_err());
+        assert!(canonical_json_date("06-30-26").is_err());
     }
 
     #[test]

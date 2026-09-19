@@ -346,10 +346,20 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     let parts = value.split(['-', '/']).collect::<Vec<_>>();
     if parts.len() != 3 || (value.contains('-') && value.contains('/')) {
         return Err(invalid(
-            "last_updated_on must be YYYY-MM-DD, M/D/YYYY, MM/DD/YYYY, M/D/YY, or MM/DD/YY",
+            "last_updated_on must be YYYY-MM-DD, unambiguous MM-DD-YY with day 13-31, M/D/YYYY, MM/DD/YYYY, M/D/YY, or MM/DD/YY",
         ));
     }
-    let (year, month, day) = if value.contains('/') {
+    let short_hyphenated = !value.contains('/')
+        && parts.iter().all(|part| {
+            part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts[0]
+            .parse::<u32>()
+            .is_ok_and(|month| (1..=12).contains(&month))
+        && parts[1]
+            .parse::<u32>()
+            .is_ok_and(|day| (13..=31).contains(&day));
+    let (year, month, day) = if value.contains('/') || short_hyphenated {
         (parts[2], parts[0], parts[1])
     } else {
         (parts[0], parts[1], parts[2])
@@ -359,7 +369,7 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     }) {
         return Err(invalid("last_updated_on contains an invalid month or day"));
     }
-    let two_digit_year = value.contains('/') && year.len() == 2;
+    let two_digit_year = (value.contains('/') || short_hyphenated) && year.len() == 2;
     if !year.bytes().all(|byte| byte.is_ascii_digit())
         || (year.len() != 4 && !two_digit_year)
     {
