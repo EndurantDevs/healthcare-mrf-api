@@ -1096,6 +1096,7 @@ async def test_get_all_unified_network_filter_matches_serving_index(monkeypatch)
     normalized_sql = " ".join(page_sql.lower().split())
     assert "c.type in ('primary', 'secondary', 'practice', 'site')" in normalized_sql
     assert "plans_network_array && :plan_network_array" in normalized_sql
+    assert "order by npi + 0" in normalized_sql
     assert params["plan_network_array"] == [424242424]
 
 
