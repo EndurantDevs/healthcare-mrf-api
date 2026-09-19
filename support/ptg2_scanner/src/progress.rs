@@ -17,6 +17,17 @@ use std::time::{Duration, Instant};
 pub const SEMANTIC_PROGRESS_INTERVAL: Duration = Duration::from_secs(4);
 pub const MAX_SEMANTIC_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
+pub fn seconds_from_micros(micros: u128) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
+pub fn compressed_mib_per_second(compressed_bytes: u64, elapsed_seconds: f64) -> f64 {
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    compressed_bytes as f64 / (1024.0 * 1024.0) / elapsed_seconds
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScannerSemanticSnapshot {
     pub semantic_work_completed: u64,
