@@ -50,6 +50,7 @@ from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
 from process.plan_summary import rebuild_plan_search_summary
+from process.mrf_publication_receipt import begin_publication
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.ptg_parts.copy_load import _copy_ignore_objects
 from process.redis_config import build_redis_settings
@@ -3321,7 +3322,7 @@ async def startup(ctx):
         ctx["context"]["import_date"] = datetime.datetime.utcnow().strftime("%Y%m%d")
 
 
-async def _publish_mrf_table_generation(import_date: str, db_schema: str) -> None:
+async def _publish_mrf_table_generation(import_date: str, db_schema: str):
     """Rotate the closed MRF family and record its generation atomically."""
 
     staging_tables_by_main_name = {}
@@ -3366,7 +3367,7 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str) -> Non
                         f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
                         f"{table}_idx_{index_name};"
                     )
-        await publish_local_reference_family_generation(
+        publication_generation = await publish_local_reference_family_generation(
             db,
             importer_id="mrf",
             schema_name=db_schema,
@@ -3376,6 +3377,7 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str) -> Non
             importer_id="mrf-address",
             schema_name=db_schema,
         )
+        return publication_generation
 
 
 async def publish_initial_generation(ctx, task):
@@ -3581,7 +3583,11 @@ async def publish_initial_generation(ctx, task):
         names={"npi_type_checksum", "address_key"},
     )
     record_finalize_phase("mrf_address_fast_path_indexes", fast_path_indexes_started)
+    publication_attempt = None
+    if not is_test_mode_enabled:
+        publication_attempt = await begin_publication(db_schema, import_date)
     address_stats = None
+    has_address_resolution = False
     if source_enabled("mrf") and not is_test_mode_enabled:
         address_field_map = {
             "first_line": "first_line",
@@ -3622,6 +3628,7 @@ async def publish_initial_generation(ctx, task):
             schema=db_schema,
         )
         logger.info("MRF canonical address resolve complete: %s", address_stats)
+        has_address_resolution = True
         if _is_truthy(os.environ.get("HLTHPRT_MRF_OPENADDRESSES_BACKFILL"), ("yes", "y", "true", "1")):
             oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
             logger.info(
@@ -3644,7 +3651,7 @@ async def publish_initial_generation(ctx, task):
     record_finalize_phase("mrf_serving_indexes", serving_indexes_started)
 
     publication_started = time.monotonic()
-    await _publish_mrf_table_generation(import_date, db_schema)
+    publication_generation = await _publish_mrf_table_generation(import_date, db_schema)
     record_finalize_phase("mrf_table_publication", publication_started)
 
     upsert_history = (
@@ -3674,7 +3681,10 @@ async def publish_initial_generation(ctx, task):
     else:
         summary_rows = await timed_finalize_phase(
             "mrf_plan_search_summary",
-            rebuild_plan_search_summary(test_mode=is_test_mode_enabled),
+            rebuild_plan_search_summary(
+                test_mode=is_test_mode_enabled,
+                publication=(publication_attempt, publication_generation, has_address_resolution),
+            ),
         )
     print("Plan search summary rows: ", summary_rows)
     start_time = ctx.get("context", {}).get("start")

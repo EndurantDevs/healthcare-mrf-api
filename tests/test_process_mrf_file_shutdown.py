@@ -370,7 +370,10 @@ async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(mon
     )
 
     assert ("summary", False) in operations
-    process_initial.publish_local_reference_family_generation.assert_awaited_once()
+    assert [
+        call.kwargs["importer_id"]
+        for call in process_initial.publish_local_reference_family_generation.await_args_list
+    ] == ["mrf", "mrf-address"]
     index_operations = [operation for operation in operations if operation[0] == "indexes"]
     assert index_operations == [
         ("indexes", "mrf_address_20260829", {"address_key"}),

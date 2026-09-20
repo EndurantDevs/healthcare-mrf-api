@@ -66,13 +66,14 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
     )
 
 
-async def _manifest(sessions, importer_id: str, schema_name: str):
+async def _manifest(sessions, importer_id: str, schema_name: str, *, dependencies=None):
     async with sessions() as session, session.begin():
         capture = await archive.capture_reference_family_source(
             session,
             importer_id=importer_id,
             schema_name=schema_name,
             source_metadata={"source_release": "synthetic-2026", "receipt": importer_id},
+            dependencies=dependencies,
         )
     return capture.manifest
 

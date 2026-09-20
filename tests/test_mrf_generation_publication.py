@@ -63,12 +63,14 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
     monkeypatch.setattr(initial, "make_class", _stage_model)
     monkeypatch.setattr(initial, "publish_local_reference_family_generation", generation_writer)
 
-    assert initial._MRF_PUBLICATION_MODELS == reference_family_spec("mrf").model_types
+    spec = reference_family_spec("mrf")
+    assert initial._MRF_PUBLICATION_MODELS == spec.model_types[:-1]
+    assert spec.model_types[-1].__tablename__ == "plan_search_summary"
     await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
 
     assert observed_scopes == [("mrf", "mrf_test"), ("mrf-address", "mrf_test")]
     assert database.exit_exception is None
-    for table_name in reference_family_spec("mrf").table_names:
+    for table_name in (model.__tablename__ for model in initial._MRF_PUBLICATION_MODELS):
         assert f"ALTER TABLE IF EXISTS mrf_test.{table_name}_stage RENAME TO {table_name};" in database.statements
 
 

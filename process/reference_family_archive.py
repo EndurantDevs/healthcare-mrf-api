@@ -27,7 +27,12 @@ from sqlalchemy.schema import CreateSequence, CreateTable, MetaData
 from db import models
 from db.tiger_models import Zip_zcta5, ZipState
 from process import entity_address_snapshot_receipt as catalog_identity
+from process.entity_address_snapshot_receipt import _projected_row_identity
+from process.mrf_publication_receipt import require_completed_publication
+from process.mrf_address_publication import STAGE_TABLE, referenced_address_filter
+from process.ext.address_canon import archive_table_name
 from process.reference_family_result_generation import (
+    RELATION_NAMES_BY_IMPORTER,
     publish_adopted_reference_family_generation,
     read_reference_family_result_generation_authority,
     require_reference_family_automatic_generation_order,
@@ -45,6 +50,7 @@ _PREDECESSOR_PREFIX = "reference_family_predecessor_"
 _LOCK_TIMEOUT = "500ms"
 _CAPTURE_TIMEOUT = "5s"
 _MAX_METADATA_BYTES = 16_384
+_AUX_SCHEMA = "mrf-canonical-address.payload-jsonb.v1"
 
 
 class ReferenceFamilyArchiveError(RuntimeError):
@@ -64,6 +70,12 @@ class ReferenceFamilySpec:
         """Return the exact ordered relation names owned by this family."""
 
         return tuple(model_type.__tablename__ for model_type in self.model_types)
+
+    @property
+    def archive_names(self) -> tuple[str, ...]:
+        """Return table names included in the portable archive."""
+
+        return self.table_names + ((STAGE_TABLE,) if self.importer_id == "mrf" else ())
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,7 @@ class ReferenceFamilyManifest:
     source_metadata_sha256: str
     schema_sha256: str
     dependencies: Mapping[str, str] = field(default_factory=dict)
+    auxiliary: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the strict portable manual-only archive manifest."""
@@ -111,6 +124,8 @@ class ReferenceFamilyManifest:
         }
         if self.dependencies:
             manifest_by_field["dependencies"] = dict(self.dependencies)
+        if self.importer_id == "mrf":
+            manifest_by_field["auxiliary"] = dict(self.auxiliary or {})
         return manifest_by_field
 
 
@@ -133,6 +148,7 @@ class ReferenceFamilyStageOwnership:
     schema_oid: int
     relation_oids: tuple[tuple[str, int], ...]
     sequence_oids: tuple[tuple[str, int, str, str], ...] = ()
+    auxiliary_oid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -241,7 +257,9 @@ _SPECS = {
                 models.PlanNetworkTierRaw,
                 models.MRFAddress,
                 models.MRFAddressEvidence,
+                models.PlanSearchSummary,
             ),
+            ("plan-attributes",),
         ),
         ReferenceFamilySpec("mrf-address", (models.MRFAddress, models.MRFAddressEvidence)),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
@@ -355,6 +373,59 @@ def _schema_digest(receipts: list[ReferenceTableReceipt] | tuple[ReferenceTableR
     return hashlib.sha256(b"reference-family-schema/v1\0" + _canonical_json(schema_receipts)).hexdigest()
 
 
+async def _mrf_auxiliary_receipt(session, schema_name, *, is_source=False, publication=None):
+    if is_source:
+        archive_name = archive_table_name()
+        if await _relation_oid(session, schema_name, archive_name) is None or publication is None:
+            raise ReferenceFamilyArchiveError("MRF canonical source or publication receipt is unavailable")
+        where_sql = referenced_address_filter(
+            schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+        )
+        count, digest = await _projected_row_identity(
+            session, schema_name, archive_name, row_json_sql="to_jsonb(row_value)", where_sql=where_sql,
+        )
+        publication_sha256 = hashlib.sha256(_canonical_json({
+            "attempt_id": str(publication["attempt_id"]),
+            "generation": publication["generation"],
+            "address_content": publication["address_content"],
+        })).hexdigest()
+    else:
+        archive_name = publication["archive_name"]
+        relation_oid = await _relation_oid(session, schema_name, STAGE_TABLE)
+        if relation_oid is None:
+            raise ReferenceFamilyArchiveError("MRF canonical auxiliary relation is missing")
+        columns = await catalog_identity._catalog_columns(session, relation_oid)
+        if [(column["attname"], column["type"], column["attnotnull"], column["default_expression"])
+            for column in columns] != [
+                ("address_key", "uuid", True, None), ("payload", "jsonb", True, None),
+            ]:
+            raise ReferenceFamilyArchiveError("MRF canonical auxiliary schema differs")
+        primary_keys = await session.scalar(text(
+            "SELECT count(*) FROM pg_catalog.pg_constraint "
+            "WHERE conrelid=:oid AND contype='p'"
+        ), {"oid": relation_oid})
+        if primary_keys != 1:
+            raise ReferenceFamilyArchiveError("MRF canonical auxiliary key constraint differs")
+        malformed = await session.scalar(text(
+            f"SELECT count(*) FROM {_quoted(schema_name)}.{_quoted(STAGE_TABLE)} "
+            "WHERE payload->>'address_key' IS DISTINCT FROM address_key::text"
+        ))
+        if malformed:
+            raise ReferenceFamilyArchiveError("MRF canonical auxiliary key differs")
+        count, digest = await _projected_row_identity(
+            session, schema_name, STAGE_TABLE, row_json_sql="row_value.payload",
+        )
+        publication_sha256 = publication["publication_sha256"]
+    return {
+        "table_name": STAGE_TABLE,
+        "archive_name": archive_name,
+        "schema_sha256": hashlib.sha256(_AUX_SCHEMA.encode()).hexdigest(),
+        "row_count": count,
+        "content_sha256": digest,
+        "publication_sha256": publication_sha256,
+    }
+
+
 def _require_transaction(session: Any) -> None:
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise ReferenceFamilyArchiveError("reference family operation requires a caller transaction")
@@ -417,6 +488,13 @@ async def _lock_family(
 ) -> None:
     relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(name)}" for name in table_names)
     await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE{' NOWAIT' if nowait else ''}"))
+
+
+async def _lock_source_family(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
+    """Use the ordinary finalizer's table-before-summary lock order."""
+
+    names = RELATION_NAMES_BY_IMPORTER["mrf"] if spec.importer_id == "mrf" else spec.table_names
+    await _lock_family(session, schema_name, names, "SHARE")
 
 
 async def _table_receipt(
@@ -529,6 +607,8 @@ async def _family_manifest(
     schema_name: str,
     source_metadata: Mapping[str, Any],
     dependencies: Mapping[str, str] | None = None,
+    auxiliary: Mapping[str, Any] | None = None,
+    publication: Mapping[str, Any] | None = None,
 ) -> ReferenceFamilyManifest:
     metadata, metadata_sha256 = _source_metadata(source_metadata)
     receipts = tuple(
@@ -543,6 +623,11 @@ async def _family_manifest(
         ]
     )
     schema_sha256 = _schema_digest(receipts)
+    if spec.importer_id == "mrf":
+        auxiliary = await _mrf_auxiliary_receipt(
+            session, schema_name, is_source=auxiliary is None,
+            publication=publication if auxiliary is None else auxiliary,
+        )
     return ReferenceFamilyManifest(
         spec.importer_id,
         receipts,
@@ -550,12 +635,17 @@ async def _family_manifest(
         metadata_sha256,
         schema_sha256,
         _dependency_packages(spec.importer_id, {} if dependencies is None else dependencies),
+        auxiliary,
     )
 
 
 def _dependency_packages(importer_id: str, value: object) -> dict[str, str]:
     """Keep dependency identity portable: exact package hashes, never local OIDs."""
-    if not isinstance(value, Mapping) or len(value) > 32:
+    if (
+        not isinstance(value, Mapping)
+        or len(value) > 32
+        or set(value) != set(reference_family_spec(importer_id).dependencies)
+    ):
         raise ReferenceFamilyArchiveError("reference family dependencies are invalid")
     if any(
         not isinstance(name, str)
@@ -569,12 +659,32 @@ def _dependency_packages(importer_id: str, value: object) -> dict[str, str]:
     return dict(sorted(value.items()))
 
 
+def _validate_mrf_auxiliary_receipt(auxiliary: object) -> Mapping[str, Any]:
+    """Validate the required portable canonical-address receipt."""
+
+    expected_fields = {
+        "table_name", "archive_name", "schema_sha256", "row_count", "content_sha256", "publication_sha256",
+    }
+    if (
+        not isinstance(auxiliary, Mapping)
+        or set(auxiliary) != expected_fields
+        or auxiliary["table_name"] != STAGE_TABLE
+        or _IDENTIFIER.fullmatch(str(auxiliary["archive_name"])) is None
+        or auxiliary["schema_sha256"] != hashlib.sha256(_AUX_SCHEMA.encode()).hexdigest()
+        or type(auxiliary["row_count"]) is not int or auxiliary["row_count"] < 0
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(auxiliary[key])) is None
+               for key in ("content_sha256", "publication_sha256"))
+    ):
+        raise ReferenceFamilyArchiveError("MRF canonical auxiliary receipt is invalid")
+    return auxiliary
+
+
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
     """Validate the portable closed-family receipt without granting authority."""
 
     if isinstance(manifest_value, ReferenceFamilyManifest):
         manifest_value = manifest_value.as_dict()
-    if not isinstance(manifest_value, Mapping) or set(manifest_value) - {"dependencies"} != {
+    if not isinstance(manifest_value, Mapping) or set(manifest_value) - {"dependencies"} != ({
         "contract",
         "importer_id",
         "publication_authority",
@@ -582,11 +692,12 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         "source_metadata",
         "source_metadata_sha256",
         "schema_sha256",
-    }:
+    } | ({"auxiliary"} if manifest_value.get("importer_id") == "mrf" else set())):
         raise ReferenceFamilyArchiveError("reference family manifest is invalid")
     if manifest_value["contract"] != CONTRACT or manifest_value["publication_authority"] != "manual-only":
         raise ReferenceFamilyArchiveError("reference family manifest is not manual-only")
     spec = reference_family_spec(manifest_value["importer_id"])
+    auxiliary = _validate_mrf_auxiliary_receipt(manifest_value.get("auxiliary")) if spec.importer_id == "mrf" else None
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
     raw_tables = manifest_value["tables"]
     if not isinstance(raw_tables, list) or len(raw_tables) != len(spec.model_types):
@@ -614,7 +725,13 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         raise ReferenceFamilyArchiveError("reference family manifest digest differs")
     dependencies = _dependency_packages(spec.importer_id, manifest_value.get("dependencies", {}))
     return ReferenceFamilyManifest(
-        spec.importer_id, tuple(receipts), metadata, metadata_sha256, schema_sha256, dependencies
+        spec.importer_id,
+        tuple(receipts),
+        metadata,
+        metadata_sha256,
+        schema_sha256,
+        dependencies,
+        auxiliary,
     )
 
 
@@ -755,13 +872,17 @@ async def _capture_reference_family_source(
     if configure_isolation:
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     async with _bounded_capture(session):
-        await _lock_family(session, schema, spec.table_names, "SHARE")
+        await _lock_source_family(session, spec, schema)
+        publication = None
+        if importer_id == "mrf":
+            publication = await require_completed_publication(session, schema)
         manifest = await _family_manifest(
             session,
             spec=spec,
             schema_name=schema,
             source_metadata=source_metadata,
             dependencies=dependencies,
+            publication=publication,
         )
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
         if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
@@ -787,12 +908,51 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
             await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
         columns = ", ".join(_quoted(column.name) for column in models_by_table[table.table_name].__table__.columns)
         await session.execute(text(f"INSERT INTO {stage_ref} ({columns}) SELECT {columns} FROM {source_ref}"))
+    if spec.importer_id == "mrf":
+        source_archive = f"{_quoted(capture.schema_name)}.{_quoted(archive_table_name())}"
+        stage_aux = f"{_quoted(stage_schema)}.{_quoted(STAGE_TABLE)}"
+        address_filter = referenced_address_filter(
+            capture.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+            key="canonical.address_key",
+        )
+        await session.execute(text(
+            f"INSERT INTO {stage_aux} (address_key, payload) "
+            f"SELECT canonical.address_key, to_jsonb(canonical) FROM {source_archive} AS canonical {address_filter}"
+        ))
     await _rebase_owned_sequences(session, stage_schema, spec.importer_id)
 
 
-async def _rebase_owned_sequences(session: Any, stage_schema: str, importer_id: str) -> None:
+async def _rebase_mrf_sequences(
+    session: Any,
+    stage_schema: str,
+    *,
+    ownership: ReferenceFamilyStageOwnership | None = None,
+) -> None:
+    """Rebase restored MRF sequences only after checking their frozen OIDs."""
+
+    await _rebase_owned_sequences(session, stage_schema, "mrf", ownership=ownership)
+
+
+async def _rebase_owned_sequences(
+    session: Any,
+    stage_schema: str,
+    importer_id: str,
+    *,
+    ownership: ReferenceFamilyStageOwnership | None = None,
+) -> None:
     """Set cloned sequence state from frozen rows, without consulting mutable sequences."""
 
+    sequence_oid_by_name = {}
+    if ownership is not None:
+        _require_transaction(session)
+        if ownership.importer_id != importer_id or ownership.schema_name != stage_schema:
+            raise ReferenceFamilyArchiveError("reference family sequence ownership scope differs")
+        await _lock_family(session, stage_schema, reference_family_spec(importer_id).archive_names, "ACCESS EXCLUSIVE")
+        # Reading each sequence retains a relation lock; verify the locked OIDs before nontransactional setval.
+        for name, oid, _table, _column in ownership.sequence_oids:
+            await session.execute(text(f"SELECT last_value FROM {_quoted(stage_schema)}.{_quoted(name)}"))
+            sequence_oid_by_name[name] = str(oid)
+        await verify_reference_family_stage_ownership(session, ownership)
     for sequence_name, table_name, column_name in _OWNED_SEQUENCES.get(importer_id, ()):
         maximum_value = await session.scalar(
             text(f"SELECT max({_quoted(column_name)})::bigint FROM {_quoted(stage_schema)}.{_quoted(table_name)}")
@@ -801,7 +961,7 @@ async def _rebase_owned_sequences(session: Any, stage_schema: str, importer_id: 
         await session.execute(
             text("SELECT pg_catalog.setval(CAST(:sequence AS regclass), :value, :called)"),
             {
-                "sequence": f"{stage_schema}.{sequence_name}",
+                "sequence": sequence_oid_by_name[sequence_name] if ownership else f"{stage_schema}.{sequence_name}",
                 "value": sequence_value,
                 "called": maximum_value is not None and maximum_value >= 1,
             },
@@ -892,6 +1052,12 @@ async def capture_reference_family_stage_ownership(
             raise ReferenceFamilyArchiveError("reference family owned relation is missing")
         relation_oids.append((table_name, relation_oid))
     owned_oids = {oid for _, oid in relation_oids}
+    auxiliary_oid = None
+    if spec.importer_id == "mrf":
+        auxiliary_oid = await _relation_oid(session, schema_name, STAGE_TABLE)
+        if auxiliary_oid is None:
+            raise ReferenceFamilyArchiveError("MRF canonical auxiliary relation is missing")
+        owned_oids.add(auxiliary_oid)
     sequence_oids = await _owned_sequences(session, schema_oid)
     expected_sequences = _OWNED_SEQUENCES.get(spec.importer_id, ())
     if (
@@ -919,6 +1085,7 @@ async def capture_reference_family_stage_ownership(
         schema_oid,
         tuple(relation_oids),
         sequence_oids,
+        auxiliary_oid,
     )
 
 
@@ -957,6 +1124,7 @@ async def _validate_stage_manifest(
         schema_name=ownership.schema_name,
         source_metadata=validated.source_metadata,
         dependencies=validated.dependencies,
+        auxiliary=validated.auxiliary,
     )
     if observed.as_dict() != validated.as_dict():
         raise ReferenceFamilyArchiveError("reference family restored stage differs")
@@ -979,12 +1147,15 @@ async def cleanup_reference_family_stage(
     await _lock_family(
         session,
         ownership.schema_name,
-        tuple(name for name, _ in ownership.relation_oids),
+        reference_family_spec(ownership.importer_id).archive_names,
         "ACCESS EXCLUSIVE",
         nowait=True,
     )
     await verify_reference_family_stage_ownership(session, ownership)
-    relations = ", ".join(f"{_quoted(ownership.schema_name)}.{_quoted(name)}" for name, _ in ownership.relation_oids)
+    relations = ", ".join(
+        f"{_quoted(ownership.schema_name)}.{_quoted(name)}"
+        for name in reference_family_spec(ownership.importer_id).archive_names
+    )
     await session.execute(text(f"DROP TABLE {relations} RESTRICT"))
     if int(
         await session.scalar(
@@ -1085,7 +1256,7 @@ async def prepare_reference_family_archive_source(
         if source_metadata_factory is not None or dependency_factory is not None:
             spec = reference_family_spec(importer_id)
             async with _bounded_capture(source_session):
-                await _lock_family(source_session, _schema_name(schema_name), spec.table_names, "SHARE")
+                await _lock_source_family(source_session, spec, _schema_name(schema_name))
                 if source_metadata_factory is not None:
                     effective_source_metadata = await source_metadata_factory(source_session)
                 if dependency_factory is not None:
@@ -1133,7 +1304,7 @@ async def export_prepared_reference_family_archive(
             await _lock_family(
                 stage_session,
                 stage_schema,
-                reference_family_spec(importer_id).table_names,
+                reference_family_spec(importer_id).archive_names,
                 "SHARE",
             )
             await verify_reference_family_stage_ownership(stage_session, ownership)
@@ -1230,6 +1401,11 @@ async def _create_model_family(
     create_indexes: bool = True,
 ) -> None:
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
+    if spec.importer_id == "mrf":
+        await session.execute(text(
+            f"CREATE TABLE {_quoted(schema_name)}.{_quoted(STAGE_TABLE)} "
+            "(address_key uuid PRIMARY KEY, payload jsonb NOT NULL)"
+        ))
     metadata = MetaData(schema=schema_name)
     for model_type in spec.model_types:
         table = model_type.__table__.to_metadata(metadata, schema=schema_name)
@@ -1271,7 +1447,8 @@ async def _create_model_indexes(session: Any, spec: ReferenceFamilySpec, schema_
             # The importer only creates copied additional indexes for these stages.
             indexes = (
                 tuple(getattr(model_type, "__my_additional_indexes__", ()) or ())
-                if model_type.__tablename__ in {"plan_benefits_marketplace", "mrf_address", "mrf_address_evidence"}
+                if model_type.__tablename__
+                in {"plan_benefits_marketplace", "mrf_address", "mrf_address_evidence", "plan_search_summary"}
                 else ()
             )
         for index in indexes:
@@ -1300,7 +1477,7 @@ async def validate_reference_family_stage(
         await _lock_family(
             session,
             ownership.schema_name,
-            tuple(name for name, _ in ownership.relation_oids),
+            reference_family_spec(ownership.importer_id).archive_names,
             "SHARE",
         )
         await verify_reference_family_stage_ownership(session, ownership)
@@ -1324,6 +1501,12 @@ async def _verify_stage_owner(
     )
     if schema_owner != expected_owner_oid:
         raise ReferenceFamilyArchiveError("reference family stage owner differs")
+    relation_oids = tuple(
+        sorted(
+            ownership.relation_oids
+            + (((STAGE_TABLE, ownership.auxiliary_oid),) if ownership.auxiliary_oid is not None else ())
+        )
+    )
     relation_rows = list(
         (
             await session.execute(
@@ -1332,14 +1515,14 @@ async def _verify_stage_owner(
                     "FROM pg_catalog.pg_class AS relation "
                     "WHERE relation.oid=ANY(CAST(:relation_oids AS oid[])) ORDER BY relation.relname"
                 ),
-                {"relation_oids": [relation_oid for _, relation_oid in ownership.relation_oids]},
+                {"relation_oids": [relation_oid for _, relation_oid in relation_oids]},
             )
         ).mappings()
     )
     if [
         (relation_record["relname"], int(relation_record["oid"]), int(relation_record["relowner"]))
         for relation_record in relation_rows
-    ] != [(table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in ownership.relation_oids]:
+    ] != [(table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in relation_oids]:
         raise ReferenceFamilyArchiveError("reference family stage owner differs")
     if ownership.sequence_oids:
         sequence_rows = list(
@@ -1458,7 +1641,7 @@ async def _lock_and_verify_activation(
     expected_incumbent: ReferenceFamilyIncumbent,
 ) -> None:
     async with _bounded_capture(session):
-        await _lock_family(session, ownership.schema_name, spec.table_names, "ACCESS EXCLUSIVE")
+        await _lock_family(session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE")
         incumbent_names = tuple(name for name, oid in expected_incumbent.relation_oids if oid is not None)
         if incumbent_names:
             await _lock_family(session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE")
@@ -1503,6 +1686,80 @@ async def _rotate_family_relations(
     return predecessor_schema
 
 
+async def _validate_mrf_canonical_address_merge(session, stage, archive) -> None:
+    """Reject mutable or mismatched canonical-address contributions before merge."""
+
+    conflict = await session.scalar(text(f"""
+        SELECT count(*) FROM {stage} AS source JOIN {archive} AS target USING (address_key)
+        WHERE target.merged_into IS NOT NULL
+           OR source.payload->>'merged_into' IS NOT NULL
+           OR jsonb_build_array(
+                source.payload->'identity_key', source.payload->'identity_version',
+                source.payload->'precision', source.payload->'premise_key',
+                source.payload->'line1_norm', source.payload->'unit_norm',
+                source.payload->'city_norm', source.payload->'state_code',
+                source.payload->'zip5', source.payload->'zip4', source.payload->'country_code'
+              ) IS DISTINCT FROM jsonb_build_array(
+                to_jsonb(target)->'identity_key', to_jsonb(target)->'identity_version',
+                to_jsonb(target)->'precision', to_jsonb(target)->'premise_key',
+                to_jsonb(target)->'line1_norm', to_jsonb(target)->'unit_norm',
+                to_jsonb(target)->'city_norm', to_jsonb(target)->'state_code',
+                to_jsonb(target)->'zip5', to_jsonb(target)->'zip4', to_jsonb(target)->'country_code'
+              )
+    """))
+    if conflict:
+        raise ReferenceFamilyArchiveError("MRF canonical destination key conflicts")
+    source_invalid = await session.scalar(text(f"""
+        SELECT count(*) FROM {stage}
+        WHERE ((payload->>'source_bits')::integer & 16) IS DISTINCT FROM 16
+           OR payload->>'merged_into' IS NOT NULL
+    """))
+    if source_invalid:
+        raise ReferenceFamilyArchiveError("MRF canonical source contribution is invalid")
+
+
+async def _merge_mrf_canonical_address(session, ownership, destination_schema, auxiliary):
+    """Merge only source-owned canonical contributions inside the cutover transaction."""
+
+    archive_name = archive_table_name()
+    if archive_name != auxiliary["archive_name"]:
+        raise ReferenceFamilyArchiveError("MRF canonical archive name differs")
+    if await _relation_oid(session, destination_schema, archive_name) is None:
+        raise ReferenceFamilyArchiveError("MRF destination canonical archive is unavailable")
+    stage = f"{_quoted(ownership.schema_name)}.{_quoted(STAGE_TABLE)}"
+    archive = f"{_quoted(destination_schema)}.{_quoted(archive_name)}"
+    await _lock_family(session, destination_schema, (archive_name,), "SHARE ROW EXCLUSIVE")
+    await _validate_mrf_canonical_address_merge(session, stage, archive)
+    await session.execute(text(f"""
+        INSERT INTO {archive}
+        SELECT (jsonb_populate_record(NULL::{archive},
+            jsonb_set(jsonb_set(source.payload, '{{source_bits}}', '16'::jsonb),
+                '{{strict_source_bits}}', to_jsonb(coalesce((source.payload->>'strict_source_bits')::integer, 0) & 16)))).*
+        FROM {stage} AS source
+        WHERE NOT EXISTS (SELECT 1 FROM {archive} AS target WHERE target.address_key=source.address_key)
+    """))
+    await session.execute(text(f"""
+        UPDATE {archive} AS target SET source_bits=target.source_bits | 16
+        FROM {stage} AS source WHERE target.address_key=source.address_key
+          AND (target.source_bits & 16) <> 16
+    """))
+    has_strict_bits = await session.scalar(text("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_attribute
+            WHERE attrelid=to_regclass(:archive) AND attname='strict_source_bits'
+              AND attnum>0 AND NOT attisdropped
+        )
+    """), {"archive": archive})
+    if has_strict_bits:
+        await session.execute(text(f"""
+            UPDATE {archive} AS target
+               SET strict_source_bits=target.strict_source_bits |
+                   (coalesce((source.payload->>'strict_source_bits')::integer, 0) & 16)
+              FROM {stage} AS source WHERE target.address_key=source.address_key
+        """))
+    await session.execute(text(f"DROP TABLE {stage} RESTRICT"))
+
+
 async def _drop_empty_stage_schema(session: Any, ownership: ReferenceFamilyStageOwnership) -> None:
     remaining_relations = int(
         await session.scalar(
@@ -1530,15 +1787,30 @@ async def _activation_receipt(
         raise ReferenceFamilyArchiveError("reference family activated relation is unavailable")
     if tuple(sorted(live_pairs)) != ownership.relation_oids:
         raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
-    local_manifest = await _family_manifest(
-        session,
-        spec=spec,
-        schema_name=expected_incumbent.schema_name,
-        source_metadata=manifest.source_metadata,
-        dependencies=manifest.dependencies,
-    )
-    if local_manifest.as_dict() != manifest.as_dict():
-        raise ReferenceFamilyArchiveError("reference family activated receipt differs")
+    if spec.importer_id == "mrf":
+        observed_tables = tuple(
+            [
+                await _table_receipt(
+                    session,
+                    importer_id=spec.importer_id,
+                    schema_name=expected_incumbent.schema_name,
+                    model_type=model,
+                )
+                for model in spec.model_types
+            ]
+        )
+        if observed_tables != manifest.tables:
+            raise ReferenceFamilyArchiveError("reference family activated receipt differs")
+    else:
+        local_manifest = await _family_manifest(
+            session,
+            spec=spec,
+            schema_name=expected_incumbent.schema_name,
+            source_metadata=manifest.source_metadata,
+            dependencies=manifest.dependencies,
+        )
+        if local_manifest.as_dict() != manifest.as_dict():
+            raise ReferenceFamilyArchiveError("reference family activated receipt differs")
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
         manifest.source_metadata_sha256,
@@ -1586,6 +1858,8 @@ async def activate_reference_family_stage(
         ownership,
         expected_incumbent,
     )
+    if spec.importer_id == "mrf":
+        await _merge_mrf_canonical_address(session, ownership, expected_incumbent.schema_name, validated_manifest.auxiliary)
     await _drop_empty_stage_schema(session, ownership)
     await publish_adopted_reference_family_generation(
         session,
@@ -1602,6 +1876,25 @@ async def activate_reference_family_stage(
         tables,
         predecessor_schema_name,
     )
+
+
+async def _complete_validated_stage_activation(
+    session: Any,
+    spec: ReferenceFamilySpec,
+    ownership: ReferenceFamilyStageOwnership,
+    expected_incumbent: ReferenceFamilyIncumbent,
+    manifest: ReferenceFamilyManifest,
+) -> tuple[str | None, list[tuple[str, int | None]]]:
+    """Rotate, merge MRF canonical rows, and verify the activated relation OIDs."""
+
+    predecessor_schema_name = await _rotate_family_relations(session, spec, ownership, expected_incumbent)
+    if spec.importer_id == "mrf":
+        await _merge_mrf_canonical_address(session, ownership, expected_incumbent.schema_name, manifest.auxiliary)
+    await _drop_empty_stage_schema(session, ownership)
+    live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
+    if tuple(sorted(live_pairs)) != ownership.relation_oids:
+        raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    return predecessor_schema_name, live_pairs
 
 
 async def activate_validated_reference_family_stage(
@@ -1639,16 +1932,9 @@ async def activate_validated_reference_family_stage(
             expected_incumbent,
             incoming_generation,
         )
-    predecessor_schema_name = await _rotate_family_relations(
-        session,
-        spec,
-        ownership,
-        expected_incumbent,
+    predecessor_schema_name, live_pairs = await _complete_validated_stage_activation(
+        session, spec, ownership, expected_incumbent, validated_manifest,
     )
-    await _drop_empty_stage_schema(session, ownership)
-    live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
-    if tuple(sorted(live_pairs)) != ownership.relation_oids:
-        raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
     published_authority = await publish_adopted_reference_family_generation(
         session,
         importer_id=spec.importer_id,
@@ -1697,6 +1983,16 @@ def _cutover_source_generation(cutover):
     return None
 
 
+def _generation_relation_oids(spec: ReferenceFamilySpec, relation_pairs) -> tuple[int | None, ...]:
+    """Project serving ownership onto the ordinary generation contract."""
+
+    relation_oids_by_name = dict(relation_pairs)
+    try:
+        return tuple(relation_oids_by_name[name] for name in RELATION_NAMES_BY_IMPORTER[spec.importer_id])
+    except KeyError as error:
+        raise ReferenceFamilyArchiveError("reference family generation inventory differs") from error
+
+
 async def _require_automatic_cutover_generation(session, spec, expected_incumbent, incoming_generation) -> None:
     """Require empty bootstrap or a strictly newer same-lineage generation."""
 
@@ -1709,6 +2005,7 @@ async def _require_automatic_cutover_generation(session, spec, expected_incumben
         lock=True,
     )
     incumbent_oids = tuple(oid for _, oid in expected_incumbent.relation_oids)
+    generation_incumbent_oids = _generation_relation_oids(spec, expected_incumbent.relation_oids)
     if current_authority.serving_generation is None:
         incumbent_presence_flags = tuple(oid is not None for oid in incumbent_oids)
         if not any(incumbent_presence_flags):
@@ -1725,7 +2022,7 @@ async def _require_automatic_cutover_generation(session, spec, expected_incumben
             if populated:
                 raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
         return
-    if current_authority.relation_oids != incumbent_oids:
+    if current_authority.relation_oids != generation_incumbent_oids:
         raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
     try:
         require_reference_family_automatic_generation_order(incoming_generation, current_authority.serving_generation)
@@ -1737,7 +2034,7 @@ def _require_published_generation_binding(spec, live_pairs, incoming_generation,
     """Verify adopted authority names the exact activated relation OIDs."""
 
     if incoming_generation is not None:
-        ordered_live_oids = tuple(dict(live_pairs)[name] for name in spec.table_names)
+        ordered_live_oids = _generation_relation_oids(spec, live_pairs)
         if published_authority.relation_oids != ordered_live_oids:
             raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
     elif published_authority.serving_generation is not None or published_authority.relation_oids is not None:
