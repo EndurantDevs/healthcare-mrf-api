@@ -23,9 +23,9 @@ jobs:
       with:
         python-version: 3.14.7
     - name: Install pinned uv
-      run: "printf '%s\\n' 'uv==0.12.12 --hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n\
+      run: "printf '%s\\n' 'uv==0.12.17 --hash=sha256:9e25bb39e1674799c408345a6397ebc2c7c719d498be0ce9d935466d36ceacf5' |\n\
         \  python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r /dev/stdin\n\
-        test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
+        test \"$(uv --version | awk '{print $2}')\" = 0.12.17\n"
     - name: Create isolated Python environment
       run: uv venv --python 3.14.7 --no-python-downloads .venv
     - name: Check public repository hygiene
