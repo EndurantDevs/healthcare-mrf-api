@@ -7,7 +7,6 @@ import importlib
 
 import pytest
 
-
 generation = importlib.import_module("process.reference_family_result_generation")
 
 

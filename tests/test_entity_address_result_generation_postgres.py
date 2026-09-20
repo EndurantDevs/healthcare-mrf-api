@@ -19,7 +19,6 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-
 generation = importlib.import_module("process.entity_address_result_generation")
 _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_GENERATION_TEST_DSN"
 _DATABASE_PATTERN = re.compile(r"^hc_address_generation_[0-9a-f]{32}$")

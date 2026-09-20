@@ -22,7 +22,6 @@ from db.models import (
     FacilityAnchorNPICandidate,
 )
 
-
 TABLE_NAME = "entity_address_result_generation"
 ENTITY_ADDRESS_RESULT_MODELS = (
     EntityAddressUnified,

@@ -18,7 +18,6 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-
 generation = importlib.import_module("process.reference_family_result_generation")
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
