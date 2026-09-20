@@ -11,8 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from process import cms_doctors_education as education
+from tests.reference_family_generation_fixture import generation_shape_check
 
 
 NPI = "1000000004"
@@ -345,7 +347,51 @@ async def _assert_publication_markers(connection, schema, marker_by_table):
         assert await connection.fetchval(f"SELECT marker FROM {schema}.{table}") == marker
 
 
+def _publisher_database(connection):
+    async def rows(statement, **params):
+        compiled = statement.compile(dialect=postgresql.dialect(paramstyle="numeric_dollar"))
+        return await connection.fetch(str(compiled), *(params[name] for name in compiled.positiontup))
+
+    async def first(statement, **params):
+        result = await rows(statement, **params)
+        return dict(result[0]) if result else None
+
+    return SimpleNamespace(transaction=connection.transaction, status=connection.execute, first=first, all=rows)
+
+
+async def _create_generation_fixture(connection, schema):
+    await connection.execute(
+        f"CREATE TABLE {schema}.reference_family_result_generation ("
+        "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
+        "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+        f"CHECK ({generation_shape_check()}))"
+    )
+    await connection.execute(
+        f"INSERT INTO {schema}.reference_family_result_generation "
+        "(importer_id, local_lineage_id, local_generation) VALUES ('cms-doctors', $1, 0)", uuid.uuid4(),
+    )
+    return await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation")
+
+
+async def _assert_published_generation(connection, database, schema, generation_before):
+    generation = importlib.import_module("process.reference_family_result_generation")
+    authority = await generation.read_reference_family_result_generation_authority(
+        database, importer_id="cms-doctors", schema_name=schema,
+    )
+    assert authority.local_generation == 1
+    assert authority.serving_generation.origin_lineage_id == str(generation_before["local_lineage_id"])
+    assert authority.serving_generation.origin_generation == 1
+    assert authority.relation_oids == tuple([
+        await connection.fetchval("SELECT $1::regclass::oid::bigint", f"{schema}.{name}")
+        for name in ("doctor_clinician_address", "cms_doctor_education")
+    ])
+    assert await generation.capture_reference_family_serving_generation(
+        database, importer_id="cms-doctors", schema_name=schema,
+    ) == authority.serving_generation
+
+
 async def test_native_postgres_publication_rolls_back_both_tables_on_education_failure(monkeypatch):
+    """Both table swaps and exact generation authority commit or roll back together."""
     dsn = os.getenv("HLTHPRT_CMS_EDUCATION_POSTGRES_DSN")
     if not dsn:
         pytest.skip("set HLTHPRT_CMS_EDUCATION_POSTGRES_DSN for the PostgreSQL proof")
@@ -361,15 +407,27 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
         await connection.execute(f"CREATE SCHEMA {schema}")
         is_schema_created = True
         marker_by_table = await _create_publication_fixture(connection, schema)
-        database = SimpleNamespace(transaction=connection.transaction, status=connection.execute)
+        generation_before = await _create_generation_fixture(connection, schema)
+        database = _publisher_database(connection)
         monkeypatch.setattr(cms_doctors, "db", database)
         monkeypatch.setattr(education, "db", database)
         stage = SimpleNamespace(__tablename__="doctor_stage")
         with pytest.raises(asyncpg.UndefinedTableError):
             await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
         await _assert_publication_markers(connection, schema, marker_by_table)
+        assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
         await connection.execute(f"CREATE TABLE {schema}.cms_doctor_education_educationtests (marker text)")
         await connection.execute(f"INSERT INTO {schema}.cms_doctor_education_educationtests VALUES ('new_education')")
+        # Reject the authority write after both swaps; PostgreSQL must undo both swaps too.
+        await connection.execute(
+            f"ALTER TABLE {schema}.reference_family_result_generation ADD CONSTRAINT reject_advance "
+            "CHECK (local_generation = 0)"
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
+        await _assert_publication_markers(connection, schema, marker_by_table)
+        assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
+        await connection.execute(f"ALTER TABLE {schema}.reference_family_result_generation DROP CONSTRAINT reject_advance")
         await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
         await _assert_publication_markers(connection, schema, {
             "doctor_clinician_address": "new_address",
@@ -377,6 +435,7 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
             "doctor_clinician_address_old": "live_address",
             "cms_doctor_education_old": "live_education",
         })
+        await _assert_published_generation(connection, database, schema, generation_before)
     finally:
         if is_schema_created:
             await connection.execute(f"DROP SCHEMA {schema} CASCADE")

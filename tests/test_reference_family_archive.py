@@ -80,6 +80,9 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
     )
     assert archive.reference_family_spec("places-zcta").table_names == ("pricing_places_zcta",)
     assert archive.reference_family_spec("lodes").table_names == ("lodes_workplace_aggregate",)
+    assert archive.reference_family_spec("cms-doctors").table_names == (
+        "doctor_clinician_address", "cms_doctor_education",
+    )
     assert archive.reference_family_spec("medicare-enrollment").table_names == (
         "medicare_enrollment_county_stats",
         "medicare_enrollment_stats",

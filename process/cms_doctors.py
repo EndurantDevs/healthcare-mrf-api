@@ -27,6 +27,7 @@ from process.ext.address_canon import resolve_into_archive, source_enabled, stam
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -403,6 +404,7 @@ async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str
                     f"RENAME TO {old_live_name};"
                 )
         await swap_education_stage(import_date, db_schema)
+        await publish_local_reference_family_generation(db, importer_id="cms-doctors", schema_name=db_schema)
 
 
 async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> dict:

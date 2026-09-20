@@ -45,6 +45,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
         ),
         "places-zcta": ("pricing_places_zcta",),
         "lodes": ("lodes_workplace_aggregate",),
+        "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
         "medicare-enrollment": (
             "medicare_enrollment_county_stats",
             "medicare_enrollment_stats",

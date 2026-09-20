@@ -68,6 +68,30 @@ discards its staging tables and never publishes either dataset.
 - CMS covers Medicare-listed clinicians of multiple professions. It is not an
   exhaustive physician roster or a source of residency/employment history.
 
+## Native generation and archive boundary
+
+The `cms-doctors` replacement family contains `doctor_clinician_address` and
+`cms_doctor_education`, in that generation-authority order. A successful full
+publication advances `reference_family_result_generation` after both table swaps
+in the same transaction, recording both live relation OIDs. A failed swap or
+authority write rolls back the entire publication. Bounded test runs do not
+advance this authority. Migration installs a generation-less row; it does not
+adopt pre-existing data as a historical publication.
+
+The existing `reference-replacement-family.postgres.v1` archive helpers accept
+this closed family. Source generation metadata must be captured with
+`capture_reference_family_serving_generation` through the archive preparation
+metadata callback, under the same source snapshot and family locks. Its portable
+lineage/counter is distinct from the education rows' source-content generation.
+Restore precreates both tables and their indexes before loading native data.
+
+The entity-address dependency role `doctor_clinician_address` therefore resolves
+to the address relation of this two-table generation, not a separately owned
+address-only package. Shared canonical address tables and other sources'
+contributions are outside this archive. This producer contract does not enable
+destination automatic activation, retention relocation, or canonical resolution;
+those require a separately integrated destination profile.
+
 ## Key Environment Variables
 - `HLTHPRT_CMS_DOCTORS_DATASET_ID` (default `mj5m-pzi6`)
 - `HLTHPRT_CMS_DOCTORS_BATCH_SIZE`
