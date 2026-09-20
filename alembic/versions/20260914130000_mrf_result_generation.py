@@ -2,7 +2,8 @@
 """Add the closed MRF replacement family to generation authority.
 
 Revision ID: 20260914130000_mrf_result_generation
-Revises: 20260914120000_npi_result_generation
+Revises: 20260917120000_entity_address_service_network,
+20260914110000_reference_family_result_generation
 """
 
 from __future__ import annotations
@@ -17,7 +18,10 @@ from sqlalchemy.dialects import postgresql
 
 
 revision = "20260914130000_mrf_result_generation"
-down_revision = "20260914120000_npi_result_generation"
+down_revision = (
+    "20260917120000_entity_address_service_network",
+    "20260914110000_reference_family_result_generation",
+)
 branch_labels = None
 depends_on = None
 

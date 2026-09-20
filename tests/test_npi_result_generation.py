@@ -19,16 +19,29 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     npi_revision = "20260914120000_npi_result_generation"
     finality_revision = "20260917130000_custom_import_generation_finality"
     service_network_revision = "20260917120000_entity_address_service_network"
+    entity_address_revision = "20260914100000_entity_address_result_generation"
+    reference_revision = "20260914110000_reference_family_result_generation"
+    mrf_revision = "20260914130000_mrf_result_generation"
 
-    assert script.get_heads() == [service_network_revision]
+    assert script.get_heads() == [mrf_revision]
     assert script.get_revision(hospital_revision).down_revision == "20260914120000_custom_import_v1_schema"
     assert script.get_revision(npi_revision).down_revision == hospital_revision
     assert script.get_revision(finality_revision).down_revision == npi_revision
     assert script.get_revision(service_network_revision).down_revision == finality_revision
+    assert script.get_revision(reference_revision).down_revision == entity_address_revision
+    assert script.get_revision(mrf_revision).down_revision == (service_network_revision, reference_revision)
     assert [step.revision.revision for step in script._upgrade_revs("head", hospital_revision)] == [
+        entity_address_revision,
+        reference_revision,
         npi_revision,
         finality_revision,
         service_network_revision,
+        mrf_revision,
+    ]
+    assert [step.revision.revision for step in script._upgrade_revs("head", service_network_revision)] == [
+        entity_address_revision,
+        reference_revision,
+        mrf_revision,
     ]
 
 
