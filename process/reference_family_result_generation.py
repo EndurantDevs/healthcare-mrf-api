@@ -13,7 +13,6 @@ from uuid import UUID
 import asyncpg
 from sqlalchemy import text
 
-
 TABLE_NAME = "reference_family_result_generation"
 RELATION_NAMES_BY_IMPORTER = {
     "mrf": (
