@@ -3371,6 +3371,11 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str) -> Non
             importer_id="mrf",
             schema_name=db_schema,
         )
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="mrf-address",
+            schema_name=db_schema,
+        )
 
 
 async def publish_initial_generation(ctx, task):

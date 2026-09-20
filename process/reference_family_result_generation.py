@@ -31,6 +31,7 @@ RELATION_NAMES_BY_IMPORTER = {
         "mrf_address",
         "mrf_address_evidence",
     ),
+    "mrf-address": ("mrf_address", "mrf_address_evidence"),
     "plan-attributes": (
         "plan_attributes",
         "plan_prices",
