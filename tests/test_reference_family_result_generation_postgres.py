@@ -35,6 +35,9 @@ _MRF_ADDRESS_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260920120000_mrf_address_result_generation.py"
 )
 _GEO_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260920130000_geo_result_generation.py"
+_PHARMACY_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260920140000_pharmacy_economics_result_generation.py"
+)
 _NPI_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914120000_npi_result_generation.py"
 _NPI_TABLES = (
     "npi",
@@ -282,6 +285,7 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
             await _upgrade_reference_generation_chain(connection)
             await _run_migration(connection, _GEO_MIGRATION_PATH, "upgrade")
+            await _run_migration(connection, _PHARMACY_MIGRATION_PATH, "upgrade")
             table_names = {name for names in generation.RELATION_NAMES_BY_IMPORTER.values() for name in names}
             for table_name in table_names:
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
@@ -296,6 +300,8 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
         await _assert_adoption_rollback(engine, schema, incumbent_authority, source_generation_by_field)
 
         async with engine.begin() as connection:
+            with pytest.raises(RuntimeError, match="prevents downgrade"):
+                await _run_migration(connection, _PHARMACY_MIGRATION_PATH, "downgrade")
             with pytest.raises(RuntimeError, match="prevents downgrade"):
                 await _run_migration(connection, _MRF_MIGRATION_PATH, "downgrade")
     finally:

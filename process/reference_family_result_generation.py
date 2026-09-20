@@ -47,6 +47,7 @@ RELATION_NAMES_BY_IMPORTER = {
         "medicare_enrollment_county_stats",
         "medicare_enrollment_stats",
     ),
+    "pharmacy-economics": ("pharmacy_economics_summary",),
 }
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_GENERATION = (1 << 63) - 1

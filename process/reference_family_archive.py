@@ -248,6 +248,7 @@ _SPECS = {
             "medicare-enrollment",
             (models.MedicareEnrollmentCountyStats, models.MedicareEnrollmentStats),
         ),
+        ReferenceFamilySpec("pharmacy-economics", (models.PharmacyEconomicsSummary,)),
     )
 }
 _OWNED_SEQUENCES = {
@@ -1138,6 +1139,7 @@ def _additional_index_sql(schema_name: str, model_type: type, index_spec: Mappin
     where_clause = index_spec.get("where")
     if where_clause not in {
         None,
+        "estimated_gross_margin IS NOT NULL",
         "type='practice'",
         "type='practice' AND phone_number IS NOT NULL AND phone_number <> ''",
     }:

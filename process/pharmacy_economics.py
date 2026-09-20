@@ -18,6 +18,7 @@ from process.control_lifecycle import mark_control_run
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -474,6 +475,9 @@ async def publish_pharmacy_economics_generation(ctx):
                     f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
                     f"RENAME TO {old_live_name};"
                 )
+        await publish_local_reference_family_generation(
+            db, importer_id="pharmacy-economics", schema_name=db_schema
+        )
     logger.info("Pharmacy Economics publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
     await mark_control_run(
