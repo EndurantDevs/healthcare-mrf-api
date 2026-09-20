@@ -80,6 +80,10 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
     )
     assert archive.reference_family_spec("places-zcta").table_names == ("pricing_places_zcta",)
     assert archive.reference_family_spec("geo").table_names == ("geo_zip_lookup",)
+    census = archive.reference_family_spec("geo-census")
+    assert census.table_names == ("geo_zip_census_profile",)
+    assert tuple(census.model_types[0].__table__.primary_key.columns.keys()) == ("zip_code",)
+    assert not set(census.table_names) & set(archive.reference_family_spec("tiger").table_names)
     assert archive.reference_family_spec("lodes").table_names == ("lodes_workplace_aggregate",)
     assert archive.reference_family_spec("cms-doctors").table_names == (
         "doctor_clinician_address",

@@ -12,4 +12,4 @@ _SPEC.loader.exec_module(_MIGRATION)
 
 
 def generation_shape_check() -> str:
-    return _MIGRATION._shape_check({**_MIGRATION._CARDINALITY, "geo": 1})
+    return _MIGRATION._shape_check({**_MIGRATION._CARDINALITY, "geo": 1, "geo-census": 1})
