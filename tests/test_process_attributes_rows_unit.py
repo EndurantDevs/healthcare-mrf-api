@@ -374,12 +374,14 @@ async def test_shutdown_builds_indexes_and_swaps_complete_tables(monkeypatch):
     status_mock, ddl_mock, time_mock = _install_shutdown_database_fakes(
         monkeypatch
     )
+    generation_writer = AsyncMock()
+    monkeypatch.setattr(process_attributes, "publish_local_reference_family_generation", generation_writer)
     started_at = datetime.datetime.utcnow()
 
     await process_attributes.shutdown(
         {
             "import_date": "20260721",
-            "context": {"test_mode": True, "start": started_at},
+            "context": {"test_mode": True, "start": started_at, "tables_prepared": True},
         }
     )
 
@@ -399,4 +401,5 @@ async def test_shutdown_builds_indexes_and_swaps_complete_tables(monkeypatch):
         for statement in status_statement_list
     )
     assert ddl_mock.await_count == 4
+    generation_writer.assert_awaited_once()
     time_mock.assert_called_once_with(started_at)
