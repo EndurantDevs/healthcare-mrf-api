@@ -93,8 +93,8 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
     assert (
-        "ghcr.io/astral-sh/uv:0.12.12@sha256:"
-        "73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4"
+        "ghcr.io/astral-sh/uv:0.12.17@sha256:"
+        "10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc"
     ) in dockerfile
     assert "uv pip check" in dockerfile
     assert "uv pip install" in dockerfile

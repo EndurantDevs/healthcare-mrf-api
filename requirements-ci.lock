@@ -3,7 +3,7 @@
 # Input: requirements-dev.txt (cd731db3c606a25461f8d6a1084feca84e3890c10b0d2416dbb97493ea74794f)
 # Input: requirements-ci.in (332d6949d5dffeea12c30fc63fb4281c8cf2ceffa14a575fa195e8bcbc432247)
 # Target: CPython 3.14.7 (Linux x86_64)
-# Resolver: uv 0.12.12
+# Resolver: uv 0.12.17
 --only-binary :all:
 
 aiocsv==1.4.1 \
