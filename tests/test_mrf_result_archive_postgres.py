@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import re
@@ -24,6 +25,12 @@ _DSN_ENV = "HLTHPRT_MRF_RESULT_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")
 _MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260914130000_mrf_result_generation.py"
+)
+_TIGER_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260920110000_tiger_result_generation.py"
+)
+_MRF_ADDRESS_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260920120000_mrf_address_result_generation.py"
 )
 
 
@@ -83,9 +90,10 @@ async def _create_family(session, schema_name: str) -> None:
     await session.execute(
         text(
             f'INSERT INTO "{schema_name}".reference_family_result_generation '
-            "(importer_id, local_lineage_id, local_generation) VALUES ('mrf', :lineage_id, 0)"
+            "(importer_id, local_lineage_id, local_generation) VALUES "
+            "('mrf', :mrf_lineage_id, 0), ('mrf-address', :address_lineage_id, 0)"
         ),
-        {"lineage_id": uuid4()},
+        {"mrf_lineage_id": uuid4(), "address_lineage_id": uuid4()},
     )
 
 
@@ -449,15 +457,16 @@ async def _initialize_published_mrf_schema(session, schema_name):
     await session.execute(
         text(
             f'INSERT INTO "{schema_name}".reference_family_result_generation '
-            "(importer_id, local_lineage_id, local_generation) VALUES ('mrf', :lineage_id, 0)"
+            "(importer_id, local_lineage_id, local_generation) VALUES "
+            "('mrf', :mrf_lineage_id, 0), ('mrf-address', :address_lineage_id, 0)"
         ),
-        {"lineage_id": uuid4()},
+        {"mrf_lineage_id": uuid4(), "address_lineage_id": uuid4()},
     )
     await session.commit()
 
 
-async def _publish_normal_mrf_stage(session, schema_name, import_date, address_key):
-    """Use the production staging and table-swap functions with synthetic rows."""
+async def _stage_normal_mrf_family(session, schema_name, import_date, address_key):
+    """Build the ordinary importer's indexed synthetic family without publishing it."""
 
     await initial._prepare_import_tables(import_date, True)
     address_stage = initial.make_class(initial.MRFAddress, import_date, schema_override=schema_name)
@@ -473,13 +482,19 @@ async def _publish_normal_mrf_stage(session, schema_name, import_date, address_k
     await session.execute(
         text(
             f'INSERT INTO "{schema_name}"."{evidence_stage.__tablename__}" '
-            "(evidence_checksum, npi, type, checksum, import_id, source_record_id, first_line) "
-            "VALUES (-7, 1000000001, 'practice', 1, 'synthetic-import', 'record-1', 'Synthetic')"
+            "(npi, type, checksum, import_id, source_record_id, first_line) "
+            "VALUES (1000000001, 'practice', 1, 'synthetic-import', 'record-1', 'Synthetic')"
         )
     )
     await initial._create_named_indexes(address_stage, schema_name)
     await initial._create_named_indexes(evidence_stage, schema_name)
     await session.commit()
+
+
+async def _publish_normal_mrf_stage(session, schema_name, import_date, address_key):
+    """Use the production staging and table-swap functions with synthetic rows."""
+
+    await _stage_normal_mrf_family(session, schema_name, import_date, address_key)
     await initial._publish_mrf_table_generation(import_date, schema_name)
 
 
@@ -531,53 +546,226 @@ async def _run_interleaved_archive_cycle(
     await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
 
 
+async def _command(*args):
+    process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+    assert process.returncode == 0, stderr.decode()
+    return stdout.decode()
+
+
 @pytest.mark.asyncio
-async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch):
+async def test_second_address_generation_failure_rolls_back_normal_mrf_rotation(monkeypatch):
+    """The address generation is part of the same real table-swap transaction."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    schema_name = f"mrf_atomic_address_{uuid4().hex[:10]}"
+    real_generation_writer = initial.publish_local_reference_family_generation
+    try:
+        async with sessions() as session:
+            monkeypatch.setattr(initial, "db", _PublisherDatabase(session, schema_name))
+            monkeypatch.setattr(initial, "get_import_schema", lambda *_args: schema_name)
+            await _initialize_published_mrf_schema(session, schema_name)
+            await _publish_normal_mrf_stage(session, schema_name, "20260920", uuid4())
+            before_mrf = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=schema_name
+            )
+            before_address = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf-address", schema_name=schema_name
+            )
+            await session.commit()
+            await _stage_normal_mrf_family(session, schema_name, "20260921", uuid4())
+
+            async def fail_after_address_write(database, *, importer_id, schema_name):
+                result = await real_generation_writer(
+                    database,
+                    importer_id=importer_id,
+                    schema_name=schema_name,
+                )
+                if importer_id == "mrf-address":
+                    raise RuntimeError("synthetic address generation failure")
+                return result
+
+            monkeypatch.setattr(initial, "publish_local_reference_family_generation", fail_after_address_write)
+            with pytest.raises(RuntimeError, match="address generation failure"):
+                await initial._publish_mrf_table_generation("20260921", schema_name)
+
+            after_mrf = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=schema_name
+            )
+            after_address = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf-address", schema_name=schema_name
+            )
+            assert after_mrf == before_mrf
+            assert after_address == before_address
+            assert (
+                await generation.current_reference_family_relation_oids(
+                    session, importer_id="mrf", schema_name=schema_name
+                )
+                == before_mrf.relation_oids
+            )
+            assert await session.scalar(text(f"SELECT to_regclass('{schema_name}.mrf_address_20260921')"))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+async def _retain_prepared(_session, _prepared):
+    return None
+
+
+async def _assert_full_mrf_stage(sessions, schema_name, dataset_id, address_key):
+    prepared = await archive.prepare_reference_family_archive_source(
+        sessions,
+        importer_id="mrf",
+        schema_name=schema_name,
+        source_metadata={"release": "synthetic-published-mrf"},
+        dataset_id=dataset_id,
+        on_prepared=_retain_prepared,
+    )
+    async with sessions() as session, session.begin():
+        await archive.validate_reference_family_stage(
+            session,
+            ownership=prepared.ownership,
+            manifest=prepared.manifest,
+        )
+        assert (
+            await session.scalar(text(f'SELECT address_key FROM "{prepared.ownership.schema_name}".mrf_address'))
+            == address_key
+        )
+        assert (
+            await session.scalar(text(f'SELECT phone_number FROM "{prepared.ownership.schema_name}".mrf_address'))
+            == "5550100"
+        )
+        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+
+
+async def _dump_prepared_archive(sessions, prepared, path):
+    database_url = make_url(_database_url()).set(drivername="postgresql")
+
+    async def dump(capture):
+        await _command(
+            "pg_dump",
+            "--dbname",
+            database_url.render_as_string(hide_password=False),
+            "--format=custom",
+            "--no-owner",
+            "--no-acl",
+            "--schema",
+            capture.ownership.schema_name,
+            "--snapshot",
+            capture.postgres_snapshot,
+            "--file",
+            str(path),
+        )
+
+    await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump)
+    return await _command("pg_restore", "--list", str(path))
+
+
+async def _restore_prepared_address_archive(sessions, prepared, dataset_id, path):
+    async with sessions() as session, session.begin():
+        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        restored = await archive.precreate_reference_family_restore(
+            session,
+            importer_id="mrf-address",
+            dataset_id=dataset_id,
+        )
+    database_url = make_url(_database_url()).set(drivername="postgresql")
+    await _command(
+        "pg_restore",
+        "--dbname",
+        database_url.render_as_string(hide_password=False),
+        "--data-only",
+        "--no-owner",
+        "--no-acl",
+        "--exit-on-error",
+        "--single-transaction",
+        str(path),
+    )
+    return restored
+
+
+async def _assert_restored_address_archive(sessions, prepared, restored, address_key):
+    async with sessions() as session, session.begin():
+        await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest)
+        assert tuple(table.table_name for table in prepared.manifest.tables) == (
+            "mrf_address",
+            "mrf_address_evidence",
+        )
+        assert restored.sequence_oids[0][0] == "mrf_address_evidence_evidence_checksum_seq"
+        assert (
+            await session.scalar(text(f'SELECT address_key FROM "{restored.schema_name}".mrf_address')) == address_key
+        )
+        assert (
+            await session.scalar(text(f'SELECT first_line FROM "{restored.schema_name}".mrf_address_evidence'))
+            == "Synthetic"
+        )
+        assert (
+            await session.scalar(
+                text(f"SELECT nextval('\"{restored.schema_name}\".mrf_address_evidence_evidence_checksum_seq')")
+            )
+            == 2
+        )
+        await archive.cleanup_reference_family_stage(session, restored)
+
+
+@pytest.mark.asyncio
+async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch, tmp_path):
     """The archive must accept the importer's real table shape, not a model-only fixture."""
 
     engine = create_async_engine(_database_url())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     schema_name = f"mrf_published_{uuid4().hex[:10]}"
-    dataset_id = uuid4()
-    stage_schema = archive.reference_family_stage_schema(dataset_id)
-    address_key = uuid4()
-
-    async def retain_prepared(_session, _prepared):
-        return None
-
+    dataset_id, address_dataset_id, address_key = uuid4(), uuid4(), uuid4()
+    owned_schemas = (
+        archive.reference_family_stage_schema(dataset_id),
+        archive.reference_family_stage_schema(address_dataset_id),
+        schema_name,
+    )
     try:
         async with sessions() as session:
             monkeypatch.setattr(initial, "db", _PublisherDatabase(session, schema_name))
             monkeypatch.setattr(initial, "get_import_schema", lambda *_args: schema_name)
             await _initialize_published_mrf_schema(session, schema_name)
             await _publish_normal_mrf_stage(session, schema_name, "20260920", address_key)
+            mrf = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=schema_name
+            )
+            address = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf-address", schema_name=schema_name
+            )
+            assert mrf.local_generation == address.local_generation == 1
+            assert address.relation_oids == mrf.relation_oids[-2:]
+        await _assert_full_mrf_stage(sessions, schema_name, dataset_id, address_key)
         prepared = await archive.prepare_reference_family_archive_source(
             sessions,
-            importer_id="mrf",
+            importer_id="mrf-address",
             schema_name=schema_name,
-            source_metadata={"release": "synthetic-published-mrf"},
-            dataset_id=dataset_id,
-            on_prepared=retain_prepared,
+            source_metadata={"release": "synthetic-published-mrf-address"},
+            dataset_id=address_dataset_id,
+            on_prepared=_retain_prepared,
         )
-        async with sessions() as session, session.begin():
-            await archive.validate_reference_family_stage(
-                session,
-                ownership=prepared.ownership,
-                manifest=prepared.manifest,
-            )
-            assert (
-                await session.scalar(text(f'SELECT address_key FROM "{prepared.ownership.schema_name}".mrf_address'))
-                == address_key
-            )
-            assert (
-                await session.scalar(text(f'SELECT phone_number FROM "{prepared.ownership.schema_name}".mrf_address'))
-                == "5550100"
-            )
-            await archive.cleanup_reference_family_stage(session, prepared.ownership)
+        archive_path = tmp_path / "mrf-address.dump"
+        listing = await _dump_prepared_archive(sessions, prepared, archive_path)
+        assert "mrf_address" in listing and "mrf_address_evidence" in listing
+        assert f" {prepared.ownership.schema_name} issuer " not in listing
+        assert f" {prepared.ownership.schema_name} plan_npi_raw " not in listing
+        restored = await _restore_prepared_address_archive(sessions, prepared, address_dataset_id, archive_path)
+        await _assert_restored_address_archive(sessions, prepared, restored, address_key)
     finally:
         async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
-            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+            for owned_schema in owned_schemas:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
         await engine.dispose()
 
 
@@ -638,10 +826,10 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
         await engine.dispose()
 
 
-def _migration_module():
+def _migration_module(path=_MIGRATION_PATH):
     module_spec = importlib.util.spec_from_file_location(
-        "mrf_result_generation_postgres_proof",
-        _MIGRATION_PATH,
+        f"{path.stem}_postgres_proof",
+        path,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -649,8 +837,8 @@ def _migration_module():
     return migration
 
 
-async def _run_migration(connection, schema_name: str, operation: str) -> None:
-    migration = _migration_module()
+async def _run_migration(connection, schema_name: str, operation: str, path=_MIGRATION_PATH) -> None:
+    migration = _migration_module(path)
 
     def apply(sync_connection) -> None:
         migration.op = Operations(MigrationContext.configure(sync_connection))
@@ -711,6 +899,110 @@ async def test_mrf_generation_migration_adds_row_and_refuses_evidence_downgrade(
                     text(
                         f'SELECT count(*) FROM "{schema_name}".'
                         "reference_family_result_generation WHERE importer_id='mrf'"
+                    )
+                )
+                == 0
+            )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+async def _install_prior_generation_ledger(connection, schema_name):
+    tiger_migration = _migration_module(_TIGER_MIGRATION_PATH)
+    prior_shape = tiger_migration._shape_check(
+        {"tiger": tiger_migration._TIGER_CARDINALITY, **tiger_migration._REFERENCE_CARDINALITY}
+    )
+    prior_importers = tuple({"tiger": tiger_migration._TIGER_CARDINALITY, **tiger_migration._REFERENCE_CARDINALITY})
+    await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+    await connection.execute(
+        text(
+            f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
+            "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
+            "local_generation bigint NOT NULL, origin_lineage_id uuid, "
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+            "CONSTRAINT reference_family_result_generation_shape_check CHECK ("
+            f"{prior_shape}))"
+        )
+    )
+    for importer_id in prior_importers:
+        await connection.execute(
+            text(
+                f'INSERT INTO "{schema_name}".reference_family_result_generation '
+                "(importer_id, local_lineage_id, local_generation) VALUES (:importer_id, :lineage_id, 0)"
+            ),
+            {"importer_id": importer_id, "lineage_id": uuid4()},
+        )
+    return (
+        await connection.execute(
+            text(f'SELECT * FROM "{schema_name}".reference_family_result_generation ORDER BY importer_id')
+        )
+    ).all()
+
+
+async def _assert_address_generation_upgrade(connection, schema_name, before):
+    await _run_migration(connection, schema_name, "upgrade", _MRF_ADDRESS_MIGRATION_PATH)
+    after = (
+        await connection.execute(
+            text(
+                f'SELECT * FROM "{schema_name}".reference_family_result_generation '
+                "WHERE importer_id <> 'mrf-address' ORDER BY importer_id"
+            )
+        )
+    ).all()
+    assert after == before
+    authority = await generation.read_reference_family_result_generation_authority(
+        connection,
+        importer_id="mrf-address",
+        schema_name=schema_name,
+    )
+    assert authority.local_generation == 0 and authority.serving_generation is None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await generation.capture_reference_family_serving_generation(
+            connection,
+            importer_id="mrf-address",
+            schema_name=schema_name,
+        )
+
+
+async def _assert_address_adoption_blocks_downgrade(connection, schema_name):
+    await connection.execute(
+        text(
+            f'UPDATE "{schema_name}".reference_family_result_generation '
+            "SET origin_lineage_id=:lineage_id, origin_generation=1, published_at=now(), "
+            "relation_oids=ARRAY[1,2]::bigint[] WHERE importer_id='mrf-address'"
+        ),
+        {"lineage_id": uuid4()},
+    )
+    with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
+        await _run_migration(connection, schema_name, "downgrade", _MRF_ADDRESS_MIGRATION_PATH)
+    await connection.execute(
+        text(
+            f'UPDATE "{schema_name}".reference_family_result_generation '
+            "SET origin_lineage_id=NULL, origin_generation=NULL, published_at=NULL, relation_oids=NULL "
+            "WHERE importer_id='mrf-address'"
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_mrf_address_generation_migration_requires_new_publication_before_export():
+    """Seed generation zero and preserve every prior family while refusing evidence loss."""
+
+    engine = create_async_engine(_database_url())
+    schema_name = f"mrf_address_migration_{uuid4().hex[:10]}"
+    try:
+        async with engine.begin() as connection:
+            before = await _install_prior_generation_ledger(connection, schema_name)
+            await _assert_address_generation_upgrade(connection, schema_name, before)
+            await _assert_address_adoption_blocks_downgrade(connection, schema_name)
+            await _run_migration(connection, schema_name, "downgrade", _MRF_ADDRESS_MIGRATION_PATH)
+            assert (
+                await connection.scalar(
+                    text(
+                        f'SELECT count(*) FROM "{schema_name}".'
+                        "reference_family_result_generation WHERE importer_id='mrf-address'"
                     )
                 )
                 == 0

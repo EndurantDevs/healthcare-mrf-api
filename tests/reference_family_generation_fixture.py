@@ -4,7 +4,9 @@
 import importlib.util
 from pathlib import Path
 
-_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260920110000_tiger_result_generation.py"
+_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260920120000_mrf_address_result_generation.py"
+)
 _SPEC = importlib.util.spec_from_file_location("reference_family_generation_fixture_migration", _MIGRATION_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MIGRATION = importlib.util.module_from_spec(_SPEC)
@@ -12,4 +14,6 @@ _SPEC.loader.exec_module(_MIGRATION)
 
 
 def generation_shape_check() -> str:
-    return _MIGRATION._shape_check({"tiger": _MIGRATION._TIGER_CARDINALITY, **_MIGRATION._REFERENCE_CARDINALITY})
+    return _MIGRATION._shape_check(
+        {"mrf-address": _MIGRATION._MRF_ADDRESS_CARDINALITY, **_MIGRATION._REFERENCE_CARDINALITY}
+    )

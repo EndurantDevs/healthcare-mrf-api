@@ -37,6 +37,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
             "mrf_address",
             "mrf_address_evidence",
         ),
+        "mrf-address": ("mrf_address", "mrf_address_evidence"),
         "plan-attributes": (
             "plan_attributes",
             "plan_prices",
