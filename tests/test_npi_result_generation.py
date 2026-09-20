@@ -24,7 +24,9 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     mrf_revision = "20260914130000_mrf_result_generation"
 
     cms_revision = "20260920100000_cms_doctors_result_generation"
-    assert script.get_heads() == [cms_revision]
+    tiger_revision = "20260920110000_tiger_result_generation"
+    assert script.get_heads() == [tiger_revision]
+    assert script.get_revision(tiger_revision).down_revision == cms_revision
     assert script.get_revision(cms_revision).down_revision == mrf_revision
     assert script.get_revision(hospital_revision).down_revision == "20260914120000_custom_import_v1_schema"
     assert script.get_revision(npi_revision).down_revision == hospital_revision
@@ -40,12 +42,14 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
         service_network_revision,
         mrf_revision,
         cms_revision,
+        tiger_revision,
     ]
     assert [step.revision.revision for step in script._upgrade_revs("head", service_network_revision)] == [
         entity_address_revision,
         reference_revision,
         mrf_revision,
         cms_revision,
+        tiger_revision,
     ]
 
 
