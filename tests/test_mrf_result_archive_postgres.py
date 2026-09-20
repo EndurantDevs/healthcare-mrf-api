@@ -152,7 +152,7 @@ async def _copy_prepared_stage(session, prepared, restored) -> None:
                 f'SELECT * FROM "{prepared.ownership.schema_name}"."{table_name}"'
             )
         )
-    await archive._rebase_mrf_sequences(session, restored.schema_name)
+    await archive._rebase_owned_sequences(session, restored.schema_name, "mrf")
 
 
 async def _prepare_restored_candidate(sessions, source_schema: str, prepared_dataset_id, restored_dataset_id):

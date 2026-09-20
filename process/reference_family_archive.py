@@ -20,11 +20,12 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import DefaultClause, Sequence, text
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateTable, MetaData
+from sqlalchemy.schema import CreateSequence, CreateTable, MetaData
 
 from db import models
+from db.tiger_models import Zip_zcta5, ZipState
 from process import entity_address_snapshot_receipt as catalog_identity
 from process.reference_family_result_generation import (
     publish_adopted_reference_family_generation,
@@ -240,6 +241,7 @@ _SPECS = {
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
+        ReferenceFamilySpec("tiger", (ZipState, Zip_zcta5)),
         ReferenceFamilySpec(
             "medicare-enrollment",
             (models.MedicareEnrollmentCountyStats, models.MedicareEnrollmentStats),
@@ -247,6 +249,7 @@ _SPECS = {
     )
 }
 _OWNED_SEQUENCES = {
+    "tiger": (("zcta5_gid_seq", "zcta5", "gid"),),
     "mrf": (
         ("issuer_issuer_id_seq", "issuer", "issuer_id"),
         (
@@ -427,15 +430,16 @@ async def _family_schema_identity(
     schema_name: str,
     table_name: str,
 ) -> str:
-    if importer_id != "mrf" or table_name not in {"issuer", "mrf_address_evidence"}:
+    sequence_by_table = {
+        owner_table: (sequence_name, owner_column)
+        for sequence_name, owner_table, owner_column in _OWNED_SEQUENCES.get(importer_id, ())
+    }
+    if table_name not in sequence_by_table:
         return await catalog_identity._schema_identity(session, relation_oid, schema_name, table_name)
     columns = await catalog_identity._catalog_columns(session, relation_oid)
     constraints = await catalog_identity._catalog_constraints(session, relation_oid, schema_name)
     indexes = await catalog_identity._catalog_indexes(session, relation_oid)
-    expected_sequence, expected_column = {
-        owner_table: (sequence_name, owner_column)
-        for sequence_name, owner_table, owner_column in _OWNED_SEQUENCES["mrf"]
-    }[table_name]
+    expected_sequence, expected_column = sequence_by_table[table_name]
     source_sequence = await _source_owned_sequence(session, relation_oid, expected_column)
     default_pattern = re.compile(
         rf"nextval\('(?:\"?{re.escape(schema_name)}\"?\.)?"
@@ -450,11 +454,11 @@ async def _family_schema_identity(
                 or column.get("attname") != expected_column
                 or default_pattern.fullmatch(default_expression) is None
             ):
-                raise ReferenceFamilyArchiveError("MRF owned sequence default is unsupported")
+                raise ReferenceFamilyArchiveError("reference family owned sequence default is unsupported")
             has_owned_sequence_default = True
             column["default_expression"] = f"reference-family-owned-sequence:{expected_sequence}"
     if not has_owned_sequence_default:
-        raise ReferenceFamilyArchiveError("MRF owned sequence default is unavailable")
+        raise ReferenceFamilyArchiveError("reference family owned sequence default is unavailable")
     catalog_identity._reject_schema_qualified_expressions(schema_name, columns, constraints, indexes)
     return catalog_identity._canonical_digest(
         {
@@ -497,7 +501,7 @@ async def _source_owned_sequence(session: Any, relation_oid: int, column_name: s
         ).mappings()
     )
     if len(sequence_records) != 1 or _IDENTIFIER.fullmatch(sequence_records[0]["sequence_name"]) is None:
-        raise ReferenceFamilyArchiveError("MRF owned sequence is unavailable")
+        raise ReferenceFamilyArchiveError("reference family owned sequence is unavailable")
     return str(sequence_records[0]["sequence_name"])
 
 
@@ -729,7 +733,7 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
     spec = reference_family_spec(capture.manifest.importer_id)
-    if spec.importer_id == "mrf":
+    if spec.importer_id in _OWNED_SEQUENCES:
         await _create_model_family(session, spec, stage_schema)
     else:
         await session.execute(text(f"CREATE SCHEMA {_quoted(stage_schema)}"))
@@ -737,18 +741,17 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
     for table in capture.manifest.tables:
         source_ref = f"{_quoted(capture.schema_name)}.{_quoted(table.table_name)}"
         stage_ref = f"{_quoted(stage_schema)}.{_quoted(table.table_name)}"
-        if spec.importer_id != "mrf":
+        if spec.importer_id not in _OWNED_SEQUENCES:
             await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
         columns = ", ".join(_quoted(column.name) for column in models_by_table[table.table_name].__table__.columns)
         await session.execute(text(f"INSERT INTO {stage_ref} ({columns}) SELECT {columns} FROM {source_ref}"))
-    if spec.importer_id == "mrf":
-        await _rebase_mrf_sequences(session, stage_schema)
+    await _rebase_owned_sequences(session, stage_schema, spec.importer_id)
 
 
-async def _rebase_mrf_sequences(session: Any, stage_schema: str) -> None:
+async def _rebase_owned_sequences(session: Any, stage_schema: str, importer_id: str) -> None:
     """Set cloned sequence state from frozen rows, without consulting mutable sequences."""
 
-    for sequence_name, table_name, column_name in _OWNED_SEQUENCES["mrf"]:
+    for sequence_name, table_name, column_name in _OWNED_SEQUENCES.get(importer_id, ()):
         maximum_value = await session.scalar(
             text(f"SELECT max({_quoted(column_name)})::bigint FROM {_quoted(stage_schema)}.{_quoted(table_name)}")
         )
@@ -1177,6 +1180,13 @@ async def _create_model_family(
     metadata = MetaData(schema=schema_name)
     for model_type in spec.model_types:
         table = model_type.__table__.to_metadata(metadata, schema=schema_name)
+        explicit_sequences = []
+        for sequence_name, owner_table, column_name in _OWNED_SEQUENCES.get(spec.importer_id, ()):
+            if owner_table == table.name and isinstance(table.c[column_name].default, Sequence):
+                sequence = Sequence(sequence_name, schema=schema_name, data_type=table.c[column_name].type)
+                await session.execute(CreateSequence(sequence))
+                table.c[column_name].server_default = DefaultClause(sequence.next_value())
+                explicit_sequences.append((sequence_name, column_name))
         if spec.importer_id == "mrf" and "address_key" in table.c and list(table.c.keys())[-1] != "address_key":
             # Ordinary MRF stages move this column before their table swap.
             address_key_column = table.c.address_key
@@ -1184,6 +1194,13 @@ async def _create_model_family(
             table.append_column(address_key_column)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
+        for sequence_name, column_name in explicit_sequences:
+            await session.execute(
+                text(
+                    f"ALTER SEQUENCE {_quoted(schema_name)}.{_quoted(sequence_name)} OWNED BY "
+                    f"{_quoted(schema_name)}.{_quoted(table.name)}.{_quoted(column_name)}"
+                )
+            )
         indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
             getattr(model_type, "__my_additional_indexes__", ()) or ()
         )
