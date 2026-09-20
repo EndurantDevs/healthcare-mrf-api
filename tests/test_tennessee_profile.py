@@ -233,7 +233,7 @@ def test_registry_worker_and_committed_result_use_managed_entrypoint():
 
     importer = worker.IMPORTER
     entry = next(entry for entry in control_imports.importer_registry() if entry["name"] == importer)
-    assert entry["family"] == "provider" and entry["depends_on"] == ["npi"] and entry["cancelable"] is True
+    assert entry["family"] == "provider" and entry["dependency_authority"] == "scheduler" and entry["cancelable"] is True
     assert entry["params_schema"] == []
     adapter = control_imports._SINGLE_JOB_ADAPTERS[importer]
     assert adapter["target_module"] == "process.tennessee_profile" and adapter["target_function"] == "import_profiles"
