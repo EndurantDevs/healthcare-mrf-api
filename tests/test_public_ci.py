@@ -99,11 +99,11 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     }
     bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
     assert bootstrap["run"] == (
-        "printf '%s\\n' 'uv==0.12.12 "
-        "--hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n"
+        "printf '%s\\n' 'uv==0.12.17 "
+        "--hash=sha256:9e25bb39e1674799c408345a6397ebc2c7c719d498be0ce9d935466d36ceacf5' |\n"
         "  python -m pip install --disable-pip-version-check --no-deps "
         "--only-binary=:all: --require-hashes -r /dev/stdin\n"
-        "test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
+        "test \"$(uv --version | awk '{print $2}')\" = 0.12.17\n"
     )
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ci/public_hygiene.py" in commands
