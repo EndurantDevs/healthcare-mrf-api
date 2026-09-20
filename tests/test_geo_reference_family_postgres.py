@@ -49,6 +49,7 @@ async def _prepare_geo_candidate(sessions, live_schema, dataset_id):
         await session.execute(
             text(f'INSERT INTO "{stage_schema}".geo_zip_lookup SELECT * FROM "{live_schema}".geo_zip_lookup')
         )
+        await archive.complete_reference_family_restore(session, stage_ownership)
         stage_index_names = await _index_names(session, stage_schema)
         assert stage_index_names == _EXPECTED_INDEX_NAMES
         await session.execute(text(f"UPDATE \"{live_schema}\".geo_zip_lookup SET city = 'Old City'"))

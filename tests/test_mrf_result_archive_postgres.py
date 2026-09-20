@@ -186,6 +186,7 @@ async def _prepare_restored_candidate(sessions, source_schema: str, prepared_dat
             dataset_id=restored_dataset_id,
         )
         await _copy_prepared_stage(session, prepared, restored)
+        await archive.complete_reference_family_restore(session, restored)
         await archive.validate_reference_family_stage(
             session,
             ownership=restored,
@@ -697,6 +698,7 @@ async def _restore_prepared_address_archive(sessions, prepared, dataset_id, path
 
 async def _assert_restored_address_archive(sessions, prepared, restored, address_key):
     async with sessions() as session, session.begin():
+        await archive.complete_reference_family_restore(session, restored)
         await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest)
         assert tuple(table.table_name for table in prepared.manifest.tables) == (
             "mrf_address",

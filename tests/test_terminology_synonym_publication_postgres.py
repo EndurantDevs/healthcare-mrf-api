@@ -176,6 +176,7 @@ async def test_terminology_reference_stage_has_complete_model_indexes():
                 connection, importer_id="terminology-synonyms", dataset_id=dataset_id
             )
             assert ownership.relation_oids[0][0] == LIVE_TABLE
+            await archive.complete_reference_family_restore(connection, ownership)
             indexes = (await connection.execute(text(
                 "SELECT indexname FROM pg_indexes WHERE schemaname=:schema"
             ), {"schema": stage_schema})).scalars().all()

@@ -136,6 +136,8 @@ async def _archive_restore(sessions, url, dataset_id, path):
         str(path),
     )
     restored_source = archive.ReferenceFamilyPreparedSource(prepared.manifest, restored)
+    async with sessions() as session, session.begin():
+        await archive.complete_reference_family_restore(session, restored)
     await _assert_restored_source(sessions, restored_source)
     return restored_source
 
