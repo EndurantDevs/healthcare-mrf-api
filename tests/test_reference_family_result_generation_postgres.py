@@ -25,6 +25,16 @@ _REFERENCE_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260914110000_reference_family_result_generation.py"
 )
 _MRF_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914130000_mrf_result_generation.py"
+_CMS_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260920100000_cms_doctors_result_generation.py"
+)
+_TIGER_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260920110000_tiger_result_generation.py"
+)
+_MRF_ADDRESS_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260920120000_mrf_address_result_generation.py"
+)
+_GEO_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260920130000_geo_result_generation.py"
 _NPI_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914120000_npi_result_generation.py"
 _NPI_TABLES = (
     "npi",
@@ -69,6 +79,68 @@ async def _run_migration(connection, path: Path, action: str) -> None:
     await connection.run_sync(apply)
 
 
+async def _upgrade_reference_generation_chain(connection) -> None:
+    for migration_path in (
+        _REFERENCE_MIGRATION_PATH,
+        _MRF_MIGRATION_PATH,
+        _CMS_MIGRATION_PATH,
+        _TIGER_MIGRATION_PATH,
+        _MRF_ADDRESS_MIGRATION_PATH,
+    ):
+        await _run_migration(connection, migration_path, "upgrade")
+
+
+@pytest.mark.asyncio
+async def test_geo_migration_seeds_exact_generation_and_preserves_prior_rows(monkeypatch):
+    schema = "reference_geo_upgrade_" + uuid4().hex
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await _upgrade_reference_generation_chain(connection)
+            before = (
+                await connection.execute(
+                    text(f'SELECT importer_id, local_lineage_id FROM "{schema}".reference_family_result_generation')
+                )
+            ).all()
+            await _run_migration(connection, _GEO_MIGRATION_PATH, "upgrade")
+            after = (
+                await connection.execute(
+                    text(f'SELECT importer_id, local_lineage_id FROM "{schema}".reference_family_result_generation')
+                )
+            ).all()
+            assert {name: lineage for name, lineage in after if name != "geo"} == dict(before)
+            assert [name for name, _ in after].count("geo") == 1
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}".reference_family_result_generation '
+                    "SET local_generation=1 WHERE importer_id='geo'"
+                )
+            )
+            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
+                await _run_migration(connection, _GEO_MIGRATION_PATH, "downgrade")
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}".reference_family_result_generation '
+                    "SET local_generation=0 WHERE importer_id='geo'"
+                )
+            )
+            await _run_migration(connection, _GEO_MIGRATION_PATH, "downgrade")
+            assert (
+                await connection.execute(
+                    text(f'SELECT importer_id, local_lineage_id FROM "{schema}".reference_family_result_generation')
+                )
+            ).all() == before
+    finally:
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        finally:
+            await engine.dispose()
+
+
 async def _npi_catalog_state(connection, schema: str):
     return (
         await connection.execute(
@@ -101,10 +173,10 @@ async def test_mrf_upgrade_preserves_npi_catalog_and_reference_rows(monkeypatch)
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
             for table_name in _NPI_TABLES:
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
-            for relation_names in generation.RELATION_NAMES_BY_IMPORTER.values():
-                for table_name in relation_names:
-                    await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
-                    await connection.execute(text(f'INSERT INTO "{schema}"."{table_name}" VALUES (1)'))
+            table_names = {name for names in generation.RELATION_NAMES_BY_IMPORTER.values() for name in names}
+            for table_name in table_names:
+                await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
+                await connection.execute(text(f'INSERT INTO "{schema}"."{table_name}" VALUES (1)'))
             await _run_migration(connection, _NPI_MIGRATION_PATH, "upgrade")
             await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
             npi_before = await _npi_catalog_state(connection, schema)
@@ -138,10 +210,12 @@ async def test_mrf_upgrade_preserves_npi_catalog_and_reference_rows(monkeypatch)
 
 
 async def _publish_initial_generations(engine, schema):
-    """Publish and verify generation one for every closed family."""
+    """Publish generation one for every application-schema family."""
 
     authority_by_importer = {}
     for importer_id in generation.RELATION_NAMES_BY_IMPORTER:
+        if importer_id == "tiger":
+            continue
         async with engine.begin() as connection:
             first = await generation.publish_local_reference_family_generation(
                 connection,
@@ -196,7 +270,7 @@ async def _assert_adoption_rollback(engine, schema, incumbent_authority, source_
 
 
 @pytest.mark.asyncio
-async def test_five_family_generation_publication_adoption_and_rollback(monkeypatch):
+async def test_closed_family_generation_publication_adoption_and_rollback(monkeypatch):
     """Bind every family to exact OIDs and keep adoption transaction-local."""
 
     schema = "reference_generation_" + uuid4().hex
@@ -206,11 +280,11 @@ async def test_five_family_generation_publication_adoption_and_rollback(monkeypa
     try:
         async with engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-            await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
-            await _run_migration(connection, _MRF_MIGRATION_PATH, "upgrade")
-            for relation_names in generation.RELATION_NAMES_BY_IMPORTER.values():
-                for table_name in relation_names:
-                    await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
+            await _upgrade_reference_generation_chain(connection)
+            await _run_migration(connection, _GEO_MIGRATION_PATH, "upgrade")
+            table_names = {name for names in generation.RELATION_NAMES_BY_IMPORTER.values() for name in names}
+            for table_name in table_names:
+                await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
 
         authority_by_importer = await _publish_initial_generations(engine, schema)
         incumbent_authority = authority_by_importer["places-zcta"]
