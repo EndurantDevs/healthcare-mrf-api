@@ -770,14 +770,14 @@ def test_approved_relation_and_credential_value_contracts_reject_invalid_shapes(
         {"private_key_pem": _PRIVATE_KEY_PEM.encode("ascii"), "private_key_passphrase": b""},
     )
     for changes in invalid_credentials:
-        values = {
+        credential_by_field = {
             "account": "synthetic-account",
             "user": "synthetic-user",
             "private_key_pem": _PRIVATE_KEY_PEM.encode("ascii"),
         }
-        values.update(changes)
+        credential_by_field.update(changes)
         with pytest.raises(snowflake.SnowflakeCredentialError):
-            snowflake.SnowflakeKeyPairCredentials(**values)
+            snowflake.SnowflakeKeyPairCredentials(**credential_by_field)
 
 
 def test_fixed_provider_rejects_malformed_documents_and_descriptor_failures(tmp_path, monkeypatch):
@@ -913,7 +913,7 @@ def test_read_statement_result_and_manifest_types_fail_closed():
                 content_sha256=digest,
             )
 
-    manifest_values = {
+    manifest_by_field = {
         "request_sha256": digest,
         "statement_sha256": digest,
         "source_snapshot_token": "release-1",
@@ -921,15 +921,15 @@ def test_read_statement_result_and_manifest_types_fail_closed():
         "content_sha256": digest,
     }
     with pytest.raises(snowflake.SnowflakeConnectorError, match="partition limit"):
-        snowflake.SnowflakeAcquisitionManifest(result_partitions=[], **manifest_values)
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=[], **manifest_by_field)
     with pytest.raises(snowflake.SnowflakeConnectorError, match="invalid entry"):
-        snowflake.SnowflakeAcquisitionManifest(result_partitions=(object(),), **manifest_values)
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=(object(),), **manifest_by_field)
     second = snowflake.SnowflakeResultPartitionManifest(ordinal=2, content_bytes=1, content_sha256=digest)
     with pytest.raises(snowflake.SnowflakeConnectorError, match="contiguous"):
-        snowflake.SnowflakeAcquisitionManifest(result_partitions=(second,), **manifest_values)
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=(second,), **manifest_by_field)
 
 
-def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
+def test_parquet_result_validates_ownership_inputs():
     column = snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=False)
     sources = _OwnedPartitionSources((_ProbeReader((b"PAR1",)),))
     invalid_results = (
@@ -943,6 +943,9 @@ def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
         with pytest.raises(snowflake.SnowflakeConnectorError):
             snowflake.SnowflakeParquetResult(source_snapshot_token="release-1", **changes)
 
+
+def test_parquet_result_rejects_invalid_lifecycle_calls():
+    column = snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=False)
     result = snowflake.SnowflakeParquetResult(
         source_snapshot_token="release-1",
         schema=(column,),
@@ -961,6 +964,10 @@ def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
         result.consume_partition_sources()
     with pytest.raises(snowflake.SnowflakeConnectorError, match="closed"):
         result.claim_partition_source(_ProbeReader((b"PAR2",)))
+
+
+def test_parquet_result_rejects_invalid_partition_iterators():
+    column = snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=False)
 
     class IteratorWithoutClose:
         def __iter__(self):
@@ -990,6 +997,9 @@ def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
             partition_sources=BrokenIterable(),
         ).consume_partition_sources()
 
+
+def test_parquet_result_reports_resource_cleanup_failures():
+    column = snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=False)
     result = snowflake.SnowflakeParquetResult(
         source_snapshot_token="release-1",
         schema=(column,),
@@ -1015,7 +1025,7 @@ def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
         snowflake._close_adapter_result_after_success(broken_result)
 
 
-def test_connector_construction_request_and_adapter_boundaries_fail_closed():
+def test_connector_construction_rejects_invalid_collaborators():
     approved = _approved_relation()
     provider = _StaticCredentialProvider()
     adapter = _Adapter(_result)
@@ -1027,11 +1037,19 @@ def test_connector_construction_request_and_adapter_boundaries_fail_closed():
         {"adapter": object()},
     )
     for changes in constructor_cases:
-        values = {"approved_relations": (approved,), "credential_provider": provider, "adapter": adapter}
-        values.update(changes)
+        connector_by_field = {
+            "approved_relations": (approved,),
+            "credential_provider": provider,
+            "adapter": adapter,
+        }
+        connector_by_field.update(changes)
         with pytest.raises(snowflake.SnowflakeConnectorError):
-            snowflake.SnowflakeAcquisitionConnector(**values)
+            snowflake.SnowflakeAcquisitionConnector(**connector_by_field)
 
+
+def test_connector_request_and_statement_boundaries_fail_closed():
+    approved = _approved_relation()
+    adapter = _Adapter(_result)
     connector = _connector(adapter)
     request_cases = (
         {"definition": object(), "relation": approved.relation, "selected_field_ids": ("npi",)},
@@ -1039,9 +1057,9 @@ def test_connector_construction_request_and_adapter_boundaries_fail_closed():
         {"definition": _definition(), "relation": approved.relation, "selected_field_ids": ("npi", "npi")},
         {"definition": _definition(), "relation": approved.relation, "selected_field_ids": ("missing",)},
     )
-    for values in request_cases:
+    for request_by_field in request_cases:
         with pytest.raises(snowflake.SnowflakeConnectorError):
-            connector.prepare_request(**values)
+            connector.prepare_request(**request_by_field)
     with pytest.raises(snowflake.SnowflakeConnectorError, match="declared request type"):
         connector.build_statement(object())
 
@@ -1064,6 +1082,11 @@ def test_connector_construction_request_and_adapter_boundaries_fail_closed():
     with pytest.raises(snowflake.SnowflakeConnectorError, match="do not match"):
         connector.build_statement(mismatched_request)
 
+
+def test_connector_acquisition_rejects_invalid_adapter_results():
+    approved = _approved_relation()
+    provider = _StaticCredentialProvider()
+    adapter = _Adapter(_result)
     bad_provider = SimpleNamespace(load_key_pair=lambda: object())
     connector = snowflake.SnowflakeAcquisitionConnector(
         approved_relations=(approved,), credential_provider=bad_provider, adapter=adapter
