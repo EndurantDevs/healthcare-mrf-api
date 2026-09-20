@@ -12,9 +12,9 @@ import re
 from uuid import uuid4
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
 
 revision = "20260914110000_reference_family_result_generation"
 down_revision = "20260914100000_entity_address_result_generation"

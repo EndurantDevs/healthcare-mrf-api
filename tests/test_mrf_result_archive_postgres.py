@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -15,9 +15,9 @@ from sqlalchemy import MetaData, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from process import initial, reference_family_archive as archive
+from process import initial
+from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-
 
 _DSN_ENV = "HLTHPRT_MRF_RESULT_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")

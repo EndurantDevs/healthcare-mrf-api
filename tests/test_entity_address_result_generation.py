@@ -7,7 +7,6 @@ import importlib
 
 import pytest
 
-
 generation = importlib.import_module("process.entity_address_result_generation")
 restore = importlib.import_module("process.entity_address_snapshot_restore")
 
