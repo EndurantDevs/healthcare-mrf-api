@@ -647,7 +647,12 @@ async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically(
             assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
     finally:
         async with engine.begin() as connection:
-            for schema_name in (stage_schema, live_schema, unrelated_schema):
+            for schema_name in (
+                stage_schema,
+                archive.reference_family_predecessor_schema(dataset_id),
+                live_schema,
+                unrelated_schema,
+            ):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
 

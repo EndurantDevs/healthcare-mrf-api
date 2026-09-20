@@ -336,7 +336,7 @@ async def finalize_attribute_tables(ctx):
         if not await _is_table_available(db_schema, table_model.__tablename__)
     ]
     if missing_tables:
-        raise RuntimeError("Required plan attribute stages are missing")
+        raise RuntimeError("Required plan attribute stages are missing: " + ", ".join(missing_tables))
     for cls, table_model in zip(processing_classes, table_models, strict=True):
         await _finalize_attribute_stage(cls, table_model, db_schema)
     async with db.transaction():
