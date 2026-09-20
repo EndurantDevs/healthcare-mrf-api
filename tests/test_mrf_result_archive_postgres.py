@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from process import initial
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
+from tests.reference_family_generation_fixture import generation_shape_check
 
 _DSN_ENV = "HLTHPRT_MRF_RESULT_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")
@@ -74,7 +75,9 @@ async def _create_family(session, schema_name: str) -> None:
             f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
             "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
             "local_generation bigint NOT NULL, origin_lineage_id uuid, "
-            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+            "CONSTRAINT reference_family_result_generation_shape_check CHECK ("
+            f"{generation_shape_check()}))"
         )
     )
     await session.execute(
@@ -438,7 +441,9 @@ async def _initialize_published_mrf_schema(session, schema_name):
             f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
             "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
             "local_generation bigint NOT NULL, origin_lineage_id uuid, "
-            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+            "CONSTRAINT reference_family_result_generation_shape_check CHECK ("
+            f"{generation_shape_check()}))"
         )
     )
     await session.execute(
