@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -72,6 +72,38 @@ async def test_successful_export_cleans_stage_before_returning_manifest(monkeypa
     cleanup.assert_awaited_once_with(ANY, ownership)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auxiliary_owner", (7, 8))
+async def test_mrf_stage_owner_includes_canonical_auxiliary(auxiliary_owner):
+    ownership = archive.ReferenceFamilyStageOwnership(
+        "mrf",
+        UUID(int=1),
+        "reference_family_archive_" + UUID(int=1).hex,
+        10,
+        (("issuer", 11),),
+        auxiliary_oid=12,
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                mappings=Mock(
+                    return_value=[
+                        {"relname": "issuer", "oid": 11, "relowner": 7},
+                        {"relname": "mrf_canonical_address", "oid": 12, "relowner": auxiliary_owner},
+                    ]
+                )
+            )
+        ),
+    )
+    if auxiliary_owner == 7:
+        await archive._verify_stage_owner(session, ownership, 7)
+    else:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage owner differs"):
+            await archive._verify_stage_owner(session, ownership, 7)
+    assert session.execute.await_args.args[1] == {"relation_oids": [11, 12]}
+
+
 def test_registry_is_closed_to_exact_ordered_replacement_families():
     assert archive.reference_family_spec("plan-attributes").table_names == (
         "plan_attributes",
@@ -95,6 +127,9 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
         "mrf_address",
         "mrf_address_evidence",
     )
+    mrf = archive.reference_family_spec("mrf")
+    assert mrf.table_names[-1] == "plan_search_summary"
+    assert mrf.dependencies == ("plan-attributes",)
     assert archive.reference_family_spec("medicare-enrollment").table_names == (
         "medicare_enrollment_county_stats",
         "medicare_enrollment_stats",
@@ -189,12 +224,22 @@ def test_manifest_binds_explicit_provenance_but_remains_manual_only():
 def test_manifest_preserves_exact_portable_dependencies_without_changing_legacy_receipts():
     legacy = _manifest()
     assert "dependencies" not in legacy.as_dict()
-    manifest = replace(legacy, dependencies={"geo": "b" * 64, "npi": "c" * 64})
+    model = archive.reference_family_spec("geo-census").model_types[0]
+    tables = (archive.ReferenceTableReceipt(model.__name__, model.__tablename__, "d" * 64, 2),)
+    manifest = archive.ReferenceFamilyManifest(
+        "geo-census",
+        tables,
+        legacy.source_metadata,
+        legacy.source_metadata_sha256,
+        archive._schema_digest(tables),
+        {"geo": "b" * 64},
+    )
     assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
-    assert archive._validation_digest(legacy.as_dict()) != archive._validation_digest(manifest.as_dict())
-    for dependencies in ({"places-zcta": "a" * 64}, {"geo": "bad"}, {"geo": None}, [], {"../geo": "b" * 64}):
+    changed = replace(manifest, dependencies={"geo": "c" * 64})
+    assert archive._validation_digest(manifest.as_dict()) != archive._validation_digest(changed.as_dict())
+    for dependencies in ({}, {"places-zcta": "a" * 64}, {"geo": "bad"}, {"geo": None}, [], {"../geo": "b" * 64}):
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="dependencies"):
-            archive.validate_reference_family_manifest({**legacy.as_dict(), "dependencies": dependencies})
+            archive.validate_reference_family_manifest({**manifest.as_dict(), "dependencies": dependencies})
 
 
 def test_validation_receipt_rejects_tampered_package_binding():

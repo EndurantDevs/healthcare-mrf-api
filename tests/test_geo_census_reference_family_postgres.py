@@ -2,7 +2,6 @@
 """Native census archive, retained replacement, and generation rollback proof."""
 
 import subprocess
-from dataclasses import replace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -96,7 +95,7 @@ async def test_census_native_archive_atomic_retained_swap_and_rollback(tmp_path)
                     "(zip_code,total_population,median_household_income) VALUES ('10001',123,45678)"
                 )
             )
-        manifest = replace(await _manifest(sessions, "geo-census", live), dependencies={"geo": "b" * 64})
+        manifest = await _manifest(sessions, "geo-census", live, dependencies={"geo": "b" * 64})
         assert [(row.table_name, row.row_count) for row in manifest.tables] == [("geo_zip_census_profile", 1)]
         async with sessions.begin() as session:
             ownership = await archive.precreate_reference_family_restore(
