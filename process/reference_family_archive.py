@@ -240,6 +240,7 @@ _SPECS = {
         ),
         ReferenceFamilySpec("mrf-address", (models.MRFAddress, models.MRFAddressEvidence)),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
+        ReferenceFamilySpec("geo", (models.GeoZipLookup,)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
         ReferenceFamilySpec("tiger", (ZipState, Zip_zcta5)),

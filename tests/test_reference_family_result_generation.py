@@ -45,6 +45,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
             "plan_benefits",
         ),
         "places-zcta": ("pricing_places_zcta",),
+        "geo": ("geo_zip_lookup",),
         "lodes": ("lodes_workplace_aggregate",),
         "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
         "tiger": ("zip_state", "zcta5"),
