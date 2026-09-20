@@ -53,6 +53,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
             "medicare_enrollment_county_stats",
             "medicare_enrollment_stats",
         ),
+        "pharmacy-economics": ("pharmacy_economics_summary",),
     }
     assert all(len(names) == len(set(names)) for names in generation.RELATION_NAMES_BY_IMPORTER.values())
 
