@@ -249,6 +249,7 @@ _SPECS = {
             (models.MedicareEnrollmentCountyStats, models.MedicareEnrollmentStats),
         ),
         ReferenceFamilySpec("pharmacy-economics", (models.PharmacyEconomicsSummary,)),
+        ReferenceFamilySpec("terminology-synonyms", (models.TerminologySynonym,)),
     )
 }
 _OWNED_SEQUENCES = {
@@ -1158,6 +1159,7 @@ def _is_reviewed_index_element(value: object) -> bool:
     if 0 < len(tokens) <= 2 and all(_IDENTIFIER.fullmatch(token) is not None for token in tokens):
         return True
     return value in {
+        "lower(synonym)",
         "LEFT(postal_code, 5)",
         "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
     }

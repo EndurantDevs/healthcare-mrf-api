@@ -4,16 +4,26 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import asyncpg
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 
 terminology_synonyms = importlib.import_module("process.terminology_synonyms")
+generation = importlib.import_module("process.reference_family_result_generation")
+archive = importlib.import_module("process.reference_family_archive")
+_ROOT = Path(__file__).resolve().parents[1]
 LIVE_TABLE = "terminology_synonym"
 OLD_TABLE = f"{LIVE_TABLE}_old"
 STAGE_TABLE = f"{LIVE_TABLE}_stage"
@@ -27,11 +37,16 @@ class _AsyncpgDatabase:
         return await self.connection.execute(statement)
 
     async def all(self, statement, **params):
+        statement = getattr(statement, "text", statement)
         arguments = []
         for position, (name, value) in enumerate(params.items(), start=1):
             statement = statement.replace(f":{name}", f"${position}")
             arguments.append(value)
         return await self.connection.fetch(statement, *arguments)
+
+    async def first(self, statement, **params):
+        rows = await self.all(statement, **params)
+        return rows[0] if rows else None
 
     @asynccontextmanager
     async def transaction(self):
@@ -72,6 +87,15 @@ async def _prepare_relations(
         STAGE_TABLE: stage_markers if stage_markers is not None else default_stage_markers,
     }
     await connection.execute(f'CREATE SCHEMA "{schema}"')
+    await connection.execute(
+        f'CREATE TABLE "{schema}".reference_family_result_generation ('
+        "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
+        "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+    )
+    await connection.execute(
+        f'INSERT INTO "{schema}".reference_family_result_generation VALUES ($1,$2,0)',
+        "terminology-synonyms", uuid.uuid4(),
+    )
     for table, marker_list in marker_list_by_table.items():
         await connection.execute(f"CREATE TABLE {_qualified(schema, table)} (marker text NOT NULL)")
         await connection.executemany(
@@ -82,6 +106,84 @@ async def _prepare_relations(
         table: await _relation_state(connection, schema, table)
         for table in marker_list_by_table
     }
+
+
+@pytest.mark.asyncio
+async def test_terminology_generation_migration_admits_one_exact_relation(monkeypatch):
+    dsn = os.getenv("HLTHPRT_TERMINOLOGY_PUBLICATION_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("requires disposable PostgreSQL")
+    schema = "terminology_migration_" + uuid.uuid4().hex
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    engine = create_async_engine(make_url(dsn).set(drivername="postgresql+asyncpg"))
+    migrations = (
+        "20260914110000_reference_family_result_generation.py",
+        "20260914130000_mrf_result_generation.py",
+        "20260920100000_cms_doctors_result_generation.py",
+        "20260920110000_tiger_result_generation.py",
+        "20260920120000_mrf_address_result_generation.py",
+        "20260920130000_geo_result_generation.py",
+        "20260920140000_pharmacy_economics_result_generation.py",
+        "20260920150000_terminology_result_generation.py",
+    )
+
+    async def apply(connection, filename, action):
+        spec = importlib.util.spec_from_file_location(filename[:-3], _ROOT / "alembic/versions" / filename)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def run(sync_connection):
+            module.op = Operations(MigrationContext.configure(sync_connection))
+            getattr(module, action)()
+
+        await connection.run_sync(run)
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await connection.execute(text(f'CREATE TABLE "{schema}".terminology_synonym (value text)'))
+            for filename in migrations:
+                await apply(connection, filename, "upgrade")
+            assert await connection.scalar(text(
+                f'SELECT count(*) FROM "{schema}".reference_family_result_generation'
+            )) == 11
+            published = await generation.publish_local_reference_family_generation(
+                connection, importer_id="terminology-synonyms", schema_name=schema
+            )
+            assert published.relation_oids == (
+                await connection.scalar(text(f"SELECT '{schema}.terminology_synonym'::regclass::oid::bigint")),
+            )
+            with pytest.raises(RuntimeError, match="prevents downgrade"):
+                await apply(connection, migrations[-1], "downgrade")
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_terminology_reference_stage_has_complete_model_indexes():
+    dsn = os.getenv("HLTHPRT_TERMINOLOGY_PUBLICATION_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("requires disposable PostgreSQL")
+    engine = create_async_engine(make_url(dsn).set(drivername="postgresql+asyncpg"))
+    dataset_id = uuid.uuid4()
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        async with engine.begin() as connection:
+            ownership = await archive.precreate_reference_family_restore(
+                connection, importer_id="terminology-synonyms", dataset_id=dataset_id
+            )
+            assert ownership.relation_oids[0][0] == LIVE_TABLE
+            indexes = (await connection.execute(text(
+                "SELECT indexname FROM pg_indexes WHERE schemaname=:schema"
+            ), {"schema": stage_schema})).scalars().all()
+            assert len(indexes) >= 5
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
+        await engine.dispose()
 
 
 @asynccontextmanager
@@ -107,6 +209,10 @@ async def test_terminology_publication_preserves_predecessor_and_rolls_back_mism
         original_state_by_table = await _prepare_relations(connection, schema)
 
         await terminology_synonyms._publish_stage(schema, stage_cls, 3)
+        published = await generation.capture_reference_family_serving_generation(
+            terminology_synonyms.db, importer_id="terminology-synonyms", schema_name=schema
+        )
+        assert published.origin_generation == 1
 
         assert await _relation_state(connection, schema, LIVE_TABLE) == original_state_by_table[STAGE_TABLE]
         assert await _relation_state(connection, schema, OLD_TABLE) == original_state_by_table[LIVE_TABLE]
@@ -121,6 +227,10 @@ async def test_terminology_publication_preserves_predecessor_and_rolls_back_mism
 
         with pytest.raises(RuntimeError, match="promoted row count 3 does not match staged row count 4"):
             await terminology_synonyms._publish_stage(schema, stage_cls, 4)
+        authority = await generation.read_reference_family_result_generation_authority(
+            terminology_synonyms.db, importer_id="terminology-synonyms", schema_name=schema
+        )
+        assert authority.local_generation == 0
 
         for table, original_state in original_state_by_table.items():
             assert await _relation_state(connection, schema, table) == original_state
@@ -155,6 +265,11 @@ async def test_terminology_rollback_reverses_relation_oids_and_content(monkeypat
         }
         assert await _relation_state(connection, schema, LIVE_TABLE) == original_state_by_table[LIVE_TABLE]
         assert await _relation_state(connection, schema, OLD_TABLE) == original_state_by_table[STAGE_TABLE]
+        authority = await generation.read_reference_family_result_generation_authority(
+            terminology_synonyms.db, importer_id="terminology-synonyms", schema_name=schema
+        )
+        assert authority.local_generation == 2
+        assert authority.relation_oids == (original_state_by_table[LIVE_TABLE][0],)
 
 
 @pytest.mark.asyncio
