@@ -44,10 +44,10 @@ def _database_url():
     if (
         not url.drivername.startswith("postgresql")
         or url.host not in {"127.0.0.1", "localhost"}
-        or url.port != 5440
+        or url.port not in {5432, 5440}
         or not _LOCAL_DATABASE.fullmatch(str(url.database or ""))
     ):
-        pytest.fail(f"{_DSN_ENV} must identify a UUID-owned PostgreSQL 18 test database on port 5440")
+        pytest.fail(f"{_DSN_ENV} must identify a UUID-owned local PostgreSQL 18 test database")
     return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 

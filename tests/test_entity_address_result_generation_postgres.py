@@ -45,7 +45,7 @@ def _database_url():
     if (
         database_url.drivername != "postgresql"
         or database_url.host not in {"127.0.0.1", "localhost"}
-        or database_url.port != 5440
+        or database_url.port not in {5432, 5440}
         or not _DATABASE_PATTERN.fullmatch(str(database_url.database or ""))
     ):
         pytest.fail(f"{_DSN_ENV} must identify a UUID-scoped local PostgreSQL test database")
