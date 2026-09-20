@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -39,6 +40,7 @@ RELATION_NAMES_BY_IMPORTER = {
     "places-zcta": ("pricing_places_zcta",),
     "lodes": ("lodes_workplace_aggregate",),
     "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
+    "tiger": ("zip_state", "zcta5"),
     "medicare-enrollment": (
         "medicare_enrollment_county_stats",
         "medicare_enrollment_stats",
@@ -236,6 +238,23 @@ def _state_sql(schema_name: str, *, lock: bool) -> str:
     )
 
 
+def _authority_schema(importer_id: str, serving_schema: str) -> str:
+    """Keep the static TIGER ledger in the application schema, without TIGER DDL grants."""
+
+    if importer_id != "tiger":
+        return serving_schema
+    if serving_schema != "tiger":
+        raise ValueError("TIGER serving schema must be tiger")
+    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
+    legacy_schema = os.getenv("DB_SCHEMA")
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
+        raise ValueError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
+    authority_schema = _schema_name(runtime_schema or legacy_schema or "mrf")
+    if authority_schema == "tiger":
+        raise ValueError("TIGER authority requires a separate application schema")
+    return authority_schema
+
+
 async def read_reference_family_result_generation_authority(
     database: Any,
     *,
@@ -247,7 +266,7 @@ async def read_reference_family_result_generation_authority(
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
-    row = await _first(database, text(_state_sql(schema, lock=lock)), importer_id=importer)
+    row = await _first(database, text(_state_sql(_authority_schema(importer, schema), lock=lock)), importer_id=importer)
     if row is None:
         raise RuntimeError("reference family generation authority is unavailable")
     return validate_reference_family_result_generation_authority(row)
@@ -324,7 +343,7 @@ async def publish_local_reference_family_generation(
     updated = await _first(
         database,
         text(
-            f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
+            f"UPDATE {_quoted(_authority_schema(importer, schema))}.{_quoted(TABLE_NAME)} SET "
             "local_generation=:next_generation, origin_lineage_id=local_lineage_id, "
             "origin_generation=:next_generation, published_at=clock_timestamp(), "
             "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
@@ -374,7 +393,7 @@ async def publish_adopted_reference_family_generation(
     updated = await _first(
         database,
         text(
-            f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
+            f"UPDATE {_quoted(_authority_schema(importer, schema))}.{_quoted(TABLE_NAME)} SET "
             "origin_lineage_id=CAST(:origin_lineage_id AS uuid), "
             "origin_generation=:origin_generation, published_at=CAST(:published_at AS timestamptz), "
             "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
