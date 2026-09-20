@@ -11,11 +11,11 @@ from uuid import uuid4
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import text
+from sqlalchemy import MetaData, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from process import reference_family_archive as archive
+from process import initial, reference_family_archive as archive
 from process import reference_family_result_generation as generation
 
 
@@ -24,6 +24,32 @@ _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")
 _MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260914130000_mrf_result_generation.py"
 )
+
+
+class _PublisherDatabase:
+    """Run the normal importer publication against one disposable session."""
+
+    def __init__(self, session, schema_name):
+        self.session = session
+        self.schema_name = schema_name
+
+    def transaction(self):
+        return self.session.begin()
+
+    def in_transaction(self):
+        return self.session.in_transaction()
+
+    async def execute(self, statement, params=None):
+        return await self.session.execute(statement, params or {})
+
+    async def status(self, statement):
+        return await self.session.execute(text(statement))
+
+    async def create_table(self, table, *, checkfirst=False):
+        if table.schema != self.schema_name:
+            table = table.to_metadata(MetaData(), schema=self.schema_name)
+        connection = await self.session.connection()
+        await connection.run_sync(lambda sync: table.create(sync, checkfirst=checkfirst))
 
 
 def _database_url() -> str:
@@ -42,17 +68,7 @@ def _database_url() -> str:
 
 async def _create_family(session, schema_name: str) -> None:
     await session.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gin"))
-    await session.execute(text(f'CREATE SCHEMA "{schema_name}"'))
-    metadata = archive.MetaData(schema=schema_name)
-    for model_type in archive.reference_family_spec("mrf").model_types:
-        table = model_type.__table__.to_metadata(metadata, schema=schema_name)
-        statement = str(archive.CreateTable(table).compile(dialect=archive.postgresql.dialect()))
-        await session.execute(text(statement))
-        indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
-            getattr(model_type, "__my_additional_indexes__", ()) or ()
-        )
-        for index in indexes:
-            await session.execute(text(archive._additional_index_sql(schema_name, model_type, index)))
+    await archive._create_model_family(session, archive.reference_family_spec("mrf"), schema_name)
     await session.execute(
         text(
             f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
@@ -266,6 +282,113 @@ async def _assert_stale_incumbent_rejected(
         await transaction.rollback()
 
 
+async def _seed_mrf_roundtrip(session, source_schema, destination_schema, unrelated_schema):
+    await _create_family(session, source_schema)
+    await _create_family(session, destination_schema)
+    await _insert_family_rows(session, source_schema, "source-v1")
+    await _insert_family_rows(session, destination_schema, "destination-v1")
+    for table_name, marker in (("history", "retained-history"), ("account_state", "retained-account")):
+        await session.execute(text(f'CREATE TABLE "{destination_schema}".{table_name} (marker text PRIMARY KEY)'))
+        await session.execute(text(f"INSERT INTO \"{destination_schema}\".{table_name} VALUES ('{marker}')"))
+    await session.execute(text(f'CREATE SCHEMA "{unrelated_schema}"'))
+    await session.execute(text(f'CREATE TABLE "{unrelated_schema}".keep_me (marker text PRIMARY KEY)'))
+    await session.execute(text(f"INSERT INTO \"{unrelated_schema}\".keep_me VALUES ('keep')"))
+    first_source = await generation.publish_local_reference_family_generation(
+        session, importer_id="mrf", schema_name=source_schema
+    )
+    await generation.publish_adopted_reference_family_generation(
+        session,
+        importer_id="mrf",
+        schema_name=destination_schema,
+        source_generation=first_source.serving_generation,
+    )
+    await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v2'"))
+    return await generation.publish_local_reference_family_generation(
+        session, importer_id="mrf", schema_name=source_schema
+    )
+
+
+async def _assert_rolled_back_activation(
+    sessions, destination_schema, ownership, manifest, incumbent, validation, owner_oid, source_generation
+) -> None:
+    async with sessions() as session:
+        transaction = await session.begin()
+        await _activate(session, ownership, manifest, incumbent, validation, owner_oid, source_generation)
+        assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
+        await transaction.rollback()
+    async with sessions() as session, session.begin():
+        assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "destination-v1"
+
+
+async def _assert_committed_activation(sessions, destination_schema, unrelated_schema, activation_by_field) -> None:
+    async with sessions() as session, session.begin():
+        receipt = await _activate(session, **activation_by_field)
+        assert receipt.predecessor_schema_name is not None
+    async with sessions() as session, session.begin():
+        adopted = await generation.read_reference_family_result_generation_authority(
+            session, importer_id="mrf", schema_name=destination_schema
+        )
+        assert adopted.serving_generation == activation_by_field["source_generation"]
+        assert len(adopted.relation_oids) == 13
+        assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
+        assert (
+            await session.scalar(text(f'SELECT issuer_name FROM "{receipt.predecessor_schema_name}".issuer'))
+            == "destination-v1"
+        )
+        assert await session.scalar(text(f"SELECT nextval('\"{destination_schema}\".issuer_issuer_id_seq')")) == 2
+        assert (
+            await session.scalar(
+                text(f"SELECT nextval('\"{destination_schema}\".mrf_address_evidence_evidence_checksum_seq')")
+            )
+            == 2
+        )
+        assert await session.scalar(text(f'SELECT marker FROM "{unrelated_schema}".keep_me')) == "keep"
+        for table_name, marker in (("history", "retained-history"), ("account_state", "retained-account")):
+            assert await session.scalar(text(f'SELECT marker FROM "{destination_schema}".{table_name}')) == marker
+        assert (
+            await session.scalar(
+                text("SELECT to_regnamespace(:schema)"), {"schema": activation_by_field["ownership"].schema_name}
+            )
+            is None
+        )
+
+
+async def _exercise_mrf_roundtrip(
+    sessions,
+    source_schema,
+    destination_schema,
+    unrelated_schema,
+    prepared_dataset_id,
+    restored_dataset_id,
+    source_generation,
+) -> None:
+    manifest, ownership = await _prepare_restored_candidate(
+        sessions, source_schema, prepared_dataset_id, restored_dataset_id
+    )
+    incumbent, validation, owner_oid = await _prepare_activation(sessions, destination_schema, manifest, ownership)
+    await _assert_replaced_sequence_rejected(sessions, ownership)
+    await _assert_wrong_sequence_column_rejected(sessions, ownership)
+    await _assert_stale_incumbent_rejected(
+        sessions, ownership, manifest, incumbent, validation, owner_oid, source_generation
+    )
+    await _assert_rolled_back_activation(
+        sessions, destination_schema, ownership, manifest, incumbent, validation, owner_oid, source_generation
+    )
+    await _assert_committed_activation(
+        sessions,
+        destination_schema,
+        unrelated_schema,
+        {
+            "ownership": ownership,
+            "manifest": manifest,
+            "incumbent": incumbent,
+            "validation": validation,
+            "owner_oid": owner_oid,
+            "source_generation": source_generation,
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back():
     """Transfer all 13 relations with frozen data, CAS, and atomic generation."""
@@ -287,111 +410,121 @@ async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back():
     }
     try:
         async with sessions() as session, session.begin():
-            await _create_family(session, source_schema)
-            await _create_family(session, destination_schema)
-            await _insert_family_rows(session, source_schema, "source-v1")
-            await _insert_family_rows(session, destination_schema, "destination-v1")
-            await session.execute(text(f'CREATE TABLE "{destination_schema}".history (marker text PRIMARY KEY)'))
-            await session.execute(text(f"INSERT INTO \"{destination_schema}\".history VALUES ('retained-history')"))
-            await session.execute(text(f'CREATE TABLE "{destination_schema}".account_state (marker text PRIMARY KEY)'))
-            await session.execute(
-                text(f"INSERT INTO \"{destination_schema}\".account_state VALUES ('retained-account')")
-            )
-            await session.execute(text(f'CREATE SCHEMA "{unrelated_schema}"'))
-            await session.execute(text(f'CREATE TABLE "{unrelated_schema}".keep_me (marker text PRIMARY KEY)'))
-            await session.execute(text(f"INSERT INTO \"{unrelated_schema}\".keep_me VALUES ('keep')"))
-            first_source = await generation.publish_local_reference_family_generation(
-                session, importer_id="mrf", schema_name=source_schema
-            )
-            await generation.publish_adopted_reference_family_generation(
-                session,
-                importer_id="mrf",
-                schema_name=destination_schema,
-                source_generation=first_source.serving_generation,
-            )
-            await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v2'"))
-            source_authority = await generation.publish_local_reference_family_generation(
-                session, importer_id="mrf", schema_name=source_schema
-            )
-        manifest, ownership = await _prepare_restored_candidate(
+            source_authority = await _seed_mrf_roundtrip(session, source_schema, destination_schema, unrelated_schema)
+        await _exercise_mrf_roundtrip(
             sessions,
             source_schema,
+            destination_schema,
+            unrelated_schema,
             prepared_dataset_id,
             restored_dataset_id,
-        )
-        incumbent, validation, owner_oid = await _prepare_activation(sessions, destination_schema, manifest, ownership)
-        await _assert_replaced_sequence_rejected(sessions, ownership)
-        await _assert_wrong_sequence_column_rejected(sessions, ownership)
-        await _assert_stale_incumbent_rejected(
-            sessions,
-            ownership,
-            manifest,
-            incumbent,
-            validation,
-            owner_oid,
             source_authority.serving_generation,
         )
-        async with sessions() as session:
-            transaction = await session.begin()
-            await _activate(
-                session,
-                ownership,
-                manifest,
-                incumbent,
-                validation,
-                owner_oid,
-                source_authority.serving_generation,
-            )
-            assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
-            await transaction.rollback()
-        async with sessions() as session, session.begin():
-            assert (
-                await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "destination-v1"
-            )
-            receipt = await _activate(
-                session,
-                ownership,
-                manifest,
-                incumbent,
-                validation,
-                owner_oid,
-                source_authority.serving_generation,
-            )
-            assert receipt.predecessor_schema_name is not None
-        async with sessions() as session, session.begin():
-            adopted = await generation.read_reference_family_result_generation_authority(
-                session, importer_id="mrf", schema_name=destination_schema
-            )
-            assert adopted.serving_generation == source_authority.serving_generation
-            assert len(adopted.relation_oids) == 13
-            assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
-            assert (
-                await session.scalar(text(f'SELECT issuer_name FROM "{receipt.predecessor_schema_name}".issuer'))
-                == "destination-v1"
-            )
-            assert await session.scalar(text(f"SELECT nextval('\"{destination_schema}\".issuer_issuer_id_seq')")) == 2
-            assert (
-                await session.scalar(
-                    text(f"SELECT nextval('\"{destination_schema}\".mrf_address_evidence_evidence_checksum_seq')")
-                )
-                == 2
-            )
-            assert await session.scalar(text(f'SELECT marker FROM "{unrelated_schema}".keep_me')) == "keep"
-            assert (
-                await session.scalar(text(f'SELECT marker FROM "{destination_schema}".history')) == "retained-history"
-            )
-            assert (
-                await session.scalar(text(f'SELECT marker FROM "{destination_schema}".account_state'))
-                == "retained-account"
-            )
-            assert (
-                await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": ownership.schema_name}) is None
-            )
     finally:
         async with engine.begin() as connection:
             for schema_name in owned_schemas:
                 if schema_name:
                     await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+async def _initialize_published_mrf_schema(session, schema_name):
+    """Create only the ordinary importer's generation authority prerequisites."""
+
+    await session.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gin"))
+    await session.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+    await session.execute(
+        text(
+            f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
+            "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
+            "local_generation bigint NOT NULL, origin_lineage_id uuid, "
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+        )
+    )
+    await session.execute(
+        text(
+            f'INSERT INTO "{schema_name}".reference_family_result_generation '
+            "(importer_id, local_lineage_id, local_generation) VALUES ('mrf', :lineage_id, 0)"
+        ),
+        {"lineage_id": uuid4()},
+    )
+    await session.commit()
+
+
+async def _publish_normal_mrf_stage(session, schema_name, import_date, address_key):
+    """Use the production staging and table-swap functions with synthetic rows."""
+
+    await initial._prepare_import_tables(import_date, True)
+    address_stage = initial.make_class(initial.MRFAddress, import_date, schema_override=schema_name)
+    evidence_stage = initial.make_class(initial.MRFAddressEvidence, import_date, schema_override=schema_name)
+    await session.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."{address_stage.__tablename__}" '
+            "(checksum, npi, type, first_line, phone_number, address_key) "
+            "VALUES (1, 1000000001, 'practice', 'Synthetic', '5550100', :address_key)"
+        ),
+        {"address_key": address_key},
+    )
+    await session.execute(
+        text(
+            f'INSERT INTO "{schema_name}"."{evidence_stage.__tablename__}" '
+            "(evidence_checksum, npi, type, checksum, import_id, source_record_id, first_line) "
+            "VALUES (-7, 1000000001, 'practice', 1, 'synthetic-import', 'record-1', 'Synthetic')"
+        )
+    )
+    await initial._create_named_indexes(address_stage, schema_name)
+    await initial._create_named_indexes(evidence_stage, schema_name)
+    await session.commit()
+    await initial._publish_mrf_table_generation(import_date, schema_name)
+
+
+@pytest.mark.asyncio
+async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch):
+    """The archive must accept the importer's real table shape, not a model-only fixture."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    schema_name = f"mrf_published_{uuid4().hex[:10]}"
+    dataset_id = uuid4()
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    address_key = uuid4()
+
+    async def retain_prepared(_session, _prepared):
+        return None
+
+    try:
+        async with sessions() as session:
+            monkeypatch.setattr(initial, "db", _PublisherDatabase(session, schema_name))
+            monkeypatch.setattr(initial, "get_import_schema", lambda *_args: schema_name)
+            await _initialize_published_mrf_schema(session, schema_name)
+            await _publish_normal_mrf_stage(session, schema_name, "20260920", address_key)
+        prepared = await archive.prepare_reference_family_archive_source(
+            sessions,
+            importer_id="mrf",
+            schema_name=schema_name,
+            source_metadata={"release": "synthetic-published-mrf"},
+            dataset_id=dataset_id,
+            on_prepared=retain_prepared,
+        )
+        async with sessions() as session, session.begin():
+            await archive.validate_reference_family_stage(
+                session,
+                ownership=prepared.ownership,
+                manifest=prepared.manifest,
+            )
+            assert (
+                await session.scalar(text(f'SELECT address_key FROM "{prepared.ownership.schema_name}".mrf_address'))
+                == address_key
+            )
+            assert (
+                await session.scalar(text(f'SELECT phone_number FROM "{prepared.ownership.schema_name}".mrf_address'))
+                == "5550100"
+            )
+            await archive.cleanup_reference_family_stage(session, prepared.ownership)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
 
 
