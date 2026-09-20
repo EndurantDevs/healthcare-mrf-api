@@ -2,6 +2,7 @@
 """Native census archive, retained replacement, and generation rollback proof."""
 
 import subprocess
+from dataclasses import replace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -26,6 +27,59 @@ from tests.test_reference_family_result_generation_postgres import (
 
 
 @pytest.mark.asyncio
+async def test_census_source_clone_keeps_captured_dependency_identity():
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live = "census_capture_" + uuid4().hex
+    identity = uuid4()
+    stage = archive.reference_family_stage_schema(identity)
+    dependency_by_dataset = {"geo": "a" * 64}
+    captures = []
+
+    async def dependencies(session):
+        assert session.in_transaction()
+        return dict(dependency_by_dataset)
+
+    async def persist(_session, prepared):
+        assert prepared.manifest.dependencies == {"geo": "a" * 64}
+
+    async def copy(capture):
+        captures.append(capture.manifest.as_dict())
+
+    try:
+        async with sessions.begin() as session:
+            await _create_live_family(session, "geo-census", live)
+            initial = await generation.publish_local_reference_family_generation(
+                session, importer_id="geo-census", schema_name=live
+            )
+        prepared = await archive.prepare_reference_family_archive_source(
+            sessions,
+            importer_id="geo-census",
+            schema_name=live,
+            source_metadata={"release": "synthetic"},
+            dataset_id=identity,
+            on_prepared=persist,
+            dependency_factory=dependencies,
+        )
+        dependency_by_dataset["geo"] = "b" * 64
+        await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=copy)
+        assert captures[0]["dependencies"] == {"geo": "a" * 64}
+        async with sessions.begin() as session:
+            assert (
+                await generation.read_reference_family_result_generation_authority(
+                    session, importer_id="geo-census", schema_name=live
+                )
+                == initial
+            )
+            await archive.cleanup_reference_family_stage(session, prepared.ownership)
+    finally:
+        async with engine.begin() as connection:
+            for schema in (stage, live):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_census_native_archive_atomic_retained_swap_and_rollback(tmp_path):
     engine = create_async_engine(_database_url())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -42,7 +96,7 @@ async def test_census_native_archive_atomic_retained_swap_and_rollback(tmp_path)
                     "(zip_code,total_population,median_household_income) VALUES ('10001',123,45678)"
                 )
             )
-        manifest = await _manifest(sessions, "geo-census", live)
+        manifest = replace(await _manifest(sessions, "geo-census", live), dependencies={"geo": "b" * 64})
         assert [(row.table_name, row.row_count) for row in manifest.tables] == [("geo_zip_census_profile", 1)]
         async with sessions.begin() as session:
             ownership = await archive.precreate_reference_family_restore(
@@ -171,10 +225,7 @@ async def test_census_import_rolls_back_rows_when_generation_publication_fails(m
             models.GeoZipCensusProfile.__table__.to_metadata(metadata, schema=schema)
             await connection.run_sync(metadata.create_all)
             await connection.execute(
-                text(
-                    f'INSERT INTO "{schema}".geo_zip_census_profile '
-                    "(zip_code,total_population) VALUES ('10001',1)"
-                )
+                text(f"INSERT INTO \"{schema}\".geo_zip_census_profile (zip_code,total_population) VALUES ('10001',1)")
             )
         async with sessions.begin() as session:
             initial = await generation.publish_local_reference_family_generation(
@@ -205,10 +256,7 @@ async def test_census_import_rolls_back_rows_when_generation_publication_fails(m
         async with sessions.begin() as session:
             assert (
                 await session.execute(
-                    text(
-                        f'SELECT zip_code,total_population FROM "{schema}".geo_zip_census_profile '
-                        "ORDER BY zip_code"
-                    )
+                    text(f'SELECT zip_code,total_population FROM "{schema}".geo_zip_census_profile ORDER BY zip_code')
                 )
             ).all() == [("10001", 1)]
             assert (
