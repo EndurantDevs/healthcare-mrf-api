@@ -754,3 +754,34 @@ async def test_automatic_and_published_generation_guards(monkeypatch):
             None,
             SimpleNamespace(relation_oids=(11,), serving_generation=None),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer_id", archive._SPECS)
+async def test_restore_defers_only_separate_model_indexes(monkeypatch, importer_id):
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    ownership = SimpleNamespace(importer_id=importer_id, schema_name="synthetic_stage")
+    spec = archive.reference_family_spec(importer_id)
+    await archive._create_model_family(session, spec, ownership.schema_name)
+    complete_statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    session.execute.reset_mock()
+    monkeypatch.setattr(archive, "capture_reference_family_stage_ownership", AsyncMock(return_value=ownership))
+    monkeypatch.setattr(archive, "reference_family_stage_schema", lambda _identity: ownership.schema_name)
+    monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
+    await archive.precreate_reference_family_restore(session, importer_id=importer_id, dataset_id=UUID(int=1))
+    table_statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert not any(statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX")) for statement in table_statements)
+    assert any("PRIMARY KEY" in statement for statement in table_statements)
+    await archive.complete_reference_family_restore(session, ownership)
+    assert [str(call.args[0]) for call in session.execute.await_args_list] == complete_statements
+
+
+@pytest.mark.asyncio
+async def test_index_completion_rejects_changed_ownership_before_ddl(monkeypatch):
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    monkeypatch.setattr(
+        archive, "verify_reference_family_stage_ownership", AsyncMock(side_effect=RuntimeError("changed"))
+    )
+    with pytest.raises(RuntimeError, match="changed"):
+        await archive.complete_reference_family_restore(session, object())
+    session.execute.assert_not_awaited()

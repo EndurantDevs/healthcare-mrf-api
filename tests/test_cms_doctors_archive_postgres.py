@@ -142,6 +142,7 @@ async def _roundtrip(sessions, prepared, url, path):
         str(path),
     )
     async with sessions() as session, session.begin():
+        await archive.complete_reference_family_restore(session, restored)
         await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest.as_dict())
         assert (
             await session.scalar(text(f'SELECT city FROM "{restored.schema_name}".doctor_clinician_address'))

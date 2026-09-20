@@ -203,6 +203,7 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
                 dataset_id=dataset_id,
             )
             await _copy_live_to_stage(session, "places-zcta", live_schema, stage_schema)
+            await archive.complete_reference_family_restore(session, owner)
         async with sessions() as session, session.begin():
             incumbent = await archive.capture_reference_family_incumbent(
                 session,
@@ -255,6 +256,7 @@ async def _validated_places_candidate(
             session, importer_id="places-zcta", dataset_id=dataset_id
         )
         await _copy_live_to_stage(session, "places-zcta", live_schema, ownership.schema_name)
+        await archive.complete_reference_family_restore(session, ownership)
         sealed_owner_oid = await session.scalar(text("SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user"))
     async with sessions() as session, session.begin():
         incumbent = await archive.capture_reference_family_incumbent(
@@ -836,6 +838,7 @@ async def test_native_multi_table_activation_is_atomic_and_preserves_indexes():
                 dataset_id=dataset_id,
             )
             await _copy_live_to_stage(session, "medicare-enrollment", live_schema, stage_schema)
+            await archive.complete_reference_family_restore(session, owner)
         async with sessions() as session, session.begin():
             incumbent = await archive.capture_reference_family_incumbent(
                 session,
