@@ -92,6 +92,8 @@ def database_boundary(monkeypatch):
         database_mocks.create_table,
     )
     monkeypatch.setattr(geo_import.db, "status", database_mocks.status)
+    database_mocks.generation = AsyncMock()
+    monkeypatch.setattr(geo_import, "publish_local_reference_family_generation", database_mocks.generation)
     monkeypatch.setattr(
         geo_import.db,
         "transaction",
@@ -250,6 +252,7 @@ async def test_load_exposes_write_failure_to_one_atomic_transaction(
     assert database_boundary.transaction.exit_count == 1
     assert database_boundary.transaction.exit_exception_type is RuntimeError
     assert not database_boundary.transaction.active
+    database_boundary.generation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -284,6 +287,28 @@ async def test_load_rolls_back_when_source_row_count_changes_after_preflight(
     assert (
         database_boundary.transaction.exit_exception_type
         is geo_import.GeoSourceValidationError
+    )
+    database_boundary.generation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_keeps_geo_publication_in_one_transaction(tmp_path, monkeypatch, database_boundary):
+    csv_path = tmp_path / "geo.csv"
+    _write_geo_csv(csv_path, [_csv_fields_by_name()])
+
+    async def capture_flush(pending_geo_rows, *, target_table):
+        assert database_boundary.transaction.active
+        pending_geo_rows.clear()
+
+    monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
+    database_boundary.generation.side_effect = RuntimeError("generation unavailable")
+
+    with pytest.raises(RuntimeError, match="generation unavailable"):
+        await geo_import.load_geo_lookup(csv_path)
+
+    assert database_boundary.transaction.exit_exception_type is RuntimeError
+    database_boundary.generation.assert_awaited_once_with(
+        geo_import.db, importer_id="geo", schema_name=geo_import.GeoZipLookup.__table__.schema
     )
 
 

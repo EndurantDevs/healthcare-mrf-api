@@ -14,6 +14,7 @@ from sqlalchemy import Table
 
 from db.models import GeoZipLookup, db
 from process.ext.utils import ensure_database
+from process.reference_family_result_generation import publish_local_reference_family_generation
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,11 @@ async def load_geo_lookup(
         _validate_stable_source_row_count(
             processed,
             expected_geo_row_count,
+        )
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="geo",
+            schema_name=target_table.schema,
         )
 
     logger.info("Loaded %s geo zip rows from %s", processed, csv_path)

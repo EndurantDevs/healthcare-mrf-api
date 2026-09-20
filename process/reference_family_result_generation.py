@@ -39,6 +39,7 @@ RELATION_NAMES_BY_IMPORTER = {
         "plan_benefits",
     ),
     "places-zcta": ("pricing_places_zcta",),
+    "geo": ("geo_zip_lookup",),
     "lodes": ("lodes_workplace_aggregate",),
     "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
     "tiger": ("zip_state", "zcta5"),

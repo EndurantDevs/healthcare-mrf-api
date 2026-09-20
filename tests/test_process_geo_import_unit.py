@@ -74,10 +74,12 @@ def database_mocks(monkeypatch):
     ensure_database_mock = AsyncMock()
     create_table_mock = AsyncMock()
     status_mock = AsyncMock()
+    generation_mock = AsyncMock()
     transaction_spy = _TransactionSpy()
     monkeypatch.setattr(geo_import, "ensure_database", ensure_database_mock)
     monkeypatch.setattr(geo_import.db, "create_table", create_table_mock)
     monkeypatch.setattr(geo_import.db, "status", status_mock)
+    monkeypatch.setattr(geo_import, "publish_local_reference_family_generation", generation_mock)
     monkeypatch.setattr(
         geo_import.db,
         "transaction",
@@ -87,6 +89,7 @@ def database_mocks(monkeypatch):
         ensure_database=ensure_database_mock,
         create_table=create_table_mock,
         status=status_mock,
+        generation=generation_mock,
         transaction=transaction_spy,
     )
 
@@ -102,12 +105,7 @@ class _InsertStatementSpy:
     def __init__(self, table, *, should_fail: bool = False):
         self.table = table
         self.should_fail = should_fail
-        self.excluded = SimpleNamespace(
-            **{
-                column.name: f"excluded_{column.name}"
-                for column in table.c
-            }
-        )
+        self.excluded = SimpleNamespace(**{column.name: f"excluded_{column.name}" for column in table.c})
         self.submitted_geo_rows = None
         self.index_elements = None
         self.updates_by_column = None
@@ -205,13 +203,9 @@ async def test_flush_upserts_every_mutable_column_and_clears_buffer(monkeypatch)
     await geo_import._flush_rows(pending_geo_rows)
 
     expected_updates_by_column = {
-        column.name: f"excluded_{column.name}"
-        for column in table.c
-        if not column.primary_key
+        column.name: f"excluded_{column.name}" for column in table.c if not column.primary_key
     }
-    assert insert_spy.submitted_geo_rows == [
-        {"zip_code": "60654", "city": "Chicago"}
-    ]
+    assert insert_spy.submitted_geo_rows == [{"zip_code": "60654", "city": "Chicago"}]
     assert insert_spy.index_elements == geo_import.GeoZipLookup.__my_index_elements__
     assert insert_spy.updates_by_column == expected_updates_by_column
     assert "zip_code" not in insert_spy.updates_by_column
@@ -238,6 +232,8 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
     monkeypatch,
     database_mocks,
 ):
+    """Normalize one valid row while skipping records without required keys."""
+
     csv_path = tmp_path / "geo.csv"
     _write_geo_csv(
         csv_path,
@@ -267,15 +263,7 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
 
     await geo_import.load_geo_lookup(csv_path)
 
-    database_mocks.ensure_database.assert_awaited_once_with(False)
-    database_mocks.create_table.assert_awaited_once_with(
-        geo_import.GeoZipLookup.__table__,
-        checkfirst=True,
-    )
-    database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE "
-        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
-    )
+    _assert_load_database_calls(database_mocks)
     assert captured_geo_rows == [
         {
             "zip_code": "00042",
@@ -293,6 +281,22 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
     ]
 
 
+def _assert_load_database_calls(database_mocks):
+    database_mocks.ensure_database.assert_awaited_once_with(False)
+    database_mocks.create_table.assert_awaited_once_with(
+        geo_import.GeoZipLookup.__table__,
+        checkfirst=True,
+    )
+    database_mocks.status.assert_awaited_once_with(
+        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
+    )
+    database_mocks.generation.assert_awaited_once_with(
+        geo_import.db,
+        importer_id="geo",
+        schema_name=geo_import.GeoZipLookup.__table__.schema,
+    )
+
+
 @pytest.mark.asyncio
 async def test_load_flushes_two_thousand_rows_then_remainder(
     tmp_path,
@@ -300,10 +304,7 @@ async def test_load_flushes_two_thousand_rows_then_remainder(
     database_mocks,
 ):
     csv_path = tmp_path / "large-geo.csv"
-    source_rows = [
-        _csv_fields_by_name(**{"Zip Code": str(zip_number)})
-        for zip_number in range(1, 2002)
-    ]
+    source_rows = [_csv_fields_by_name(**{"Zip Code": str(zip_number)}) for zip_number in range(1, 2002)]
     _write_geo_csv(csv_path, source_rows)
     batch_sizes = []
 
@@ -319,8 +320,7 @@ async def test_load_flushes_two_thousand_rows_then_remainder(
 
     assert batch_sizes == [geo_import.IMPORT_BATCH_SIZE, 1]
     database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE "
-        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
+        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
     )
 
 
@@ -346,8 +346,7 @@ async def test_load_uses_default_source_and_model_schema(
 
     assert [geo_values["zip_code"] for geo_values in flushed_geo_rows] == ["60654"]
     database_mocks.status.assert_awaited_once_with(
-        f"TRUNCATE TABLE "
-        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
+        f"TRUNCATE TABLE {geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
     )
 
 
