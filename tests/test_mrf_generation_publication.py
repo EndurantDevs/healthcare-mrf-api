@@ -52,12 +52,12 @@ def _stage_model(model_type, import_date, *, schema_override):
 @pytest.mark.asyncio
 async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transaction(monkeypatch):
     database = _Database()
-    observed_by_field = {}
+    observed_scopes = []
 
     async def generation_writer(session, *, importer_id, schema_name):
         assert session is database
         assert database.in_transaction
-        observed_by_field.update(importer_id=importer_id, schema_name=schema_name)
+        observed_scopes.append((importer_id, schema_name))
 
     monkeypatch.setattr(initial, "db", database)
     monkeypatch.setattr(initial, "make_class", _stage_model)
@@ -66,7 +66,7 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
     assert initial._MRF_PUBLICATION_MODELS == reference_family_spec("mrf").model_types
     await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
 
-    assert observed_by_field == {"importer_id": "mrf", "schema_name": "mrf_test"}
+    assert observed_scopes == [("mrf", "mrf_test"), ("mrf-address", "mrf_test")]
     assert database.exit_exception is None
     for table_name in reference_family_spec("mrf").table_names:
         assert f"ALTER TABLE IF EXISTS mrf_test.{table_name}_stage RENAME TO {table_name};" in database.statements
@@ -75,10 +75,13 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
 @pytest.mark.asyncio
 async def test_mrf_finalizer_generation_failure_rolls_back_rotation(monkeypatch):
     database = _Database()
+    observed_importers = []
 
-    async def generation_writer(_session, **_scope):
+    async def generation_writer(_session, *, importer_id, **_scope):
         assert database.in_transaction
-        raise RuntimeError("generation write failed")
+        observed_importers.append(importer_id)
+        if importer_id == "mrf-address":
+            raise RuntimeError("generation write failed")
 
     monkeypatch.setattr(initial, "db", database)
     monkeypatch.setattr(initial, "make_class", _stage_model)
@@ -87,4 +90,5 @@ async def test_mrf_finalizer_generation_failure_rolls_back_rotation(monkeypatch)
     with pytest.raises(RuntimeError, match="generation write failed"):
         await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
 
+    assert observed_importers == ["mrf", "mrf-address"]
     assert database.exit_exception is RuntimeError

@@ -238,6 +238,7 @@ _SPECS = {
                 models.MRFAddressEvidence,
             ),
         ),
+        ReferenceFamilySpec("mrf-address", (models.MRFAddress, models.MRFAddressEvidence)),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
@@ -252,6 +253,13 @@ _OWNED_SEQUENCES = {
     "tiger": (("zcta5_gid_seq", "zcta5", "gid"),),
     "mrf": (
         ("issuer_issuer_id_seq", "issuer", "issuer_id"),
+        (
+            "mrf_address_evidence_evidence_checksum_seq",
+            "mrf_address_evidence",
+            "evidence_checksum",
+        ),
+    ),
+    "mrf-address": (
         (
             "mrf_address_evidence_evidence_checksum_seq",
             "mrf_address_evidence",
@@ -1187,7 +1195,11 @@ async def _create_model_family(
                 await session.execute(CreateSequence(sequence))
                 table.c[column_name].server_default = DefaultClause(sequence.next_value())
                 explicit_sequences.append((sequence_name, column_name))
-        if spec.importer_id == "mrf" and "address_key" in table.c and list(table.c.keys())[-1] != "address_key":
+        if (
+            spec.importer_id in {"mrf", "mrf-address"}
+            and "address_key" in table.c
+            and list(table.c.keys())[-1] != "address_key"
+        ):
             # Ordinary MRF stages move this column before their table swap.
             address_key_column = table.c.address_key
             table._columns.remove(address_key_column)
@@ -1204,7 +1216,7 @@ async def _create_model_family(
         indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
             getattr(model_type, "__my_additional_indexes__", ()) or ()
         )
-        if spec.importer_id == "mrf":
+        if spec.importer_id in {"mrf", "mrf-address"}:
             # The importer only creates copied additional indexes for these stages.
             indexes = (
                 tuple(getattr(model_type, "__my_additional_indexes__", ()) or ())
