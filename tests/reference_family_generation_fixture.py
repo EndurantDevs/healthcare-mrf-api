@@ -4,7 +4,6 @@
 import importlib.util
 from pathlib import Path
 
-
 _MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914130000_mrf_result_generation.py"
 _SPEC = importlib.util.spec_from_file_location("reference_family_generation_fixture_migration", _MIGRATION_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
