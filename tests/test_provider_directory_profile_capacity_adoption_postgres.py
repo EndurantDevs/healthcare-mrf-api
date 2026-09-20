@@ -20,9 +20,6 @@ from process import provider_directory_profile as profile
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_attestation as lease
 from process import provider_directory_profile_runtime_observation as runtime
-from tests.provider_directory_profile_capacity_runtime_test_support import (
-    PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
-)
 from tests.provider_directory_profile_delta_schema_fixtures import (
     _create_delta_contract_tables,
 )
@@ -263,7 +260,7 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     assert observation == {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         "healthcare_source_commit": "d" * 40,
-        "profile_migration_revision": PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
+        "profile_migration_revision": next(iter(expected_heads)),
         "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
         "profile_strategy_version": profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
         "postgres_server_version_num": observation["postgres_server_version_num"],

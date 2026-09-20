@@ -414,6 +414,7 @@ def _patch_shutdown_dependencies(monkeypatch, module, counts):
     monkeypatch.setattr(module.db, "scalar", AsyncMock(side_effect=counts))
     monkeypatch.setattr(module.db, "transaction", _transaction)
     monkeypatch.setattr(module, "_publish_stage_table", AsyncMock())
+    monkeypatch.setattr(module, "publish_local_reference_family_generation", AsyncMock())
     monkeypatch.setattr(module, "mark_control_run", AsyncMock())
     monkeypatch.setattr(module, "print_time_info", lambda _started_at: None)
 
@@ -437,6 +438,7 @@ async def test_shutdown_skips_empty_and_publishes_test_run(monkeypatch):
     await module.shutdown(shutdown_context_by_name)
 
     assert module._publish_stage_table.await_count == 2
+    module.publish_local_reference_family_generation.assert_awaited_once()
     module.mark_control_run.assert_awaited_once()
     assert module.mark_control_run.await_args.kwargs["metrics"]["zip_rows"] == 3
 
@@ -475,6 +477,7 @@ async def test_shutdown_publishes_complete_production_run(monkeypatch):
     await module.shutdown(shutdown_context_by_name)
 
     assert module._publish_stage_table.await_count == 2
+    module.publish_local_reference_family_generation.assert_awaited_once()
     assert module.mark_control_run.await_args.args[0] == "fallback-run"
 
 
