@@ -239,6 +239,7 @@ _SPECS = {
         ),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
+        ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
         ReferenceFamilySpec(
             "medicare-enrollment",
             (models.MedicareEnrollmentCountyStats, models.MedicareEnrollmentStats),
