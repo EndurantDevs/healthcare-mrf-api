@@ -76,6 +76,7 @@ def _install_mrf_shutdown_finalizer_mocks(monkeypatch, operations, mark_run, cre
         ),
     )
     monkeypatch.setattr(process_initial, "_create_named_indexes", create_indexes)
+    monkeypatch.setattr(process_initial, "publish_local_reference_family_generation", AsyncMock())
     monkeypatch.setattr(process_initial, "source_enabled", lambda _source: False)
     monkeypatch.setattr(
         process_initial,
@@ -369,6 +370,7 @@ async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(mon
     )
 
     assert ("summary", False) in operations
+    process_initial.publish_local_reference_family_generation.assert_awaited_once()
     index_operations = [operation for operation in operations if operation[0] == "indexes"]
     assert index_operations == [
         ("indexes", "mrf_address_20260829", {"address_key"}),
