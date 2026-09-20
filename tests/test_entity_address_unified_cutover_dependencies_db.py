@@ -9,13 +9,14 @@ import pytest
 from tests.test_entity_address_unified_publication_db import (
     _StageTable,
     _prepare_live_and_stage,
+    _stub_result_generation,
     _temporary_schema,
     entity_address_unified,
 )
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_dependency_preflight_blocks_live_and_old_views(monkeypatch):
+async def test_real_postgres_dependency_preflight_blocks_live_and_old_views(monkeypatch, _stub_result_generation):
     """Reject cross-schema views before cutover, then allow explicit cleanup."""
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
@@ -78,7 +79,7 @@ async def test_real_postgres_dependency_preflight_blocks_live_and_old_views(monk
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_cutover_rechecks_dependencies_under_lock(monkeypatch):
+async def test_real_postgres_cutover_rechecks_dependencies_under_lock(monkeypatch, _stub_result_generation):
     """Catch a view created after the early materialization preflight."""
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
