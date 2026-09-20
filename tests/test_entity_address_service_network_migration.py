@@ -122,7 +122,14 @@ def test_migration_rejects_wrong_valid_index_shape(monkeypatch):
 def test_downgrade_drops_only_the_service_network_index(monkeypatch):
     operations = _Operations()
     monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(
+        _Context,
+        "autocommit_block",
+        lambda _self: pytest.fail("downgrade must stay transactional"),
+    )
 
     migration.downgrade()
 
-    assert operations.executed == [migration._drop_index_sql("mrf")]
+    assert operations.executed == [
+        'DROP INDEX IF EXISTS "mrf"."entity_address_unified_idx_service_plans_network_array"'
+    ]

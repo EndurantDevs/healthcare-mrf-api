@@ -148,8 +148,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop only the service-location plan-network index."""
+    """Keep index removal in the transaction of a multi-revision downgrade."""
 
     schema = _schema()
-    with op.get_context().autocommit_block():
-        op.execute(_drop_index_sql(schema))
+    op.execute(f"DROP INDEX IF EXISTS {_qt(schema, INDEX_NAME)}")
