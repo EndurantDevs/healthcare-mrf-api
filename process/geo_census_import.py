@@ -439,6 +439,8 @@ async def _ensure_profile_columns(schema: str) -> None:
 
 async def load_geo_census_lookup(test_mode: bool = False) -> int:
     """Build and persist the ZIP-level Census lookup."""
+    from process.reference_family_result_generation import publish_local_reference_family_generation
+
     profiles = await _collect_profile_map(test_mode=test_mode)
     await ensure_database(test_mode)
     await db.create_table(GeoZipCensusProfile.__table__, checkfirst=True)
@@ -455,6 +457,7 @@ async def load_geo_census_lookup(test_mode: bool = False) -> int:
             if len(buffered_rows) >= IMPORT_BATCH_SIZE:
                 await _flush_rows(buffered_rows)
         await _flush_rows(buffered_rows)
+        await publish_local_reference_family_generation(db, importer_id="geo-census", schema_name=schema)
 
     logger.info("Loaded Census ZIP profile rows=%s", len(profiles))
     return len(profiles)

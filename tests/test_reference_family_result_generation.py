@@ -46,6 +46,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
         ),
         "places-zcta": ("pricing_places_zcta",),
         "geo": ("geo_zip_lookup",),
+        "geo-census": ("geo_zip_census_profile",),
         "lodes": ("lodes_workplace_aggregate",),
         "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
         "tiger": ("zip_state", "zcta5"),
@@ -86,6 +87,7 @@ def test_generation_authority_accepts_complete_family_state():
         ("unknown", [10]),
         ("medicare-enrollment", [10]),
         ("medicare-enrollment", [10, 10]),
+        ("geo-census", [10, 11]),
         ("places-zcta", [0]),
     ],
 )
