@@ -13,6 +13,8 @@ from db.connection import db
 from db.models import (Plan, PlanAttributes, PlanBenefits, PlanPrices,
                        PlanSearchSummary)
 from process.ext.utils import ensure_database
+from process.mrf_publication_receipt import capture_summary_inputs, complete_publication, qualified
+from process.mrf_address_publication import lock_publication_family
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +288,7 @@ async def _ensure_summary_columns() -> None:
         await db.status(stmt)
 
 
-async def rebuild_plan_search_summary(test_mode: bool = False) -> int:
+async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=None) -> int:
     """
     Materialize plan_search_summary with pre-calculated filters so /plan/search can run without large joins.
     """
@@ -299,15 +301,14 @@ async def rebuild_plan_search_summary(test_mode: bool = False) -> int:
     benefit_subq = _build_benefit_summary_subquery()
     price_subq = _build_price_summary_subquery()
     schema = summary_table.schema or "public"
-    base_name = summary_table.name
-    temp_name = f"{base_name}_refresh"
+    temp_name = f"{summary_table.name}_refresh"
     temp_metadata = MetaData()
     temp_table = summary_table.tometadata(temp_metadata, name=temp_name)
     temp_table.schema = schema
 
     qualified_temp = f'"{schema}"."{temp_name}"'
-    qualified_base = f'"{schema}"."{base_name}"'
-    qualified_backup = f'"{schema}"."{base_name}_old"'
+    qualified_base = f'"{schema}"."{summary_table.name}"'
+    qualified_backup = f'"{schema}"."{summary_table.name}_old"'
 
     async with db.session() as session:
         await session.execute(text(f'DROP TABLE IF EXISTS {qualified_temp};'))
@@ -394,18 +395,25 @@ async def rebuild_plan_search_summary(test_mode: bool = False) -> int:
 
     insert_stmt = pg_insert(temp_table).from_select(insert_columns, data_stmt)
 
-    async with db.session() as session:
+    async with db.transaction() as session:
+        if publication:
+            await lock_publication_family(session, schema, qualified)
+        summary_inputs = await capture_summary_inputs(session, schema) if publication else None
         await session.execute(insert_stmt)
         count_result = await session.execute(select(func.count()).select_from(temp_table))
         rowcount = count_result.scalar() or 0
 
-    async with db.session() as session:
         await session.execute(text(f'DROP TABLE IF EXISTS {qualified_backup};'))
-        await session.execute(text(f'ALTER TABLE IF EXISTS {qualified_base} RENAME TO "{base_name}_old";'))
-        await session.execute(text(f'ALTER TABLE {qualified_temp} RENAME TO "{base_name}"'))
+        await session.execute(text(f'ALTER TABLE IF EXISTS {qualified_base} RENAME TO "{summary_table.name}_old";'))
+        await session.execute(text(f'ALTER TABLE {qualified_temp} RENAME TO "{summary_table.name}"'))
         await session.execute(text(f'DROP TABLE IF EXISTS {qualified_backup};'))
 
-    await _ensure_summary_indexes()
+        await _ensure_summary_indexes()
+        if publication:
+            attempt, generation, address_resolution_performed = publication
+            await complete_publication(
+                session, schema, attempt, generation, summary_inputs, address_resolution_performed,
+            )
 
     logger.info("Rebuilt plan_search_summary with %s rows", rowcount)
     return int(rowcount)

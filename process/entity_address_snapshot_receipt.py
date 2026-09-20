@@ -329,6 +329,7 @@ async def _projected_row_identity(
     *,
     row_json_sql: str,
     parameters: Mapping[str, Any] | None = None,
+    where_sql: str = "",
 ) -> tuple[int, str]:
     """Fold sorted projected-row hashes without materializing source rows."""
 
@@ -338,6 +339,7 @@ async def _projected_row_identity(
             WITH row_hashes AS MATERIALIZED (
                 SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(({row_json_sql})::text, 'UTF8')), 'hex') AS row_sha256
                   FROM {_quoted(schema_name)}.{_quoted(table_name)} AS row_value
+                 {where_sql}
             ), ordered AS (
                 SELECT row_sha256, pg_catalog.row_number() OVER (ORDER BY row_sha256 COLLATE \"C\") - 1 AS ordinal
                   FROM row_hashes
