@@ -8,10 +8,12 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -698,3 +700,440 @@ def test_partition_manifests_at_definition_and_connector_boundaries_seal(partiti
     assert manifest.canonical_manifest.count('"ordinal"') == partition_count
     assert len(manifest.canonical_manifest.encode("utf-8")) <= snowflake.MAX_MANIFEST_CANONICAL_BYTES
     assert len(manifest.manifest_sha256) == 64
+
+
+@pytest.mark.parametrize(
+    ("call", "error_type"),
+    (
+        (lambda: snowflake._field_id("Not_Snake", "field"), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._sha256("not-a-digest", "digest"), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._printable_text("", "value", maximum_bytes=8), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._printable_text("\ud800", "value", maximum_bytes=8), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._printable_text("too long", "value", maximum_bytes=2), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._printable_text("line\nbreak", "value", maximum_bytes=32), snowflake.SnowflakeConnectorError),
+        (lambda: snowflake._credential_text("", "secret", maximum_bytes=8), snowflake.SnowflakeCredentialError),
+        (lambda: snowflake._credential_text("env:SECRET", "secret", maximum_bytes=32), snowflake.SnowflakeCredentialError),
+        (lambda: snowflake._credential_text("\ud800", "secret", maximum_bytes=8), snowflake.SnowflakeCredentialError),
+        (lambda: snowflake._credential_text("too long", "secret", maximum_bytes=2), snowflake.SnowflakeCredentialError),
+        (lambda: snowflake._credential_principal("", "principal"), snowflake.SnowflakeCredentialError),
+        (lambda: snowflake._credential_principal("two words", "principal"), snowflake.SnowflakeCredentialError),
+    ),
+)
+def test_scalar_boundaries_fail_closed(call, error_type):
+    with pytest.raises(error_type):
+        call()
+
+
+def test_manifest_and_capture_policy_boundaries_fail_closed(monkeypatch):
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="canonically serialized"):
+        snowflake._manifest_identity_sha256({"unsupported": object()})
+    monkeypatch.setattr(snowflake, "MAX_MANIFEST_CANONICAL_BYTES", 1)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="byte limit"):
+        snowflake._manifest_identity_sha256({"value": "bounded"})
+
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="declared capture-limit type"):
+        snowflake._validated_capture_limits(object())
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="result-byte bounds"):
+        snowflake._validated_capture_limits(
+            replace(CaptureLimits(), maximum_compressed_bytes=snowflake.MAX_RESULT_BYTES + 1)
+        )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="total-byte limit"):
+        snowflake._remaining_partition_limits(
+            _capture_limits(compressed_bytes=4, decoded_bytes=4),
+            compressed_bytes=4,
+            decoded_bytes=0,
+        )
+
+
+def test_approved_relation_and_credential_value_contracts_reject_invalid_shapes():
+    first = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="provider_npi")
+    duplicate_field = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="other_npi")
+    duplicate_column = snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="provider_npi")
+    relation = snowflake.SnowflakeRelation(database="raw_data", schema="public", name="providers")
+
+    invalid_relations = (
+        (object(), (first,)),
+        (relation, ()),
+        (relation, (object(),)),
+        (relation, (first, duplicate_field)),
+        (relation, (first, duplicate_column)),
+    )
+    for invalid_relation, columns in invalid_relations:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            snowflake.SnowflakeApprovedRelation(relation=invalid_relation, columns=columns)
+
+    invalid_credentials = (
+        {"private_key_pem": b""},
+        {"private_key_pem": b"not-pem"},
+        {"private_key_pem": b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----"},
+        {"private_key_pem": b"-----BEGIN PRIVATE KEY-----\nx\n-----END CERTIFICATE-----"},
+        {"private_key_pem": _PRIVATE_KEY_PEM.encode("ascii"), "private_key_passphrase": b""},
+    )
+    for changes in invalid_credentials:
+        values = {
+            "account": "synthetic-account",
+            "user": "synthetic-user",
+            "private_key_pem": _PRIVATE_KEY_PEM.encode("ascii"),
+        }
+        values.update(changes)
+        with pytest.raises(snowflake.SnowflakeCredentialError):
+            snowflake.SnowflakeKeyPairCredentials(**values)
+
+
+def test_fixed_provider_rejects_malformed_documents_and_descriptor_failures(tmp_path, monkeypatch):
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="absolute pathlib path"):
+        snowflake.FixedLocalKeyPairCredentialProvider(Path("relative"))
+
+    directory = _credential_directory(tmp_path)
+    credential_file = directory / snowflake.FIXED_KEY_PAIR_CREDENTIAL_FILENAME
+    for raw in (b"\xff", b"[]", b'{"account":"one","account":"two"}'):
+        if credential_file.exists():
+            credential_file.chmod(0o600)
+        credential_file.write_bytes(raw)
+        credential_file.chmod(0o400)
+        with snowflake.FixedLocalKeyPairCredentialProvider(directory) as provider:
+            with pytest.raises(snowflake.SnowflakeCredentialError):
+                provider.load_key_pair()
+
+    provider = object.__new__(snowflake.FixedLocalKeyPairCredentialProvider)
+    provider._closed = False
+    provider._credential_directory_descriptor = 123
+    provider._credential_directory_identity = snowflake._CredentialDirectoryIdentity(device=1, inode=1)
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "fstat", lambda _descriptor: (_ for _ in ()).throw(OSError("gone")))
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="unavailable"):
+            provider._pinned_directory_descriptor()
+    metadata = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=os.geteuid(), st_dev=2, st_ino=2)
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "fstat", lambda _descriptor: metadata)
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="identity changed"):
+            provider._pinned_directory_descriptor()
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            snowflake.FixedLocalKeyPairCredentialProvider,
+            "close",
+            lambda _provider: (_ for _ in ()).throw(RuntimeError("close")),
+        )
+        assert provider.__exit__(RuntimeError, RuntimeError("primary"), None) is None
+
+    released = object.__new__(snowflake.FixedLocalKeyPairCredentialProvider)
+    released._closed = False
+    released._credential_directory_descriptor = None
+    released.close()
+    assert released._closed is True
+    failing_close = object.__new__(snowflake.FixedLocalKeyPairCredentialProvider)
+    failing_close._closed = False
+    failing_close._credential_directory_descriptor = 123
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "close", lambda _descriptor: (_ for _ in ()).throw(OSError("close")))
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="cannot be closed"):
+            failing_close.close()
+
+
+def test_fixed_credential_metadata_and_cleanup_guards(monkeypatch):
+    current_user = os.geteuid()
+    metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=current_user, st_size=1)
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="real directory"):
+        snowflake._validate_fixed_credential_directory(metadata)
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="owned"):
+        snowflake._validate_fixed_credential_directory(
+            SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=current_user + 1)
+        )
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="untrusted replacement"):
+        snowflake._validate_fixed_credential_directory(
+            SimpleNamespace(st_mode=stat.S_IFDIR | 0o722, st_uid=current_user)
+        )
+    with pytest.raises(snowflake.SnowflakeCredentialError, match="owned"):
+        snowflake._validate_fixed_credential_file(
+            SimpleNamespace(st_mode=stat.S_IFREG | 0o400, st_uid=current_user + 1, st_size=1)
+        )
+
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "geteuid", None)
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="owner identity support"):
+            snowflake._effective_user_id()
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "close", lambda _descriptor: (_ for _ in ()).throw(RuntimeError("close")))
+        assert snowflake._close_descriptor_after_failure(1) is None
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "close", lambda _descriptor: (_ for _ in ()).throw(OSError("close")))
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="cannot be closed"):
+            snowflake._close_descriptor_after_success(1)
+    with monkeypatch.context() as context:
+        context.setattr(snowflake.os, "open", lambda *_args, **_kwargs: 1)
+        context.setattr(snowflake.os, "supports_dir_fd", set())
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="directory support"):
+            snowflake._open_fixed_credential_directory(Path("/synthetic"))
+        with pytest.raises(snowflake.SnowflakeCredentialError, match="file-opening support"):
+            snowflake._read_fixed_credential_file(1)
+
+    snowflake.SnowflakeKeyPairCredentials(
+        account="synthetic-account",
+        user="synthetic-user",
+        private_key_pem=_PRIVATE_KEY_PEM.encode("ascii"),
+    )
+
+
+def test_read_statement_result_and_manifest_types_fail_closed():
+    relation = _approved_relation().relation
+    column = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="provider_npi")
+    duplicate = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="other_npi")
+    digest = _manifest_digest("digest")
+
+    invalid_requests = (
+        {"relation": object(), "selected_columns": (column,)},
+        {"relation": relation, "selected_columns": ()},
+        {"relation": relation, "selected_columns": (object(),)},
+        {"relation": relation, "selected_columns": (column, duplicate)},
+    )
+    for changes in invalid_requests:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            snowflake.SnowflakeReadRequest(
+                relation=changes["relation"],
+                selected_columns=changes["selected_columns"],
+                definition_sha256=digest,
+                schema_sha256=digest,
+            )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="declared request type"):
+        snowflake.SnowflakeReadStatement(request=object())
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="boolean"):
+        snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=1)
+    with pytest.raises(NotImplementedError):
+        snowflake.SnowflakePartitionSourceSet.__iter__(object())
+    with pytest.raises(NotImplementedError):
+        snowflake.SnowflakePartitionSourceSet.close(object())
+
+    invalid_partitions = ((0, 1), (1, 0))
+    for ordinal, content_bytes in invalid_partitions:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            snowflake.SnowflakeResultPartitionManifest(
+                ordinal=ordinal,
+                content_bytes=content_bytes,
+                content_sha256=digest,
+            )
+
+    manifest_values = {
+        "request_sha256": digest,
+        "statement_sha256": digest,
+        "source_snapshot_token": "release-1",
+        "schema_fingerprint": digest,
+        "content_sha256": digest,
+    }
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="partition limit"):
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=[], **manifest_values)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="invalid entry"):
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=(object(),), **manifest_values)
+    second = snowflake.SnowflakeResultPartitionManifest(ordinal=2, content_bytes=1, content_sha256=digest)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="contiguous"):
+        snowflake.SnowflakeAcquisitionManifest(result_partitions=(second,), **manifest_values)
+
+
+def test_adapter_result_ownership_contract_rejects_invalid_lifecycle_calls():
+    column = snowflake.SnowflakeResultColumn(field_id="npi", source_type="NUMBER", nullable=False)
+    sources = _OwnedPartitionSources((_ProbeReader((b"PAR1",)),))
+    invalid_results = (
+        {"schema": [], "partition_sources": sources},
+        {"schema": (object(),), "partition_sources": sources},
+        {"schema": (column, column), "partition_sources": sources},
+        {"schema": (column,), "partition_sources": object()},
+        {"schema": (column,), "partition_sources": sources, "on_close": object()},
+    )
+    for changes in invalid_results:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            snowflake.SnowflakeParquetResult(source_snapshot_token="release-1", **changes)
+
+    result = snowflake.SnowflakeParquetResult(
+        source_snapshot_token="release-1",
+        schema=(column,),
+        partition_sources=_OwnedPartitionSources((_ProbeReader((b"PAR1",)),)),
+    )
+    iterator = result.consume_partition_sources()
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="already consumed"):
+        result.consume_partition_sources()
+    reader = next(iterator)
+    result.claim_partition_source(reader)
+    result.close_partition_source(reader)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="not claimed"):
+        result.close_partition_source(_ProbeReader((b"PAR2",)))
+    result.close()
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="closed"):
+        result.consume_partition_sources()
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="closed"):
+        result.claim_partition_source(_ProbeReader((b"PAR2",)))
+
+    class IteratorWithoutClose:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            return None
+
+    class BrokenIterable:
+        def __iter__(self):
+            raise TypeError("not iterable")
+
+        def close(self):
+            return None
+
+    no_iterator_close = IteratorWithoutClose()
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="iterator must own"):
+        snowflake.SnowflakeParquetResult(
+            source_snapshot_token="release-1",
+            schema=(column,),
+            partition_sources=no_iterator_close,
+        ).consume_partition_sources()
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="must be iterable"):
+        snowflake.SnowflakeParquetResult(
+            source_snapshot_token="release-1",
+            schema=(column,),
+            partition_sources=BrokenIterable(),
+        ).consume_partition_sources()
+
+    result = snowflake.SnowflakeParquetResult(
+        source_snapshot_token="release-1",
+        schema=(column,),
+        partition_sources=_OwnedPartitionSources(()),
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="explicit close"):
+        result.claim_partition_source(object())
+    result._close_owned_resource(object())
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="cleanup failed"):
+        result.close()
+
+    cleanup_failure = snowflake.SnowflakeParquetResult(
+        source_snapshot_token="release-1",
+        schema=(column,),
+        partition_sources=_OwnedPartitionSources(()),
+        on_close=lambda: (_ for _ in ()).throw(RuntimeError("cleanup")),
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="cleanup failed"):
+        cleanup_failure.close()
+
+    broken_result = SimpleNamespace(close=lambda: (_ for _ in ()).throw(RuntimeError("close")))
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="cleanup failed"):
+        snowflake._close_adapter_result_after_success(broken_result)
+
+
+def test_connector_construction_request_and_adapter_boundaries_fail_closed():
+    approved = _approved_relation()
+    provider = _StaticCredentialProvider()
+    adapter = _Adapter(_result)
+    constructor_cases = (
+        {"approved_relations": []},
+        {"approved_relations": (object(),)},
+        {"approved_relations": (approved, approved)},
+        {"credential_provider": object()},
+        {"adapter": object()},
+    )
+    for changes in constructor_cases:
+        values = {"approved_relations": (approved,), "credential_provider": provider, "adapter": adapter}
+        values.update(changes)
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            snowflake.SnowflakeAcquisitionConnector(**values)
+
+    connector = _connector(adapter)
+    request_cases = (
+        {"definition": object(), "relation": approved.relation, "selected_field_ids": ("npi",)},
+        {"definition": _definition(), "relation": object(), "selected_field_ids": ("npi",)},
+        {"definition": _definition(), "relation": approved.relation, "selected_field_ids": ("npi", "npi")},
+        {"definition": _definition(), "relation": approved.relation, "selected_field_ids": ("missing",)},
+    )
+    for values in request_cases:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            connector.prepare_request(**values)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="declared request type"):
+        connector.build_statement(object())
+
+    unapproved_request = snowflake.SnowflakeReadRequest(
+        relation=snowflake.SnowflakeRelation(database="raw_data", schema="public", name="other"),
+        selected_columns=(approved.columns[0],),
+        definition_sha256=_definition().digest,
+        schema_sha256=_definition().schema_digest,
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="not approved"):
+        connector.build_statement(unapproved_request)
+    mismatched_request = snowflake.SnowflakeReadRequest(
+        relation=approved.relation,
+        selected_columns=(
+            snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="different_npi"),
+        ),
+        definition_sha256=_definition().digest,
+        schema_sha256=_definition().schema_digest,
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="do not match"):
+        connector.build_statement(mismatched_request)
+
+    bad_provider = SimpleNamespace(load_key_pair=lambda: object())
+    connector = snowflake.SnowflakeAcquisitionConnector(
+        approved_relations=(approved,), credential_provider=bad_provider, adapter=adapter
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="invalid key-pair"):
+        connector.acquire(_request(connector))
+    bad_adapter = SimpleNamespace(fetch_parquet=lambda _statement, _credentials: object())
+    connector = snowflake.SnowflakeAcquisitionConnector(
+        approved_relations=(approved,), credential_provider=provider, adapter=bad_adapter
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="invalid Parquet result"):
+        connector.acquire(_request(connector))
+
+
+def test_acquisition_and_capture_replay_detect_tampered_evidence(monkeypatch):
+    connector = _connector(_Adapter(lambda: _result(partition_payloads=(b"PAR1",))))
+    acquisition = connector.acquire(_request(connector))
+    other_digest = _manifest_digest("other")
+
+    tampered_values = (
+        {"statement": object()},
+        {"manifest": object()},
+        {"manifest": replace(acquisition.manifest, request_sha256=other_digest)},
+        {"manifest": replace(acquisition.manifest, statement_sha256=other_digest)},
+        {"parquet_captures": ()},
+        {
+            "manifest": replace(
+                acquisition.manifest,
+                result_partitions=(
+                    replace(acquisition.manifest.result_partitions[0], content_sha256=other_digest),
+                ),
+            )
+        },
+        {"manifest": replace(acquisition.manifest, content_sha256=other_digest)},
+    )
+    for changes in tampered_values:
+        with pytest.raises(snowflake.SnowflakeConnectorError):
+            replace(acquisition, **changes)
+
+    capture = acquisition.parquet_captures[0]
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="sealed capture"):
+        snowflake._capture_receipt(object(), ordinal=1, source_snapshot_token="release-1")
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="snapshot token"):
+        snowflake._capture_receipt(capture, ordinal=1, source_snapshot_token="other-release")
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="invalid byte length"):
+        snowflake._capture_receipt(
+            replace(capture, manifest=replace(capture.manifest, compressed_bytes=0)),
+            ordinal=1,
+            source_snapshot_token=acquisition.manifest.source_snapshot_token,
+        )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="decoded-byte length"):
+        snowflake._capture_receipt(
+            replace(capture, manifest=replace(capture.manifest, decoded_bytes=0)),
+            ordinal=1,
+            source_snapshot_token=acquisition.manifest.source_snapshot_token,
+        )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="partition limit"):
+        snowflake._verified_capture_receipts(
+            (capture,) * (snowflake.MAX_RESULT_PARTITIONS + 1),
+            source_snapshot_token=acquisition.manifest.source_snapshot_token,
+            capture_limits=CaptureLimits(),
+        )
+    monkeypatch.setattr(
+        snowflake,
+        "verify_capture",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(snowflake.CaptureError("invalid")),
+    )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="cannot be replayed"):
+        snowflake._verified_capture_receipts(
+            (capture,),
+            source_snapshot_token=acquisition.manifest.source_snapshot_token,
+            capture_limits=CaptureLimits(),
+        )
