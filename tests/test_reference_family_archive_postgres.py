@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as result_generation
+from tests.reference_family_generation_fixture import generation_shape_check
 
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
@@ -51,7 +52,9 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
             f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
             "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, "
             "local_generation bigint NOT NULL, origin_lineage_id uuid, "
-            "origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+            "origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+            "CONSTRAINT reference_family_result_generation_shape_check CHECK ("
+            f"{generation_shape_check()}))"
         )
     )
     await session.execute(
