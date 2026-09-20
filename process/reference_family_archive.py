@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
@@ -57,6 +57,7 @@ class ReferenceFamilySpec:
 
     importer_id: str
     model_types: tuple[type, ...]
+    dependencies: tuple[str, ...] = ()
 
     @property
     def table_names(self) -> tuple[str, ...]:
@@ -94,11 +95,12 @@ class ReferenceFamilyManifest:
     source_metadata: Mapping[str, Any]
     source_metadata_sha256: str
     schema_sha256: str
+    dependencies: Mapping[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         """Return the strict portable manual-only archive manifest."""
 
-        return {
+        manifest_by_field = {
             "contract": CONTRACT,
             "importer_id": self.importer_id,
             "publication_authority": "manual-only",
@@ -107,6 +109,9 @@ class ReferenceFamilyManifest:
             "source_metadata_sha256": self.source_metadata_sha256,
             "schema_sha256": self.schema_sha256,
         }
+        if self.dependencies:
+            manifest_by_field["dependencies"] = dict(self.dependencies)
+        return manifest_by_field
 
 
 @dataclass(frozen=True)
@@ -241,7 +246,7 @@ _SPECS = {
         ReferenceFamilySpec("mrf-address", (models.MRFAddress, models.MRFAddressEvidence)),
         ReferenceFamilySpec("places-zcta", (models.PricingPlacesZcta,)),
         ReferenceFamilySpec("geo", (models.GeoZipLookup,)),
-        ReferenceFamilySpec("geo-census", (models.GeoZipCensusProfile,)),
+        ReferenceFamilySpec("geo-census", (models.GeoZipCensusProfile,), ("geo",)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
         ReferenceFamilySpec("tiger", (ZipState, Zip_zcta5)),
@@ -523,6 +528,7 @@ async def _family_manifest(
     spec: ReferenceFamilySpec,
     schema_name: str,
     source_metadata: Mapping[str, Any],
+    dependencies: Mapping[str, str] | None = None,
 ) -> ReferenceFamilyManifest:
     metadata, metadata_sha256 = _source_metadata(source_metadata)
     receipts = tuple(
@@ -543,7 +549,24 @@ async def _family_manifest(
         metadata,
         metadata_sha256,
         schema_sha256,
+        _dependency_packages(spec.importer_id, {} if dependencies is None else dependencies),
     )
+
+
+def _dependency_packages(importer_id: str, value: object) -> dict[str, str]:
+    """Keep dependency identity portable: exact package hashes, never local OIDs."""
+    if not isinstance(value, Mapping) or len(value) > 32:
+        raise ReferenceFamilyArchiveError("reference family dependencies are invalid")
+    if any(
+        not isinstance(name, str)
+        or re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", name) is None
+        or name == importer_id
+        or not isinstance(package_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", package_id) is None
+        for name, package_id in value.items()
+    ):
+        raise ReferenceFamilyArchiveError("reference family dependencies are invalid")
+    return dict(sorted(value.items()))
 
 
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
@@ -551,7 +574,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
 
     if isinstance(manifest_value, ReferenceFamilyManifest):
         manifest_value = manifest_value.as_dict()
-    if not isinstance(manifest_value, Mapping) or set(manifest_value) != {
+    if not isinstance(manifest_value, Mapping) or set(manifest_value) - {"dependencies"} != {
         "contract",
         "importer_id",
         "publication_authority",
@@ -589,7 +612,10 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
     schema_sha256 = _schema_digest(receipts)
     if manifest_value["source_metadata_sha256"] != metadata_sha256 or manifest_value["schema_sha256"] != schema_sha256:
         raise ReferenceFamilyArchiveError("reference family manifest digest differs")
-    return ReferenceFamilyManifest(spec.importer_id, tuple(receipts), metadata, metadata_sha256, schema_sha256)
+    dependencies = _dependency_packages(spec.importer_id, manifest_value.get("dependencies", {}))
+    return ReferenceFamilyManifest(
+        spec.importer_id, tuple(receipts), metadata, metadata_sha256, schema_sha256, dependencies
+    )
 
 
 def _validation_digest(payload: Mapping[str, Any]) -> str:
@@ -697,6 +723,7 @@ async def capture_reference_family_source(
     importer_id: str,
     schema_name: str,
     source_metadata: Mapping[str, Any],
+    dependencies: Mapping[str, str] | None = None,
 ) -> ReferenceFamilySourceCapture:
     """Pin and describe one exact live family under the caller transaction."""
 
@@ -706,6 +733,7 @@ async def capture_reference_family_source(
         schema_name=schema_name,
         source_metadata=source_metadata,
         configure_isolation=True,
+        dependencies=dependencies,
     )
 
 
@@ -716,6 +744,7 @@ async def _capture_reference_family_source(
     schema_name: str,
     source_metadata: Mapping[str, Any],
     configure_isolation: bool,
+    dependencies: Mapping[str, str] | None = None,
 ) -> ReferenceFamilySourceCapture:
     """Capture after either this function or its caller establishes isolation."""
 
@@ -732,6 +761,7 @@ async def _capture_reference_family_source(
             spec=spec,
             schema_name=schema,
             source_metadata=source_metadata,
+            dependencies=dependencies,
         )
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
         if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
@@ -926,6 +956,7 @@ async def _validate_stage_manifest(
         spec=spec,
         schema_name=ownership.schema_name,
         source_metadata=validated.source_metadata,
+        dependencies=validated.dependencies,
     )
     if observed.as_dict() != validated.as_dict():
         raise ReferenceFamilyArchiveError("reference family restored stage differs")
@@ -1042,6 +1073,7 @@ async def prepare_reference_family_archive_source(
     dataset_id: UUID,
     on_prepared: Callable[[Any, ReferenceFamilyPreparedSource], Awaitable[None]],
     source_metadata_factory: Callable[[Any], Awaitable[Mapping[str, Any]]] | None = None,
+    dependency_factory: Callable[[Any], Awaitable[Mapping[str, str]]] | None = None,
 ) -> ReferenceFamilyPreparedSource:
     """Clone once and persist its exact owner before the clone transaction commits."""
 
@@ -1049,11 +1081,15 @@ async def prepare_reference_family_archive_source(
     async with session_factory() as source_session, source_session.begin():
         await source_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         effective_source_metadata = source_metadata
-        if source_metadata_factory is not None:
+        package_by_dataset = {}
+        if source_metadata_factory is not None or dependency_factory is not None:
             spec = reference_family_spec(importer_id)
             async with _bounded_capture(source_session):
                 await _lock_family(source_session, _schema_name(schema_name), spec.table_names, "SHARE")
-                effective_source_metadata = await source_metadata_factory(source_session)
+                if source_metadata_factory is not None:
+                    effective_source_metadata = await source_metadata_factory(source_session)
+                if dependency_factory is not None:
+                    package_by_dataset = await dependency_factory(source_session)
         if effective_source_metadata is None:
             raise ReferenceFamilyArchiveError("reference family source metadata is required")
         capture = await _capture_reference_family_source(
@@ -1062,6 +1098,7 @@ async def prepare_reference_family_archive_source(
             schema_name=schema_name,
             source_metadata=effective_source_metadata,
             configure_isolation=False,
+            dependencies=package_by_dataset,
         )
         async with session_factory() as clone_session, clone_session.begin():
             await _clone_source(clone_session, capture, stage_schema)
@@ -1498,6 +1535,7 @@ async def _activation_receipt(
         spec=spec,
         schema_name=expected_incumbent.schema_name,
         source_metadata=manifest.source_metadata,
+        dependencies=manifest.dependencies,
     )
     if local_manifest.as_dict() != manifest.as_dict():
         raise ReferenceFamilyArchiveError("reference family activated receipt differs")

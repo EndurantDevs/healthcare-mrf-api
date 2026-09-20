@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 from contextlib import asynccontextmanager
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 from uuid import UUID
@@ -82,6 +83,7 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
     assert archive.reference_family_spec("geo").table_names == ("geo_zip_lookup",)
     census = archive.reference_family_spec("geo-census")
     assert census.table_names == ("geo_zip_census_profile",)
+    assert census.dependencies == ("geo",)
     assert tuple(census.model_types[0].__table__.primary_key.columns.keys()) == ("zip_code",)
     assert not set(census.table_names) & set(archive.reference_family_spec("tiger").table_names)
     assert archive.reference_family_spec("lodes").table_names == ("lodes_workplace_aggregate",)
@@ -182,6 +184,17 @@ def test_manifest_binds_explicit_provenance_but_remains_manual_only():
     tampered["source_metadata"]["source_release"] = "different"
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="digest differs"):
         archive.validate_reference_family_manifest(tampered)
+
+
+def test_manifest_preserves_exact_portable_dependencies_without_changing_legacy_receipts():
+    legacy = _manifest()
+    assert "dependencies" not in legacy.as_dict()
+    manifest = replace(legacy, dependencies={"geo": "b" * 64, "npi": "c" * 64})
+    assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
+    assert archive._validation_digest(legacy.as_dict()) != archive._validation_digest(manifest.as_dict())
+    for dependencies in ({"places-zcta": "a" * 64}, {"geo": "bad"}, {"geo": None}, [], {"../geo": "b" * 64}):
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="dependencies"):
+            archive.validate_reference_family_manifest({**legacy.as_dict(), "dependencies": dependencies})
 
 
 def test_validation_receipt_rejects_tampered_package_binding():
