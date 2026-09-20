@@ -152,6 +152,7 @@ async def test_pharmacy_reference_stage_has_complete_model_indexes():
                 connection, importer_id="pharmacy-economics", dataset_id=dataset_id
             )
             assert owner.relation_oids[0][0] == _LIVE
+            await archive.complete_reference_family_restore(connection, owner)
             indexes = (await connection.execute(text(
                 "SELECT indexdef FROM pg_indexes WHERE schemaname=:schema"
             ), {"schema": stage_schema})).scalars().all()

@@ -1171,12 +1171,12 @@ async def precreate_reference_family_restore(
     importer_id: str,
     dataset_id: UUID,
 ) -> ReferenceFamilyStageOwnership:
-    """Create an empty model-complete target for a native data-only restore."""
+    """Create model tables, constraints and sequences for a native data-only restore."""
 
     _require_transaction(session)
     spec = reference_family_spec(importer_id)
     schema_name = reference_family_stage_schema(dataset_id)
-    await _create_model_family(session, spec, schema_name)
+    await _create_model_family(session, spec, schema_name, create_indexes=False)
     return await capture_reference_family_stage_ownership(
         session,
         importer_id=importer_id,
@@ -1188,6 +1188,8 @@ async def _create_model_family(
     session: Any,
     spec: ReferenceFamilySpec,
     schema_name: str,
+    *,
+    create_indexes: bool = True,
 ) -> None:
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
     metadata = MetaData(schema=schema_name)
@@ -1218,6 +1220,12 @@ async def _create_model_family(
                     f"{_quoted(schema_name)}.{_quoted(table.name)}.{_quoted(column_name)}"
                 )
             )
+    if create_indexes:
+        await _create_model_indexes(session, spec, schema_name)
+
+
+async def _create_model_indexes(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
+    for model_type in spec.model_types:
         indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
             getattr(model_type, "__my_additional_indexes__", ()) or ()
         )
@@ -1230,6 +1238,14 @@ async def _create_model_family(
             )
         for index in indexes:
             await session.execute(text(_additional_index_sql(schema_name, model_type, index)))
+
+
+async def complete_reference_family_restore(session: Any, ownership: ReferenceFamilyStageOwnership) -> None:
+    """Build reviewed model indexes after data restore, before freezing the owned stage."""
+
+    _require_transaction(session)
+    await verify_reference_family_stage_ownership(session, ownership)
+    await _create_model_indexes(session, reference_family_spec(ownership.importer_id), ownership.schema_name)
 
 
 async def validate_reference_family_stage(
@@ -1713,6 +1729,7 @@ __all__ = [
     "export_reference_family_archive",
     "export_prepared_reference_family_archive",
     "precreate_reference_family_restore",
+    "complete_reference_family_restore",
     "prepare_reference_family_archive_source",
     "prepare_reference_family_activation",
     "reference_family_spec",
