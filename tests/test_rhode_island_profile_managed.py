@@ -557,7 +557,7 @@ def test_managed_registry_entrypoint_and_terminal_commit():
     from process import control_lifecycle
 
     entry = next(entry for entry in control_imports.importer_registry() if entry["name"] == worker.IMPORTER)
-    assert entry["family"] == "provider" and entry["depends_on"] == ["npi"] and entry["cancelable"]
+    assert entry["family"] == "provider" and entry["dependency_authority"] == "scheduler" and entry["cancelable"]
     assert entry["params_schema"] == []
     adapter = control_imports._SINGLE_JOB_ADAPTERS[worker.IMPORTER]
     assert (

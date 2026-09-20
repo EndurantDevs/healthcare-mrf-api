@@ -167,17 +167,6 @@ class _ImportRunEnsureState:
 
 _IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 
-_IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
-    "npi": ["nucc"],
-    "florida-mqa-profile": ["npi"],
-    "massachusetts-borim-profile": ["npi"],
-    "kentucky-kbml-profile": ["npi"],
-    "tennessee-tdh-profile": ["npi"],
-    "rhode-island-doh-profile": ["npi"],
-    "new-york-nypp-profile": ["npi"],
-    "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
-}
-
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     "ptg": {"queue": "arq:PTG", "function": "ptg_control_start", "payload": "ptg_control", "job_prefix": "ptg_start"},
     "ptg-candidate-audit": {
@@ -776,12 +765,11 @@ def importer_registry() -> list[dict[str, Any]]:
                 "family": _importer_family(name),
                 "kind": "discovered" if name == "ptg" else "scheduled",
                 "lifecycle": "start_finish" if name in finish_commands else "single",
-                "schedulable": True,
+                "schedulable": name in _SINGLE_JOB_ADAPTERS,
                 "cancelable": name in _CANCELABLE_IMPORTERS,
                 "retryable": True,
                 "enqueue_adapter": "arq_single_job" if name in _SINGLE_JOB_ADAPTERS else "pending",
                 "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
-                "depends_on": list(_IMPORTER_DEPENDENCIES.get(name, [])),
                 "params_schema": _control_param_schema(name, command),
                 **({"profile_source": dict(_PROFILE_SOURCES[name])} if name in _PROFILE_SOURCES else {}),
             }
@@ -793,6 +781,10 @@ def importer_registry() -> list[dict[str, Any]]:
             _plan_pricing_em_distance_registry_entry(),
         )
     )
+    for importer in importers:
+        # Dependencies belong to scheduler policy, not engine capability discovery.
+        importer["depends_on"] = []
+        importer["dependency_authority"] = "scheduler"
     return sorted(importers, key=lambda importer: importer["name"])
 
 

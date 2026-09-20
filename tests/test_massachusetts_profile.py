@@ -384,7 +384,7 @@ def test_registry_adapter_and_worker_agree_without_unmanaged_cli(monkeypatch):
 
     importer = "massachusetts-borim-profile"
     registration = next(entry for entry in control_imports.importer_registry() if entry["name"] == importer)
-    assert registration["family"] == "provider" and registration["depends_on"] == ["npi"]
+    assert registration["family"] == "provider" and registration["dependency_authority"] == "scheduler"
     assert registration["cancelable"] is True and registration["enqueue_adapter"] == "arq_single_job"
     assert {parameter["name"] for parameter in registration["params_schema"]} == {"max_providers", "resume_from", "reprocess_from"}
     adapter = control_imports._SINGLE_JOB_ADAPTERS[importer]

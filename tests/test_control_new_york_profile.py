@@ -30,7 +30,7 @@ def test_catalog_cli_and_worker_register_only_complete_nypp_source():
     entries = control_imports.importer_registry()
     entry = next(entry for entry in entries if entry["name"] == profile.IMPORTER)
     assert entry["profile_source"] == {"source_key": "new-york-nypp", "display_name": "New York Physician Profile"}
-    assert entry["family"] == "provider" and entry["depends_on"] == ["npi"]
+    assert entry["family"] == "provider" and entry["dependency_authority"] == "scheduler"
     assert entry["cancelable"] and entry["schedulable"] and entry["retryable"]
     assert entry["params_schema"] == [] and entry["enqueue_adapter"] == "arq_single_job"
     assert profile.CATEGORIES == ("education", "training", "certifications")

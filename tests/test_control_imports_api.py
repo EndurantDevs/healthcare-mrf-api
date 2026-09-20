@@ -133,7 +133,8 @@ def _assert_provider_importer_contracts(importer_by_name):
     assert florida_profile["family"] == "provider"
     assert florida_profile["enqueue_adapter"] == "arq_single_job"
     assert florida_profile["queue"] == "arq:FloridaMQAProfile"
-    assert florida_profile["depends_on"] == ["npi"]
+    assert florida_profile["depends_on"] == []
+    assert florida_profile["dependency_authority"] == "scheduler"
     assert florida_profile["cancelable"] is False
     assert {
         param["name"] for param in florida_profile["params_schema"]
@@ -209,18 +210,13 @@ def test_importer_registry_exposes_reference_and_discovery_params():
     assert importer_by_name["terminology-synonyms"]["family"] == "reference"
     assert importer_by_name["terminology-synonyms"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["terminology-synonyms"]["queue"] == "arq:TerminologySynonyms"
-    assert importer_by_name["terminology-synonyms"]["depends_on"] == [
-        "nucc",
-        "code-sets",
-        "clinical-reference",
-        "claims-pricing",
-        "drug-claims",
-    ]
+    assert importer_by_name["terminology-synonyms"]["depends_on"] == []
+    assert importer_by_name["terminology-synonyms"]["dependency_authority"] == "scheduler"
     assert importer_by_name["geo"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["geo-census"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["plan-attributes"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["npi"]["schedulable"] is True
-    assert importer_by_name["npi"]["depends_on"] == ["nucc"]
+    assert importer_by_name["npi"]["depends_on"] == []
     assert importer_by_name["ptg"]["cancelable"] is True
     assert importer_by_name["npi"]["cancelable"] is True
     assert importer_by_name["claims-pricing"]["cancelable"] is False
@@ -253,6 +249,26 @@ def test_importer_registry_exposes_archive_and_address_params():
     assert any(param["name"] == "import_id" and param["type"] == "text" for param in importer_by_name["openaddresses"]["params_schema"])
     assert any(param["name"] == "local_files" and param["multiple"] for param in importer_by_name["openaddresses"]["params_schema"])
     assert any(param["name"] == "resume_stage" and param["is_flag"] for param in importer_by_name["openaddresses"]["params_schema"])
+
+
+def test_importer_capabilities_do_not_claim_pending_adapters_or_dependency_policy():
+    entry_by_name = {entry["name"]: entry for entry in importer_registry()}
+    for entry in entry_by_name.values():
+        assert entry["depends_on"] == []
+        assert entry["dependency_authority"] == "scheduler"
+        if entry["schedulable"]:
+            assert entry["enqueue_adapter"] == "arq_single_job"
+    for name in (
+        "provider-directory-admission-backfill",
+        "provider-directory-selection-receipt-backfill",
+        "plan-pricing-em-distance",
+    ):
+        assert entry_by_name[name]["schedulable"] is False
+    assert "formulary-fhir" not in entry_by_name
+    projection = entry_by_name["plan-pricing-em-distance"]
+    assert {param["name"] for param in projection["params_schema"] if param["required"]} == {
+        "plan_release_id", "serving_revision_id"
+    }
 
 
 def test_importer_registry_exposes_entity_address_params():
