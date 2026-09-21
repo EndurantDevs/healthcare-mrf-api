@@ -13,15 +13,18 @@ from types import SimpleNamespace
 import pyarrow.parquet as pq
 import pytest
 
+import process.custom_import.snowflake_python as snowflake_python
 from process.custom_import.capture import capture_stream, iter_records
 from process.custom_import.snowflake import (
     SNOWFLAKE_RESULT_STREAM,
     SnowflakeConnectorError,
+    SnowflakeCredentialError,
     SnowflakeDeclaredColumn,
     SnowflakeKeyPairCredentials,
     SnowflakeReadRequest,
     SnowflakeReadStatement,
     SnowflakeRelation,
+    SnowflakeResultColumn,
 )
 from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter
 
@@ -458,3 +461,174 @@ def test_adapter_preserves_fetch_cancellation_when_cleanup_fails(monkeypatch, cr
 def test_adapter_rejects_unsafe_connection_identifiers(value):
     with pytest.raises(SnowflakeConnectorError, match="simple identifier"):
         SnowflakePythonConnectorAdapter(role=value, warehouse="warehouse")
+
+
+def test_adapter_rejects_invalid_runtime_arguments_before_connecting(credentials):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+
+    with pytest.raises(SnowflakeConnectorError, match="generated Snowflake statement"):
+        adapter.fetch_parquet(object(), credentials)
+    with pytest.raises(SnowflakeConnectorError, match="key-pair credentials"):
+        adapter.fetch_parquet(_statement(), object())
+
+
+def test_adapter_requires_a_statement_identity(monkeypatch, credentials):
+    cursor = _Cursor(())
+    cursor.sfqid = " "
+    connection = _Connection(cursor)
+    monkeypatch.setattr(
+        "process.custom_import.snowflake_python.snowflake.connector.connect",
+        lambda **_arguments: connection,
+    )
+
+    with pytest.raises(SnowflakeConnectorError, match="statement identity"):
+        SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+            _statement(),
+            credentials,
+        )
+
+    assert cursor.closed
+    assert connection.closed
+
+
+def test_adapter_rejects_malformed_result_boundaries(monkeypatch):
+    text_column = SnowflakeResultColumn(field_id="value", source_type="TEXT", nullable=False)
+    boolean_column = SnowflakeResultColumn(field_id="value", source_type="BOOLEAN", nullable=True)
+    fixed_column = SnowflakeResultColumn(field_id="value", source_type="FIXED(10,0)", nullable=True)
+    scaled_column = SnowflakeResultColumn(field_id="value", source_type="FIXED(10,2)", nullable=True)
+
+    with pytest.raises(SnowflakeConnectorError, match="result schema"):
+        snowflake_python._result_schema(_statement(), ())
+    with pytest.raises(SnowflakeConnectorError, match="result schema"):
+        snowflake_python._result_schema(
+            _statement(),
+            (SimpleNamespace(name="wrong", type_name="TEXT", is_nullable=False),) * 2,
+        )
+    with pytest.raises(SnowflakeConnectorError, match="not supported"):
+        snowflake_python._source_type(SimpleNamespace(type_name="DATE"))
+    with pytest.raises(SnowflakeConnectorError, match="unavailable"):
+        snowflake_python._source_type(SimpleNamespace(type_name=None, type_code=True))
+    with pytest.raises(SnowflakeConnectorError, match="precision is invalid"):
+        snowflake_python._metadata_integer(SimpleNamespace(precision=True), "precision", minimum=1, maximum=38)
+    with pytest.raises(SnowflakeConnectorError, match="nullability is invalid"):
+        snowflake_python._is_nullable(SimpleNamespace(is_nullable="yes"))
+
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 1)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        snowflake_python._validate_result_rows((("x",),), (text_column,))
+    with pytest.raises(SnowflakeConnectorError, match="does not match"):
+        snowflake_python._result_row_variable_bytes("x", (text_column,))
+    with pytest.raises(SnowflakeConnectorError, match="does not match"):
+        snowflake_python._result_row_variable_bytes(("x", "extra"), (text_column,))
+    with pytest.raises(SnowflakeConnectorError, match="non-nullable"):
+        snowflake_python._variable_scalar_bytes(None, text_column)
+    with pytest.raises(SnowflakeConnectorError, match="TEXT result value"):
+        snowflake_python._variable_scalar_bytes(1, text_column)
+    with pytest.raises(SnowflakeConnectorError, match="valid UTF-8"):
+        snowflake_python._variable_scalar_bytes("\ud800", SnowflakeResultColumn("value", "TEXT", True))
+    with pytest.raises(SnowflakeConnectorError, match="BOOLEAN result value"):
+        snowflake_python._variable_scalar_bytes(1, boolean_column)
+    with pytest.raises(SnowflakeConnectorError, match="signed 64-bit"):
+        snowflake_python._variable_scalar_bytes(True, fixed_column)
+    with pytest.raises(SnowflakeConnectorError, match="FIXED result value"):
+        snowflake_python._variable_scalar_bytes("not-a-decimal", scaled_column)
+    assert snowflake_python._arrow_fixed_bytes("BOOLEAN", 1) == 2
+    assert snowflake_python._arrow_fixed_bytes("FIXED(10,0)", 1) == 9
+    assert snowflake_python._arrow_type(boolean_column) == snowflake_python.pa.bool_()
+    with pytest.raises(SnowflakeConnectorError, match="not supported by the Parquet encoder"):
+        snowflake_python._fixed_type_parts("invalid")
+
+
+def test_adapter_closes_after_fetch_and_cleanup_errors(monkeypatch, credentials):
+    cursor = _Cursor(())
+    connection = _Connection(cursor)
+
+    def fail_fetch():
+        raise RuntimeError("synthetic fetch failure")
+
+    cursor.fetchone = fail_fetch
+    monkeypatch.setattr(
+        "process.custom_import.snowflake_python.snowflake.connector.connect",
+        lambda **_arguments: connection,
+    )
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+        _statement(),
+        credentials,
+    )
+
+    with pytest.raises(SnowflakeConnectorError, match="result fetch failed"):
+        next(result.consume_partition_sources())
+    assert cursor.closed
+    assert connection.closed
+
+    sources = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(_Cursor(())),
+        cursor=_Cursor(()),
+        result_schema=(SnowflakeResultColumn("value", "TEXT", True),),
+    )
+    next(iter(sources))
+    with pytest.raises(SnowflakeConnectorError, match="already consumed"):
+        next(iter(sources))
+
+
+def test_adapter_wraps_invalid_private_key_material(monkeypatch):
+    credentials = SnowflakeKeyPairCredentials(account="example", user="reader", private_key_pem=_PRIVATE_KEY)
+
+    def invalid_key(*_args, **_kwargs):
+        raise ValueError("synthetic invalid key")
+
+    monkeypatch.setattr(snowflake_python.serialization, "load_pem_private_key", invalid_key)
+
+    with pytest.raises(SnowflakeCredentialError, match="cannot be loaded"):
+        snowflake_python._private_key_der(credentials)
+
+
+def test_adapter_enforces_partition_and_parquet_encoding_limits(monkeypatch):
+    text_column = SnowflakeResultColumn("value", "TEXT", True)
+    boolean_column = SnowflakeResultColumn("value", "BOOLEAN", True)
+    source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(_Cursor(())),
+        cursor=_Cursor((("x",),)),
+        result_schema=(text_column,),
+    )
+
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 1)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        source._next_partition_rows(None)
+
+    source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(_Cursor(())),
+        cursor=_Cursor((("x",),)),
+        result_schema=(text_column,),
+    )
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 100)
+    monkeypatch.setattr(snowflake_python, "_FETCH_ROWS", 1)
+    assert source._next_partition_rows(None) == ([("x",)], None, False)
+    assert snowflake_python._is_nullable(SimpleNamespace(is_nullable=None))
+    assert snowflake_python._variable_scalar_bytes(True, boolean_column) == 0
+
+    fake_arrow = SimpleNamespace(
+        ArrowException=RuntimeError,
+        Table=SimpleNamespace(from_arrays=lambda *_args, **_kwargs: SimpleNamespace(nbytes=101)),
+        array=lambda *_args, **_kwargs: object(),
+        field=lambda *_args, **_kwargs: object(),
+        schema=lambda *_args, **_kwargs: object(),
+        string=lambda: object(),
+    )
+    monkeypatch.setattr(snowflake_python, "pa", fake_arrow)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))
+
+    def invalid_table(*_args, **_kwargs):
+        raise TypeError("synthetic Arrow failure")
+
+    fake_arrow.Table.from_arrays = invalid_table
+    with pytest.raises(SnowflakeConnectorError, match="cannot be encoded"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))
+
+    fake_arrow.Table.from_arrays = lambda *_args, **_kwargs: SimpleNamespace(nbytes=0)
+    monkeypatch.setattr(
+        snowflake_python.pq, "write_table", lambda _table, destination, **_kwargs: destination.write(b"x" * 101)
+    )
+    with pytest.raises(SnowflakeConnectorError, match="Parquet partition exceeds"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))

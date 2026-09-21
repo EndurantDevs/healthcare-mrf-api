@@ -5,16 +5,23 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import process.custom_import.family as family
 import process.custom_import.runner as runner
-from process.custom_import.definition import CustomImportDefinition
+import process.custom_import.runner_codec as runner_codec
+import process.custom_import.runner_registry as runner_registry
+from process.custom_import.definition import ChildCollection, CustomImportDefinition, Field, KeyPart
 from process.custom_import.execution import LeaseGrant
 from process.custom_import.family import assemble_root_families
 from process.custom_import.publication import (
@@ -573,3 +580,559 @@ async def test_runner_stops_finality_when_authority_changes_after_graph(
     run_result = await run_candidate(lambda: None, request)
 
     assert run_result.status == expected_status
+
+
+def _codec_field(field_id: str, value_type: str, *, nullable: bool = False) -> Field:
+    return Field(
+        field_id=field_id,
+        field_slot=99,
+        value_type=value_type,
+        nullable=nullable,
+        projection_slot=None,
+        collection=None,
+    )
+
+
+def test_runner_codec_rejects_malformed_canonical_values():
+    definition = _definition()
+    decimal_field = _codec_field("amount", "decimal")
+    date_field = _codec_field("effective_date", "date")
+    timestamp_field = _codec_field("captured_at", "timestamp")
+    integer_field = _codec_field("rank", "integer")
+    boolean_field = _codec_field("active", "boolean")
+    string_field = _codec_field("display_name", "string")
+    required_field = _codec_field("required", "string")
+    nullable_field = _codec_field("optional", "string", nullable=True)
+
+    retained = SimpleNamespace(children=(SimpleNamespace(collection="rates", values_by_field={"amount": 1}),))
+    assert runner_codec.family_children(retained) == (("rates", {"amount": 1}),)
+    assert runner_codec.root_key_evidence_from_tuple(definition, ["1234567893"]) is None
+    assert runner_codec.root_key_evidence_from_tuple(definition, ("1234567893",)) is not None
+
+    with pytest.raises(CandidateRunnerError, match="not UTF-8"):
+        runner_codec._digest_text_fragment(hashlib.sha256(), "\ud800")
+    with pytest.raises(CandidateRunnerError, match="root key is incomplete"):
+        runner_codec.root_key_document(definition, {})
+    with pytest.raises(CandidateRunnerError, match="root key is malformed"):
+        runner_codec.root_key_document_from_tuple(definition, ())
+    with pytest.raises(CandidateRunnerError, match="family key is incomplete"):
+        runner_codec.key_document(("missing",), {}, {})
+
+    for field, value, message in (
+        (decimal_field, "not-a-decimal", "decimal value is not canonical"),
+        (date_field, "2026-01-01", "date value is malformed"),
+        (timestamp_field, "2026-01-01", "timestamp value is malformed"),
+        (integer_field, True, "integer value is malformed"),
+        (boolean_field, 1, "boolean value is malformed"),
+        (string_field, 1, "string value is malformed"),
+    ):
+        with pytest.raises(CandidateRunnerError, match=message):
+            runner_codec.value_document(field, value)
+
+    with pytest.raises(CandidateRunnerError, match="candidate canonical value is malformed"):
+        runner_codec.canonical({"value": object()})
+    with pytest.raises(CandidateRunnerError, match="fields do not match"):
+        runner_codec.payload_values(
+            (required_field,), '{"contract":"custom-import-record/v1","fields":[]}', label="payload"
+        )
+    with pytest.raises(CandidateRunnerError, match="not canonical text"):
+        runner_codec.parse_canonical_payload(1, "payload")
+    with pytest.raises(CandidateRunnerError, match="payload is malformed"):
+        runner_codec.parse_canonical_payload("not-json", "payload")
+    with pytest.raises(CandidateRunnerError, match="unknown contract"):
+        runner_codec.parse_canonical_payload('{"contract":"other"}', "payload")
+    with pytest.raises(CandidateRunnerError, match="field identity"):
+        runner_codec.payload_field_value(required_field, {"field": "other", "value": {}}, "payload")
+    with pytest.raises(CandidateRunnerError, match="field value does not match"):
+        runner_codec.payload_field_value(required_field, {"field": "required", "value": 1}, "payload")
+    with pytest.raises(CandidateRunnerError, match="omits a required"):
+        runner_codec.payload_field_value(
+            required_field, {"field": "required", "value": {"state": "missing"}}, "payload"
+        )
+    assert (
+        runner_codec.payload_field_value(
+            nullable_field, {"field": "optional", "value": {"state": "missing"}}, "payload"
+        )
+        is runner_codec._MISSING
+    )
+    with pytest.raises(CandidateRunnerError, match="nulls a required"):
+        runner_codec.payload_field_value(
+            required_field, {"field": "required", "value": {"state": "null", "type": "string"}}, "payload"
+        )
+    assert (
+        runner_codec.payload_field_value(
+            nullable_field, {"field": "optional", "value": {"state": "null", "type": "string"}}, "payload"
+        )
+        is None
+    )
+    with pytest.raises(CandidateRunnerError, match="field value is malformed"):
+        runner_codec.payload_field_value(
+            required_field, {"field": "required", "value": {"state": "value", "type": "string"}}, "payload"
+        )
+
+    for field, value, message in (
+        (decimal_field, "not-a-decimal", "decimal value is malformed"),
+        (date_field, 1, "date value is malformed"),
+        (date_field, "not-a-date", "date value is malformed"),
+        (timestamp_field, 1, "timestamp value is malformed"),
+        (timestamp_field, "not-a-timestamp", "timestamp value is malformed"),
+        (timestamp_field, "2026-01-01T00:00:00", "timestamp value is malformed"),
+        (string_field, 1, "string value is malformed"),
+        (integer_field, True, "integer value is malformed"),
+        (boolean_field, 1, "boolean value is malformed"),
+    ):
+        with pytest.raises(CandidateRunnerError, match=message):
+            runner_codec.decode_payload_scalar(field, value, "payload")
+
+
+def test_runner_rejects_invalid_host_boundaries_before_lifecycle_work():
+    request = _request(_definition())
+
+    with pytest.raises(CandidateRunnerError, match="requires a session factory"):
+        runner.validate_candidate_request(None, request)
+    with pytest.raises(CandidateRunnerError, match="request is malformed"):
+        runner.validate_candidate_request(lambda: None, object())
+    with pytest.raises(CandidateRunnerError, match="definition is malformed"):
+        runner.validate_candidate_request(lambda: None, replace(request, definition=object()))
+    with pytest.raises(CandidateRunnerError, match="complete_scope must be boolean"):
+        runner.validate_candidate_request(lambda: None, replace(request, complete_scope=1))
+    with pytest.raises(CandidateRunnerError, match="bounded root and child"):
+        runner.validate_candidate_request(lambda: None, replace(request, roots={}))
+    with pytest.raises(CandidateRunnerError, match="lease token is malformed"):
+        runner.validate_candidate_request(lambda: None, replace(request, lease_token=object()))
+    with pytest.raises(CandidateRunnerError, match="dataset_id must be a positive integer"):
+        runner.validate_candidate_identifiers(replace(request, dataset_id=0))
+    with pytest.raises(CandidateRunnerError, match="definition is not canonical"):
+        runner.validate_definition_canonical(replace(request.definition, canonical="not-json"))
+    with pytest.raises(CandidateRunnerError, match="does not match its canonical"):
+        runner.validate_definition_canonical(replace(request.definition, refresh_mode="snapshot"))
+
+
+class _LifecycleSession:
+    def begin(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _ObservedSession(_LifecycleSession):
+    def __init__(self, execution, lease, now):
+        self.execution = execution
+        self.lease = lease
+        self.now = now
+        self.no_autoflush = nullcontext()
+
+    async def get(self, model, _execution_id):
+        return self.execution if model is runner.CustomImportExecution else self.lease
+
+    async def scalar(self, _statement):
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_runner_observes_exact_execution_and_lease_state():
+    request = _request(_definition())
+    grant = _grant()
+    now = datetime.now(UTC)
+
+    def execution(state="running", **changes):
+        values = {
+            "dataset_id": request.dataset_id,
+            "definition_revision_id": request.definition_revision_id,
+            "schema_revision_id": request.schema_revision_id,
+            "capture_bundle_id": 1,
+            "state": state,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def session_factory(current_execution, lease):
+        return lambda: _ObservedSession(current_execution, lease, now)
+
+    valid_lease = SimpleNamespace(
+        fence=grant.fence,
+        token_sha256=runner.lease_token_sha256(request.lease_token),
+        expires_at=now + timedelta(minutes=1),
+    )
+    assert (
+        await runner.observed_finality_state(session_factory(execution(dataset_id=99), valid_lease), request, grant)
+        is None
+    )
+    assert (
+        await runner.observed_finality_state(session_factory(execution("canceling"), valid_lease), request, grant)
+        == "canceling"
+    )
+    assert (
+        await runner.observed_finality_state(session_factory(execution("canceled"), valid_lease), request, grant)
+        == "canceled"
+    )
+    assert await runner.observed_finality_state(session_factory(execution(), None), request, grant) == "lease_lost"
+    assert await runner.observed_finality_state(session_factory(execution(), valid_lease), request, grant) is None
+
+
+@pytest.mark.asyncio
+async def test_runner_classifies_terminal_state_edges(monkeypatch):
+    request = _request(_definition())
+    admitted = assemble_root_families(request.definition, request.roots, request.children_by_collection)
+    materialized = runner._MaterializedCandidate(31, None, 1, 0)
+    transition = SimpleNamespace(changed=False, state="canceled")
+    original_finish_canceled = runner._finish_canceled_candidate
+
+    async def finish(*_args, **_kwargs):
+        return transition
+
+    async def canceled(*_args, **_kwargs):
+        return CandidateRunResult("canceled", request.execution_id)
+
+    monkeypatch.setattr(runner, "finish_execution", finish)
+    monkeypatch.setattr(runner, "_finish_canceled_candidate", canceled)
+    assert (
+        await runner._finish_rejected_candidate(_LifecycleSession, request, _grant(), admitted)
+    ).status == "canceled"
+
+    transition.state = "canceling"
+    assert (
+        await runner._finish_rejected_candidate(_LifecycleSession, request, _grant(), admitted)
+    ).status == "canceled"
+
+    transition.state = "unknown"
+    assert (
+        await runner._finish_rejected_candidate(_LifecycleSession, request, _grant(), admitted)
+    ).status == "lease_lost"
+
+    monkeypatch.setattr(runner, "_finish_canceled_candidate", original_finish_canceled)
+    transition.changed = True
+    transition.state = "running"
+    assert (
+        await runner._finish_canceled_candidate(_LifecycleSession, request, _grant(), admitted)
+    ).status == "canceled"
+    assert (
+        await runner._finish_canceled_candidate(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).generation_id == 31
+    transition.changed = False
+    assert (
+        await runner._finish_canceled_candidate(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "lease_lost"
+
+    transition.changed = True
+    assert (
+        await runner._finish_rejected_candidate(_LifecycleSession, request, _grant(), admitted)
+    ).status == "candidate_rejected"
+
+
+@pytest.mark.asyncio
+async def test_runner_classifies_finality_conflicts_without_fallbacks(monkeypatch):
+    request = _request(_definition())
+    admitted = assemble_root_families(request.definition, request.roots, request.children_by_collection)
+    materialized = runner._MaterializedCandidate(31, runner._Pointer(30, 12, 13, 7), 1, 0)
+    observed = {"state": "canceling"}
+
+    async def observed_state(*_args):
+        return observed["state"]
+
+    async def canceled(*_args, **_kwargs):
+        return CandidateRunResult("canceled", request.execution_id, generation_id=31)
+
+    monkeypatch.setattr(runner, "observed_finality_state", observed_state)
+    monkeypatch.setattr(runner, "_finish_canceled_candidate", canceled)
+    assert (
+        await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "canceled"
+    observed["state"] = "canceled"
+    assert (
+        await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "canceled"
+    observed["state"] = "lease_lost"
+    assert (
+        await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "lease_lost"
+    observed["state"] = None
+    assert await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized) is None
+
+    async def no_change_conflict(*_args):
+        raise PublicationConflict("finality race")
+
+    async def terminal_conflict(*_args):
+        return CandidateRunResult("canceled", request.execution_id, generation_id=31)
+
+    monkeypatch.setattr(runner, "_record_no_change_or_none", no_change_conflict)
+    monkeypatch.setattr(runner, "_finality_conflict_outcome", terminal_conflict)
+    assert (
+        await runner.no_change_result_or_none(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "canceled"
+
+    async def seal_conflict(*_args):
+        raise PublicationConflict("finality race")
+
+    monkeypatch.setattr(runner, "_seal", seal_conflict)
+    assert (
+        await runner.seal_and_activate_candidate(_LifecycleSession, request, _grant(), admitted, materialized)
+    ).status == "canceled"
+
+    async def no_terminal_conflict(*_args):
+        return None
+
+    monkeypatch.setattr(runner, "_finality_conflict_outcome", no_terminal_conflict)
+    with pytest.raises(PublicationConflict, match="finality race"):
+        await runner.seal_and_activate_candidate(_LifecycleSession, request, _grant(), admitted, materialized)
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_only_the_declared_no_change_and_activation_conflicts(monkeypatch):
+    request = _request(_definition())
+    materialized = runner._MaterializedCandidate(31, runner._Pointer(30, 12, 13, 7), 1, 0)
+
+    async def mismatch(*_args, **_kwargs):
+        raise PublicationConflict(runner._NO_CHANGE_DIFFERENCE)
+
+    monkeypatch.setattr(runner, "record_no_change", mismatch)
+    assert await runner._record_no_change_or_none(_LifecycleSession, request, _grant(), materialized) is None
+
+    async def unexpected_conflict(*_args, **_kwargs):
+        raise PublicationConflict("unexpected")
+
+    monkeypatch.setattr(runner, "record_no_change", unexpected_conflict)
+    with pytest.raises(PublicationConflict, match="unexpected"):
+        await runner._record_no_change_or_none(_LifecycleSession, request, _grant(), materialized)
+    monkeypatch.setattr(runner, "activate_generation", unexpected_conflict)
+    assert await runner._activate(_LifecycleSession, request, materialized) is None
+
+
+def test_family_validation_rejects_noncanonical_child_and_scalar_values():
+    decimal_field = _codec_field("value", "decimal")
+    timestamp_field = _codec_field("value", "timestamp")
+    collection = ChildCollection(name="rates", parent_key=(), child_key=("value",))
+
+    assert family._canonical_child_key(collection, ("not-a-decimal",), {"value": decimal_field}) is None
+    assert family._canonical_child_key(collection, (datetime(2026, 1, 1),), {"value": timestamp_field}) is None
+    assert not family._is_value_type_valid("not-a-decimal", "decimal")
+    projected_string = Field("value", 99, "string", False, 1, None)
+    assert not family._is_scalar_storage_valid(projected_string, "\ud800")
+    projected_decimal = Field("value", 99, "decimal", False, 1, None)
+    assert not family._is_scalar_storage_valid(projected_decimal, object())
+    assert not family.is_decimal_scalar_storage_valid("not-a-decimal")
+    assert family._normalize_decimal_fraction(Decimal(0)) == Decimal(0)
+
+
+def test_family_validation_rejects_missing_child_identity_after_field_validation(monkeypatch):
+    collection = ChildCollection(
+        name="rates",
+        parent_key=(KeyPart(child_field="parent", root_field="id"),),
+        child_key=("value",),
+    )
+    rejection_codes = defaultdict(set)
+    family._admit_child_records(
+        SimpleNamespace(child_collections=(collection,)),
+        {"rates": ({"parent": "root", "value": None},)},
+        {("root",): {}},
+        {"rates": {"value": _codec_field("value", "string", nullable=True)}},
+        rejection_codes,
+    )
+    assert rejection_codes[("root",)] == {"child_key_missing"}
+
+    class BrokenDecimal:
+        def __new__(cls, _value):
+            raise family.InvalidOperation
+
+    monkeypatch.setattr(family, "Decimal", BrokenDecimal)
+    assert family.normalize_source_decimal("1") is None
+    assert family._is_scalar_storage_valid(_codec_field("value", "date"), datetime(2026, 1, 1))
+
+
+class _RegistryResult:
+    def __init__(self, row=None):
+        self._row = row
+
+    def scalar_one_or_none(self):
+        return self._row
+
+
+class _RegistrySession:
+    def __init__(self):
+        self.row = None
+        self.rows = ()
+        self.clock = None
+        self.info = {}
+        self.no_autoflush = nullcontext()
+
+    async def execute(self, _statement):
+        return _RegistryResult(self.row)
+
+    async def scalars(self, _statement):
+        return SimpleNamespace(all=lambda: list(self.rows))
+
+    async def scalar(self, _statement):
+        return self.clock
+
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_untrusted_persisted_boundaries():
+    request = _request(_definition())
+    session = _RegistrySession()
+
+    with pytest.raises(CandidateRunnerError, match="dataset does not exist"):
+        await runner_registry.lock_dataset(session, request.dataset_id)
+    with pytest.raises(CandidateRunnerError, match="execution does not exist"):
+        await runner_registry.lock_execution(session, request)
+    session.row = SimpleNamespace(
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+        capture_bundle_id=None,
+    )
+    with pytest.raises(CandidateRunnerError, match="identity does not match"):
+        await runner_registry.lock_execution(session, request)
+
+    with pytest.raises(CandidateRunnerError, match="authority is not bound"):
+        await runner_registry.prepare_materialization_statement(session)
+    session.info[runner_registry._MATERIALIZATION_WINDOW_KEY] = runner_registry._MaterializationLeaseWindow(
+        expires_at=datetime.now(UTC),
+        monotonic_deadline=0,
+    )
+    with pytest.raises(runner_registry.LeaseAuthorityLost, match="window expired"):
+        await runner_registry.prepare_materialization_statement(session)
+    session.clock = datetime(2026, 1, 1)
+    with pytest.raises(CandidateRunnerError, match="aware timestamp"):
+        await runner_registry.database_now(session)
+
+    session.rows = (
+        SimpleNamespace(
+            collection_name="rates", collection_slot=1, canonical_key_shape="wrong", key_shape_sha256=b"wrong"
+        ),
+    )
+    with pytest.raises(CandidateRunnerError, match="child collection keys"):
+        await runner_registry.load_collection_slots(session, request)
+    session.rows = ()
+    with pytest.raises(CandidateRunnerError, match="field rows"):
+        await runner_registry.validate_field_rows(session, request, {"rates": 1})
+
+    field_rows = [
+        SimpleNamespace(
+            field_slot=field.field_slot,
+            field_name=field.field_id,
+            collection_slot=0 if field.collection is None else 1,
+            field_type=field.value_type,
+            is_nullable=field.nullable,
+            projection_slot=field.projection_slot or 0,
+        )
+        for field in request.definition.fields
+    ]
+    field_rows[0].field_name = "wrong"
+    session.rows = field_rows
+    with pytest.raises(CandidateRunnerError, match="field rows"):
+        await runner_registry.validate_field_rows(session, request, {"rates": 1})
+
+    session.rows = [
+        SimpleNamespace(field_slot=field.field_slot, field_id="wrong") for field in request.definition.fields
+    ]
+    with pytest.raises(CandidateRunnerError, match="field slots"):
+        await runner_registry.validate_field_slot_ledger(session, request)
+
+    streams = [
+        SimpleNamespace(
+            stream_id=stream.stream_id,
+            stream_slot=index,
+            record_kind=stream.record_kind,
+            collection_slot=None if stream.child_collection is None else 1,
+            decoder=stream.format,
+            compression=stream.compression,
+            snapshot_token_selector=stream.snapshot_token,
+            record_path=stream.record_path,
+        )
+        for index, stream in enumerate(request.definition.source_streams, start=1)
+    ]
+    streams[0].record_kind = "wrong"
+    session.rows = streams
+    with pytest.raises(CandidateRunnerError, match="source streams"):
+        await runner_registry.load_stream_slots(session, request, {"rates": 1})
+    streams[0].record_kind = "root"
+    streams[1].stream_slot = streams[0].stream_slot
+    with pytest.raises(CandidateRunnerError, match="slots are not unique"):
+        await runner_registry.load_stream_slots(session, request, {"rates": 1})
+
+    session.rows = ()
+    with pytest.raises(CandidateRunnerError, match="field aliases"):
+        await runner_registry.validate_alias_rows(session, request, {"providers": 1, "rates": 2})
+
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_lost_authority_and_profile_drift(monkeypatch):
+    request = _request(_definition())
+    session = _RegistrySession()
+    execution = SimpleNamespace(execution_id=request.execution_id)
+
+    with pytest.raises(runner_registry.LeaseAuthorityLost, match="lease is no longer current"):
+        await runner_registry.establish_materialization_authority(
+            session,
+            request,
+            _grant(),
+            execution,
+            None,
+            datetime.now(UTC),
+        )
+
+    session.info[runner_registry._MATERIALIZATION_WINDOW_KEY] = object()
+    with pytest.raises(CandidateRunnerError, match="already bound"):
+        await runner_registry.establish_materialization_authority(
+            session,
+            request,
+            _grant(),
+            execution,
+            SimpleNamespace(),
+            datetime.now(UTC),
+        )
+
+    session.info.clear()
+    with pytest.raises(runner_registry.LeaseAuthorityLost, match="lease is no longer current"):
+        await runner_registry.establish_materialization_authority(
+            session,
+            request,
+            _grant(),
+            execution,
+            SimpleNamespace(),
+            datetime.now(UTC),
+        )
+
+    root_stream = request.definition.source_streams[0]
+    second_root_stream = replace(root_stream, stream_id="other_root")
+    root_only_request = replace(request, definition=SimpleNamespace(source_streams=(root_stream, second_root_stream)))
+    session.rows = (
+        SimpleNamespace(
+            stream_id=root_stream.stream_id,
+            stream_slot=1,
+            record_kind="root",
+            collection_slot=None,
+            decoder=root_stream.format,
+            compression=root_stream.compression,
+            snapshot_token_selector=root_stream.snapshot_token,
+            record_path=root_stream.record_path,
+        ),
+        SimpleNamespace(
+            stream_id=second_root_stream.stream_id,
+            stream_slot=2,
+            record_kind="root",
+            collection_slot=None,
+            decoder=second_root_stream.format,
+            compression=second_root_stream.compression,
+            snapshot_token_selector=second_root_stream.snapshot_token,
+            record_path=second_root_stream.record_path,
+        ),
+    )
+    with pytest.raises(CandidateRunnerError, match="one root stream"):
+        await runner_registry.load_stream_slots(session, root_only_request, {})
+
+    async def no_statement_budget(*_args):
+        return None
+
+    monkeypatch.setattr(runner_registry, "prepare_materialization_statement", no_statement_budget)
+    monkeypatch.setattr(runner_registry, "selection_profile_models", lambda *_args, **_kwargs: (object(),))
+    monkeypatch.setattr(runner_registry, "has_profile_mismatch", lambda *_args: True)
+    session.rows = (object(),)
+    with pytest.raises(CandidateRunnerError, match="selection profiles"):
+        await runner_registry.ensure_selection_profiles(
+            session, request, SimpleNamespace(child_collection_slots={"rates": 1})
+        )
