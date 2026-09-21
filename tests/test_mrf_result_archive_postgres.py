@@ -36,11 +36,54 @@ _MRF_ADDRESS_MIGRATION_PATH = (
 )
 
 
-async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema):
-    """Build the real summary and receipt after the fixture's family rotation."""
+async def _prepare_synthetic_publication_schema(connection, schema):
+    """Add the receipt migration and canonical-address coverage for a fixture."""
+
     from tests.test_reference_family_result_generation_postgres import _run_migration
 
     migration = Path(__file__).resolve().parents[1] / "alembic/versions/20260920170000_mrf_publication_receipt.py"
+
+    await _run_migration(connection, migration, "upgrade")
+    await connection.execute(
+        text(f'''CREATE TABLE "{schema}".address_archive_v2 (
+        address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL)''')
+    )
+    synthetic_key = uuid4()
+    for name in ("mrf_address", "mrf_address_evidence"):
+        await connection.execute(
+            text(f'UPDATE "{schema}".{name} SET address_key=:key WHERE address_key IS NULL'),
+            {"key": synthetic_key},
+        )
+    await connection.execute(
+        text(f'''
+        INSERT INTO "{schema}".address_archive_v2 (address_key, source_bits)
+        SELECT address_key, 16 FROM "{schema}".mrf_address
+        UNION SELECT address_key, 16 FROM "{schema}".mrf_address_evidence
+    ''')
+    )
+    assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".address_archive_v2')) > 0
+
+
+async def _configure_synthetic_plan_summary_tables(connection, schema, patch):
+    """Bind plan-summary tables to the synthetic schema and create missing ones."""
+
+    metadata = MetaData()
+    for attribute in (
+        "plan_table",
+        "plan_attributes_table",
+        "plan_benefits_table",
+        "plan_prices_table",
+        "summary_table",
+    ):
+        table = getattr(plan_summary, attribute).to_metadata(metadata, schema=schema)
+        patch.setattr(plan_summary, attribute, table)
+        if table.name not in {"plan", "plan_search_summary"}:
+            await connection.run_sync(lambda sync, table=table: table.create(sync))
+
+
+async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema):
+    """Build the real summary and receipt after the fixture's family rotation."""
+
     database = Database(engine=engine, session_factory=sessions)
 
     async def ready(_test_mode):
@@ -54,37 +97,8 @@ async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema)
         patch.setattr(plan_summary, "db", database)
         patch.setattr(plan_summary, "ensure_database", ready)
         async with engine.begin() as connection:
-            await _run_migration(connection, migration, "upgrade")
-            await connection.execute(
-                text(f'''CREATE TABLE "{schema}".address_archive_v2 (
-                address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL)''')
-            )
-            synthetic_key = uuid4()
-            for name in ("mrf_address", "mrf_address_evidence"):
-                await connection.execute(
-                    text(f'UPDATE "{schema}".{name} SET address_key=:key WHERE address_key IS NULL'),
-                    {"key": synthetic_key},
-                )
-            await connection.execute(
-                text(f'''
-                INSERT INTO "{schema}".address_archive_v2 (address_key, source_bits)
-                SELECT address_key, 16 FROM "{schema}".mrf_address
-                UNION SELECT address_key, 16 FROM "{schema}".mrf_address_evidence
-            ''')
-            )
-            assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".address_archive_v2')) > 0
-            metadata = MetaData()
-            for attribute in (
-                "plan_table",
-                "plan_attributes_table",
-                "plan_benefits_table",
-                "plan_prices_table",
-                "summary_table",
-            ):
-                table = getattr(plan_summary, attribute).to_metadata(metadata, schema=schema)
-                patch.setattr(plan_summary, attribute, table)
-                if table.name not in {"plan", "plan_search_summary"}:
-                    await connection.run_sync(lambda sync, table=table: table.create(sync))
+            await _prepare_synthetic_publication_schema(connection, schema)
+            await _configure_synthetic_plan_summary_tables(connection, schema, patch)
         patch.setattr(
             plan_summary,
             "PRICE_RATE_COLUMNS",
@@ -481,18 +495,9 @@ async def _assert_committed_activation(sessions, destination_schema, unrelated_s
         )
 
 
-async def _exercise_mrf_roundtrip(
-    sessions,
-    source_schema,
-    destination_schema,
-    unrelated_schema,
-    prepared_dataset_id,
-    restored_dataset_id,
-    source_generation,
-) -> None:
-    manifest, ownership = await _prepare_restored_candidate(
-        sessions, source_schema, prepared_dataset_id, restored_dataset_id
-    )
+async def _prepare_destination_address_merge(sessions, destination_schema, ownership):
+    """Insert one local address contribution and return its canonical key."""
+
     async with sessions() as session, session.begin():
         key = await session.scalar(
             text(
@@ -506,7 +511,12 @@ async def _exercise_mrf_roundtrip(
             ),
             {"key": key, "note": "keep-local"},
         )
-    incumbent, validation, owner_oid = await _prepare_activation(sessions, destination_schema, manifest, ownership)
+    return key
+
+
+async def _assert_destination_address_conflict_rejected(sessions, destination_schema, key, activation_by_field):
+    """Reject activation when an incumbent local address conflicts with the stage."""
+
     async with sessions() as session:
         transaction = await session.begin()
         await session.execute(
@@ -514,29 +524,13 @@ async def _exercise_mrf_roundtrip(
             {"key": key, "other": uuid4()},
         )
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="key conflicts"):
-            await _activate(session, ownership, manifest, incumbent, validation, owner_oid, source_generation)
+            await _activate(session, **activation_by_field)
         await transaction.rollback()
-    await _assert_replaced_sequence_rejected(sessions, ownership)
-    await _assert_wrong_sequence_column_rejected(sessions, ownership)
-    await _assert_stale_incumbent_rejected(
-        sessions, ownership, manifest, incumbent, validation, owner_oid, source_generation
-    )
-    await _assert_rolled_back_activation(
-        sessions, destination_schema, ownership, manifest, incumbent, validation, owner_oid, source_generation
-    )
-    await _assert_committed_activation(
-        sessions,
-        destination_schema,
-        unrelated_schema,
-        {
-            "ownership": ownership,
-            "manifest": manifest,
-            "incumbent": incumbent,
-            "validation": validation,
-            "owner_oid": owner_oid,
-            "source_generation": source_generation,
-        },
-    )
+
+
+async def _assert_destination_address_merge_retained(sessions, destination_schema, key):
+    """Confirm activation preserves and combines the local address contribution."""
+
     async with sessions() as session, session.begin():
         assert (
             await session.scalar(
@@ -552,6 +546,39 @@ async def _exercise_mrf_roundtrip(
             )
             == 17
         )
+
+
+async def _exercise_mrf_roundtrip(
+    sessions,
+    source_schema,
+    destination_schema,
+    unrelated_schema,
+    prepared_dataset_id,
+    restored_dataset_id,
+    source_generation,
+) -> None:
+    """Exercise address conflicts, rollbacks, and successful MRF archive activation."""
+
+    manifest, ownership = await _prepare_restored_candidate(
+        sessions, source_schema, prepared_dataset_id, restored_dataset_id
+    )
+    key = await _prepare_destination_address_merge(sessions, destination_schema, ownership)
+    incumbent, validation, owner_oid = await _prepare_activation(sessions, destination_schema, manifest, ownership)
+    activation_by_field = {
+        "ownership": ownership,
+        "manifest": manifest,
+        "incumbent": incumbent,
+        "validation": validation,
+        "owner_oid": owner_oid,
+        "source_generation": source_generation,
+    }
+    await _assert_destination_address_conflict_rejected(sessions, destination_schema, key, activation_by_field)
+    await _assert_replaced_sequence_rejected(sessions, ownership)
+    await _assert_wrong_sequence_column_rejected(sessions, ownership)
+    await _assert_stale_incumbent_rejected(sessions, **activation_by_field)
+    await _assert_rolled_back_activation(sessions, destination_schema, **activation_by_field)
+    await _assert_committed_activation(sessions, destination_schema, unrelated_schema, activation_by_field)
+    await _assert_destination_address_merge_retained(sessions, destination_schema, key)
 
 
 @pytest.mark.asyncio
