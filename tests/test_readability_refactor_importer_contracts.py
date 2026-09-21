@@ -400,6 +400,7 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "publish_local_reference_family_generation", AsyncMock())
 
     terminal_result = await cms_doctors.publish_cms_doctors_generation(worker_context_by_key)
 
@@ -434,6 +435,7 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "publish_local_reference_family_generation", AsyncMock())
 
     await cms_doctors.publish_cms_doctors_generation(
         {"import_date": "run", "context": {"run": 1, "education": {"education_rows": 10000}, "control_run_id": "control", "start": "start"}}
