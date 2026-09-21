@@ -27,7 +27,14 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     tiger_revision = "20260920110000_tiger_result_generation"
     mrf_address_revision = "20260920120000_mrf_address_result_generation"
     geo_revision = "20260920130000_geo_result_generation"
-    assert script.get_heads() == [geo_revision]
+    pharmacy_economics_revision = "20260920140000_pharmacy_economics_result_generation"
+    terminology_revision = "20260920150000_terminology_result_generation"
+    census_revision = "20260920160000_geo_census_result_generation"
+    receipt_revision = "20260920170000_mrf_publication_receipt"
+    provider_quality_revision = "20260921000000_provider_quality_result_generation"
+    assert script.get_heads() == [provider_quality_revision]
+    assert script.get_revision(provider_quality_revision).down_revision == receipt_revision
+    assert script.get_revision(receipt_revision).down_revision == "20260920160000_geo_census_result_generation"
     assert script.get_revision(geo_revision).down_revision == mrf_address_revision
     assert script.get_revision(mrf_address_revision).down_revision == tiger_revision
     assert script.get_revision(tiger_revision).down_revision == cms_revision
@@ -49,6 +56,11 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
         tiger_revision,
         mrf_address_revision,
         geo_revision,
+        pharmacy_economics_revision,
+        terminology_revision,
+        census_revision,
+        receipt_revision,
+        provider_quality_revision,
     ]
     assert [step.revision.revision for step in script._upgrade_revs("head", service_network_revision)] == [
         entity_address_revision,
@@ -58,6 +70,11 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
         tiger_revision,
         mrf_address_revision,
         geo_revision,
+        pharmacy_economics_revision,
+        terminology_revision,
+        census_revision,
+        receipt_revision,
+        provider_quality_revision,
     ]
 
 
