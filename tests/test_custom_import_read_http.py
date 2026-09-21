@@ -213,6 +213,40 @@ def test_canonical_unicode_filter_values_round_trip() -> None:
     assert http._parse_search_request(body).filters[0].value == request_by_field["filters"][0]["value"]
 
 
+def test_optional_order_terms_round_trip_with_fixed_null_ordering() -> None:
+    request_by_field = json.loads(_BODY)
+    request_by_field["order"] = [
+        {"field_id": "metric", "direction": "desc"},
+        {"field_id": "display_name", "direction": "asc"},
+    ]
+    parsed = http._parse_search_request(http._canonical_json_bytes(request_by_field))
+
+    assert parsed.order_terms is not None
+    assert [(term.field_id, term.direction, term.nulls) for term in parsed.order_terms] == [
+        ("metric", "desc", "last"),
+        ("display_name", "asc", "last"),
+    ]
+    assert parsed.bind(11).order_terms == parsed.order_terms
+    assert http._parse_search_request(_BODY).order_terms is None
+
+
+def test_signed_order_direction_cannot_be_changed_without_resigning() -> None:
+    request_by_field = json.loads(_BODY)
+    request_by_field["order"] = [{"field_id": "metric", "direction": "asc"}]
+    body = http._canonical_json_bytes(request_by_field)
+    request_by_field["order"][0]["direction"] = "desc"
+    tampered_body = http._canonical_json_bytes(request_by_field)
+
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._verify_transport(
+            headers=_headers(body=body),
+            body=tampered_body,
+            request=http._parse_search_request(tampered_body),
+            trusted_now=_NOW,
+            keyring=http._load_keyring(_keyring_document()),
+        )
+
+
 @pytest.mark.parametrize(
     "operation",
     [
@@ -336,6 +370,28 @@ def test_closed_headers_reject_malformed_runtime_shapes() -> None:
         {"cursor": None, "filters": [], "page_size": 50, "target": {**_TARGET, "generation_id": 0}},
         {"cursor": None, "filters": {}, "page_size": 50, "target": _TARGET},
         {"cursor": None, "filters": ["bad"], "page_size": 50, "target": _TARGET},
+        {"cursor": None, "filters": [], "order": [], "page_size": 50, "target": _TARGET},
+        {
+            "cursor": None,
+            "filters": [],
+            "order": [{"field_id": "metric", "direction": "up"}],
+            "page_size": 50,
+            "target": _TARGET,
+        },
+        {
+            "cursor": None,
+            "filters": [],
+            "order": [{"field_id": "metric", "direction": []}],
+            "page_size": 50,
+            "target": _TARGET,
+        },
+        {
+            "cursor": None,
+            "filters": [],
+            "order": [{"field_id": "metric", "direction": "asc", "nulls": "last"}],
+            "page_size": 50,
+            "target": _TARGET,
+        },
         {
             "cursor": None,
             "filters": [{"field_id": "name", "operator": "eq"}],
