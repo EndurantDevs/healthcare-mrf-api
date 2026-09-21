@@ -217,13 +217,13 @@ def test_bridge_rejects_malformed_request_and_acquisition_boundaries():
     acquisition = _acquisition(definition)
     request = _request(definition, acquisition)
 
-    for malformed in (
-        object(),
-        replace(request, definition=object()),
-        replace(request, lease_token=""),
-        replace(request, dataset_id=0),
+    for malformed, expected_message in (
+        (object(), "Snowflake candidate request is invalid"),
+        (replace(request, definition=object()), "Snowflake candidate definition is invalid"),
+        (replace(request, lease_token=""), "Snowflake candidate request is invalid"),
+        (replace(request, dataset_id=0), "Snowflake candidate identifiers are invalid"),
     ):
-        with pytest.raises(SnowflakeCandidateError):
+        with pytest.raises(SnowflakeCandidateError, match=expected_message):
             snowflake_candidate._validated_request(malformed)
     with pytest.raises(SnowflakeCandidateError, match="acquisition is invalid"):
         snowflake_candidate._verified_acquisition(object())
