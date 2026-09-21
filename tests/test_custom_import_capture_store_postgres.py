@@ -292,89 +292,67 @@ async def test_capture_registration_rejects_an_incomplete_definition_graph():
             await _attempt_incomplete_capture_registration(case)
 
 
-@pytest.mark.asyncio
-async def test_stale_execution_bind_rolls_back_the_enclosing_capture_registration():
-    async with isolated_publication_case() as case:
-        seed = await _seed_case(case)
-        stale_owner = "synthetic-stale-owner"
-        recovery_identity = "synthetic-recovery-owner"
-        async with case.sessions() as session:
-            async with session.begin():
-                reserved = await lifecycle.reserve_execution(
-                    session,
-                    dataset_id=seed.dataset_id,
-                    definition_revision_id=seed.definition_revision_id,
-                    schema_revision_id=seed.schema_revision_id,
-                    idempotency_key="synthetic-stale-bind",
-                    mechanism="local",
-                )
-                first_owner = await lifecycle.claim_execution(
-                    session,
-                    execution_id=reserved.execution_id,
-                    token=stale_owner,
-                    lease_seconds=60,
-                )
-        assert first_owner is not None
+async def _reserve_execution_with_lease_takeover(
+    case,
+    seed: _Seed,
+    *,
+    stale_owner: str,
+    recovery_identity: str,
+) -> tuple[lifecycle.ExecutionSubmission, lifecycle.LeaseGrant, lifecycle.LeaseGrant]:
+    """Reserve an execution, expire its first lease, and return both owners."""
 
-        async with case.sessions() as session:
-            async with session.begin():
-                await session.execute(
-                    update(CustomImportLease)
-                    .where(CustomImportLease.execution_id == reserved.execution_id)
-                    .values(expires_at=func.clock_timestamp())
-                )
-        async with case.sessions() as session:
-            async with session.begin():
-                recovery_owner = await lifecycle.claim_execution(
-                    session,
-                    execution_id=reserved.execution_id,
-                    token=recovery_identity,
-                    lease_seconds=60,
-                )
-        assert recovery_owner is not None and recovery_owner.fence == first_owner.fence + 1
-
-        with pytest.raises(RuntimeError, match="rollback stale bind"):
-            async with case.sessions() as session:
-                async with session.begin():
-                    bundle = await register_capture_bundle(
-                        session,
-                        dataset_id=seed.dataset_id,
-                        definition_revision_id=seed.definition_revision_id,
-                        schema_revision_id=seed.schema_revision_id,
-                        receipts=_build_receipt_set(),
-                    )
-                    binding = await lifecycle.bind_execution_capture_bundle(
-                        session,
-                        execution_id=reserved.execution_id,
-                        dataset_id=seed.dataset_id,
-                        definition_revision_id=seed.definition_revision_id,
-                        schema_revision_id=seed.schema_revision_id,
-                        capture_bundle_id=bundle.capture_bundle_id,
-                        fence=first_owner.fence,
-                        token=stale_owner,
-                    )
-                    assert binding is None
-                    raise RuntimeError("rollback stale bind")
-
-        async with case.sessions() as session:
-            bundles = await session.scalar(
-                select(func.count()).select_from(CustomImportCaptureBundle).where(
-                    CustomImportCaptureBundle.dataset_id == seed.dataset_id
-                )
+    async with case.sessions() as session:
+        async with session.begin():
+            reserved = await lifecycle.reserve_execution(
+                session,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                idempotency_key="synthetic-stale-bind",
+                mechanism="local",
             )
-            captures = await session.scalar(
-                select(func.count()).select_from(CustomImportCapture).where(
-                    CustomImportCapture.dataset_id == seed.dataset_id
-                )
+            first_owner = await lifecycle.claim_execution(
+                session,
+                execution_id=reserved.execution_id,
+                token=stale_owner,
+                lease_seconds=60,
             )
-            execution = await session.get(CustomImportExecution, reserved.execution_id)
+    assert first_owner is not None
 
-        assert bundles == captures == 0
-        assert execution is not None and execution.capture_bundle_id is None
+    async with case.sessions() as session:
+        async with session.begin():
+            await session.execute(
+                update(CustomImportLease)
+                .where(CustomImportLease.execution_id == reserved.execution_id)
+                .values(expires_at=func.clock_timestamp())
+            )
+    async with case.sessions() as session:
+        async with session.begin():
+            recovery_owner = await lifecycle.claim_execution(
+                session,
+                execution_id=reserved.execution_id,
+                token=recovery_identity,
+                lease_seconds=60,
+            )
+    assert recovery_owner is not None
+    assert recovery_owner.fence == first_owner.fence + 1
+    return reserved, first_owner, recovery_owner
 
+
+async def _roll_back_stale_capture_registration(
+    case,
+    seed: _Seed,
+    *,
+    execution_id: int,
+    stale_fence: int,
+    stale_owner: str,
+) -> None:
+    """Require a stale bind to roll back its caller-owned capture transaction."""
+
+    with pytest.raises(RuntimeError, match="rollback stale bind"):
         async with case.sessions() as session:
             async with session.begin():
-                recovery_bundle = await register_capture_bundle(
+                bundle = await register_capture_bundle(
                     session,
                     dataset_id=seed.dataset_id,
                     definition_revision_id=seed.definition_revision_id,
@@ -383,18 +361,104 @@ async def test_stale_execution_bind_rolls_back_the_enclosing_capture_registratio
                 )
                 binding = await lifecycle.bind_execution_capture_bundle(
                     session,
-                    execution_id=reserved.execution_id,
+                    execution_id=execution_id,
                     dataset_id=seed.dataset_id,
                     definition_revision_id=seed.definition_revision_id,
                     schema_revision_id=seed.schema_revision_id,
-                    capture_bundle_id=recovery_bundle.capture_bundle_id,
-                    fence=recovery_owner.fence,
-                    token=recovery_identity,
+                    capture_bundle_id=bundle.capture_bundle_id,
+                    fence=stale_fence,
+                    token=stale_owner,
                 )
-                assert binding is not None
-                assert binding.execution_id == reserved.execution_id
-                assert binding.capture_bundle_id == recovery_bundle.capture_bundle_id
+                assert binding is None
+                raise RuntimeError("rollback stale bind")
 
+
+async def _capture_registration_counts(case, seed: _Seed) -> tuple[int, int]:
+    """Return the retained bundle and capture row counts for one dataset."""
+
+    async with case.sessions() as session:
+        bundle_count = await session.scalar(
+            select(func.count())
+            .select_from(CustomImportCaptureBundle)
+            .where(CustomImportCaptureBundle.dataset_id == seed.dataset_id)
+        )
+        capture_count = await session.scalar(
+            select(func.count())
+            .select_from(CustomImportCapture)
+            .where(CustomImportCapture.dataset_id == seed.dataset_id)
+        )
+    return bundle_count, capture_count
+
+
+async def _register_recovery_capture_bundle(
+    case,
+    seed: _Seed,
+    *,
+    execution_id: int,
+    recovery_fence: int,
+    recovery_identity: str,
+) -> int:
+    """Register and bind a retained bundle while the recovery owner is current."""
+
+    async with case.sessions() as session:
+        async with session.begin():
+            recovery_bundle = await register_capture_bundle(
+                session,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                receipts=_build_receipt_set(),
+            )
+            binding = await lifecycle.bind_execution_capture_bundle(
+                session,
+                execution_id=execution_id,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                capture_bundle_id=recovery_bundle.capture_bundle_id,
+                fence=recovery_fence,
+                token=recovery_identity,
+            )
+            assert binding is not None
+            assert binding.execution_id == execution_id
+            assert binding.capture_bundle_id == recovery_bundle.capture_bundle_id
+            return recovery_bundle.capture_bundle_id
+
+
+@pytest.mark.asyncio
+async def test_stale_execution_bind_rolls_back_the_enclosing_capture_registration():
+    """A stale bind rolls back capture rows, while recovery binds and replays."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case)
+        stale_owner = "synthetic-stale-owner"
+        recovery_identity = "synthetic-recovery-owner"
+        reserved, first_owner, recovery_owner = await _reserve_execution_with_lease_takeover(
+            case,
+            seed,
+            stale_owner=stale_owner,
+            recovery_identity=recovery_identity,
+        )
+        await _roll_back_stale_capture_registration(
+            case,
+            seed,
+            execution_id=reserved.execution_id,
+            stale_fence=first_owner.fence,
+            stale_owner=stale_owner,
+        )
+        bundle_count, capture_count = await _capture_registration_counts(case, seed)
+        async with case.sessions() as session:
+            execution = await session.get(CustomImportExecution, reserved.execution_id)
+        assert bundle_count == capture_count == 0
+        assert execution is not None and execution.capture_bundle_id is None
+
+        recovery_bundle_id = await _register_recovery_capture_bundle(
+            case,
+            seed,
+            execution_id=reserved.execution_id,
+            recovery_fence=recovery_owner.fence,
+            recovery_identity=recovery_identity,
+        )
         async with case.sessions() as session:
             async with session.begin():
                 replayed = await lifecycle.reserve_execution(
@@ -408,4 +472,4 @@ async def test_stale_execution_bind_rolls_back_the_enclosing_capture_registratio
 
         assert replayed.created is False
         assert replayed.execution_id == reserved.execution_id
-        assert replayed.capture_bundle_id == recovery_bundle.capture_bundle_id
+        assert replayed.capture_bundle_id == recovery_bundle_id

@@ -190,7 +190,9 @@ async def test_duplicate_submission_returns_the_same_execution_and_rejects_drift
 
 
 @pytest.mark.asyncio
-async def test_reservation_reuses_its_bound_execution_without_replacing_the_bundle():
+async def test_reservation_replays_its_bound_execution():
+    """A reservation replays its running execution with the retained bundle."""
+
     session = _SyntheticSession()
 
     reserved = await lifecycle.reserve_execution(
@@ -235,6 +237,38 @@ async def test_reservation_reuses_its_bound_execution_without_replacing_the_bund
         created=False,
         capture_bundle_id=44,
     )
+
+
+@pytest.mark.asyncio
+async def test_bound_reservation_rejects_bundle_replacement():
+    """A live owner cannot replace a capture bundle bound to its execution."""
+
+    session = _SyntheticSession()
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-reservation",
+        mechanism="local",
+    )
+    owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+    )
+    assert owner is not None
+    bound = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=owner.fence,
+        token=_WORKER_A,
+    )
+    assert bound is not None
     with pytest.raises(lifecycle.IdempotencyConflict):
         await lifecycle.bind_execution_capture_bundle(
             session,
@@ -243,10 +277,16 @@ async def test_reservation_reuses_its_bound_execution_without_replacing_the_bund
             definition_revision_id=22,
             schema_revision_id=33,
             capture_bundle_id=45,
-            fence=first_owner.fence,
+            fence=owner.fence,
             token=_WORKER_A,
         )
 
+
+@pytest.mark.asyncio
+async def test_canceled_reservation_rejects_capture_binding():
+    """Cancellation prevents a lease owner from binding a capture bundle."""
+
+    session = _SyntheticSession()
     canceled = await lifecycle.reserve_execution(
         session,
         dataset_id=11,
