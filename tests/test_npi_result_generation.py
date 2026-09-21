@@ -13,7 +13,33 @@ from process import npi_result_archive as archive
 from process import npi_result_generation as generation
 
 
+_HOSPITAL_UPGRADE_REVISIONS = (
+    "20260914100000_entity_address_result_generation",
+    "20260914110000_reference_family_result_generation",
+    "20260914120000_npi_result_generation",
+    "20260917130000_custom_import_generation_finality",
+    "20260917120000_entity_address_service_network",
+    "20260914130000_mrf_result_generation",
+    "20260920100000_cms_doctors_result_generation",
+    "20260920110000_tiger_result_generation",
+    "20260920120000_mrf_address_result_generation",
+    "20260920130000_geo_result_generation",
+    "20260920140000_pharmacy_economics_result_generation",
+    "20260920150000_terminology_result_generation",
+    "20260920160000_geo_census_result_generation",
+    "20260920170000_mrf_publication_receipt",
+    "20260921000000_provider_quality_result_generation",
+)
+_SERVICE_NETWORK_UPGRADE_REVISIONS = (
+    "20260914100000_entity_address_result_generation",
+    "20260914110000_reference_family_result_generation",
+    *_HOSPITAL_UPGRADE_REVISIONS[5:],
+)
+
+
 def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
+    """The archive migrations retain one ordered head from deployed schemas."""
+
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     hospital_revision = "20260917100000_hospital_price_csv_v3_label"
     npi_revision = "20260914120000_npi_result_generation"
@@ -27,9 +53,6 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     tiger_revision = "20260920110000_tiger_result_generation"
     mrf_address_revision = "20260920120000_mrf_address_result_generation"
     geo_revision = "20260920130000_geo_result_generation"
-    pharmacy_economics_revision = "20260920140000_pharmacy_economics_result_generation"
-    terminology_revision = "20260920150000_terminology_result_generation"
-    census_revision = "20260920160000_geo_census_result_generation"
     receipt_revision = "20260920170000_mrf_publication_receipt"
     provider_quality_revision = "20260921000000_provider_quality_result_generation"
     assert script.get_heads() == [provider_quality_revision]
@@ -45,37 +68,12 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     assert script.get_revision(service_network_revision).down_revision == finality_revision
     assert script.get_revision(reference_revision).down_revision == entity_address_revision
     assert script.get_revision(mrf_revision).down_revision == (service_network_revision, reference_revision)
-    assert [step.revision.revision for step in script._upgrade_revs("head", hospital_revision)] == [
-        entity_address_revision,
-        reference_revision,
-        npi_revision,
-        finality_revision,
-        service_network_revision,
-        mrf_revision,
-        cms_revision,
-        tiger_revision,
-        mrf_address_revision,
-        geo_revision,
-        pharmacy_economics_revision,
-        terminology_revision,
-        census_revision,
-        receipt_revision,
-        provider_quality_revision,
-    ]
-    assert [step.revision.revision for step in script._upgrade_revs("head", service_network_revision)] == [
-        entity_address_revision,
-        reference_revision,
-        mrf_revision,
-        cms_revision,
-        tiger_revision,
-        mrf_address_revision,
-        geo_revision,
-        pharmacy_economics_revision,
-        terminology_revision,
-        census_revision,
-        receipt_revision,
-        provider_quality_revision,
-    ]
+    assert tuple(step.revision.revision for step in script._upgrade_revs("head", hospital_revision)) == (
+        _HOSPITAL_UPGRADE_REVISIONS
+    )
+    assert tuple(step.revision.revision for step in script._upgrade_revs("head", service_network_revision)) == (
+        _SERVICE_NETWORK_UPGRADE_REVISIONS
+    )
 
 
 def _serving(lineage_id: str, revision: int) -> dict[str, object]:
