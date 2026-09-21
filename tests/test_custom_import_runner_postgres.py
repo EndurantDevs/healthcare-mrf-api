@@ -26,6 +26,7 @@ from db.models.custom_import import (
     CustomImportCurrentGeneration,
     CustomImportDataset,
     CustomImportDefinitionRevision,
+    CustomImportEntityBinding,
     CustomImportExecution,
     CustomImportFamilyRevision,
     CustomImportField,
@@ -50,6 +51,7 @@ from process.custom_import.definition import CustomImportDefinition, canonical_j
 from process.custom_import.execution import claim_execution, create_execution, request_cancellation
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner import CandidateRunnerError, CandidateRunRequest, CandidateRunResult, run_candidate
+from process.custom_import.runner_codec import child_key_hash, new_family_hash
 from process.custom_import.snowflake_candidate import SnowflakeCandidateRequest, run_snowflake_candidate
 from process.custom_import.snowflake_python import _parquet_reader
 from tests.custom_import_postgres_support import digest, isolated_publication_case
@@ -104,7 +106,12 @@ class _SnowflakePartitionSources:
         self._reader.close()
 
 
-def _snowflake_acquisition(definition: CustomImportDefinition) -> snowflake.SnowflakeAcquisition:
+def _snowflake_acquisition(
+    definition: CustomImportDefinition,
+    *,
+    root_rows: tuple[tuple[object, object], ...] = (("1234567893", "Synthetic Bridge"),),
+    snapshot_token: str = "synthetic-snowflake-snapshot",
+) -> snowflake.SnowflakeAcquisition:
     request = snowflake.SnowflakeReadRequest(
         relation=snowflake.SnowflakeRelation(database="synthetic", schema="public", name="root_records"),
         selected_columns=(
@@ -120,14 +127,92 @@ def _snowflake_acquisition(definition: CustomImportDefinition) -> snowflake.Snow
         snowflake.SnowflakeResultColumn(field_id="display_name", source_type="TEXT", nullable=False),
     )
     result = snowflake.SnowflakeParquetResult(
-        source_snapshot_token="synthetic-snowflake-snapshot",
+        source_snapshot_token=snapshot_token,
         schema=schema,
-        partition_sources=_SnowflakePartitionSources(_parquet_reader((("1234567893", "Synthetic Bridge"),), schema)),
+        partition_sources=_SnowflakePartitionSources(_parquet_reader(root_rows, schema)),
     )
     try:
         return snowflake._seal_acquisition(statement, result, capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS)
     finally:
         result.close()
+
+
+def _snowflake_family_definition() -> CustomImportDefinition:
+    document = json.loads(_FIXTURE.read_text())
+    document["refresh_mode"] = "snapshot"
+    for stream in document["streams"]:
+        stream.update(format="parquet", compression="none", snapshot_token="source_snapshot")
+    document["aliases"] = {
+        "providers": {"NPI": "npi", "DISPLAY_NAME": "display_name"},
+        "rates": {"RATE_NPI": "rate_npi", "SERVICE_CODE": "service_code", "AMOUNT": "amount"},
+    }
+    return CustomImportDefinition.from_mapping(document)
+
+
+def _snowflake_child_acquisition(
+    definition: CustomImportDefinition,
+    *,
+    child_rows: tuple[tuple[object, object, object], ...] = (("1234567893", "SYNTHETIC", Decimal("12.50")),),
+    snapshot_token: str = "synthetic-snowflake-snapshot",
+    amount_source_type: str = "FIXED(30,12)",
+) -> snowflake.SnowflakeAcquisition:
+    field_ids = ("rate_npi", "service_code", "amount")
+    request = snowflake.SnowflakeReadRequest(
+        relation=snowflake.SnowflakeRelation(database="synthetic", schema="public", name="child_records"),
+        selected_columns=tuple(
+            snowflake.SnowflakeDeclaredColumn(field_id=field_id, column_identifier=field_id) for field_id in field_ids
+        ),
+        definition_sha256=definition.digest,
+        schema_sha256=definition.schema_digest,
+    )
+    schema = (
+        snowflake.SnowflakeResultColumn(field_id="rate_npi", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="service_code", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="amount", source_type=amount_source_type, nullable=True),
+    )
+    adapter_result = snowflake.SnowflakeParquetResult(
+        source_snapshot_token=snapshot_token,
+        schema=schema,
+        partition_sources=_SnowflakePartitionSources(_parquet_reader(child_rows, schema)),
+    )
+    try:
+        return snowflake._seal_acquisition(
+            snowflake.SnowflakeReadStatement(request=request),
+            adapter_result,
+            capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS,
+        )
+    finally:
+        adapter_result.close()
+
+
+def _snowflake_family_request(
+    seed: _Seed,
+    *,
+    suffix: str,
+    root_rows: tuple[tuple[object, object], ...],
+    child_rows: tuple[tuple[object, object, object], ...],
+    amount_source_type: str = "FIXED(30,12)",
+) -> SnowflakeCandidateRequest:
+    snapshot_token = f"synthetic-snowflake-{suffix}"
+    return SnowflakeCandidateRequest(
+        dataset_id=seed.dataset_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        definition=seed.definition,
+        acquisition=_snowflake_acquisition(
+            seed.definition,
+            root_rows=root_rows,
+            snapshot_token=snapshot_token,
+        ),
+        child_acquisition=_snowflake_child_acquisition(
+            seed.definition,
+            child_rows=child_rows,
+            snapshot_token=snapshot_token,
+            amount_source_type=amount_source_type,
+        ),
+        idempotency_key=f"synthetic-snowflake-family-{suffix}",
+        lease_token=f"synthetic-snowflake-family-{suffix}-lease",
+    )
 
 
 def _snapshot_definition() -> CustomImportDefinition:
@@ -521,6 +606,103 @@ async def test_snowflake_bridge_registers_and_activates_one_durable_root_candida
             assert execution is not None and execution.capture_bundle_id is not None
             bundle = await session.get(CustomImportCaptureBundle, execution.capture_bundle_id)
             assert bundle is not None and bundle.snapshot_token == "synthetic-snowflake-snapshot"
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bridge_activates_exact_family_bundle():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_family", _snowflake_family_definition())
+        run_result = await run_snowflake_candidate(
+            case.sessions,
+            SnowflakeCandidateRequest(
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                definition=seed.definition,
+                acquisition=_snowflake_acquisition(seed.definition),
+                child_acquisition=_snowflake_child_acquisition(seed.definition),
+                idempotency_key="synthetic-snowflake-family",
+                lease_token="synthetic-snowflake-family-lease",
+            ),
+        )
+        assert run_result.status == "activated" and run_result.accepted_family_count == 1
+        child_values = _rate("1234567893", "SYNTHETIC", Decimal("12.50"))
+        expected = assemble_root_families(
+            seed.definition, [_root("1234567893", "Synthetic Bridge")], {"rates": [child_values]}
+        )
+        async with case.sessions() as session:
+            execution = await session.get(CustomImportExecution, run_result.execution_id)
+            bundle = await session.get(CustomImportCaptureBundle, execution.capture_bundle_id)
+            assert bundle is not None and bundle.stream_count == 2
+            assert bundle.snapshot_token == "synthetic-snowflake-snapshot"
+            captures = (
+                await session.scalars(
+                    select(CustomImportCapture).where(CustomImportCapture.capture_bundle_id == bundle.capture_bundle_id)
+                )
+            ).all()
+            assert len(captures) == 2 and len({capture.manifest_sha256 for capture in captures}) == 2
+            family = (await session.scalars(select(CustomImportFamilyRevision))).one()
+            assert family.child_count == 1
+            assert family.family_sha256 == new_family_hash(seed.definition, expected.families[0])
+            child = (await session.scalars(select(CustomImportChildRevision))).one()
+            assert child.child_key_sha256 == child_key_hash(seed.definition, "rates", child_values)
+            assert child.root_record_id == family.root_record_id
+            binding = (await session.scalars(select(CustomImportEntityBinding))).one()
+            assert binding.adapter_id == "npi" and binding.canonical_value == "1234567893"
+            assert len((await session.scalars(select(CustomImportRootScalar))).all()) == 2
+            assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
+            assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
+            pointer = await session.get(CustomImportCurrentGeneration, seed.dataset_id)
+            assert pointer.generation_id == run_result.generation_id
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bridge_retains_only_the_family_with_an_invalid_child():
+    """Retain one prior family while publishing an independent valid update."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_family_retention", _snowflake_family_definition())
+        prior = await run_snowflake_candidate(
+            case.sessions,
+            _snowflake_family_request(
+                seed,
+                suffix="prior",
+                root_rows=(("1234567893", "Prior First"), ("1003000126", "Prior Second")),
+                child_rows=(
+                    ("1234567893", "FIRST", Decimal("10.00")),
+                    ("1003000126", "SECOND", Decimal("20.00")),
+                ),
+            ),
+        )
+        assert prior.status == "activated"
+
+        update_run = await run_snowflake_candidate(
+            case.sessions,
+            _snowflake_family_request(
+                seed,
+                suffix="update",
+                root_rows=(("1234567893", "Rejected First"), ("1003000126", "Accepted Second")),
+                child_rows=(("1234567893", "FIRST", "invalid"), ("1003000126", "SECOND", "21.00")),
+                amount_source_type="TEXT",
+            ),
+        )
+
+        assert update_run.status == "activated"
+        assert update_run.generation_id is not None
+        assert update_run.accepted_family_count == 1
+        assert update_run.rejection_count == 1
+        async with case.sessions() as session:
+            rejections = (
+                await session.scalars(
+                    select(CustomImportRejection).where(CustomImportRejection.execution_id == update_run.execution_id)
+                )
+            ).all()
+            root_revisions = await _generation_root_revisions(session, update_run.generation_id)
+        assert {rejection.code for rejection in rejections} == {"field_type_invalid"}
+        assert {
+            json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"]
+            for root_revision in root_revisions
+        } == {"Prior First", "Accepted Second"}
 
 
 @pytest.mark.asyncio
