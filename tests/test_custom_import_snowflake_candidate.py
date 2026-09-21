@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from io import BytesIO
 
@@ -11,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from process.custom_import import snowflake
+from process.custom_import import snowflake, snowflake_candidate
 from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.snowflake_candidate import (
@@ -209,3 +210,79 @@ async def test_bridge_rejects_omitted_nullable_root_field_before_storage():
             session_factory,
             _request(definition, _acquisition(definition)),
         )
+
+
+def test_bridge_rejects_malformed_request_and_acquisition_boundaries():
+    definition = _definition()
+    acquisition = _acquisition(definition)
+    request = _request(definition, acquisition)
+
+    for malformed in (
+        object(),
+        replace(request, definition=object()),
+        replace(request, lease_token=""),
+        replace(request, dataset_id=0),
+    ):
+        with pytest.raises(SnowflakeCandidateError):
+            snowflake_candidate._validated_request(malformed)
+    with pytest.raises(SnowflakeCandidateError, match="acquisition is invalid"):
+        snowflake_candidate._verified_acquisition(object())
+
+
+def test_bridge_rejects_definition_binding_and_replay_shape_edges():
+    definition = _definition()
+    acquisition = _acquisition(definition)
+    revised_document = json.loads(definition.canonical)
+    revised_document["refresh_mode"] = "upsert"
+    revised = CustomImportDefinition.from_mapping(revised_document)
+    with pytest.raises(SnowflakeCandidateError, match="definition identity"):
+        _prepare_candidate(_request(revised, acquisition))
+
+    destination = BytesIO()
+    pq.write_table(pa.table({"npi": ["1234567893"]}), destination)
+    incomplete_capture = capture_stream(
+        BytesIO(destination.getvalue()),
+        snowflake.SNOWFLAKE_RESULT_STREAM,
+        source_snapshot_token="synthetic-snapshot",
+    )
+    incomplete_acquisition = replace(acquisition)
+    object.__setattr__(incomplete_acquisition, "parquet_captures", (incomplete_capture,))
+    with pytest.raises(SnowflakeCandidateError):
+        snowflake_candidate._decode_roots(
+            incomplete_acquisition,
+            entity_field="npi",
+            selected_field_ids=("npi", "display_name"),
+        )
+    invalid_acquisition = replace(acquisition)
+    object.__setattr__(invalid_acquisition, "parquet_captures", (object(),))
+    with pytest.raises(SnowflakeCandidateError, match="cannot be replayed"):
+        snowflake_candidate._decode_roots(
+            invalid_acquisition,
+            entity_field="npi",
+            selected_field_ids=("npi", "display_name"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_session_factory_and_registry_mismatch(monkeypatch):
+    definition = _definition()
+    request = _request(definition, _acquisition(definition))
+    with pytest.raises(SnowflakeCandidateError, match="session factory"):
+        await run_snowflake_candidate(None, request)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+    async def reject(*_args):
+        raise snowflake_candidate.CandidateRunnerError("synthetic mismatch")
+
+    monkeypatch.setattr(snowflake_candidate, "validate_revision_identity", reject)
+    with pytest.raises(SnowflakeCandidateError, match="does not match"):
+        await run_snowflake_candidate(Session, request)
