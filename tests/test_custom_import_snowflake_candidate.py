@@ -8,6 +8,7 @@ import json
 from dataclasses import replace
 from decimal import Decimal
 from io import BytesIO
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -201,6 +202,66 @@ def test_bridge_replays_each_partition_before_preparing_a_root_candidate():
     object.__setattr__(acquisition, "parquet_captures", tuple(reversed(acquisition.parquet_captures)))
     with pytest.raises(SnowflakeCandidateError, match="seal"):
         _prepare_candidate(_request(definition, acquisition))
+
+
+def test_approved_root_acquisition_replays_through_the_generic_candidate_boundary():
+    document = json.loads(_definition().canonical)
+    document["aliases"]["snowflake_result"] = {
+        "PROVIDER_NPI": "npi",
+        "PROVIDER_DISPLAY_NAME": "display_name",
+    }
+    definition = CustomImportDefinition.from_mapping(document)
+    relation = snowflake.SnowflakeRelation(database="synthetic", schema="public", name="root_records")
+    approved_relation = snowflake.SnowflakeApprovedRelation(
+        relation=relation,
+        columns=(
+            snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="provider_npi"),
+            snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="provider_display_name"),
+        ),
+    )
+    destination = BytesIO()
+    pq.write_table(pa.table({"npi": ["1234567893"], "display_name": ["Synthetic One"]}), destination)
+    statements = []
+
+    def partition_sources():
+        yield BytesIO(destination.getvalue())
+
+    def fetch_parquet(statement, _credentials):
+        statements.append(statement)
+        return snowflake.SnowflakeParquetResult(
+            source_snapshot_token="synthetic-snapshot",
+            schema=(
+                snowflake.SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),
+                snowflake.SnowflakeResultColumn(field_id="display_name", source_type="TEXT", nullable=False),
+            ),
+            partition_sources=partition_sources(),
+        )
+
+    connector = snowflake.SnowflakeAcquisitionConnector(
+        approved_relations=(approved_relation,),
+        credential_provider=SimpleNamespace(
+            load_key_pair=lambda: snowflake.SnowflakeKeyPairCredentials(
+                account="synthetic-account",
+                user="synthetic-user",
+                private_key_pem=b"-----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY-----\n",
+            )
+        ),
+        adapter=SimpleNamespace(fetch_parquet=fetch_parquet),
+    )
+
+    acquisition = connector.acquire(
+        connector.prepare_request(
+            definition,
+            relation=relation,
+            selected_field_ids=("npi", "display_name"),
+        )
+    )
+    prepared = _prepare_candidate(_request(definition, acquisition))
+
+    assert statements == [acquisition.statement]
+    assert prepared.roots == ({"npi": "1234567893", "display_name": "Synthetic One"},)
+    assert prepared.children_by_collection == {}
+    assert prepared.receipts[0].stream_id == "snowflake_result"
 
 
 @pytest.mark.parametrize("target", ("request", "manifest"))

@@ -8,6 +8,8 @@ from asyncio import CancelledError
 from dataclasses import dataclass
 from decimal import Decimal
 from io import BytesIO
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pyarrow.parquet as pq
@@ -108,6 +110,18 @@ def credentials(monkeypatch) -> SnowflakeKeyPairCredentials:
         lambda _credentials: b"private-key-der",
     )
     return SnowflakeKeyPairCredentials(account="example", user="reader", private_key_pem=_PRIVATE_KEY)
+
+
+def test_connector_import_accepts_the_project_pyarrow_version():
+    completed = subprocess.run(
+        [sys.executable, "-W", "error::UserWarning", "-c", "import snowflake.connector"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_adapter_executes_only_generated_select_and_yields_parquet(monkeypatch, credentials):
