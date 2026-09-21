@@ -15,10 +15,10 @@ from db.connection import Database
 from process import mrf_publication_receipt as receipt
 from process import reference_family_result_generation as generation
 from tests.test_reference_family_result_generation_postgres import (
-    _database_url,
     _MRF_MIGRATION_PATH,
-    _migration_module,
     _REFERENCE_MIGRATION_PATH,
+    _database_url,
+    _migration_module,
     _run_migration,
 )
 
@@ -399,7 +399,8 @@ async def test_completion_visibility_rollback_input_drift_and_explicit_recovery(
 async def test_native_source_prepare_requires_matching_completed_finalizer(monkeypatch):
     """Admit native MRF source only while its exact finalizer receipt remains current."""
 
-    from process import plan_summary, reference_family_archive as archive
+    from process import plan_summary
+    from process import reference_family_archive as archive
     from tests.test_reference_family_archive_postgres import _create_live_family
 
     schema = "mrf_admission_" + uuid4().hex
