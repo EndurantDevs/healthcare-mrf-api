@@ -190,6 +190,143 @@ async def test_duplicate_submission_returns_the_same_execution_and_rejects_drift
 
 
 @pytest.mark.asyncio
+async def test_reservation_reuses_its_bound_execution_without_replacing_the_bundle():
+    session = _SyntheticSession()
+
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation",
+        mechanism="local",
+    )
+    first_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+    )
+    assert first_owner is not None
+    bound = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=first_owner.fence,
+        token=_WORKER_A,
+    )
+    replay = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation",
+        mechanism="local",
+    )
+
+    assert reserved.created is True and reserved.capture_bundle_id is None
+    assert bound is not None
+    assert bound.execution_id == reserved.execution_id and bound.capture_bundle_id == 44
+    assert replay == lifecycle.ExecutionSubmission(
+        execution_id=reserved.execution_id,
+        state="running",
+        created=False,
+        capture_bundle_id=44,
+    )
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.bind_execution_capture_bundle(
+            session,
+            execution_id=reserved.execution_id,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            capture_bundle_id=45,
+            fence=first_owner.fence,
+            token=_WORKER_A,
+        )
+
+    canceled = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-canceled-reservation",
+        mechanism="local",
+    )
+    canceled_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=canceled.execution_id,
+        token=_WORKER_A,
+    )
+    assert canceled_owner is not None
+    await lifecycle.request_cancellation(session, execution_id=canceled.execution_id)
+    unavailable = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=canceled.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=46,
+        fence=canceled_owner.fence,
+        token=_WORKER_A,
+    )
+    assert unavailable is None
+
+
+@pytest.mark.asyncio
+async def test_reservation_binding_rejects_a_stale_owner_after_lease_takeover():
+    session = _SyntheticSession()
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation-takeover",
+        mechanism="local",
+    )
+    first_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+        lease_seconds=60,
+    )
+    assert first_owner is not None
+    session.now = first_owner.expires_at
+    recovery_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_B,
+    )
+    assert recovery_owner is not None and recovery_owner.fence == first_owner.fence + 1
+
+    stale = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=first_owner.fence,
+        token=_WORKER_A,
+    )
+    recovered = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=recovery_owner.fence,
+        token=_WORKER_B,
+    )
+
+    assert stale is None
+    assert recovered is not None and recovered.capture_bundle_id == 44
+
+
+@pytest.mark.asyncio
 async def test_competing_claims_leave_only_the_first_worker_authorized():
     session = _SyntheticSession()
     submission = await _submission(session)

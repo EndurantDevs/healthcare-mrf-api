@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -20,9 +20,12 @@ from db.models.custom_import import (
     CustomImportCaptureBundle,
     CustomImportDataset,
     CustomImportDefinitionRevision,
+    CustomImportExecution,
+    CustomImportLease,
     CustomImportSchemaRevision,
     CustomImportSourceStream,
 )
+from process.custom_import import execution as lifecycle
 from process.custom_import.capture_store import (
     CaptureBundleConflict,
     CaptureReceipt,
@@ -287,3 +290,122 @@ async def test_capture_registration_rejects_an_incomplete_definition_graph():
     async with isolated_publication_case() as case:
         with pytest.raises(CaptureStoreError, match="definition graph is invalid"):
             await _attempt_incomplete_capture_registration(case)
+
+
+@pytest.mark.asyncio
+async def test_stale_execution_bind_rolls_back_the_enclosing_capture_registration():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case)
+        stale_owner = "synthetic-stale-owner"
+        recovery_identity = "synthetic-recovery-owner"
+        async with case.sessions() as session:
+            async with session.begin():
+                reserved = await lifecycle.reserve_execution(
+                    session,
+                    dataset_id=seed.dataset_id,
+                    definition_revision_id=seed.definition_revision_id,
+                    schema_revision_id=seed.schema_revision_id,
+                    idempotency_key="synthetic-stale-bind",
+                    mechanism="local",
+                )
+                first_owner = await lifecycle.claim_execution(
+                    session,
+                    execution_id=reserved.execution_id,
+                    token=stale_owner,
+                    lease_seconds=60,
+                )
+        assert first_owner is not None
+
+        async with case.sessions() as session:
+            async with session.begin():
+                await session.execute(
+                    update(CustomImportLease)
+                    .where(CustomImportLease.execution_id == reserved.execution_id)
+                    .values(expires_at=func.clock_timestamp())
+                )
+        async with case.sessions() as session:
+            async with session.begin():
+                recovery_owner = await lifecycle.claim_execution(
+                    session,
+                    execution_id=reserved.execution_id,
+                    token=recovery_identity,
+                    lease_seconds=60,
+                )
+        assert recovery_owner is not None and recovery_owner.fence == first_owner.fence + 1
+
+        with pytest.raises(RuntimeError, match="rollback stale bind"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    bundle = await register_capture_bundle(
+                        session,
+                        dataset_id=seed.dataset_id,
+                        definition_revision_id=seed.definition_revision_id,
+                        schema_revision_id=seed.schema_revision_id,
+                        receipts=_build_receipt_set(),
+                    )
+                    binding = await lifecycle.bind_execution_capture_bundle(
+                        session,
+                        execution_id=reserved.execution_id,
+                        dataset_id=seed.dataset_id,
+                        definition_revision_id=seed.definition_revision_id,
+                        schema_revision_id=seed.schema_revision_id,
+                        capture_bundle_id=bundle.capture_bundle_id,
+                        fence=first_owner.fence,
+                        token=stale_owner,
+                    )
+                    assert binding is None
+                    raise RuntimeError("rollback stale bind")
+
+        async with case.sessions() as session:
+            bundles = await session.scalar(
+                select(func.count()).select_from(CustomImportCaptureBundle).where(
+                    CustomImportCaptureBundle.dataset_id == seed.dataset_id
+                )
+            )
+            captures = await session.scalar(
+                select(func.count()).select_from(CustomImportCapture).where(
+                    CustomImportCapture.dataset_id == seed.dataset_id
+                )
+            )
+            execution = await session.get(CustomImportExecution, reserved.execution_id)
+
+        assert bundles == captures == 0
+        assert execution is not None and execution.capture_bundle_id is None
+
+        async with case.sessions() as session:
+            async with session.begin():
+                recovery_bundle = await register_capture_bundle(
+                    session,
+                    dataset_id=seed.dataset_id,
+                    definition_revision_id=seed.definition_revision_id,
+                    schema_revision_id=seed.schema_revision_id,
+                    receipts=_build_receipt_set(),
+                )
+                binding = await lifecycle.bind_execution_capture_bundle(
+                    session,
+                    execution_id=reserved.execution_id,
+                    dataset_id=seed.dataset_id,
+                    definition_revision_id=seed.definition_revision_id,
+                    schema_revision_id=seed.schema_revision_id,
+                    capture_bundle_id=recovery_bundle.capture_bundle_id,
+                    fence=recovery_owner.fence,
+                    token=recovery_identity,
+                )
+                assert binding is not None
+                assert binding.execution_id == reserved.execution_id
+                assert binding.capture_bundle_id == recovery_bundle.capture_bundle_id
+
+        async with case.sessions() as session:
+            async with session.begin():
+                replayed = await lifecycle.reserve_execution(
+                    session,
+                    dataset_id=seed.dataset_id,
+                    definition_revision_id=seed.definition_revision_id,
+                    schema_revision_id=seed.schema_revision_id,
+                    idempotency_key="synthetic-stale-bind",
+                    mechanism="local",
+                )
+
+        assert replayed.created is False
+        assert replayed.execution_id == reserved.execution_id
+        assert replayed.capture_bundle_id == recovery_bundle.capture_bundle_id
