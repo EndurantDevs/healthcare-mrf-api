@@ -397,18 +397,38 @@ def _target_document(target: _TransportTarget) -> dict[str, object]:
 
 
 def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
-    raw = _strict_json(body)
+    """Parse one canonical, closed, signed search request body."""
+
+    document = _strict_json(body)
     base_fields = frozenset({"cursor", "filters", "page_size", "target"})
-    if type(raw) is not dict or frozenset(raw) not in {base_fields, base_fields | {"order"}}:
+    if type(document) is not dict or frozenset(document) not in {base_fields, base_fields | {"order"}}:
         raise _fail()
-    if _canonical_json_bytes(raw) != body:
+    if _canonical_json_bytes(document) != body:
         raise _fail()
-    transport_target = _parse_target(raw.get("target"))
-    filters = raw.get("filters")
-    if type(filters) is not list or len(filters) > 3:
+    transport_target = _parse_target(document.get("target"))
+    read_filters = _parse_filter_documents(document.get("filters"))
+    order_terms = _parse_order_documents(document.get("order")) if "order" in document else None
+    try:
+        parsed_request = _ParsedSearchRequest(
+            target=transport_target,
+            filters=read_filters,
+            order_terms=order_terms,
+            page_size=document.get("page_size"),
+            cursor=document.get("cursor"),
+        )
+        parsed_request.bind(1)
+        return parsed_request
+    except CustomImportReadRequestError, TypeError:
+        raise _fail() from None
+
+
+def _parse_filter_documents(filter_documents: object) -> tuple[ReadFilter, ...]:
+    """Parse the bounded structured filter list."""
+
+    if type(filter_documents) is not list or len(filter_documents) > 3:
         raise _fail()
-    parsed_filters: list[ReadFilter] = []
-    for filter_document in filters:
+    read_filters: list[ReadFilter] = []
+    for filter_document in filter_documents:
         if type(filter_document) is not dict:
             raise _fail()
         operator = filter_document.get("operator")
@@ -420,7 +440,7 @@ def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
         if frozenset(filter_document) != expected_fields:
             raise _fail()
         try:
-            parsed_filters.append(
+            read_filters.append(
                 ReadFilter(
                     field_id=filter_document.get("field_id"),
                     operator=operator,
@@ -429,38 +449,29 @@ def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
             )
         except CustomImportReadRequestError:
             raise _fail() from None
-    parsed_order: tuple[ReadOrderTerm, ...] | None = None
-    if "order" in raw:
-        order = raw.get("order")
-        if type(order) is not list or not 1 <= len(order) <= 3:
+    return tuple(read_filters)
+
+
+def _parse_order_documents(order_documents: object) -> tuple[ReadOrderTerm, ...]:
+    """Parse request-selected order terms with the fixed null policy."""
+
+    if type(order_documents) is not list or not 1 <= len(order_documents) <= 3:
+        raise _fail()
+    order_terms: list[ReadOrderTerm] = []
+    for order_document in order_documents:
+        if type(order_document) is not dict or frozenset(order_document) != {"field_id", "direction"}:
             raise _fail()
-        order_terms: list[ReadOrderTerm] = []
-        for order_document in order:
-            if type(order_document) is not dict or frozenset(order_document) != {"field_id", "direction"}:
-                raise _fail()
-            try:
-                order_terms.append(
-                    ReadOrderTerm(
-                        field_id=order_document.get("field_id"),
-                        direction=order_document.get("direction"),
-                        nulls="last",
-                    )
+        try:
+            order_terms.append(
+                ReadOrderTerm(
+                    field_id=order_document.get("field_id"),
+                    direction=order_document.get("direction"),
+                    nulls="last",
                 )
-            except CustomImportReadRequestError:
-                raise _fail() from None
-        parsed_order = tuple(order_terms)
-    try:
-        parsed = _ParsedSearchRequest(
-            target=transport_target,
-            filters=tuple(parsed_filters),
-            order_terms=parsed_order,
-            page_size=raw.get("page_size"),
-            cursor=raw.get("cursor"),
-        )
-        parsed.bind(1)
-        return parsed
-    except CustomImportReadRequestError, TypeError:
-        raise _fail() from None
+            )
+        except CustomImportReadRequestError:
+            raise _fail() from None
+    return tuple(order_terms)
 
 
 @dataclass(frozen=True, slots=True)
