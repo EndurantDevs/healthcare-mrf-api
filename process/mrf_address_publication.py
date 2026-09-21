@@ -42,19 +42,24 @@ async def capture_address_content(session, schema, qualified):
             missing = await session.scalar(text(f"SELECT count(*) FROM {table}"))
             projection = "to_jsonb(row_value)"
         else:
-            missing = await session.scalar(text(f"""
+            missing = await session.scalar(
+                text(f"""
                 SELECT count(*) FROM {table} AS source
                 WHERE source.address_key IS NULL OR NOT EXISTS (
                     SELECT 1 FROM {archive} AS canonical
                     WHERE canonical.address_key=source.address_key
                       AND canonical.merged_into IS NULL
                       AND (canonical.source_bits & 16) = 16)
-            """))
+            """)
+            )
             projection = f"""jsonb_build_array(to_jsonb(row_value),
                 (SELECT to_jsonb(canonical) FROM {archive} AS canonical
                  WHERE canonical.address_key=row_value.address_key))"""
         count, digest = await _projected_row_identity(
-            session, schema, name, row_json_sql=projection,
+            session,
+            schema,
+            name,
+            row_json_sql=projection,
         )
         address_content_map["tables"][name] = {"rows": count, "sha256": digest, "uncovered": int(missing)}
     return address_content_map

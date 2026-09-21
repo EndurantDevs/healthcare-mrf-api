@@ -28,19 +28,21 @@ from db import models
 from db.tiger_models import Zip_zcta5, ZipState
 from process import entity_address_snapshot_receipt as catalog_identity
 from process.entity_address_snapshot_receipt import _projected_row_identity
-from process.mrf_publication_receipt import require_completed_publication
-from process.mrf_address_publication import STAGE_TABLE, referenced_address_filter
 from process.ext.address_canon import archive_table_name
+from process.mrf_address_publication import STAGE_TABLE, referenced_address_filter
+from process.mrf_publication_receipt import require_completed_publication
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
-    TABLE_NAME as GENERATION_TABLE,
     ReferenceFamilyServingGeneration,
     current_reference_family_relation_oids,
     publish_adopted_reference_family_generation,
     read_reference_family_result_generation_authority,
     require_reference_family_automatic_generation_order,
     validate_reference_family_serving_generation,
+)
+from process.reference_family_result_generation import (
+    TABLE_NAME as GENERATION_TABLE,
 )
 
 logger = logging.getLogger(__name__)
