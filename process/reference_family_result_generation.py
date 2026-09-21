@@ -50,6 +50,16 @@ RELATION_NAMES_BY_IMPORTER = {
     ),
     "pharmacy-economics": ("pharmacy_economics_summary",),
     "terminology-synonyms": ("terminology_synonym",),
+    "provider-quality": (
+        "pricing_qpp_provider",
+        "pricing_svi_zcta",
+        "pricing_provider_quality_measure",
+        "pricing_provider_quality_domain",
+        "pricing_provider_quality_score",
+        "pricing_provider_quality_feature",
+        "pricing_provider_quality_procedure_lsh",
+        "pricing_provider_quality_peer_target",
+    ),
 }
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_GENERATION = (1 << 63) - 1
