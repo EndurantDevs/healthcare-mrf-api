@@ -236,6 +236,23 @@ def test_manifest_binds_explicit_provenance_but_remains_manual_only():
         archive.validate_reference_family_manifest(tampered)
 
 
+def test_manifest_preserves_tracked_source_generation_authority():
+    source_generation = archive.ReferenceFamilyServingGeneration(
+        "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        7,
+        datetime(2026, 9, 21, 0, 0, tzinfo=UTC),
+    )
+    manifest = replace(
+        _manifest(),
+        publication_authority="tracked-generation",
+        source_serving_generation=source_generation,
+    )
+
+    assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="manifest is invalid"):
+        archive.validate_reference_family_manifest({**manifest.as_dict(), "publication_authority": "manual-only"})
+
+
 def test_manifest_preserves_exact_portable_dependencies_without_changing_legacy_receipts():
     legacy = _manifest()
     assert "dependencies" not in legacy.as_dict()
@@ -277,6 +294,20 @@ async def test_capture_rejects_absent_provenance_before_database_access():
         )
     session.execute.assert_not_awaited()
     session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bounded_capture_does_not_mask_the_original_failure():
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=["0", "0"]),
+        execute=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        async with archive._bounded_capture(session):
+            raise RuntimeError("original failure")
+
+    assert session.execute.await_count == 2
 
 
 @pytest.mark.asyncio
