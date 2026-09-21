@@ -8,7 +8,7 @@ import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any
@@ -253,10 +253,18 @@ def _admit_child_records(
             if child_key is None:
                 rejection_codes_by_root_key[root_key].add("child_key_missing")
                 continue
-            if child_key in child_keys_by_parent[root_key]:
+            canonical_child_key = _canonical_child_key(
+                collection,
+                child_key,
+                child_fields_by_collection[collection.name],
+            )
+            if canonical_child_key is None:
+                rejection_codes_by_root_key[root_key].add("field_type_invalid")
+                continue
+            if canonical_child_key in child_keys_by_parent[root_key]:
                 rejection_codes_by_root_key[root_key].add("duplicate_child_key")
                 continue
-            child_keys_by_parent[root_key].add(child_key)
+            child_keys_by_parent[root_key].add(canonical_child_key)
             child_records_by_root_and_collection[collection.name][root_key].append(_freeze_record(child_record))
     return child_records_by_root_and_collection, candidate_error_codes
 
@@ -338,6 +346,31 @@ def _parent_key(record: Mapping[str, Any], collection: ChildCollection) -> tuple
             return None
         values.append(value)
     return tuple(values)
+
+
+def _canonical_child_key(
+    collection: ChildCollection,
+    child_key: tuple[Any, ...],
+    fields_by_id: Mapping[str, Field],
+) -> tuple[Any, ...] | None:
+    """Normalize child-key values to their typed identity before duplicate checks."""
+
+    canonical_values: list[Any] = []
+    for field_id, value in zip(collection.child_key, child_key, strict=True):
+        field = fields_by_id[field_id]
+        if field.value_type == "decimal":
+            value = normalize_source_decimal(value)
+            if value is None:
+                return None
+        elif field.value_type == "timestamp":
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                return None
+            try:
+                value = value.astimezone(UTC)
+            except OverflowError:
+                return None
+        canonical_values.append(value)
+    return tuple(canonical_values)
 
 
 def _record_error(

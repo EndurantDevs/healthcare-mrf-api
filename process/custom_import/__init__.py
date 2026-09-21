@@ -54,10 +54,19 @@ from process.custom_import.materialization import (
     selection_profile_models,
     winner_materialization_models,
 )
+from process.custom_import.runner import (
+    CandidateRunnerError,
+    CandidateRunRequest,
+    CandidateRunResult,
+    run_candidate,
+)
 
 __all__ = (
     "CONTRACT_VERSION",
     "CandidateRejected",
+    "CandidateRunRequest",
+    "CandidateRunResult",
+    "CandidateRunnerError",
     "CaptureError",
     "CaptureLimits",
     "CaptureManifest",
@@ -95,6 +104,7 @@ __all__ = (
     "persist_winner_materialization",
     "project_child_scalars",
     "project_root_scalars",
+    "run_candidate",
     "scalar_projection_models",
     "selection_profile_models",
     "validate_source_snapshot_tokens",
