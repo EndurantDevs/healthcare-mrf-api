@@ -236,6 +236,34 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_source_capture_binds_tracked_serving_generation():
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema = f"rf_capture_{token}"
+    unrelated_schema = f"rf_capture_keep_{token}"
+    try:
+        async with sessions() as session, session.begin():
+            await _create_places_fixture(session, live_schema, unrelated_schema)
+            authority = await result_generation.publish_local_reference_family_generation(
+                session,
+                importer_id="places-zcta",
+                schema_name=live_schema,
+            )
+
+        manifest = await _manifest(sessions, "places-zcta", live_schema)
+
+        assert manifest.publication_authority == "tracked-generation"
+        assert manifest.source_serving_generation == authority.serving_generation
+        assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (live_schema, unrelated_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
 async def _validated_places_candidate(
     sessions,
     live_schema,
