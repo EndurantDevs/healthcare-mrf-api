@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import sys
 
-
 _CANCELED = '{"code":"canceled","status":"error"}'
 _FAILED = '{"code":"failed","status":"error"}'
 
