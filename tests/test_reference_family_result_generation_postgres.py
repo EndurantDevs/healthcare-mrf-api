@@ -44,6 +44,9 @@ _TERMINOLOGY_MIGRATION_PATH = (
 _CENSUS_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260920160000_geo_census_result_generation.py"
 )
+_PROVIDER_QUALITY_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260921000000_provider_quality_result_generation.py"
+)
 _NPI_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260914120000_npi_result_generation.py"
 _NPI_TABLES = (
     "npi",
@@ -294,6 +297,7 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
             await _run_migration(connection, _PHARMACY_MIGRATION_PATH, "upgrade")
             await _run_migration(connection, _TERMINOLOGY_MIGRATION_PATH, "upgrade")
             await _run_migration(connection, _CENSUS_MIGRATION_PATH, "upgrade")
+            await _run_migration(connection, _PROVIDER_QUALITY_MIGRATION_PATH, "upgrade")
             table_names = {name for names in generation.RELATION_NAMES_BY_IMPORTER.values() for name in names}
             for table_name in table_names:
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))

@@ -64,6 +64,8 @@ def _replace(schema: str, counts: dict[str, int]) -> None:
 
 
 def upgrade() -> None:
+    """Add pharmacy economics generation authority."""
+
     schema = _schema()
     _replace(schema, {**_COUNTS, "pharmacy-economics": 1})
     op.execute(
@@ -75,12 +77,20 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Remove unused pharmacy economics generation authority."""
+
     schema = _schema()
     table = f'"{schema}"."{_TABLE}"'
-    retained = op.get_bind().execute(sa.text(
-        f"SELECT EXISTS (SELECT 1 FROM {table} WHERE importer_id='pharmacy-economics' "
-        "AND (local_generation <> 0 OR origin_generation IS NOT NULL))"
-    )).scalar_one()
+    retained = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"SELECT EXISTS (SELECT 1 FROM {table} WHERE importer_id='pharmacy-economics' "
+                "AND (local_generation <> 0 OR origin_generation IS NOT NULL))"
+            )
+        )
+        .scalar_one()
+    )
     if retained:
         raise RuntimeError("pharmacy economics generation evidence prevents downgrade")
     op.execute(f"DELETE FROM {table} WHERE importer_id='pharmacy-economics'")

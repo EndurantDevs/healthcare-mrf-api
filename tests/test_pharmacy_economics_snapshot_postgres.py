@@ -78,11 +78,14 @@ async def _case(monkeypatch):
             await connection.execute(f'INSERT INTO "{schema}"."{name}" VALUES ($1,$2,1,1,$3)', "CA", "123", marker)
             await connection.execute(f'CREATE UNIQUE INDEX "{name}_idx_primary" ON "{schema}"."{name}" (state,ndc11)')
             for index in stage.__my_additional_indexes__:
-                index_name = economics._stage_index_name(name, index["name"]) if name == _STAGE else f"{name}_idx_{index['name']}"
+                index_name = (
+                    economics._stage_index_name(name, index["name"])
+                    if name == _STAGE
+                    else f"{name}_idx_{index['name']}"
+                )
                 where = f" WHERE {index['where']}" if index.get("where") else ""
                 await connection.execute(
-                    f'CREATE INDEX "{index_name}" ON "{schema}"."{name}" '
-                    f"({', '.join(index['index_elements'])}){where}"
+                    f'CREATE INDEX "{index_name}" ON "{schema}"."{name}" ({", ".join(index["index_elements"])}){where}'
                 )
         await connection.execute(
             f'CREATE TABLE "{schema}".reference_family_result_generation ('
@@ -91,7 +94,8 @@ async def _case(monkeypatch):
         )
         await connection.execute(
             f'INSERT INTO "{schema}".reference_family_result_generation VALUES ($1,$2,0)',
-            "pharmacy-economics", uuid4(),
+            "pharmacy-economics",
+            uuid4(),
         )
         yield connection, schema
     finally:
@@ -108,8 +112,8 @@ async def test_normal_publish_binds_exact_oid_and_rollback_is_atomic(monkeypatch
     async with _case(monkeypatch) as (connection, schema):
         old_oid = await _oid(connection, schema, _LIVE)
         stage_oid = await _oid(connection, schema, _STAGE)
-        ctx = {"import_date": "stage", "context": {"run": 1, "test_mode": True}}
-        await economics.publish_pharmacy_economics_generation(ctx)
+        context_by_name = {"import_date": "stage", "context": {"run": 1, "test_mode": True}}
+        await economics.publish_pharmacy_economics_generation(context_by_name)
         authority = await generation.read_reference_family_result_generation_authority(
             economics.db, importer_id="pharmacy-economics", schema_name=schema
         )
@@ -129,7 +133,7 @@ async def test_normal_publish_binds_exact_oid_and_rollback_is_atomic(monkeypatch
 
         monkeypatch.setattr(economics, "publish_local_reference_family_generation", fail_after_generation)
         with pytest.raises(RuntimeError, match="late publication failure"):
-            await economics.publish_pharmacy_economics_generation(ctx)
+            await economics.publish_pharmacy_economics_generation(context_by_name)
         assert await _oid(connection, schema, _LIVE) == old_oid
         assert await _oid(connection, schema, _STAGE) == stage_oid
         authority = await generation.read_reference_family_result_generation_authority(
@@ -153,9 +157,15 @@ async def test_pharmacy_reference_stage_has_complete_model_indexes():
             )
             assert owner.relation_oids[0][0] == _LIVE
             await archive.complete_reference_family_restore(connection, owner)
-            indexes = (await connection.execute(text(
-                "SELECT indexdef FROM pg_indexes WHERE schemaname=:schema"
-            ), {"schema": stage_schema})).scalars().all()
+            indexes = (
+                (
+                    await connection.execute(
+                        text("SELECT indexdef FROM pg_indexes WHERE schemaname=:schema"), {"schema": stage_schema}
+                    )
+                )
+                .scalars()
+                .all()
+            )
             assert any("sdud_volume DESC" in definition for definition in indexes)
             assert any("estimated_gross_margin IS NOT NULL" in definition for definition in indexes)
     finally:

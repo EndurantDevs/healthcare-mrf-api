@@ -438,8 +438,8 @@ def test_model_index_ddl_rejects_malformed_options(index_spec):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("contract", "wrong", "not manual-only"),
-        ("publication_authority", "automatic", "not manual-only"),
+        ("contract", "wrong", "authority is invalid"),
+        ("publication_authority", "automatic", "authority is invalid"),
         ("tables", [], "table set is invalid"),
     ],
 )
@@ -609,7 +609,9 @@ async def test_prepared_export_and_stage_manifest_guards(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prepare_metadata_factory_and_export_snapshot_guards(monkeypatch):
+async def test_prepare_metadata_factory_guards(monkeypatch):
+    """Resolve source metadata inside the capture transaction or fail closed."""
+
     manifest = _manifest()
     ownership = _ownership()
     session = SimpleNamespace(execute=AsyncMock())
@@ -667,7 +669,33 @@ async def test_prepare_metadata_factory_and_export_snapshot_guards(monkeypatch):
             source_metadata_factory=metadata_factory,
         )
 
-    session.execute = AsyncMock(side_effect=[None, SimpleNamespace(scalar_one=lambda: "invalid snapshot")])
+
+@pytest.mark.asyncio
+async def test_export_rejects_invalid_snapshot(monkeypatch):
+    """Reject an invalid PostgreSQL snapshot before calling the archive writer."""
+
+    manifest = _manifest()
+    ownership = _ownership()
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, SimpleNamespace(scalar_one=lambda: "invalid snapshot")])
+    )
+
+    @asynccontextmanager
+    async def begin():
+        yield
+
+    session.begin = begin
+
+    @asynccontextmanager
+    async def session_factory():
+        yield session
+
+    @asynccontextmanager
+    async def bounded(_session):
+        yield
+
+    monkeypatch.setattr(archive, "_bounded_capture", bounded)
+    monkeypatch.setattr(archive, "_lock_family", AsyncMock())
     monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
     monkeypatch.setattr(archive, "_validate_stage_manifest", AsyncMock())
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage snapshot is invalid"):
@@ -731,6 +759,8 @@ async def test_stage_owner_and_activation_guards(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_activation_receipt_and_authority_guards(monkeypatch):
+    """Reject mismatched activation receipts before publication."""
+
     ownership = _ownership()
     incumbent = _incumbent()
     manifest = _manifest()
@@ -761,6 +791,15 @@ async def test_activation_receipt_and_authority_guards(monkeypatch):
         await archive._activation_receipt(
             object(), archive.reference_family_spec("places-zcta"), ownership, incumbent, manifest, tables, None
         )
+
+
+@pytest.mark.asyncio
+async def test_activation_authority_guards():
+    """Reject invalid manual and validated activation authorities."""
+
+    ownership = _ownership()
+    incumbent = _incumbent()
+    manifest = _manifest()
 
     session = SimpleNamespace(in_transaction=lambda: True)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="activation ownership is invalid"):

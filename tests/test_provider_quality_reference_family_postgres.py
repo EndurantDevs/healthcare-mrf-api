@@ -407,6 +407,26 @@ async def _activate_quality(session, restored, manifest, incumbent, owner_oid, r
     )
 
 
+async def _assert_quality_activation_cycle(sessions, schema, prepared, restored):
+    incumbent, owner_oid, receipt = await _quality_activation_binding(sessions, restored, prepared.manifest, schema)
+    source_generation = prepared.manifest.source_metadata["serving_generation"]
+    async with sessions() as session:
+        transaction = await session.begin()
+        await _activate_quality(session, restored, prepared.manifest, incumbent, owner_oid, receipt, source_generation)
+        assert (
+            len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"])) == 8
+        )
+        await transaction.rollback()
+    async with sessions() as session, session.begin():
+        assert await _relation_oids(
+            session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]
+        ) == tuple(relation_oid for _name, relation_oid in incumbent.relation_oids)
+        await _activate_quality(session, restored, prepared.manifest, incumbent, owner_oid, receipt, source_generation)
+        assert (
+            len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"])) == 8
+        )
+
+
 @pytest.mark.asyncio
 async def test_quality_restored_indexes_activate_after_ordinary_publish_and_rollback(monkeypatch, tmp_path):
     """Stage-owned restored indexes survive rollback and replace an ordinary published family."""
@@ -436,29 +456,7 @@ async def test_quality_restored_indexes_activate_after_ordinary_publish_and_roll
             tuple(name for name, _oid in prepared.ownership.relation_oids),
         )
         restored = await _restore_and_validate_quality_archive(sessions, prepared, dataset_id, dump_path, dsn)
-        incumbent, owner_oid, receipt = await _quality_activation_binding(sessions, restored, prepared.manifest, schema)
-        source_generation = prepared.manifest.source_metadata["serving_generation"]
-        async with sessions() as session:
-            transaction = await session.begin()
-            await _activate_quality(
-                session, restored, prepared.manifest, incumbent, owner_oid, receipt, source_generation
-            )
-            assert (
-                len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]))
-                == 8
-            )
-            await transaction.rollback()
-        async with sessions() as session, session.begin():
-            assert await _relation_oids(
-                session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]
-            ) == tuple(relation_oid for _name, relation_oid in incumbent.relation_oids)
-            await _activate_quality(
-                session, restored, prepared.manifest, incumbent, owner_oid, receipt, source_generation
-            )
-            assert (
-                len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]))
-                == 8
-            )
+        await _assert_quality_activation_cycle(sessions, schema, prepared, restored)
         await _ordinary_quality_publish(sessions, schema)
         prepared_second = await _prepare_quality_archive(
             sessions,
@@ -480,43 +478,4 @@ async def test_quality_restored_indexes_activate_after_ordinary_publish_and_roll
             second_dump_path,
             second_dsn,
         )
-        incumbent_second, owner_oid, receipt_second = await _quality_activation_binding(
-            sessions,
-            restored_second,
-            prepared_second.manifest,
-            schema,
-        )
-        second_generation = prepared_second.manifest.source_metadata["serving_generation"]
-        async with sessions() as session:
-            transaction = await session.begin()
-            await _activate_quality(
-                session,
-                restored_second,
-                prepared_second.manifest,
-                incumbent_second,
-                owner_oid,
-                receipt_second,
-                second_generation,
-            )
-            assert (
-                len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]))
-                == 8
-            )
-            await transaction.rollback()
-        async with sessions() as session, session.begin():
-            assert await _relation_oids(
-                session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]
-            ) == tuple(relation_oid for _name, relation_oid in incumbent_second.relation_oids)
-            await _activate_quality(
-                session,
-                restored_second,
-                prepared_second.manifest,
-                incumbent_second,
-                owner_oid,
-                receipt_second,
-                second_generation,
-            )
-            assert (
-                len(await _relation_oids(session, schema, generation.RELATION_NAMES_BY_IMPORTER["provider-quality"]))
-                == 8
-            )
+        await _assert_quality_activation_cycle(sessions, schema, prepared_second, restored_second)
