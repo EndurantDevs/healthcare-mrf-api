@@ -551,24 +551,24 @@ def test_adapter_closes_after_fetch_and_cleanup_errors(monkeypatch, credentials)
         "process.custom_import.snowflake_python.snowflake.connector.connect",
         lambda **_arguments: connection,
     )
-    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+    acquisition_result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
         _statement(),
         credentials,
     )
 
     with pytest.raises(SnowflakeConnectorError, match="result fetch failed"):
-        next(result.consume_partition_sources())
+        next(acquisition_result.consume_partition_sources())
     assert cursor.closed
     assert connection.closed
 
-    sources = snowflake_python._SnowflakeParquetPartitionSources(
+    partition_sources = snowflake_python._SnowflakeParquetPartitionSources(
         connection=_Connection(_Cursor(())),
         cursor=_Cursor(()),
         result_schema=(SnowflakeResultColumn("value", "TEXT", True),),
     )
-    next(iter(sources))
+    next(iter(partition_sources))
     with pytest.raises(SnowflakeConnectorError, match="already consumed"):
-        next(iter(sources))
+        next(iter(partition_sources))
 
 
 def test_adapter_wraps_invalid_private_key_material(monkeypatch):
@@ -586,7 +586,7 @@ def test_adapter_wraps_invalid_private_key_material(monkeypatch):
 def test_adapter_enforces_partition_and_parquet_encoding_limits(monkeypatch):
     text_column = SnowflakeResultColumn("value", "TEXT", True)
     boolean_column = SnowflakeResultColumn("value", "BOOLEAN", True)
-    source = snowflake_python._SnowflakeParquetPartitionSources(
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
         connection=_Connection(_Cursor(())),
         cursor=_Cursor((("x",),)),
         result_schema=(text_column,),
@@ -594,16 +594,16 @@ def test_adapter_enforces_partition_and_parquet_encoding_limits(monkeypatch):
 
     monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 1)
     with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
-        source._next_partition_rows(None)
+        partition_source._next_partition_rows(None)
 
-    source = snowflake_python._SnowflakeParquetPartitionSources(
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
         connection=_Connection(_Cursor(())),
         cursor=_Cursor((("x",),)),
         result_schema=(text_column,),
     )
     monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 100)
     monkeypatch.setattr(snowflake_python, "_FETCH_ROWS", 1)
-    assert source._next_partition_rows(None) == ([("x",)], None, False)
+    assert partition_source._next_partition_rows(None) == ([("x",)], None, False)
     assert snowflake_python._is_nullable(SimpleNamespace(is_nullable=None))
     assert snowflake_python._variable_scalar_bytes(True, boolean_column) == 0
 
