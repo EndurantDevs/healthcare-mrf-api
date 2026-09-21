@@ -37,6 +37,7 @@ from process.custom_import.read_contracts import (
 from process.custom_import.read_core import (
     CustomImportReadService,
     ReadFilter,
+    ReadOrderTerm,
     SearchRequest,
 )
 
@@ -335,6 +336,7 @@ class _TransportTarget:
 class _ParsedSearchRequest:
     target: _TransportTarget
     filters: tuple[ReadFilter, ...]
+    order_terms: tuple[ReadOrderTerm, ...] | None
     page_size: int
     cursor: str | None
 
@@ -350,6 +352,7 @@ class _ParsedSearchRequest:
                 profile_id=self.target.profile_id,
             ),
             filters=self.filters,
+            order_terms=self.order_terms,
             page_size=self.page_size,
             cursor=self.cursor,
         )
@@ -395,7 +398,8 @@ def _target_document(target: _TransportTarget) -> dict[str, object]:
 
 def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
     raw = _strict_json(body)
-    if type(raw) is not dict or frozenset(raw) != {"cursor", "filters", "page_size", "target"}:
+    base_fields = frozenset({"cursor", "filters", "page_size", "target"})
+    if type(raw) is not dict or frozenset(raw) not in {base_fields, base_fields | {"order"}}:
         raise _fail()
     if _canonical_json_bytes(raw) != body:
         raise _fail()
@@ -425,10 +429,31 @@ def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
             )
         except CustomImportReadRequestError:
             raise _fail() from None
+    parsed_order: tuple[ReadOrderTerm, ...] | None = None
+    if "order" in raw:
+        order = raw.get("order")
+        if type(order) is not list or not 1 <= len(order) <= 3:
+            raise _fail()
+        order_terms: list[ReadOrderTerm] = []
+        for order_document in order:
+            if type(order_document) is not dict or frozenset(order_document) != {"field_id", "direction"}:
+                raise _fail()
+            try:
+                order_terms.append(
+                    ReadOrderTerm(
+                        field_id=order_document.get("field_id"),
+                        direction=order_document.get("direction"),
+                        nulls="last",
+                    )
+                )
+            except CustomImportReadRequestError:
+                raise _fail() from None
+        parsed_order = tuple(order_terms)
     try:
         parsed = _ParsedSearchRequest(
             target=transport_target,
             filters=tuple(parsed_filters),
+            order_terms=parsed_order,
             page_size=raw.get("page_size"),
             cursor=raw.get("cursor"),
         )

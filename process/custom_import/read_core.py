@@ -143,7 +143,12 @@ class ReadOrderTerm:
 
     def __post_init__(self) -> None:
         _bounded_identifier(self.field_id, "order field_id")
-        if self.direction not in {"asc", "desc"} or self.nulls not in {"first", "last"}:
+        if (
+            type(self.direction) is not str
+            or type(self.nulls) is not str
+            or self.direction not in {"asc", "desc"}
+            or self.nulls not in {"first", "last"}
+        ):
             raise CustomImportReadRequestError("order term is malformed")
 
 
@@ -855,12 +860,22 @@ def _normalize_search_plan(request: SearchRequest, context: _ReadContext) -> _Se
         ReadOrderTerm(field_id=term.field_id, direction=term.direction, nulls=term.nulls)
         for term in context.definition.query.order_terms
     )
-    requested_order_terms = declared_order_terms if request.order_terms is None else request.order_terms
-    if (
-        len(declared_order_terms) > MAX_ORDER_TERMS
-        or len(requested_order_terms) > MAX_ORDER_TERMS
-        or requested_order_terms != declared_order_terms
-    ):
+    requested_order_terms = _normalized_order_terms(
+        declared_order_terms if request.order_terms is None else request.order_terms,
+        context,
+    )
+    if len(declared_order_terms) > MAX_ORDER_TERMS or len(requested_order_terms) > MAX_ORDER_TERMS:
+        raise CustomImportReadRequestError("order term count exceeds the read-core limit")
+    if request.order_terms is not None and context.definition.query.sortable_fields:
+        sortable_fields = set(context.definition.query.sortable_fields)
+        requested_fields = [term.field_id for term in requested_order_terms]
+        if (
+            not requested_order_terms
+            or len(requested_fields) != len(set(requested_fields))
+            or any(term.field_id not in sortable_fields or term.nulls != "last" for term in requested_order_terms)
+        ):
+            raise CustomImportReadRequestError("order terms are not permitted by the query contract")
+    elif requested_order_terms != declared_order_terms:
         raise CustomImportReadRequestError("order terms must exactly match the bounded definition order")
     _verify_order_context(requested_order_terms, context)
     search_shape_map = {
@@ -882,11 +897,13 @@ def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadConte
     if len(raw_filters) > MAX_FILTER_TERMS:
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     normalized_filters: list[_NormalizedFilter] = []
-    permitted_ids = set(context.definition.query.root_fields) | set(context.definition.query.child_fields)
     for raw_filter in raw_filters:
-        if type(raw_filter) is not ReadFilter or raw_filter.field_id not in permitted_ids:
+        if type(raw_filter) is not ReadFilter:
             raise CustomImportReadRequestError("filter field is not declared by the query contract")
-        field = context.definition.fields_by_id.get(raw_filter.field_id)
+        field_id = context.definition.query.resolve_field_id(raw_filter.field_id)
+        if field_id is None:
+            raise CustomImportReadRequestError("filter field is not declared by the query contract")
+        field = context.definition.fields_by_id.get(field_id)
         if field is None:
             raise CustomImportReadUnavailableError("declared query field has no persisted binding")
         _verify_field_context(field, context)
@@ -909,6 +926,21 @@ def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadConte
             zip(descriptor_texts, normalized_filters, strict=True), key=lambda descriptor_pair: descriptor_pair[0]
         )
     )
+
+
+def _normalized_order_terms(
+    raw_order_terms: tuple[ReadOrderTerm, ...],
+    context: _ReadContext,
+) -> tuple[ReadOrderTerm, ...]:
+    normalized: list[ReadOrderTerm] = []
+    for raw_term in raw_order_terms:
+        if type(raw_term) is not ReadOrderTerm:
+            raise CustomImportReadRequestError("order field is not declared by the query contract")
+        field_id = context.definition.query.resolve_field_id(raw_term.field_id)
+        if field_id is None:
+            raise CustomImportReadRequestError("order field is not declared by the query contract")
+        normalized.append(ReadOrderTerm(field_id, raw_term.direction, raw_term.nulls))
+    return tuple(normalized)
 
 
 def _verify_order_context(order_terms: tuple[ReadOrderTerm, ...], context: _ReadContext) -> None:

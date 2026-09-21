@@ -19,7 +19,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import operators
 
 from process.custom_import import read_core, read_cursor, read_identity
-from process.custom_import.definition import CustomImportDefinition, Field
+from process.custom_import.definition import CustomImportDefinition, Field, load_json_definition
 from process.custom_import.read_core import (
     MAX_PAGE_OFFSET,
     MAX_READ_TIMEOUT_MS,
@@ -654,6 +654,19 @@ def query_context():
     return read_core._ReadContext(_target(), 1, definition, 1, 1, {"rates": 1}, {1: "rates"})
 
 
+@pytest.fixture
+def aliased_query_context():
+    raw = load_json_definition((Path(__file__).with_name("fixtures") / "custom_import/v1_valid.json").read_text())
+    raw["query"].update(
+        {
+            "aliases": {"metric": "amount", "provider": "display_name"},
+            "sortable_fields": ["amount"],
+        }
+    )
+    definition = CustomImportDefinition.from_mapping(raw)
+    return read_core._ReadContext(_target(), 1, definition, 1, 1, {"rates": 1}, {1: "rates"})
+
+
 def test_query_normalization_is_order_independent_and_rejects_repeated_predicates(query_context):
     filters = (read_core.ReadFilter("npi", "eq", "1234567893"), read_core.ReadFilter("amount", "gt", "1.25"))
     request = SearchRequest(_target(), filters=filters)
@@ -667,6 +680,53 @@ def test_query_normalization_is_order_independent_and_rejects_repeated_predicate
         read_core._normalize_search_plan(replace(request, filters=filters * 2), query_context)
 
 
+def test_query_aliases_normalize_before_fingerprinting_and_duplicate_checks(aliased_query_context):
+    aliased = SearchRequest(_target(), filters=(read_core.ReadFilter("metric", "gt", "1.25"),))
+    canonical = SearchRequest(_target(), filters=(read_core.ReadFilter("amount", "gt", "1.25"),))
+
+    assert read_core._normalize_search_plan(aliased, aliased_query_context) == read_core._normalize_search_plan(
+        canonical, aliased_query_context
+    )
+    with pytest.raises(CustomImportReadRequestError, match="repeat"):
+        read_core._normalize_search_plan(
+            replace(
+                aliased,
+                filters=(
+                    read_core.ReadFilter("metric", "gt", "1.25"),
+                    read_core.ReadFilter("amount", "gt", "1.25"),
+                ),
+            ),
+            aliased_query_context,
+        )
+
+
+def test_explicit_sort_uses_query_aliases_and_sortable_allowlist(aliased_query_context):
+    aliased = SearchRequest(
+        _target(),
+        order_terms=(read_core.ReadOrderTerm("metric", "desc", "last"),),
+    )
+    canonical = replace(
+        aliased,
+        order_terms=(read_core.ReadOrderTerm("amount", "desc", "last"),),
+    )
+
+    assert read_core._normalize_search_plan(aliased, aliased_query_context) == read_core._normalize_search_plan(
+        canonical, aliased_query_context
+    )
+    invalid_orders = (
+        (),
+        (read_core.ReadOrderTerm("provider", "asc", "last"),),
+        (read_core.ReadOrderTerm("metric", "asc", "first"),),
+        (
+            read_core.ReadOrderTerm("metric", "asc", "last"),
+            read_core.ReadOrderTerm("amount", "desc", "last"),
+        ),
+    )
+    for order in invalid_orders:
+        with pytest.raises(CustomImportReadRequestError, match="not permitted"):
+            read_core._normalize_search_plan(replace(aliased, order_terms=order), aliased_query_context)
+
+
 def test_search_cannot_override_verified_target_or_definition_order(query_context):
     request = SearchRequest(_target())
     for invalid in (object(), replace(request, target=_target(102))):
@@ -675,6 +735,12 @@ def test_search_cannot_override_verified_target_or_definition_order(query_contex
     for order in ((), (read_core.ReadOrderTerm("amount", "desc", "last"),)):
         with pytest.raises(CustomImportReadRequestError, match="exactly match"):
             read_core._normalize_search_plan(replace(request, order_terms=order), query_context)
+
+
+@pytest.mark.parametrize(("direction", "nulls"), (([], "last"), ("asc", {})))
+def test_order_terms_reject_non_string_enums(direction, nulls):
+    with pytest.raises(CustomImportReadRequestError, match="malformed"):
+        read_core.ReadOrderTerm("amount", direction, nulls)
 
 
 def test_declared_filter_and_order_fields_require_persisted_bindings(query_context):
