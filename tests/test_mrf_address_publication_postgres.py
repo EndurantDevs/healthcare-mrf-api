@@ -76,6 +76,49 @@ async def _assert_missing_address_rejected(engine, schema, admit):
         await admit()
 
 
+async def _require_completed_address_publication(sessions, schema):
+    """Return the completed receipt while holding its canonical-address locks."""
+
+    async with sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        await lock_publication_family(session, schema, receipt.qualified)
+        return await receipt.require_completed_publication(session, schema)
+
+
+async def _complete_address_publication(database, schema):
+    """Publish and complete one synthetic MRF receipt."""
+
+    attempt = await receipt.begin_publication(schema, "synthetic")
+    async with database.transaction() as session:
+        await lock_publication_family(session, schema, receipt.qualified)
+        authority = await generation.publish_local_reference_family_generation(
+            session,
+            importer_id="mrf",
+            schema_name=schema,
+        )
+        inputs = await receipt.capture_summary_inputs(session, schema)
+        await receipt.complete_publication(session, schema, attempt, authority, inputs, True)
+
+
+async def _create_address_publication_schema(engine, schema, key):
+    """Create the synthetic tables and receipt migrations for the address test."""
+
+    async with engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        for name in dict.fromkeys(name for tables in generation.RELATION_NAMES_BY_IMPORTER.values() for name in tables):
+            await connection.execute(text(f'CREATE TABLE "{schema}"."{name}" (value text, address_key uuid)'))
+        await connection.execute(text(f'CREATE TABLE "{schema}".plan_search_summary (value text)'))
+        await connection.execute(
+            text(f'''CREATE TABLE "{schema}".address_archive_v2 (
+            address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer, value text)''')
+        )
+        for name in ("mrf_address", "mrf_address_evidence"):
+            await connection.execute(text(f"INSERT INTO \"{schema}\".{name} VALUES ('original', :key)"), {"key": key})
+        await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
+        await _run_migration(connection, _MRF_MIGRATION_PATH, "upgrade")
+        await _run_migration(connection, _MIGRATION, "upgrade")
+
+
 @pytest.mark.asyncio
 async def test_address_coverage_and_content_are_bound_to_completion(monkeypatch):
     """Bind completion to precisely covered canonical-address content and locks."""
@@ -89,54 +132,19 @@ async def test_address_coverage_and_content_are_bound_to_completion(monkeypatch)
     monkeypatch.setattr(receipt, "db", database)
     key = uuid4()
 
-    async def admit():
-        async with sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            await lock_publication_family(session, schema, receipt.qualified)
-            return await receipt.require_completed_publication(session, schema)
-
-    async def complete():
-        attempt = await receipt.begin_publication(schema, "synthetic")
-        async with database.transaction() as session:
-            await lock_publication_family(session, schema, receipt.qualified)
-            authority = await generation.publish_local_reference_family_generation(
-                session,
-                importer_id="mrf",
-                schema_name=schema,
-            )
-            inputs = await receipt.capture_summary_inputs(session, schema)
-            await receipt.complete_publication(session, schema, attempt, authority, inputs, True)
-
     try:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-            for name in dict.fromkeys(
-                name for tables in generation.RELATION_NAMES_BY_IMPORTER.values() for name in tables
-            ):
-                await connection.execute(text(f'CREATE TABLE "{schema}"."{name}" (value text, address_key uuid)'))
-            await connection.execute(text(f'CREATE TABLE "{schema}".plan_search_summary (value text)'))
-            await connection.execute(
-                text(f'''CREATE TABLE "{schema}".address_archive_v2 (
-                address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer, value text)''')
-            )
-            for name in ("mrf_address", "mrf_address_evidence"):
-                await connection.execute(
-                    text(f"INSERT INTO \"{schema}\".{name} VALUES ('original', :key)"), {"key": key}
-                )
-            await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
-            await _run_migration(connection, _MRF_MIGRATION_PATH, "upgrade")
-            await _run_migration(connection, _MIGRATION, "upgrade")
-        await complete()
+        await _create_address_publication_schema(engine, schema, key)
+        await _complete_address_publication(database, schema)
         with pytest.raises(RuntimeError, match="coverage is incomplete"):
-            await admit()
+            await _require_completed_address_publication(sessions, schema)
         async with engine.begin() as connection:
             await connection.execute(
                 text(f"INSERT INTO \"{schema}\".address_archive_v2 VALUES (:key, NULL, 16, 'original')"), {"key": key}
             )
         with pytest.raises(RuntimeError, match="content differs"):
-            await admit()
-        await complete()
-        await admit()
+            await _require_completed_address_publication(sessions, schema)
+        await _complete_address_publication(database, schema)
+        await _require_completed_address_publication(sessions, schema)
         await _assert_pinned_publication_blocks_writes(engine, sessions, schema)
         # An unrelated canonical row is outside this publication's contribution.
         async with engine.begin() as connection:
@@ -144,7 +152,8 @@ async def test_address_coverage_and_content_are_bound_to_completion(monkeypatch)
                 text(f"INSERT INTO \"{schema}\".address_archive_v2 VALUES (:key, NULL, 1, 'unrelated')"),
                 {"key": uuid4()},
             )
-        await admit()
+        await _require_completed_address_publication(sessions, schema)
+        admit = lambda: _require_completed_address_publication(sessions, schema)
         await _assert_relevant_address_changes_require_republication(engine, schema, admit, key)
         await _assert_missing_address_rejected(engine, schema, admit)
     finally:
