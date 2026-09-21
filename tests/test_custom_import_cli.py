@@ -63,11 +63,11 @@ def test_validate_rejects_tty_or_path_arguments_without_reflecting_input(capsys)
     assert "synthetic-definition" not in captured.err
 
 
-def test_module_cli_validates_piped_synthetic_input():
+def test_module_cli_validates_piped_synthetic_input(tmp_path):
     completed = subprocess.run(
         [sys.executable, "-m", "custom_import_cli", "validate", "--format", "json"],
         cwd=Path(__file__).resolve().parents[1],
-        env={},
+        env={"PYTHONPYCACHEPREFIX": str(tmp_path / "pycache"), "PYTHONWARNINGS": "error"},
         input=(FIXTURES / "v1_valid.json").read_bytes(),
         capture_output=True,
         check=False,
