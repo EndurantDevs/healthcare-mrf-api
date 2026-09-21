@@ -30,6 +30,8 @@ def _previous():
 
 
 def upgrade():
+    """Add census generation authority."""
+
     previous = _previous()
     schema = previous._schema()
     previous._replace(schema, {**previous._COUNTS, "terminology-synonyms": 1, "geo-census": 1})
@@ -42,16 +44,15 @@ def upgrade():
 
 
 def downgrade():
+    """Remove unused census generation authority."""
+
     previous = _previous()
     schema = previous._schema()
     table = f'"{schema}".reference_family_result_generation'
     generation = (
         op.get_bind()
         .execute(
-            sa.text(
-                f"SELECT local_generation,origin_generation FROM {table} "
-                "WHERE importer_id='geo-census' FOR UPDATE"
-            )
+            sa.text(f"SELECT local_generation,origin_generation FROM {table} WHERE importer_id='geo-census' FOR UPDATE")
         )
         .one()
     )
