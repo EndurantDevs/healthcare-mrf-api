@@ -8,11 +8,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from process.custom_import.capture import CaptureError, iter_records
+import pyarrow as pa
+
+from process.custom_import.capture import (
+    CaptureError,
+    SealedCapture,
+    _open_parquet_reader,
+    _validate_parquet_envelope,
+    _validated_parquet_schema,
+    iter_records,
+)
 from process.custom_import.capture_store import CaptureReceipt, register_capture_bundle
-from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.definition import CustomImportDefinition, Field, SourceStream
 from process.custom_import.execution import create_execution, lease_token_sha256
-from process.custom_import.family import _is_valid_npi
+from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
 from process.custom_import.runner import (
     CandidateRunnerError,
     CandidateRunRequest,
@@ -47,7 +56,12 @@ class SnowflakeCandidateError(ValueError):
 
 @dataclass(frozen=True)
 class SnowflakeCandidateRequest:
-    """One root-only Snowflake acquisition and its durable candidate identity."""
+    """A root and optional child acquisition with one shared source snapshot.
+
+    Acquisitions retain the connector's fixed Parquet transport stream. Their
+    roles bind them to the definition's sole root and optional child stream;
+    this boundary cannot create a shared snapshot from independent reads.
+    """
 
     dataset_id: int
     definition_revision_id: int
@@ -56,6 +70,7 @@ class SnowflakeCandidateRequest:
     acquisition: SnowflakeAcquisition
     idempotency_key: str
     lease_token: str | bytes | bytearray | memoryview
+    child_acquisition: SnowflakeAcquisition | None = None
 
 
 @dataclass(frozen=True)
@@ -63,7 +78,8 @@ class _PreparedCandidate:
     """Fully replayed source records and the connector-owned bundle receipt."""
 
     roots: tuple[Mapping[str, Any], ...]
-    receipt: CaptureReceipt
+    children_by_collection: Mapping[str, tuple[Mapping[str, Any], ...]]
+    receipts: tuple[CaptureReceipt, ...]
 
 
 def _validated_request(request: object) -> SnowflakeCandidateRequest:
@@ -133,75 +149,154 @@ def _verified_acquisition(acquisition: object) -> SnowflakeAcquisition:
         raise SnowflakeCandidateError("Snowflake acquisition seal is invalid") from exc
 
 
-def _validate_root_scope(definition: CustomImportDefinition, acquisition: SnowflakeAcquisition) -> tuple[str, ...]:
-    """Bind this connector's one result stream to one exact root definition."""
+def _bound_acquisitions(
+    request: SnowflakeCandidateRequest,
+) -> tuple[tuple[SourceStream, SnowflakeAcquisition], ...]:
+    """Require exactly one acquisition for each supported declared stream."""
 
-    if (
-        definition.child_collections
-        or definition.child_fields
-        or definition.aliases
-        or definition.source_streams != (SNOWFLAKE_RESULT_STREAM,)
-    ):
-        raise SnowflakeCandidateError("Snowflake candidate requires one root-only result definition")
+    definition = request.definition
+    if len(definition.child_collections) > 1:
+        raise SnowflakeCandidateError("Snowflake candidate supports at most one declared child collection")
+    if bool(definition.child_collections) != (request.child_acquisition is not None):
+        raise SnowflakeCandidateError("Snowflake acquisitions must exactly cover the declared source streams")
+    acquisitions = []
+    for stream in definition.source_streams:
+        if (
+            stream.format != SNOWFLAKE_RESULT_STREAM.format
+            or stream.compression != SNOWFLAKE_RESULT_STREAM.compression
+            or stream.record_path is not None
+            or stream.snapshot_token != SNOWFLAKE_RESULT_STREAM.snapshot_token
+        ):
+            raise SnowflakeCandidateError("Snowflake source streams must use the fixed Parquet result shape")
+        acquisition = request.acquisition if stream.record_kind == "root" else request.child_acquisition
+        acquisitions.append((stream, _verified_acquisition(acquisition)))
+    try:
+        validate_source_snapshot_tokens(
+            definition,
+            {stream.stream_id: (acquisition.manifest.source_snapshot_token,) for stream, acquisition in acquisitions},
+        )
+    except SourceSnapshotError as exc:
+        raise SnowflakeCandidateError("Snowflake acquisitions must share one exact snapshot token") from exc
+    return tuple(acquisitions)
+
+
+def _validate_stream_scope(
+    definition: CustomImportDefinition,
+    stream: SourceStream,
+    acquisition: SnowflakeAcquisition,
+) -> tuple[Field, ...]:
+    """Bind selected columns and aliases to the exact declared record scope."""
+
     request = acquisition.statement.request
     if request.definition_sha256 != definition.digest or request.schema_sha256 != definition.schema_digest:
         raise SnowflakeCandidateError("Snowflake acquisition definition identity does not match the registered scope")
-    selected_field_ids = request.selected_field_ids
-    root_field_ids = {field.field_id for field in definition.root_fields}
-    if set(selected_field_ids) != root_field_ids:
-        raise SnowflakeCandidateError("Snowflake selected fields do not exactly cover the registered root scope")
-    return selected_field_ids
+    fields = tuple(field for field in definition.fields if field.collection == stream.child_collection)
+    field_ids = {field.field_id for field in fields}
+    if set(request.selected_field_ids) != field_ids:
+        raise SnowflakeCandidateError("Snowflake selected fields do not exactly cover the registered stream scope")
+    selected_by_column = {column.column_identifier: column.field_id for column in request.selected_columns}
+    if len(selected_by_column) != len(request.selected_columns):
+        raise SnowflakeCandidateError("Snowflake selected source columns must be unique")
+    for alias in definition.aliases:
+        if alias.stream_id == stream.stream_id and selected_by_column.get(alias.source_label) != alias.field_id:
+            raise SnowflakeCandidateError("Snowflake source aliases do not match the selected column bindings")
+    return fields
 
 
-def _decode_roots(
+def _validate_partition_schema(
+    acquisition: SnowflakeAcquisition,
+    capture: SealedCapture,
+    fields_by_id: Mapping[str, Field],
+) -> None:
+    """Check declared column identity and types even for a zero-row partition."""
+
+    _validate_parquet_envelope(capture.payload)
+    with _open_parquet_reader(capture.payload, acquisition.capture_limits) as parquet_reader:
+        schema = parquet_reader.schema_arrow
+        labels = _validated_parquet_schema(schema, acquisition.capture_limits)
+    if labels != acquisition.statement.request.selected_field_ids:
+        raise SnowflakeCandidateError("Snowflake result schema does not match the selected fields")
+    for column in schema:
+        if not _is_column_type_valid(column.type, fields_by_id[column.name]):
+            raise SnowflakeCandidateError("Snowflake result schema type does not match the declared field")
+
+
+def _is_column_type_valid(column_type: pa.DataType, field: Field) -> bool:
+    """Match the shared scalar domain without coercing any source values."""
+
+    if pa.types.is_null(column_type):
+        return field.nullable
+    is_string = pa.types.is_string(column_type) or pa.types.is_large_string(column_type)
+    if field.value_type == "string":
+        return is_string
+    if field.value_type == "integer":
+        return pa.types.is_integer(column_type)
+    if field.value_type == "decimal":
+        return is_string or pa.types.is_integer(column_type) or pa.types.is_decimal(column_type)
+    if field.value_type == "boolean":
+        return pa.types.is_boolean(column_type)
+    return False
+
+
+def _decode_records(
     acquisition: SnowflakeAcquisition,
     *,
-    entity_field: str,
-    selected_field_ids: tuple[str, ...],
+    fields: tuple[Field, ...],
 ) -> tuple[Mapping[str, Any], ...]:
     """Replay every sealed partition without accepting a partial aggregate."""
 
     limits = acquisition.capture_limits
-    roots: list[Mapping[str, Any]] = []
+    decoded_records: list[Mapping[str, Any]] = []
     record_count = 0
-    expected_field_ids = set(selected_field_ids)
+    fields_by_id = {field.field_id: field for field in fields}
+    expected_field_ids = set(fields_by_id)
+    if not acquisition.parquet_captures:
+        raise SnowflakeCandidateError("Snowflake acquisition requires a schema-bearing Parquet partition")
     for capture in acquisition.parquet_captures:
         try:
+            _validate_partition_schema(acquisition, capture, fields_by_id)
             partition_records = iter_records(capture, SNOWFLAKE_RESULT_STREAM, limits=limits)
             for decoded_record in partition_records:
-                values = decoded_record.values
-                if set(values) != expected_field_ids:
-                    raise SnowflakeCandidateError("Snowflake result fields do not match the selected root fields")
-                entity_value = values.get(entity_field)
-                if not isinstance(entity_value, str) or not _is_valid_npi(entity_value):
-                    raise SnowflakeCandidateError("Snowflake root entity values must be valid NPI strings")
+                values_by_field = decoded_record.values
+                if set(values_by_field) != expected_field_ids:
+                    raise SnowflakeCandidateError("Snowflake result fields do not match the selected fields")
                 record_count += 1
                 if record_count > limits.maximum_records:
                     raise SnowflakeCandidateError("Snowflake acquisition exceeds the aggregate record limit")
-                roots.append(dict(values))
+                decoded_records.append(dict(values_by_field))
         except CaptureError as exc:
             raise SnowflakeCandidateError("Snowflake acquisition partition cannot be replayed") from exc
-    return tuple(roots)
+    return tuple(decoded_records)
 
 
 def _prepare_candidate(request: SnowflakeCandidateRequest) -> _PreparedCandidate:
-    acquisition = _verified_acquisition(request.acquisition)
-    selected_field_ids = _validate_root_scope(request.definition, acquisition)
-    roots = _decode_roots(
-        acquisition,
-        entity_field=request.definition.entity_field,
-        selected_field_ids=selected_field_ids,
-    )
-    return _PreparedCandidate(
-        roots=roots,
-        receipt=CaptureReceipt(
-            stream_id=SNOWFLAKE_RESULT_STREAM.stream_id,
-            source_snapshot_token=acquisition.manifest.source_snapshot_token,
-            byte_count=sum(partition.content_bytes for partition in acquisition.manifest.result_partitions),
-            content_sha256=acquisition.manifest.content_sha256,
-            canonical_manifest=acquisition.manifest.canonical_manifest,
-            manifest_sha256=acquisition.manifest.manifest_sha256,
-        ),
+    roots = ()
+    children_by_collection = {}
+    receipts = []
+    for stream, acquisition in _bound_acquisitions(request):
+        fields = _validate_stream_scope(request.definition, stream, acquisition)
+        stream_records = _decode_records(
+            acquisition,
+            fields=fields,
+        )
+        if stream.record_kind == "root":
+            roots = stream_records
+        else:
+            children_by_collection[stream.child_collection] = stream_records
+        receipts.append(_capture_receipt(stream, acquisition))
+    return _PreparedCandidate(roots=roots, children_by_collection=children_by_collection, receipts=tuple(receipts))
+
+
+def _capture_receipt(stream: SourceStream, acquisition: SnowflakeAcquisition) -> CaptureReceipt:
+    """Retain the connector seal under its exact definition-owned stream."""
+
+    return CaptureReceipt(
+        stream_id=stream.stream_id,
+        source_snapshot_token=acquisition.manifest.source_snapshot_token,
+        byte_count=sum(partition.content_bytes for partition in acquisition.manifest.result_partitions),
+        content_sha256=acquisition.manifest.content_sha256,
+        canonical_manifest=acquisition.manifest.canonical_manifest,
+        manifest_sha256=acquisition.manifest.manifest_sha256,
     )
 
 
@@ -223,7 +318,7 @@ async def run_snowflake_candidate(
         lease_token=request.lease_token,
         definition=request.definition,
         roots=prepared.roots,
-        children_by_collection={},
+        children_by_collection=prepared.children_by_collection,
         complete_scope=True,
     )
     async with session_factory() as session, session.begin():
@@ -236,7 +331,7 @@ async def run_snowflake_candidate(
             dataset_id=request.dataset_id,
             definition_revision_id=request.definition_revision_id,
             schema_revision_id=request.schema_revision_id,
-            receipts=(prepared.receipt,),
+            receipts=prepared.receipts,
         )
         submission = await create_execution(
             session,
@@ -257,7 +352,7 @@ async def run_snowflake_candidate(
             lease_token=request.lease_token,
             definition=request.definition,
             roots=prepared.roots,
-            children_by_collection={},
+            children_by_collection=prepared.children_by_collection,
             complete_scope=True,
         ),
     )

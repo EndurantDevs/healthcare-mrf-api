@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Focused replay contracts for the root-only Snowflake candidate bridge."""
+"""Focused replay contracts for the bounded Snowflake family bridge."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from decimal import Decimal
 from io import BytesIO
 
 import pyarrow as pa
@@ -14,6 +16,8 @@ import pytest
 from process.custom_import import snowflake
 from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.family import assemble_root_families
+from process.custom_import.runner_codec import child_key_hash, new_family_hash, root_key_hash
 from process.custom_import.snowflake_candidate import (
     SnowflakeCandidateError,
     SnowflakeCandidateRequest,
@@ -82,13 +86,13 @@ def _definition(*, with_child: bool = False, with_nullable_root_field: bool = Fa
     )
 
 
-def _capture(definition: CustomImportDefinition, npi: object, display_name: str):
+def _capture(table: pa.Table, snapshot_token: str):
     destination = BytesIO()
-    pq.write_table(pa.table({"npi": [npi], "display_name": [display_name]}), destination)
+    pq.write_table(table, destination)
     return capture_stream(
         BytesIO(destination.getvalue()),
         snowflake.SNOWFLAKE_RESULT_STREAM,
-        source_snapshot_token="synthetic-snapshot",
+        source_snapshot_token=snapshot_token,
     )
 
 
@@ -97,25 +101,42 @@ def _acquisition(
     *,
     first_npi: object = "1234567893",
 ) -> snowflake.SnowflakeAcquisition:
+    return _table_acquisition(
+        definition,
+        ("npi", "display_name"),
+        (
+            pa.table({"npi": [first_npi], "display_name": ["Synthetic One"]}),
+            pa.table({"npi": ["1234567893"], "display_name": ["Synthetic Two"]}),
+        ),
+    )
+
+
+def _table_acquisition(
+    definition: CustomImportDefinition,
+    field_ids: tuple[str, ...],
+    partitions: tuple[pa.Table, ...],
+    *,
+    snapshot_token: str = "synthetic-snapshot",
+    column_identifiers: tuple[str, ...] | None = None,
+) -> snowflake.SnowflakeAcquisition:
+    """Seal synthetic result bytes independently of the declared projection."""
+
     request = snowflake.SnowflakeReadRequest(
         relation=snowflake.SnowflakeRelation(database="synthetic", schema="public", name="root_records"),
-        selected_columns=(
-            snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="npi"),
-            snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="display_name"),
+        selected_columns=tuple(
+            snowflake.SnowflakeDeclaredColumn(field_id=field_id, column_identifier=column)
+            for field_id, column in zip(field_ids, column_identifiers or field_ids, strict=True)
         ),
         definition_sha256=definition.digest,
         schema_sha256=definition.schema_digest,
     )
     statement = snowflake.SnowflakeReadStatement(request=request)
-    captures = (
-        _capture(definition, first_npi, "Synthetic One"),
-        _capture(definition, "1234567893", "Synthetic Two"),
-    )
+    captures = tuple(_capture(table, snapshot_token) for table in partitions)
     receipts = tuple(
         snowflake._capture_receipt(
             capture,
             ordinal=ordinal,
-            source_snapshot_token="synthetic-snapshot",
+            source_snapshot_token=snapshot_token,
         )
         for ordinal, capture in enumerate(captures, start=1)
     )
@@ -125,10 +146,7 @@ def _acquisition(
     _, schema_fingerprint = snowflake._identity_sha256(
         "result-schema",
         {
-            "columns": [
-                {"field_id": "npi", "nullable": False, "source_type": "TEXT"},
-                {"field_id": "display_name", "nullable": False, "source_type": "TEXT"},
-            ],
+            "columns": [{"field_id": field_id, "nullable": False, "source_type": "TEXT"} for field_id in field_ids],
             "contract": snowflake.CONNECTOR_CONTRACT,
             "format": snowflake.PARQUET_RESULT_FORMAT,
         },
@@ -138,7 +156,7 @@ def _acquisition(
         manifest=snowflake.SnowflakeAcquisitionManifest(
             request_sha256=request.request_sha256,
             statement_sha256=statement.statement_sha256,
-            source_snapshot_token="synthetic-snapshot",
+            source_snapshot_token=snapshot_token,
             schema_fingerprint=schema_fingerprint,
             result_partitions=receipts,
             content_sha256=content_hasher.hexdigest(),
@@ -168,8 +186,9 @@ def test_bridge_replays_each_partition_before_preparing_a_root_candidate():
     prepared = _prepare_candidate(_request(definition, acquisition))
 
     assert [root["display_name"] for root in prepared.roots] == ["Synthetic One", "Synthetic Two"]
-    assert prepared.receipt.content_sha256 == acquisition.manifest.content_sha256
-    with pytest.raises(SnowflakeCandidateError, match="root-only"):
+    assert prepared.receipts[0].content_sha256 == acquisition.manifest.content_sha256
+    assert prepared.children_by_collection == {}
+    with pytest.raises(SnowflakeCandidateError, match="exactly cover"):
         _prepare_candidate(_request(_definition(with_child=True), acquisition))
     with pytest.raises(SnowflakeCandidateError, match="aggregate record"):
         _prepare_candidate(
@@ -177,7 +196,7 @@ def test_bridge_replays_each_partition_before_preparing_a_root_candidate():
                 definition, replace(acquisition, capture_limits=replace(acquisition.capture_limits, maximum_records=1))
             )
         )
-    with pytest.raises(SnowflakeCandidateError, match="NPI strings"):
+    with pytest.raises(SnowflakeCandidateError, match="schema type"):
         _prepare_candidate(_request(definition, _acquisition(definition, first_npi=1234567893)))
     object.__setattr__(acquisition, "parquet_captures", tuple(reversed(acquisition.parquet_captures)))
     with pytest.raises(SnowflakeCandidateError, match="seal"):
@@ -209,3 +228,246 @@ async def test_bridge_rejects_omitted_nullable_root_field_before_storage():
             session_factory,
             _request(definition, _acquisition(definition)),
         )
+
+
+def _family_request(
+    *,
+    child_values: tuple[object, ...] = ("second", "first"),
+    child_snapshot: str = "synthetic-snapshot",
+) -> SnowflakeCandidateRequest:
+    document = json.loads(_definition(with_child=True).canonical)
+    document["aliases"] = {
+        "snowflake_result": {"PROVIDER_NPI": "npi", "PROVIDER_NAME": "display_name"},
+        "details": {"PARENT_NPI": "detail_npi", "DETAIL_KEY": "detail_id"},
+    }
+    definition = CustomImportDefinition.from_mapping(document)
+    root_acquisition = _table_acquisition(
+        definition,
+        ("npi", "display_name"),
+        (pa.table({"npi": ["1234567893"], "display_name": ["Synthetic One"]}),),
+        column_identifiers=("PROVIDER_NPI", "PROVIDER_NAME"),
+    )
+    child_acquisition = _table_acquisition(
+        definition,
+        ("detail_npi", "detail_id"),
+        (
+            pa.table(
+                {
+                    "detail_npi": pa.array(["1234567893"] * len(child_values), type=pa.string()),
+                    "detail_id": pa.array(child_values, type=None if child_values else pa.string()),
+                }
+            ),
+        ),
+        snapshot_token=child_snapshot,
+        column_identifiers=("PARENT_NPI", "DETAIL_KEY"),
+    )
+    return replace(_request(definition, root_acquisition), child_acquisition=child_acquisition)
+
+
+def test_bridge_binds_shared_snapshot_and_family_keys():
+    request = _family_request()
+    prepared = _prepare_candidate(request)
+    admitted = assemble_root_families(request.definition, prepared.roots, prepared.children_by_collection)
+    reordered = replace(
+        prepared,
+        children_by_collection={"details": tuple(reversed(prepared.children_by_collection["details"]))},
+    )
+    replay = assemble_root_families(request.definition, reordered.roots, reordered.children_by_collection)
+
+    assert admitted.rejections == admitted.candidate_errors == ()
+    assert len(admitted.families) == 1
+    assert admitted.families[0].root_key == ("1234567893",)
+    assert [receipt.stream_id for receipt in prepared.receipts] == ["snowflake_result", "details"]
+    assert {receipt.source_snapshot_token for receipt in prepared.receipts} == {"synthetic-snapshot"}
+    assert new_family_hash(request.definition, admitted.families[0]) == new_family_hash(
+        request.definition, replay.families[0]
+    )
+    assert root_key_hash(request.definition, admitted.families[0].root) == root_key_hash(
+        request.definition, replay.families[0].root
+    )
+    assert (
+        len(
+            {
+                child_key_hash(request.definition, "details", child)
+                for child in prepared.children_by_collection["details"]
+            }
+        )
+        == 2
+    )
+    assert prepared.receipts[1].manifest_sha256 == request.child_acquisition.manifest.manifest_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ("snapshot", "missing_child", "extra_child", "swapped_scope", "seal", "type"))
+async def test_bridge_rejects_invalid_source_bundles_before_storage(defect):
+    request = _family_request()
+    match defect:
+        case "snapshot":
+            request = _family_request(child_snapshot="different-synthetic-snapshot")
+        case "missing_child":
+            request = replace(request, child_acquisition=None)
+        case "extra_child":
+            definition = _definition()
+            request = replace(
+                _request(definition, _acquisition(definition)), child_acquisition=request.child_acquisition
+            )
+        case "swapped_scope":
+            request = replace(request, acquisition=request.child_acquisition, child_acquisition=request.acquisition)
+        case "seal":
+            object.__setattr__(request.child_acquisition.manifest, "canonical_manifest", "{}")
+        case "type":
+            request = _family_request(child_values=(1,))
+
+    def session_factory():
+        raise AssertionError("storage must not open for an invalid source bundle")
+
+    with pytest.raises(SnowflakeCandidateError):
+        await run_snowflake_candidate(session_factory, request)
+
+
+@pytest.mark.parametrize("alias_mapping", ({"NPI": "display_name"}, {"UNSELECTED": "npi"}))
+def test_bridge_rejects_inconsistent_source_aliases(alias_mapping):
+    document = json.loads(_definition().canonical)
+    document["aliases"] = {"snowflake_result": alias_mapping}
+    definition = CustomImportDefinition.from_mapping(document)
+
+    with pytest.raises(SnowflakeCandidateError, match="aliases"):
+        _prepare_candidate(_request(definition, _acquisition(definition)))
+
+
+@pytest.mark.parametrize("has_rows", (False, True))
+@pytest.mark.parametrize("defect", ("missing", "extra", "order", "type"))
+def test_bridge_validates_every_partition_schema(has_rows, defect):
+    definition = _definition()
+    columns_by_name = {
+        "npi": pa.array(["1234567893"] if has_rows else [], type=pa.string()),
+        "display_name": pa.array(["Synthetic One"] if has_rows else [], type=pa.string()),
+    }
+    if defect == "missing":
+        columns_by_name.pop("display_name")
+    elif defect == "extra":
+        columns_by_name["unselected"] = columns_by_name["npi"]
+    elif defect == "order":
+        columns_by_name = dict(reversed(tuple(columns_by_name.items())))
+    else:
+        columns_by_name["display_name"] = pa.array([1] if has_rows else [], type=pa.int64())
+    acquisition = _table_acquisition(definition, ("npi", "display_name"), (pa.table(columns_by_name),))
+
+    with pytest.raises(SnowflakeCandidateError, match="schema"):
+        _prepare_candidate(_request(definition, acquisition))
+
+
+@pytest.mark.parametrize("child_values", (("same", "same"), ("orphan",)))
+def test_bridge_preserves_generic_child_rejection(child_values):
+    request = _family_request(child_values=child_values)
+    prepared = _prepare_candidate(request)
+    children = prepared.children_by_collection["details"]
+    if child_values == ("orphan",):
+        children = ({**children[0], "detail_npi": "9876543215"},)
+    admitted = assemble_root_families(request.definition, prepared.roots, {"details": children})
+
+    if child_values == ("orphan",):
+        assert admitted.candidate_errors == ("orphan_child",)
+    else:
+        assert admitted.families == ()
+        assert [rejection.code for rejection in admitted.rejections] == ["duplicate_child_key"]
+
+
+@pytest.mark.parametrize("amount", ("12.50", Decimal("12.50"), 12))
+def test_bridge_reuses_declared_decimal_types(amount):
+    document = json.loads(_definition().canonical)
+    document["schema"]["root"]["fields"][1]["type"] = "decimal"
+    definition = CustomImportDefinition.from_mapping(document)
+    acquisition = _table_acquisition(
+        definition,
+        ("npi", "display_name"),
+        (pa.table({"npi": ["1234567893"], "display_name": [amount]}),),
+    )
+
+    prepared = _prepare_candidate(_request(definition, acquisition))
+
+    assert prepared.roots[0]["display_name"] == amount
+
+
+def test_bridge_accepts_schema_bearing_empty_child():
+    request = _family_request(child_values=())
+
+    prepared = _prepare_candidate(request)
+
+    assert prepared.children_by_collection == {"details": ()}
+    assert len(prepared.receipts) == 2
+
+
+@pytest.mark.parametrize(
+    ("defect", "rejection_code"),
+    (("null", "required_field_null"), ("decimal", "field_type_invalid"), ("npi", "entity_binding_invalid")),
+)
+def test_bridge_preserves_typed_row_errors_for_family_rejection(defect, rejection_code):
+    definition = _definition()
+    columns_by_name = {"npi": ["1234567893"], "display_name": ["Synthetic One"]}
+    if defect == "null":
+        columns_by_name["display_name"] = pa.array([None], type=pa.string())
+    elif defect == "decimal":
+        document = json.loads(definition.canonical)
+        document["schema"]["root"]["fields"][1]["type"] = "decimal"
+        definition = CustomImportDefinition.from_mapping(document)
+        columns_by_name["display_name"] = ["12e3"]
+    elif defect == "npi":
+        columns_by_name["npi"] = ["1234567890"]
+    acquisition = _table_acquisition(
+        definition,
+        ("npi", "display_name"),
+        (pa.table(columns_by_name),),
+    )
+
+    prepared = _prepare_candidate(_request(definition, acquisition))
+    admitted = assemble_root_families(definition, prepared.roots, {})
+
+    assert admitted.families == ()
+    assert [rejection.code for rejection in admitted.rejections] == [rejection_code]
+
+
+@pytest.mark.parametrize("defect", ("no_partitions", "duplicate_column"))
+def test_bridge_rejects_invalid_capture_structure(defect):
+    definition = _definition()
+    acquisition = _table_acquisition(
+        definition,
+        ("npi", "display_name"),
+        () if defect == "no_partitions" else (pa.table({"npi": ["1234567893"], "display_name": ["One"]}),),
+        column_identifiers=("NPI", "NPI") if defect == "duplicate_column" else None,
+    )
+
+    with pytest.raises(SnowflakeCandidateError):
+        _prepare_candidate(_request(definition, acquisition))
+
+
+def test_bridge_rejects_multiple_declared_children():
+    request = _family_request()
+    document = json.loads(request.definition.canonical)
+    document["schema"]["children"].append(
+        {
+            "name": "extras",
+            "parent_key": [{"child": "extra_npi", "root": "npi"}],
+            "child_key": ["extra_id"],
+            "fields": [
+                {"id": "extra_npi", "slot": 5, "type": "string", "nullable": False},
+                {"id": "extra_id", "slot": 6, "type": "string", "nullable": False},
+            ],
+        }
+    )
+    document["streams"].append({**document["streams"][1], "id": "extras", "child": "extras"})
+    request = replace(request, definition=CustomImportDefinition.from_mapping(document))
+
+    with pytest.raises(SnowflakeCandidateError, match="at most one"):
+        _prepare_candidate(request)
+
+
+@pytest.mark.parametrize("stream_update", ({"format": "json"}, {"compression": "gzip"}, {"snapshot_token": "other"}))
+def test_bridge_preserves_fixed_transport_shape(stream_update):
+    request = _family_request()
+    document = json.loads(request.definition.canonical)
+    document["streams"][1].update(stream_update)
+    request = replace(request, definition=CustomImportDefinition.from_mapping(document))
+
+    with pytest.raises(SnowflakeCandidateError, match="fixed Parquet"):
+        _prepare_candidate(request)
