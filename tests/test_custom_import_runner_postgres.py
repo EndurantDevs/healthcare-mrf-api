@@ -143,8 +143,8 @@ def _snowflake_family_definition() -> CustomImportDefinition:
     for stream in document["streams"]:
         stream.update(format="parquet", compression="none", snapshot_token="source_snapshot")
     document["aliases"] = {
-        "providers": {"NPI": "npi", "DISPLAY_NAME": "display_name"},
-        "rates": {"RATE_NPI": "rate_npi", "SERVICE_CODE": "service_code", "AMOUNT": "amount"},
+        "providers": {"npi": "npi", "display_name": "display_name"},
+        "rates": {"rate_npi": "rate_npi", "service_code": "service_code", "amount": "amount"},
     }
     return CustomImportDefinition.from_mapping(document)
 
