@@ -333,7 +333,8 @@ async def _projected_row_identity(
 ) -> tuple[int, str]:
     """Fold sorted projected-row hashes without materializing source rows."""
 
-    chunk_rows_result = await session.stream(
+    # Buffer compact chunk receipts: an asyncpg named cursor can retain the stage relation through activation DDL.
+    chunk_rows_result = await session.execute(
         text(
             f"""
             WITH row_hashes AS MATERIALIZED (
@@ -355,23 +356,20 @@ async def _projected_row_identity(
     )
     digest = hashlib.sha256(b"entity-address-row-chunks/v1\0")
     total_rows, expected_ordinal = 0, 0
-    try:
-        async for chunk_row in chunk_rows_result.mappings():
-            chunk_ordinal = int(chunk_row["chunk_ordinal"])
-            chunk_rows = int(chunk_row["chunk_row_count"])
-            chunk_sha256 = str(chunk_row["chunk_sha256"])
-            if (
-                chunk_ordinal != expected_ordinal
-                or not 1 <= chunk_rows <= _CHUNK_ROWS
-                or _SHA256.fullmatch(chunk_sha256) is None
-            ):
-                raise EntityAddressArchiveReceiptError("entity-address archive row receipt is invalid")
-            digest.update(struct.pack(">I", chunk_rows))
-            digest.update(bytes.fromhex(chunk_sha256))
-            total_rows += chunk_rows
-            expected_ordinal += 1
-    finally:
-        await chunk_rows_result.close()
+    for chunk_row in chunk_rows_result.mappings():
+        chunk_ordinal = int(chunk_row["chunk_ordinal"])
+        chunk_rows = int(chunk_row["chunk_row_count"])
+        chunk_sha256 = str(chunk_row["chunk_sha256"])
+        if (
+            chunk_ordinal != expected_ordinal
+            or not 1 <= chunk_rows <= _CHUNK_ROWS
+            or _SHA256.fullmatch(chunk_sha256) is None
+        ):
+            raise EntityAddressArchiveReceiptError("entity-address archive row receipt is invalid")
+        digest.update(struct.pack(">I", chunk_rows))
+        digest.update(bytes.fromhex(chunk_sha256))
+        total_rows += chunk_rows
+        expected_ordinal += 1
     return total_rows, digest.hexdigest()
 
 
