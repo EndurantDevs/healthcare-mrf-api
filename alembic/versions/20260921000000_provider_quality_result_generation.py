@@ -2,7 +2,7 @@
 """Admit the exact eight-table provider-quality serving generation.
 
 Revision ID: 20260921000000_provider_quality_result_generation
-Revises: 20260920160000_geo_census_result_generation
+Revises: 20260920170000_mrf_publication_receipt
 """
 
 import importlib.util
@@ -15,7 +15,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "20260921000000_provider_quality_result_generation"
-down_revision = "20260920160000_geo_census_result_generation"
+down_revision = "20260920170000_mrf_publication_receipt"
 branch_labels = None
 depends_on = None
 
