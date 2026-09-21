@@ -1007,12 +1007,32 @@ def _normalized_boolean(value: object, field_id: str) -> tuple[bool, bool]:
 
 
 def _normalized_date(value: object, field_id: str) -> tuple[dt.date, str]:
+    if type(value) is str:
+        try:
+            parsed = dt.date.fromisoformat(value)
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.isoformat() != value:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a date")
+        return parsed, value
     if not isinstance(value, dt.date) or isinstance(value, dt.datetime):
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a date")
     return value, value.isoformat()
 
 
 def _normalized_timestamp(value: object, field_id: str) -> tuple[dt.datetime, str]:
+    if type(value) is str:
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
+        normalized = parsed.astimezone(dt.UTC)
+        canonical = normalized.isoformat().replace("+00:00", "Z")
+        if canonical != value:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
+        return normalized, canonical
     if not isinstance(value, dt.datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
     normalized = value.astimezone(dt.UTC)

@@ -14,6 +14,7 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "coverage",
     "clinical",
     "codes",
+    "custom_import",
     "healthcheck",
     "hospital_prices",
     "plan",
@@ -40,6 +41,7 @@ def test_init_api_registers_group(monkeypatch):
     api_module = importlib.import_module("api.__init__")
     monkeypatch.setattr(api_module, "db", fake_db)
     monkeypatch.setitem(init_api.__globals__, "db", fake_db)
+
     class FakeApp:
         def __init__(self):
             self.config = {}
@@ -51,6 +53,7 @@ def test_init_api_registers_group(monkeypatch):
             def decorator(func):
                 self.listeners[event] = func
                 return func
+
             return decorator
 
         signal = listener
@@ -58,6 +61,7 @@ def test_init_api_registers_group(monkeypatch):
         def middleware(self, _phase):
             def decorator(func):
                 return func
+
             return decorator
 
         def register_middleware(self, middleware, phase):
@@ -77,9 +81,7 @@ def test_init_api_registers_group(monkeypatch):
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
     ]
     assert hasattr(app.registered, "blueprints")
-    assert {bp.name for bp in app.registered.blueprints} == (
-        EXPECTED_PUBLIC_BLUEPRINT_NAMES
-    )
+    assert {bp.name for bp in app.registered.blueprints} == (EXPECTED_PUBLIC_BLUEPRINT_NAMES)
 
 
 @pytest.mark.parametrize("distance", [0.1, 1, 5])

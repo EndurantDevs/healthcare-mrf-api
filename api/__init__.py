@@ -11,6 +11,7 @@ from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
 from api.endpoint.coverage import blueprint as v1_coverage
 from api.endpoint.codes import blueprint as v1_codes
 from api.endpoint.clinical import blueprint as v1_clinical
+from api.endpoint.extension_reads import blueprint as v1_custom_import
 from api.endpoint.geo import blueprint as v1_geo
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
 from api.endpoint.hospital_prices import blueprint as v1_hospital_prices
@@ -75,6 +76,7 @@ def init_api(api):
             v1_formulary_fhir,
             v1_codes,
             v1_clinical,
+            v1_custom_import,
             v1_import,
             v1_issuer,
             v1_npi,
