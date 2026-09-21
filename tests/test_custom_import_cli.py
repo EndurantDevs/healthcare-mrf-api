@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,11 @@ class _TtyBytes(BytesIO):
         return True
 
     isatty = is_tty
+
+
+class _NonBytesStream:
+    def read(self, _size):
+        return None
 
 
 def test_validate_reads_bounded_json_stdin_and_returns_only_a_receipt(capsys):
@@ -61,6 +66,46 @@ def test_validate_rejects_tty_or_path_arguments_without_reflecting_input(capsys)
     assert captured.out == ""
     assert captured.err == '{"code":"invalid_arguments","status":"error"}\n'
     assert "synthetic-definition" not in captured.err
+
+
+def test_stdin_rejects_invalid_text_nonbytes_or_oversize_input():
+    assert cli._read_stdin(StringIO("synthetic")) == b"synthetic"
+
+    for stream in (
+        StringIO("\ud800"),
+        _NonBytesStream(),
+        BytesIO(b"x" * (cli.MAX_DEFINITION_BYTES + 1)),
+    ):
+        with pytest.raises(cli._DefinitionInputError):
+            cli._read_stdin(stream)
+
+
+def test_load_definition_rejects_unsupported_format():
+    with pytest.raises(cli._DefinitionInputError):
+        cli.load_definition_from_stdin("synthetic", stream=BytesIO(b"{}"))
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_exit_code", "expected_receipt"),
+    (
+        (KeyboardInterrupt, 130, '{"code":"canceled","status":"error"}\n'),
+        (RuntimeError, 1, '{"code":"failed","status":"error"}\n'),
+    ),
+)
+def test_validate_redacts_interrupt_and_unexpected_failures(
+    monkeypatch, capsys, failure, expected_exit_code, expected_receipt
+):
+    def raise_failure(*_args, **_kwargs):
+        raise failure("synthetic-private-value")
+
+    monkeypatch.setattr(cli, "load_definition_from_stdin", raise_failure)
+    exit_code = cli.run_command(["validate", "--format", "json"])
+
+    captured = capsys.readouterr()
+    assert exit_code == expected_exit_code
+    assert captured.out == ""
+    assert captured.err == expected_receipt
+    assert "synthetic-private-value" not in captured.err
 
 
 def test_module_cli_validates_piped_synthetic_input(tmp_path):
