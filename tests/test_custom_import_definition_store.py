@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,7 @@ from db.models.custom_import import (
     CustomImportSourceStream,
 )
 from process.custom_import.definition import CustomImportDefinition, load_json_definition
+import process.custom_import.definition_store as definition_store
 from process.custom_import.definition_store import DefinitionRegistrationError, register_definition
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
@@ -268,3 +271,73 @@ async def test_registration_replay_rejects_descendant_drift():
 
     with pytest.raises(DefinitionRegistrationError, match="persisted definition graph"):
         await register_definition(session, "synthetic_store", definition)
+
+
+def test_definition_store_rejects_untrusted_or_ambiguous_identity_boundaries():
+    definition = _definition()
+
+    with pytest.raises(DefinitionRegistrationError, match="dataset_key"):
+        definition_store._normalized_dataset_key("Synthetic Store")
+    with pytest.raises(TypeError, match="CustomImportDefinition"):
+        definition_store._canonical_definition(object())
+    with pytest.raises(DefinitionRegistrationError, match="canonical content is invalid"):
+        definition_store._canonical_definition(replace(definition, canonical="not-json"))
+    with pytest.raises(DefinitionRegistrationError, match="does not match its fields"):
+        definition_store._canonical_definition(replace(definition, refresh_mode="snapshot"))
+    with pytest.raises(DefinitionRegistrationError, match="active caller transaction"):
+        definition_store._require_transaction(object())
+    with pytest.raises(DefinitionRegistrationError, match="clean session"):
+        definition_store._require_clean_session(SimpleNamespace(new=(object(),), dirty=(), deleted=()))
+
+    duplicate_revision_rows = (SimpleNamespace(revision_number=1),) * 2
+    with pytest.raises(DefinitionRegistrationError, match="revision identity is ambiguous"):
+        definition_store._row_by_revision(duplicate_revision_rows, 1, "definition")
+    assert not definition_store._is_matching_digest(object(), b"digest")
+    duplicate_digest_rows = (
+        SimpleNamespace(definition_sha256=b"digest"),
+        SimpleNamespace(definition_sha256=b"digest"),
+    )
+    with pytest.raises(DefinitionRegistrationError, match="content identity is ambiguous"):
+        definition_store._row_by_digest(duplicate_digest_rows, "definition_sha256", b"digest", "definition")
+
+    invalid_row = SimpleNamespace(canonical_definition="not-json")
+    with pytest.raises(DefinitionRegistrationError, match="canonical content is invalid"):
+        definition_store._persisted_definition(invalid_row, SimpleNamespace())
+    mismatched_row = SimpleNamespace(
+        canonical_definition=definition.canonical,
+        schema_revision_id=1,
+        revision_number=definition.definition_revision,
+        contract_version="wrong",
+        refresh_mode=definition.refresh_mode,
+        definition_sha256=bytes.fromhex(definition.digest),
+    )
+    mismatched_schema = SimpleNamespace(
+        schema_revision_id=1,
+        revision_number=definition.schema_revision,
+        canonical_schema=definition.schema_canonical,
+        schema_sha256=bytes.fromhex(definition.schema_digest),
+    )
+    with pytest.raises(DefinitionRegistrationError, match="identity is invalid"):
+        definition_store._persisted_definition(mismatched_row, mismatched_schema)
+    with pytest.raises(DefinitionRegistrationError, match="schema is unavailable"):
+        definition_store._validate_transition(
+            definition, (SimpleNamespace(revision_number=1, schema_revision_id=1),), ()
+        )
+    with pytest.raises(DefinitionRegistrationError, match="stable field slot"):
+        definition_store._new_field_slots(
+            (definition.fields[0],),
+            (SimpleNamespace(field_slot=definition.fields[0].field_slot, field_id="other"),),
+        )
+
+
+class _AbsentDatasetSession:
+    no_autoflush = nullcontext()
+
+    async def execute(self, _statement):
+        return _SyntheticResult()
+
+
+@pytest.mark.asyncio
+async def test_definition_store_rejects_an_unavailable_locked_dataset():
+    with pytest.raises(DefinitionRegistrationError, match="registered dataset is unavailable"):
+        await definition_store._locked_dataset(_AbsentDatasetSession(), "synthetic_store")

@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
+import process.custom_import.capture_store as capture_store
 from process.custom_import.capture_store import (
     CaptureReceipt,
     CaptureStoreError,
@@ -120,3 +122,86 @@ async def test_registration_requires_a_caller_owned_transaction_before_any_datab
             schema_revision_id=3,
             receipts=(_build_receipt(),),
         )
+
+
+def test_capture_store_rejects_malformed_receipt_boundaries(monkeypatch):
+    with pytest.raises(CaptureStoreError, match="stream_id"):
+        _build_receipt(stream_id="UPPER")
+    with pytest.raises(CaptureStoreError, match="byte_count"):
+        _build_receipt(byte_count=True)
+    with pytest.raises(CaptureStoreError, match="snapshot token"):
+        _build_receipt(source_snapshot_token="\x00")
+    with pytest.raises(CaptureStoreError, match="must be text"):
+        capture_store._canonical_manifest(1)
+    with pytest.raises(CaptureStoreError, match="valid UTF-8"):
+        capture_store._canonical_manifest("\ud800")
+    with pytest.raises(CaptureStoreError, match="byte limit"):
+        capture_store._canonical_manifest("")
+    with pytest.raises(CaptureStoreError, match="cannot contain NaN"):
+        capture_store._canonical_manifest('{"value":NaN}')
+    with pytest.raises(CaptureStoreError, match="not canonical JSON"):
+        capture_store._canonical_manifest("{")
+    with pytest.raises(CaptureStoreError, match="clean session"):
+        capture_store._require_clean_session(SimpleNamespace(new=(object(),), dirty=(), deleted=()))
+    with pytest.raises(CaptureStoreError, match="positive bigint"):
+        capture_store._identity(dataset_id=0, definition_revision_id=1, schema_revision_id=1)
+
+    receipt = _build_receipt()
+    with pytest.raises(CaptureStoreError, match="non-empty tuple"):
+        capture_store._validate_receipts([receipt])
+    with pytest.raises(CaptureStoreError, match="declared receipt type"):
+        capture_store._validate_receipts((object(),))
+    with pytest.raises(CaptureStoreError, match="stream ids must be unique"):
+        capture_store._validate_receipts((receipt, receipt))
+    with pytest.raises(CaptureStoreError, match="one exact snapshot token"):
+        capture_store._validate_receipts((receipt, _build_receipt(stream_id="details", source_snapshot_token="other")))
+    with pytest.raises(CaptureStoreError, match="exactly cover"):
+        capture_store._index_receipts_by_stream((("records", 1),), (_build_receipt(stream_id="details"),))
+
+    prepared_receipt = _build_receipt()
+    identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
+    monkeypatch.setattr(capture_store, "_MAX_MANIFEST_BYTES", 1)
+    with pytest.raises(CaptureStoreError, match="bundle manifest exceeds"):
+        capture_store._prepare_capture_bundle(identity, (("records", 1),), {"records": prepared_receipt})
+
+
+class _MissingDatasetSession:
+    async def execute(self, _statement):
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_capture_store_rejects_missing_dataset_before_registration():
+    with pytest.raises(CaptureStoreError, match="dataset does not exist"):
+        await capture_store._lock_dataset(
+            _MissingDatasetSession(),
+            capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3),
+        )
+
+
+class _MissingDefinitionSession:
+    async def get(self, *_args):
+        return None
+
+
+class _NoIdentifierInsertSession:
+    def add(self, _model):
+        return None
+
+    def add_all(self, _models):
+        return None
+
+    async def flush(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_capture_store_rejects_missing_definition_and_insert_identity():
+    identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
+
+    with pytest.raises(CaptureStoreError, match="identity does not match"):
+        await capture_store._validated_streams(_MissingDefinitionSession(), identity)
+
+    prepared = capture_store._prepare_capture_bundle(identity, (("records", 1),), {"records": _build_receipt()})
+    with pytest.raises(CaptureStoreError, match="did not return an identifier"):
+        await capture_store._insert_capture_bundle(_NoIdentifierInsertSession(), prepared)
