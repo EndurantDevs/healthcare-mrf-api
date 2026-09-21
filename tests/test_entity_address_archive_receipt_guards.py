@@ -134,17 +134,12 @@ async def test_schema_receipt_rejects_relation_without_columns(monkeypatch):
 @pytest.mark.parametrize(
     "changes", [{"chunk_ordinal": 1}, {"chunk_row_count": 0}, {"chunk_row_count": 4097}, {"chunk_sha256": "invalid"}]
 )
-async def test_invalid_row_chunks_close_the_stream_before_failing(changes):
+async def test_invalid_row_chunks_fail_closed(changes):
     chunk_by_field = {"chunk_ordinal": 0, "chunk_row_count": 1, "chunk_sha256": "a" * 64, **changes}
-
-    async def chunks():
-        yield chunk_by_field
-
-    result = SimpleNamespace(mappings=chunks, close=AsyncMock())
-    session = SimpleNamespace(stream=AsyncMock(return_value=result))
+    result = SimpleNamespace(mappings=lambda: [chunk_by_field])
+    session = SimpleNamespace(execute=AsyncMock(return_value=result))
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="row receipt is invalid"):
         await receipt._row_identity(session, "stage", "address")
-    result.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

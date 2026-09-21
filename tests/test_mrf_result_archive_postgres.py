@@ -466,17 +466,15 @@ async def _assert_committed_activation(sessions, destination_schema, unrelated_s
         summary_indexes = set(
             await session.scalars(
                 text(
-                    "SELECT indexname FROM pg_catalog.pg_indexes "
+                    "SELECT indexdef FROM pg_catalog.pg_indexes "
                     "WHERE schemaname=:schema AND tablename='plan_search_summary'"
                 ),
                 {"schema": destination_schema},
             )
         )
-        assert {
-            "plan_search_summary_pkey",
-            "plan_search_summary_idx_plan_search_summary_state_year_idx",
-            "plan_search_summary_idx_plan_search_summary_issuer_year_idx",
-        } <= summary_indexes
+        assert any(" UNIQUE INDEX plan_search_summary_pkey " in index for index in summary_indexes)
+        assert any(index.endswith(" (state, year)") for index in summary_indexes)
+        assert any(index.endswith(" (issuer_id, year)") for index in summary_indexes)
         assert await session.scalar(text(f"SELECT nextval('\"{destination_schema}\".issuer_issuer_id_seq')")) == 2
         assert (
             await session.scalar(
@@ -726,6 +724,30 @@ async def _run_interleaved_archive_cycle(
         second_restored,
     )
     await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
+
+
+async def _initialize_interleaved_archive_source(monkeypatch, engine, sessions, source_schema, destination_schema):
+    """Create a completed source publication and the destination-local address archive."""
+
+    async with sessions() as session, session.begin():
+        await _create_family(session, source_schema)
+        await _create_family(session, destination_schema)
+        await _insert_family_rows(session, source_schema, "source-v1")
+        await _insert_family_rows(session, destination_schema, "destination-v1")
+        await generation.publish_local_reference_family_generation(
+            session,
+            importer_id="mrf",
+            schema_name=source_schema,
+        )
+
+    await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema)
+    async with sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'CREATE TABLE "{destination_schema}".address_archive_v2 '
+                "(address_key uuid PRIMARY KEY, merged_into uuid, source_bits integer NOT NULL)"
+            )
+        )
 
 
 async def _command(*args):
@@ -1047,11 +1069,13 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
         archive.reference_family_predecessor_schema(second_restored),
     }
     try:
-        async with sessions() as session, session.begin():
-            await _create_family(session, source_schema)
-            await _create_family(session, destination_schema)
-            await _insert_family_rows(session, source_schema, "source-v1")
-            await _insert_family_rows(session, destination_schema, "destination-v1")
+        await _initialize_interleaved_archive_source(
+            monkeypatch,
+            engine,
+            sessions,
+            source_schema,
+            destination_schema,
+        )
 
         await _run_interleaved_archive_cycle(
             sessions,
