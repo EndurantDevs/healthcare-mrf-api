@@ -248,6 +248,14 @@ class FieldAlias:
 
 
 @dataclass(frozen=True)
+class QueryAlias:
+    """Stable public query name mapped to one canonical field identifier."""
+
+    name: str
+    field_id: str
+
+
+@dataclass(frozen=True)
 class SortTerm:
     """Bounded selection or result order term."""
 
@@ -264,6 +272,15 @@ class QueryContract:
     child_collection: str | None
     child_fields: tuple[str, ...]
     order_terms: tuple[SortTerm, ...]
+    aliases: tuple[QueryAlias, ...] = ()
+    sortable_fields: tuple[str, ...] = ()
+
+    def resolve_field_id(self, name: str) -> str | None:
+        """Resolve one canonical query field or immutable query alias."""
+
+        if name in self.root_fields or name in self.child_fields:
+            return name
+        return next((alias.field_id for alias in self.aliases if alias.name == name), None)
 
 
 @dataclass(frozen=True)
@@ -741,7 +758,11 @@ def _parse_query(
     child_fields: tuple[Field, ...],
     children: tuple[ChildCollection, ...],
 ) -> QueryContract:
-    query = _mapping(raw, "definition.query", keys={"root_fields", "child", "order"})
+    query = _mapping(
+        raw,
+        "definition.query",
+        keys={"root_fields", "child", "order", "aliases", "sortable_fields"},
+    )
     root_ids = {field.field_id for field in root_fields if field.projection_slot is not None}
     child_by_collection: dict[str, set[str]] = {}
     for field in child_fields:
@@ -779,7 +800,45 @@ def _parse_query(
     permitted = set(root_query_fields) | set(query_child_fields)
     if any(term.field_id not in permitted for term in order):
         raise DefinitionError("query order terms must use permitted query fields")
-    return QueryContract(root_query_fields, child_collection, query_child_fields, order)
+    query_aliases = _parse_query_aliases(
+        query.get("aliases", {}),
+        permitted=permitted,
+        canonical_field_ids={field.field_id for field in (*root_fields, *child_fields)},
+    )
+    sortable_fields = tuple(
+        _identifier(field_id, "definition.query.sortable_fields")
+        for field_id in _array(query.get("sortable_fields", []), "definition.query.sortable_fields")
+    )
+    if len(sortable_fields) != len(set(sortable_fields)) or not set(sortable_fields).issubset(permitted):
+        raise DefinitionError("query sortable fields must be unique permitted query fields")
+    return QueryContract(
+        root_query_fields,
+        child_collection,
+        query_child_fields,
+        order,
+        query_aliases,
+        sortable_fields,
+    )
+
+
+def _parse_query_aliases(
+    raw: Any,
+    *,
+    permitted: set[str],
+    canonical_field_ids: set[str],
+) -> tuple[QueryAlias, ...]:
+    if not isinstance(raw, Mapping):
+        raise DefinitionError("definition.query.aliases must be an object")
+    aliases: list[QueryAlias] = []
+    for raw_name, raw_field_id in raw.items():
+        name = _identifier(raw_name, "definition.query.aliases")
+        field_id = _identifier(raw_field_id, f"definition.query.aliases.{name}")
+        if name in canonical_field_ids:
+            raise DefinitionError("query aliases cannot collide with canonical field ids")
+        if field_id not in permitted:
+            raise DefinitionError("query aliases must target permitted query fields")
+        aliases.append(QueryAlias(name, field_id))
+    return tuple(sorted(aliases, key=lambda alias: alias.name))
 
 
 def _parse_profiles(raw: Any, query: QueryContract, fields: tuple[Field, ...]) -> tuple[SelectionProfile, ...]:
@@ -869,3 +928,7 @@ def _validate_revision_transition(previous: CustomImportDefinition, current: Cus
         if field_id in slot_by_current_field_id
     ):
         raise DefinitionError("stable field slots cannot be rebound")
+    previous_query_aliases = {alias.name: alias.field_id for alias in previous.query.aliases}
+    current_query_aliases = {alias.name: alias.field_id for alias in current.query.aliases}
+    if any(current_query_aliases.get(name) != field_id for name, field_id in previous_query_aliases.items()):
+        raise DefinitionError("published query aliases cannot be removed or rebound")
