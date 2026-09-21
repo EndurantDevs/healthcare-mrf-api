@@ -483,6 +483,54 @@ async def _publish_normal_mrf_stage(session, schema_name, import_date, address_k
     await initial._publish_mrf_table_generation(import_date, schema_name)
 
 
+async def _activate_manual_archive(sessions, destination_schema, manifest, ownership):
+    async with sessions() as session, session.begin():
+        incumbent = await archive.capture_reference_family_incumbent(
+            session,
+            importer_id="mrf",
+            schema_name=destination_schema,
+        )
+        return await archive.activate_reference_family_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            expected_incumbent=incumbent,
+            authority="manual",
+        )
+
+
+async def _run_interleaved_archive_cycle(
+    sessions,
+    monkeypatch,
+    source_schema,
+    destination_schema,
+    dataset_ids,
+):
+    first_prepared, first_restored, second_prepared, second_restored = dataset_ids
+    manifest, ownership = await _prepare_restored_candidate(
+        sessions,
+        source_schema,
+        first_prepared,
+        first_restored,
+    )
+    await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
+
+    async with sessions() as session:
+        monkeypatch.setattr(initial, "db", _PublisherDatabase(session, destination_schema))
+        monkeypatch.setattr(initial, "get_import_schema", lambda *_args: destination_schema)
+        await _publish_normal_mrf_stage(session, destination_schema, "20260921", uuid4())
+        await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v3'"))
+        await session.commit()
+
+    manifest, ownership = await _prepare_restored_candidate(
+        sessions,
+        source_schema,
+        second_prepared,
+        second_restored,
+    )
+    await _activate_manual_archive(sessions, destination_schema, manifest, ownership)
+
+
 @pytest.mark.asyncio
 async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch):
     """The archive must accept the importer's real table shape, not a model-only fixture."""
@@ -530,6 +578,63 @@ async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch):
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" CASCADE'))
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monkeypatch):
+    """An ordinary table swap must not leave names that block the next archive."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    source_schema = f"mrf_interleave_source_{token}"
+    destination_schema = f"mrf_interleave_destination_{token}"
+    first_prepared, first_restored = uuid4(), uuid4()
+    second_prepared, second_restored = uuid4(), uuid4()
+    dataset_ids = first_prepared, first_restored, second_prepared, second_restored
+    owned_schemas = {
+        source_schema,
+        destination_schema,
+        archive.reference_family_stage_schema(first_prepared),
+        archive.reference_family_stage_schema(first_restored),
+        archive.reference_family_predecessor_schema(first_restored),
+        archive.reference_family_stage_schema(second_prepared),
+        archive.reference_family_stage_schema(second_restored),
+        archive.reference_family_predecessor_schema(second_restored),
+    }
+    try:
+        async with sessions() as session, session.begin():
+            await _create_family(session, source_schema)
+            await _create_family(session, destination_schema)
+            await _insert_family_rows(session, source_schema, "source-v1")
+            await _insert_family_rows(session, destination_schema, "destination-v1")
+
+        await _run_interleaved_archive_cycle(
+            sessions,
+            monkeypatch,
+            source_schema,
+            destination_schema,
+            dataset_ids,
+        )
+
+        async with sessions() as session, session.begin():
+            assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v3"
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_catalog.pg_class AS relation "
+                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+                        "WHERE namespace.nspname=:schema_name AND relation.relname LIKE '%\\_old' ESCAPE '\\'"
+                    ),
+                    {"schema_name": destination_schema},
+                )
+                == 0
+            )
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in owned_schemas:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
 
 

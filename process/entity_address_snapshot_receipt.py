@@ -277,7 +277,10 @@ def _reject_schema_qualified_expressions(schema_name: str, *catalog_groups: list
         strict=True,
     ):
         expressions.extend(entry.get(key) for entry in entries for key in keys)
-    if any(isinstance(expression, str) and schema_name in expression for expression in expressions):
+    schema_reference = re.compile(rf'(?<![A-Za-z0-9_$])(?:{re.escape(schema_name)}|"{re.escape(schema_name)}")\.')
+    if any(
+        isinstance(expression, str) and schema_reference.search(expression) is not None for expression in expressions
+    ):
         raise EntityAddressArchiveReceiptError("entity-address archive schema expression is unsupported")
 
 
