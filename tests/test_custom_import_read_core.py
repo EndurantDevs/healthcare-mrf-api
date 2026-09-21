@@ -133,6 +133,23 @@ def test_string_filter_rejects_invalid_unicode_without_exposing_the_value():
         read_core._normalized_string("\ud800", "synthetic_field")
 
 
+def test_temporal_filters_accept_only_canonical_json_values():
+    assert read_core._normalized_date("2031-01-02", "synthetic_field") == (
+        dt.date(2031, 1, 2),
+        "2031-01-02",
+    )
+    assert read_core._normalized_timestamp("2031-01-02T03:04:05Z", "synthetic_field") == (
+        dt.datetime(2031, 1, 2, 3, 4, 5, tzinfo=dt.UTC),
+        "2031-01-02T03:04:05Z",
+    )
+    for value in ("2031-1-2", "2031-01-02T00:00:00Z"):
+        with pytest.raises(CustomImportReadRequestError):
+            read_core._normalized_date(value, "synthetic_field")
+    for value in ("2031-01-02T03:04:05+00:00", "2031-01-02T03:04:05.1Z"):
+        with pytest.raises(CustomImportReadRequestError):
+            read_core._normalized_timestamp(value, "synthetic_field")
+
+
 def test_cursor_rejects_tampering_scope_generation_and_expiry():
     cursor = _codec().issue(_cursor_state())
 
@@ -304,7 +321,6 @@ def test_filter_values_preserve_storage_types_and_canonical_cursor_values(value_
         ("decimal", "0.0000000000001"),
         ("decimal", "1000000000000000000"),
         ("boolean", 1),
-        ("date", "2026-01-02"),
         ("date", dt.datetime(2026, 1, 2)),
         ("timestamp", dt.date(2026, 1, 2)),
         ("timestamp", dt.datetime(2026, 1, 2)),
