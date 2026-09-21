@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -31,6 +32,8 @@ from process.reference_family_result_generation import (
     require_reference_family_automatic_generation_order,
     validate_reference_family_serving_generation,
 )
+
+logger = logging.getLogger(__name__)
 
 CONTRACT = "reference-replacement-family.postgres.v1"
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
@@ -1000,7 +1003,16 @@ async def export_reference_family_archive(
             archive_copy=archive_copy,
         )
         return prepared_source.manifest
-    finally:
+    except BaseException:
+        if ownership is not None:
+            try:
+                await _shielded_cleanup(session_factory, ownership)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("reference family stage %s requires manual cleanup", ownership.schema_name)
+        raise
+    else:
         if ownership is not None:
             await _shielded_cleanup(session_factory, ownership)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -9,6 +10,36 @@ from uuid import UUID
 import pytest
 
 from process import reference_family_archive as archive
+
+
+@pytest.mark.asyncio
+async def test_export_failure_is_not_replaced_by_cleanup_failure(monkeypatch, caplog):
+    ownership = SimpleNamespace(schema_name="reference_family_archive_synthetic")
+    prepared = SimpleNamespace(manifest=_manifest(), ownership=ownership)
+
+    async def prepare(*_args, **_kwargs):
+        return prepared
+
+    async def export(*_args, **_kwargs):
+        raise ValueError("synthetic export failure")
+
+    async def cleanup(*_args, **_kwargs):
+        raise RuntimeError("synthetic cleanup failure")
+
+    monkeypatch.setattr(archive, "prepare_reference_family_archive_source", prepare)
+    monkeypatch.setattr(archive, "export_prepared_reference_family_archive", export)
+    monkeypatch.setattr(archive, "_shielded_cleanup", cleanup)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ValueError, match="synthetic export failure"):
+        await archive.export_reference_family_archive(
+            object(),
+            importer_id="places-zcta",
+            schema_name="mrf",
+            source_metadata={"source_release": "synthetic-2026"},
+            dataset_id=UUID("550e8400-e29b-41d4-a716-446655440000"),
+            archive_copy=AsyncMock(),
+        )
+    assert "requires manual cleanup" in caplog.text
 
 
 def test_registry_is_closed_to_exact_ordered_replacement_families():
