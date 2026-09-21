@@ -45,10 +45,13 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
+from process.custom_import import snowflake
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
 from process.custom_import.execution import claim_execution, create_execution, request_cancellation
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner import CandidateRunnerError, CandidateRunRequest, CandidateRunResult, run_candidate
+from process.custom_import.snowflake_candidate import SnowflakeCandidateRequest, run_snowflake_candidate
+from process.custom_import.snowflake_python import _parquet_reader
 from tests.custom_import_postgres_support import digest, isolated_publication_case
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
@@ -65,6 +68,66 @@ class _Seed:
 
 def _definition() -> CustomImportDefinition:
     return CustomImportDefinition.from_json(_FIXTURE.read_text())
+
+
+def _snowflake_definition() -> CustomImportDefinition:
+    document = json.loads(_FIXTURE.read_text())
+    document["refresh_mode"] = "snapshot"
+    document["streams"] = [
+        {
+            "id": "snowflake_result",
+            "kind": "root",
+            "format": "parquet",
+            "compression": "none",
+            "snapshot_token": "source_snapshot",
+        }
+    ]
+    document["schema"]["children"] = []
+    document["aliases"] = {"snowflake_result": {}}
+    document["query"] = {"root_fields": ["npi", "display_name"], "order": []}
+    document["selection_profiles"] = []
+    return CustomImportDefinition.from_mapping(document)
+
+
+class _SnowflakePartitionSources:
+    def __init__(self, reader) -> None:
+        self._reader = reader
+        self._consumed = False
+
+    def __iter__(self):
+        if self._consumed:
+            raise RuntimeError("synthetic source was consumed twice")
+        self._consumed = True
+        yield self._reader
+
+    def close(self) -> None:
+        self._reader.close()
+
+
+def _snowflake_acquisition(definition: CustomImportDefinition) -> snowflake.SnowflakeAcquisition:
+    request = snowflake.SnowflakeReadRequest(
+        relation=snowflake.SnowflakeRelation(database="synthetic", schema="public", name="root_records"),
+        selected_columns=(
+            snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="npi"),
+            snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="display_name"),
+        ),
+        definition_sha256=definition.digest,
+        schema_sha256=definition.schema_digest,
+    )
+    statement = snowflake.SnowflakeReadStatement(request=request)
+    schema = (
+        snowflake.SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="display_name", source_type="TEXT", nullable=False),
+    )
+    result = snowflake.SnowflakeParquetResult(
+        source_snapshot_token="synthetic-snowflake-snapshot",
+        schema=schema,
+        partition_sources=_SnowflakePartitionSources(_parquet_reader((("1234567893", "Synthetic Bridge"),), schema)),
+    )
+    try:
+        return snowflake._seal_acquisition(statement, result, capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS)
+    finally:
+        result.close()
 
 
 def _snapshot_definition() -> CustomImportDefinition:
@@ -429,6 +492,35 @@ async def test_runner_materializes_seals_and_activates_typed_candidate_rows():
             assert len((await session.scalars(select(CustomImportRootScalar))).all()) == 2
             assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
             assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bridge_registers_and_activates_one_durable_root_candidate():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bridge", _snowflake_definition())
+
+        run_result = await run_snowflake_candidate(
+            case.sessions,
+            SnowflakeCandidateRequest(
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                definition=seed.definition,
+                acquisition=_snowflake_acquisition(seed.definition),
+                idempotency_key="synthetic-snowflake-bridge",
+                lease_token="synthetic-snowflake-bridge-lease",
+            ),
+        )
+
+        assert run_result.status == "activated"
+        assert run_result.generation_id is not None
+        async with case.sessions() as session:
+            pointer = await session.get(CustomImportCurrentGeneration, seed.dataset_id)
+            execution = await session.get(CustomImportExecution, run_result.execution_id)
+            assert pointer is not None and pointer.generation_id == run_result.generation_id
+            assert execution is not None and execution.capture_bundle_id is not None
+            bundle = await session.get(CustomImportCaptureBundle, execution.capture_bundle_id)
+            assert bundle is not None and bundle.snapshot_token == "synthetic-snowflake-snapshot"
 
 
 @pytest.mark.asyncio
