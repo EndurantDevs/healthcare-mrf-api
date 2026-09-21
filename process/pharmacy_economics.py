@@ -15,8 +15,7 @@ from arq import create_pool
 
 from db.models import PharmacyEconomicsSummary, db
 from process.control_lifecycle import mark_control_run
-from process.ext.utils import (ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects)
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.redis_config import build_redis_settings
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
@@ -35,16 +34,56 @@ FUL_TITLE = "ACA Federal Upper Limits"
 # Medicaid professional dispensing fees by state (sourced from CMS/Pharm.D references)
 # These represent the state Medicaid FFS dispensing fee per prescription.
 STATE_DISPENSING_FEES: dict[str, float] = {
-    "AL": 10.64, "AK": 10.81, "AZ": 12.00, "AR": 6.65, "CA": 10.05,
-    "CO": 10.17, "CT": 11.90, "DE": 3.65, "DC": 12.00, "FL": 10.24,
-    "GA": 10.93, "HI": 10.49, "ID": 10.00, "IL": 13.18, "IN": 10.00,
-    "IA": 10.02, "KS": 10.65, "KY": 10.76, "LA": 10.15, "ME": 11.52,
-    "MD": 5.61, "MA": 13.70, "MI": 13.00, "MN": 10.48, "MS": 7.21,
-    "MO": 6.15, "MT": 12.00, "NE": 10.57, "NV": 10.18, "NH": 11.00,
-    "NJ": 10.05, "NM": 10.31, "NY": 10.08, "NC": 6.00, "ND": 10.07,
-    "OH": 10.49, "OK": 10.18, "OR": 10.13, "PA": 10.49, "RI": 13.75,
-    "SC": 10.32, "SD": 10.86, "TN": 10.15, "TX": 7.93, "UT": 10.23,
-    "VT": 10.14, "VA": 10.49, "WA": 10.15, "WV": 12.55, "WI": 10.51,
+    "AL": 10.64,
+    "AK": 10.81,
+    "AZ": 12.00,
+    "AR": 6.65,
+    "CA": 10.05,
+    "CO": 10.17,
+    "CT": 11.90,
+    "DE": 3.65,
+    "DC": 12.00,
+    "FL": 10.24,
+    "GA": 10.93,
+    "HI": 10.49,
+    "ID": 10.00,
+    "IL": 13.18,
+    "IN": 10.00,
+    "IA": 10.02,
+    "KS": 10.65,
+    "KY": 10.76,
+    "LA": 10.15,
+    "ME": 11.52,
+    "MD": 5.61,
+    "MA": 13.70,
+    "MI": 13.00,
+    "MN": 10.48,
+    "MS": 7.21,
+    "MO": 6.15,
+    "MT": 12.00,
+    "NE": 10.57,
+    "NV": 10.18,
+    "NH": 11.00,
+    "NJ": 10.05,
+    "NM": 10.31,
+    "NY": 10.08,
+    "NC": 6.00,
+    "ND": 10.07,
+    "OH": 10.49,
+    "OK": 10.18,
+    "OR": 10.13,
+    "PA": 10.49,
+    "RI": 13.75,
+    "SC": 10.32,
+    "SD": 10.86,
+    "TN": 10.15,
+    "TX": 7.93,
+    "UT": 10.23,
+    "VT": 10.14,
+    "VA": 10.49,
+    "WA": 10.15,
+    "WV": 12.55,
+    "WI": 10.51,
     "WY": 12.00,
 }
 
@@ -110,9 +149,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
-        exists = bool(
-            await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;")
-        )
+        exists = bool(await db.scalar(f"SELECT to_regnamespace('{db_schema}') IS NOT NULL;"))
         if exists:
             logger.warning(
                 "Schema %s already exists but CREATE SCHEMA failed (%s); continuing",
@@ -210,7 +247,7 @@ def _parse_int(raw) -> int:
         return 0
     try:
         return int(float(text))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -222,7 +259,7 @@ def _parse_float(raw) -> float | None:
         return None
     try:
         return float(text)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -240,8 +277,7 @@ async def _fetch_sdud(client, sdud_url: str) -> dict[str, dict[str, dict]]:
                 ndc = utilization_row.get("ndc") or utilization_row.get("NDC") or ""
                 product_name = utilization_row.get("product_name") or utilization_row.get("Product Name") or ""
                 qty = _parse_int(
-                    utilization_row.get("number_of_prescriptions")
-                    or utilization_row.get("Number of Prescriptions")
+                    utilization_row.get("number_of_prescriptions") or utilization_row.get("Number of Prescriptions")
                 )
 
                 if not state or len(state) != 2 or not ndc or qty <= 0:
@@ -299,7 +335,9 @@ async def _fetch_ful(client, ful_url: str) -> dict[str, float]:
             reader = csv.DictReader(fh)
             for row in reader:
                 ndc = row.get("NDC") or row.get("ndc") or ""
-                price = _parse_float(row.get("ACA FUL") or row.get("ful_per_unit") or row.get("Weighted Average of AMPs"))
+                price = _parse_float(
+                    row.get("ACA FUL") or row.get("ful_per_unit") or row.get("Weighted Average of AMPs")
+                )
                 if not ndc or price is None or price <= 0:
                     continue
                 ndc_clean = ndc.replace("-", "").strip()
@@ -325,9 +363,7 @@ def _pharmacy_economics_rows(
             ful_ceiling = ful_data.get(ndc11)
             # Standard 30-day quantity baseline.
             quantity = 30
-            reimbursed_per_unit = (
-                min(nadac_cost, ful_ceiling) if ful_ceiling else nadac_cost
-            )
+            reimbursed_per_unit = min(nadac_cost, ful_ceiling) if ful_ceiling else nadac_cost
             total_reimbursement = (reimbursed_per_unit * quantity) + dispensing_fee
             total_cost = nadac_cost * quantity
             yield {
@@ -360,6 +396,7 @@ async def process_pharmacy_economics_data(ctx, task=None):
     test_row_limit = int(os.getenv("HLTHPRT_PHARMACY_ECON_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
 
     import aiohttp
+
     client = aiohttp.ClientSession()
     accepted_rows = 0
 
@@ -435,9 +472,7 @@ async def publish_pharmacy_economics_generation(ctx):
     await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(PharmacyEconomicsSummary, import_date)
-    stage_rows = int(await db.scalar(
-        f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     if context.get("test_mode"):
         logger.info("Pharmacy Economics test mode: staged rows=%d", stage_rows)
     elif stage_rows < DEFAULT_MIN_ROWS:
@@ -448,17 +483,12 @@ async def publish_pharmacy_economics_generation(ctx):
         table = PharmacyEconomicsSummary.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
         await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
+        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
         archived = _archived_identifier(f"{table}_idx_primary")
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
         await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-        )
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
+            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
         )
         if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
             for index in stage_cls.__my_additional_indexes__:
@@ -466,18 +496,13 @@ async def publish_pharmacy_economics_generation(ctx):
                 old_live_name = f"{table}_idx_{index_name}"
                 archived_live_name = _archived_identifier(old_live_name)
                 await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                    f"RENAME TO {archived_live_name};"
-                )
+                await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
                 await db.status(
                     f"ALTER INDEX IF EXISTS "
                     f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
                     f"RENAME TO {old_live_name};"
                 )
-        await publish_local_reference_family_generation(
-            db, importer_id="pharmacy-economics", schema_name=db_schema
-        )
+        await publish_local_reference_family_generation(db, importer_id="pharmacy-economics", schema_name=db_schema)
     logger.info("Pharmacy Economics publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
     await mark_control_run(

@@ -399,7 +399,45 @@ def _schema_digest(receipts: list[ReferenceTableReceipt] | tuple[ReferenceTableR
     return hashlib.sha256(b"reference-family-schema/v1\0" + _canonical_json(schema_receipts)).hexdigest()
 
 
+async def _restored_mrf_auxiliary_identity(session, schema_name, publication):
+    archive_name = publication["archive_name"]
+    relation_oid = await _relation_oid(session, schema_name, STAGE_TABLE)
+    if relation_oid is None:
+        raise ReferenceFamilyArchiveError("MRF canonical auxiliary relation is missing")
+    columns = await catalog_identity._catalog_columns(session, relation_oid)
+    if [
+        (column["attname"], column["type"], column["attnotnull"], column["default_expression"]) for column in columns
+    ] != [
+        ("address_key", "uuid", True, None),
+        ("payload", "jsonb", True, None),
+    ]:
+        raise ReferenceFamilyArchiveError("MRF canonical auxiliary schema differs")
+    primary_keys = await session.scalar(
+        text("SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid=:oid AND contype='p'"),
+        {"oid": relation_oid},
+    )
+    if primary_keys != 1:
+        raise ReferenceFamilyArchiveError("MRF canonical auxiliary key constraint differs")
+    malformed = await session.scalar(
+        text(
+            f"SELECT count(*) FROM {_quoted(schema_name)}.{_quoted(STAGE_TABLE)} "
+            "WHERE payload->>'address_key' IS DISTINCT FROM address_key::text"
+        )
+    )
+    if malformed:
+        raise ReferenceFamilyArchiveError("MRF canonical auxiliary key differs")
+    count, digest = await _projected_row_identity(
+        session,
+        schema_name,
+        STAGE_TABLE,
+        row_json_sql="row_value.payload",
+    )
+    return archive_name, count, digest, publication["publication_sha256"]
+
+
 async def _mrf_auxiliary_receipt(session, schema_name, *, is_source=False, publication=None):
+    """Build the portable canonical-address receipt for source or restored data."""
+
     if is_source:
         archive_name = archive_table_name()
         if await _relation_oid(session, schema_name, archive_name) is None or publication is None:
@@ -422,40 +460,9 @@ async def _mrf_auxiliary_receipt(session, schema_name, *, is_source=False, publi
             )
         ).hexdigest()
     else:
-        archive_name = publication["archive_name"]
-        relation_oid = await _relation_oid(session, schema_name, STAGE_TABLE)
-        if relation_oid is None:
-            raise ReferenceFamilyArchiveError("MRF canonical auxiliary relation is missing")
-        columns = await catalog_identity._catalog_columns(session, relation_oid)
-        if [
-            (column["attname"], column["type"], column["attnotnull"], column["default_expression"])
-            for column in columns
-        ] != [
-            ("address_key", "uuid", True, None),
-            ("payload", "jsonb", True, None),
-        ]:
-            raise ReferenceFamilyArchiveError("MRF canonical auxiliary schema differs")
-        primary_keys = await session.scalar(
-            text("SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid=:oid AND contype='p'"),
-            {"oid": relation_oid},
+        archive_name, count, digest, publication_sha256 = await _restored_mrf_auxiliary_identity(
+            session, schema_name, publication
         )
-        if primary_keys != 1:
-            raise ReferenceFamilyArchiveError("MRF canonical auxiliary key constraint differs")
-        malformed = await session.scalar(
-            text(
-                f"SELECT count(*) FROM {_quoted(schema_name)}.{_quoted(STAGE_TABLE)} "
-                "WHERE payload->>'address_key' IS DISTINCT FROM address_key::text"
-            )
-        )
-        if malformed:
-            raise ReferenceFamilyArchiveError("MRF canonical auxiliary key differs")
-        count, digest = await _projected_row_identity(
-            session,
-            schema_name,
-            STAGE_TABLE,
-            row_json_sql="row_value.payload",
-        )
-        publication_sha256 = publication["publication_sha256"]
     return {
         "table_name": STAGE_TABLE,
         "archive_name": archive_name,
@@ -514,8 +521,7 @@ async def _bounded_capture(session: Any):
     try:
         yield
     except BaseException:
-        # SET LOCAL expires with the failed caller transaction; another SQL
-        # statement here would mask the original database error.
+        # A failed caller transaction expires SET LOCAL; more SQL would mask the original error.
         raise
     else:
         await _set_local_timeout(session, "lock_timeout", previous_lock)
@@ -751,6 +757,30 @@ def _validate_mrf_auxiliary_receipt(auxiliary: object) -> Mapping[str, Any]:
     return auxiliary
 
 
+def _manifest_table_receipts(raw_tables: object, spec: ReferenceFamilySpec) -> tuple[ReferenceTableReceipt, ...]:
+    if not isinstance(raw_tables, list) or len(raw_tables) != len(spec.model_types):
+        raise ReferenceFamilyArchiveError("reference family manifest table set is invalid")
+    receipts = []
+    for raw_table, model_type in zip(raw_tables, spec.model_types, strict=True):
+        if not isinstance(raw_table, Mapping) or set(raw_table) != {
+            "model_name",
+            "table_name",
+            "schema_sha256",
+            "row_count",
+        }:
+            raise ReferenceFamilyArchiveError("reference family table receipt is invalid")
+        if (
+            raw_table["model_name"] != model_type.__name__
+            or raw_table["table_name"] != model_type.__tablename__
+            or not re.fullmatch(r"[0-9a-f]{64}", str(raw_table["schema_sha256"]))
+            or type(raw_table["row_count"]) is not int
+            or raw_table["row_count"] < 0
+        ):
+            raise ReferenceFamilyArchiveError("reference family table receipt is invalid")
+        receipts.append(ReferenceTableReceipt(**dict(raw_table)))
+    return tuple(receipts)
+
+
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
     """Validate the portable closed-family receipt without granting authority."""
 
@@ -779,27 +809,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
     spec = reference_family_spec(manifest_value["importer_id"])
     auxiliary = _validate_mrf_auxiliary_receipt(manifest_value.get("auxiliary")) if spec.importer_id == "mrf" else None
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
-    raw_tables = manifest_value["tables"]
-    if not isinstance(raw_tables, list) or len(raw_tables) != len(spec.model_types):
-        raise ReferenceFamilyArchiveError("reference family manifest table set is invalid")
-    receipts = []
-    for raw_table, model_type in zip(raw_tables, spec.model_types, strict=True):
-        if not isinstance(raw_table, Mapping) or set(raw_table) != {
-            "model_name",
-            "table_name",
-            "schema_sha256",
-            "row_count",
-        }:
-            raise ReferenceFamilyArchiveError("reference family table receipt is invalid")
-        if (
-            raw_table["model_name"] != model_type.__name__
-            or raw_table["table_name"] != model_type.__tablename__
-            or not re.fullmatch(r"[0-9a-f]{64}", str(raw_table["schema_sha256"]))
-            or type(raw_table["row_count"]) is not int
-            or raw_table["row_count"] < 0
-        ):
-            raise ReferenceFamilyArchiveError("reference family table receipt is invalid")
-        receipts.append(ReferenceTableReceipt(**dict(raw_table)))
+    receipts = _manifest_table_receipts(manifest_value["tables"], spec)
     schema_sha256 = _schema_digest(receipts)
     if manifest_value["source_metadata_sha256"] != metadata_sha256 or manifest_value["schema_sha256"] != schema_sha256:
         raise ReferenceFamilyArchiveError("reference family manifest digest differs")

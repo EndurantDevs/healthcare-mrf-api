@@ -201,7 +201,7 @@ async def test_generation_reads_require_authority_rows():
     with pytest.raises(RuntimeError, match="singleton is unavailable"):
         await generation.read_entity_address_result_generation_authority(session, schema_name="mrf")
 
-    row = {
+    authority_by_field = {
         "singleton": True,
         "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
         "local_generation": 0,
@@ -210,7 +210,7 @@ async def test_generation_reads_require_authority_rows():
         "published_at": None,
         "relation_oids": None,
     }
-    result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: row))
+    result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: authority_by_field))
     session.execute = AsyncMock(return_value=result)
     assert (
         await generation.read_entity_address_result_generation_authority(session, schema_name="mrf")

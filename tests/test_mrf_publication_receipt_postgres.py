@@ -37,7 +37,7 @@ class _EmptyMigrationOperations:
         return self
 
     def scalar(self):
-        return False
+        return 0
 
 
 def test_empty_downgrade_fences_receipt_before_check_and_drop(monkeypatch):
@@ -71,19 +71,23 @@ async def _configure_summary_tables(connection, monkeypatch, schema, *, drop_exi
 
     metadata = MetaData()
     for attribute_name in (
-        "plan_table", "plan_attributes_table", "plan_benefits_table", "plan_prices_table", "summary_table",
+        "plan_table",
+        "plan_attributes_table",
+        "plan_benefits_table",
+        "plan_prices_table",
+        "summary_table",
     ):
         table = getattr(plan_summary, attribute_name).to_metadata(metadata, schema=schema)
         monkeypatch.setattr(plan_summary, attribute_name, table)
         if drop_existing:
             await connection.execute(text(f'DROP TABLE "{schema}"."{table.name}"'))
         if drop_existing or table.name != "plan":
-            await connection.run_sync(
-                lambda sync, table=table: table.create(sync, checkfirst=not drop_existing)
-            )
-    monkeypatch.setattr(plan_summary, "PRICE_RATE_COLUMNS", tuple(
-        plan_summary.plan_prices_table.c[column.name] for column in plan_summary.PRICE_RATE_COLUMNS
-    ))
+            await connection.run_sync(lambda sync, table=table: table.create(sync, checkfirst=not drop_existing))
+    monkeypatch.setattr(
+        plan_summary,
+        "PRICE_RATE_COLUMNS",
+        tuple(plan_summary.plan_prices_table.c[column.name] for column in plan_summary.PRICE_RATE_COLUMNS),
+    )
 
 
 async def _restore_rotated_summary_relation(engine, schema, table_name, prepare):
@@ -99,7 +103,9 @@ async def _restore_rotated_summary_relation(engine, schema, table_name, prepare)
         await connection.execute(text(f'ALTER TABLE "{schema}".identity_old RENAME TO "{table_name}"'))
 
 
-async def _assert_summary_failure_revokes_source_admission(monkeypatch, plan_summary, archive_prepare, schema, authority):
+async def _assert_summary_failure_revokes_source_admission(
+    monkeypatch, plan_summary, archive_prepare, schema, authority
+):
     """Keep a failed summary rebuild from leaving a source archive admissible."""
 
     failed_attempt = await receipt.begin_publication(schema, "summary_failure")
@@ -151,7 +157,9 @@ async def _assert_completed_source_admission(database, plan_summary, prepare, sc
     attempt = await receipt.begin_publication(schema, "untracked")
     async with database.transaction() as session:
         authority = await generation.publish_local_reference_family_generation(
-            session, importer_id="mrf", schema_name=schema,
+            session,
+            importer_id="mrf",
+            schema_name=schema,
         )
     with pytest.raises(RuntimeError, match="completion is unavailable"):
         await prepare()
@@ -164,7 +172,9 @@ async def _assert_completed_source_becomes_stale(engine, database, schema, prepa
         await _restore_rotated_summary_relation(engine, schema, table_name, prepare)
     async with database.transaction() as session:
         await generation.publish_local_reference_family_generation(
-            session, importer_id="mrf", schema_name=schema,
+            session,
+            importer_id="mrf",
+            schema_name=schema,
         )
     with pytest.raises(RuntimeError, match="completion generation differs"):
         await prepare()
@@ -195,9 +205,9 @@ async def _assert_completion_rollback(engine, database, schema, attempt, authori
         assert completed_receipt["generation"]["local_generation"] == authority.local_generation
         assert completed_receipt["summary_inputs"] == inputs
         assert completed_receipt["address_resolution_performed"] is True
-        assert completed_receipt["summary_oid"] == await observer.scalar(text(
-            f"SELECT '{schema}.plan_search_summary'::regclass::oid"
-        ))
+        assert completed_receipt["summary_oid"] == await observer.scalar(
+            text(f"SELECT '{schema}.plan_search_summary'::regclass::oid")
+        )
 
 
 async def _recover_failed_receipt(database, schema, authority, inputs):
@@ -206,7 +216,9 @@ async def _recover_failed_receipt(database, schema, authority, inputs):
     failed_attempt = await receipt.begin_publication(schema, "later_failure")
     async with database.transaction() as session:
         newer_authority = await generation.publish_local_reference_family_generation(
-            session, importer_id="mrf", schema_name=schema,
+            session,
+            importer_id="mrf",
+            schema_name=schema,
         )
     with pytest.raises(RuntimeError, match="generation changed"):
         async with database.transaction() as session:
@@ -226,10 +238,13 @@ async def _assert_summary_input_drift_and_recover(engine, database, schema, fail
     with pytest.raises(RuntimeError, match="reconcile"):
         await receipt.begin_publication(schema, "retry_after_crash")
     async with database.transaction() as session:
-        deletion_result = await session.execute(text(f"""
+        deletion_result = await session.execute(
+            text(f"""
             DELETE FROM "{schema}".{receipt.TABLE}
             WHERE state='pending' AND attempt_id=CAST(:attempt AS uuid)
-        """), {"attempt": failed_attempt})
+        """),
+            {"attempt": failed_attempt},
+        )
         assert deletion_result.rowcount == 1
     recovery_attempt = await receipt.begin_publication(schema, "full_rebuild")
     assert recovery_attempt != failed_attempt
@@ -257,11 +272,16 @@ async def _assert_summary_index_failure(monkeypatch, plan_summary, database, sch
     with pytest.raises(RuntimeError, match="index failure"):
         await plan_summary.rebuild_plan_search_summary(publication=(index_failure_attempt, authority, False))
     async with database.engine.connect() as observer:
-        assert await observer.scalar(text(f"SELECT '{schema}.plan_search_summary'::regclass::oid")) == completed_summary_oid
+        assert (
+            await observer.scalar(text(f"SELECT '{schema}.plan_search_summary'::regclass::oid"))
+            == completed_summary_oid
+        )
         assert await observer.scalar(text(f'SELECT state FROM "{schema}".{receipt.TABLE}')) == "pending"
 
 
-async def _rebuild_summary_with_input_fence(monkeypatch, plan_summary, engine, database, schema, recovery_attempt, authority):
+async def _rebuild_summary_with_input_fence(
+    monkeypatch, plan_summary, engine, database, schema, recovery_attempt, authority
+):
     """Prove final summary indexing keeps source writes fenced through completion."""
 
     ensure_indexes = plan_summary._ensure_summary_indexes
@@ -281,13 +301,13 @@ async def _rebuild_summary_with_input_fence(monkeypatch, plan_summary, engine, d
     assert await plan_summary.rebuild_plan_search_summary(publication=(recovery_attempt, authority, False)) == 0
     assert index_call_counts[0] == 2
     async with engine.connect() as observer:
-        completed_summary_oid = await observer.scalar(text(
-            f'SELECT summary_oid FROM "{schema}".{receipt.TABLE} WHERE state=\'complete\''
-        ))
+        completed_summary_oid = await observer.scalar(
+            text(f"SELECT summary_oid FROM \"{schema}\".{receipt.TABLE} WHERE state='complete'")
+        )
         assert completed_summary_oid
-        assert await observer.scalar(text(
-            f'SELECT address_resolution_performed FROM "{schema}".{receipt.TABLE}'
-        )) is False
+        assert (
+            await observer.scalar(text(f'SELECT address_resolution_performed FROM "{schema}".{receipt.TABLE}')) is False
+        )
     return completed_summary_oid
 
 
@@ -306,8 +326,17 @@ async def _create_receipt_schema(engine, schema):
         await _run_migration(connection, _MIGRATION, "upgrade")
 
 
+async def _publish_mrf_authority(database, schema):
+    async with database.transaction() as session:
+        return await generation.publish_local_reference_family_generation(
+            session, importer_id="mrf", schema_name=schema
+        )
+
+
 @pytest.mark.asyncio
 async def test_completion_visibility_rollback_input_drift_and_explicit_recovery(monkeypatch):
+    """Preserve receipt visibility, rollback, drift rejection, and explicit recovery."""
+
     schema = "mrf_receipt_" + uuid4().hex
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
@@ -322,31 +351,43 @@ async def test_completion_visibility_rollback_input_drift_and_explicit_recovery(
                 await _run_migration(connection, _MIGRATION, "downgrade")
         with pytest.raises(RuntimeError, match="reconcile"):
             await receipt.begin_publication(schema, "concurrent")
+        authority = await _publish_mrf_authority(database, schema)
         async with database.transaction() as session:
-            authority = await generation.publish_local_reference_family_generation(
-                session, importer_id="mrf", schema_name=schema,
-            )
             inputs = await receipt.capture_summary_inputs(session, schema)
         await _assert_completion_rollback(engine, database, schema, attempt, authority, inputs)
         failed_attempt, authority = await _recover_failed_receipt(database, schema, authority, inputs)
         recovery_attempt = await _assert_summary_input_drift_and_recover(
-            engine, database, schema, failed_attempt, authority, inputs,
+            engine,
+            database,
+            schema,
+            failed_attempt,
+            authority,
+            inputs,
         )
 
         from process import plan_summary
+
         async with engine.begin() as connection:
             await _configure_summary_tables(connection, monkeypatch, schema, drop_existing=True)
         monkeypatch.setattr(plan_summary, "db", database)
         monkeypatch.setattr(plan_summary, "ensure_database", _summary_database_ready)
-        async with database.transaction() as session:
-            authority = await generation.publish_local_reference_family_generation(
-                session, importer_id="mrf", schema_name=schema,
-            )
+        authority = await _publish_mrf_authority(database, schema)
         completed_summary_oid = await _rebuild_summary_with_input_fence(
-            monkeypatch, plan_summary, engine, database, schema, recovery_attempt, authority,
+            monkeypatch,
+            plan_summary,
+            engine,
+            database,
+            schema,
+            recovery_attempt,
+            authority,
         )
         await _assert_summary_index_failure(
-            monkeypatch, plan_summary, database, schema, authority, completed_summary_oid,
+            monkeypatch,
+            plan_summary,
+            database,
+            schema,
+            authority,
+            completed_summary_oid,
         )
     finally:
         async with engine.begin() as connection:
@@ -386,7 +427,10 @@ async def test_native_source_prepare_requires_matching_completed_finalizer(monke
             await _run_migration(connection, _MIGRATION, "upgrade")
             await _configure_summary_tables(connection, monkeypatch, schema)
         prepared, authority = await _assert_completed_source_admission(
-            database, plan_summary, prepare, schema,
+            database,
+            plan_summary,
+            prepare,
+            schema,
         )
         assert prepared.manifest.importer_id == "mrf"
         await _assert_completed_source_becomes_stale(engine, database, schema, prepare)

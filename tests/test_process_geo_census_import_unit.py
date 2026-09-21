@@ -322,9 +322,7 @@ async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
         "race_some_other_race_alone_pct": 690 / 23890 * 100,
         "race_two_or_more_races_pct": 755 / 23890 * 100,
     }
-    observed_fields_by_name = {
-        field_name: profile[field_name] for field_name in expected_fields_by_name
-    }
+    observed_fields_by_name = {field_name: profile[field_name] for field_name in expected_fields_by_name}
     assert observed_fields_by_name == pytest.approx(expected_fields_by_name)
 
 
@@ -359,19 +357,11 @@ async def test_flush_rows_skips_empty_batches_and_upserts_nonempty_batches(
     await geo_census._flush_rows(buffered_rows)
 
     table = geo_census.GeoZipCensusProfile.__table__
-    expected_update_column_names = {
-        column.name for column in table.c if not column.primary_key
-    }
+    expected_update_column_names = {column.name for column in table.c if not column.primary_key}
     assert insert_calls == [table]
-    assert insert_statement.rows_to_insert == [
-        {"zip_code": "01234", "total_population": 10}
-    ]
-    assert insert_statement.conflict_options["index_elements"] == (
-        geo_census.GeoZipCensusProfile.__my_index_elements__
-    )
-    assert set(insert_statement.conflict_options["set_"]) == (
-        expected_update_column_names
-    )
+    assert insert_statement.rows_to_insert == [{"zip_code": "01234", "total_population": 10}]
+    assert insert_statement.conflict_options["index_elements"] == (geo_census.GeoZipCensusProfile.__my_index_elements__)
+    assert set(insert_statement.conflict_options["set_"]) == (expected_update_column_names)
     assert insert_statement.status_calls == 1
     assert buffered_rows == []
 
@@ -392,59 +382,46 @@ async def test_ensure_profile_columns_emits_every_declarative_ddl(monkeypatch):
         "ALTER TABLE synthetic_schema.geo_zip_census_profile "
         f"ADD COLUMN IF NOT EXISTS {geo_census.PROFILE_COLUMN_DDLS[0]};"
     )
-    assert statements[-1].endswith(
-        f"ADD COLUMN IF NOT EXISTS {geo_census.PROFILE_COLUMN_DDLS[-1]};"
-    )
+    assert statements[-1].endswith(f"ADD COLUMN IF NOT EXISTS {geo_census.PROFILE_COLUMN_DDLS[-1]};")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_write", [False, True])
 async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch, fail_write):
+    """Keep census rows and generation publication in one transaction."""
+
     from process import reference_family_result_generation as generation
 
-    in_transaction = False
+    transaction_state_by_name = {"active": False}
 
     @asynccontextmanager
     async def transaction():
-        nonlocal in_transaction
-        in_transaction = True
+        transaction_state_by_name["active"] = True
         try:
             yield
         finally:
-            in_transaction = False
+            transaction_state_by_name["active"] = False
 
     async def publish_after_rows(*_args, **_kwargs):
-        assert in_transaction
+        assert transaction_state_by_name["active"]
         assert len(captured_rows_by_name["rows"]) == 2
 
     publish = AsyncMock(side_effect=publish_after_rows)
     monkeypatch.setattr(generation, "publish_local_reference_family_generation", publish)
     captured_rows_by_name = {"rows": []}
 
-    async def _fake_collect(*_args, **_kwargs):
-        return PERSISTED_PROFILES_BY_ZIP
-
-    async def _fake_ensure_database(_test_mode):
-        return None
-
-    async def _fake_create_table(*_args, **_kwargs):
-        return None
-
-    async def _fake_status(_statement, *args, **kwargs):
-        return None
-
     async def _fake_flush(rows):
-        assert in_transaction
+        assert transaction_state_by_name["active"]
         if fail_write:
             raise RuntimeError("synthetic write failure")
         captured_rows_by_name["rows"].extend(rows)
         rows.clear()
 
-    monkeypatch.setattr(geo_census, "_collect_profile_map", _fake_collect)
-    monkeypatch.setattr(geo_census, "ensure_database", _fake_ensure_database)
-    monkeypatch.setattr(geo_census.db, "create_table", _fake_create_table)
+    monkeypatch.setattr(geo_census, "_collect_profile_map", AsyncMock(return_value=PERSISTED_PROFILES_BY_ZIP))
+    monkeypatch.setattr(geo_census, "ensure_database", AsyncMock())
+    monkeypatch.setattr(geo_census.db, "create_table", AsyncMock())
     monkeypatch.setattr(geo_census.db, "transaction", transaction)
-    monkeypatch.setattr(geo_census.db, "status", _fake_status)
+    monkeypatch.setattr(geo_census.db, "status", AsyncMock())
     monkeypatch.setattr(geo_census, "_flush_rows", _fake_flush)
     monkeypatch.setattr(geo_census, "IMPORT_BATCH_SIZE", 2)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -453,20 +430,17 @@ async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch, fail_wri
         with pytest.raises(RuntimeError, match="synthetic write failure"):
             await geo_census.load_geo_census_lookup(test_mode=False)
         publish.assert_not_awaited()
-        assert not in_transaction
+        assert not transaction_state_by_name["active"]
         return
 
     inserted = await geo_census.load_geo_census_lookup(test_mode=False)
 
     assert inserted == 2
     publish.assert_awaited_once_with(geo_census.db, importer_id="geo-census", schema_name="mrf")
-    assert not in_transaction
+    assert not transaction_state_by_name["active"]
     assert len(captured_rows_by_name["rows"]) == 2
     assert captured_rows_by_name["rows"][0]["zip_code"] == "60654"
-    assert (
-        captured_rows_by_name["rows"][0]["total_employer_establishments"]
-        == 2224
-    )
+    assert captured_rows_by_name["rows"][0]["total_employer_establishments"] == 2224
 
 
 def test_geo_census_command_forwards_test_mode(monkeypatch):
