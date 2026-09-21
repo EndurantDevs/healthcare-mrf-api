@@ -71,6 +71,87 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CoverageStatistics'
+  /extensions/custom-import/search:
+    post:
+      operationId: searchCustomImportExtension
+      summary: Search one authorized, immutable custom-import generation
+      description: |
+        Service-to-service extension read. The gateway signs the canonical
+        request body, authorization scope, exact target, method, path, request
+        identity, and a short validity window. Cursors are opaque and remain
+        bound to the same target, query, ordering, authorization scope, and
+        expiry.
+      parameters:
+        - name: X-HealthPorta-Extension-Read-Context
+          in: header
+          required: true
+          description: Base64url-encoded canonical signed request context.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 3072
+            pattern: '^[A-Za-z0-9_-]+$'
+        - name: X-HealthPorta-Extension-Read-Key-Id
+          in: header
+          required: true
+          description: Identifier of the configured transport signing key.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 32
+            pattern: '^[a-z0-9][a-z0-9-]{0,31}$'
+        - name: X-HealthPorta-Extension-Read-Signature
+          in: header
+          required: true
+          description: Base64url-encoded HMAC-SHA256 signature over the context.
+          schema:
+            type: string
+            minLength: 43
+            maxLength: 43
+            pattern: '^[A-Za-z0-9_-]{43}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportReadRequest'
+      responses:
+        '200':
+          description: Exact-count page from the selected family and optional context child.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadPage'
+        '400':
+          description: The signed request or cursor violates the bounded read contract.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
+        '404':
+          description: The permit, target, or authorization boundary is not available to the caller.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
+        '503':
+          description: The exact pinned read cannot be served within its bounded window.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
   /plan/:
     get:
       operationId: getPlan
@@ -6723,6 +6804,11 @@ components:
       schema:
         type: string
         enum: ['private, no-store']
+    CustomImportReadCacheControl:
+      description: Present on every custom-import extension-read response to prohibit storage.
+      schema:
+        type: string
+        enum: ['private, no-store']
     FHIRFormularyCacheControl:
       description: Present on every FHIR formulary response to prohibit storage.
       schema:
@@ -6856,6 +6942,162 @@ components:
         details:
           type: string
       additionalProperties: true
+    CustomImportReadRequest:
+      type: object
+      additionalProperties: false
+      required: [target, filters, page_size, cursor]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportReadTarget'
+        filters:
+          type: array
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/CustomImportReadFilter'
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+        cursor:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          nullable: true
+          description: Opaque continuation returned by the same authorized query.
+    CustomImportReadTarget:
+      type: object
+      additionalProperties: false
+      required: [dataset_key, generation_id, definition_revision_id, schema_revision_id, profile_id]
+      properties:
+        dataset_key:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        generation_id:
+          type: integer
+          format: int64
+          minimum: 1
+        definition_revision_id:
+          type: integer
+          format: int64
+          minimum: 1
+        schema_revision_id:
+          type: integer
+          format: int64
+          minimum: 1
+        profile_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+    CustomImportReadFilter:
+      oneOf:
+        - $ref: '#/components/schemas/CustomImportReadComparisonFilter'
+        - $ref: '#/components/schemas/CustomImportReadStateFilter'
+    CustomImportReadComparisonFilter:
+      type: object
+      additionalProperties: false
+      required: [field_id, operator, value]
+      properties:
+        field_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        operator:
+          type: string
+          enum: [eq, neq, gt, gte, lt, lte]
+        value:
+          oneOf:
+            - type: string
+              maxLength: 2048
+            - type: integer
+              format: int64
+            - type: boolean
+    CustomImportReadStateFilter:
+      type: object
+      additionalProperties: false
+      required: [field_id, operator]
+      properties:
+        field_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        operator:
+          type: string
+          enum: [is_null, is_missing]
+    CustomImportReadPage:
+      type: object
+      additionalProperties: false
+      required: [target, total, items, next_cursor, expires_at]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportReadTarget'
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CustomImportReadItem'
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          nullable: true
+        expires_at:
+          type: integer
+          format: int64
+          minimum: 0
+          description: UNIX expiry time for this page and its continuation.
+    CustomImportReadItem:
+      type: object
+      additionalProperties: false
+      required: [root_fields, context_fields]
+      properties:
+        root_fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/CustomImportReadFieldValue'
+        context_fields:
+          type: array
+          description: Fields from the one selected context child, or an empty array.
+          items:
+            $ref: '#/components/schemas/CustomImportReadFieldValue'
+    CustomImportReadFieldValue:
+      type: object
+      additionalProperties: false
+      required: [field_id, field_type, state, value]
+      properties:
+        field_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        field_type:
+          type: string
+          enum: [string, integer, decimal, boolean, date, timestamp]
+        state:
+          type: string
+          enum: [value, 'null', missing]
+        value:
+          oneOf:
+            - type: string
+              nullable: true
+            - type: integer
+              format: int64
+            - type: boolean
+    CustomImportReadErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/CustomImportReadError'
+    CustomImportReadError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [custom_import_read_request_invalid, resource_not_found, custom_import_read_unavailable]
+        message:
+          type: string
     PtgAuditOccurrenceResponse:
       type: object
       required:

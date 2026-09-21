@@ -246,6 +246,35 @@ def test_openapi_routes_match_code():
         )
 
 
+def test_custom_import_extension_read_openapi_contract():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = spec["paths"]["/extensions/custom-import/search"]["post"]
+    header_names = {parameter["name"] for parameter in operation["parameters"]}
+
+    assert header_names == {
+        "X-HealthPorta-Extension-Read-Context",
+        "X-HealthPorta-Extension-Read-Key-Id",
+        "X-HealthPorta-Extension-Read-Signature",
+    }
+    assert all(parameter["required"] is True for parameter in operation["parameters"])
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CustomImportReadRequest"
+    }
+    value_schema = spec["components"]["schemas"]["CustomImportReadFieldValue"]["properties"]["value"]
+    assert "nullable" not in value_schema
+    assert value_schema["oneOf"][0] == {"type": "string", "nullable": True}
+    assert set(operation["responses"]) == {"200", "400", "404", "503"}
+    for status, response_schema in {
+        "200": "CustomImportReadPage",
+        "400": "CustomImportReadErrorResponse",
+        "404": "CustomImportReadErrorResponse",
+        "503": "CustomImportReadErrorResponse",
+    }.items():
+        response = operation["responses"][status]
+        assert response["headers"]["Cache-Control"] == {"$ref": "#/components/headers/CustomImportReadCacheControl"}
+        assert response["content"]["application/json"]["schema"] == {"$ref": f"#/components/schemas/{response_schema}"}
+
+
 def test_pricing_procedure_scope_refusals_match_shared_handler():
     """Document every structured 422 emitted by both procedure-search paths."""
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
