@@ -758,6 +758,8 @@ def _parse_query(
     child_fields: tuple[Field, ...],
     children: tuple[ChildCollection, ...],
 ) -> QueryContract:
+    """Parse the projected query surface, aliases, and result ordering."""
+
     query = _mapping(
         raw,
         "definition.query",
@@ -774,51 +776,66 @@ def _parse_query(
     )
     if len(root_query_fields) != len(set(root_query_fields)) or not set(root_query_fields).issubset(root_ids):
         raise DefinitionError("query root fields must be unique projected root fields")
-    raw_child = query.get("child")
-    child_collection: str | None = None
-    query_child_fields: tuple[str, ...] = ()
-    if raw_child is not None:
-        child = _mapping(raw_child, "definition.query.child", keys={"collection", "fields"})
-        child_collection = _identifier(
-            _required(child, "collection", "definition.query.child"),
-            "definition.query.child.collection",
-        )
-        if child_collection not in {collection.name for collection in children}:
-            raise DefinitionError("query child collection is not declared")
-        query_child_fields = tuple(
-            _identifier(field_id, "definition.query.child.fields")
-            for field_id in _array(
-                _required(child, "fields", "definition.query.child"),
-                "definition.query.child.fields",
-            )
-        )
-        if len(query_child_fields) != len(set(query_child_fields)) or not set(query_child_fields).issubset(
-            child_by_collection.get(child_collection, set())
-        ):
-            raise DefinitionError("query child fields must be unique projected fields in one collection")
-    order = _parse_sort_terms(query.get("order", []), "definition.query.order", maximum=MAX_ORDER_TERMS)
-    permitted = set(root_query_fields) | set(query_child_fields)
-    if any(term.field_id not in permitted for term in order):
+    child_collection, query_child_fields = _parse_query_child(query.get("child"), child_by_collection, children)
+    order_terms = _parse_sort_terms(query.get("order", []), "definition.query.order", maximum=MAX_ORDER_TERMS)
+    permitted_field_ids = set(root_query_fields) | set(query_child_fields)
+    if any(term.field_id not in permitted_field_ids for term in order_terms):
         raise DefinitionError("query order terms must use permitted query fields")
     query_aliases = _parse_query_aliases(
         query.get("aliases", {}),
-        permitted=permitted,
+        permitted=permitted_field_ids,
         canonical_field_ids={field.field_id for field in (*root_fields, *child_fields)},
     )
-    sortable_fields = tuple(
-        _identifier(field_id, "definition.query.sortable_fields")
-        for field_id in _array(query.get("sortable_fields", []), "definition.query.sortable_fields")
-    )
-    if len(sortable_fields) != len(set(sortable_fields)) or not set(sortable_fields).issubset(permitted):
-        raise DefinitionError("query sortable fields must be unique permitted query fields")
     return QueryContract(
         root_query_fields,
         child_collection,
         query_child_fields,
-        order,
+        order_terms,
         query_aliases,
-        sortable_fields,
+        _parse_sortable_fields(query.get("sortable_fields", []), permitted_field_ids),
     )
+
+
+def _parse_query_child(
+    raw_child: object,
+    child_field_ids_by_collection: Mapping[str | None, set[str]],
+    children: tuple[ChildCollection, ...],
+) -> tuple[str | None, tuple[str, ...]]:
+    """Parse the optional single child collection exposed to queries."""
+
+    if raw_child is None:
+        return None, ()
+    child = _mapping(raw_child, "definition.query.child", keys={"collection", "fields"})
+    child_collection = _identifier(
+        _required(child, "collection", "definition.query.child"),
+        "definition.query.child.collection",
+    )
+    if child_collection not in {collection.name for collection in children}:
+        raise DefinitionError("query child collection is not declared")
+    query_child_fields = tuple(
+        _identifier(field_id, "definition.query.child.fields")
+        for field_id in _array(
+            _required(child, "fields", "definition.query.child"),
+            "definition.query.child.fields",
+        )
+    )
+    if len(query_child_fields) != len(set(query_child_fields)) or not set(query_child_fields).issubset(
+        child_field_ids_by_collection.get(child_collection, set())
+    ):
+        raise DefinitionError("query child fields must be unique projected fields in one collection")
+    return child_collection, query_child_fields
+
+
+def _parse_sortable_fields(raw: object, permitted_field_ids: set[str]) -> tuple[str, ...]:
+    """Parse fields opted into request-selected ordering."""
+
+    sortable_fields = tuple(
+        _identifier(field_id, "definition.query.sortable_fields")
+        for field_id in _array(raw, "definition.query.sortable_fields")
+    )
+    if len(sortable_fields) != len(set(sortable_fields)) or not set(sortable_fields).issubset(permitted_field_ids):
+        raise DefinitionError("query sortable fields must be unique permitted query fields")
+    return sortable_fields
 
 
 def _parse_query_aliases(
@@ -928,7 +945,10 @@ def _validate_revision_transition(previous: CustomImportDefinition, current: Cus
         if field_id in slot_by_current_field_id
     ):
         raise DefinitionError("stable field slots cannot be rebound")
-    previous_query_aliases = {alias.name: alias.field_id for alias in previous.query.aliases}
-    current_query_aliases = {alias.name: alias.field_id for alias in current.query.aliases}
-    if any(current_query_aliases.get(name) != field_id for name, field_id in previous_query_aliases.items()):
+    previous_field_id_by_query_alias = {alias.name: alias.field_id for alias in previous.query.aliases}
+    current_field_id_by_query_alias = {alias.name: alias.field_id for alias in current.query.aliases}
+    if any(
+        current_field_id_by_query_alias.get(name) != field_id
+        for name, field_id in previous_field_id_by_query_alias.items()
+    ):
         raise DefinitionError("published query aliases cannot be removed or rebound")
