@@ -21,22 +21,22 @@ def _result(value):
 
 def _publication(monkeypatch):
     generation = SimpleNamespace(relation_oids=(11,), as_dict=lambda: {"generation": 1})
-    content = {"archive_oid": 12, "tables": {"mrf_address": {"uncovered": 0}}}
-    row = {
+    address_content_map = {"archive_oid": 12, "tables": {"mrf_address": {"uncovered": 0}}}
+    publication_row_map = {
         "contract_version": 1,
         "state": "complete",
         "generation": generation.as_dict(),
         "summary_inputs": {"plan": 13},
         "summary_oid": 14,
-        "address_content": content,
+        "address_content": address_content_map,
     }
     monkeypatch.setattr(receipt, "capture_summary_inputs", AsyncMock(return_value={"plan": 13}))
     monkeypatch.setattr(
         receipt, "read_reference_family_result_generation_authority", AsyncMock(return_value=generation)
     )
     monkeypatch.setattr(receipt, "current_reference_family_relation_oids", AsyncMock(return_value=(11,)))
-    monkeypatch.setattr(receipt, "capture_address_content", AsyncMock(return_value=content))
-    return generation, row
+    monkeypatch.setattr(receipt, "capture_address_content", AsyncMock(return_value=address_content_map))
+    return generation, publication_row_map
 
 
 @pytest.mark.parametrize("schema,name", [("bad-name", "valid"), ("valid", "x" * 64)])
