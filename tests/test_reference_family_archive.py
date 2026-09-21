@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 
 from process import reference_family_archive as archive
+from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import ReferenceFamilyServingGeneration
 
 
@@ -134,6 +135,20 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
         "medicare_enrollment_county_stats",
         "medicare_enrollment_stats",
     )
+    quality = archive.reference_family_spec("provider-quality")
+    assert quality.table_names == (
+        "pricing_qpp_provider",
+        "pricing_svi_zcta",
+        "pricing_provider_quality_measure",
+        "pricing_provider_quality_domain",
+        "pricing_provider_quality_score",
+        "pricing_provider_quality_feature",
+        "pricing_provider_quality_procedure_lsh",
+        "pricing_provider_quality_peer_target",
+    )
+    assert quality.dependencies == ()
+    assert "pricing_quality_run" not in quality.table_names
+    assert "procedure_taxonomy_signal" not in quality.table_names
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="unsupported"):
         archive.reference_family_spec("npi")
 
@@ -816,6 +831,29 @@ async def test_automatic_and_published_generation_guards(monkeypatch):
             None,
             SimpleNamespace(relation_oids=(11,), serving_generation=None),
         )
+
+
+def test_provider_quality_archive_index_names_reuse_collision_safe_staging_identity():
+    names = []
+    raw_names = []
+    for model_type in archive.reference_family_spec("provider-quality").model_types:
+        for index in getattr(model_type, "__my_additional_indexes__", ()) or ():
+            suffix = index.get("name", "_".join(index["index_elements"]))
+            raw_name = f"mrf_{model_type.__tablename__}_idx_{suffix}"
+            expected = _index_name_for_table(
+                model_type.__tablename__,
+                raw_name,
+            )
+            statement = archive._additional_index_sql("mrf", model_type, index)
+            assert f'INDEX "{expected}" ' in statement
+            names.append(expected)
+            raw_names.append(raw_name)
+
+    assert len(names) == 30
+    assert len(names) == len(set(names))
+    assert all(len(name) <= 63 for name in names)
+    long_names = [name for name in raw_names if len(name) > 63]
+    assert len({name[:63] for name in long_names}) < len(long_names)
 
 
 @pytest.mark.asyncio

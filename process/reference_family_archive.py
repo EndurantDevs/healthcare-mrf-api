@@ -31,6 +31,7 @@ from process.entity_address_snapshot_receipt import _projected_row_identity
 from process.mrf_publication_receipt import require_completed_publication
 from process.mrf_address_publication import STAGE_TABLE, referenced_address_filter
 from process.ext.address_canon import archive_table_name
+from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
     publish_adopted_reference_family_generation,
@@ -274,6 +275,19 @@ _SPECS = {
         ),
         ReferenceFamilySpec("pharmacy-economics", (models.PharmacyEconomicsSummary,)),
         ReferenceFamilySpec("terminology-synonyms", (models.TerminologySynonym,)),
+        ReferenceFamilySpec(
+            "provider-quality",
+            (
+                models.PricingQppProvider,
+                models.PricingSviZcta,
+                models.PricingProviderQualityMeasure,
+                models.PricingProviderQualityDomain,
+                models.PricingProviderQualityScore,
+                models.PricingProviderQualityFeature,
+                models.PricingProviderQualityProcedureLSH,
+                models.PricingProviderQualityPeerTarget,
+            ),
+        ),
     )
 }
 _OWNED_SEQUENCES = {
@@ -1330,7 +1344,10 @@ def _additional_index_sql(schema_name: str, model_type: type, index_spec: Mappin
     suffix = index_spec.get("name", "_".join(elements))
     if not isinstance(suffix, str) or _IDENTIFIER.fullmatch(suffix) is None:
         raise ReferenceFamilyArchiveError("reference family model index is invalid")
-    index_name = f"{model_type.__tablename__}_idx_{suffix}"[:63]
+    index_name = _index_name_for_table(
+        model_type.__tablename__,
+        f"{schema_name}_{model_type.__tablename__}_idx_{suffix}",
+    )
     method = index_spec.get("using")
     if method is not None and method not in {"btree", "gin", "gist", "hash", "brin", "spgist"}:
         raise ReferenceFamilyArchiveError("reference family model index method is invalid")
@@ -1409,6 +1426,11 @@ async def _create_model_family(
     metadata = MetaData(schema=schema_name)
     for model_type in spec.model_types:
         table = model_type.__table__.to_metadata(metadata, schema=schema_name)
+        if spec.importer_id == "provider-quality" and table.primary_key.columns:
+            table.primary_key.name = _index_name_for_table(
+                table.name,
+                f"{schema_name}_{table.name}_pkey",
+            )
         explicit_sequences = []
         for sequence_name, owner_table, column_name in _OWNED_SEQUENCES.get(spec.importer_id, ()):
             if owner_table == table.name and isinstance(table.c[column_name].default, Sequence):
@@ -1440,6 +1462,19 @@ async def _create_model_family(
 
 async def _create_model_indexes(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
     for model_type in spec.model_types:
+        if spec.importer_id == "provider-quality":
+            primary_elements = tuple(getattr(model_type, "__my_index_elements__", ()) or ())
+            if primary_elements:
+                primary_name = _index_name_for_table(
+                    model_type.__tablename__,
+                    f"{schema_name}_{model_type.__tablename__}_idx_primary",
+                )
+                await session.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX {_quoted(primary_name)} ON {_quoted(schema_name)}."
+                        f"{_quoted(model_type.__tablename__)} ({', '.join(primary_elements)})"
+                    )
+                )
         indexes = tuple(getattr(model_type, "__my_initial_indexes__", ()) or ()) + tuple(
             getattr(model_type, "__my_additional_indexes__", ()) or ()
         )
