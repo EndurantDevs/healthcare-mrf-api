@@ -690,6 +690,68 @@ async def _submit_execution(
     return _submission_result(execution, is_created=is_created)
 
 
+async def _lock_current_capture_binding(
+    session: AsyncSession,
+    *,
+    execution_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    fence: int,
+    token_sha256: bytes,
+) -> tuple[CustomImportExecution, str, dt.datetime] | None:
+    """Lock and return a running execution only for its current lease owner."""
+
+    await _lock_dataset(session, dataset_id)
+    execution = await _lock_execution(session, execution_id, dataset_id=dataset_id)
+    if execution is None:
+        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    if execution.definition_revision_id != definition_revision_id or execution.schema_revision_id != schema_revision_id:
+        raise IdempotencyConflict("execution identity does not match the capture bundle")
+    state = _validate_execution_state(execution)
+    lease = await _lock_lease(session, execution_id)
+    _validate_lease(lease)
+    now = await _database_now(session)
+    if state != "running" or not _has_matching_lease_authority(
+        lease,
+        fence=fence,
+        token_sha256=token_sha256,
+        now=now,
+    ):
+        return None
+    return execution, state, now
+
+
+async def _bind_locked_capture_bundle(
+    session: AsyncSession,
+    *,
+    execution: CustomImportExecution,
+    dataset_id: int,
+    capture_bundle_id: int,
+    state: str,
+    now: dt.datetime,
+) -> ExecutionSubmission:
+    """Attach a bundle to an authorized locked execution without replacing one."""
+
+    existing_bundle_id = execution.capture_bundle_id
+    if existing_bundle_id is not None:
+        if existing_bundle_id != capture_bundle_id:
+            raise IdempotencyConflict("execution is already bound to a different capture bundle")
+        return _submission_result(execution, is_created=False)
+    await session.execute(
+        update(CustomImportExecution)
+        .where(CustomImportExecution.execution_id == execution.execution_id)
+        .where(CustomImportExecution.dataset_id == dataset_id)
+        .values(capture_bundle_id=capture_bundle_id, updated_at=now)
+    )
+    return ExecutionSubmission(
+        execution_id=execution.execution_id,
+        state=state,
+        created=False,
+        capture_bundle_id=capture_bundle_id,
+    )
+
+
 async def bind_execution_capture_bundle(
     session: AsyncSession,
     *,
@@ -703,10 +765,8 @@ async def bind_execution_capture_bundle(
 ) -> ExecutionSubmission | None:
     """Bind one retained bundle only while the exact owner lease is live.
 
-    The dataset, execution, and lease locks make the bundle bind atomic with
-    its current-fence check.  A cancellation or stale owner returns ``None``
-    without attaching the new source bundle, so a caller can roll back an
-    enclosing capture registration transaction.
+    A stale or canceled execution returns ``None`` without attaching the
+    bundle, allowing the caller to roll back its capture registration.
     """
 
     _require_caller_transaction(session)
@@ -717,45 +777,25 @@ async def bind_execution_capture_bundle(
     schema_revision_id = _positive_id(schema_revision_id, "schema_revision_id")
     capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
     fence = _fence(fence)
-    token_sha256 = lease_token_sha256(token)
-
-    await _lock_dataset(session, dataset_id)
-    execution = await _lock_execution(session, execution_id, dataset_id=dataset_id)
-    if execution is None:
-        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
-    if (
-        execution.definition_revision_id != definition_revision_id
-        or execution.schema_revision_id != schema_revision_id
-    ):
-        raise IdempotencyConflict("execution identity does not match the capture bundle")
-    state = _validate_execution_state(execution)
-    lease = await _lock_lease(session, execution_id)
-    _validate_lease(lease)
-    now = await _database_now(session)
-    if state != "running" or not _has_matching_lease_authority(
-        lease,
-        fence=fence,
-        token_sha256=token_sha256,
-        now=now,
-    ):
-        return None
-
-    existing_bundle_id = execution.capture_bundle_id
-    if existing_bundle_id is not None:
-        if existing_bundle_id != capture_bundle_id:
-            raise IdempotencyConflict("execution is already bound to a different capture bundle")
-        return _submission_result(execution, is_created=False)
-    await session.execute(
-        update(CustomImportExecution)
-        .where(CustomImportExecution.execution_id == execution_id)
-        .where(CustomImportExecution.dataset_id == dataset_id)
-        .values(capture_bundle_id=capture_bundle_id, updated_at=now)
-    )
-    return ExecutionSubmission(
+    binding_context = await _lock_current_capture_binding(
+        session,
         execution_id=execution_id,
-        state=state,
-        created=False,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        fence=fence,
+        token_sha256=lease_token_sha256(token),
+    )
+    if binding_context is None:
+        return None
+    execution, state, now = binding_context
+    return await _bind_locked_capture_bundle(
+        session,
+        execution=execution,
+        dataset_id=dataset_id,
         capture_bundle_id=capture_bundle_id,
+        state=state,
+        now=now,
     )
 
 
