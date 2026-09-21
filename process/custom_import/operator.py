@@ -204,7 +204,7 @@ def _lease_status(row) -> LeaseStatus | None:
         raise OperatorInvariantError("custom import operator evidence is invalid")
     heartbeat_at = row["lease_heartbeat_at"]
     expires_at = row["lease_expires_at"]
-    if (fence == 0 and (heartbeat_at is not None or expires_at is not None)) or (fence > 0 and expires_at is None):
+    if (fence == 0 and expires_at is not None) or (fence > 0 and expires_at is None):
         raise OperatorInvariantError("custom import operator evidence is invalid")
     return LeaseStatus(fence=fence, heartbeat_at=heartbeat_at, expires_at=expires_at)
 
