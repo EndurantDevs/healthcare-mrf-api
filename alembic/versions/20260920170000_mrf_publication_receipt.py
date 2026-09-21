@@ -4,8 +4,9 @@
 import os
 import re
 
-from alembic import op
 from sqlalchemy import text
+
+from alembic import op
 
 revision = "20260920170000_mrf_publication_receipt"
 down_revision = "20260920160000_geo_census_result_generation"
@@ -15,8 +16,11 @@ depends_on = None
 
 def _table():
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
-    if (os.getenv("HLTHPRT_DB_SCHEMA") and os.getenv("DB_SCHEMA")
-            and os.environ["HLTHPRT_DB_SCHEMA"] != os.environ["DB_SCHEMA"]):
+    if (
+        os.getenv("HLTHPRT_DB_SCHEMA")
+        and os.getenv("DB_SCHEMA")
+        and os.environ["HLTHPRT_DB_SCHEMA"] != os.environ["DB_SCHEMA"]
+    ):
         raise RuntimeError("database schema settings differ")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", schema):
         raise RuntimeError("invalid MRF receipt schema")
