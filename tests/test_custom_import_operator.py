@@ -147,6 +147,15 @@ async def test_active_execution_can_report_a_repairable_missing_lease():
 
 
 @pytest.mark.asyncio
+async def test_inactive_lease_can_retain_heartbeat():
+    execution_map = {**_execution_row(state="completed"), "lease_fence": 0, "lease_expires_at": None}
+    status = await inspect_execution(_Session(execution_map), dataset_id=3, execution_id=17)
+
+    assert status.lease is not None
+    assert (status.lease.fence, status.lease.heartbeat_at, status.lease.expires_at) == (0, _NOW, None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("dataset_id, execution_id", [(0, 1), (1, 0), (True, 1), (1, 2**63)])
 async def test_execution_status_rejects_invalid_identifiers_without_sql(dataset_id, execution_id):
     session = _Session(_execution_row())
