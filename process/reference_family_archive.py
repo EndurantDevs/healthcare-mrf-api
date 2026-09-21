@@ -1371,6 +1371,10 @@ async def _rotate_family_relations(
     ownership: ReferenceFamilyStageOwnership,
     expected_incumbent: ReferenceFamilyIncumbent,
 ) -> str | None:
+    ordinary_predecessors = ", ".join(
+        f"{_quoted(expected_incumbent.schema_name)}.{_quoted(table_name + '_old')}" for table_name in spec.table_names
+    )
+    await session.execute(text(f"DROP TABLE IF EXISTS {ordinary_predecessors} RESTRICT"))
     incumbent_oids_by_name = dict(expected_incumbent.relation_oids)
     predecessor_schema = None
     if any(oid is not None for oid in incumbent_oids_by_name.values()):

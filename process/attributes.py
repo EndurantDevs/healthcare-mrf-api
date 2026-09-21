@@ -347,7 +347,9 @@ async def finalize_attribute_tables(ctx):
             importer_id="plan-attributes",
             schema_name=db_schema,
         )
-    print_time_info(ctx["context"]["start"])
+    context["tables_prepared"] = False
+    _TABLE_STATE_BY_KEY["is_prepared"] = False
+    print_time_info(context["start"])
 
 
 shutdown = finalize_attribute_tables

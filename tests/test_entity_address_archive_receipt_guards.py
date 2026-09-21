@@ -108,11 +108,18 @@ async def test_receipt_without_transaction_cannot_acquire_locks():
 @pytest.mark.parametrize(
     "group,key", [(0, "default_expression"), (1, "check_expression"), (2, "predicate"), (2, "expressions")]
 )
-def test_schema_bound_expressions_are_not_portable(group, key):
+@pytest.mark.parametrize("expression", ["source_stage.table_name", '"source_stage".table_name'])
+def test_schema_bound_expressions_are_not_portable(group, key, expression):
     catalogs = [[], [], []]
-    catalogs[group].append({key: "source_stage.table_name"})
+    catalogs[group].append({key: expression})
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="expression is unsupported"):
         receipt._reject_schema_qualified_expressions("source_stage", *catalogs)
+
+
+def test_schema_name_inside_unqualified_owned_sequence_is_portable():
+    catalogs = [[{"default_expression": "nextval('mrf_address_id_seq'::regclass)"}], [], []]
+
+    receipt._reject_schema_qualified_expressions("mrf", *catalogs)
 
 
 @pytest.mark.asyncio
