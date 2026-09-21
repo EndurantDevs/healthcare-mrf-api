@@ -120,19 +120,19 @@ async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypat
     )
     manifest = AsyncMock(return_value=_manifest())
     monkeypatch.setattr(archive, "_family_manifest", manifest)
-    arguments = dict(
+    capture_argument_map = dict(
         importer_id="places-zcta",
         schema_name="synthetic",
         source_metadata={"release": "synthetic"},
         configure_isolation=False,
     )
     if state == "untracked":
-        result = await archive._capture_reference_family_source(session, **arguments)
-        assert result.manifest == _manifest()
+        capture = await archive._capture_reference_family_source(session, **capture_argument_map)
+        assert capture.manifest == _manifest()
         assert manifest.await_args.kwargs["source_serving_generation"] is None
     else:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="source generation|source snapshot"):
-            await archive._capture_reference_family_source(session, **arguments)
+            await archive._capture_reference_family_source(session, **capture_argument_map)
         assert manifest.await_count == int(state == "invalid-snapshot")
 
 
@@ -178,15 +178,15 @@ async def test_canonical_merge_rejects_invalid_sources_and_preserves_strict_bits
     session = SimpleNamespace(
         scalar=AsyncMock(side_effect=[0, int(failure == "invalid-source"), True]), execute=AsyncMock()
     )
-    auxiliary = {"archive_name": "other" if failure == "archive-name" else archive.archive_table_name()}
+    auxiliary_receipt_map = {"archive_name": "other" if failure == "archive-name" else archive.archive_table_name()}
     if failure != "strict-bits":
         with pytest.raises(
             archive.ReferenceFamilyArchiveError, match="archive name|archive is unavailable|source contribution"
         ):
-            await archive._merge_mrf_canonical_address(session, _ownership("mrf"), "synthetic", auxiliary)
+            await archive._merge_mrf_canonical_address(session, _ownership("mrf"), "synthetic", auxiliary_receipt_map)
         session.execute.assert_not_awaited()
     else:
-        await archive._merge_mrf_canonical_address(session, _ownership("mrf"), "synthetic", auxiliary)
+        await archive._merge_mrf_canonical_address(session, _ownership("mrf"), "synthetic", auxiliary_receipt_map)
         statements = [str(call.args[0]) for call in session.execute.await_args_list]
         assert "strict_source_bits=target.strict_source_bits |" in statements[2]
         assert statements[-1].startswith("DROP TABLE")
