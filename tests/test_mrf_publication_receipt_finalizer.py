@@ -36,6 +36,7 @@ async def test_shared_finalizer_claims_before_live_effects(monkeypatch, tracked,
             if failure == name:
                 raise RuntimeError(f"{name} failure")
             return result
+
         return perform
 
     monkeypatch.setattr(process_initial, "begin_publication", claim)
@@ -52,7 +53,7 @@ async def test_shared_finalizer_claims_before_live_effects(monkeypatch, tracked,
         assert "control_run_id" not in task_by_field["context"]
     with pytest.raises(RuntimeError, match=f"{failure} failure"):
         await process_initial.publish_initial_generation({}, task_by_field)
-    assert effects == ["pending", "archive", "family", "summary"][:["archive", "family", "summary"].index(failure) + 2]
+    assert effects == ["pending", "archive", "family", "summary"][: ["archive", "family", "summary"].index(failure) + 2]
     assert all(call.kwargs.get("status") != "succeeded" for call in mark_run.await_args_list)
 
 
