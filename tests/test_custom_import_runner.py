@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -593,17 +594,8 @@ def _codec_field(field_id: str, value_type: str, *, nullable: bool = False) -> F
     )
 
 
-def test_runner_codec_rejects_malformed_canonical_values():
+def test_runner_codec_rejects_malformed_key_documents():
     definition = _definition()
-    decimal_field = _codec_field("amount", "decimal")
-    date_field = _codec_field("effective_date", "date")
-    timestamp_field = _codec_field("captured_at", "timestamp")
-    integer_field = _codec_field("rank", "integer")
-    boolean_field = _codec_field("active", "boolean")
-    string_field = _codec_field("display_name", "string")
-    required_field = _codec_field("required", "string")
-    nullable_field = _codec_field("optional", "string", nullable=True)
-
     retained = SimpleNamespace(children=(SimpleNamespace(collection="rates", values_by_field={"amount": 1}),))
     assert runner_codec.family_children(retained) == (("rates", {"amount": 1}),)
     assert runner_codec.root_key_evidence_from_tuple(definition, ["1234567893"]) is None
@@ -618,19 +610,27 @@ def test_runner_codec_rejects_malformed_canonical_values():
     with pytest.raises(CandidateRunnerError, match="family key is incomplete"):
         runner_codec.key_document(("missing",), {}, {})
 
-    for field, value, message in (
-        (decimal_field, "not-a-decimal", "decimal value is not canonical"),
-        (date_field, "2026-01-01", "date value is malformed"),
-        (timestamp_field, "2026-01-01", "timestamp value is malformed"),
-        (integer_field, True, "integer value is malformed"),
-        (boolean_field, 1, "boolean value is malformed"),
-        (string_field, 1, "string value is malformed"),
+
+def test_runner_codec_rejects_invalid_value_documents():
+    for field, input_value, error_message in (
+        (_codec_field("amount", "decimal"), "not-a-decimal", "decimal value is not canonical"),
+        (_codec_field("effective_date", "date"), "2026-01-01", "date value is malformed"),
+        (_codec_field("captured_at", "timestamp"), "2026-01-01", "timestamp value is malformed"),
+        (_codec_field("rank", "integer"), True, "integer value is malformed"),
+        (_codec_field("active", "boolean"), 1, "boolean value is malformed"),
+        (_codec_field("display_name", "string"), 1, "string value is malformed"),
     ):
-        with pytest.raises(CandidateRunnerError, match=message):
-            runner_codec.value_document(field, value)
+        with pytest.raises(CandidateRunnerError, match=error_message):
+            runner_codec.value_document(field, input_value)
 
     with pytest.raises(CandidateRunnerError, match="candidate canonical value is malformed"):
         runner_codec.canonical({"value": object()})
+
+
+def test_runner_codec_rejects_invalid_payload_documents():
+    required_field = _codec_field("required", "string")
+    nullable_field = _codec_field("optional", "string", nullable=True)
+
     with pytest.raises(CandidateRunnerError, match="fields do not match"):
         runner_codec.payload_values(
             (required_field,), '{"contract":"custom-import-record/v1","fields":[]}', label="payload"
@@ -670,19 +670,21 @@ def test_runner_codec_rejects_malformed_canonical_values():
             required_field, {"field": "required", "value": {"state": "value", "type": "string"}}, "payload"
         )
 
-    for field, value, message in (
-        (decimal_field, "not-a-decimal", "decimal value is malformed"),
-        (date_field, 1, "date value is malformed"),
-        (date_field, "not-a-date", "date value is malformed"),
-        (timestamp_field, 1, "timestamp value is malformed"),
-        (timestamp_field, "not-a-timestamp", "timestamp value is malformed"),
-        (timestamp_field, "2026-01-01T00:00:00", "timestamp value is malformed"),
-        (string_field, 1, "string value is malformed"),
-        (integer_field, True, "integer value is malformed"),
-        (boolean_field, 1, "boolean value is malformed"),
+
+def test_runner_codec_rejects_invalid_decoded_scalars():
+    for field, input_value, error_message in (
+        (_codec_field("amount", "decimal"), "not-a-decimal", "decimal value is malformed"),
+        (_codec_field("effective_date", "date"), 1, "date value is malformed"),
+        (_codec_field("effective_date", "date"), "not-a-date", "date value is malformed"),
+        (_codec_field("captured_at", "timestamp"), 1, "timestamp value is malformed"),
+        (_codec_field("captured_at", "timestamp"), "not-a-timestamp", "timestamp value is malformed"),
+        (_codec_field("captured_at", "timestamp"), "2026-01-01T00:00:00", "timestamp value is malformed"),
+        (_codec_field("display_name", "string"), 1, "string value is malformed"),
+        (_codec_field("rank", "integer"), True, "integer value is malformed"),
+        (_codec_field("active", "boolean"), 1, "boolean value is malformed"),
     ):
-        with pytest.raises(CandidateRunnerError, match=message):
-            runner_codec.decode_payload_scalar(field, value, "payload")
+        with pytest.raises(CandidateRunnerError, match=error_message):
+            runner_codec.decode_payload_scalar(field, input_value, "payload")
 
 
 def test_runner_rejects_invalid_host_boundaries_before_lifecycle_work():
@@ -740,15 +742,15 @@ async def test_runner_observes_exact_execution_and_lease_state():
     now = datetime.now(UTC)
 
     def execution(state="running", **changes):
-        values = {
+        execution_fields_by_name = {
             "dataset_id": request.dataset_id,
             "definition_revision_id": request.definition_revision_id,
             "schema_revision_id": request.schema_revision_id,
             "capture_bundle_id": 1,
             "state": state,
         }
-        values.update(changes)
-        return SimpleNamespace(**values)
+        execution_fields_by_name.update(changes)
+        return SimpleNamespace(**execution_fields_by_name)
 
     def session_factory(current_execution, lease):
         return lambda: _ObservedSession(current_execution, lease, now)
@@ -829,10 +831,10 @@ async def test_runner_classifies_finality_conflicts_without_fallbacks(monkeypatc
     request = _request(_definition())
     admitted = assemble_root_families(request.definition, request.roots, request.children_by_collection)
     materialized = runner._MaterializedCandidate(31, runner._Pointer(30, 12, 13, 7), 1, 0)
-    observed = {"state": "canceling"}
+    observed_state_by_name = {"state": "canceling"}
 
     async def observed_state(*_args):
-        return observed["state"]
+        return observed_state_by_name["state"]
 
     async def canceled(*_args, **_kwargs):
         return CandidateRunResult("canceled", request.execution_id, generation_id=31)
@@ -842,15 +844,15 @@ async def test_runner_classifies_finality_conflicts_without_fallbacks(monkeypatc
     assert (
         await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
     ).status == "canceled"
-    observed["state"] = "canceled"
+    observed_state_by_name["state"] = "canceled"
     assert (
         await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
     ).status == "canceled"
-    observed["state"] = "lease_lost"
+    observed_state_by_name["state"] = "lease_lost"
     assert (
         await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized)
     ).status == "lease_lost"
-    observed["state"] = None
+    observed_state_by_name["state"] = None
     assert await runner._finality_conflict_outcome(_LifecycleSession, request, _grant(), admitted, materialized) is None
 
     async def no_change_conflict(*_args):
@@ -958,19 +960,17 @@ class _RegistrySession:
         self.clock = None
         self.info = {}
         self.no_autoflush = nullcontext()
+        self.scalars = AsyncMock(side_effect=lambda _statement: SimpleNamespace(all=lambda: list(self.rows)))
 
     async def execute(self, _statement):
         return _RegistryResult(self.row)
-
-    async def scalars(self, _statement):
-        return SimpleNamespace(all=lambda: list(self.rows))
 
     async def scalar(self, _statement):
         return self.clock
 
 
 @pytest.mark.asyncio
-async def test_runner_registry_rejects_untrusted_persisted_boundaries():
+async def test_runner_registry_rejects_missing_or_expired_identity_state():
     request = _request(_definition())
     session = _RegistrySession()
 
@@ -998,6 +998,12 @@ async def test_runner_registry_rejects_untrusted_persisted_boundaries():
     session.clock = datetime(2026, 1, 1)
     with pytest.raises(CandidateRunnerError, match="aware timestamp"):
         await runner_registry.database_now(session)
+
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_collection_and_field_catalog_drift():
+    request = _request(_definition())
+    session = _RegistrySession()
 
     session.rows = (
         SimpleNamespace(
@@ -1032,6 +1038,11 @@ async def test_runner_registry_rejects_untrusted_persisted_boundaries():
     with pytest.raises(CandidateRunnerError, match="field slots"):
         await runner_registry.validate_field_slot_ledger(session, request)
 
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_stream_and_alias_drift():
+    request = _request(_definition())
+    session = _RegistrySession()
     streams = [
         SimpleNamespace(
             stream_id=stream.stream_id,
@@ -1060,7 +1071,7 @@ async def test_runner_registry_rejects_untrusted_persisted_boundaries():
 
 
 @pytest.mark.asyncio
-async def test_runner_registry_rejects_lost_authority_and_profile_drift(monkeypatch):
+async def test_runner_registry_rejects_lost_materialization_authority():
     request = _request(_definition())
     session = _RegistrySession()
     execution = SimpleNamespace(execution_id=request.execution_id)
@@ -1097,6 +1108,11 @@ async def test_runner_registry_rejects_lost_authority_and_profile_drift(monkeypa
             datetime.now(UTC),
         )
 
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_multiple_root_streams():
+    request = _request(_definition())
+    session = _RegistrySession()
     root_stream = request.definition.source_streams[0]
     second_root_stream = replace(root_stream, stream_id="other_root")
     root_only_request = replace(request, definition=SimpleNamespace(source_streams=(root_stream, second_root_stream)))
@@ -1124,6 +1140,12 @@ async def test_runner_registry_rejects_lost_authority_and_profile_drift(monkeypa
     )
     with pytest.raises(CandidateRunnerError, match="one root stream"):
         await runner_registry.load_stream_slots(session, root_only_request, {})
+
+
+@pytest.mark.asyncio
+async def test_runner_registry_rejects_selection_profile_drift(monkeypatch):
+    request = _request(_definition())
+    session = _RegistrySession()
 
     async def no_statement_budget(*_args):
         return None
