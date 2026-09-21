@@ -1002,7 +1002,6 @@ async def export_reference_family_archive(
             prepared=prepared_source,
             archive_copy=archive_copy,
         )
-        return prepared_source.manifest
     except BaseException:
         if ownership is not None:
             try:
@@ -1015,6 +1014,7 @@ async def export_reference_family_archive(
     else:
         if ownership is not None:
             await _shielded_cleanup(session_factory, ownership)
+        return prepared_source.manifest
 
 
 async def prepare_reference_family_archive_source(
