@@ -13,11 +13,18 @@ from pathlib import Path
 from sqlalchemy import select, text
 
 from db.models import (
-    ProviderProfileArtifact, ProviderProfileFact, ProviderProfileImportRun,
-    ProviderProfileSourcePublication, ProviderProfileSourceRecord, db,
+    ProviderProfileArtifact,
+    ProviderProfileFact,
+    ProviderProfileImportRun,
+    ProviderProfileSourcePin,
+    ProviderProfileSourcePublication,
+    ProviderProfileSourceRecord,
+    db,
 )
 from process.florida_mqa_profile import (
-    _claim_import_run, _delete_retained_payload_rows, _remove_artifact_run_directories,
+    _claim_import_run,
+    _delete_retained_payload_rows,
+    _remove_artifact_run_directories,
 )
 
 RUN_ID_PATTERN = re.compile(r"(?:[a-f0-9]{32}|[a-f0-9]{64})")
@@ -28,11 +35,46 @@ def _now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _counts_by_run(count_rows):
+    return {
+        count_row._mapping["run_id"]: {
+            key: int(count or 0) for key, count in count_row._mapping.items() if key != "run_id"
+        }
+        for count_row in count_rows
+    }
+
+
 async def ensure_tables():
     """Create only the shared source tables used by this importer."""
-    for model in (ProviderProfileImportRun, ProviderProfileArtifact, ProviderProfileSourceRecord,
-                  ProviderProfileFact, ProviderProfileSourcePublication):
-        await db.create_table(model.__table__, checkfirst=True)
+    for model in (
+        ProviderProfileImportRun,
+        ProviderProfileArtifact,
+        ProviderProfileSourceRecord,
+        ProviderProfileFact,
+        ProviderProfileSourcePublication,
+        ProviderProfileSourcePin,
+    ):
+        table = model.__table__
+        relation = f'"{table.schema or "mrf"}"."{table.name}"'
+        if not await db.scalar(text("SELECT to_regclass(:relation) IS NOT NULL"), relation=relation):
+            await db.create_table(table, checkfirst=True)
+    # Archive guards are migration-owned; runtime users need no function ownership.
+    # A legacy empty family can still import, but cannot export without the migration.
+    from process.source_profile_result_archive import require_pin_guards
+
+    schema = ProviderProfileSourcePin.__table__.schema or "mrf"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+        raise ValueError("source profile pin schema is invalid")
+    async with db.transaction() as session:
+        installed = await db.scalar(
+            text(
+                "SELECT to_regprocedure(:name) IS NOT NULL OR "
+                f'EXISTS(SELECT 1 FROM "{schema}".provider_profile_source_pin)'
+            ),
+            name=f'"{schema}".provider_profile_pinned_run_guard()',
+        )
+        if installed:
+            await require_pin_guards(session, schema)
 
 
 @dataclass(frozen=True)
@@ -67,8 +109,10 @@ class SourceProfileStore:
         return run_id
 
     async def _lock_source(self):
-        await db.scalar(text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
-                        lock_name=f"{self._table(ProviderProfileSourcePublication)}.{self.policy.source_key}.publication")
+        await db.scalar(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+            lock_name=f"{self._table(ProviderProfileSourcePublication)}.{self.policy.source_key}.publication",
+        )
 
     async def _read_run(self, run_id):
         table = ProviderProfileImportRun.__table__
@@ -76,7 +120,10 @@ class SourceProfileStore:
         if source_row is None:
             raise RuntimeError(f"{self.policy.error_prefix}_run_missing")
         run_by_field = dict(source_row._mapping)
-        if run_by_field["source_key"] != self.policy.source_key or run_by_field["schema_version"] != self.policy.schema_version:
+        if (
+            run_by_field["source_key"] != self.policy.source_key
+            or run_by_field["schema_version"] != self.policy.schema_version
+        ):
             raise RuntimeError(f"{self.policy.error_prefix}_run_source_mismatch")
         return run_by_field
 
@@ -90,8 +137,10 @@ class SourceProfileStore:
         current_run = await self._read_run(publication_by_field["current_run_id"])
         if current_run["status"] != "completed":
             raise RuntimeError(f"{self.policy.error_prefix}_publication_invalid")
-        if (self._manifest(current_run)["max_providers"] is not None
-                or (current_run.get("metrics") or {}).get("published") is not True):
+        if (
+            self._manifest(current_run)["max_providers"] is not None
+            or (current_run.get("metrics") or {}).get("published") is not True
+        ):
             raise RuntimeError(f"{self.policy.error_prefix}_publication_invalid")
         return publication_by_field
 
@@ -102,13 +151,25 @@ class SourceProfileStore:
         manifest_by_field = run_by_field.get("source_manifest")
         if not isinstance(manifest_by_field, dict):
             raise ValueError(f"{self.policy.error_prefix}_manifest_invalid")
-        required_fields = {"max_providers", "expected_current_run_id", "full_cohort_licenses",
-                           "requested_licenses", "cohort_sha256", "source", "categories", "resume_from"}
+        required_fields = {
+            "max_providers",
+            "expected_current_run_id",
+            "full_cohort_licenses",
+            "requested_licenses",
+            "cohort_sha256",
+            "source",
+            "categories",
+            "resume_from",
+        }
         if not required_fields <= manifest_by_field.keys():
             raise ValueError(f"{self.policy.error_prefix}_manifest_missing")
         descriptor = manifest_by_field["source"]
-        if (not isinstance(descriptor, dict) or descriptor.get("source_key") != self.policy.source_key
-                or descriptor.get("source_kind") != "state_regulator" or descriptor.get("jurisdiction") != self.policy.jurisdiction):
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("source_key") != self.policy.source_key
+            or descriptor.get("source_kind") != "state_regulator"
+            or descriptor.get("jurisdiction") != self.policy.jurisdiction
+        ):
             raise ValueError(f"{self.policy.error_prefix}_manifest_source_invalid")
         if not self._has_valid_categories(manifest_by_field["categories"]):
             raise ValueError(f"{self.policy.error_prefix}_manifest_categories_invalid")
@@ -120,7 +181,11 @@ class SourceProfileStore:
         limit = manifest_by_field["max_providers"]
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError(f"{self.policy.error_prefix}_limit_invalid")
-        expected_count = min(limit, manifest_by_field["full_cohort_licenses"]) if limit is not None else manifest_by_field["full_cohort_licenses"]
+        expected_count = (
+            min(limit, manifest_by_field["full_cohort_licenses"])
+            if limit is not None
+            else manifest_by_field["full_cohort_licenses"]
+        )
         if manifest_by_field["requested_licenses"] != expected_count:
             raise ValueError(f"{self.policy.error_prefix}_manifest_scope_invalid")
         for key in ("expected_current_run_id", "resume_from"):
@@ -138,21 +203,32 @@ class SourceProfileStore:
     async def claim_run(self, run_row):
         """Claim a fresh run under the source publication lock; never replay an ID."""
         self._run_id(run_row.get("run_id"))
-        if (run_row.get("source_key") != self.policy.source_key or run_row.get("schema_version") != self.policy.schema_version
-                or run_row.get("jurisdiction") != self.policy.jurisdiction or run_row.get("status") != "running"):
+        if (
+            run_row.get("source_key") != self.policy.source_key
+            or run_row.get("schema_version") != self.policy.schema_version
+            or run_row.get("jurisdiction") != self.policy.jurisdiction
+            or run_row.get("status") != "running"
+        ):
             raise ValueError(f"{self.policy.error_prefix}_initial_run_invalid")
         manifest = self._manifest(run_row)
         async with db.transaction():
             await self._lock_source()
             await self._expected_publication(manifest["expected_current_run_id"])
             table = ProviderProfileImportRun.__table__
-            if await db.scalar(select(table.c.run_id).where(
-                    table.c.source_key == self.policy.source_key, table.c.status.in_(ACTIVE_STATUSES)).limit(1)):
+            if await db.scalar(
+                select(table.c.run_id)
+                .where(table.c.source_key == self.policy.source_key, table.c.status.in_(ACTIVE_STATUSES))
+                .limit(1)
+            ):
                 raise RuntimeError(f"{self.policy.error_prefix}_source_already_running")
             if manifest["resume_from"] is not None:
-                resume_run = await self._resume_run(manifest["resume_from"], manifest["max_providers"], manifest["expected_current_run_id"])
-                if any(manifest[key] != resume_run["source_manifest"][key]
-                       for key in ("cohort_sha256", "full_cohort_licenses", "requested_licenses", "categories")):
+                resume_run = await self._resume_run(
+                    manifest["resume_from"], manifest["max_providers"], manifest["expected_current_run_id"]
+                )
+                if any(
+                    manifest[key] != resume_run["source_manifest"][key]
+                    for key in ("cohort_sha256", "full_cohort_licenses", "requested_licenses", "categories")
+                ):
                     raise RuntimeError(f"{self.policy.error_prefix}_resume_cohort_mismatch")
             await _claim_import_run(run_row)
 
@@ -169,14 +245,20 @@ class SourceProfileStore:
             run_by_field = await self._read_run(run_id)
             if run_by_field["status"] not in ACTIVE_STATUSES:
                 raise RuntimeError(f"{self.policy.error_prefix}_run_not_active")
-            await db.update(ProviderProfileImportRun.__table__).where(
-                ProviderProfileImportRun.__table__.c.run_id == run_id).values(fields).status()
+            await (
+                db.update(ProviderProfileImportRun.__table__)
+                .where(ProviderProfileImportRun.__table__.c.run_id == run_id)
+                .values(fields)
+                .status()
+            )
 
     async def retained_counts(self, run_id):
         """Count stored source records and public NPIs, including integrity failures."""
         return (await self._retained_counts_by_run([run_id]))[run_id]
 
     async def _retained_counts_by_run(self, run_ids):
+        """Count retained rows and integrity failures for each validated run."""
+
         run_ids = sorted({self._run_id(run_id) for run_id in run_ids})
         if not run_ids:
             return {}
@@ -184,7 +266,8 @@ class SourceProfileStore:
         facts = self._table(ProviderProfileFact)
         artifacts = self._table(ProviderProfileArtifact)
         runs = self._table(ProviderProfileImportRun)
-        count_rows = await db.all(text(f"""
+        count_rows = await db.all(
+            text(f"""
             WITH source_counts AS (
                 SELECT run_id, count(*) AS retained_source_records,
                    count(*) FILTER (WHERE {self.policy.received_profile_sql}) AS received_profiles,
@@ -226,9 +309,12 @@ class SourceProfileStore:
               FROM unnest(CAST(:run_ids AS text[])) AS requested(run_id)
               LEFT JOIN source_counts USING (run_id) LEFT JOIN fact_counts USING (run_id)
               LEFT JOIN artifact_counts USING (run_id)
-        """), run_ids=run_ids, source_key=self.policy.source_key, schema_version=self.policy.schema_version)
-        return {count_row._mapping["run_id"]: {key: int(count or 0) for key, count in count_row._mapping.items() if key != "run_id"}
-                for count_row in count_rows}
+        """),
+            run_ids=run_ids,
+            source_key=self.policy.source_key,
+            schema_version=self.policy.schema_version,
+        )
+        return _counts_by_run(count_rows)
 
     def _completion_metrics(self, run_by_field, metrics, counts_by_field):
         manifest = self._manifest(run_by_field)
@@ -236,14 +322,20 @@ class SourceProfileStore:
             raise RuntimeError(f"{self.policy.error_prefix}_acquisition_incomplete")
         if type(metrics.get("transport_failures")) is not int or metrics["transport_failures"] != 0:
             raise RuntimeError(f"{self.policy.error_prefix}_transport_failures")
-        if (type(metrics.get("responses")) is not int
-                or metrics["responses"] != manifest["requested_licenses"]
-                or metrics["responses"] != counts_by_field["retained_source_records"]):
+        if (
+            type(metrics.get("responses")) is not int
+            or metrics["responses"] != manifest["requested_licenses"]
+            or metrics["responses"] != counts_by_field["retained_source_records"]
+        ):
             raise RuntimeError(f"{self.policy.error_prefix}_response_count_mismatch")
         if any(counts_by_field[key] for key in ("invalid_source_records", "invalid_facts", "foreign_artifacts")):
             raise RuntimeError(f"{self.policy.error_prefix}_retained_integrity_invalid")
-        return {**metrics, **counts_by_field, "requested_licenses": manifest["requested_licenses"],
-                "full_cohort_licenses": manifest["full_cohort_licenses"]}
+        return {
+            **metrics,
+            **counts_by_field,
+            "requested_licenses": manifest["requested_licenses"],
+            "full_cohort_licenses": manifest["full_cohort_licenses"],
+        }
 
     def _publication_volume(self, metrics, incumbent_metrics):
         if metrics["received_profiles"] * 2 < metrics["requested_licenses"]:
@@ -258,9 +350,12 @@ class SourceProfileStore:
 
     async def _complete_run(self, run_id, metrics):
         finished_at = _now()
-        await db.update(ProviderProfileImportRun.__table__).where(
-            ProviderProfileImportRun.__table__.c.run_id == run_id).values(
-                status="completed", metrics=metrics, finished_at=finished_at, error=None).status()
+        await (
+            db.update(ProviderProfileImportRun.__table__)
+            .where(ProviderProfileImportRun.__table__.c.run_id == run_id)
+            .values(status="completed", metrics=metrics, finished_at=finished_at, error=None)
+            .status()
+        )
         return finished_at
 
     async def publish_run(self, run_id, *, expected_current_run_id, metrics):
@@ -280,12 +375,24 @@ class SourceProfileStore:
             incumbent_metrics = await self.retained_counts(expected_current_run_id) if expected_current_run_id else None
             self._publication_volume(final_metrics, incumbent_metrics)
             published_at = await self._complete_run(run_id, {**final_metrics, "published": True})
-            await db.update(ProviderProfileFact.__table__).where(
-                ProviderProfileFact.__table__.c.run_id == run_id).values(published_at=published_at).status()
-            pointer_by_field = {"source_key": self.policy.source_key, "current_run_id": run_id,
-                                "previous_run_id": expected_current_run_id, "published_at": published_at}
-            await db.insert(ProviderProfileSourcePublication.__table__).values(pointer_by_field).on_conflict_do_update(
-                index_elements=["source_key"], set_=pointer_by_field).status()
+            await (
+                db.update(ProviderProfileFact.__table__)
+                .where(ProviderProfileFact.__table__.c.run_id == run_id)
+                .values(published_at=published_at)
+                .status()
+            )
+            pointer_by_field = {
+                "source_key": self.policy.source_key,
+                "current_run_id": run_id,
+                "previous_run_id": expected_current_run_id,
+                "published_at": published_at,
+            }
+            await (
+                db.insert(ProviderProfileSourcePublication.__table__)
+                .values(pointer_by_field)
+                .on_conflict_do_update(index_elements=["source_key"], set_=pointer_by_field)
+                .status()
+            )
         return {**final_metrics, "published": True, "run_id": run_id, "previous_run_id": expected_current_run_id}
 
     async def finish_unpublished_run(self, run_id, metrics):
@@ -306,9 +413,12 @@ class SourceProfileStore:
             run_by_field = await self._read_run(run_id)
             if run_by_field["status"] == "completed":
                 return
-            await db.update(ProviderProfileImportRun.__table__).where(
-                ProviderProfileImportRun.__table__.c.run_id == run_id).values(
-                    status="failed", error={"message": str(error)}, finished_at=_now()).status()
+            await (
+                db.update(ProviderProfileImportRun.__table__)
+                .where(ProviderProfileImportRun.__table__.c.run_id == run_id)
+                .values(status="failed", error={"message": str(error)}, finished_at=_now())
+                .status()
+            )
 
     async def _resume_run(self, run_id, max_providers, expected_current_run_id):
         if max_providers is not None and (type(max_providers) is not int or max_providers <= 0):
@@ -316,11 +426,14 @@ class SourceProfileStore:
         candidate_run = await self._read_run(run_id)
         manifest = self._manifest(candidate_run)
         finished_at = candidate_run.get("finished_at")
-        if (candidate_run["status"] != "failed" or not isinstance(finished_at, datetime)
-                or finished_at < _now() - timedelta(days=7) or finished_at > _now()):
+        if (
+            candidate_run["status"] != "failed"
+            or not isinstance(finished_at, datetime)
+            or finished_at < _now() - timedelta(days=7)
+            or finished_at > _now()
+        ):
             raise RuntimeError(f"{self.policy.error_prefix}_resume_not_eligible")
-        if (manifest["max_providers"] != max_providers
-                or manifest["expected_current_run_id"] != expected_current_run_id):
+        if manifest["max_providers"] != max_providers or manifest["expected_current_run_id"] != expected_current_run_id:
             raise RuntimeError(f"{self.policy.error_prefix}_resume_scope_mismatch")
         await self._expected_publication(expected_current_run_id)
         return candidate_run
@@ -331,15 +444,21 @@ class SourceProfileStore:
             await self._lock_source()
             return await self._resume_run(run_id, max_providers, expected_current_run_id)
 
-    def _retention_candidates(self, run_rows, publication, now):
-        protected_run_ids = set()
+    def _retention_candidates(self, run_rows, publication, now, pinned_run_ids=()):
+        protected_run_ids = set(pinned_run_ids)
         if publication:
-            protected_run_ids.update(publication[key] for key in ("current_run_id", "previous_run_id") if publication[key])
-        started_times = [source_row["started_at"] for source_row in run_rows if isinstance(source_row.get("started_at"), datetime)]
+            protected_run_ids.update(
+                publication[key] for key in ("current_run_id", "previous_run_id") if publication[key]
+            )
+        started_times = [
+            source_row["started_at"] for source_row in run_rows if isinstance(source_row.get("started_at"), datetime)
+        ]
         latest_started_at = max(started_times, default=None)
         for source_row in run_rows:
             # The newest bounded completion is still needed for acceptance and inspection.
-            if source_row.get("started_at") == latest_started_at or not isinstance(source_row.get("started_at"), datetime):
+            if source_row.get("started_at") == latest_started_at or not isinstance(
+                source_row.get("started_at"), datetime
+            ):
                 protected_run_ids.add(source_row["run_id"])
             if source_row["status"] in ACTIVE_STATUSES:
                 protected_run_ids.add(source_row["run_id"])
@@ -351,8 +470,10 @@ class SourceProfileStore:
             if source_row["run_id"] in protected_run_ids:
                 continue
             if source_row["status"] == "completed" or (
-                    source_row["status"] == "failed" and isinstance(source_row.get("finished_at"), datetime)
-                    and source_row["finished_at"] < now - timedelta(days=7)):
+                source_row["status"] == "failed"
+                and isinstance(source_row.get("finished_at"), datetime)
+                and source_row["finished_at"] < now - timedelta(days=7)
+            ):
                 eligible_run_ids.append(self._run_id(source_row["run_id"]))
         return sorted(eligible_run_ids), sorted(protected_run_ids)
 
@@ -368,13 +489,28 @@ class SourceProfileStore:
             publication = await self.read_publication()
             table = ProviderProfileImportRun.__table__
             run_rows = await db.all(select(table).where(table.c.source_key == self.policy.source_key))
+            pin_table = ProviderProfileSourcePin.__table__
+            pinned_run_ids = {
+                pin_row.run_id
+                for pin_row in await db.all(
+                    select(pin_table.c.run_id).where(pin_table.c.source_key == self.policy.source_key)
+                )
+            }
             eligible_run_ids, protected_run_ids = self._retention_candidates(
-                [dict(source_row._mapping) for source_row in run_rows], publication, _now())
+                [dict(source_row._mapping) for source_row in run_rows], publication, _now(), pinned_run_ids
+            )
             await self._assert_source_ownership(eligible_run_ids)
             deleted_by_kind = await _delete_retained_payload_rows(eligible_run_ids) if eligible_run_ids else {}
             # Keep the same source lock through exact directory deletion so a resume cannot race cleanup.
-            directory_receipt = await asyncio.to_thread(_remove_artifact_run_directories, Path(artifact_root), eligible_run_ids)
-        return {"status": "completed_with_directory_errors" if directory_receipt["errors"] else "completed",
-                "source_key": self.policy.source_key, "failed_retention_days": 7, "deleted_run_ids": eligible_run_ids,
-                "protected_audit_run_ids": protected_run_ids, "deleted_rows": deleted_by_kind,
-                "artifact_directories": directory_receipt}
+            directory_receipt = await asyncio.to_thread(
+                _remove_artifact_run_directories, Path(artifact_root), eligible_run_ids
+            )
+        return {
+            "status": "completed_with_directory_errors" if directory_receipt["errors"] else "completed",
+            "source_key": self.policy.source_key,
+            "failed_retention_days": 7,
+            "deleted_run_ids": eligible_run_ids,
+            "protected_audit_run_ids": protected_run_ids,
+            "deleted_rows": deleted_by_kind,
+            "artifact_directories": directory_receipt,
+        }

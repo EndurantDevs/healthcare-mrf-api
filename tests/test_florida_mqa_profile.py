@@ -141,13 +141,14 @@ async def test_schema_bootstrap_and_license_index_use_the_profile_schema(monkeyp
     class BootstrapDb:
         def __init__(self):
             self.created = []
-            self.statuses = []
+            self.relations = []
+
+        async def scalar(self, _statement, **params):
+            self.relations.append(params["relation"])
+            return None
 
         async def create_table(self, table, **kwargs):
             self.created.append((table.name, kwargs))
-
-        async def status(self, statement):
-            self.statuses.append(str(statement))
 
         async def all(self, _statement):
             return [
@@ -171,7 +172,8 @@ async def test_schema_bootstrap_and_license_index_use_the_profile_schema(monkeyp
     index = await florida_mqa_profile_module._load_florida_license_index()
 
     assert len(database.created) == 5
-    assert any("logical_fact_key" in statement for statement in database.statuses)
+    assert len(database.relations) == 5
+    assert all(kwargs == {"checkfirst": True} for _, kwargs in database.created)
     assert index["ME12345"][0]["npi"] == 1000000004
 
 

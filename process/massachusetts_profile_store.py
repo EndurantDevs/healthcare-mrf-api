@@ -6,22 +6,49 @@ import re
 
 from sqlalchemy import select
 
-from process import provider_profile_source_store as shared_store
 from db.models import (
     ProviderProfileArtifact as ProviderProfileArtifact,
+)
+from db.models import (
     ProviderProfileFact as ProviderProfileFact,
+)
+from db.models import (
     ProviderProfileImportRun as ProviderProfileImportRun,
+)
+from db.models import (
     ProviderProfileSourcePublication as ProviderProfileSourcePublication,
+)
+from db.models import (
     ProviderProfileSourceRecord as ProviderProfileSourceRecord,
 )
-from process.provider_profile_source_store import (
-    ACTIVE_STATUSES as ACTIVE_STATUSES, RUN_ID_PATTERN as RUN_ID_PATTERN,
-    ProfileSourcePolicy, SourceProfileStore,
-    _now as _now, ensure_tables as ensure_tables,
+from process import provider_profile_source_store as shared_store
+from process.massachusetts_profile_rows import (
+    LEGACY_CATEGORIES as LEGACY_CATEGORIES,
 )
 from process.massachusetts_profile_rows import (
-    LEGACY_CATEGORIES as LEGACY_CATEGORIES, PROFILE_CATEGORIES as PROFILE_CATEGORIES,
-    SCHEMA_VERSION as SCHEMA_VERSION, SOURCE_KEY as SOURCE_KEY,
+    PROFILE_CATEGORIES as PROFILE_CATEGORIES,
+)
+from process.massachusetts_profile_rows import (
+    SCHEMA_VERSION as SCHEMA_VERSION,
+)
+from process.massachusetts_profile_rows import (
+    SOURCE_KEY as SOURCE_KEY,
+)
+from process.provider_profile_source_store import (
+    ACTIVE_STATUSES as ACTIVE_STATUSES,
+)
+from process.provider_profile_source_store import (
+    RUN_ID_PATTERN as RUN_ID_PATTERN,
+)
+from process.provider_profile_source_store import (
+    ProfileSourcePolicy,
+    SourceProfileStore,
+)
+from process.provider_profile_source_store import (
+    _now as _now,
+)
+from process.provider_profile_source_store import (
+    ensure_tables as ensure_tables,
 )
 
 
@@ -37,13 +64,18 @@ class MassachusettsProfileStore(SourceProfileStore):
         lineage = manifest.get("reprocessing")
         if parent_id is not None:
             self._run_id(parent_id)
-            if (manifest["resume_from"] is not None or parent_id != manifest["expected_current_run_id"]
-                    or manifest["categories"] != list(PROFILE_CATEGORIES)
-                    or not isinstance(lineage, dict)
-                    or set(lineage) != {"source_run_id", "artifact_id", "manifest_sha256", "response_envelopes_sha256"}
-                    or lineage["source_run_id"] != parent_id
-                    or any(not isinstance(lineage[key], str) or not re.fullmatch(r"[a-f0-9]{64}", lineage[key])
-                           for key in ("artifact_id", "manifest_sha256", "response_envelopes_sha256"))):
+            if (
+                manifest["resume_from"] is not None
+                or parent_id != manifest["expected_current_run_id"]
+                or manifest["categories"] != list(PROFILE_CATEGORIES)
+                or not isinstance(lineage, dict)
+                or set(lineage) != {"source_run_id", "artifact_id", "manifest_sha256", "response_envelopes_sha256"}
+                or lineage["source_run_id"] != parent_id
+                or any(
+                    not isinstance(lineage[key], str) or not re.fullmatch(r"[a-f0-9]{64}", lineage[key])
+                    for key in ("artifact_id", "manifest_sha256", "response_envelopes_sha256")
+                )
+            ):
                 raise ValueError("massachusetts_profile_reprocessing_manifest_invalid")
         elif lineage is not None:
             raise ValueError("massachusetts_profile_reprocessing_manifest_invalid")
@@ -56,10 +88,17 @@ class MassachusettsProfileStore(SourceProfileStore):
         async with shared_store.db.transaction():
             await self._lock_source()
             manifest = self._manifest(run_row)
-            parent, artifact = await self._reprocess_run(manifest["reprocess_from"], manifest["expected_current_run_id"])
-            if (any(manifest[key] != parent["source_manifest"][key] for key in ("cohort_sha256", "full_cohort_licenses", "source"))
-                    or manifest["reprocessing"]["artifact_id"] != artifact["artifact_id"]
-                    or manifest["reprocessing"]["manifest_sha256"] != artifact["content_sha256"]):
+            parent, artifact = await self._reprocess_run(
+                manifest["reprocess_from"], manifest["expected_current_run_id"]
+            )
+            if (
+                any(
+                    manifest[key] != parent["source_manifest"][key]
+                    for key in ("cohort_sha256", "full_cohort_licenses", "source")
+                )
+                or manifest["reprocessing"]["artifact_id"] != artifact["artifact_id"]
+                or manifest["reprocessing"]["manifest_sha256"] != artifact["content_sha256"]
+            ):
                 raise RuntimeError("massachusetts_profile_reprocessing_parent_changed")
             await super().claim_run(run_row)
 
@@ -67,10 +106,14 @@ class MassachusettsProfileStore(SourceProfileStore):
         result = super()._completion_metrics(run_by_field, metrics, counts_by_field)
         manifest = self._manifest(run_by_field)
         if manifest.get("reprocess_from") is not None and (
-                type(metrics.get("reused_responses")) is not int or metrics["reused_responses"] != metrics["responses"]
-                or not re.fullmatch(r"[a-f0-9]{64}", str(metrics.get("response_envelopes_sha256")))
-                or (manifest["max_providers"] is None
-                    and metrics["response_envelopes_sha256"] != manifest["reprocessing"]["response_envelopes_sha256"])):
+            type(metrics.get("reused_responses")) is not int
+            or metrics["reused_responses"] != metrics["responses"]
+            or not re.fullmatch(r"[a-f0-9]{64}", str(metrics.get("response_envelopes_sha256")))
+            or (
+                manifest["max_providers"] is None
+                and metrics["response_envelopes_sha256"] != manifest["reprocessing"]["response_envelopes_sha256"]
+            )
+        ):
             raise RuntimeError("massachusetts_profile_reprocessing_incomplete")
         return result
 
@@ -83,8 +126,12 @@ class MassachusettsProfileStore(SourceProfileStore):
     async def _reprocess_run(self, run_id, expected_current_run_id):
         parent = await self._read_run(run_id)
         manifest = self._manifest(parent)
-        if (run_id != expected_current_run_id or parent["status"] != "completed"
-                or manifest["max_providers"] is not None or (parent.get("metrics") or {}).get("published") is not True):
+        if (
+            run_id != expected_current_run_id
+            or parent["status"] != "completed"
+            or manifest["max_providers"] is not None
+            or (parent.get("metrics") or {}).get("published") is not True
+        ):
             raise RuntimeError("massachusetts_profile_reprocessing_parent_ineligible")
         await self._expected_publication(expected_current_run_id)
         self._completion_metrics(parent, parent["metrics"], await self.retained_counts(run_id))
@@ -93,7 +140,11 @@ class MassachusettsProfileStore(SourceProfileStore):
         if len(artifacts) != 1:
             raise RuntimeError("massachusetts_profile_reprocessing_artifact_missing")
         artifact_by_field = dict(artifacts[0]._mapping)
-        if (artifact_by_field["source_key"] != SOURCE_KEY or artifact_by_field["file_name"] != "manifest.json" or artifact_by_field["category"] != "profile"):
+        if (
+            artifact_by_field["source_key"] != SOURCE_KEY
+            or artifact_by_field["file_name"] != "manifest.json"
+            or artifact_by_field["category"] != "profile"
+        ):
             raise RuntimeError("massachusetts_profile_reprocessing_artifact_invalid")
         return parent, artifact_by_field
 
@@ -103,8 +154,8 @@ class MassachusettsProfileStore(SourceProfileStore):
             await self._lock_source()
             return await self._reprocess_run(run_id, expected_current_run_id)
 
-    def _retention_candidates(self, run_rows, publication, now):
-        eligible, protected = super()._retention_candidates(run_rows, publication, now)
+    def _retention_candidates(self, run_rows, publication, now, pinned_run_ids=()):
+        eligible, protected = super()._retention_candidates(run_rows, publication, now, pinned_run_ids)
         run_by_id = {row["run_id"]: row for row in run_rows}
         retained_ids = set(run_by_id) - set(eligible)
         pending_ids = list(retained_ids)
@@ -123,12 +174,17 @@ class MassachusettsProfileStore(SourceProfileStore):
         return sorted(set(eligible) - retained_ids), sorted(set(protected))
 
 
-_store = MassachusettsProfileStore(ProfileSourcePolicy(
-    source_key=SOURCE_KEY, schema_version=SCHEMA_VERSION, jurisdiction="MA",
-    categories=("education", "training"), error_prefix="massachusetts_profile",
-    guarded_public_sql="f.category IN ('education', 'training')",
-    received_profile_sql="raw_payload->>'licenseNumber' = license_number AND raw_payload->>'licenseMetaId' = '1'",
-))
+_store = MassachusettsProfileStore(
+    ProfileSourcePolicy(
+        source_key=SOURCE_KEY,
+        schema_version=SCHEMA_VERSION,
+        jurisdiction="MA",
+        categories=("education", "training"),
+        error_prefix="massachusetts_profile",
+        guarded_public_sql="f.category IN ('education', 'training')",
+        received_profile_sql="raw_payload->>'licenseNumber' = license_number AND raw_payload->>'licenseMetaId' = '1'",
+    )
+)
 
 _table = _store._table
 _run_id = _store._run_id

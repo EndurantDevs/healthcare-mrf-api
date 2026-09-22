@@ -12,7 +12,6 @@ from alembic.script import ScriptDirectory
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
 
-
 _HOSPITAL_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
     "20260914110000_reference_family_result_generation",
@@ -30,6 +29,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20260920170000_mrf_publication_receipt",
     "20260921000000_provider_quality_result_generation",
     "20260922000000_custom_import_durable_parquet_capture",
+    "20260922010000_source_profile_archive_pins",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -49,7 +49,6 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     entity_address_revision = "20260914100000_entity_address_result_generation"
     reference_revision = "20260914110000_reference_family_result_generation"
     mrf_revision = "20260914130000_mrf_result_generation"
-
     cms_revision = "20260920100000_cms_doctors_result_generation"
     tiger_revision = "20260920110000_tiger_result_generation"
     mrf_address_revision = "20260920120000_mrf_address_result_generation"
@@ -57,7 +56,9 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     receipt_revision = "20260920170000_mrf_publication_receipt"
     provider_quality_revision = "20260921000000_provider_quality_result_generation"
     durable_capture_revision = "20260922000000_custom_import_durable_parquet_capture"
-    assert script.get_heads() == [durable_capture_revision]
+    source_profile_revision = "20260922010000_source_profile_archive_pins"
+    assert script.get_heads() == [source_profile_revision]
+    assert script.get_revision(source_profile_revision).down_revision == durable_capture_revision
     assert script.get_revision(durable_capture_revision).down_revision == provider_quality_revision
     assert script.get_revision(provider_quality_revision).down_revision == receipt_revision
     assert script.get_revision(receipt_revision).down_revision == "20260920160000_geo_census_result_generation"
