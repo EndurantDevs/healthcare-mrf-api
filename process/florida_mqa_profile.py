@@ -1817,37 +1817,13 @@ async def _ensure_tables() -> None:
         ProviderProfileFact,
         ProviderProfileProjection,
     ):
-        await db.create_table(model.__table__, checkfirst=True)
-    schema = ProviderProfileFact.__table__.schema or "mrf"
-    await db.status(
-        f"ALTER TABLE {schema}.provider_profile_fact "
-        "ADD COLUMN IF NOT EXISTS logical_fact_key varchar(64);"
-    )
-    await db.status(
-        f"UPDATE {schema}.provider_profile_fact "
-        "SET logical_fact_key = fact_id WHERE logical_fact_key IS NULL;"
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.provider_profile_fact "
-        "ALTER COLUMN logical_fact_key SET NOT NULL;"
-    )
-    await db.status(
-        f"CREATE INDEX IF NOT EXISTS provider_profile_fact_logical_key_idx "
-        f"ON {schema}.provider_profile_fact (logical_fact_key, npi);"
-    )
-    await db.status(
-        "CREATE INDEX IF NOT EXISTS provider_profile_fact_npi_category_idx "
-        f"ON {schema}.provider_profile_fact (npi, category);"
-    )
-    await db.status(
-        "CREATE INDEX IF NOT EXISTS provider_profile_fact_run_npi_idx "
-        f"ON {schema}.provider_profile_fact (run_id, npi);"
-    )
-    await db.status(
-        "CREATE INDEX IF NOT EXISTS provider_profile_source_record_npi_idx "
-        f"ON {schema}.provider_profile_source_record "
-        "(matched_npi, match_status);"
-    )
+        table = model.__table__
+        relation = f'"{table.schema or "mrf"}"."{table.name}"'
+        if await db.scalar(
+            text("SELECT to_regclass(:relation)"),
+            relation=relation,
+        ) is None:
+            await db.create_table(table, checkfirst=True)
 
 
 async def _load_florida_license_index() -> dict[str, list[dict[str, Any]]]:

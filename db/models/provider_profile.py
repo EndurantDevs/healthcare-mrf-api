@@ -13,8 +13,8 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
-    Integer,
     Index,
+    Integer,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
@@ -31,6 +31,7 @@ __all__ = (
     "ProviderProfileProjection",
     "ProviderProfileSourceRecord",
     "ProviderProfileSourcePublication",
+    "ProviderProfileSourcePin",
 )
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
@@ -88,6 +89,23 @@ class ProviderProfileSourcePublication(Base, JSONOutputMixin):
     current_run_id = Column(String(64), nullable=False)
     previous_run_id = Column(String(64))
     published_at = Column(TIMESTAMP, nullable=False)
+
+
+class ProviderProfileSourcePin(Base, JSONOutputMixin):
+    """Local archive/activation authority; never part of the portable result."""
+
+    __tablename__ = "provider_profile_source_pin"
+    __table_args__ = (
+        PrimaryKeyConstraint("pin_id", "run_id"),
+        Index("provider_profile_source_pin_run_idx", "run_id"),
+        {"schema": _SCHEMA, "extend_existing": True},
+    )
+
+    pin_id = Column(String(36), nullable=False)
+    source_key = Column(String(96), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    purpose = Column(String(16), nullable=False)
+    authority_json = Column(JSON, nullable=False)
 
 
 class ProviderProfileArtifact(Base, JSONOutputMixin):
