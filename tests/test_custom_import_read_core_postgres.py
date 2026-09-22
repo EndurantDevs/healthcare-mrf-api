@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from db.models.custom_import import (
     CustomImportChildScalar,
+    CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
     CustomImportField,
     CustomImportFieldSlot,
@@ -28,8 +29,14 @@ from process.custom_import.definition import (
     canonical_json,
     canonical_sha256,
 )
-from process.custom_import.publication import activate_generation, seal_generation
+from process.custom_import.publication import (
+    activate_generation,
+    record_no_change,
+    rollback_generation,
+    seal_generation,
+)
 from process.custom_import.read_core import (
+    CustomImportReadCursorError,
     CustomImportReadRequestError,
     CustomImportReadService,
     CustomImportReadUnavailableError,
@@ -50,6 +57,7 @@ from tests.custom_import_postgres_support import (
     digest,
     isolated_publication_case,
     seed_family_material,
+    seed_publication_graph,
     seed_running_generation,
     transaction_session,
 )
@@ -61,6 +69,14 @@ class _AllowSyntheticRead:
     def authorize(self, authorization, *, target):
         del authorization, target
         return ExtensionReadScope("synthetic:read")
+
+
+class _ScopedSyntheticRead:
+    """Issue one synthetic scope per accepted authorization for cursor tests."""
+
+    def authorize(self, authorization, *, target):
+        del target
+        return ExtensionReadScope(f"synthetic:{authorization.credential}")
 
 
 @dataclass(frozen=True)
@@ -501,9 +517,9 @@ async def _seed_read_fixture(session) -> _ReadFixture:
     )
 
 
-def _service(*, cache=None, statement_timeout_ms: int = 10_000) -> CustomImportReadService:
+def _service(*, cache=None, statement_timeout_ms: int = 10_000, authorizer=None) -> CustomImportReadService:
     return CustomImportReadService(
-        authorizer=_AllowSyntheticRead(),
+        authorizer=_AllowSyntheticRead() if authorizer is None else authorizer,
         cache=cache,
         cursor_secret=b"r" * 32,
         now=lambda: 1_000,
@@ -880,9 +896,119 @@ async def _sealed_empty_successor(session, fixture: _ReadFixture) -> GenerationA
     return successor
 
 
+async def _current_target(session, fixture: _ReadFixture) -> PinnedReadTarget:
+    pointer = await session.get(CustomImportCurrentGeneration, fixture.graph.dataset_id)
+    assert pointer is not None
+    return PinnedReadTarget(
+        dataset_id=pointer.dataset_id,
+        generation_id=pointer.generation_id,
+        definition_revision_id=pointer.definition_revision_id,
+        schema_revision_id=pointer.schema_revision_id,
+        profile_id=fixture.target.profile_id,
+    )
+
+
 @pytest.mark.asyncio
-async def test_read_core_rejects_publication_between_count_and_page(monkeypatch):
-    """A concurrent activation cannot produce or cache a torn exact-count page."""
+async def test_read_core_reads_retained_pinned_generation_after_publication():
+    """A retained pin and its cursor survive a newer current publication."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+            successor = await _sealed_empty_successor(seed_session, fixture)
+
+        cache = _RecordingCache()
+        service = _service(cache=cache, authorizer=_ScopedSyntheticRead())
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        first_request = SearchRequest(target=fixture.target, page_size=1)
+
+        async with case.sessions() as read_session:
+            first_page = await service.search(
+                read_session,
+                authorization=authorization,
+                request=first_request,
+            )
+        assert first_page.total == 2
+        assert first_page.next_cursor is not None
+        assert cache.set_calls == 1
+
+        async with case.sessions() as publish_session, publish_session.begin():
+            await activate_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=successor.generation_id,
+                expected_generation_id=fixture.current_attempt.generation_id,
+                expected_pointer_version=1,
+            )
+            rollback = await rollback_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=fixture.current_attempt.generation_id,
+                expected_generation_id=successor.generation_id,
+                expected_pointer_version=2,
+            )
+            assert rollback.event_kind == "rolled_back"
+            await activate_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=successor.generation_id,
+                expected_generation_id=fixture.current_attempt.generation_id,
+                expected_pointer_version=3,
+            )
+
+        async with case.sessions() as read_session:
+            assert (
+                await service.search(
+                    read_session,
+                    authorization=authorization,
+                    request=first_request,
+                )
+                is first_page
+            )
+            resumed_page = await service.search(
+                read_session,
+                authorization=authorization,
+                request=SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+            )
+            assert resumed_page.total == 2
+            assert len(resumed_page.items) == 1
+            assert resumed_page.next_cursor is None
+
+            current_target = await _current_target(read_session, fixture)
+            assert current_target.generation_id == successor.generation_id
+            current_page = await service.search(
+                read_session,
+                authorization=authorization,
+                request=SearchRequest(target=current_target, page_size=1),
+            )
+            assert current_page.total == 0
+
+            for request, cursor_authorization in (
+                (
+                    SearchRequest(
+                        target=fixture.target,
+                        filters=(ReadFilter("npi", "eq", "synthetic-root"),),
+                        page_size=1,
+                        cursor=first_page.next_cursor,
+                    ),
+                    authorization,
+                ),
+                (
+                    SearchRequest(target=current_target, page_size=1, cursor=first_page.next_cursor),
+                    authorization,
+                ),
+                (
+                    SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+                    ExtensionReadAuthorization("synthetic-other-token"),
+                ),
+            ):
+                with pytest.raises(CustomImportReadCursorError):
+                    await service.search(read_session, authorization=cursor_authorization, request=request)
+
+
+@pytest.mark.asyncio
+async def test_read_core_keeps_retained_pin_when_pointer_moves_between_count_and_page(monkeypatch):
+    """A pointer move cannot invalidate an already admitted retained target."""
 
     async with isolated_publication_case() as case:
         async with case.sessions() as seed_session, seed_session.begin():
@@ -900,15 +1026,12 @@ async def test_read_core_rejects_publication_between_count_and_page(monkeypatch)
             return total
 
         monkeypatch.setattr(read_core, "_exact_count", delayed_exact_count)
-        cache = _RecordingCache()
-        service = _service(cache=cache)
-        authorization = ExtensionReadAuthorization("synthetic-read-token")
-
         async with case.sessions() as read_session:
+            cache = _RecordingCache()
             read_task = asyncio.create_task(
-                service.search(
+                _service(cache=cache).search(
                     read_session,
-                    authorization=authorization,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
                     request=SearchRequest(target=fixture.target),
                 )
             )
@@ -925,8 +1048,80 @@ async def test_read_core_rejects_publication_between_count_and_page(monkeypatch)
             finally:
                 continue_read.set()
 
-            with pytest.raises(CustomImportReadUnavailableError, match="changed during"):
-                await asyncio.wait_for(read_task, timeout=5)
+            page = await asyncio.wait_for(read_task, timeout=5)
 
-        assert cache.set_calls == 0
-        assert cache.values == {}
+    assert page.total == 2
+    assert len(page.items) == 2
+    assert cache.set_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_read_core_rejects_unsealed_or_mismatched_pinned_targets():
+    """Only the exact sealed generation, dataset, schema, and profile may read."""
+
+    async with transaction_session() as session, session.begin():
+        fixture = await _seed_read_fixture(session)
+        unsealed = await seed_running_generation(
+            session,
+            fixture.graph,
+            suffix=f"read-core-unsealed-{uuid.uuid4().hex}",
+            base_generation_id=fixture.current_attempt.generation_id,
+        )
+        sealed_never_published = await _sealed_empty_successor(session, fixture)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        for target in (
+            replace(fixture.target, generation_id=2**62),
+            replace(fixture.target, generation_id=unsealed.generation_id),
+            replace(fixture.target, generation_id=sealed_never_published.generation_id),
+            replace(fixture.target, dataset_id=fixture.target.dataset_id + 1),
+            replace(fixture.target, definition_revision_id=fixture.target.definition_revision_id + 1),
+            replace(fixture.target, schema_revision_id=fixture.target.schema_revision_id + 1),
+            replace(fixture.target, profile_id="unknown_profile"),
+        ):
+            with pytest.raises(CustomImportReadUnavailableError):
+                await service.search(
+                    session,
+                    authorization=authorization,
+                    request=SearchRequest(target=target),
+                )
+
+
+@pytest.mark.asyncio
+async def test_read_identity_rejects_sealed_no_change_candidate_without_target_event():
+    """A no-change receipt publishes its retained base, never its candidate."""
+
+    async with transaction_session() as session, session.begin():
+        graph = await seed_publication_graph(session)
+        await activate_generation(
+            session,
+            dataset_id=graph.dataset_id,
+            target_generation_id=graph.first_generation_id,
+            expected_generation_id=None,
+            expected_pointer_version=0,
+        )
+        receipt = await record_no_change(
+            session,
+            dataset_id=graph.dataset_id,
+            execution_id=graph.no_change_execution_id,
+            expected_generation_id=graph.first_generation_id,
+            expected_pointer_version=1,
+            candidate_generation_id=graph.no_change_candidate_generation_id,
+            lease_fence=graph.no_change_fence,
+            lease_token=graph.no_change_token,
+        )
+        assert receipt.to_generation_id == graph.first_generation_id
+        target = PinnedReadTarget(
+            dataset_id=graph.dataset_id,
+            generation_id=graph.first_generation_id,
+            definition_revision_id=graph.definition_revision_id,
+            schema_revision_id=graph.schema_revision_id,
+            profile_id="synthetic_profile",
+        )
+
+        await read_identity.verify_published_generation(session, target)
+        with pytest.raises(CustomImportReadUnavailableError, match="pinned generation"):
+            await read_identity.verify_published_generation(
+                session,
+                replace(target, generation_id=graph.no_change_candidate_generation_id),
+            )

@@ -6,7 +6,7 @@ This module deliberately has no HTTP registration or policy implementation.
 An extension-facing adapter verifies its own authorization material, supplies a
 stable authorization scope through :class:`ExtensionReadAuthorizer`, and maps
 these typed results to its transport.  The read core then permits only an
-explicit current, sealed generation and one exact selection profile.
+explicit sealed generation and one exact selection profile.
 
 Search starts from a persisted ``CustomImportWinner``.  A child predicate or
 order therefore always addresses that winner's one selected context child; it
@@ -41,7 +41,6 @@ from db.models.custom_import import (
     CustomImportChildCollection,
     CustomImportChildRevision,
     CustomImportChildScalar,
-    CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
@@ -95,7 +94,7 @@ from process.custom_import.read_cursor import (
 )
 from process.custom_import.read_identity import (
     verified_definition,
-    verify_current_generation,
+    verify_published_generation,
 )
 
 _VALUE_STATES = frozenset({"value", "null", "missing"})
@@ -223,7 +222,7 @@ class SearchItem:
 
 @dataclass(frozen=True, slots=True)
 class SearchPage:
-    """One exact-count page over a sealed, current winner selection."""
+    """One exact-count page over a sealed winner selection."""
 
     target: PinnedReadTarget
     total: int
@@ -287,7 +286,6 @@ class _ReadContext:
     """Definition, profile, and P1 identities verified for one pinned read."""
 
     target: PinnedReadTarget
-    pointer_version: int
     definition: CustomImportDefinition
     profile_slot: int
     profile_context_slot: int
@@ -338,13 +336,13 @@ class CustomImportReadService:
             cache_key = _cache_key("search", context.target, plan.fingerprint, scope_digest, offset)
             cached_page = await _cached_search_page(self._cache, cache_key, context, plan, scope_digest, trusted_now)
             if cached_page is not None:
-                await verify_current_generation(session, context.target, context.pointer_version)
+                await verify_published_generation(session, context.target)
                 return cached_page
             statement = _filtered_winner_statement(context, plan.filters)
             total = await _exact_count(session, statement)
             selected_rows = await _page_winner_rows(session, statement, context, plan, offset)
             page_items = await _hydrate_search_page_items(session, context, selected_rows)
-            await verify_current_generation(session, context.target, context.pointer_version)
+            await verify_published_generation(session, context.target)
             expires_at = trusted_now + self._cursor_ttl_seconds
             next_cursor = self._next_search_cursor(
                 context,
@@ -388,11 +386,11 @@ class CustomImportReadService:
             cache_key = _detail_cache_key(context.target, winner, scope_digest)
             cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
             if cached_detail is not None:
-                await verify_current_generation(session, context.target, context.pointer_version)
+                await verify_published_generation(session, context.target)
                 return cached_detail
             selected_row = await _selected_winner_row(session, context, winner)
             detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
-            await verify_current_generation(session, context.target, context.pointer_version)
+            await verify_published_generation(session, context.target)
         await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
         return detail
 
@@ -637,9 +635,7 @@ def _is_statement_timeout(error: DBAPIError) -> bool:
 
 
 async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) -> _ReadContext:
-    definition_row, schema_row, pointer_version = await _eligible_definition_rows(session, target)
-    if type(pointer_version) is not int or pointer_version <= 0:
-        raise CustomImportReadUnavailableError("current generation pointer is invalid")
+    definition_row, schema_row = await _eligible_definition_rows(session, target)
     definition = verified_definition(definition_row, schema_row)
     collection_slots = await _collection_slots(session, target, definition)
     profile = await _exact_profile(session, target)
@@ -647,7 +643,6 @@ async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) ->
     await _verified_field_rows(session, target, definition, collection_slots)
     return _ReadContext(
         target=target,
-        pointer_version=pointer_version,
         definition=definition,
         profile_slot=profile_slot,
         profile_context_slot=profile_context_slot,
@@ -659,12 +654,12 @@ async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) ->
 async def _eligible_definition_rows(
     session: AsyncSession,
     pinned_target: PinnedReadTarget,
-) -> tuple[CustomImportDefinitionRevision, CustomImportSchemaRevision, int]:
+) -> tuple[CustomImportDefinitionRevision, CustomImportSchemaRevision]:
+    await verify_published_generation(session, pinned_target)
     statement = (
         select(
             CustomImportDefinitionRevision,
             CustomImportSchemaRevision,
-            CustomImportCurrentGeneration.pointer_version,
         )
         .select_from(CustomImportDefinitionRevision)
         .join(
@@ -675,38 +670,29 @@ async def _eligible_definition_rows(
             ),
         )
         .join(
-            CustomImportCurrentGeneration,
-            and_(
-                CustomImportCurrentGeneration.dataset_id == CustomImportDefinitionRevision.dataset_id,
-                CustomImportCurrentGeneration.definition_revision_id
-                == CustomImportDefinitionRevision.definition_revision_id,
-                CustomImportCurrentGeneration.schema_revision_id == CustomImportDefinitionRevision.schema_revision_id,
-            ),
-        )
-        .join(
             CustomImportGeneration,
             and_(
-                CustomImportGeneration.generation_id == CustomImportCurrentGeneration.generation_id,
-                CustomImportGeneration.dataset_id == CustomImportCurrentGeneration.dataset_id,
-                CustomImportGeneration.definition_revision_id == CustomImportCurrentGeneration.definition_revision_id,
-                CustomImportGeneration.schema_revision_id == CustomImportCurrentGeneration.schema_revision_id,
+                CustomImportGeneration.generation_id == pinned_target.generation_id,
+                CustomImportGeneration.dataset_id == CustomImportDefinitionRevision.dataset_id,
+                CustomImportGeneration.definition_revision_id
+                == CustomImportDefinitionRevision.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == CustomImportDefinitionRevision.schema_revision_id,
             ),
         )
         .join(
             CustomImportGenerationSeal,
             and_(
-                CustomImportGenerationSeal.generation_id == CustomImportCurrentGeneration.generation_id,
-                CustomImportGenerationSeal.dataset_id == CustomImportCurrentGeneration.dataset_id,
+                CustomImportGenerationSeal.generation_id == CustomImportGeneration.generation_id,
+                CustomImportGenerationSeal.dataset_id == CustomImportGeneration.dataset_id,
                 CustomImportGenerationSeal.definition_revision_id
-                == CustomImportCurrentGeneration.definition_revision_id,
-                CustomImportGenerationSeal.schema_revision_id == CustomImportCurrentGeneration.schema_revision_id,
+                == CustomImportGeneration.definition_revision_id,
+                CustomImportGenerationSeal.schema_revision_id == CustomImportGeneration.schema_revision_id,
             ),
         )
         .where(
             CustomImportDefinitionRevision.dataset_id == pinned_target.dataset_id,
             CustomImportDefinitionRevision.definition_revision_id == pinned_target.definition_revision_id,
             CustomImportDefinitionRevision.schema_revision_id == pinned_target.schema_revision_id,
-            CustomImportCurrentGeneration.generation_id == pinned_target.generation_id,
             CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
         )
     )
@@ -1084,7 +1070,7 @@ def _winner_statement(context: _ReadContext):
     """Return only winners eligible for this pinned profile and context shape."""
 
     winner_statement = _winner_identity_statement()
-    winner_statement = _current_generation_winner_statement(winner_statement, context)
+    winner_statement = _pinned_generation_winner_statement(winner_statement, context)
     if context.profile_context_slot == 0:
         return winner_statement.where(
             CustomImportWinner.context_collection_slot == 0,
@@ -1128,18 +1114,18 @@ def _winner_identity_statement():
     )
 
 
-def _current_generation_winner_statement(winner_statement, context: _ReadContext):
-    """Restrict winner rows to the exact current and sealed pinned generation."""
+def _pinned_generation_winner_statement(winner_statement, context: _ReadContext):
+    """Restrict winner rows to the exact sealed pinned generation."""
 
     pinned_target = context.target
     return (
         winner_statement.join(
-            CustomImportCurrentGeneration,
+            CustomImportGeneration,
             and_(
-                CustomImportCurrentGeneration.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportCurrentGeneration.generation_id == CustomImportWinner.generation_id,
-                CustomImportCurrentGeneration.definition_revision_id == CustomImportWinner.definition_revision_id,
-                CustomImportCurrentGeneration.schema_revision_id == CustomImportWinner.schema_revision_id,
+                CustomImportGeneration.dataset_id == CustomImportWinner.dataset_id,
+                CustomImportGeneration.generation_id == CustomImportWinner.generation_id,
+                CustomImportGeneration.definition_revision_id == CustomImportWinner.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == CustomImportWinner.schema_revision_id,
             ),
         )
         .join(

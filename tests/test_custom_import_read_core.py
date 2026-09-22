@@ -18,7 +18,7 @@ from sqlalchemy import column
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import operators
 
-from process.custom_import import read_core, read_cursor, read_identity
+from process.custom_import import publication, read_core, read_cursor, read_identity
 from process.custom_import.definition import CustomImportDefinition, Field, load_json_definition
 from process.custom_import.read_core import (
     MAX_PAGE_OFFSET,
@@ -75,7 +75,6 @@ def test_next_cursor_stops_before_exceeding_the_offset_limit():
     service = CustomImportReadService(authorizer=None, cursor_secret=b"s" * 32)
     context = read_core._ReadContext(
         target=_target(),
-        pointer_version=1,
         definition=None,
         profile_slot=1,
         profile_context_slot=0,
@@ -646,12 +645,60 @@ def test_persisted_definition_parse_failure_is_unavailable(document):
         read_identity.verified_definition(definition, object())
 
 
+@pytest.mark.asyncio
+async def test_published_generation_validation_uses_the_pinned_target_and_canonical_event():
+    target = _target()
+    details = publication._PublicationEventDetails(
+        dataset_id=target.dataset_id,
+        definition_revision_id=target.definition_revision_id,
+        schema_revision_id=target.schema_revision_id,
+        execution_id=41,
+        event_kind="activated",
+        from_generation_id=None,
+        to_generation_id=target.generation_id,
+        expected_pointer_version=0,
+        committed_pointer_version=1,
+    )
+    canonical, digest = publication._event_document(details)
+    event = SimpleNamespace(
+        **details.__dict__,
+        finality_contract=publication.FINALITY_EVENT_CONTRACT,
+        canonical_event=canonical,
+        event_sha256=digest,
+    )
+
+    def session_for(event_row):
+        return SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=(
+                    SimpleNamespace(scalar_one_or_none=lambda: target.generation_id),
+                    SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: event_row)),
+                )
+            )
+        )
+
+    session = session_for(event)
+    await read_identity.verify_published_generation(session, target)
+
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "custom_import_current_generation" not in "\n".join(statements)
+    assert "to_generation_id" in statements[1]
+    assert "finality_contract" in statements[1]
+
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
+        await read_identity.verify_published_generation(session_for(None), target)
+
+    event.canonical_event = "{}"
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
+        await read_identity.verify_published_generation(session_for(event), target)
+
+
 @pytest.fixture
 def query_context():
     definition = CustomImportDefinition.from_json(
         (Path(__file__).with_name("fixtures") / "custom_import/v1_valid.json").read_text()
     )
-    return read_core._ReadContext(_target(), 1, definition, 1, 1, {"rates": 1}, {1: "rates"})
+    return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
 
 
 @pytest.fixture
@@ -664,7 +711,7 @@ def aliased_query_context():
         }
     )
     definition = CustomImportDefinition.from_mapping(raw)
-    return read_core._ReadContext(_target(), 1, definition, 1, 1, {"rates": 1}, {1: "rates"})
+    return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
 
 
 def test_query_normalization_is_order_independent_and_rejects_repeated_predicates(query_context):

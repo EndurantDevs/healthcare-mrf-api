@@ -6,15 +6,22 @@ from __future__ import annotations
 
 import hmac
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
-    CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
+    CustomImportGeneration,
+    CustomImportGenerationSeal,
+    CustomImportPublicationEvent,
     CustomImportSchemaRevision,
 )
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.publication import (
+    FINALITY_EVENT_CONTRACT,
+    PublicationConflict,
+    verify_publication_event_material,
+)
 from process.custom_import.read_contracts import (
     CustomImportReadUnavailableError,
     PinnedReadTarget,
@@ -46,20 +53,55 @@ def verified_definition(
     return definition
 
 
-async def verify_current_generation(
-    session: AsyncSession,
-    target: PinnedReadTarget,
-    expected_pointer_version: int,
-) -> None:
-    """Reject a read when publication moved during its database work."""
+async def verify_published_generation(session: AsyncSession, target: PinnedReadTarget) -> None:
+    """Require an exact sealed generation with a canonical finality event."""
 
-    pointer_version = await session.scalar(
-        select(CustomImportCurrentGeneration.pointer_version).where(
-            CustomImportCurrentGeneration.dataset_id == target.dataset_id,
-            CustomImportCurrentGeneration.definition_revision_id == target.definition_revision_id,
-            CustomImportCurrentGeneration.schema_revision_id == target.schema_revision_id,
-            CustomImportCurrentGeneration.generation_id == target.generation_id,
+    generation_id = (
+        await session.execute(
+            select(CustomImportGenerationSeal.generation_id)
+            .select_from(CustomImportGeneration)
+            .join(
+                CustomImportGenerationSeal,
+                and_(
+                    CustomImportGenerationSeal.generation_id == CustomImportGeneration.generation_id,
+                    CustomImportGenerationSeal.dataset_id == CustomImportGeneration.dataset_id,
+                    CustomImportGenerationSeal.definition_revision_id
+                    == CustomImportGeneration.definition_revision_id,
+                    CustomImportGenerationSeal.schema_revision_id == CustomImportGeneration.schema_revision_id,
+                ),
+            )
+            .where(
+                CustomImportGeneration.generation_id == target.generation_id,
+                CustomImportGeneration.dataset_id == target.dataset_id,
+                CustomImportGeneration.definition_revision_id == target.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == target.schema_revision_id,
+                CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
+            )
         )
+    ).scalar_one_or_none()
+    if generation_id != target.generation_id:
+        raise CustomImportReadUnavailableError("pinned generation is not eligible for extension reads")
+    event = (
+        (
+            await session.execute(
+                select(CustomImportPublicationEvent)
+                .where(
+                    CustomImportPublicationEvent.dataset_id == target.dataset_id,
+                    CustomImportPublicationEvent.definition_revision_id == target.definition_revision_id,
+                    CustomImportPublicationEvent.schema_revision_id == target.schema_revision_id,
+                    CustomImportPublicationEvent.to_generation_id == target.generation_id,
+                    CustomImportPublicationEvent.finality_contract == FINALITY_EVENT_CONTRACT,
+                )
+                .order_by(CustomImportPublicationEvent.publication_event_id)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
     )
-    if type(pointer_version) is not int or pointer_version != expected_pointer_version:
-        raise CustomImportReadUnavailableError("pinned generation changed during the extension read")
+    if event is None:
+        raise CustomImportReadUnavailableError("pinned generation is not eligible for extension reads")
+    try:
+        verify_publication_event_material(event)
+    except PublicationConflict:
+        raise CustomImportReadUnavailableError("pinned generation is not eligible for extension reads") from None
