@@ -6338,7 +6338,6 @@ async def _sapphire_query_probe_targets(
                     "resolver": "sapphire_html_tocs",
                     "file_name": slug,
                     "payer_name": _clean_text(query) or None,
-                    "company_name": _clean_text(query) or None,
                     "query_probe_slug": slug,
                 },
             )
@@ -14978,19 +14977,6 @@ def _with_query_expansion_match(
 ) -> CrawlTarget:
     """Annotate a crawl target accepted for a scoped payer query."""
     metadata = dict(crawl_target.metadata or {})
-    query_label = _clean_text(query)
-    if query_label:
-        metadata.setdefault("company_name", query_label)
-        metadata.setdefault("employer_name", query_label)
-    target_label = _clean_text(
-        metadata.get("company_name")
-        or metadata.get("payer_name")
-        or metadata.get("employer_name")
-        or crawl_target.label
-    )
-    if target_label:
-        metadata.setdefault("company_name", target_label)
-        metadata.setdefault("employer_name", target_label)
     metadata["target_payer_query"] = query
     metadata["query_expansion_match"] = True
     if match_scope:
