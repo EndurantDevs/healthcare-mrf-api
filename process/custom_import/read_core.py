@@ -674,8 +674,7 @@ async def _eligible_definition_rows(
             and_(
                 CustomImportGeneration.generation_id == pinned_target.generation_id,
                 CustomImportGeneration.dataset_id == CustomImportDefinitionRevision.dataset_id,
-                CustomImportGeneration.definition_revision_id
-                == CustomImportDefinitionRevision.definition_revision_id,
+                CustomImportGeneration.definition_revision_id == CustomImportDefinitionRevision.definition_revision_id,
                 CustomImportGeneration.schema_revision_id == CustomImportDefinitionRevision.schema_revision_id,
             ),
         )
@@ -684,8 +683,7 @@ async def _eligible_definition_rows(
             and_(
                 CustomImportGenerationSeal.generation_id == CustomImportGeneration.generation_id,
                 CustomImportGenerationSeal.dataset_id == CustomImportGeneration.dataset_id,
-                CustomImportGenerationSeal.definition_revision_id
-                == CustomImportGeneration.definition_revision_id,
+                CustomImportGenerationSeal.definition_revision_id == CustomImportGeneration.definition_revision_id,
                 CustomImportGenerationSeal.schema_revision_id == CustomImportGeneration.schema_revision_id,
             ),
         )

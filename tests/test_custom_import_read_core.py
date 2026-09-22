@@ -647,20 +647,20 @@ def test_persisted_definition_parse_failure_is_unavailable(document):
 
 @pytest.mark.asyncio
 async def test_published_generation_validation_uses_the_pinned_target_and_canonical_event():
-    target = _target()
+    pinned_target = _target()
     details = publication._PublicationEventDetails(
-        dataset_id=target.dataset_id,
-        definition_revision_id=target.definition_revision_id,
-        schema_revision_id=target.schema_revision_id,
+        dataset_id=pinned_target.dataset_id,
+        definition_revision_id=pinned_target.definition_revision_id,
+        schema_revision_id=pinned_target.schema_revision_id,
         execution_id=41,
         event_kind="activated",
         from_generation_id=None,
-        to_generation_id=target.generation_id,
+        to_generation_id=pinned_target.generation_id,
         expected_pointer_version=0,
         committed_pointer_version=1,
     )
     canonical, digest = publication._event_document(details)
-    event = SimpleNamespace(
+    publication_event = SimpleNamespace(
         **details.__dict__,
         finality_contract=publication.FINALITY_EVENT_CONTRACT,
         canonical_event=canonical,
@@ -671,14 +671,14 @@ async def test_published_generation_validation_uses_the_pinned_target_and_canoni
         return SimpleNamespace(
             execute=AsyncMock(
                 side_effect=(
-                    SimpleNamespace(scalar_one_or_none=lambda: target.generation_id),
+                    SimpleNamespace(scalar_one_or_none=lambda: pinned_target.generation_id),
                     SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: event_row)),
                 )
             )
         )
 
-    session = session_for(event)
-    await read_identity.verify_published_generation(session, target)
+    session = session_for(publication_event)
+    await read_identity.verify_published_generation(session, pinned_target)
 
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert "custom_import_current_generation" not in "\n".join(statements)
@@ -686,11 +686,11 @@ async def test_published_generation_validation_uses_the_pinned_target_and_canoni
     assert "finality_contract" in statements[1]
 
     with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
-        await read_identity.verify_published_generation(session_for(None), target)
+        await read_identity.verify_published_generation(session_for(None), pinned_target)
 
-    event.canonical_event = "{}"
+    publication_event.canonical_event = "{}"
     with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned generation"):
-        await read_identity.verify_published_generation(session_for(event), target)
+        await read_identity.verify_published_generation(session_for(publication_event), pinned_target)
 
 
 @pytest.fixture
