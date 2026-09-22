@@ -39,6 +39,7 @@ from db.json_mixin import JSONOutputMixin
 __all__ = (
     "CustomImportCapture",
     "CustomImportCaptureBundle",
+    "CustomImportCaptureParquetPart",
     "CustomImportChildCollection",
     "CustomImportChildRevision",
     "CustomImportChildScalar",
@@ -700,6 +701,13 @@ class CustomImportCaptureBundle(_CustomImportModel):
             + _sha256_check("manifest_sha256"),
             name="custom_import_capture_bundle_shape_check",
         ),
+        Index(
+            "custom_import_capture_bundle_snapshot_digest_idx",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            "snapshot_token_sha256",
+        ),
     )
 
     capture_bundle_id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -763,6 +771,15 @@ class CustomImportCapture(_CustomImportModel):
             "byte_count >= 0 AND " + _sha256_check("content_sha256") + " AND " + _sha256_check("manifest_sha256"),
             name="custom_import_capture_shape_check",
         ),
+        CheckConstraint(
+            "(payload_contract IS NULL AND payload_part_count IS NULL AND payload_set_sha256 IS NULL) OR "
+            "(payload_contract IS NOT NULL AND payload_contract = 'custom-import/parquet-parts/v1' AND "
+            "byte_count BETWEEN 1 AND 67108864 AND payload_part_count IS NOT NULL AND "
+            "payload_part_count BETWEEN 1 AND 4096 AND payload_set_sha256 IS NOT NULL AND "
+            + _sha256_check("payload_set_sha256")
+            + ")",
+            name="custom_import_capture_payload_shape_check",
+        ),
     )
 
     capture_bundle_id = Column(BigInteger, primary_key=True)
@@ -774,6 +791,48 @@ class CustomImportCapture(_CustomImportModel):
     byte_count = Column(BigInteger, nullable=False)
     canonical_manifest = Column(Text, nullable=False)
     manifest_sha256 = Column(LargeBinary(32), nullable=False)
+    payload_contract = Column(String(63))
+    payload_part_count = Column(Integer)
+    payload_set_sha256 = Column(LargeBinary(32))
+    sealed_at = _timestamp_column()
+
+
+class CustomImportCaptureParquetPart(_CustomImportModel):
+    """One immutable retained Parquet payload part for a durable capture."""
+
+    __tablename__ = "custom_import_capture_parquet_part"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint(
+            "capture_bundle_id",
+            "stream_slot",
+            "part_ordinal",
+            name="custom_import_capture_parquet_part_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["capture_bundle_id", "stream_slot"],
+            [
+                _reference("custom_import_capture", "capture_bundle_id"),
+                _reference("custom_import_capture", "stream_slot"),
+            ],
+            name="custom_import_capture_parquet_part_capture_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "part_ordinal BETWEEN 1 AND 4096 AND byte_count BETWEEN 1 AND 67108864 AND "
+            "octet_length(payload) = byte_count AND "
+            + _sha256_check("payload_sha256")
+            + " AND payload_sha256 = pg_catalog.sha256(payload)",
+            name="custom_import_capture_parquet_part_shape_check",
+        ),
+    )
+
+    capture_bundle_id = Column(BigInteger, primary_key=True)
+    stream_slot = Column(SmallInteger, primary_key=True)
+    part_ordinal = Column(Integer, primary_key=True)
+    byte_count = Column(BigInteger, nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    payload_sha256 = Column(LargeBinary(32), nullable=False)
     sealed_at = _timestamp_column()
 
 
