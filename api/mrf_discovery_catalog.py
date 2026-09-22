@@ -313,7 +313,6 @@ def _file_item(
 
     file_data = _row_mapping(file_row)
     file_metadata = _metadata_dict(file_data.get("metadata_json"))
-    source_metadata = _metadata_dict(file_data.get("source_metadata_json"))
     canonical_url = str(
         file_data.get("canonical_url") or file_data.get("url") or ""
     ).strip()
@@ -344,8 +343,7 @@ def _file_item(
             "engine_source_catalog_id": file_data.get("source_id"),
             "engine_source_file_version_id": file_data.get("mrf_file_id"),
             "content_length": file_data.get("size_bytes"),
-            "company_name": file_metadata.get("company_name")
-            or source_metadata.get("target_payer_query"),
+            "company_name": file_metadata.get("company_name"),
             "plan_info": _normalized_plan_info(
                 file_data,
                 file_metadata,

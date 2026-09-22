@@ -1352,7 +1352,7 @@ def test_sapphire_query_slug_variants_probe_common_legal_suffixes():
     ]
 
 
-def test_query_expansion_target_uses_query_as_company_label():
+def test_query_expansion_target_keeps_query_as_provenance_only():
     target = discovery.CrawlTarget(
         source={"source_id": "src_aetna", "display_name": "Example Aetna"},
         url="https://example.test/2026-06-01_example-packaging-rates.json.gz",
@@ -1373,8 +1373,8 @@ def test_query_expansion_target_uses_query_as_company_label():
     matched = discovery._matched_query_expansion_target(target, "Example Packaging")
 
     assert matched is not None
-    assert matched.metadata["company_name"] == "Example Packaging"
-    assert matched.metadata["employer_name"] == "Example Packaging"
+    assert "company_name" not in matched.metadata
+    assert "employer_name" not in matched.metadata
     assert matched.metadata["target_payer_query"] == "Example Packaging"
     assert matched.metadata["query_expansion_match"] is True
     assert matched.metadata["plan_info"][0]["plan_name"] == "Example Packaging HSA Choice POS II"
@@ -1530,7 +1530,8 @@ def test_query_expansion_toc_plan_fallback_is_resolver_scoped():
     assert matched_target.url == "https://example.test/static-index.json"
     assert matched_target.metadata["query_expansion_match"] is True
     assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
-    assert matched_target.metadata["company_name"] == "Sample Employer"
+    assert "company_name" not in matched_target.metadata
+    assert "employer_name" not in matched_target.metadata
 
 
 def test_monthly_toc_query_expansion_scans_reporting_plan_identity():
@@ -2339,7 +2340,10 @@ async def test_query_expansion_uses_sapphire_probe_when_base_resolver_fails(monk
                 url="https://example.sapphiremrfhub.com/tocs/current/example-packaging",
                 label="Example Packaging",
                 resolved_from_url=url,
-                metadata={"company_name": "Example Packaging"},
+                metadata={
+                    "payer_name": query,
+                    "query_probe_slug": "example-packaging",
+                },
             )
         ]
 
@@ -2363,6 +2367,8 @@ async def test_query_expansion_uses_sapphire_probe_when_base_resolver_fails(monk
     ]
     assert crawl_targets[0].metadata["query_expansion_match"] is True
     assert crawl_targets[0].metadata["target_payer_query"] == "Example Packaging Inc"
+    assert "company_name" not in crawl_targets[0].metadata
+    assert "employer_name" not in crawl_targets[0].metadata
 
 
 def test_crawl_source_dedupe_keeps_distinct_healthsparq_metadata_catalogs():
@@ -5852,7 +5858,9 @@ async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch
     assert observations == []
     assert [crawl_target.label for crawl_target in resolved] == ["Example Employer"]
     assert resolved[0].metadata["query_expansion_match"] is True
-    assert resolved[0].metadata["company_name"] == "Example Employer"
+    assert resolved[0].metadata["target_payer_query"] == "Example Employer"
+    assert "company_name" not in resolved[0].metadata
+    assert "employer_name" not in resolved[0].metadata
 
 
 @pytest.mark.asyncio
@@ -9359,7 +9367,10 @@ async def test_sapphire_query_probe_targets_keep_existing_current_tocs(monkeypat
     assert [target.url for target in targets] == [
         "https://bcbsla.sapphiremrfhub.com/tocs/current/example_packaging_inc"
     ]
-    assert targets[0].metadata["company_name"] == "Example Packaging Inc"
+    assert targets[0].metadata["payer_name"] == "Example Packaging Inc"
+    assert targets[0].metadata["query_probe_slug"] == "example_packaging_inc"
+    assert "company_name" not in targets[0].metadata
+    assert "employer_name" not in targets[0].metadata
 
 
 def test_sapphire_static_query_hashes_are_loaded_from_gatsby_page_data():
