@@ -67,7 +67,7 @@ from process.custom_import.execution import (
 PublicationKind = Literal["activated", "rolled_back", "no_change"]
 _GENERATION_SEAL_CONTRACT = "custom-import-generation-seal/v1"
 _NO_CHANGE_SEAL_CONTRACT = "custom-import-no-change-seal/v1"
-_FINALITY_EVENT_CONTRACT = "custom-import-finality/v1"
+FINALITY_EVENT_CONTRACT = "custom-import-finality/v1"
 _MATERIALIZATION_DOMAIN = "generation-materialization/v1"
 _EFFECTIVE_OUTPUT_DOMAIN = "generation-effective-output/v1"
 _SOURCE_BUNDLE_DOMAIN = "source-bundle/v1"
@@ -259,10 +259,19 @@ def _event_details_from_event(event: CustomImportPublicationEvent) -> _Publicati
     )
 
 
-def _verify_event_material(event: CustomImportPublicationEvent) -> None:
-    canonical, digest = _event_document(_event_details_from_event(event))
-    if event.canonical_event != canonical or not hmac.compare_digest(bytes(event.event_sha256), digest):
+def verify_publication_event_material(event: CustomImportPublicationEvent) -> None:
+    """Require an immutable publication event to retain its canonical receipt."""
+
+    try:
+        canonical, digest = _event_document(_event_details_from_event(event))
+        event_digest = bytes(event.event_sha256)
+    except (AttributeError, TypeError, ValueError):
+        raise PublicationConflict("persisted publication receipt is not canonical") from None
+    if event.canonical_event != canonical or not hmac.compare_digest(event_digest, digest):
         raise PublicationConflict("persisted publication receipt is not canonical")
+
+
+_verify_event_material = verify_publication_event_material
 
 
 def _receipt(event: CustomImportPublicationEvent, *, replayed: bool) -> PublicationReceipt:
@@ -2267,7 +2276,7 @@ def _new_publication_event(details: _PublicationEventDetails) -> CustomImportPub
         to_generation_id=details.to_generation_id,
         expected_pointer_version=details.expected_pointer_version,
         committed_pointer_version=details.committed_pointer_version,
-        finality_contract=_FINALITY_EVENT_CONTRACT,
+        finality_contract=FINALITY_EVENT_CONTRACT,
         canonical_event=canonical,
         event_sha256=digest,
     )
@@ -2503,7 +2512,7 @@ def _validate_no_change_event(
 
     if (
         event.event_kind != "no_change"
-        or event.finality_contract != _FINALITY_EVENT_CONTRACT
+        or event.finality_contract != FINALITY_EVENT_CONTRACT
         or event.dataset_id != seal.dataset_id
         or event.execution_id != seal.execution_id
         or event.definition_revision_id != seal.definition_revision_id
@@ -2833,6 +2842,7 @@ async def record_no_change(
 
 
 __all__ = (
+    "FINALITY_EVENT_CONTRACT",
     "GenerationSealReceipt",
     "PublicationConflict",
     "PublicationKind",
@@ -2841,4 +2851,5 @@ __all__ = (
     "record_no_change",
     "rollback_generation",
     "seal_generation",
+    "verify_publication_event_material",
 )
