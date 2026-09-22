@@ -44,6 +44,21 @@ def _dense_file_row(file_id: str, plan_count: int) -> dict[str, object]:
     }
 
 
+def test_file_item_does_not_promote_source_query_to_company_identity():
+    file_row = _dense_file_row("file_query", 1)
+    file_row["source_metadata_json"] = {
+        "target_payer_query": "Example Employer"
+    }
+
+    file_item = catalog._file_item(file_row)
+
+    assert file_item["company_name"] is None
+    assert file_item["plan_info"][0]["plan_name"] == "Example Plan 0"
+
+    file_row["metadata_json"] = {"company_name": "Published Employer"}
+    assert catalog._file_item(file_row)["company_name"] == "Published Employer"
+
+
 class _FileRowStreamStatement:
     """Expose deterministic rows through the production streaming contract."""
 
