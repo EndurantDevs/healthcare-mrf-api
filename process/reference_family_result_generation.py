@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 TABLE_NAME = "reference_family_result_generation"
 RELATION_NAMES_BY_IMPORTER = {
+    "label": ("label",),
     "mrf": (
         "issuer",
         "plan",
@@ -281,10 +282,28 @@ async def read_reference_family_result_generation_authority(
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
+    if importer == "label":
+        from drug_snapshot_runtime.publication import read_result_publication_authority
+
+        return _label_authority(
+            await read_result_publication_authority(database, importer_id=importer, schema=schema, lock=lock)
+        )
     row = await _first(database, text(_state_sql(_authority_schema(importer, schema), lock=lock)), importer_id=importer)
     if row is None:
         raise RuntimeError("reference family generation authority is unavailable")
     return validate_reference_family_result_generation_authority(row)
+
+
+def _label_authority(authority):
+    """Preserve the shared generation shape while using the Drug-owned ledger."""
+    serving = authority.serving_generation
+    return ReferenceFamilyResultGenerationAuthority(
+        authority.importer_id,
+        authority.local_lineage_id,
+        authority.local_generation,
+        None if serving is None else validate_reference_family_serving_generation(serving.as_dict()),
+        authority.relation_oids,
+    )
 
 
 async def current_reference_family_relation_oids(
@@ -348,6 +367,14 @@ async def publish_local_reference_family_generation(
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
+    if importer == "label":
+        from drug_snapshot_runtime.publication import publish_local_result_generation
+
+        return _label_authority(
+            await publish_local_result_generation(
+                database, importer_id="label", schema=schema, consumed_dependencies={}
+            )
+        )
     current = await read_reference_family_result_generation_authority(
         database, importer_id=importer, schema_name=schema, lock=True
     )
@@ -374,6 +401,23 @@ async def publish_local_reference_family_generation(
     return validate_reference_family_result_generation_authority(updated)
 
 
+async def _adopt_label_generation(
+    database: Any,
+    schema: str,
+    source_generation: Mapping[str, Any] | ReferenceFamilyServingGeneration | None,
+) -> ReferenceFamilyResultGenerationAuthority:
+    """Bridge the shared generation contract to Label's native ledger."""
+
+    from drug_snapshot_runtime.publication import adopt_label_generation
+
+    source = (
+        source_generation.as_dict()
+        if isinstance(source_generation, ReferenceFamilyServingGeneration)
+        else source_generation
+    )
+    return _label_authority(await adopt_label_generation(database, schema=schema, source_generation=source))
+
+
 async def publish_adopted_reference_family_generation(
     database: Any,
     *,
@@ -385,6 +429,8 @@ async def publish_adopted_reference_family_generation(
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
+    if importer == "label":
+        return await _adopt_label_generation(database, schema, source_generation)
     current = await read_reference_family_result_generation_authority(
         database, importer_id=importer, schema_name=schema, lock=True
     )
