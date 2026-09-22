@@ -162,13 +162,7 @@ def _part_insert_guard_function_sql(schema: str) -> str:
     """
 
 
-def _complete_guard_function_sql(schema: str) -> str:
-    bundle = _qualified(schema, _BUNDLE_TABLE)
-    capture = _qualified(schema, _CAPTURE_TABLE)
-    part = _qualified(schema, _PART_TABLE)
-    source_stream = _qualified(schema, _STREAM_TABLE)
-    function = _qualified(schema, _COMPLETE_GUARD)
-    return f"""
+_COMPLETE_GUARD_SQL_TEMPLATE = """
     CREATE FUNCTION {function}()
     RETURNS trigger
     LANGUAGE plpgsql
@@ -298,6 +292,25 @@ def _complete_guard_function_sql(schema: str) -> str:
     END;
     $function$
     """
+
+
+def _complete_guard_function_sql(schema: str) -> str:
+    """Return the deferred trigger function that seals a durable capture bundle."""
+
+    return _COMPLETE_GUARD_SQL_TEMPLATE.format(
+        bundle=_qualified(schema, _BUNDLE_TABLE),
+        capture=_qualified(schema, _CAPTURE_TABLE),
+        part=_qualified(schema, _PART_TABLE),
+        source_stream=_qualified(schema, _STREAM_TABLE),
+        function=_qualified(schema, _COMPLETE_GUARD),
+        _CAPTURE_TABLE=_CAPTURE_TABLE,
+        _MAX_BUNDLE_BYTES=_MAX_BUNDLE_BYTES,
+        _MAX_BUNDLE_PART_COUNT=_MAX_BUNDLE_PART_COUNT,
+        _MAX_PART_BYTES=_MAX_PART_BYTES,
+        _MAX_PART_COUNT=_MAX_PART_COUNT,
+        _PAYLOAD_CONTRACT=_PAYLOAD_CONTRACT,
+        _PAYLOAD_SET_DOMAIN_HEX=_PAYLOAD_SET_DOMAIN_HEX,
+    )
 
 
 def _part_insert_trigger_sql(schema: str) -> str:

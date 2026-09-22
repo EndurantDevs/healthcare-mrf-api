@@ -529,21 +529,55 @@ def _durable_payload_metadata(capture: CustomImportCapture) -> tuple[int, bytes]
     return part_count, payload_set_sha256
 
 
+def _new_capture_bundle(prepared: _PreparedCaptureBundle) -> CustomImportCaptureBundle:
+    identity = prepared.identity
+    return CustomImportCaptureBundle(
+        dataset_id=identity.dataset_id,
+        definition_revision_id=identity.definition_revision_id,
+        schema_revision_id=identity.schema_revision_id,
+        snapshot_token=prepared.snapshot_token,
+        snapshot_token_sha256=prepared.snapshot_token_sha256,
+        canonical_manifest=prepared.canonical_manifest,
+        manifest_sha256=prepared.manifest_sha256,
+        stream_count=len(prepared.streams),
+    )
+
+
 async def _is_matching_replayable_parquet_rows(
     session: AsyncSession,
     bundle: CustomImportCaptureBundle,
     prepared: _PreparedCaptureBundle,
     captures_by_stream: Mapping[str, ReplayableParquetCapture],
 ) -> bool | None:
-    result = await session.execute(
+    """Return whether locked stored rows exactly match a replayable Parquet bundle."""
+
+    capture_query = await session.execute(
         select(CustomImportCapture)
         .where(CustomImportCapture.capture_bundle_id == bundle.capture_bundle_id)
         .with_for_update()
     )
-    captures = tuple(result.scalars().all())
-    persisted_by_slot = {capture.stream_slot: capture for capture in captures}
-    if len(persisted_by_slot) != len(captures) or len(captures) != len(prepared.streams):
+    stored_captures = tuple(capture_query.scalars().all())
+    persisted_by_slot = {capture.stream_slot: capture for capture in stored_captures}
+    if len(persisted_by_slot) != len(stored_captures) or len(stored_captures) != len(prepared.streams):
         return False
+    return await _is_matching_stored_replayable_payload(
+        session,
+        bundle,
+        prepared,
+        captures_by_stream,
+        persisted_by_slot,
+    )
+
+
+async def _is_matching_stored_replayable_payload(
+    session: AsyncSession,
+    bundle: CustomImportCaptureBundle,
+    prepared: _PreparedCaptureBundle,
+    captures_by_stream: Mapping[str, ReplayableParquetCapture],
+    persisted_by_slot: Mapping[int, CustomImportCapture],
+) -> bool | None:
+    """Return whether stored durable payload metadata and parts exactly match."""
+
     metadata_by_slot: dict[int, tuple[int, bytes] | None] = {}
     for stream_id, stream_slot in prepared.streams:
         capture = persisted_by_slot.get(stream_slot)
@@ -564,15 +598,7 @@ async def _is_matching_replayable_parquet_rows(
     if any(metadata is None for metadata in metadata_by_slot.values()):
         return False
 
-    part_result = await session.execute(
-        select(CustomImportCaptureParquetPart)
-        .where(CustomImportCaptureParquetPart.capture_bundle_id == bundle.capture_bundle_id)
-        .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
-        .with_for_update()
-    )
-    parts_by_slot: dict[int, list[CustomImportCaptureParquetPart]] = {}
-    for part in part_result.scalars().all():
-        parts_by_slot.setdefault(part.stream_slot, []).append(part)
+    parts_by_slot = await _locked_parquet_parts_by_slot(session, bundle)
     if set(parts_by_slot) != set(metadata_by_slot):
         return False
     for stream_id, stream_slot in prepared.streams:
@@ -586,17 +612,33 @@ async def _is_matching_replayable_parquet_rows(
         if len(persisted_parts) != len(expected.parts):
             return False
         for ordinal, (part, expected_payload) in enumerate(zip(persisted_parts, expected.parts, strict=True), start=1):
-            payload = _stored_bytes(part.payload)
+            stored_payload = _stored_bytes(part.payload)
             if (
                 part.part_ordinal != ordinal
                 or part.byte_count != len(expected_payload)
-                or payload != expected_payload
+                or stored_payload != expected_payload
                 or not _is_stored_digest_equal(part.payload_sha256, hashlib.sha256(expected_payload).digest())
-                or payload is None
-                or hashlib.sha256(payload).digest() != hashlib.sha256(expected_payload).digest()
+                or stored_payload is None
+                or hashlib.sha256(stored_payload).digest() != hashlib.sha256(expected_payload).digest()
             ):
                 return False
     return True
+
+
+async def _locked_parquet_parts_by_slot(
+    session: AsyncSession,
+    bundle: CustomImportCaptureBundle,
+) -> dict[int, list[CustomImportCaptureParquetPart]]:
+    part_query = await session.execute(
+        select(CustomImportCaptureParquetPart)
+        .where(CustomImportCaptureParquetPart.capture_bundle_id == bundle.capture_bundle_id)
+        .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
+        .with_for_update()
+    )
+    parts_by_slot: dict[int, list[CustomImportCaptureParquetPart]] = {}
+    for part in part_query.scalars().all():
+        parts_by_slot.setdefault(part.stream_slot, []).append(part)
+    return parts_by_slot
 
 
 async def _snapshot_bundles(
@@ -672,16 +714,7 @@ async def _insert_capture_bundle(
     prepared: _PreparedCaptureBundle,
 ) -> CaptureBundleRegistration:
     identity = prepared.identity
-    bundle = CustomImportCaptureBundle(
-        dataset_id=identity.dataset_id,
-        definition_revision_id=identity.definition_revision_id,
-        schema_revision_id=identity.schema_revision_id,
-        snapshot_token=prepared.snapshot_token,
-        snapshot_token_sha256=prepared.snapshot_token_sha256,
-        canonical_manifest=prepared.canonical_manifest,
-        manifest_sha256=prepared.manifest_sha256,
-        stream_count=len(prepared.streams),
-    )
+    bundle = _new_capture_bundle(prepared)
     session.add(bundle)
     await session.flush()
     if not isinstance(bundle.capture_bundle_id, int) or bundle.capture_bundle_id <= 0:
@@ -714,17 +747,10 @@ async def _insert_replayable_parquet_bundle(
     prepared: _PreparedCaptureBundle,
     captures_by_stream: Mapping[str, ReplayableParquetCapture],
 ) -> CaptureBundleRegistration:
+    """Insert one prepared durable capture bundle and its ordered Parquet parts."""
+
     identity = prepared.identity
-    bundle = CustomImportCaptureBundle(
-        dataset_id=identity.dataset_id,
-        definition_revision_id=identity.definition_revision_id,
-        schema_revision_id=identity.schema_revision_id,
-        snapshot_token=prepared.snapshot_token,
-        snapshot_token_sha256=prepared.snapshot_token_sha256,
-        canonical_manifest=prepared.canonical_manifest,
-        manifest_sha256=prepared.manifest_sha256,
-        stream_count=len(prepared.streams),
-    )
+    bundle = _new_capture_bundle(prepared)
     session.add(bundle)
     await session.flush()
     if not isinstance(bundle.capture_bundle_id, int) or bundle.capture_bundle_id <= 0:
@@ -756,12 +782,12 @@ async def _insert_replayable_parquet_bundle(
             capture_bundle_id=bundle.capture_bundle_id,
             stream_slot=stream_slot,
             part_ordinal=ordinal,
-            byte_count=len(payload),
-            payload=payload,
-            payload_sha256=hashlib.sha256(payload).digest(),
+            byte_count=len(part_payload),
+            payload=part_payload,
+            payload_sha256=hashlib.sha256(part_payload).digest(),
         )
         for stream_id, stream_slot in prepared.streams
-        for ordinal, payload in enumerate(captures_by_stream[stream_id].parts, start=1)
+        for ordinal, part_payload in enumerate(captures_by_stream[stream_id].parts, start=1)
     )
     await session.flush()
     return CaptureBundleRegistration(
@@ -843,6 +869,147 @@ async def register_replayable_parquet_bundle(
     )
 
 
+async def _load_replayable_bundle_model(
+    session: AsyncSession,
+    capture_bundle_id: int,
+    identity: _CaptureIdentity,
+) -> CustomImportCaptureBundle:
+    bundle = (
+        await session.execute(
+            select(CustomImportCaptureBundle).where(
+                CustomImportCaptureBundle.capture_bundle_id == capture_bundle_id,
+                CustomImportCaptureBundle.dataset_id == identity.dataset_id,
+                CustomImportCaptureBundle.definition_revision_id == identity.definition_revision_id,
+                CustomImportCaptureBundle.schema_revision_id == identity.schema_revision_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if bundle is None:
+        raise CaptureBundleConflict("capture bundle does not match the durable replay identity")
+    return bundle
+
+
+async def _load_replayable_captures_by_slot(
+    session: AsyncSession,
+    capture_bundle_id: int,
+    identity: _CaptureIdentity,
+    streams: tuple[tuple[str, int], ...],
+) -> dict[int, CustomImportCapture]:
+    capture_rows = tuple(
+        (
+            await session.execute(
+                select(CustomImportCapture)
+                .where(CustomImportCapture.capture_bundle_id == capture_bundle_id)
+                .order_by(CustomImportCapture.stream_slot)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    captures_by_slot = {capture.stream_slot: capture for capture in capture_rows}
+    expected_slots = {stream_slot for _, stream_slot in streams}
+    if len(captures_by_slot) != len(capture_rows) or set(captures_by_slot) != expected_slots:
+        raise CaptureBundleConflict("durable capture bundle has missing or extra stream captures")
+    if any(
+        capture.dataset_id != identity.dataset_id
+        or capture.definition_revision_id != identity.definition_revision_id
+        or capture.schema_revision_id != identity.schema_revision_id
+        for capture in capture_rows
+    ):
+        raise CaptureBundleConflict("durable capture bundle stream identity has drifted")
+    return captures_by_slot
+
+
+def _complete_payload_metadata_by_slot(
+    captures_by_slot: Mapping[int, CustomImportCapture],
+) -> dict[int, tuple[int, bytes] | None]:
+    payload_metadata_by_slot = {
+        stream_slot: _durable_payload_metadata(capture) for stream_slot, capture in captures_by_slot.items()
+    }
+    if all(metadata is None for metadata in payload_metadata_by_slot.values()):
+        raise CapturePayloadUnavailable("capture bundle has no durable payload")
+    if any(metadata is None for metadata in payload_metadata_by_slot.values()):
+        raise CaptureBundleConflict("durable capture bundle has mixed payload availability")
+    return payload_metadata_by_slot
+
+
+async def _load_replayable_parts_by_slot(
+    session: AsyncSession,
+    capture_bundle_id: int,
+    streams: tuple[tuple[str, int], ...],
+) -> dict[int, list[CustomImportCaptureParquetPart]]:
+    part_rows = tuple(
+        (
+            await session.execute(
+                select(CustomImportCaptureParquetPart)
+                .where(CustomImportCaptureParquetPart.capture_bundle_id == capture_bundle_id)
+                .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    parts_by_slot: dict[int, list[CustomImportCaptureParquetPart]] = {}
+    for part in part_rows:
+        parts_by_slot.setdefault(part.stream_slot, []).append(part)
+    if set(parts_by_slot) != {stream_slot for _, stream_slot in streams}:
+        raise CaptureBundleConflict("durable capture bundle has missing or extra payload parts")
+    return parts_by_slot
+
+
+def _replayable_captures_from_rows(
+    bundle: CustomImportCaptureBundle,
+    streams: tuple[tuple[str, int], ...],
+    captures_by_slot: Mapping[int, CustomImportCapture],
+    payload_metadata_by_slot: Mapping[int, tuple[int, bytes] | None],
+    parts_by_slot: Mapping[int, list[CustomImportCaptureParquetPart]],
+) -> tuple[tuple[ReplayableParquetCapture, ...], dict[str, CaptureReceipt]]:
+    replayable_captures: list[ReplayableParquetCapture] = []
+    receipts_by_stream: dict[str, CaptureReceipt] = {}
+    try:
+        for stream_id, stream_slot in streams:
+            capture = captures_by_slot[stream_slot]
+            metadata = payload_metadata_by_slot[stream_slot]
+            assert metadata is not None
+            part_count, expected_set_sha256 = metadata
+            persisted_parts = parts_by_slot[stream_slot]
+            if len(persisted_parts) != part_count:
+                raise CaptureBundleConflict("durable capture bundle has an incomplete part count")
+            part_payloads: list[bytes] = []
+            for ordinal, part in enumerate(persisted_parts, start=1):
+                stored_payload = _stored_bytes(part.payload)
+                stored_digest = _stored_bytes(part.payload_sha256)
+                if (
+                    part.part_ordinal != ordinal
+                    or stored_payload is None
+                    or part.byte_count != len(stored_payload)
+                    or stored_digest is None
+                    or len(stored_digest) != 32
+                    or hashlib.sha256(stored_payload).digest() != stored_digest
+                ):
+                    raise CaptureBundleConflict("durable capture payload part has drifted")
+                part_payloads.append(stored_payload)
+            payload_parts = tuple(part_payloads)
+            if _payload_set_sha256(payload_parts) != expected_set_sha256:
+                raise CaptureBundleConflict("durable capture payload set digest has drifted")
+            receipt = CaptureReceipt(
+                stream_id=stream_id,
+                source_snapshot_token=bundle.snapshot_token,
+                byte_count=capture.byte_count,
+                content_sha256=bytes(capture.content_sha256).hex(),
+                canonical_manifest=capture.canonical_manifest,
+                manifest_sha256=bytes(capture.manifest_sha256).hex(),
+            )
+            replayable = ReplayableParquetCapture(receipt=receipt, parts=payload_parts)
+            receipts_by_stream[stream_id] = receipt
+            replayable_captures.append(replayable)
+    except (AttributeError, TypeError, ValueError, CaptureStoreError) as exc:
+        if isinstance(exc, CaptureBundleConflict):
+            raise
+        raise CaptureBundleConflict("durable capture bundle payload is invalid") from exc
+    return tuple(replayable_captures), receipts_by_stream
+
+
 async def load_replayable_parquet_bundle(
     session: AsyncSession,
     *,
@@ -861,110 +1028,18 @@ async def load_replayable_parquet_bundle(
     capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
     streams = await _validated_streams(session, identity)
     await _validated_replayable_parquet_streams(session, identity, streams)
-    bundle = (
-        await session.execute(
-            select(CustomImportCaptureBundle).where(
-                CustomImportCaptureBundle.capture_bundle_id == capture_bundle_id,
-                CustomImportCaptureBundle.dataset_id == identity.dataset_id,
-                CustomImportCaptureBundle.definition_revision_id == identity.definition_revision_id,
-                CustomImportCaptureBundle.schema_revision_id == identity.schema_revision_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if bundle is None:
-        raise CaptureBundleConflict("capture bundle does not match the durable replay identity")
-    capture_rows = tuple(
-        (
-            await session.execute(
-                select(CustomImportCapture)
-                .where(CustomImportCapture.capture_bundle_id == capture_bundle_id)
-                .order_by(CustomImportCapture.stream_slot)
-            )
-        )
-        .scalars()
-        .all()
+    bundle = await _load_replayable_bundle_model(session, capture_bundle_id, identity)
+    captures_by_slot = await _load_replayable_captures_by_slot(session, capture_bundle_id, identity, streams)
+    payload_metadata_by_slot = _complete_payload_metadata_by_slot(captures_by_slot)
+    parts_by_slot = await _load_replayable_parts_by_slot(session, capture_bundle_id, streams)
+    replayable_captures, receipts_by_stream = _replayable_captures_from_rows(
+        bundle,
+        streams,
+        captures_by_slot,
+        payload_metadata_by_slot,
+        parts_by_slot,
     )
-    capture_by_slot = {capture.stream_slot: capture for capture in capture_rows}
-    expected_slots = {stream_slot for _, stream_slot in streams}
-    if len(capture_by_slot) != len(capture_rows) or set(capture_by_slot) != expected_slots:
-        raise CaptureBundleConflict("durable capture bundle has missing or extra stream captures")
-    if any(
-        capture.dataset_id != identity.dataset_id
-        or capture.definition_revision_id != identity.definition_revision_id
-        or capture.schema_revision_id != identity.schema_revision_id
-        for capture in capture_rows
-    ):
-        raise CaptureBundleConflict("durable capture bundle stream identity has drifted")
-    payload_metadata_by_slot = {
-        stream_slot: _durable_payload_metadata(capture) for stream_slot, capture in capture_by_slot.items()
-    }
-    if all(metadata is None for metadata in payload_metadata_by_slot.values()):
-        raise CapturePayloadUnavailable("capture bundle has no durable payload")
-    if any(metadata is None for metadata in payload_metadata_by_slot.values()):
-        raise CaptureBundleConflict("durable capture bundle has mixed payload availability")
-
-    part_rows = tuple(
-        (
-            await session.execute(
-                select(CustomImportCaptureParquetPart)
-                .where(CustomImportCaptureParquetPart.capture_bundle_id == capture_bundle_id)
-                .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    parts_by_slot: dict[int, list[CustomImportCaptureParquetPart]] = {}
-    for part in part_rows:
-        parts_by_slot.setdefault(part.stream_slot, []).append(part)
-    if set(parts_by_slot) != expected_slots:
-        raise CaptureBundleConflict("durable capture bundle has missing or extra payload parts")
-
-    replayable_captures: list[ReplayableParquetCapture] = []
-    receipts_by_stream: dict[str, CaptureReceipt] = {}
-    try:
-        for stream_id, stream_slot in streams:
-            capture = capture_by_slot[stream_slot]
-            metadata = payload_metadata_by_slot[stream_slot]
-            assert metadata is not None
-            part_count, expected_set_sha256 = metadata
-            persisted_parts = parts_by_slot[stream_slot]
-            if len(persisted_parts) != part_count:
-                raise CaptureBundleConflict("durable capture bundle has an incomplete part count")
-            payloads: list[bytes] = []
-            for ordinal, part in enumerate(persisted_parts, start=1):
-                payload = _stored_bytes(part.payload)
-                digest = _stored_bytes(part.payload_sha256)
-                if (
-                    part.part_ordinal != ordinal
-                    or payload is None
-                    or part.byte_count != len(payload)
-                    or digest is None
-                    or len(digest) != 32
-                    or hashlib.sha256(payload).digest() != digest
-                ):
-                    raise CaptureBundleConflict("durable capture payload part has drifted")
-                payloads.append(payload)
-            parts = tuple(payloads)
-            if _payload_set_sha256(parts) != expected_set_sha256:
-                raise CaptureBundleConflict("durable capture payload set digest has drifted")
-            receipt = CaptureReceipt(
-                stream_id=stream_id,
-                source_snapshot_token=bundle.snapshot_token,
-                byte_count=capture.byte_count,
-                content_sha256=bytes(capture.content_sha256).hex(),
-                canonical_manifest=capture.canonical_manifest,
-                manifest_sha256=bytes(capture.manifest_sha256).hex(),
-            )
-            replayable = ReplayableParquetCapture(receipt=receipt, parts=parts)
-            receipts_by_stream[stream_id] = receipt
-            replayable_captures.append(replayable)
-    except (AttributeError, TypeError, ValueError, CaptureStoreError) as exc:
-        if isinstance(exc, CaptureBundleConflict):
-            raise
-        raise CaptureBundleConflict("durable capture bundle payload is invalid") from exc
-
     prepared = _prepare_capture_bundle(identity, streams, receipts_by_stream)
     if not _is_matching_bundle(bundle, prepared):
         raise CaptureBundleConflict("durable capture bundle identity has drifted")
-    return _validate_replayable_parquet_captures(tuple(replayable_captures))
+    return _validate_replayable_parquet_captures(replayable_captures)
