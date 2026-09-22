@@ -1604,7 +1604,7 @@ async def _entity_winner_locator(
     ).all()
     if len(family_rows) != 1:
         raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
-    root_record_id, family_revision_id, entity_binding_id = tuple(family_rows[0])
+    root_record_id, family_revision_id, entity_binding_id = family_rows[0]
     selected_row = (
         await session.execute(
             entity_statement.where(
