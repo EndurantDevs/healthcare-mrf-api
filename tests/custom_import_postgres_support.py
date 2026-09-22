@@ -65,6 +65,9 @@ _TEST_DATABASE = re.compile(r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))", re.
 _ROOT = Path(__file__).resolve().parents[1]
 _BASE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
 _FINALITY_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
+_DURABLE_CAPTURE_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20260922000000_custom_import_durable_parquet_capture.py"
+)
 
 
 def digest(label: str) -> bytes:
@@ -104,11 +107,12 @@ def _migration(path: Path, module_name: str):
 
 
 def _install_custom_import_migrations(sync_connection, schema_name: str) -> None:
-    """Install the exact v1 and finality DDL in one disposable schema."""
+    """Install the exact custom-import DDL needed by the focused PostgreSQL proofs."""
 
     for path, module_name in (
         (_BASE_MIGRATION_PATH, "custom_import_v1_test_migration"),
         (_FINALITY_MIGRATION_PATH, "custom_import_finality_test_migration"),
+        (_DURABLE_CAPTURE_MIGRATION_PATH, "custom_import_durable_capture_test_migration"),
     ):
         migration = _migration(path, module_name)
         migration._schema = lambda: schema_name

@@ -14,7 +14,9 @@ from process.custom_import.capture_store import (
     CaptureReceipt,
     CaptureStoreError,
     CaptureStoreTransactionRequired,
+    ReplayableParquetCapture,
     register_capture_bundle,
+    register_replayable_parquet_bundle,
 )
 from process.custom_import.snowflake import SnowflakeAcquisitionManifest, SnowflakeResultPartitionManifest
 
@@ -34,6 +36,15 @@ def _build_receipt(**changes: object) -> CaptureReceipt:
     }
     receipt_values_by_field.update(changes)
     return CaptureReceipt(**receipt_values_by_field)
+
+
+def _build_replayable_capture(
+    parts: tuple[bytes, ...] = (b"parquet-part-one", b"parquet-part-two"),
+) -> ReplayableParquetCapture:
+    return ReplayableParquetCapture(
+        receipt=_build_receipt(byte_count=sum(len(part) for part in parts)),
+        parts=parts,
+    )
 
 
 def test_capture_receipt_requires_canonical_sealed_manifest_facts():
@@ -124,6 +135,49 @@ async def test_registration_requires_a_caller_owned_transaction_before_any_datab
         )
 
 
+async def test_durable_registration_requires_a_caller_owned_transaction_before_any_database_work():
+    with pytest.raises(CaptureStoreTransactionRequired):
+        await register_replayable_parquet_bundle(
+            _NoTransaction(),
+            dataset_id=1,
+            definition_revision_id=2,
+            schema_revision_id=3,
+            captures=(_build_replayable_capture(),),
+        )
+
+
+def test_replayable_parquet_capture_binds_ordered_part_identity_without_exposing_parts():
+    capture = _build_replayable_capture()
+    expected = hashlib.sha256(
+        b"custom-import/parquet-parts/v1\x00"
+        + (1).to_bytes(4, byteorder="big")
+        + len(capture.parts[0]).to_bytes(8, byteorder="big")
+        + hashlib.sha256(capture.parts[0]).digest()
+        + (2).to_bytes(4, byteorder="big")
+        + len(capture.parts[1]).to_bytes(8, byteorder="big")
+        + hashlib.sha256(capture.parts[1]).digest()
+    ).digest()
+
+    assert capture_store._payload_set_sha256(capture.parts) == expected
+    assert capture_store._payload_set_sha256(capture.parts[::-1]) != expected
+    assert "parts=" not in repr(capture)
+
+
+def test_replayable_parquet_capture_rejects_count_size_and_byte_identity_drift(monkeypatch):
+    with pytest.raises(CaptureStoreError, match="tuple"):
+        ReplayableParquetCapture(receipt=_build_receipt(byte_count=1), parts=[b"x"])
+    with pytest.raises(CaptureStoreError, match="non-empty"):
+        ReplayableParquetCapture(receipt=_build_receipt(byte_count=0), parts=(b"",))
+    with pytest.raises(CaptureStoreError, match="byte count"):
+        ReplayableParquetCapture(receipt=_build_receipt(byte_count=2), parts=(b"x",))
+    monkeypatch.setattr(capture_store, "_MAX_PARQUET_PART_BYTES", 1)
+    with pytest.raises(CaptureStoreError, match="durable payload limit"):
+        ReplayableParquetCapture(receipt=_build_receipt(byte_count=2), parts=(b"x", b"y"))
+    monkeypatch.setattr(capture_store, "_MAX_PARQUET_PARTS_PER_CAPTURE", 1)
+    with pytest.raises(CaptureStoreError, match="1 through 4096"):
+        ReplayableParquetCapture(receipt=_build_receipt(byte_count=2), parts=(b"x", b"y"))
+
+
 def test_capture_store_rejects_malformed_receipt_boundaries(monkeypatch):
     with pytest.raises(CaptureStoreError, match="stream_id"):
         _build_receipt(stream_id="UPPER")
@@ -195,6 +249,21 @@ class _NoIdentifierInsertSession:
         return None
 
 
+class _ReplayableInsertSession:
+    def __init__(self) -> None:
+        self.flush_count = 0
+        self.batches: list[tuple[object, ...]] = []
+
+    def add(self, model) -> None:
+        model.capture_bundle_id = 1
+
+    def add_all(self, models) -> None:
+        self.batches.append(tuple(models))
+
+    async def flush(self) -> None:
+        self.flush_count += 1
+
+
 @pytest.mark.asyncio
 async def test_capture_store_rejects_missing_definition_and_insert_identity():
     identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
@@ -205,3 +274,47 @@ async def test_capture_store_rejects_missing_definition_and_insert_identity():
     prepared = capture_store._prepare_capture_bundle(identity, (("records", 1),), {"records": _build_receipt()})
     with pytest.raises(CaptureStoreError, match="did not return an identifier"):
         await capture_store._insert_capture_bundle(_NoIdentifierInsertSession(), prepared)
+
+
+@pytest.mark.asyncio
+async def test_replayable_parquet_insert_batches_all_part_rows_in_one_flush():
+    identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
+    capture = _build_replayable_capture()
+    prepared = capture_store._prepare_capture_bundle(
+        identity,
+        (("records", 1),),
+        {"records": capture.receipt},
+    )
+    session = _ReplayableInsertSession()
+
+    registered = await capture_store._insert_replayable_parquet_bundle(
+        session,
+        prepared,
+        {"records": capture},
+    )
+
+    assert registered.capture_bundle_id == 1
+    assert session.flush_count == 3
+    assert tuple(len(batch) for batch in session.batches) == (len(capture.parts),)
+
+
+class _SnapshotBundleLookupSession:
+    statement = None
+
+    async def execute(self, statement):
+        self.statement = statement
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+
+@pytest.mark.asyncio
+async def test_snapshot_lookup_uses_digest_then_retains_exact_token_comparison():
+    identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
+    prepared = capture_store._prepare_capture_bundle(identity, (("records", 1),), {"records": _build_receipt()})
+    session = _SnapshotBundleLookupSession()
+
+    assert await capture_store._snapshot_bundles(session, prepared) == ()
+
+    assert session.statement is not None
+    where_clause = str(session.statement.whereclause)
+    assert "snapshot_token_sha256" in where_clause
+    assert "snapshot_token =" in where_clause

@@ -10,6 +10,9 @@ import sqlalchemy as sa
 from db import maintenance
 from db.models import (
     CustomImportChildCollection,
+    CustomImportCapture,
+    CustomImportCaptureBundle,
+    CustomImportCaptureParquetPart,
     CustomImportDataset,
     CustomImportField,
     CustomImportGeneration,
@@ -24,10 +27,24 @@ from db.models import (
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
+DURABLE_CAPTURE_MIGRATION_PATH = (
+    ROOT / "alembic" / "versions" / "20260922000000_custom_import_durable_parquet_capture.py"
+)
 
 
 def _migration():
     spec = importlib.util.spec_from_file_location("custom_import_v1_migration", MIGRATION_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _durable_capture_migration():
+    spec = importlib.util.spec_from_file_location(
+        "custom_import_durable_capture_migration",
+        DURABLE_CAPTURE_MIGRATION_PATH,
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -118,6 +135,101 @@ def test_runtime_models_keep_generation_selection_and_lease_shapes_explicit():
         "entity_binding_id",
         "context_key_sha256",
     )
+
+
+def test_durable_capture_models_bind_only_immutable_bounded_parquet_parts():
+    """Keep retained payload metadata and physical part checks in the schema model."""
+
+    payload_shape = next(
+        constraint
+        for constraint in CustomImportCapture.__table__.constraints
+        if constraint.name == "custom_import_capture_payload_shape_check"
+    )
+    assert "payload_contract IS NULL AND payload_part_count IS NULL" in str(payload_shape.sqltext)
+    assert "payload_set_sha256 IS NOT NULL" in str(payload_shape.sqltext)
+    assert "custom-import/parquet-parts/v1" in str(payload_shape.sqltext)
+    assert CustomImportCapture.__table__.c.payload_contract.type.length == 63
+    assert CustomImportCapture.__table__.c.payload_set_sha256.type.length == 32
+    snapshot_lookup_index = next(
+        index
+        for index in CustomImportCaptureBundle.__table__.indexes
+        if index.name == "custom_import_capture_bundle_snapshot_digest_idx"
+    )
+    assert tuple(column.name for column in snapshot_lookup_index.columns) == (
+        "dataset_id",
+        "definition_revision_id",
+        "schema_revision_id",
+        "snapshot_token_sha256",
+    )
+
+    part_shape = next(
+        constraint
+        for constraint in CustomImportCaptureParquetPart.__table__.constraints
+        if constraint.name == "custom_import_capture_parquet_part_shape_check"
+    )
+    assert "part_ordinal BETWEEN 1 AND 4096" in str(part_shape.sqltext)
+    assert "octet_length(payload) = byte_count" in str(part_shape.sqltext)
+    assert "pg_catalog.sha256(payload)" in str(part_shape.sqltext)
+    capture_foreign_key = next(
+        constraint
+        for constraint in CustomImportCaptureParquetPart.__table__.foreign_key_constraints
+        if constraint.name == "custom_import_capture_parquet_part_capture_fkey"
+    )
+    assert capture_foreign_key.ondelete == "RESTRICT"
+    assert tuple(CustomImportCaptureParquetPart.__table__.primary_key.columns.keys()) == (
+        "capture_bundle_id",
+        "stream_slot",
+        "part_ordinal",
+    )
+
+
+def test_durable_capture_migration_is_schema_only_and_downgrades_fail_closed(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    migration = _durable_capture_migration()
+    upgrade_statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", upgrade_statements.append)
+
+    migration.upgrade()
+
+    upgrade_sql = "\n".join(" ".join(statement.split()) for statement in upgrade_statements)
+    assert migration.down_revision == "20260921000000_provider_quality_result_generation"
+    assert "INSERT INTO" not in upgrade_sql
+    assert 'UPDATE "custom_import_test"."custom_import_capture"' not in upgrade_sql
+    assert "payload_contract VARCHAR(63)" in upgrade_sql
+    assert "payload_set_sha256 IS NOT NULL" in upgrade_sql
+    assert 'CREATE TABLE "custom_import_test"."custom_import_capture_parquet_part"' in upgrade_sql
+    assert "ON DELETE RESTRICT" in upgrade_sql
+    assert "pg_catalog.sha256(payload)" in upgrade_sql
+    assert "custom_import_capture_parquet_part_parent_invalid" in upgrade_sql
+    assert "decoder IS DISTINCT FROM 'parquet'" in upgrade_sql
+    assert "compression IS DISTINCT FROM 'none'" in upgrade_sql
+    assert "custom_import_capture_parquet_part_already_complete" in upgrade_sql
+    assert upgrade_sql.count("CREATE CONSTRAINT TRIGGER") == 2
+    assert upgrade_sql.count("DEFERRABLE INITIALLY DEFERRED") == 2
+    assert "AFTER INSERT ON" in upgrade_sql
+    assert "WHEN (NEW.payload_contract = 'custom-import/parquet-parts/v1')" in upgrade_sql
+    assert "WHEN (NEW.part_ordinal = 1)" in upgrade_sql
+    assert "AND capture.payload_contract = 'custom-import/parquet-parts/v1'" in upgrade_sql
+    assert "pg_catalog.int4send(part.part_ordinal)" in upgrade_sql
+    assert "pg_catalog.int8send(part.byte_count)" in upgrade_sql
+    assert "custom_import_capture_parquet_payload_set_digest_mismatch" in upgrade_sql
+    assert "custom_import_capture_bundle_snapshot_digest_idx" in upgrade_sql
+    assert "custom_import_capture_parquet_part_immutable_row_guard" in upgrade_sql
+    assert "custom_import_capture_parquet_bundle_limit_exceeded" in upgrade_sql
+
+    downgrade_statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", downgrade_statements.append)
+    migration.downgrade()
+
+    downgrade_sql = "\n".join(" ".join(statement.split()) for statement in downgrade_statements)
+    assert downgrade_statements[0].startswith("LOCK TABLE")
+    assert "custom_import_capture_parquet_downgrade_blocked" in downgrade_sql
+    assert (
+        'DROP INDEX IF EXISTS "custom_import_test"."custom_import_capture_bundle_snapshot_digest_idx"' in downgrade_sql
+    )
+    assert 'DROP TABLE IF EXISTS "custom_import_test"."custom_import_capture_parquet_part"' in downgrade_sql
+    assert "DROP COLUMN IF EXISTS payload_contract" in downgrade_sql
 
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):

@@ -6,18 +6,26 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import uuid
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from sqlalchemy import func, select, update
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import func, inspect, select, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
     CustomImportCapture,
     CustomImportCaptureBundle,
+    CustomImportCaptureParquetPart,
     CustomImportDataset,
     CustomImportDefinitionRevision,
     CustomImportExecution,
@@ -28,15 +36,25 @@ from db.models.custom_import import (
 from process.custom_import import execution as lifecycle
 from process.custom_import.capture_store import (
     CaptureBundleConflict,
+    CapturePayloadUnavailable,
     CaptureReceipt,
     CaptureStoreError,
+    ReplayableParquetCapture,
+    load_replayable_parquet_bundle,
     register_capture_bundle,
+    register_replayable_parquet_bundle,
 )
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.definition_store import register_definition
 from tests.custom_import_postgres_support import isolated_publication_case
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
+_DURABLE_CAPTURE_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260922000000_custom_import_durable_parquet_capture.py"
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +91,76 @@ def _build_receipt_set(*, snapshot: str = "synthetic-snapshot-1", suffix: str = 
     )
 
 
+def _synthetic_parquet_part(stream_id: str, ordinal: int) -> bytes:
+    output = BytesIO()
+    pq.write_table(pa.table({"ordinal": [ordinal], "stream_id": [stream_id]}), output)
+    return output.getvalue()
+
+
+def _schema_bearing_zero_row_parquet_part() -> bytes:
+    schema = pa.schema((pa.field("ordinal", pa.int64()), pa.field("stream_id", pa.string())))
+    table = pa.Table.from_arrays(
+        (pa.array((), type=pa.int64()), pa.array((), type=pa.string())),
+        schema=schema,
+    )
+    output = BytesIO()
+    pq.write_table(table, output)
+    return output.getvalue()
+
+
+def _build_replayable_capture(
+    stream_id: str,
+    parts: tuple[bytes, ...],
+    *,
+    snapshot: str = "synthetic-parquet-snapshot-1",
+) -> ReplayableParquetCapture:
+    canonical_manifest = json.dumps(
+        {"connector": "synthetic-parquet", "part_count": len(parts), "stream": stream_id, "version": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    receipt = CaptureReceipt(
+        stream_id=stream_id,
+        source_snapshot_token=snapshot,
+        byte_count=sum(len(part) for part in parts),
+        content_sha256=hashlib.sha256(b"".join(parts)).hexdigest(),
+        canonical_manifest=canonical_manifest,
+        manifest_sha256=hashlib.sha256(canonical_manifest.encode("utf-8")).hexdigest(),
+    )
+    return ReplayableParquetCapture(receipt=receipt, parts=parts)
+
+
+def _build_replayable_capture_set() -> tuple[ReplayableParquetCapture, ...]:
+    return (
+        _build_replayable_capture(
+            "providers",
+            (_synthetic_parquet_part("providers", 1), _synthetic_parquet_part("providers", 2)),
+        ),
+        _build_replayable_capture("rates", (_synthetic_parquet_part("rates", 1),)),
+    )
+
+
+def _parquet_definition() -> CustomImportDefinition:
+    definition_document = json.loads(_FIXTURE.read_text())
+    for stream in definition_document["streams"]:
+        stream["format"] = "parquet"
+        stream["compression"] = "none"
+    return CustomImportDefinition.from_mapping(definition_document)
+
+
+def _downgrade_durable_capture(sync_connection, schema_name: str) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "custom_import_durable_capture_downgrade",
+        _DURABLE_CAPTURE_MIGRATION_PATH,
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.downgrade()
+
+
 async def _register_synthetic_definition(session: AsyncSession) -> _Seed:
     """Register the exact parsed v1 fixture through the production definition store."""
 
@@ -81,6 +169,20 @@ async def _register_synthetic_definition(session: AsyncSession) -> _Seed:
         session,
         f"synthetic_capture_store_{suffix}",
         CustomImportDefinition.from_json(_FIXTURE.read_text()),
+    )
+    return _Seed(
+        dataset_id=registration.dataset_id,
+        definition_revision_id=registration.definition_revision_id,
+        schema_revision_id=registration.schema_revision_id,
+    )
+
+
+async def _register_parquet_synthetic_definition(session: AsyncSession) -> _Seed:
+    suffix = uuid.uuid4().hex[:16]
+    registration = await register_definition(
+        session,
+        f"synthetic_durable_capture_{suffix}",
+        _parquet_definition(),
     )
     return _Seed(
         dataset_id=registration.dataset_id,
@@ -98,6 +200,18 @@ async def _register_bundle(case, seed: _Seed, receipts: tuple[CaptureReceipt, ..
                 definition_revision_id=seed.definition_revision_id,
                 schema_revision_id=seed.schema_revision_id,
                 receipts=receipts,
+            )
+
+
+async def _register_replayable_bundle(case, seed: _Seed, captures: tuple[ReplayableParquetCapture, ...]):
+    async with case.sessions() as session:
+        async with session.begin():
+            return await register_replayable_parquet_bundle(
+                session,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                captures=captures,
             )
 
 
@@ -122,6 +236,102 @@ async def _seed_case(case) -> _Seed:
     async with case.sessions() as session:
         async with session.begin():
             return await _register_synthetic_definition(session)
+
+
+async def _seed_parquet_case(case) -> _Seed:
+    async with case.sessions() as session:
+        async with session.begin():
+            return await _register_parquet_synthetic_definition(session)
+
+
+async def _stage_durable_bundle(
+    session: AsyncSession,
+    seed: _Seed,
+    captures: tuple[ReplayableParquetCapture, ...],
+    *,
+    payload_set_sha256: bytes,
+    omitted_part: tuple[str, int] | None = None,
+    durable_stream_ids: frozenset[str] | None = None,
+    staged_parts: tuple[tuple[str, int, bytes], ...] | None = None,
+) -> None:
+    """Stage a database-level durable bundle for one deferred-guard assertion."""
+
+    durable_stream_ids = (
+        frozenset(capture.receipt.stream_id for capture in captures)
+        if durable_stream_ids is None
+        else durable_stream_ids
+    )
+    source_slots = dict(
+        (
+            await session.execute(
+                select(CustomImportSourceStream.stream_id, CustomImportSourceStream.stream_slot).where(
+                    CustomImportSourceStream.dataset_id == seed.dataset_id,
+                    CustomImportSourceStream.definition_revision_id == seed.definition_revision_id,
+                    CustomImportSourceStream.schema_revision_id == seed.schema_revision_id,
+                )
+            )
+        ).all()
+    )
+    snapshot_token = captures[0].receipt.source_snapshot_token
+    bundle_manifest = json.dumps(
+        {"contract": "synthetic-durable", "snapshot": snapshot_token},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    bundle = CustomImportCaptureBundle(
+        dataset_id=seed.dataset_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        snapshot_token=snapshot_token,
+        snapshot_token_sha256=hashlib.sha256(snapshot_token.encode("utf-8")).digest(),
+        canonical_manifest=bundle_manifest,
+        manifest_sha256=hashlib.sha256(bundle_manifest.encode("utf-8")).digest(),
+        stream_count=len(captures),
+    )
+    session.add(bundle)
+    await session.flush()
+    assert isinstance(bundle.capture_bundle_id, int)
+
+    session.add_all(
+        CustomImportCapture(
+            capture_bundle_id=bundle.capture_bundle_id,
+            dataset_id=seed.dataset_id,
+            definition_revision_id=seed.definition_revision_id,
+            schema_revision_id=seed.schema_revision_id,
+            stream_slot=source_slots[capture.receipt.stream_id],
+            content_sha256=bytes.fromhex(capture.receipt.content_sha256),
+            byte_count=capture.receipt.byte_count,
+            canonical_manifest=capture.receipt.canonical_manifest,
+            manifest_sha256=bytes.fromhex(capture.receipt.manifest_sha256),
+            payload_contract=(
+                "custom-import/parquet-parts/v1" if capture.receipt.stream_id in durable_stream_ids else None
+            ),
+            payload_part_count=(len(capture.parts) if capture.receipt.stream_id in durable_stream_ids else None),
+            payload_set_sha256=(payload_set_sha256 if capture.receipt.stream_id in durable_stream_ids else None),
+        )
+        for capture in captures
+    )
+    await session.flush()
+    if staged_parts is None:
+        staged_parts = tuple(
+            (capture.receipt.stream_id, ordinal, payload)
+            for capture in captures
+            if capture.receipt.stream_id in durable_stream_ids
+            for ordinal, payload in enumerate(capture.parts, start=1)
+            if (capture.receipt.stream_id, ordinal) != omitted_part
+        )
+    session.add_all(
+        CustomImportCaptureParquetPart(
+            capture_bundle_id=bundle.capture_bundle_id,
+            stream_slot=source_slots[stream_id],
+            part_ordinal=ordinal,
+            byte_count=len(payload),
+            payload=payload,
+            payload_sha256=hashlib.sha256(payload).digest(),
+        )
+        for stream_id, ordinal, payload in staged_parts
+    )
+    await session.flush()
 
 
 async def _seed_incomplete_definition_graph(session: AsyncSession) -> _Seed:
@@ -201,6 +411,86 @@ async def test_register_capture_bundle_persists_complete_scope_and_replays_exact
         )
 
 
+async def test_register_and_load_replayable_parquet_bundle_in_a_fresh_session():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        first = await _register_replayable_bundle(case, seed, captures)
+        replay = await _register_replayable_bundle(case, seed, captures)
+
+        assert first.created is True
+        assert replay.created is False
+        assert replay.capture_bundle_id == first.capture_bundle_id
+        async with case.sessions() as session:
+            loaded = await load_replayable_parquet_bundle(
+                session,
+                capture_bundle_id=first.capture_bundle_id,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+            )
+            part_count = await session.scalar(
+                select(func.count())
+                .select_from(CustomImportCaptureParquetPart)
+                .where(CustomImportCaptureParquetPart.capture_bundle_id == first.capture_bundle_id)
+            )
+
+        assert tuple(capture.receipt for capture in loaded) == tuple(capture.receipt for capture in captures)
+        assert tuple(capture.parts for capture in loaded) == tuple(capture.parts for capture in captures)
+        assert part_count == 3
+
+
+async def test_replayable_parquet_round_trip_preserves_schema_bearing_zero_row_parts():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        zero_row_part = _schema_bearing_zero_row_parquet_part()
+        captures = tuple(_build_replayable_capture(stream_id, (zero_row_part,)) for stream_id in ("providers", "rates"))
+        registered = await _register_replayable_bundle(case, seed, captures)
+        async with case.sessions() as session:
+            loaded = await load_replayable_parquet_bundle(
+                session,
+                capture_bundle_id=registered.capture_bundle_id,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+            )
+
+    expected_schema = pa.schema((pa.field("ordinal", pa.int64()), pa.field("stream_id", pa.string())))
+    assert all(pq.read_table(BytesIO(capture.parts[0])).num_rows == 0 for capture in loaded)
+    assert all(pq.read_table(BytesIO(capture.parts[0])).schema == expected_schema for capture in loaded)
+
+
+async def test_durable_registration_refuses_metadata_only_and_payload_drift():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        await _register_bundle(case, seed, tuple(capture.receipt for capture in captures))
+
+        with pytest.raises(CapturePayloadUnavailable, match="no durable payload"):
+            await _register_replayable_bundle(case, seed, captures)
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        await _register_replayable_bundle(case, seed, captures)
+        first = captures[0]
+        changed_payload = first.parts[0][:-1] + bytes((first.parts[0][-1] ^ 1,))
+        drifted = (
+            ReplayableParquetCapture(receipt=first.receipt, parts=(changed_payload, *first.parts[1:])),
+            captures[1],
+        )
+
+        with pytest.raises(CaptureBundleConflict, match="durable capture bundle"):
+            await _register_replayable_bundle(case, seed, drifted)
+
+
+async def test_durable_registration_requires_persisted_parquet_without_compression():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case)
+        with pytest.raises(CaptureStoreError, match="Parquet streams without compression"):
+            await _register_replayable_bundle(case, seed, _build_replayable_capture_set())
+
+
 async def test_register_capture_bundle_rejects_partial_scope_snapshot_drift_and_receipt_drift():
     async with isolated_publication_case() as case:
         seed = await _seed_case(case)
@@ -236,6 +526,21 @@ async def _register_in_transaction(session: AsyncSession, seed: _Seed, receipts:
         )
 
 
+async def _register_replayable_in_transaction(
+    session: AsyncSession,
+    seed: _Seed,
+    captures: tuple[ReplayableParquetCapture, ...],
+):
+    async with session.begin():
+        return await register_replayable_parquet_bundle(
+            session,
+            dataset_id=seed.dataset_id,
+            definition_revision_id=seed.definition_revision_id,
+            schema_revision_id=seed.schema_revision_id,
+            captures=captures,
+        )
+
+
 async def _exercise_concurrent_replay(case, seed: _Seed, receipts: tuple[CaptureReceipt, ...]):
     async with case.sessions() as first_session, case.sessions() as second_session:
         transaction = await first_session.begin()
@@ -249,6 +554,37 @@ async def _exercise_concurrent_replay(case, seed: _Seed, receipts: tuple[Capture
                 receipts=receipts,
             )
             replay_task = asyncio.create_task(_register_in_transaction(second_session, seed, receipts))
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(replay_task), timeout=0.1)
+            await transaction.commit()
+            replay = await asyncio.wait_for(replay_task, timeout=5)
+            return first, replay
+        finally:
+            if transaction.is_active:
+                await transaction.rollback()
+            if replay_task is not None and not replay_task.done():
+                replay_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await replay_task
+
+
+async def _exercise_concurrent_replayable_parquet_registration(
+    case,
+    seed: _Seed,
+    captures: tuple[ReplayableParquetCapture, ...],
+):
+    async with case.sessions() as first_session, case.sessions() as second_session:
+        transaction = await first_session.begin()
+        replay_task = None
+        try:
+            first = await register_replayable_parquet_bundle(
+                first_session,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                captures=captures,
+            )
+            replay_task = asyncio.create_task(_register_replayable_in_transaction(second_session, seed, captures))
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(replay_task), timeout=0.1)
             await transaction.commit()
@@ -284,6 +620,308 @@ async def test_concurrent_exact_replays_serialize_on_the_dataset_lock():
         assert first.created is True
         assert replay.created is False
         assert replay.capture_bundle_id == first.capture_bundle_id
+
+
+async def test_concurrent_exact_durable_replays_serialize_on_the_dataset_lock():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        first, replay = await _exercise_concurrent_replayable_parquet_registration(
+            case,
+            seed,
+            _build_replayable_capture_set(),
+        )
+
+        assert first.created is True
+        assert replay.created is False
+        assert replay.capture_bundle_id == first.capture_bundle_id
+
+
+async def test_durable_registration_rolls_back_all_parts_with_the_caller_transaction():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        with pytest.raises(RuntimeError, match="rollback durable capture"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    registered = await register_replayable_parquet_bundle(
+                        session,
+                        dataset_id=seed.dataset_id,
+                        definition_revision_id=seed.definition_revision_id,
+                        schema_revision_id=seed.schema_revision_id,
+                        captures=_build_replayable_capture_set(),
+                    )
+                    assert registered.created is True
+                    raise RuntimeError("rollback durable capture")
+
+        assert await _durable_capture_registration_counts(case, seed) == (0, 0, 0)
+
+
+async def test_deferred_durable_guard_rejects_a_wrong_ordered_payload_set_digest_at_commit():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_payload_set_digest_mismatch"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        _build_replayable_capture_set(),
+                        payload_set_sha256=b"\x00" * 32,
+                    )
+
+
+async def test_deferred_durable_guard_rejects_a_missing_part_at_commit():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_parts_incomplete"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        _build_replayable_capture_set(),
+                        payload_set_sha256=b"\x00" * 32,
+                        omitted_part=("providers", 2),
+                    )
+
+
+async def test_deferred_durable_guard_rejects_a_missing_one_based_first_part_at_commit():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_parts_incomplete"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        _build_replayable_capture_set(),
+                        payload_set_sha256=b"\x00" * 32,
+                        omitted_part=("providers", 1),
+                    )
+
+
+async def test_deferred_durable_guard_rejects_terminal_first_parts_at_commit():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_parts_incomplete"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        captures,
+                        payload_set_sha256=b"\x00" * 32,
+                        staged_parts=(
+                            ("providers", 2, captures[0].parts[1]),
+                            ("rates", 1, captures[1].parts[0]),
+                        ),
+                    )
+
+
+async def test_part_shape_guard_rejects_explicit_ordinal_zero():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_part_shape_check"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        captures,
+                        payload_set_sha256=b"\x00" * 32,
+                        staged_parts=(("providers", 0, captures[0].parts[0]),),
+                    )
+
+
+async def test_deferred_durable_guard_rejects_mixed_legacy_and_durable_captures():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        with pytest.raises(DBAPIError, match="custom_import_capture_parquet_bundle_incomplete"):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await _stage_durable_bundle(
+                        session,
+                        seed,
+                        _build_replayable_capture_set(),
+                        payload_set_sha256=b"\x00" * 32,
+                        durable_stream_ids=frozenset(("rates",)),
+                    )
+
+
+async def test_durable_part_guards_enforce_parent_shape_completeness_and_immutability():
+    async with isolated_publication_case() as case:
+        parquet_seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        durable = await _register_replayable_bundle(case, parquet_seed, captures)
+
+        async with case.sessions() as session:
+            with pytest.raises(DBAPIError, match="custom_import_capture_payload_shape_check"):
+                async with session.begin():
+                    bundle = CustomImportCaptureBundle(
+                        dataset_id=parquet_seed.dataset_id,
+                        definition_revision_id=parquet_seed.definition_revision_id,
+                        schema_revision_id=parquet_seed.schema_revision_id,
+                        snapshot_token="synthetic-partial-payload",
+                        snapshot_token_sha256=_digest("partial-payload-snapshot"),
+                        canonical_manifest='{"contract":"synthetic","partial":true}',
+                        manifest_sha256=_digest("partial-payload-manifest"),
+                        stream_count=2,
+                    )
+                    session.add(bundle)
+                    await session.flush()
+                    session.add(
+                        CustomImportCapture(
+                            capture_bundle_id=bundle.capture_bundle_id,
+                            dataset_id=parquet_seed.dataset_id,
+                            definition_revision_id=parquet_seed.definition_revision_id,
+                            schema_revision_id=parquet_seed.schema_revision_id,
+                            stream_slot=1,
+                            content_sha256=_digest("partial-payload-content"),
+                            byte_count=1,
+                            canonical_manifest='{"connector":"synthetic","partial":true}',
+                            manifest_sha256=_digest("partial-payload-capture-manifest"),
+                            payload_part_count=1,
+                        )
+                    )
+                    await session.flush()
+
+        async with case.sessions() as session:
+            with pytest.raises(DBAPIError, match="custom_import_capture_parquet_part_shape_check"):
+                async with session.begin():
+                    bundle = CustomImportCaptureBundle(
+                        dataset_id=parquet_seed.dataset_id,
+                        definition_revision_id=parquet_seed.definition_revision_id,
+                        schema_revision_id=parquet_seed.schema_revision_id,
+                        snapshot_token="synthetic-invalid-part",
+                        snapshot_token_sha256=_digest("invalid-part-snapshot"),
+                        canonical_manifest='{"contract":"synthetic","invalid_part":true}',
+                        manifest_sha256=_digest("invalid-part-bundle-manifest"),
+                        stream_count=2,
+                    )
+                    session.add(bundle)
+                    await session.flush()
+                    session.add(
+                        CustomImportCapture(
+                            capture_bundle_id=bundle.capture_bundle_id,
+                            dataset_id=parquet_seed.dataset_id,
+                            definition_revision_id=parquet_seed.definition_revision_id,
+                            schema_revision_id=parquet_seed.schema_revision_id,
+                            stream_slot=1,
+                            content_sha256=_digest("invalid-part-content"),
+                            byte_count=1,
+                            canonical_manifest='{"connector":"synthetic","invalid_part":true}',
+                            manifest_sha256=_digest("invalid-part-capture-manifest"),
+                            payload_contract="custom-import/parquet-parts/v1",
+                            payload_part_count=1,
+                            payload_set_sha256=_digest("invalid-part-payload-set"),
+                        )
+                    )
+                    await session.flush()
+                    session.add(
+                        CustomImportCaptureParquetPart(
+                            capture_bundle_id=bundle.capture_bundle_id,
+                            stream_slot=1,
+                            part_ordinal=1,
+                            byte_count=1,
+                            payload=b"x",
+                            payload_sha256=b"\x00" * 32,
+                        )
+                    )
+                    await session.flush()
+
+        async with case.sessions() as session:
+            with pytest.raises(DBAPIError, match="custom_import_capture_parquet_part_already_complete"):
+                async with session.begin():
+                    payload = b"extra-valid-part"
+                    session.add(
+                        CustomImportCaptureParquetPart(
+                            capture_bundle_id=durable.capture_bundle_id,
+                            stream_slot=1,
+                            part_ordinal=3,
+                            byte_count=len(payload),
+                            payload=payload,
+                            payload_sha256=hashlib.sha256(payload).digest(),
+                        )
+                    )
+
+        async with case.sessions() as session:
+            with pytest.raises(DBAPIError, match="custom_import_immutable_row"):
+                async with session.begin():
+                    await session.execute(
+                        update(CustomImportCaptureParquetPart)
+                        .where(
+                            CustomImportCaptureParquetPart.capture_bundle_id == durable.capture_bundle_id,
+                            CustomImportCaptureParquetPart.stream_slot == 1,
+                            CustomImportCaptureParquetPart.part_ordinal == 1,
+                        )
+                        .values(payload=b"attempted-part-mutation")
+                    )
+
+        metadata_seed = await _seed_parquet_case(case)
+        metadata_captures = _build_replayable_capture_set()
+        metadata = await _register_bundle(case, metadata_seed, tuple(capture.receipt for capture in metadata_captures))
+        async with case.sessions() as session:
+            with pytest.raises(DBAPIError, match="custom_import_capture_parquet_part_parent_invalid"):
+                async with session.begin():
+                    payload = b"part-under-metadata-only-capture"
+                    session.add(
+                        CustomImportCaptureParquetPart(
+                            capture_bundle_id=metadata.capture_bundle_id,
+                            stream_slot=1,
+                            part_ordinal=1,
+                            byte_count=len(payload),
+                            payload=payload,
+                            payload_sha256=hashlib.sha256(payload).digest(),
+                        )
+                    )
+                    await session.flush()
+
+
+async def test_durable_capture_migration_refuses_downgrade_when_payload_exists():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        await _register_replayable_bundle(case, seed, _build_replayable_capture_set())
+        async with case.engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                with pytest.raises(DBAPIError, match="custom_import_capture_parquet_downgrade_blocked"):
+                    await connection.run_sync(_downgrade_durable_capture, case.schema_name)
+            finally:
+                if transaction.is_active:
+                    await transaction.rollback()
+
+
+async def test_durable_capture_migration_downgrades_legacy_all_null_captures():
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        registered = await _register_bundle(case, seed, _build_receipt_set())
+        async with case.sessions() as session:
+            captures = (
+                (
+                    await session.execute(
+                        select(CustomImportCapture).where(
+                            CustomImportCapture.capture_bundle_id == registered.capture_bundle_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert all(
+            capture.payload_contract is None
+            and capture.payload_part_count is None
+            and capture.payload_set_sha256 is None
+            for capture in captures
+        )
+        async with case.engine.connect() as connection:
+            async with connection.begin():
+                await connection.run_sync(_downgrade_durable_capture, case.schema_name)
+            table_names = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).get_table_names(schema=case.schema_name)
+            )
+
+        assert "custom_import_capture_parquet_part" not in table_names
 
 
 async def test_capture_registration_rejects_an_incomplete_definition_graph():
@@ -388,6 +1026,33 @@ async def _capture_registration_counts(case, seed: _Seed) -> tuple[int, int]:
             .where(CustomImportCapture.dataset_id == seed.dataset_id)
         )
     return bundle_count, capture_count
+
+
+async def _durable_capture_registration_counts(case, seed: _Seed) -> tuple[int, int, int]:
+    """Return bundle, capture, and durable part rows retained for one dataset."""
+
+    async with case.sessions() as session:
+        bundle_count = await session.scalar(
+            select(func.count())
+            .select_from(CustomImportCaptureBundle)
+            .where(CustomImportCaptureBundle.dataset_id == seed.dataset_id)
+        )
+        capture_count = await session.scalar(
+            select(func.count())
+            .select_from(CustomImportCapture)
+            .where(CustomImportCapture.dataset_id == seed.dataset_id)
+        )
+        part_count = await session.scalar(
+            select(func.count())
+            .select_from(CustomImportCaptureParquetPart)
+            .join(
+                CustomImportCapture,
+                (CustomImportCaptureParquetPart.capture_bundle_id == CustomImportCapture.capture_bundle_id)
+                & (CustomImportCaptureParquetPart.stream_slot == CustomImportCapture.stream_slot),
+            )
+            .where(CustomImportCapture.dataset_id == seed.dataset_id)
+        )
+    return int(bundle_count or 0), int(capture_count or 0), int(part_count or 0)
 
 
 async def _register_recovery_capture_bundle(
