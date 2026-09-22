@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Closed HTTP boundary for generic custom-import extension searches."""
+"""Closed HTTP boundary for generic custom-import extension reads."""
 
 from __future__ import annotations
 
@@ -36,8 +36,10 @@ from process.custom_import.read_contracts import (
 )
 from process.custom_import.read_core import (
     CustomImportReadService,
+    EntityLocator,
     ReadFilter,
     ReadOrderTerm,
+    RootDetailRequest,
     SearchRequest,
 )
 
@@ -49,6 +51,7 @@ CUSTOM_IMPORT_READ_CONTEXT_HEADER = "X-HealthPorta-Extension-Read-Context"
 CUSTOM_IMPORT_READ_KEY_ID_HEADER = "X-HealthPorta-Extension-Read-Key-Id"
 CUSTOM_IMPORT_READ_SIGNATURE_HEADER = "X-HealthPorta-Extension-Read-Signature"
 CUSTOM_IMPORT_READ_PATH = "/api/v1/extensions/custom-import/search"
+CUSTOM_IMPORT_DETAIL_PATH = "/api/v1/extensions/custom-import/detail"
 CUSTOM_IMPORT_READ_ISSUER = "healthporta-extension-gateway"
 CUSTOM_IMPORT_READ_AUDIENCE = "healthcare-mrf-api"
 CUSTOM_IMPORT_READ_CAPABILITY = "custom-import:extension-read"
@@ -358,6 +361,28 @@ class _ParsedSearchRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedDetailRequest:
+    target: _TransportTarget
+    entity: EntityLocator
+    family_entitlement: str
+
+    def bind(self, dataset_id: int) -> RootDetailRequest:
+        """Bind the verified external request to one internal dataset ID."""
+
+        return RootDetailRequest(
+            target=PinnedReadTarget(
+                dataset_id=dataset_id,
+                generation_id=self.target.generation_id,
+                definition_revision_id=self.target.definition_revision_id,
+                schema_revision_id=self.target.schema_revision_id,
+                profile_id=self.target.profile_id,
+            ),
+            entity=self.entity,
+            family_entitlement=self.family_entitlement,
+        )
+
+
 def _parse_target(value: object) -> _TransportTarget:
     if type(value) is not dict or frozenset(value) != {
         "dataset_key",
@@ -419,6 +444,35 @@ def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
         parsed_request.bind(1)
         return parsed_request
     except CustomImportReadRequestError, TypeError:
+        raise _fail() from None
+
+
+def _parse_detail_request(body: bytes) -> _ParsedDetailRequest:
+    """Parse one canonical, closed, signed entity detail request body."""
+
+    document = _strict_json(body)
+    if type(document) is not dict or frozenset(document) != {"entity", "family_entitlement", "target"}:
+        raise _fail()
+    if _canonical_json_bytes(document) != body:
+        raise _fail()
+    try:
+        parsed_request = _ParsedDetailRequest(
+            target=_parse_target(document.get("target")),
+            entity=_parse_entity(document.get("entity")),
+            family_entitlement=document.get("family_entitlement"),
+        )
+        parsed_request.bind(1)
+        return parsed_request
+    except CustomImportReadRequestError, TypeError:
+        raise _fail() from None
+
+
+def _parse_entity(value: object) -> EntityLocator:
+    if type(value) is not dict or frozenset(value) != {"adapter_id", "value"}:
+        raise _fail()
+    try:
+        return EntityLocator(adapter_id=value.get("adapter_id"), value=value.get("value"))
+    except CustomImportReadRequestError:
         raise _fail() from None
 
 
@@ -514,9 +568,10 @@ def _verify_transport(
     *,
     headers: Mapping[str, Any],
     body: bytes,
-    request: _ParsedSearchRequest,
+    request: _ParsedSearchRequest | _ParsedDetailRequest,
     trusted_now: str,
     keyring: _Keyring,
+    path: str = CUSTOM_IMPORT_READ_PATH,
 ) -> _VerifiedTransport:
     """Verify one signed transport permit against the exact request."""
 
@@ -543,7 +598,7 @@ def _verify_transport(
         "contract": CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
         "issuer": CUSTOM_IMPORT_READ_ISSUER,
         "method": "POST",
-        "path": CUSTOM_IMPORT_READ_PATH,
+        "path": path,
     }
     for name, expected_value in expected_by_field.items():
         actual_value = context_fields.get(name)
@@ -658,6 +713,20 @@ def _page_payload(page: Any, target: _TransportTarget) -> dict[str, object]:
     }
 
 
+def _detail_payload(detail: Any, target: _TransportTarget) -> dict[str, object]:
+    return {
+        "target": _target_document(target),
+        "root_fields": [_field_value(value) for value in detail.root_fields],
+        "children": [
+            {
+                "collection": child.collection,
+                "fields": [_field_value(value) for value in child.fields],
+            }
+            for child in detail.children
+        ],
+    }
+
+
 def _response(body: bytes, status: int):
     return response.raw(
         body,
@@ -733,11 +802,57 @@ async def serve_custom_import_search(request: Any, session: Any):
     return _response(encoded, 200)
 
 
+async def serve_custom_import_detail(request: Any, session: Any):
+    """Serve one signed, pinned entity detail without cursor fallback modes."""
+
+    if getattr(request, "method", None) != "POST" or getattr(request, "path", None) != CUSTOM_IMPORT_DETAIL_PATH:
+        return _error(404)
+    try:
+        body = getattr(request, "body", None)
+        if type(body) is not bytes or not 1 <= len(body) <= _MAX_BODY_BYTES:
+            raise _fail()
+        parsed_request = _parse_detail_request(body)
+        keyring = _keyring()
+        verified = _verify_transport(
+            headers=request.headers,
+            body=body,
+            request=parsed_request,
+            trusted_now=_trusted_now(),
+            keyring=keyring,
+            path=CUSTOM_IMPORT_DETAIL_PATH,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
+        async with asyncio.timeout_at(deadline):
+            pinned_target = await _resolve_pinned_target(session, parsed_request.target)
+        remaining_timeout_ms = int((deadline - loop.time()) * 1_000)
+        if remaining_timeout_ms < 1:
+            raise CustomImportReadUnavailableError("custom import read timed out")
+        detail_request = parsed_request.bind(pinned_target.dataset_id)
+        service = CustomImportReadService(
+            authorizer=_TransportAuthorizer(verified, pinned_target),
+            statement_timeout_ms=remaining_timeout_ms,
+        )
+        detail = await service.root_detail_for_entity(
+            session,
+            authorization=ExtensionReadAuthorization(verified.credential),
+            request=detail_request,
+        )
+        encoded = orjson.dumps(_detail_payload(detail, parsed_request.target))
+        if len(encoded) > _MAX_RESPONSE_BYTES:
+            raise CustomImportReadUnavailableError("custom import response exceeds the bound")
+    except Exception as failure:
+        _log_failure(failure)
+        return _error(_failure_status(failure))
+    return _response(encoded, 200)
+
+
 __all__ = (
     "CUSTOM_IMPORT_READ_AUDIENCE",
     "CUSTOM_IMPORT_READ_CAPABILITY",
     "CUSTOM_IMPORT_READ_CONTEXT_HEADER",
     "CUSTOM_IMPORT_READ_CURSOR_SECRET_ENV",
+    "CUSTOM_IMPORT_DETAIL_PATH",
     "CUSTOM_IMPORT_READ_ISSUER",
     "CUSTOM_IMPORT_READ_KEY_ID_HEADER",
     "CUSTOM_IMPORT_READ_PATH",
@@ -747,5 +862,6 @@ __all__ = (
     "CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV",
     "custom_import_read_body_sha256",
     "custom_import_read_signature_message",
+    "serve_custom_import_detail",
     "serve_custom_import_search",
 )
