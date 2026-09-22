@@ -908,6 +908,66 @@ async def _current_target(session, fixture: _ReadFixture) -> PinnedReadTarget:
     )
 
 
+async def _assert_retained_cursor_behavior(
+    read_session,
+    service,
+    authorization,
+    fixture: _ReadFixture,
+    successor: GenerationAttempt,
+    first_request: SearchRequest,
+    first_page,
+) -> None:
+    """Verify cache, cursor, and current-target behavior after supersession."""
+
+    assert (
+        await service.search(
+            read_session,
+            authorization=authorization,
+            request=first_request,
+        )
+        is first_page
+    )
+    resumed_page = await service.search(
+        read_session,
+        authorization=authorization,
+        request=SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+    )
+    assert resumed_page.total == 2
+    assert len(resumed_page.items) == 1
+    assert resumed_page.next_cursor is None
+
+    current_target = await _current_target(read_session, fixture)
+    assert current_target.generation_id == successor.generation_id
+    current_page = await service.search(
+        read_session,
+        authorization=authorization,
+        request=SearchRequest(target=current_target, page_size=1),
+    )
+    assert current_page.total == 0
+
+    for request, cursor_authorization in (
+        (
+            SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("npi", "eq", "synthetic-root"),),
+                page_size=1,
+                cursor=first_page.next_cursor,
+            ),
+            authorization,
+        ),
+        (
+            SearchRequest(target=current_target, page_size=1, cursor=first_page.next_cursor),
+            authorization,
+        ),
+        (
+            SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+            ExtensionReadAuthorization("synthetic-other-token"),
+        ),
+    ):
+        with pytest.raises(CustomImportReadCursorError):
+            await service.search(read_session, authorization=cursor_authorization, request=request)
+
+
 @pytest.mark.asyncio
 async def test_read_core_reads_retained_pinned_generation_after_publication():
     """A retained pin and its cursor survive a newer current publication."""
@@ -957,57 +1017,19 @@ async def test_read_core_reads_retained_pinned_generation_after_publication():
             )
 
         async with case.sessions() as read_session:
-            assert (
-                await service.search(
-                    read_session,
-                    authorization=authorization,
-                    request=first_request,
-                )
-                is first_page
-            )
-            resumed_page = await service.search(
+            await _assert_retained_cursor_behavior(
                 read_session,
-                authorization=authorization,
-                request=SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+                service,
+                authorization,
+                fixture,
+                successor,
+                first_request,
+                first_page,
             )
-            assert resumed_page.total == 2
-            assert len(resumed_page.items) == 1
-            assert resumed_page.next_cursor is None
-
-            current_target = await _current_target(read_session, fixture)
-            assert current_target.generation_id == successor.generation_id
-            current_page = await service.search(
-                read_session,
-                authorization=authorization,
-                request=SearchRequest(target=current_target, page_size=1),
-            )
-            assert current_page.total == 0
-
-            for request, cursor_authorization in (
-                (
-                    SearchRequest(
-                        target=fixture.target,
-                        filters=(ReadFilter("npi", "eq", "synthetic-root"),),
-                        page_size=1,
-                        cursor=first_page.next_cursor,
-                    ),
-                    authorization,
-                ),
-                (
-                    SearchRequest(target=current_target, page_size=1, cursor=first_page.next_cursor),
-                    authorization,
-                ),
-                (
-                    SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
-                    ExtensionReadAuthorization("synthetic-other-token"),
-                ),
-            ):
-                with pytest.raises(CustomImportReadCursorError):
-                    await service.search(read_session, authorization=cursor_authorization, request=request)
 
 
 @pytest.mark.asyncio
-async def test_read_core_keeps_retained_pin_when_pointer_moves_between_count_and_page(monkeypatch):
+async def test_read_core_keeps_retained_pin_after_pointer_move(monkeypatch):
     """A pointer move cannot invalidate an already admitted retained target."""
 
     async with isolated_publication_case() as case:
@@ -1111,7 +1133,7 @@ async def test_read_identity_rejects_sealed_no_change_candidate_without_target_e
             lease_token=graph.no_change_token,
         )
         assert receipt.to_generation_id == graph.first_generation_id
-        target = PinnedReadTarget(
+        pinned_target = PinnedReadTarget(
             dataset_id=graph.dataset_id,
             generation_id=graph.first_generation_id,
             definition_revision_id=graph.definition_revision_id,
@@ -1119,9 +1141,9 @@ async def test_read_identity_rejects_sealed_no_change_candidate_without_target_e
             profile_id="synthetic_profile",
         )
 
-        await read_identity.verify_published_generation(session, target)
+        await read_identity.verify_published_generation(session, pinned_target)
         with pytest.raises(CustomImportReadUnavailableError, match="pinned generation"):
             await read_identity.verify_published_generation(
                 session,
-                replace(target, generation_id=graph.no_change_candidate_generation_id),
+                replace(pinned_target, generation_id=graph.no_change_candidate_generation_id),
             )

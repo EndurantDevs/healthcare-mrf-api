@@ -53,7 +53,7 @@ def verified_definition(
     return definition
 
 
-async def verify_published_generation(session: AsyncSession, target: PinnedReadTarget) -> None:
+async def verify_published_generation(session: AsyncSession, pinned_target: PinnedReadTarget) -> None:
     """Require an exact sealed generation with a canonical finality event."""
 
     generation_id = (
@@ -65,31 +65,30 @@ async def verify_published_generation(session: AsyncSession, target: PinnedReadT
                 and_(
                     CustomImportGenerationSeal.generation_id == CustomImportGeneration.generation_id,
                     CustomImportGenerationSeal.dataset_id == CustomImportGeneration.dataset_id,
-                    CustomImportGenerationSeal.definition_revision_id
-                    == CustomImportGeneration.definition_revision_id,
+                    CustomImportGenerationSeal.definition_revision_id == CustomImportGeneration.definition_revision_id,
                     CustomImportGenerationSeal.schema_revision_id == CustomImportGeneration.schema_revision_id,
                 ),
             )
             .where(
-                CustomImportGeneration.generation_id == target.generation_id,
-                CustomImportGeneration.dataset_id == target.dataset_id,
-                CustomImportGeneration.definition_revision_id == target.definition_revision_id,
-                CustomImportGeneration.schema_revision_id == target.schema_revision_id,
+                CustomImportGeneration.generation_id == pinned_target.generation_id,
+                CustomImportGeneration.dataset_id == pinned_target.dataset_id,
+                CustomImportGeneration.definition_revision_id == pinned_target.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == pinned_target.schema_revision_id,
                 CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
             )
         )
     ).scalar_one_or_none()
-    if generation_id != target.generation_id:
+    if generation_id != pinned_target.generation_id:
         raise CustomImportReadUnavailableError("pinned generation is not eligible for extension reads")
     event = (
         (
             await session.execute(
                 select(CustomImportPublicationEvent)
                 .where(
-                    CustomImportPublicationEvent.dataset_id == target.dataset_id,
-                    CustomImportPublicationEvent.definition_revision_id == target.definition_revision_id,
-                    CustomImportPublicationEvent.schema_revision_id == target.schema_revision_id,
-                    CustomImportPublicationEvent.to_generation_id == target.generation_id,
+                    CustomImportPublicationEvent.dataset_id == pinned_target.dataset_id,
+                    CustomImportPublicationEvent.definition_revision_id == pinned_target.definition_revision_id,
+                    CustomImportPublicationEvent.schema_revision_id == pinned_target.schema_revision_id,
+                    CustomImportPublicationEvent.to_generation_id == pinned_target.generation_id,
                     CustomImportPublicationEvent.finality_contract == FINALITY_EVENT_CONTRACT,
                 )
                 .order_by(CustomImportPublicationEvent.publication_event_id)
