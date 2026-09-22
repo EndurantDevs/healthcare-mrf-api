@@ -222,11 +222,11 @@ async def test_mrf_upgrade_preserves_npi_catalog_and_reference_rows(monkeypatch)
 
 
 async def _publish_initial_generations(engine, schema):
-    """Publish generation one for every application-schema family."""
+    """Publish generation one for each application-schema reference-ledger family."""
 
     authority_by_importer = {}
     for importer_id in generation.RELATION_NAMES_BY_IMPORTER:
-        if importer_id == "tiger":
+        if importer_id in {"label", "tiger"}:
             continue
         async with engine.begin() as connection:
             first = await generation.publish_local_reference_family_generation(

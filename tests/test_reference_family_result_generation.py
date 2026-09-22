@@ -22,6 +22,7 @@ def _serving(lineage: str, value: int):
 
 def test_closed_relation_families_are_ordered_and_distinct():
     assert generation.RELATION_NAMES_BY_IMPORTER == {
+        "label": ("label",),
         "mrf": (
             "issuer",
             "plan",
