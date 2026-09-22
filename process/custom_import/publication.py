@@ -265,7 +265,7 @@ def verify_publication_event_material(event: CustomImportPublicationEvent) -> No
     try:
         canonical, digest = _event_document(_event_details_from_event(event))
         event_digest = bytes(event.event_sha256)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         raise PublicationConflict("persisted publication receipt is not canonical") from None
     if event.canonical_event != canonical or not hmac.compare_digest(event_digest, digest):
         raise PublicationConflict("persisted publication receipt is not canonical")
