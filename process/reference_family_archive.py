@@ -327,6 +327,10 @@ _OWNED_SEQUENCES = {
 def reference_family_spec(importer_id: str) -> ReferenceFamilySpec:
     """Resolve only a compiled-in reviewed importer family."""
 
+    if importer_id == "label":
+        from drug_snapshot_runtime.label import Label
+
+        return ReferenceFamilySpec("label", (Label,))
     try:
         spec = _SPECS[importer_id]
     except (KeyError, TypeError) as error:
@@ -554,6 +558,8 @@ async def _has_source_generation_authority(session: Any, spec: ReferenceFamilySp
 
     if spec.importer_id == "tiger":
         return schema_name == "tiger"
+    if spec.importer_id == "label":
+        return True
     return bool(
         await session.scalar(
             text(
@@ -809,6 +815,8 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
     if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation"}:
         raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
     spec = reference_family_spec(manifest_value["importer_id"])
+    if spec.importer_id == "label" and authority != "tracked-generation":
+        raise ReferenceFamilyArchiveError("label source generation is required")
     auxiliary = _validate_mrf_auxiliary_receipt(manifest_value.get("auxiliary")) if spec.importer_id == "mrf" else None
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
     receipts = _manifest_table_receipts(manifest_value["tables"], spec)
@@ -991,7 +999,7 @@ async def _capture_reference_family_source(
                 schema_name=schema,
             )
             if generation_authority.serving_generation is None:
-                if generation_authority.relation_oids is not None:
+                if importer_id == "label" or generation_authority.relation_oids is not None:
                     raise ReferenceFamilyArchiveError("reference family source generation is incomplete")
             elif generation_authority.relation_oids != current_generation_oids:
                 raise ReferenceFamilyArchiveError("reference family source generation is drifted")
@@ -2030,7 +2038,7 @@ async def activate_reference_family_stage(
         session,
         importer_id=spec.importer_id,
         schema_name=expected_incumbent.schema_name,
-        source_generation=None,
+        source_generation=validated_manifest.source_serving_generation if spec.importer_id == "label" else None,
     )
     return await _activation_receipt(
         session,
