@@ -172,9 +172,9 @@ class _Service:
         assert request.entity.adapter_id == "synthetic"
         assert request.entity.value == "binding-synthetic"
         assert request.family_entitlement == "full_family"
-        target = request.target
+        detail_target = request.target
         return RootDetail(
-            target=target,
+            target=detail_target,
             winner=WinnerLocator(1, 2, 3, b"w" * 32),
             root_fields=(ReadFieldValue("name", "string", "value", "Synthetic"),),
             children=(
@@ -773,10 +773,10 @@ async def test_detail_requires_full_family_entitlement_before_service_or_sql(mon
             self.calls += 1
             raise AssertionError("detail entitlement reached SQL")
 
-    document = {"entity": {"adapter_id": "synthetic", "value": "binding-synthetic"}, "target": _TARGET}
+    request_body_map = {"entity": {"adapter_id": "synthetic", "value": "binding-synthetic"}, "target": _TARGET}
     if family_entitlement is not None:
-        document["family_entitlement"] = family_entitlement
-    body = http._canonical_json_bytes(document)
+        request_body_map["family_entitlement"] = family_entitlement
+    body = http._canonical_json_bytes(request_body_map)
     session = NoSqlSession()
     monkeypatch.setattr(http, "CustomImportReadService", ForbiddenService)
 
