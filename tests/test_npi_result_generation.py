@@ -29,6 +29,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20260920160000_geo_census_result_generation",
     "20260920170000_mrf_publication_receipt",
     "20260921000000_provider_quality_result_generation",
+    "20260922000000_custom_import_durable_parquet_capture",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -55,7 +56,9 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     geo_revision = "20260920130000_geo_result_generation"
     receipt_revision = "20260920170000_mrf_publication_receipt"
     provider_quality_revision = "20260921000000_provider_quality_result_generation"
-    assert script.get_heads() == [provider_quality_revision]
+    durable_capture_revision = "20260922000000_custom_import_durable_parquet_capture"
+    assert script.get_heads() == [durable_capture_revision]
+    assert script.get_revision(durable_capture_revision).down_revision == provider_quality_revision
     assert script.get_revision(provider_quality_revision).down_revision == receipt_revision
     assert script.get_revision(receipt_revision).down_revision == "20260920160000_geo_census_result_generation"
     assert script.get_revision(geo_revision).down_revision == mrf_address_revision
