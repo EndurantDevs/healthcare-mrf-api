@@ -42,6 +42,7 @@ from db.models.custom_import import (
     CustomImportChildRevision,
     CustomImportChildScalar,
     CustomImportDefinitionRevision,
+    CustomImportEntityBinding,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
     CustomImportField,
@@ -116,6 +117,8 @@ _READ_TIMEOUT_SETTINGS = text(
     WHERE name = 'statement_timeout'
     """
 )
+_MAX_ENTITY_VALUE_BYTES = 512
+_FULL_FAMILY_ENTITLEMENT = "full_family"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +178,25 @@ class SearchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityLocator:
+    """One adapter-qualified entity value used to select a root family."""
+
+    adapter_id: str
+    value: str
+
+    def __post_init__(self) -> None:
+        _bounded_identifier(self.adapter_id, "entity adapter_id")
+        if type(self.value) is not str:
+            raise CustomImportReadRequestError("entity value is malformed")
+        try:
+            value_size = len(self.value.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise CustomImportReadRequestError("entity value is malformed") from None
+        if not 1 <= value_size <= _MAX_ENTITY_VALUE_BYTES:
+            raise CustomImportReadRequestError("entity value is malformed")
+
+
+@dataclass(frozen=True, slots=True)
 class WinnerLocator:
     """The exact persisted winner used to select a root-family detail view."""
 
@@ -189,6 +211,24 @@ class WinnerLocator:
         _positive_integer(self.entity_binding_id, "entity_binding_id")
         if type(self.context_key_sha256) is not bytes or len(self.context_key_sha256) != 32:
             raise CustomImportReadRequestError("winner context key is malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class RootDetailRequest:
+    """One exact target, entity selector, and full-family entitlement."""
+
+    target: PinnedReadTarget
+    entity: EntityLocator
+    family_entitlement: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target) is not PinnedReadTarget
+            or type(self.entity) is not EntityLocator
+            or type(self.family_entitlement) is not str
+            or self.family_entitlement != _FULL_FAMILY_ENTITLEMENT
+        ):
+            raise CustomImportReadRequestError("root detail request is malformed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,7 +340,7 @@ class CustomImportReadService:
         self,
         *,
         authorizer: ExtensionReadAuthorizer | None,
-        cursor_secret: bytes,
+        cursor_secret: bytes | None = None,
         cache: CustomImportReadCache | None = None,
         cursor_ttl_seconds: int = 300,
         statement_timeout_ms: int = DEFAULT_READ_TIMEOUT_MS,
@@ -312,7 +352,7 @@ class CustomImportReadService:
             raise CustomImportReadRequestError("statement_timeout_ms is outside the read-core limit")
         self._authorizer = authorizer
         self._cache = cache
-        self._cursor_codec = ReadCursorCodec(cursor_secret)
+        self._cursor_codec = None if cursor_secret is None else ReadCursorCodec(cursor_secret)
         self._cursor_ttl_seconds = cursor_ttl_seconds
         self._statement_timeout_ms = statement_timeout_ms
         self._now = time.time if now is None else now
@@ -327,6 +367,8 @@ class CustomImportReadService:
         """Search persisted winners after auth, eligibility, filtering, and exact count."""
 
         authorization_scope = self._authorize(authorization, request.target)
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, request.target)
             plan = _normalize_search_plan(request, context)
@@ -379,20 +421,71 @@ class CustomImportReadService:
         """Hydrate all children in the exact family selected by one persisted winner."""
 
         authorization_scope = self._authorize(authorization, target)
+        return await self._root_detail(
+            session,
+            target=target,
+            winner=winner,
+            authorization_scope=authorization_scope,
+        )
+
+    async def root_detail_for_entity(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        request: RootDetailRequest,
+    ) -> RootDetail:
+        """Hydrate one unambiguous entity family through the normal detail path."""
+
+        if type(request) is not RootDetailRequest:
+            raise CustomImportReadRequestError("root detail request is malformed")
+        authorization_scope = self._authorize(authorization, request.target)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+            context = await _load_read_context(session, request.target)
+            winner = await _entity_winner_locator(session, context, request.entity)
+            trusted_now = self._trusted_now()
+            detail, cache_key = await self._root_detail_from_context(session, context, winner, authorization_scope)
+        if cache_key is not None:
+            await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
+        return detail
+
+    async def _root_detail(
+        self,
+        session: AsyncSession,
+        *,
+        target: PinnedReadTarget,
+        winner: WinnerLocator,
+        authorization_scope: ExtensionReadScope,
+    ) -> RootDetail:
+        """Run one authorized detail hydration under one bounded read window."""
+
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, target)
             trusted_now = self._trusted_now()
-            scope_digest = _scope_digest(authorization_scope)
-            cache_key = _detail_cache_key(context.target, winner, scope_digest)
-            cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
-            if cached_detail is not None:
-                await verify_published_generation(session, context.target)
-                return cached_detail
-            selected_row = await _selected_winner_row(session, context, winner)
-            detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
-            await verify_published_generation(session, context.target)
-        await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
+            detail, cache_key = await self._root_detail_from_context(session, context, winner, authorization_scope)
+        if cache_key is not None:
+            await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
         return detail
+
+    async def _root_detail_from_context(
+        self,
+        session: AsyncSession,
+        context: _ReadContext,
+        winner: WinnerLocator,
+        authorization_scope: ExtensionReadScope,
+    ) -> tuple[RootDetail, str | None]:
+        """Reuse exact winner hydration after a target context is verified."""
+
+        scope_digest = _scope_digest(authorization_scope)
+        cache_key = _detail_cache_key(context.target, winner, scope_digest)
+        cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
+        if cached_detail is not None:
+            await verify_published_generation(session, context.target)
+            return cached_detail, None
+        selected_row = await _selected_winner_row(session, context, winner)
+        detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
+        await verify_published_generation(session, context.target)
+        return detail, cache_key
 
     def _authorize(
         self,
@@ -438,6 +531,8 @@ class CustomImportReadService:
 
         if request.cursor is None:
             return 0
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         state = self._cursor_codec.open(
             request.cursor,
             pinned_target=request.target,
@@ -459,6 +554,8 @@ class CustomImportReadService:
         next_offset = page_window.offset + page_window.returned_count
         if page_window.returned_count == 0 or next_offset >= page_window.total or next_offset > MAX_PAGE_OFFSET:
             return None
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         return self._cursor_codec.issue(
             ReadCursorState(
                 target=context.target,
@@ -1472,6 +1569,59 @@ async def _selected_winner_row(
     return _winner_row(row, context.profile_context_slot > 0)
 
 
+async def _entity_winner_locator(
+    session: AsyncSession,
+    context: _ReadContext,
+    entity: EntityLocator,
+) -> WinnerLocator:
+    """Resolve one entity only when its pinned profile has one root family."""
+
+    entity_statement = (
+        _winner_statement(context)
+        .join(
+            CustomImportEntityBinding,
+            and_(
+                CustomImportEntityBinding.entity_binding_id == CustomImportWinner.entity_binding_id,
+                CustomImportEntityBinding.dataset_id == CustomImportWinner.dataset_id,
+            ),
+        )
+        .where(
+            CustomImportEntityBinding.adapter_id == entity.adapter_id,
+            CustomImportEntityBinding.canonical_value == entity.value,
+        )
+    )
+    family_rows = (
+        await session.execute(
+            entity_statement.with_only_columns(
+                CustomImportFamilyRevision.root_record_id,
+                CustomImportWinner.family_revision_id,
+                CustomImportWinner.entity_binding_id,
+                maintain_column_froms=True,
+            )
+            .distinct()
+            .limit(2)
+        )
+    ).all()
+    if len(family_rows) != 1:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+    root_record_id, family_revision_id, entity_binding_id = tuple(family_rows[0])
+    selected_row = (
+        await session.execute(
+            entity_statement.where(
+                CustomImportFamilyRevision.root_record_id == root_record_id,
+                CustomImportWinner.family_revision_id == family_revision_id,
+                CustomImportWinner.entity_binding_id == entity_binding_id,
+            )
+            .order_by(CustomImportWinner.context_key_sha256)
+            .limit(1)
+        )
+    ).one_or_none()
+    if selected_row is None:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+    winner, family = _winner_row(selected_row, context.profile_context_slot > 0)[:2]
+    return _winner_locator(winner, family)
+
+
 async def _hydrate_root_detail(
     session: AsyncSession,
     context: _ReadContext,
@@ -1597,6 +1747,7 @@ __all__ = (
     "CustomImportReadService",
     "CustomImportReadUnavailableError",
     "DEFAULT_READ_TIMEOUT_MS",
+    "EntityLocator",
     "ExtensionReadAuthorization",
     "ExtensionReadAuthorizer",
     "ExtensionReadScope",
@@ -1614,6 +1765,7 @@ __all__ = (
     "ReadFieldValue",
     "ReadFilter",
     "ReadOrderTerm",
+    "RootDetailRequest",
     "RootDetail",
     "SearchItem",
     "SearchPage",

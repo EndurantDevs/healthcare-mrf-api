@@ -27,10 +27,13 @@ from process.custom_import.read_core import (
     CustomImportReadCursorError,
     CustomImportReadRequestError,
     CustomImportReadService,
+    CustomImportReadUnavailableError,
+    EntityLocator,
     ExtensionReadAuthorization,
     PinnedReadTarget,
     ReadCursorCodec,
     ReadCursorState,
+    RootDetailRequest,
     SearchRequest,
     WinnerLocator,
 )
@@ -530,6 +533,37 @@ def test_filter_order_and_winner_contracts_reject_invalid_shapes():
             read_core.ReadOrderTerm("synthetic_field", direction, nulls)
     with pytest.raises(CustomImportReadRequestError):
         WinnerLocator(1, 2, 3, b"short")
+    with pytest.raises(CustomImportReadRequestError):
+        EntityLocator("invalid-adapter", "synthetic")
+    with pytest.raises(CustomImportReadRequestError):
+        RootDetailRequest(_target(), object(), "full_family")
+
+
+@pytest.mark.parametrize("family_entitlement", (None, False, "root_fields"))
+def test_root_detail_request_requires_the_full_family_entitlement(family_entitlement):
+    with pytest.raises(CustomImportReadRequestError):
+        RootDetailRequest(_target(), EntityLocator("synthetic", "value"), family_entitlement)
+
+
+def test_entity_locator_has_a_utf8_byte_bound():
+    EntityLocator("synthetic", "😀" * 128)
+    with pytest.raises(CustomImportReadRequestError):
+        EntityLocator("synthetic", "😀" * 129)
+
+
+@pytest.mark.asyncio
+async def test_entity_detail_authorizes_before_any_storage_work():
+    session = SimpleNamespace(execute=AsyncMock(side_effect=AssertionError("unexpected storage work")))
+    service = CustomImportReadService(authorizer=None, cursor_secret=b"s" * 32)
+
+    with pytest.raises(CustomImportReadAuthorizationError, match="^extension read is not authorized$"):
+        await service.root_detail_for_entity(
+            session,
+            authorization=ExtensionReadAuthorization("synthetic-secret"),
+            request=RootDetailRequest(_target(), EntityLocator("synthetic", "value"), "full_family"),
+        )
+
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("ttl", (True, 0, 901))
@@ -712,6 +746,77 @@ def aliased_query_context():
     )
     definition = CustomImportDefinition.from_mapping(raw)
     return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
+
+
+def test_detail_projects_only_declared_root_and_child_fields(query_context):
+    root_fields = read_core._detail_root_fields(query_context.definition)
+    child_fields = read_core._detail_child_fields_by_slot(query_context)
+
+    assert [field.field_id for field in root_fields] == ["npi", "display_name"]
+    assert [field.field_id for field in child_fields[1]] == ["service_code", "amount"]
+    assert "rate_npi" not in {field.field_id for field in child_fields[1]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_rows", ((), ((1, 2, 3), (4, 5, 3))))
+async def test_entity_detail_refuses_absent_or_ambiguous_root_families(query_context, family_rows):
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: family_rows)),
+    )
+
+    with pytest.raises(CustomImportReadUnavailableError, match="^selected entity is not eligible for root detail$"):
+        await read_core._entity_winner_locator(session, query_context, EntityLocator("synthetic", "value"))
+
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_entity_detail_resolves_one_generic_entity_to_a_stable_winner(query_context):
+    winner = SimpleNamespace(entity_binding_id=3, context_key_sha256=b"w" * 32)
+    family = SimpleNamespace(root_record_id=1, family_revision_id=2)
+    statements = []
+
+    class Session:
+        def __init__(self) -> None:
+            self.results = iter(
+                (
+                    SimpleNamespace(all=lambda: ((1, 2, 3),)),
+                    SimpleNamespace(one_or_none=lambda: (winner, family, object(), object())),
+                )
+            )
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return next(self.results)
+
+    locator = await read_core._entity_winner_locator(Session(), query_context, EntityLocator("synthetic", "value"))
+
+    assert locator == WinnerLocator(1, 2, 3, b"w" * 32)
+    assert len(statements) == 2
+    statement_text = str(statements[0])
+    assert "DISTINCT" in statement_text
+    assert "custom_import_entity_binding.adapter_id" in statement_text
+    for column_name in ("dataset_id", "generation_id", "definition_revision_id", "schema_revision_id", "profile_slot"):
+        assert f"custom_import_winner.{column_name}" in statement_text
+
+
+@pytest.mark.asyncio
+async def test_entity_detail_resolves_a_root_scoped_profile(query_context):
+    winner = SimpleNamespace(entity_binding_id=3, context_key_sha256=b"w" * 32)
+    family = SimpleNamespace(root_record_id=1, family_revision_id=2)
+    context = replace(query_context, profile_context_slot=0)
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=(
+                SimpleNamespace(all=lambda: ((1, 2, 3),)),
+                SimpleNamespace(one_or_none=lambda: (winner, family, object())),
+            )
+        )
+    )
+
+    locator = await read_core._entity_winner_locator(session, context, EntityLocator("synthetic", "value"))
+
+    assert locator == WinnerLocator(1, 2, 3, b"w" * 32)
 
 
 def test_query_normalization_is_order_independent_and_rejects_repeated_predicates(query_context):
