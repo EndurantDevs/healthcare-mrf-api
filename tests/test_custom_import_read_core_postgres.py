@@ -16,6 +16,7 @@ from db.models.custom_import import (
     CustomImportChildScalar,
     CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
+    CustomImportEntityBinding,
     CustomImportField,
     CustomImportFieldSlot,
     CustomImportRootScalar,
@@ -40,10 +41,12 @@ from process.custom_import.read_core import (
     CustomImportReadRequestError,
     CustomImportReadService,
     CustomImportReadUnavailableError,
+    EntityLocator,
     ExtensionReadAuthorization,
     ExtensionReadScope,
     PinnedReadTarget,
     ReadFilter,
+    RootDetailRequest,
     SearchRequest,
 )
 from tests.custom_import_postgres_support import (
@@ -617,6 +620,21 @@ async def _assert_exact_family_detail(session, service, authorization, fixture: 
     }
     assert amount_state_by_child_id[fixture.selected_family.child_revision_ids[0]] == "missing"
     assert amount_state_by_child_id[fixture.selected_family.child_revision_ids[1]] == "null"
+    entity_binding = await session.get(CustomImportEntityBinding, fixture.selected_family.entity_binding_id)
+    assert entity_binding is not None
+    entity_detail = await service.root_detail_for_entity(
+        session,
+        authorization=authorization,
+        request=RootDetailRequest(
+            target=fixture.target,
+            entity=EntityLocator(entity_binding.adapter_id, entity_binding.canonical_value),
+            family_entitlement="full_family",
+        ),
+    )
+    assert entity_detail.winner.family_revision_id == fixture.selected_family.family_revision_id
+    assert {child.child_revision_id for child in entity_detail.children} == set(
+        fixture.selected_family.child_revision_ids
+    )
 
 
 @pytest.mark.asyncio

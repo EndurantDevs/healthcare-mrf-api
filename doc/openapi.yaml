@@ -152,6 +152,86 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CustomImportReadErrorResponse'
+  /extensions/custom-import/detail:
+    post:
+      operationId: readCustomImportExtensionDetail
+      summary: Read one authorized, immutable custom-import root family
+      description: |
+        Service-to-service extension read. The gateway signs the canonical
+        request body, authorization scope, exact target, method, path, request
+        identity, and a short validity window. The entity adapter and value
+        select exactly one root family in the pinned profile.
+      parameters:
+        - name: X-HealthPorta-Extension-Read-Context
+          in: header
+          required: true
+          description: Base64url-encoded canonical signed request context.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 3072
+            pattern: '^[A-Za-z0-9_-]+$'
+        - name: X-HealthPorta-Extension-Read-Key-Id
+          in: header
+          required: true
+          description: Identifier of the configured transport signing key.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 32
+            pattern: '^[a-z0-9][a-z0-9-]{0,31}$'
+        - name: X-HealthPorta-Extension-Read-Signature
+          in: header
+          required: true
+          description: Base64url-encoded HMAC-SHA256 signature over the context.
+          schema:
+            type: string
+            minLength: 43
+            maxLength: 43
+            pattern: '^[A-Za-z0-9_-]{43}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportDetailRequest'
+      responses:
+        '200':
+          description: All permitted root and child projections from one exact root family.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportRootDetail'
+        '400':
+          description: The signed request violates the bounded detail contract.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
+        '404':
+          description: The permit, target, or authorization boundary is not available to the caller.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
+        '503':
+          description: The exact pinned detail cannot be served within its bounded window.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportReadErrorResponse'
   /plan/:
     get:
       operationId: getPlan
@@ -6964,6 +7044,36 @@ components:
           maxLength: 2048
           nullable: true
           description: Opaque continuation returned by the same authorized query.
+    CustomImportDetailRequest:
+      type: object
+      additionalProperties: false
+      required: [target, entity, family_entitlement]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportReadTarget'
+        entity:
+          $ref: '#/components/schemas/CustomImportDetailEntity'
+        family_entitlement:
+          type: string
+          enum: [full_family]
+          description: |
+            The gateway must assert full_family only after verifying the caller may read every
+            projected root and child field, every child collection, and all rows in the selected
+            family. Narrower grants are rejected; v1 does not redact or partially return families.
+            The assertion is authenticated by the signed request-body digest.
+    CustomImportDetailEntity:
+      type: object
+      additionalProperties: false
+      required: [adapter_id, value]
+      properties:
+        adapter_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        value:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Canonical stored value for this adapter, matched exactly without normalization; 1-512 UTF-8 bytes.
     CustomImportReadTarget:
       type: object
       additionalProperties: false
@@ -7058,6 +7168,36 @@ components:
         context_fields:
           type: array
           description: Fields from the one selected context child, or an empty array.
+          items:
+            $ref: '#/components/schemas/CustomImportReadFieldValue'
+    CustomImportRootDetail:
+      type: object
+      additionalProperties: false
+      required: [target, root_fields, children]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportReadTarget'
+        root_fields:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/CustomImportReadFieldValue'
+        children:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/CustomImportRootDetailChild'
+    CustomImportRootDetailChild:
+      type: object
+      additionalProperties: false
+      required: [collection, fields]
+      properties:
+        collection:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        fields:
+          type: array
+          maxItems: 20
           items:
             $ref: '#/components/schemas/CustomImportReadFieldValue'
     CustomImportReadFieldValue:

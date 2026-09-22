@@ -7,7 +7,7 @@ from typing import Any
 
 from sanic import Blueprint
 
-from api.custom_import_read_http import serve_custom_import_search
+from api.custom_import_read_http import serve_custom_import_detail, serve_custom_import_search
 
 blueprint = Blueprint("custom_import", url_prefix="/extensions/custom-import", version=1)
 
@@ -21,3 +21,10 @@ async def search(request: Any):
     """Forward one extension search through the closed signed boundary."""
 
     return await serve_custom_import_search(request, _session(request))
+
+
+@blueprint.post("/detail", name="custom_import.detail")
+async def detail(request: Any):
+    """Forward one full-family detail read through the closed signed boundary."""
+
+    return await serve_custom_import_detail(request, _session(request))

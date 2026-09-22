@@ -275,6 +275,37 @@ def test_custom_import_extension_read_openapi_contract():
         assert response["content"]["application/json"]["schema"] == {"$ref": f"#/components/schemas/{response_schema}"}
 
 
+def test_custom_import_extension_detail_openapi_contract():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = spec["paths"]["/extensions/custom-import/detail"]["post"]
+    request_schema = spec["components"]["schemas"]["CustomImportDetailRequest"]
+    entity_schema = spec["components"]["schemas"]["CustomImportDetailEntity"]
+
+    assert {parameter["name"] for parameter in operation["parameters"]} == {
+        "X-HealthPorta-Extension-Read-Context",
+        "X-HealthPorta-Extension-Read-Key-Id",
+        "X-HealthPorta-Extension-Read-Signature",
+    }
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CustomImportDetailRequest"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CustomImportRootDetail"
+    }
+    assert set(operation["responses"]) == {"200", "400", "404", "503"}
+    assert request_schema["required"] == ["target", "entity", "family_entitlement"]
+    entitlement_schema = request_schema["properties"]["family_entitlement"]
+    assert entitlement_schema["enum"] == ["full_family"]
+    entitlement_description = " ".join(entitlement_schema["description"].split())
+    assert "every projected root and child field" in entitlement_description
+    assert "Narrower grants are rejected" in entitlement_description
+    assert "does not redact or partially return families" in entitlement_description
+    assert "signed request-body digest" in entitlement_description
+    assert entity_schema["properties"]["value"]["maxLength"] == 512
+    assert "canonical stored value" in entity_schema["properties"]["value"]["description"].lower()
+    assert "UTF-8 bytes" in entity_schema["properties"]["value"]["description"]
+
+
 def test_pricing_procedure_scope_refusals_match_shared_handler():
     """Document every structured 422 emitted by both procedure-search paths."""
     spec = yaml.safe_load(OPENAPI_PATH.read_text())

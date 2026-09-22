@@ -21,7 +21,9 @@ from api import custom_import_read_http as http
 from api.endpoint import extension_reads
 from process.custom_import.read_contracts import ExtensionReadAuthorization, PinnedReadTarget
 from process.custom_import.read_core import (
+    ReadChild,
     ReadFieldValue,
+    RootDetail,
     SearchItem,
     SearchPage,
     WinnerLocator,
@@ -42,6 +44,11 @@ _BODY = (
     b'{"cursor":"synthetic-cursor-a","filters":[{"field_id":"region","operator":"eq",'
     b'"value":"north"},{"field_id":"status","operator":"eq","value":"active"}],'
     b'"page_size":50,"target":'
+    b'{"dataset_key":"synthetic_dataset","definition_revision_id":21,"generation_id":101,'
+    b'"profile_id":"synthetic_profile","schema_revision_id":31}}'
+)
+_DETAIL_BODY = (
+    b'{"entity":{"adapter_id":"synthetic","value":"binding-synthetic"},"family_entitlement":"full_family","target":'
     b'{"dataset_key":"synthetic_dataset","definition_revision_id":21,"generation_id":101,'
     b'"profile_id":"synthetic_profile","schema_revision_id":31}}'
 )
@@ -68,6 +75,7 @@ def _headers(
     body: bytes = _BODY,
     scope: str = "a" * 64,
     request_id: str = "123e4567-e89b-42d3-a456-426614174000",
+    path: str = http.CUSTOM_IMPORT_READ_PATH,
 ) -> dict[str, str]:
     context = json.dumps(
         {
@@ -80,7 +88,7 @@ def _headers(
             "issued_at": "2031-01-02T03:04:05Z",
             "issuer": http.CUSTOM_IMPORT_READ_ISSUER,
             "method": "POST",
-            "path": http.CUSTOM_IMPORT_READ_PATH,
+            "path": path,
             "request_id": request_id,
             "target": _TARGET,
         },
@@ -99,8 +107,8 @@ def _headers(
     }
 
 
-def _resigned_headers(**changes) -> dict[str, str]:
-    headers = _headers()
+def _resigned_headers(*, body: bytes = _BODY, path: str = http.CUSTOM_IMPORT_READ_PATH, **changes) -> dict[str, str]:
+    headers = _headers(body=body, path=path)
     encoded = headers[http.CUSTOM_IMPORT_READ_CONTEXT_HEADER]
     context = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     for name, value in changes.items():
@@ -125,14 +133,14 @@ class _Request:
 
 
 class _Service:
-    def __init__(self, *, authorizer, cursor_secret, **_kwargs) -> None:
+    def __init__(self, *, authorizer, cursor_secret=None, **_kwargs) -> None:
         self.authorizer = authorizer
         self.cursor_secret = cursor_secret
 
     async def search(self, _session, *, authorization, request):
         assert type(authorization) is ExtensionReadAuthorization
         assert self.authorizer.authorize(authorization, target=request.target).value == "a" * 64
-        assert len(self.cursor_secret) == 32
+        assert self.cursor_secret is not None and len(self.cursor_secret) == 32
         target = request.target
         return SearchPage(
             target=target,
@@ -155,6 +163,37 @@ class _Service:
             next_cursor="cir1.synthetic",
             expires_at=1_234,
             query_fingerprint="b" * 64,
+            authorization_scope_sha256="a" * 64,
+        )
+
+    async def root_detail_for_entity(self, _session, *, authorization, request):
+        assert type(authorization) is ExtensionReadAuthorization
+        assert self.authorizer.authorize(authorization, target=request.target).value == "a" * 64
+        assert request.entity.adapter_id == "synthetic"
+        assert request.entity.value == "binding-synthetic"
+        assert request.family_entitlement == "full_family"
+        target = request.target
+        return RootDetail(
+            target=target,
+            winner=WinnerLocator(1, 2, 3, b"w" * 32),
+            root_fields=(ReadFieldValue("name", "string", "value", "Synthetic"),),
+            children=(
+                ReadChild(
+                    "rates",
+                    1,
+                    (ReadFieldValue("amount", "decimal", "value", __import__("decimal").Decimal("1.20")),),
+                ),
+                ReadChild(
+                    "rates",
+                    2,
+                    (ReadFieldValue("amount", "decimal", "null", None),),
+                ),
+                ReadChild(
+                    "contacts",
+                    3,
+                    (ReadFieldValue("city", "string", "value", "Synthetic City"),),
+                ),
+            ),
             authorization_scope_sha256="a" * 64,
         )
 
@@ -244,6 +283,23 @@ def test_signed_order_direction_cannot_be_changed_without_resigning() -> None:
             request=http._parse_search_request(tampered_body),
             trusted_now=_NOW,
             keyring=http._load_keyring(_keyring_document()),
+        )
+
+
+def test_detail_full_family_entitlement_cannot_be_changed_without_resigning() -> None:
+    document = json.loads(_DETAIL_BODY)
+    body = http._canonical_json_bytes(document)
+    document["family_entitlement"] = "root_fields"
+    tampered_body = http._canonical_json_bytes(document)
+
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._verify_transport(
+            headers=_headers(body=body, path=http.CUSTOM_IMPORT_DETAIL_PATH),
+            body=tampered_body,
+            request=http._parse_detail_request(body),
+            trusted_now=_NOW,
+            keyring=http._load_keyring(_keyring_document()),
+            path=http.CUSTOM_IMPORT_DETAIL_PATH,
         )
 
 
@@ -418,6 +474,37 @@ def test_search_parser_requires_canonical_json() -> None:
 
 
 @pytest.mark.parametrize(
+    "document",
+    (
+        {"target": _TARGET},
+        {"entity": "synthetic", "target": _TARGET},
+        {"entity": {"adapter_id": "synthetic", "value": "synthetic"}, "family_entitlement": False, "target": _TARGET},
+        {
+            "entity": {"adapter_id": "synthetic", "value": "synthetic"},
+            "family_entitlement": "root_fields",
+            "target": _TARGET,
+        },
+        {"entity": {"adapter_id": "synthetic", "value": ""}, "target": _TARGET},
+        {"entity": {"adapter_id": "wrong-adapter", "value": "synthetic"}, "target": _TARGET},
+        {"entity": {"adapter_id": "synthetic", "value": "x" * 513}, "target": _TARGET},
+        {"entity": {"adapter_id": "synthetic", "value": "synthetic"}, "target": _TARGET, "cursor": None},
+    ),
+)
+def test_detail_parser_rejects_malformed_closed_documents(document) -> None:
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._parse_detail_request(http._canonical_json_bytes(document))
+
+
+def test_detail_parser_binds_generic_entity_without_a_vendor_policy() -> None:
+    parsed = http._parse_detail_request(_DETAIL_BODY)
+    request = parsed.bind(11)
+
+    assert request.target == PinnedReadTarget(11, 101, 21, 31, "synthetic_profile")
+    assert (request.entity.adapter_id, request.entity.value) == ("synthetic", "binding-synthetic")
+    assert request.family_entitlement == "full_family"
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"contract": None},
@@ -535,6 +622,42 @@ async def test_signed_search_authorizes_before_service_and_returns_typed_payload
 
 
 @pytest.mark.asyncio
+async def test_signed_detail_returns_one_full_family_with_multiple_collections(monkeypatch) -> None:
+    _install_keyring(monkeypatch)
+    http._cursor_secret_for_document.cache_clear()
+    monkeypatch.delenv(http.CUSTOM_IMPORT_READ_CURSOR_SECRET_ENV)
+    monkeypatch.setattr(http, "CustomImportReadService", _Service)
+    monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
+    request = _Request(
+        _DETAIL_BODY,
+        _headers(body=_DETAIL_BODY, path=http.CUSTOM_IMPORT_DETAIL_PATH),
+        path=http.CUSTOM_IMPORT_DETAIL_PATH,
+    )
+
+    http_response = await http.serve_custom_import_detail(request, object())
+
+    assert http_response.status == 200
+    assert orjson.loads(http_response.body) == {
+        "target": _TARGET,
+        "root_fields": [{"field_id": "name", "field_type": "string", "state": "value", "value": "Synthetic"}],
+        "children": [
+            {
+                "collection": "rates",
+                "fields": [{"field_id": "amount", "field_type": "decimal", "state": "value", "value": "1.20"}],
+            },
+            {
+                "collection": "rates",
+                "fields": [{"field_id": "amount", "field_type": "decimal", "state": "null", "value": None}],
+            },
+            {
+                "collection": "contacts",
+                "fields": [{"field_id": "city", "field_type": "string", "state": "value", "value": "Synthetic City"}],
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
 async def test_registered_route_forwards_the_bound_session(monkeypatch) -> None:
     session = object()
     observed_calls = []
@@ -559,6 +682,30 @@ async def test_registered_route_forwards_the_bound_session(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_detail_route_forwards_the_bound_session(monkeypatch) -> None:
+    session = object()
+    observed_calls = []
+
+    async def serve(request, candidate_session):
+        observed_calls.append((request.method, request.path, candidate_session))
+        return response.json({"ok": True})
+
+    monkeypatch.setattr(extension_reads, "serve_custom_import_detail", serve)
+    app = Sanic(f"custom-import-detail-route-{uuid.uuid4().hex}")
+
+    @app.middleware("request")
+    async def bind(request):
+        request.ctx.sa_session = session
+
+    app.blueprint(Blueprint.group([extension_reads.blueprint], version_prefix="/api/v"))
+    _request, result = await app.asgi_client.post(http.CUSTOM_IMPORT_DETAIL_PATH, data=_DETAIL_BODY)
+
+    assert result.status_code == 200
+    assert result.json == {"ok": True}
+    assert observed_calls == [("POST", http.CUSTOM_IMPORT_DETAIL_PATH, session)]
+
+
+@pytest.mark.asyncio
 async def test_invalid_signature_stops_before_service_or_sql(monkeypatch) -> None:
     _install_keyring(monkeypatch)
 
@@ -578,6 +725,68 @@ async def test_invalid_signature_stops_before_service_or_sql(monkeypatch) -> Non
 
     assert result.status == 404
     assert orjson.loads(result.body) == {"error": {"code": "resource_not_found", "message": "Resource not found."}}
+
+
+@pytest.mark.asyncio
+async def test_missing_detail_capability_stops_before_service_or_sql(monkeypatch) -> None:
+    _install_keyring(monkeypatch)
+
+    class ForbiddenService:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("missing capability reached service construction")
+
+    monkeypatch.setattr(http, "CustomImportReadService", ForbiddenService)
+
+    class NoSqlSession:
+        async def execute(self, _statement):
+            raise AssertionError("missing capability reached SQL")
+
+    result = await http.serve_custom_import_detail(
+        _Request(
+            _DETAIL_BODY,
+            _resigned_headers(
+                body=_DETAIL_BODY,
+                path=http.CUSTOM_IMPORT_DETAIL_PATH,
+                capability="other:capability",
+            ),
+            path=http.CUSTOM_IMPORT_DETAIL_PATH,
+        ),
+        NoSqlSession(),
+    )
+
+    assert result.status == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_entitlement", (None, False, "root_fields"))
+async def test_detail_requires_full_family_entitlement_before_service_or_sql(monkeypatch, family_entitlement) -> None:
+    _install_keyring(monkeypatch)
+
+    class ForbiddenService:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("detail entitlement reached service construction")
+
+    class NoSqlSession:
+        calls = 0
+
+        async def execute(self, _statement):
+            self.calls += 1
+            raise AssertionError("detail entitlement reached SQL")
+
+    document = {"entity": {"adapter_id": "synthetic", "value": "binding-synthetic"}, "target": _TARGET}
+    if family_entitlement is not None:
+        document["family_entitlement"] = family_entitlement
+    body = http._canonical_json_bytes(document)
+    session = NoSqlSession()
+    monkeypatch.setattr(http, "CustomImportReadService", ForbiddenService)
+
+    result = await http.serve_custom_import_detail(
+        _Request(body, _headers(body=body, path=http.CUSTOM_IMPORT_DETAIL_PATH), path=http.CUSTOM_IMPORT_DETAIL_PATH),
+        session,
+    )
+
+    assert result.status == 404
+    assert session.calls == 0
 
 
 @pytest.mark.asyncio
@@ -724,6 +933,32 @@ async def test_oversized_response_fails_closed(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_absent_detail_root_fails_closed(monkeypatch) -> None:
+    _install_keyring(monkeypatch)
+
+    class AbsentRootService(_Service):
+        async def root_detail_for_entity(self, _session, *, authorization, request):
+            del authorization, request
+            raise http.CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+
+    monkeypatch.setattr(http, "CustomImportReadService", AbsentRootService)
+    monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
+    result = await http.serve_custom_import_detail(
+        _Request(
+            _DETAIL_BODY,
+            _headers(body=_DETAIL_BODY, path=http.CUSTOM_IMPORT_DETAIL_PATH),
+            path=http.CUSTOM_IMPORT_DETAIL_PATH,
+        ),
+        object(),
+    )
+
+    assert result.status == 503
+    assert orjson.loads(result.body) == {
+        "error": {"code": "custom_import_read_unavailable", "message": "Custom import read is temporarily unavailable."}
+    }
+
+
+@pytest.mark.asyncio
 async def test_endpoint_forwards_request_session(monkeypatch) -> None:
     session = object()
     request = SimpleNamespace(ctx=SimpleNamespace(sa_session=session))
@@ -830,6 +1065,32 @@ def test_transport_target_mismatch_is_rejected() -> None:
         http._verify_transport(
             headers=context_headers,
             body=_BODY,
+            request=request,
+            trusted_now=_NOW,
+            keyring=keyring,
+        )
+
+
+def test_detail_transport_requires_its_exact_signed_path_and_target() -> None:
+    request = http._parse_detail_request(_DETAIL_BODY)
+    headers = _headers(body=_DETAIL_BODY, path=http.CUSTOM_IMPORT_DETAIL_PATH)
+    keyring = http._load_keyring(_keyring_document())
+
+    assert (
+        http._verify_transport(
+            headers=headers,
+            body=_DETAIL_BODY,
+            request=request,
+            trusted_now=_NOW,
+            keyring=keyring,
+            path=http.CUSTOM_IMPORT_DETAIL_PATH,
+        ).target
+        == request.target
+    )
+    with pytest.raises(http.CustomImportReadTransportError):
+        http._verify_transport(
+            headers=headers,
+            body=_DETAIL_BODY,
             request=request,
             trusted_now=_NOW,
             keyring=keyring,
