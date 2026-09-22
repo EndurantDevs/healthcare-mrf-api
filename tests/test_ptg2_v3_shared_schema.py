@@ -151,7 +151,7 @@ def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["20260921000000_provider_quality_result_generation"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["20260922000000_custom_import_durable_parquet_capture"]
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

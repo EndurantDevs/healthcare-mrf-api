@@ -106,7 +106,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def test_factorized_projection_precedes_the_unique_repository_head() -> None:
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20260921000000_provider_quality_result_generation"]
+    assert script.get_heads() == ["20260922000000_custom_import_durable_parquet_capture"]
     factorized = script.get_revision("20260828120000_plan_pricing_factorized_projection")
     assert factorized.down_revision == ("20260829100000_activate_import_run_idempotency_scope")
     assert (
