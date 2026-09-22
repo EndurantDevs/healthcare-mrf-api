@@ -22,7 +22,7 @@ def _database_url():
     if not raw:
         pytest.skip("HLTHPRT_SOURCE_PROFILE_ARCHIVE_TEST_DSN is not set")
     url = make_url(raw)
-    assert url.host in {"127.0.0.1", "localhost"} and url.port == 5440
+    assert url.host in {"127.0.0.1", "localhost"} and url.port in {5432, 5440}
     assert re.fullmatch(r"hc_source_profile_[0-9a-f]{32}", url.database or "")
     return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 

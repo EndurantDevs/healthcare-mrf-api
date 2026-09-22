@@ -23,10 +23,18 @@ _EXPECTED_INDEX_NAMES = {
 
 async def _index_names(session, schema_name):
     rows = await session.execute(
-        text("SELECT indexname FROM pg_indexes WHERE schemaname=:schema AND tablename='geo_zip_lookup'"),
+        text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname=:schema AND tablename='geo_zip_lookup'"),
         {"schema": schema_name},
     )
-    return {row[0] for row in rows.all()}
+    index_rows = rows.all()
+    assert {(row[1].split(" USING ", 1)[1], row[1].startswith("CREATE UNIQUE INDEX ")) for row in index_rows} == {
+        ("btree (zip_code)", True),
+        ("btree (state)", False),
+        ("btree (city_lower, state)", False),
+        ("btree (city_lower)", False),
+        ("btree (latitude, longitude)", False),
+    }
+    return {row[0] for row in index_rows}
 
 
 async def _prepare_geo_candidate(sessions, live_schema, dataset_id):
@@ -51,7 +59,12 @@ async def _prepare_geo_candidate(sessions, live_schema, dataset_id):
         )
         await archive.complete_reference_family_restore(session, stage_ownership)
         stage_index_names = await _index_names(session, stage_schema)
-        assert stage_index_names == _EXPECTED_INDEX_NAMES
+        assert stage_index_names == {
+            name
+            if name == "geo_zip_lookup_pkey"
+            else archive._index_name_for_table("geo_zip_lookup", f"{stage_schema}_{name}")
+            for name in _EXPECTED_INDEX_NAMES
+        }
         await session.execute(text(f"UPDATE \"{live_schema}\".geo_zip_lookup SET city = 'Old City'"))
         initial_authority = await generation.publish_local_reference_family_generation(
             session, importer_id="geo", schema_name=live_schema
