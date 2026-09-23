@@ -157,11 +157,12 @@ async def test_two_ordinary_publishers_do_not_deadlock_on_lock_upgrade():
 @pytest.mark.asyncio
 async def test_worker_swap_failure_rolls_back_resolver_and_geocode(monkeypatch):
     """The actual finalizer binds both address effects and family DDL to one transaction."""
-    database_name = make_url(_dsn()).database
+    test_dsn = make_url(_dsn())
+    database_name = test_dsn.database
     schema = f"facility_worker_{uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_DATABASE", database_name)
     monkeypatch.setenv("HLTHPRT_DB_HOST", "127.0.0.1")
-    monkeypatch.setenv("HLTHPRT_DB_PORT", "5440")
+    monkeypatch.setenv("HLTHPRT_DB_PORT", str(test_dsn.port))
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.setattr(anchors, "DEFAULT_MIN_ROWS", 0)
     monkeypatch.setattr(anchors, "DEFAULT_MIN_HOSPITAL_COORD_COVERAGE", 0.0)
