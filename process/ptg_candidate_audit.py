@@ -1388,6 +1388,7 @@ def _audit_only_result(
         "storage_generation": candidate_audit_target.storage_generation,
         "snapshot_status": "validated",
         "activation_status": "deferred",
+        "source_key": candidate_audit_target.source_key,
         "snapshot_id": candidate_audit_target.snapshot_id,
         "candidate_snapshot_id": candidate_audit_target.snapshot_id,
         "import_run_id": candidate_audit_target.candidate_run_id,
