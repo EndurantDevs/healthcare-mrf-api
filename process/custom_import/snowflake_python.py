@@ -16,6 +16,7 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
 
+from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
 from process.custom_import.snowflake import (
     MAX_RESULT_PARTITION_BYTES,
     SnowflakeConnectorError,
@@ -24,6 +25,18 @@ from process.custom_import.snowflake import (
     SnowflakeParquetResult,
     SnowflakeReadStatement,
     SnowflakeResultColumn,
+)
+from process.custom_import.snowflake_bundle import (
+    _BUNDLE_ROW_KIND_COLUMN,
+    _DATA_ROW_KIND,
+    _METADATA_ROW_KIND,
+    _SOURCE_SNAPSHOT_TOKEN_COLUMN,
+    _STREAM_ID_COLUMN,
+    _STREAM_ORDINAL_COLUMN,
+    SnowflakeBundleResult,
+    SnowflakeBundleStatement,
+    SnowflakeBundleStreamMetadata,
+    SnowflakeBundleStreamResult,
 )
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
@@ -50,7 +63,7 @@ class SnowflakePythonConnectorAdapter:
         statement: SnowflakeReadStatement,
         credentials: SnowflakeKeyPairCredentials,
     ) -> SnowflakeParquetResult:
-        """Execute exactly one generated statement and retain its query identity."""
+        """Execute one generated single-stream statement and retain its query identity."""
 
         if not isinstance(statement, SnowflakeReadStatement):
             raise SnowflakeConnectorError("runtime adapter requires a generated Snowflake statement")
@@ -59,38 +72,21 @@ class SnowflakePythonConnectorAdapter:
         connection = None
         cursor = None
         try:
-            connection = snowflake.connector.connect(
-                account=credentials.account,
-                user=credentials.user,
-                authenticator="SNOWFLAKE_JWT",
-                private_key=_private_key_der(credentials),
-                role=self._role,
-                warehouse=self._warehouse,
-                autocommit=False,
-                client_session_keep_alive=False,
-                login_timeout=_LOGIN_TIMEOUT_SECONDS,
-                network_timeout=_NETWORK_TIMEOUT_SECONDS,
-                socket_timeout=_NETWORK_TIMEOUT_SECONDS,
-                session_parameters={
-                    "QUERY_TAG": _QUERY_TAG,
-                    "STATEMENT_TIMEOUT_IN_SECONDS": _STATEMENT_TIMEOUT_SECONDS,
-                },
-            )
+            connection = self._connect(credentials)
             cursor = connection.cursor()
             cursor.execute(statement.sql)
             query_id = getattr(cursor, "sfqid", None)
             if not isinstance(query_id, str) or not query_id.strip():
                 raise SnowflakeConnectorError("Snowflake did not return a statement identity")
             result_schema = _result_schema(statement, cursor.description)
-            partition_sources = _SnowflakeParquetPartitionSources(
-                connection=connection,
-                cursor=cursor,
-                result_schema=result_schema,
-            )
             parquet_result = SnowflakeParquetResult(
                 source_snapshot_token=f"snowflake-query:{query_id}",
                 schema=result_schema,
-                partition_sources=partition_sources,
+                partition_sources=_SnowflakeParquetPartitionSources(
+                    connection=connection,
+                    cursor=cursor,
+                    result_schema=result_schema,
+                ),
             )
             connection = None
             cursor = None
@@ -104,6 +100,83 @@ class SnowflakePythonConnectorAdapter:
         except BaseException:
             _best_effort_close(cursor, connection)
             raise
+
+    def fetch_bundle(
+        self,
+        statement: SnowflakeBundleStatement,
+        credentials: SnowflakeKeyPairCredentials,
+    ) -> SnowflakeBundleResult:
+        """Execute one generated bundle statement with one shared query receipt."""
+
+        if not isinstance(statement, SnowflakeBundleStatement):
+            raise SnowflakeConnectorError("runtime adapter requires a generated Snowflake bundle statement")
+        if not isinstance(credentials, SnowflakeKeyPairCredentials):
+            raise SnowflakeCredentialError("runtime adapter requires key-pair credentials")
+        connection = None
+        cursor = None
+        try:
+            connection = self._connect(credentials)
+            cursor = connection.cursor()
+            cursor.execute(statement.sql)
+            query_id = getattr(cursor, "sfqid", None)
+            if not isinstance(query_id, str) or not query_id.strip():
+                raise SnowflakeConnectorError("Snowflake did not return a statement identity")
+            schemas = _bundle_result_schemas(statement, cursor.description)
+            metadata, source_snapshot_token, pending_row = _bundle_stream_metadata(statement, cursor)
+            partition_sources = _SnowflakeBundlePartitionSources(
+                connection=connection,
+                cursor=cursor,
+                statement=statement,
+                schemas=schemas,
+                pending_row=pending_row,
+            )
+            bundle_result = SnowflakeBundleResult(
+                stream_results=tuple(
+                    SnowflakeBundleStreamResult(
+                        metadata=stream_metadata,
+                        parquet_result=SnowflakeParquetResult(
+                            source_snapshot_token=source_snapshot_token,
+                            schema=schema,
+                            partition_sources=partition_sources.stream_sources(index),
+                        ),
+                    )
+                    for index, (stream_metadata, schema) in enumerate(zip(metadata, schemas, strict=True))
+                ),
+                query_id=query_id,
+            )
+            connection = None
+            cursor = None
+            return bundle_result
+        except SnowflakeConnectorError:
+            _best_effort_close(cursor, connection)
+            raise
+        except Exception as exc:
+            _best_effort_close(cursor, connection)
+            raise SnowflakeConnectorError("Snowflake bundle read failed") from exc
+        except BaseException:
+            _best_effort_close(cursor, connection)
+            raise
+
+    def _connect(self, credentials: SnowflakeKeyPairCredentials) -> Any:
+        """Open the fixed policy connection for bundle reads."""
+
+        return snowflake.connector.connect(
+            account=credentials.account,
+            user=credentials.user,
+            authenticator="SNOWFLAKE_JWT",
+            private_key=_private_key_der(credentials),
+            role=self._role,
+            warehouse=self._warehouse,
+            autocommit=False,
+            client_session_keep_alive=False,
+            login_timeout=_LOGIN_TIMEOUT_SECONDS,
+            network_timeout=_NETWORK_TIMEOUT_SECONDS,
+            socket_timeout=_NETWORK_TIMEOUT_SECONDS,
+            session_parameters={
+                "QUERY_TAG": _QUERY_TAG,
+                "STATEMENT_TIMEOUT_IN_SECONDS": _STATEMENT_TIMEOUT_SECONDS,
+            },
+        )
 
 
 class _SnowflakeParquetPartitionSources:
@@ -193,6 +266,258 @@ class _SnowflakeParquetPartitionSources:
         self._cursor = None
         self._connection = None
         _close_resources(cursor, connection)
+
+
+def _bundle_result_schemas(
+    statement: SnowflakeBundleStatement,
+    description: object,
+) -> tuple[tuple[SnowflakeResultColumn, ...], ...]:
+    """Split the one union result schema back into declared stream schemas."""
+
+    fields = tuple(sorted(statement.request.definition.fields, key=lambda field: field.field_slot))
+    expected_labels = (
+        _BUNDLE_ROW_KIND_COLUMN,
+        _STREAM_ORDINAL_COLUMN,
+        _STREAM_ID_COLUMN,
+        _SOURCE_SNAPSHOT_TOKEN_COLUMN,
+        *(field.field_id for field in fields),
+    )
+    if not isinstance(description, Sequence) or len(description) != len(expected_labels):
+        raise SnowflakeConnectorError("Snowflake bundle result schema does not match the selected fields")
+    if tuple(getattr(metadata, "name", None) for metadata in description) != expected_labels:
+        raise SnowflakeConnectorError("Snowflake bundle result schema does not match the selected fields")
+    row_kind_type = _source_type(description[0])
+    if _fixed_type_parts(row_kind_type)[1] != 0 or _is_nullable(description[0]):
+        raise SnowflakeConnectorError("Snowflake bundle discriminator schema is invalid")
+    ordinal_type = _source_type(description[1])
+    if _fixed_type_parts(ordinal_type)[1] != 0 or _is_nullable(description[1]):
+        raise SnowflakeConnectorError("Snowflake bundle discriminator schema is invalid")
+    if _source_type(description[2]) != "TEXT" or _is_nullable(description[2]):
+        raise SnowflakeConnectorError("Snowflake bundle discriminator schema is invalid")
+    if _source_type(description[3]) != "TEXT":
+        raise SnowflakeConnectorError("Snowflake bundle snapshot metadata schema is invalid")
+    columns_by_field = {
+        field.field_id: SnowflakeResultColumn(
+            field_id=field.field_id,
+            source_type=_source_type(metadata),
+            nullable=_is_nullable(metadata),
+        )
+        for field, metadata in zip(fields, description[4:], strict=True)
+    }
+    return tuple(
+        tuple(columns_by_field[column.field_id] for column in selected_columns)
+        for selected_columns in statement.selected_columns_by_stream
+    )
+
+
+def _bundle_stream_metadata(
+    statement: SnowflakeBundleStatement,
+    cursor: Any,
+) -> tuple[tuple[SnowflakeBundleStreamMetadata, ...], str, Sequence[object] | None]:
+    """Read exactly one configured semantic-token observation before bundle rows."""
+
+    expected_row_length = len(statement.request.definition.fields) + 4
+    stream_metadata_items = []
+    for ordinal, binding in enumerate(statement.request.bindings, start=1):
+        result_row = cursor.fetchone()
+        if result_row is None:
+            raise SnowflakeConnectorError("Snowflake bundle metadata observations are incomplete")
+        if (
+            isinstance(result_row, (str, bytes, bytearray, memoryview))
+            or not isinstance(result_row, Sequence)
+            or len(result_row) != expected_row_length
+            or _bundle_row_kind(result_row) != _METADATA_ROW_KIND
+            or result_row[1] != ordinal
+            or result_row[2] != binding.stream_id
+            or any(metadata_value is not None for metadata_value in result_row[4:])
+        ):
+            raise SnowflakeConnectorError("Snowflake bundle metadata row does not match the generated statement")
+        stream_metadata_items.append(
+            SnowflakeBundleStreamMetadata(
+                stream_id=binding.stream_id,
+                semantic_token_metadata_key=binding.semantic_token_metadata_key,
+                source_snapshot_tokens=(result_row[3],),
+            )
+        )
+    pending_row = cursor.fetchone()
+    if pending_row is not None and _bundle_row_kind(pending_row) != _DATA_ROW_KIND:
+        raise SnowflakeConnectorError("Snowflake bundle metadata observations are not exactly one per stream")
+    try:
+        source_snapshot_token = validate_source_snapshot_tokens(
+            statement.request.definition,
+            {metadata_item.stream_id: metadata_item.source_snapshot_tokens for metadata_item in stream_metadata_items},
+        )
+    except SourceSnapshotError as exc:
+        raise SnowflakeConnectorError("Snowflake bundle streams require one shared semantic snapshot token") from exc
+    return tuple(stream_metadata_items), source_snapshot_token, pending_row
+
+
+def _bundle_row_kind(result_row: Sequence[object]) -> int:
+    value = result_row[0]
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {_METADATA_ROW_KIND, _DATA_ROW_KIND}:
+        raise SnowflakeConnectorError("Snowflake bundle row kind is invalid")
+    return value
+
+
+class _SnowflakeBundlePartitionSources:
+    """One cursor split into ordered stream readers without another source read."""
+
+    def __init__(
+        self,
+        *,
+        connection: Any,
+        cursor: Any,
+        statement: SnowflakeBundleStatement,
+        schemas: tuple[tuple[SnowflakeResultColumn, ...], ...],
+        pending_row: Sequence[object] | None,
+    ) -> None:
+        self._connection = connection
+        self._cursor = cursor
+        self._schemas = schemas
+        self._stream_ids = tuple(binding.stream_id for binding in statement.request.bindings)
+        fields = tuple(sorted(statement.request.definition.fields, key=lambda field: field.field_slot))
+        output_index_by_field = {field.field_id: index for index, field in enumerate(fields, start=4)}
+        self._field_indexes_by_stream = tuple(
+            tuple(output_index_by_field[column.field_id] for column in selected_columns)
+            for selected_columns in statement.selected_columns_by_stream
+        )
+        self._partition_rows = statement.request.encoding.partition_rows
+        self._expected_row_length = len(fields) + 4
+        self._next_stream_index = 0
+        self._pending_row = pending_row
+        self._closed_stream_indexes: set[int] = set()
+        self._closed = False
+        self._stream_sources = tuple(
+            _SnowflakeBundleStreamPartitionSources(self, stream_index) for stream_index in range(len(self._stream_ids))
+        )
+
+    def stream_sources(self, stream_index: int) -> _SnowflakeBundleStreamPartitionSources:
+        """Return the one ordered source collection for a configured stream."""
+
+        return self._stream_sources[stream_index]
+
+    def next_partition_rows(self, stream_index: int) -> tuple[list[Sequence[object]], bool]:
+        """Return the next deterministic partition for one configured stream."""
+
+        if self._closed:
+            raise SnowflakeConnectorError("Snowflake bundle result is closed")
+        if stream_index != self._next_stream_index:
+            raise SnowflakeConnectorError("Snowflake bundle streams must be consumed in configured order")
+        partition_rows: list[Sequence[object]] = []
+        variable_bytes = 0
+        expected_ordinal = stream_index + 1
+        while len(partition_rows) < self._partition_rows:
+            result_row = self._pending_row
+            if result_row is None:
+                result_row = self._cursor.fetchone()
+            else:
+                self._pending_row = None
+            if result_row is None:
+                return partition_rows, True
+            ordinal, selected_values = self._split_row(result_row, stream_index)
+            if ordinal > expected_ordinal:
+                self._pending_row = result_row
+                return partition_rows, True
+            if ordinal < expected_ordinal:
+                raise SnowflakeConnectorError("Snowflake bundle result rows are not ordered by stream")
+            schema = self._schemas[stream_index]
+            row_variable_bytes = _result_row_variable_bytes(selected_values, schema)
+            decoded_bytes = variable_bytes + row_variable_bytes + _fixed_batch_bytes(schema, len(partition_rows) + 1)
+            if decoded_bytes > MAX_RESULT_PARTITION_BYTES:
+                if not partition_rows:
+                    raise SnowflakeConnectorError("Snowflake bundle result batch exceeds the decoded-byte limit")
+                self._pending_row = result_row
+                return partition_rows, False
+            partition_rows.append(selected_values)
+            variable_bytes += row_variable_bytes
+        return partition_rows, False
+
+    def finish_stream(self, stream_index: int) -> None:
+        """Advance only after this stream's final partition has been yielded."""
+
+        if self._closed or stream_index != self._next_stream_index:
+            raise SnowflakeConnectorError("Snowflake bundle streams are not contiguous")
+        self._next_stream_index += 1
+
+    def close_stream(self, stream_index: int) -> None:
+        """Release one stream and close the shared cursor after the final release."""
+
+        self._closed_stream_indexes.add(stream_index)
+        if len(self._closed_stream_indexes) == len(self._stream_ids):
+            self.close()
+
+    def close(self) -> None:
+        """Close the sole cursor and connection once every stream is released."""
+
+        if self._closed:
+            return
+        self._closed = True
+        cursor, connection = self._cursor, self._connection
+        self._cursor = None
+        self._connection = None
+        _close_resources(cursor, connection)
+
+    def _split_row(self, result_row: object, stream_index: int) -> tuple[int, Sequence[object]]:
+        if isinstance(result_row, (str, bytes, bytearray, memoryview)) or not isinstance(result_row, Sequence):
+            raise SnowflakeConnectorError("Snowflake bundle result row does not match the generated statement")
+        if len(result_row) != self._expected_row_length:
+            raise SnowflakeConnectorError("Snowflake bundle result row does not match the generated statement")
+        if _bundle_row_kind(result_row) != _DATA_ROW_KIND:
+            raise SnowflakeConnectorError("Snowflake bundle data row does not match the generated statement")
+        ordinal = result_row[1]
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or not 1 <= ordinal <= len(self._stream_ids):
+            raise SnowflakeConnectorError("Snowflake bundle stream ordinal is invalid")
+        if result_row[2] != self._stream_ids[ordinal - 1] or result_row[3] is not None:
+            raise SnowflakeConnectorError("Snowflake bundle stream identity is invalid")
+        return ordinal, tuple(result_row[index] for index in self._field_indexes_by_stream[stream_index])
+
+
+class _SnowflakeBundleStreamPartitionSources:
+    """The single-use source set exposed for one stream of a shared cursor."""
+
+    def __init__(self, owner: _SnowflakeBundlePartitionSources, stream_index: int) -> None:
+        self._owner = owner
+        self._stream_index = stream_index
+        self._started = False
+        self._closed = False
+
+    def __iter__(self) -> Iterator[BinaryIO]:
+        if self._started:
+            raise SnowflakeConnectorError("Snowflake bundle stream batches were already consumed")
+        self._started = True
+        has_emitted_partition = False
+        has_primary_failure = False
+        try:
+            while True:
+                partition_rows, is_complete = self._owner.next_partition_rows(self._stream_index)
+                if partition_rows:
+                    has_emitted_partition = True
+                    yield _parquet_reader(partition_rows, self._owner._schemas[self._stream_index])
+                if is_complete:
+                    if not has_emitted_partition:
+                        yield _parquet_reader((), self._owner._schemas[self._stream_index])
+                    self._owner.finish_stream(self._stream_index)
+                    return
+        except SnowflakeConnectorError:
+            has_primary_failure = True
+            raise
+        except Exception as exc:
+            has_primary_failure = True
+            raise SnowflakeConnectorError("Snowflake bundle result fetch failed") from exc
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if has_primary_failure:
+                _best_effort_close(self._owner)
+
+    def close(self) -> None:
+        """Release this stream's share of the one underlying cursor."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._owner.close_stream(self._stream_index)
 
 
 def _identifier(value: object, label: str) -> str:
@@ -346,7 +671,7 @@ def _arrow_fixed_bytes(source_type: str, row_count: int) -> int:
         return null_bitmap_bytes + 4 * (row_count + 1)
     if source_type == "BOOLEAN":
         return 2 * null_bitmap_bytes
-    if _fixed_type_parts(source_type)[1] == 0:
+    if not _uses_decimal_storage(source_type):
         return null_bitmap_bytes + 8 * row_count
     return null_bitmap_bytes + 16 * row_count
 
@@ -368,8 +693,7 @@ def _variable_scalar_bytes(scalar_value: object, result_column: SnowflakeResultC
         if not isinstance(scalar_value, bool):
             raise SnowflakeConnectorError("Snowflake BOOLEAN result value is invalid")
         return 0
-    _, scale = _fixed_type_parts(source_type)
-    if scale == 0:
+    if not _uses_decimal_storage(source_type):
         if (
             isinstance(scalar_value, bool)
             or not isinstance(scalar_value, int)
@@ -388,9 +712,16 @@ def _arrow_type(result_column: SnowflakeResultColumn) -> pa.DataType:
     if result_column.source_type == "BOOLEAN":
         return pa.bool_()
     precision, scale = _fixed_type_parts(result_column.source_type)
-    if scale == 0:
+    if not _uses_decimal_storage(result_column.source_type):
         return pa.int64()
     return pa.decimal128(precision, scale)
+
+
+def _uses_decimal_storage(source_type: str) -> bool:
+    if source_type in {"TEXT", "BOOLEAN"}:
+        return False
+    precision, scale = _fixed_type_parts(source_type)
+    return scale != 0 or precision > 18
 
 
 def _fixed_type_parts(source_type: str) -> tuple[int, int]:

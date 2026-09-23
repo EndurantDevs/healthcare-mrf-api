@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -17,9 +20,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import process.custom_import.runner as runner
 import process.custom_import.runner_graph as runner_graph
+import process.custom_import.snowflake_candidate as snowflake_candidate
 from db.models.custom_import import (
     CustomImportCapture,
     CustomImportCaptureBundle,
+    CustomImportCaptureParquetPart,
     CustomImportChildCollection,
     CustomImportChildRevision,
     CustomImportChildScalar,
@@ -47,12 +52,33 @@ from db.models.custom_import import (
     CustomImportWinner,
 )
 from process.custom_import import snowflake
+from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
-from process.custom_import.execution import claim_execution, create_execution, request_cancellation
+from process.custom_import.execution import (
+    IdempotencyConflict,
+    claim_execution,
+    create_execution,
+    finish_execution,
+    request_cancellation,
+    reserve_execution,
+)
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner import CandidateRunnerError, CandidateRunRequest, CandidateRunResult, run_candidate
 from process.custom_import.runner_codec import child_key_hash, new_family_hash
-from process.custom_import.snowflake_candidate import SnowflakeCandidateRequest, run_snowflake_candidate
+from process.custom_import.snowflake_bundle import (
+    SnowflakeBundleAcquisition,
+    SnowflakeBundleAcquisitionConnector,
+    SnowflakeBundleBinding,
+    SnowflakeBundleRequest,
+    SnowflakeBundleStatement,
+    SnowflakeBundleStreamCapture,
+)
+from process.custom_import.snowflake_candidate import (
+    SnowflakeBundleCandidateRequest,
+    SnowflakeCandidateRequest,
+    run_snowflake_bundle_candidate,
+    run_snowflake_candidate,
+)
 from process.custom_import.snowflake_python import _parquet_reader
 from tests.custom_import_postgres_support import digest, isolated_publication_case
 
@@ -89,6 +115,211 @@ def _snowflake_definition() -> CustomImportDefinition:
     document["query"] = {"root_fields": ["npi", "display_name"], "order": []}
     document["selection_profiles"] = []
     return CustomImportDefinition.from_mapping(document)
+
+
+def _snowflake_bundle_definition() -> CustomImportDefinition:
+    document = json.loads(_FIXTURE.read_text())
+    document["refresh_mode"] = "snapshot"
+    for stream in document["streams"]:
+        stream.update(format="parquet", compression="none", snapshot_token="source_snapshot")
+    document["aliases"] = {
+        "providers": {"NPI": "npi", "DISPLAY_NAME": "display_name"},
+        "rates": {"RATE_NPI": "rate_npi", "SERVICE_CODE": "service_code", "AMOUNT": "amount"},
+    }
+    return CustomImportDefinition.from_mapping(document)
+
+
+def _snowflake_bundle_statement(definition: CustomImportDefinition) -> SnowflakeBundleStatement:
+    snapshot_relation = snowflake.SnowflakeRelation(database="synthetic", schema="public", name="snapshots")
+    root_relation = snowflake.SnowflakeRelation(database="synthetic", schema="public", name="providers")
+    child_relation = snowflake.SnowflakeRelation(database="synthetic", schema="public", name="rates")
+    snapshot_column = snowflake.SnowflakeDeclaredColumn(field_id="source_snapshot", column_identifier="snapshot_token")
+    root_columns = (
+        snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="NPI"),
+        snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="DISPLAY_NAME"),
+    )
+    child_columns = (
+        snowflake.SnowflakeDeclaredColumn(field_id="rate_npi", column_identifier="RATE_NPI"),
+        snowflake.SnowflakeDeclaredColumn(field_id="service_code", column_identifier="SERVICE_CODE"),
+        snowflake.SnowflakeDeclaredColumn(field_id="amount", column_identifier="AMOUNT"),
+    )
+    request = SnowflakeBundleRequest(
+        definition=definition,
+        bindings=(
+            SnowflakeBundleBinding(
+                stream_id="providers",
+                relation=root_relation,
+                source_snapshot_token_relation=snapshot_relation,
+                selected_field_ids=("npi", "display_name"),
+                semantic_token_metadata_key="source_snapshot",
+            ),
+            SnowflakeBundleBinding(
+                stream_id="rates",
+                relation=child_relation,
+                source_snapshot_token_relation=snapshot_relation,
+                selected_field_ids=("rate_npi", "service_code", "amount"),
+                semantic_token_metadata_key="source_snapshot",
+            ),
+        ),
+    )
+    return SnowflakeBundleStatement(
+        request=request,
+        selected_columns_by_stream=(root_columns, child_columns),
+        source_snapshot_token_columns_by_stream=(snapshot_column, snapshot_column),
+    )
+
+
+def _snowflake_bundle_acquisition(
+    definition: CustomImportDefinition,
+    *,
+    root_rows: tuple[tuple[object, object], ...] = (("1234567893", "Synthetic Bundle"),),
+    child_rows: tuple[tuple[object, object, object], ...] = (("1234567893", "SYNTHETIC", Decimal("12.50")),),
+    snapshot_token: str = "synthetic-snowflake-bundle",
+    amount_source_type: str = "FIXED(30,12)",
+) -> SnowflakeBundleAcquisition:
+    statement = _snowflake_bundle_statement(definition)
+    root_schema = (
+        snowflake.SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="display_name", source_type="TEXT", nullable=False),
+    )
+    child_schema = (
+        snowflake.SnowflakeResultColumn(field_id="rate_npi", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="service_code", source_type="TEXT", nullable=False),
+        snowflake.SnowflakeResultColumn(field_id="amount", source_type=amount_source_type, nullable=True),
+    )
+    root_stream, child_stream = definition.source_streams
+    root_capture = capture_stream(
+        BytesIO(_parquet_reader(root_rows, root_schema).getvalue()),
+        root_stream,
+        source_snapshot_token=snapshot_token,
+        limits=snowflake.DEFAULT_CAPTURE_LIMITS,
+    )
+    child_capture = capture_stream(
+        BytesIO(_parquet_reader(child_rows, child_schema).getvalue()),
+        child_stream,
+        source_snapshot_token=snapshot_token,
+        limits=snowflake.DEFAULT_CAPTURE_LIMITS,
+    )
+    return SnowflakeBundleAcquisition(
+        statement=statement,
+        source_snapshot_token=snapshot_token,
+        stream_captures=(
+            SnowflakeBundleStreamCapture(
+                stream_id=root_stream.stream_id,
+                schema=root_schema,
+                captures=(root_capture,),
+            ),
+            SnowflakeBundleStreamCapture(
+                stream_id=child_stream.stream_id,
+                schema=child_schema,
+                captures=(child_capture,),
+            ),
+        ),
+        capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS,
+    )
+
+
+class _ClosedBundleAcquirer:
+    def __init__(self, acquisition: SnowflakeBundleAcquisition) -> None:
+        self._acquisition = acquisition
+        self.calls = 0
+        self.source_closed = False
+
+    def build_statement(self, request: SnowflakeBundleRequest) -> SnowflakeBundleStatement:
+        assert request == self._acquisition.statement.request
+        return self._acquisition.statement
+
+    def acquire(
+        self,
+        request: SnowflakeBundleRequest,
+        *,
+        prepared_statement: SnowflakeBundleStatement,
+    ) -> SnowflakeBundleAcquisition:
+        assert request == self._acquisition.statement.request
+        assert prepared_statement == self._acquisition.statement
+        self.calls += 1
+        self.source_closed = True
+        return self._acquisition
+
+
+class _PreparedStatementOnlyAcquirer:
+    """A preflight-only connector proving conflicts stop before source work."""
+
+    def __init__(self, statement: SnowflakeBundleStatement) -> None:
+        self._statement = statement
+        self.acquire_calls = 0
+
+    def build_statement(self, request: SnowflakeBundleRequest) -> SnowflakeBundleStatement:
+        assert request == self._statement.request
+        return self._statement
+
+    def acquire(
+        self,
+        _request: SnowflakeBundleRequest,
+        *,
+        prepared_statement: SnowflakeBundleStatement,
+    ) -> SnowflakeBundleAcquisition:
+        assert prepared_statement == self._statement
+        self.acquire_calls += 1
+        raise AssertionError("an idempotency conflict must stop before source acquisition")
+
+
+def _physical_mapping_drift_statement(definition: CustomImportDefinition) -> SnowflakeBundleStatement:
+    """Keep logical request inputs fixed while changing one approved physical column."""
+
+    statement = _snowflake_bundle_statement(definition)
+    request = statement.request
+    snapshot_relation = request.bindings[0].source_snapshot_token_relation
+    connector = SnowflakeBundleAcquisitionConnector(
+        approved_relations=(
+            snowflake.SnowflakeApprovedRelation(
+                relation=snapshot_relation,
+                columns=(
+                    snowflake.SnowflakeDeclaredColumn(
+                        field_id="source_snapshot",
+                        column_identifier="SNAPSHOT_TOKEN_RENAMED",
+                    ),
+                ),
+            ),
+            snowflake.SnowflakeApprovedRelation(
+                relation=request.bindings[0].relation,
+                columns=statement.selected_columns_by_stream[0],
+            ),
+            snowflake.SnowflakeApprovedRelation(
+                relation=request.bindings[1].relation,
+                columns=statement.selected_columns_by_stream[1],
+            ),
+        ),
+        credential_provider=SimpleNamespace(load_key_pair=lambda: None),
+        adapter=SimpleNamespace(fetch_bundle=lambda *_arguments: None),
+    )
+    return connector.build_statement(request)
+
+
+def _snowflake_bundle_candidate_request(
+    seed: _Seed,
+    *,
+    suffix: str,
+    root_rows: tuple[tuple[object, object], ...],
+    child_rows: tuple[tuple[object, object, object], ...],
+    amount_source_type: str = "FIXED(30,12)",
+) -> tuple[_ClosedBundleAcquirer, SnowflakeBundleCandidateRequest]:
+    acquisition = _snowflake_bundle_acquisition(
+        seed.definition,
+        root_rows=root_rows,
+        child_rows=child_rows,
+        snapshot_token=f"synthetic-snowflake-{suffix}",
+        amount_source_type=amount_source_type,
+    )
+    return _ClosedBundleAcquirer(acquisition), SnowflakeBundleCandidateRequest(
+        dataset_id=seed.dataset_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        definition=seed.definition,
+        bundle_request=acquisition.statement.request,
+        idempotency_key=f"synthetic-snowflake-family-{suffix}",
+        lease_token=f"synthetic-snowflake-family-{suffix}-lease",
+    )
 
 
 class _SnowflakePartitionSources:
@@ -135,84 +366,6 @@ def _snowflake_acquisition(
         return snowflake._seal_acquisition(statement, result, capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS)
     finally:
         result.close()
-
-
-def _snowflake_family_definition() -> CustomImportDefinition:
-    document = json.loads(_FIXTURE.read_text())
-    document["refresh_mode"] = "snapshot"
-    for stream in document["streams"]:
-        stream.update(format="parquet", compression="none", snapshot_token="source_snapshot")
-    document["aliases"] = {
-        "providers": {"NPI": "npi", "DISPLAY_NAME": "display_name"},
-        "rates": {"RATE_NPI": "rate_npi", "SERVICE_CODE": "service_code", "AMOUNT": "amount"},
-    }
-    return CustomImportDefinition.from_mapping(document)
-
-
-def _snowflake_child_acquisition(
-    definition: CustomImportDefinition,
-    *,
-    child_rows: tuple[tuple[object, object, object], ...] = (("1234567893", "SYNTHETIC", Decimal("12.50")),),
-    snapshot_token: str = "synthetic-snowflake-snapshot",
-    amount_source_type: str = "FIXED(30,12)",
-) -> snowflake.SnowflakeAcquisition:
-    field_ids = ("rate_npi", "service_code", "amount")
-    request = snowflake.SnowflakeReadRequest(
-        relation=snowflake.SnowflakeRelation(database="synthetic", schema="public", name="child_records"),
-        selected_columns=tuple(
-            snowflake.SnowflakeDeclaredColumn(field_id=field_id, column_identifier=field_id) for field_id in field_ids
-        ),
-        definition_sha256=definition.digest,
-        schema_sha256=definition.schema_digest,
-    )
-    schema = (
-        snowflake.SnowflakeResultColumn(field_id="rate_npi", source_type="TEXT", nullable=False),
-        snowflake.SnowflakeResultColumn(field_id="service_code", source_type="TEXT", nullable=False),
-        snowflake.SnowflakeResultColumn(field_id="amount", source_type=amount_source_type, nullable=True),
-    )
-    adapter_result = snowflake.SnowflakeParquetResult(
-        source_snapshot_token=snapshot_token,
-        schema=schema,
-        partition_sources=_SnowflakePartitionSources(_parquet_reader(child_rows, schema)),
-    )
-    try:
-        return snowflake._seal_acquisition(
-            snowflake.SnowflakeReadStatement(request=request),
-            adapter_result,
-            capture_limits=snowflake.DEFAULT_CAPTURE_LIMITS,
-        )
-    finally:
-        adapter_result.close()
-
-
-def _snowflake_family_request(
-    seed: _Seed,
-    *,
-    suffix: str,
-    root_rows: tuple[tuple[object, object], ...],
-    child_rows: tuple[tuple[object, object, object], ...],
-    amount_source_type: str = "FIXED(30,12)",
-) -> SnowflakeCandidateRequest:
-    snapshot_token = f"synthetic-snowflake-{suffix}"
-    return SnowflakeCandidateRequest(
-        dataset_id=seed.dataset_id,
-        definition_revision_id=seed.definition_revision_id,
-        schema_revision_id=seed.schema_revision_id,
-        definition=seed.definition,
-        acquisition=_snowflake_acquisition(
-            seed.definition,
-            root_rows=root_rows,
-            snapshot_token=snapshot_token,
-        ),
-        child_acquisition=_snowflake_child_acquisition(
-            seed.definition,
-            child_rows=child_rows,
-            snapshot_token=snapshot_token,
-            amount_source_type=amount_source_type,
-        ),
-        idempotency_key=f"synthetic-snowflake-family-{suffix}",
-        lease_token=f"synthetic-snowflake-family-{suffix}-lease",
-    )
 
 
 def _snapshot_definition() -> CustomImportDefinition:
@@ -547,6 +700,57 @@ async def _seed_case(case, suffix: str, definition: CustomImportDefinition | Non
         return await _seed_identity(session, suffix, definition)
 
 
+async def _seed_mapping_drift_execution(
+    case,
+    seed: _Seed,
+    request: SnowflakeBundleCandidateRequest,
+    statement: SnowflakeBundleStatement,
+    stored_identity_state: str,
+) -> tuple[int, bytes]:
+    """Persist one legacy, live, expired, or terminal bundle reservation."""
+
+    baseline_identity = snowflake_candidate._bundle_request_identity_sha256(request, statement)
+    async with case.sessions() as session, session.begin():
+        submission = await reserve_execution(
+            session,
+            dataset_id=seed.dataset_id,
+            definition_revision_id=seed.definition_revision_id,
+            schema_revision_id=seed.schema_revision_id,
+            idempotency_key=request.idempotency_key,
+            mechanism="local",
+            request_identity_sha256=None if stored_identity_state == "null" else baseline_identity,
+        )
+        grant = None
+        if stored_identity_state != "null":
+            grant = await claim_execution(
+                session,
+                execution_id=submission.execution_id,
+                token=request.lease_token,
+                lease_seconds=60,
+            )
+    if stored_identity_state == "expired":
+        assert grant is not None
+        async with case.sessions() as session, session.begin():
+            await session.execute(
+                update(CustomImportLease)
+                .where(CustomImportLease.execution_id == submission.execution_id)
+                .values(expires_at=func.clock_timestamp())
+            )
+    elif stored_identity_state == "terminal":
+        assert grant is not None
+        async with case.sessions() as session, session.begin():
+            await request_cancellation(session, execution_id=submission.execution_id)
+            terminal = await finish_execution(
+                session,
+                execution_id=submission.execution_id,
+                fence=grant.fence,
+                token=request.lease_token,
+                terminal_state="canceled",
+            )
+        assert terminal.state == "canceled"
+    return submission.execution_id, baseline_identity
+
+
 @pytest.mark.asyncio
 async def test_runner_materializes_seals_and_activates_typed_candidate_rows():
     async with isolated_publication_case() as case:
@@ -608,84 +812,335 @@ async def test_snowflake_bridge_registers_and_activates_one_durable_root_candida
             assert bundle is not None and bundle.snapshot_token == "synthetic-snowflake-snapshot"
 
 
+def _bundle_family_expectation(definition: CustomImportDefinition):
+    child_values = _rate("1234567893", "SYNTHETIC", Decimal("12.50"))
+    expected = assemble_root_families(
+        definition,
+        [_root("1234567893", "Synthetic Bundle")],
+        {"rates": [child_values]},
+    )
+    return child_values, expected
+
+
 @pytest.mark.asyncio
-async def test_snowflake_bridge_activates_exact_family_bundle():
+async def test_snowflake_bundle_rehydrates_durable_streams_before_exact_activation():
+    """Reserve before source acquisition, then replay only durable closed bytes."""
     async with isolated_publication_case() as case:
-        seed = await _seed_case(case, "snowflake_family", _snowflake_family_definition())
-        run_result = await run_snowflake_candidate(
-            case.sessions,
-            SnowflakeCandidateRequest(
-                dataset_id=seed.dataset_id,
-                definition_revision_id=seed.definition_revision_id,
-                schema_revision_id=seed.schema_revision_id,
-                definition=seed.definition,
-                acquisition=_snowflake_acquisition(seed.definition),
-                child_acquisition=_snowflake_child_acquisition(seed.definition),
-                idempotency_key="synthetic-snowflake-family",
-                lease_token="synthetic-snowflake-family-lease",
-            ),
+        seed = await _seed_case(case, "snowflake_bundle", _snowflake_bundle_definition())
+        acquirer, candidate_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="bundle",
+            root_rows=(("1234567893", "Synthetic Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
         )
-        assert run_result.status == "activated" and run_result.accepted_family_count == 1
-        child_values = _rate("1234567893", "SYNTHETIC", Decimal("12.50"))
-        expected = assemble_root_families(
-            seed.definition, [_root("1234567893", "Synthetic Bridge")], {"rates": [child_values]}
+        opened_sessions, source_closed_flags = [], []
+
+        @asynccontextmanager
+        async def sessions_for_lifecycle():
+            source_closed_flags.append(acquirer.source_closed)
+            async with case.sessions() as session:
+                opened_sessions.append(session)
+                yield session
+
+        run_result = await run_snowflake_bundle_candidate(
+            sessions_for_lifecycle,
+            acquirer,
+            candidate_request,
         )
+
+        assert acquirer.calls == 1 and not source_closed_flags[0]
+        assert any(source_closed_flags) and all(source_closed_flags[source_closed_flags.index(True) :])
+        assert len({id(session) for session in opened_sessions}) == len(opened_sessions)
+        assert run_result.status == "activated"
+        assert run_result.accepted_family_count == 1
+        assert run_result.generation_id is not None
+        child_values, expected = _bundle_family_expectation(seed.definition)
         async with case.sessions() as session:
             execution = await session.get(CustomImportExecution, run_result.execution_id)
+            assert execution is not None and execution.capture_bundle_id is not None
             bundle = await session.get(CustomImportCaptureBundle, execution.capture_bundle_id)
-            assert bundle is not None and bundle.stream_count == 2
-            assert bundle.snapshot_token == "synthetic-snowflake-snapshot"
-            captures = (
+            assert bundle is not None
+            assert bundle.snapshot_token == "synthetic-snowflake-bundle"
+            parts = (
                 await session.scalars(
-                    select(CustomImportCapture).where(CustomImportCapture.capture_bundle_id == bundle.capture_bundle_id)
+                    select(CustomImportCaptureParquetPart).where(
+                        CustomImportCaptureParquetPart.capture_bundle_id == bundle.capture_bundle_id
+                    )
                 )
             ).all()
-            assert len(captures) == 2 and len({capture.manifest_sha256 for capture in captures}) == 2
             family = (await session.scalars(select(CustomImportFamilyRevision))).one()
-            assert family.child_count == 1
-            assert family.family_sha256 == new_family_hash(seed.definition, expected.families[0])
             child = (await session.scalars(select(CustomImportChildRevision))).one()
-            assert child.child_key_sha256 == child_key_hash(seed.definition, "rates", child_values)
-            assert child.root_record_id == family.root_record_id
             binding = (await session.scalars(select(CustomImportEntityBinding))).one()
-            assert binding.adapter_id == "npi" and binding.canonical_value == "1234567893"
+            pointer = await session.get(CustomImportCurrentGeneration, seed.dataset_id)
+        assert len(parts) == 2 and all(part.payload for part in parts)
+        assert family.child_count == 1
+        assert family.family_sha256 == new_family_hash(seed.definition, expected.families[0])
+        assert child.child_key_sha256 == child_key_hash(seed.definition, "rates", child_values)
+        assert child.root_record_id == family.root_record_id
+        assert binding.adapter_id == "npi" and binding.canonical_value == "1234567893"
+        async with case.sessions() as session:
             assert len((await session.scalars(select(CustomImportRootScalar))).all()) == 2
             assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
             assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
-            pointer = await session.get(CustomImportCurrentGeneration, seed.dataset_id)
-            assert pointer.generation_id == run_result.generation_id
+        assert pointer is not None and pointer.generation_id == run_result.generation_id
 
 
 @pytest.mark.asyncio
-async def test_snowflake_bridge_retains_only_the_family_with_an_invalid_child():
-    """Retain one prior family while publishing an independent valid update."""
+async def test_snowflake_bundle_resume_replays_durable_capture_without_acquiring(monkeypatch):
+    """An expired owner reuses its bound capture instead of reading Snowflake again."""
 
     async with isolated_publication_case() as case:
-        seed = await _seed_case(case, "snowflake_family_retention", _snowflake_family_definition())
-        prior = await run_snowflake_candidate(
-            case.sessions,
-            _snowflake_family_request(
-                seed,
-                suffix="prior",
-                root_rows=(("1234567893", "Prior First"), ("1003000126", "Prior Second")),
-                child_rows=(
-                    ("1234567893", "FIRST", Decimal("10.00")),
-                    ("1003000126", "SECOND", Decimal("20.00")),
-                ),
+        seed = await _seed_case(case, "snowflake_bundle_resume", _snowflake_bundle_definition())
+        initial_acquirer, initial_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="resume_initial",
+            root_rows=(("1234567893", "Initial Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        original_materialize = runner._materialize_candidate
+
+        async def expire_lease_before_materialization(session_factory, candidate_request, grant, admitted):
+            async with case.sessions() as session, session.begin():
+                await session.execute(
+                    update(CustomImportLease)
+                    .where(CustomImportLease.execution_id == grant.execution_id)
+                    .values(expires_at=func.clock_timestamp())
+                )
+            return await original_materialize(session_factory, candidate_request, grant, admitted)
+
+        monkeypatch.setattr(runner, "_materialize_candidate", expire_lease_before_materialization)
+        initial_run = await run_snowflake_bundle_candidate(case.sessions, initial_acquirer, initial_request)
+        monkeypatch.setattr(runner, "_materialize_candidate", original_materialize)
+
+        recovery_acquirer, _ = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="resume_unused",
+            root_rows=(("1234567893", "Unexpected Bundle"),),
+            child_rows=(("1234567893", "UNEXPECTED", Decimal("99.00")),),
+        )
+        recovery_request = replace(initial_request, lease_token="synthetic-snowflake-bundle-recovery-lease")
+        resumed_run = await run_snowflake_bundle_candidate(case.sessions, recovery_acquirer, recovery_request)
+        duplicate_run = await run_snowflake_bundle_candidate(case.sessions, recovery_acquirer, recovery_request)
+
+        assert initial_run.status == "lease_lost"
+        assert initial_acquirer.calls == 1
+        assert resumed_run.status == "activated"
+        assert resumed_run.execution_id == initial_run.execution_id
+        assert duplicate_run.status == "not_claimed"
+        assert recovery_acquirer.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bundle_lost_lease_rolls_back_new_capture_binding(monkeypatch):
+    """A stale claimant cannot attach or retain a newly acquired durable capture."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bundle_stale", _snowflake_bundle_definition())
+        acquirer, candidate_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="stale",
+            root_rows=(("1234567893", "Stale Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        original_registration = snowflake_candidate._register_bundle_captures
+
+        async def expire_lease_before_capture_binding(session_factory, request, grant, captures):
+            async with case.sessions() as session, session.begin():
+                await session.execute(
+                    update(CustomImportLease)
+                    .where(CustomImportLease.execution_id == grant.execution_id)
+                    .values(expires_at=func.clock_timestamp())
+                )
+            return await original_registration(session_factory, request, grant, captures)
+
+        monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", expire_lease_before_capture_binding)
+        run_result = await run_snowflake_bundle_candidate(case.sessions, acquirer, candidate_request)
+
+        assert run_result.status == "lease_lost"
+        assert acquirer.calls == 1
+        async with case.sessions() as session:
+            execution = await session.get(CustomImportExecution, run_result.execution_id)
+            capture_bundles = (
+                await session.scalars(
+                    select(CustomImportCaptureBundle).where(CustomImportCaptureBundle.dataset_id == seed.dataset_id)
+                )
+            ).all()
+        assert execution is not None and execution.capture_bundle_id is None
+        assert {bundle.capture_bundle_id for bundle in capture_bundles} == {seed.capture_bundle_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("cancellation", "lease_loss"))
+async def test_snowflake_bundle_stops_after_source_when_lease_changes(monkeypatch, mode):
+    """Cancellation or expiry after source work cannot retain or publish a bundle."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, f"snowflake_bundle_{mode}", _snowflake_bundle_definition())
+        acquirer, candidate_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix=mode,
+            root_rows=(("1234567893", "Interrupted Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        original_renewal = snowflake_candidate._renew_bundle_lease
+        renewal_calls = []
+
+        async def change_lease_after_source(session_factory, request, grant):
+            renewal_calls.append(grant)
+            if len(renewal_calls) == 1:
+                return await original_renewal(session_factory, request, grant)
+            async with case.sessions() as session, session.begin():
+                if mode == "cancellation":
+                    await request_cancellation(session, execution_id=grant.execution_id)
+                else:
+                    await session.execute(
+                        update(CustomImportLease)
+                        .where(CustomImportLease.execution_id == grant.execution_id)
+                        .values(expires_at=func.clock_timestamp())
+                    )
+            return await original_renewal(session_factory, request, grant)
+
+        monkeypatch.setattr(snowflake_candidate, "_renew_bundle_lease", change_lease_after_source)
+        run_result = await run_snowflake_bundle_candidate(case.sessions, acquirer, candidate_request)
+
+        assert run_result.status == ("canceled" if mode == "cancellation" else "lease_lost")
+        assert acquirer.calls == 1 and len(renewal_calls) == 2
+        async with case.sessions() as session:
+            execution = await session.get(CustomImportExecution, run_result.execution_id)
+            capture_bundles = (
+                await session.scalars(
+                    select(CustomImportCaptureBundle).where(CustomImportCaptureBundle.dataset_id == seed.dataset_id)
+                )
+            ).all()
+            generations = (await session.scalars(select(CustomImportGeneration))).all()
+        assert execution is not None and execution.capture_bundle_id is None
+        assert execution.state == ("canceled" if mode == "cancellation" else "running")
+        assert {bundle.capture_bundle_id for bundle in capture_bundles} == {seed.capture_bundle_id}
+        assert generations == []
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bundle_unbound_capture_is_not_acquired_twice(monkeypatch):
+    """A post-source interruption fails closed rather than rereading the same execution."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bundle_unbound", _snowflake_bundle_definition())
+        acquirer, initial_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="unbound",
+            root_rows=(("1234567893", "Unbound Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        original_registration = snowflake_candidate._register_bundle_captures
+
+        async def interrupt_before_capture_binding(*_arguments):
+            raise RuntimeError("synthetic post-source interruption")
+
+        monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", interrupt_before_capture_binding)
+        with pytest.raises(RuntimeError, match="post-source interruption"):
+            await run_snowflake_bundle_candidate(case.sessions, acquirer, initial_request)
+        monkeypatch.setattr(snowflake_candidate, "_register_bundle_captures", original_registration)
+        assert acquirer.calls == 1
+
+        async with case.sessions() as session:
+            execution = (await session.scalars(select(CustomImportExecution))).one()
+            execution_id = execution.execution_id
+        async with case.sessions() as session, session.begin():
+            await session.execute(
+                update(CustomImportLease)
+                .where(CustomImportLease.execution_id == execution_id)
+                .values(expires_at=func.clock_timestamp())
+            )
+        recovery_request = replace(initial_request, lease_token="synthetic-snowflake-unbound-recovery-lease")
+        with pytest.raises(snowflake_candidate.SnowflakeCandidateError, match="unbound source capture"):
+            await run_snowflake_bundle_candidate(case.sessions, acquirer, recovery_request)
+
+        assert acquirer.calls == 1
+        async with case.sessions() as session:
+            execution = (await session.scalars(select(CustomImportExecution))).one()
+        assert execution.execution_id == execution_id and execution.state == "failed"
+        assert execution.capture_bundle_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_identity_state", ("null", "live", "expired", "terminal"))
+async def test_snowflake_bundle_resolved_mapping_drift_conflicts_before_claim_or_source(stored_identity_state):
+    """A key cannot switch physical columns across legacy, live, expired, or terminal rows."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(
+            case, f"snowflake_mapping_drift_{stored_identity_state}", _snowflake_bundle_definition()
+        )
+        baseline_acquirer, baseline_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix=f"mapping_drift_{stored_identity_state}",
+            root_rows=(("1234567893", "Baseline Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        baseline_statement = baseline_acquirer.build_statement(baseline_request.bundle_request)
+        drifting_statement = _physical_mapping_drift_statement(seed.definition)
+        drifting_acquirer = _PreparedStatementOnlyAcquirer(drifting_statement)
+        assert drifting_statement.request.request_sha256 == baseline_statement.request.request_sha256
+        assert drifting_statement.statement_sha256 != baseline_statement.statement_sha256
+        execution_id, baseline_identity = await _seed_mapping_drift_execution(
+            case,
+            seed,
+            baseline_request,
+            baseline_statement,
+            stored_identity_state,
+        )
+
+        drift_request = replace(
+            baseline_request,
+            lease_token=f"synthetic-mapping-drift-{stored_identity_state}-lease",
+        )
+        with pytest.raises(IdempotencyConflict):
+            await run_snowflake_bundle_candidate(case.sessions, drifting_acquirer, drift_request)
+
+        assert drifting_acquirer.acquire_calls == 0
+        async with case.sessions() as session:
+            execution = await session.get(CustomImportExecution, execution_id)
+            lease = await session.get(CustomImportLease, execution_id)
+        assert execution is not None and lease is not None
+        assert execution.request_identity_sha256 == (None if stored_identity_state == "null" else baseline_identity)
+        assert lease.fence == (0 if stored_identity_state == "null" else 1)
+        assert (
+            execution.state
+            == {
+                "null": "queued",
+                "live": "running",
+                "expired": "running",
+                "terminal": "canceled",
+            }[stored_identity_state]
+        )
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bundle_retains_only_the_family_with_an_invalid_child():
+    """Retain one prior family while publishing an independent valid bundle update."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bundle_retention", _snowflake_bundle_definition())
+        prior_acquirer, prior_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="prior",
+            root_rows=(("1234567893", "Prior First"), ("1003000126", "Prior Second")),
+            child_rows=(
+                ("1234567893", "FIRST", Decimal("10.00")),
+                ("1003000126", "SECOND", Decimal("20.00")),
             ),
         )
+        prior = await run_snowflake_bundle_candidate(case.sessions, prior_acquirer, prior_request)
         assert prior.status == "activated"
 
-        update_run = await run_snowflake_candidate(
-            case.sessions,
-            _snowflake_family_request(
-                seed,
-                suffix="update",
-                root_rows=(("1234567893", "Rejected First"), ("1003000126", "Accepted Second")),
-                child_rows=(("1234567893", "FIRST", "invalid"), ("1003000126", "SECOND", "21.00")),
-                amount_source_type="TEXT",
-            ),
+        update_acquirer, update_request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="update",
+            root_rows=(("1234567893", "Rejected First"), ("1003000126", "Accepted Second")),
+            child_rows=(("1234567893", "FIRST", "invalid"), ("1003000126", "SECOND", "21.00")),
+            amount_source_type="TEXT",
         )
+        update_run = await run_snowflake_bundle_candidate(case.sessions, update_acquirer, update_request)
 
         assert update_run.status == "activated"
         assert update_run.generation_id is not None

@@ -359,8 +359,18 @@ def test_bridge_binds_shared_snapshot_and_family_keys():
 
 
 @pytest.mark.asyncio
+async def test_legacy_bridge_cannot_publish_a_multi_stream_candidate():
+    request = _family_request()
+
+    def session_factory():
+        raise AssertionError("legacy multi-stream publication must stop before storage")
+
+    with pytest.raises(SnowflakeCandidateError, match="one-statement bundle candidate path"):
+        await run_snowflake_candidate(session_factory, request)
+
+
 @pytest.mark.parametrize("defect", ("snapshot", "missing_child", "extra_child", "swapped_scope", "seal", "type"))
-async def test_bridge_rejects_invalid_source_bundles_before_storage(defect):
+def test_bridge_rejects_invalid_source_bundles_before_storage(defect):
     request = _family_request()
     match defect:
         case "snapshot":
@@ -379,11 +389,8 @@ async def test_bridge_rejects_invalid_source_bundles_before_storage(defect):
         case "type":
             request = _family_request(child_values=(1,))
 
-    def session_factory():
-        raise AssertionError("storage must not open for an invalid source bundle")
-
     with pytest.raises(SnowflakeCandidateError):
-        await run_snowflake_candidate(session_factory, request)
+        _prepare_candidate(request)
 
 
 @pytest.mark.parametrize("alias_mapping", ({"NPI": "display_name"}, {"UNSELECTED": "npi"}))
