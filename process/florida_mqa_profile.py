@@ -30,13 +30,15 @@ import click
 from dotenv import load_dotenv
 from sqlalchemy import (
     ARRAY,
-    JSON as SQLAlchemyJSON,
     Date,
     DateTime,
     MetaData,
     func,
     select,
     text,
+)
+from sqlalchemy import (
+    JSON as SQLAlchemyJSON,
 )
 
 from db.models import (
@@ -47,6 +49,7 @@ from db.models import (
     ProviderProfileSourceRecord,
     db,
 )
+from process.florida_profile_retention import protected_projection_run_ids
 from process.live_progress import enqueue_live_progress
 from process.provider_profile_live_progress import (
     normalization_completed,
@@ -4451,45 +4454,6 @@ async def _delete_retained_payload_rows(
     return deleted_rows_by_key
 
 
-async def _protected_projection_run_ids(
-    schema: str,
-    live_name: str,
-    old_name: str,
-) -> set[str]:
-    """Return generation IDs referenced by live and rollback projections."""
-
-    protected_run_ids: set[str] = set()
-    projection_tables = await db.all(
-        text(
-            """
-            SELECT tablename
-              FROM pg_catalog.pg_tables
-             WHERE schemaname = :schema
-               AND tablename IN (:live_name, :old_name)
-            """
-        ),
-        schema=schema,
-        live_name=live_name,
-        old_name=old_name,
-    )
-    for projection_table in projection_tables:
-        table_name = str(projection_table._mapping["tablename"])
-        if table_name not in {live_name, old_name}:
-            continue
-        generation_rows = await db.all(
-            text(
-                f"SELECT DISTINCT generation_id "
-                f"FROM {schema}.{table_name}"
-            )
-        )
-        protected_run_ids.update(
-            str(source_row._mapping["generation_id"])
-            for source_row in generation_rows
-            if source_row._mapping["generation_id"]
-        )
-    return protected_run_ids
-
-
 async def _post_success_retention(
     *,
     run_id: str,
@@ -4509,7 +4473,7 @@ async def _post_success_retention(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
             lock_name=f"{schema}.{live_name}.publication",
         )
-        protected_run_ids = await _protected_projection_run_ids(schema, live_name, old_name)
+        protected_run_ids = await protected_projection_run_ids(db, schema, live_name, old_name)
         terminal_rows = await db.all(
             select(
                 ProviderProfileImportRun.run_id,
