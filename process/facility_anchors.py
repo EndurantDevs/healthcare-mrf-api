@@ -10,14 +10,29 @@ import logging
 import os
 import re
 import uuid
+from functools import partial
 
 from arq import create_pool
-from db.models import FacilityAnchor, db
+
+from db.models import FacilityAddressContribution, FacilityAnchor, db
 from process.control_lifecycle import mark_control_run
-from process.ext.address_canon import archive_table_name, resolve_into_archive, source_enabled, stamp_address_keys
-from process.ext.utils import (ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects)
+from process.ext.address_canon import (
+    archive_table_name,
+    resolve_into_archive,
+    restore_missing_zip_from_tiger_zcta,
+    source_enabled,
+    stamp_address_keys,
+)
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
+from process.facility_address_contribution_capture import (
+    capture_canonical_observations,
+    capture_metadata,
+    captured_geocode_cte,
+    require_capture_bounds,
+    require_local_family_publication,
+)
 from process.redis_config import build_redis_settings
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
@@ -192,16 +207,17 @@ async def _canonical_archive_table(db_schema: str) -> str | None:
     return None
 
 
-async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_schema: str) -> int:
+async def _refresh_archive_geocodes_from_facility_anchors(
+    stage_table: str, db_schema: str, *, contribution_table: str | None = None,
+) -> int:
     archive_table = await _canonical_archive_table(db_schema)
     if not archive_table:
+        if contribution_table:
+            raise RuntimeError("Facility address contribution requires the canonical archive")
         logger.warning("Skipping facility-anchor archive geocode refresh: no canonical archive table is available.")
         return 0
 
-    return int(
-        await db.status(
-            f"""
-            WITH facility_geocodes AS (
+    winner_sql = f"""
                 SELECT DISTINCT ON (address_key)
                     address_key,
                     latitude::numeric(11,8) AS lat,
@@ -211,7 +227,15 @@ async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_s
                    AND latitude IS NOT NULL
                    AND longitude IS NOT NULL
                  ORDER BY address_key, (facility_type = 'Hospital') DESC
-            )
+    """
+    geocode_cte = (
+        captured_geocode_cte(schema=db_schema, contribution_table=contribution_table, winner_sql=winner_sql)
+        if contribution_table else f"facility_geocodes AS ({winner_sql})"
+    )
+    async with db.transaction() as session:
+        updated = int(await db.status(
+            f"""
+            WITH {geocode_cte}
             UPDATE {db_schema}.{archive_table} AS archive
                SET lat = facility_geocodes.lat,
                    long = facility_geocodes.long,
@@ -224,9 +248,10 @@ async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_s
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """
-        )
-        or 0
-    )
+        ) or 0)
+        if contribution_table:
+            await require_capture_bounds(session, schema=db_schema, contribution_table=contribution_table)
+        return updated
 
 
 async def _backfill_hospital_coordinates_from_existing_live(stage_table: str, db_schema: str) -> int:
@@ -564,6 +589,13 @@ async def startup(ctx):
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
     await db.create_table(stage_cls.__table__, checkfirst=True)
     await _create_stage_indexes(stage_cls, db_schema)
+    contribution_stage = f"{FacilityAddressContribution.__main_table__}_{import_date}"
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{contribution_stage};")
+    await db.status(
+        f"CREATE TABLE {db_schema}.{contribution_stage} ("
+        "kind varchar(16) NOT NULL, address_key uuid NOT NULL, payload jsonb NOT NULL, "
+        f"CONSTRAINT {_archived_identifier(contribution_stage, '_pkey')} PRIMARY KEY (kind, address_key));"
+    )
 
     logger.info("Facility Anchors startup ready: schema=%s import_date=%s", db_schema, import_date)
 
@@ -635,71 +667,104 @@ async def publish_facility_anchors_generation(ctx):
             "aborting publish."
         )
 
-    address_stats = None
-    if source_enabled("facility_anchors"):
+    source_has_addresses = source_enabled("facility_anchors")
+    if source_has_addresses:
+        address_field_map = {
+            "first_line": "address_line1",
+            "second_line": "NULL",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "'US'",
+        }
         await stamp_address_keys(
             stage_cls.__tablename__,
-            {
-                "first_line": "address_line1",
-                "second_line": "NULL",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "'US'",
-            },
+            address_field_map,
             schema=db_schema,
         )
-        address_stats = await resolve_into_archive(
+        await restore_missing_zip_from_tiger_zcta(
             stage_cls.__tablename__,
-            {
-                "first_line": "address_line1",
-                "second_line": "NULL",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "'US'",
-            },
-            source_bit=8,
-            priority=4,
+            address_field_map,
             schema=db_schema,
         )
-        logger.info("Facility Anchors canonical address resolve complete: %s", address_stats)
-        geocode_updates = await _refresh_archive_geocodes_from_facility_anchors(stage_cls.__tablename__, db_schema)
-        logger.info("Facility Anchors archive geocode refresh updated %d canonical rows.", geocode_updates)
 
-    async with db.transaction():
-        table = FacilityAnchor.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
-
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-        )
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
-        )
-
-        if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
-            for index in stage_cls.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
-                old_live_name = f"{table}_idx_{index_name}"
-                archived_live_name = _archived_identifier(old_live_name)
-                await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                    f"RENAME TO {archived_live_name};"
+    async with db.transaction() as session:
+        await require_local_family_publication(session, schema=db_schema)
+        address_stats = None
+        contribution_stage = f"{FacilityAddressContribution.__main_table__}_{import_date}"
+        if source_has_addresses:
+            address_stats = await resolve_into_archive(
+                stage_cls.__tablename__,
+                address_field_map,
+                source_bit=8,
+                priority=4,
+                schema=db_schema,
+                source_capture=partial(
+                    capture_canonical_observations, contribution_table=contribution_stage,
+                ),
+                zip_restore_complete=True,
+            )
+            logger.info("Facility Anchors canonical address resolve complete: %s", address_stats)
+            geocode_updates = await _refresh_archive_geocodes_from_facility_anchors(
+                stage_cls.__tablename__, db_schema, contribution_table=contribution_stage,
+            )
+            logger.info("Facility Anchors archive geocode refresh updated %d canonical rows.", geocode_updates)
+        else:
+            async with db.transaction() as session:
+                await capture_metadata(
+                    session, schema=db_schema, contribution_table=contribution_stage, enabled=False,
                 )
-                await db.status(
-                    f"ALTER INDEX IF EXISTS "
-                    f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
-                    f"RENAME TO {old_live_name};"
-                )
+
+        async with db.transaction():
+            table = FacilityAnchor.__main_table__
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
+            )
+
+            archived = _archived_identifier(f"{table}_idx_primary")
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
+            )
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
+            )
+
+            if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
+                for index in stage_cls.__my_additional_indexes__:
+                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                    old_live_name = f"{table}_idx_{index_name}"
+                    archived_live_name = _archived_identifier(old_live_name)
+                    await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
+                        f"RENAME TO {archived_live_name};"
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
+                        f"RENAME TO {old_live_name};"
+                    )
+            contribution_table = FacilityAddressContribution.__main_table__
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{contribution_table}_old;")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{contribution_table} RENAME TO {contribution_table}_old;"
+            )
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{contribution_table}_pkey "
+                f"RENAME TO {contribution_table}_old_pkey;"
+            )
+            await db.status(
+                f"ALTER TABLE {db_schema}.{contribution_stage} RENAME TO {contribution_table};"
+            )
+            await db.status(
+                f"ALTER INDEX {db_schema}.{_archived_identifier(contribution_stage, '_pkey')} "
+                f"RENAME TO {contribution_table}_pkey;"
+            )
+            await publish_local_reference_family_generation(db, importer_id="facility-anchors", schema_name=db_schema)
 
     logger.info(
         "Facility Anchors publish complete: rows=%d hospitals=%d hospital_with_coords=%d ratio=%.3f",

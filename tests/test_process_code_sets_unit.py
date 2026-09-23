@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -59,6 +60,14 @@ def _stub_import_dependencies(
     monkeypatch.setattr(code_sets, "ensure_database", ensure_database)
     monkeypatch.setattr(code_sets, "_ensure_code_catalog", ensure_catalog)
     monkeypatch.setattr(code_sets, "_upsert_code_rows", upsert_rows)
+    monkeypatch.setattr(code_sets, "publish_local_generation", AsyncMock())
+    monkeypatch.setattr(code_sets.db, "status", AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    monkeypatch.setattr(code_sets.db, "transaction", transaction)
     monkeypatch.setattr(
         code_sets,
         "_download_text",
@@ -255,7 +264,7 @@ async def test_ensure_code_catalog_creates_and_normalizes_catalog(monkeypatch):
 async def test_upsert_code_rows_preserves_first_duplicate_per_system_and_code(
     monkeypatch,
 ):
-    execute_status = AsyncMock()
+    execute_status = AsyncMock(return_value=1)
     monkeypatch.setattr(code_sets.db, "status", execute_status)
     code_rows = [
         code_sets.CodeSetRow("RC", "0450", "First display", source="first"),
@@ -275,6 +284,7 @@ async def test_upsert_code_rows_preserves_first_duplicate_per_system_and_code(
     assert "ON CONFLICT (code_system, code) DO UPDATE" in (
         execute_status.await_args_list[0].args[0]
     )
+    assert "WHERE code_catalog.source = excluded.source" in execute_status.await_args_list[0].args[0]
 
 
 @pytest.mark.asyncio
@@ -284,6 +294,16 @@ async def test_upsert_code_rows_does_not_write_an_empty_collection(monkeypatch):
 
     assert await code_sets._upsert_code_rows("mrf", []) == 0
     execute_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upsert_code_rows_rejects_foreign_source(monkeypatch):
+    monkeypatch.setattr(code_sets.db, "status", AsyncMock(return_value=0))
+
+    with pytest.raises(RuntimeError, match="owned by another source"):
+        await code_sets._upsert_code_rows(
+            "mrf", [code_sets.CodeSetRow("POS", "23", "Candidate", source=code_sets.SOURCE_POS)]
+        )
 
 
 @pytest.mark.asyncio

@@ -282,6 +282,7 @@ _SPECS = {
         ReferenceFamilySpec("geo-census", (models.GeoZipCensusProfile,), ("geo",)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
         ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
+        ReferenceFamilySpec("facility-anchors", (models.FacilityAnchor, models.FacilityAddressContribution)),
         ReferenceFamilySpec("tiger", (ZipState, Zip_zcta5)),
         ReferenceFamilySpec(
             "medicare-enrollment",
@@ -1005,6 +1006,12 @@ async def _capture_reference_family_source(
                 raise ReferenceFamilyArchiveError("reference family source generation is drifted")
             else:
                 source_serving_generation = generation_authority.serving_generation
+        if importer_id == "facility-anchors":
+            from process.facility_address_contribution_merge import validate_observations
+
+            if source_serving_generation is None:
+                raise ReferenceFamilyArchiveError("facility source generation is unavailable")
+            await validate_observations(session, stage_schema=schema, schema=schema, bind_alias=False)
         manifest = await _family_manifest(
             session,
             spec=spec,
@@ -2003,6 +2010,8 @@ async def activate_reference_family_stage(
     """Manually rotate one complete family inside the caller-owned transaction."""
 
     _require_transaction(session)
+    if isinstance(ownership, ReferenceFamilyStageOwnership) and ownership.importer_id == "facility-anchors":
+        raise ReferenceFamilyArchiveError("facility activation requires protected contribution preparation")
     if authority != "manual":
         raise ReferenceFamilyArchiveError("reference family automatic activation is unsupported")
     if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
@@ -2078,6 +2087,7 @@ async def activate_validated_reference_family_stage(
     expected_incumbent: ReferenceFamilyIncumbent,
     validation_receipt: Mapping[str, Any] | ReferenceFamilyValidationReceipt,
     cutover: ReferenceFamilyCutoverAuthority,
+    contribution_effect_receipt: Mapping[str, Any] | None = None,
 ) -> ReferenceFamilyActivationReceipt:
     """CAS-rotate one publisher-validated immutable stage without recounting."""
 
@@ -2105,6 +2115,7 @@ async def activate_validated_reference_family_stage(
             expected_incumbent,
             incoming_generation,
         )
+    await _apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
     predecessor_schema_name, live_pairs = await _complete_validated_stage_activation(
         session,
         spec,
@@ -2127,6 +2138,29 @@ async def activate_validated_reference_family_stage(
         predecessor_schema_name,
         validation.tables,
     )
+
+
+async def _apply_validated_contribution(session, ownership, expected_incumbent, receipt) -> None:
+    """Apply only the contribution owned by this protected family cutover."""
+    if ownership.importer_id == "facility-anchors":
+        from process.facility_address_contribution_effects import (
+            apply_facility_address_effects,
+            validate_effect_receipt,
+        )
+
+        if receipt is None:
+            raise ReferenceFamilyArchiveError("facility activation requires contribution evidence")
+        receipt = validate_effect_receipt(receipt)
+        if (
+            receipt["schema"] != expected_incumbent.schema_name
+            or receipt["stage_schema"] != ownership.schema_name
+            or receipt["stage_schema_oid"] != ownership.schema_oid
+            or receipt["contribution_oid"] != dict(ownership.relation_oids).get("facility_address_contribution")
+        ):
+            raise ReferenceFamilyArchiveError("facility contribution stage or destination differs")
+        await apply_facility_address_effects(session, receipt)
+    elif receipt is not None:
+        raise ReferenceFamilyArchiveError("reference family contribution scope differs")
 
 
 def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, validation, cutover) -> None:
