@@ -1003,13 +1003,30 @@ async def test_oversized_response_fails_closed(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_absent_detail_root_fails_closed(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("failure_type", "expected_status", "expected_error"),
+    (
+        (
+            http.CustomImportReadEntityAbsentError,
+            404,
+            {"code": "custom_import_entity_absent", "message": "Requested custom import entity was not found."},
+        ),
+        (
+            http.CustomImportReadUnavailableError,
+            503,
+            {"code": "custom_import_read_unavailable", "message": "Custom import read is temporarily unavailable."},
+        ),
+    ),
+)
+async def test_detail_root_maps_absence_distinct_from_unavailable(
+    monkeypatch, failure_type, expected_status, expected_error
+) -> None:
     _install_keyring(monkeypatch)
 
     class AbsentRootService(_Service):
         async def root_detail_for_entity(self, _session, *, authorization, request):
             del authorization, request
-            raise http.CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+            raise failure_type("synthetic detail failure")
 
     monkeypatch.setattr(http, "CustomImportReadService", AbsentRootService)
     monkeypatch.setattr(http, "_resolve_pinned_target", _resolved_target)
@@ -1022,10 +1039,9 @@ async def test_absent_detail_root_fails_closed(monkeypatch) -> None:
         object(),
     )
 
-    assert result.status == 503
-    assert orjson.loads(result.body) == {
-        "error": {"code": "custom_import_read_unavailable", "message": "Custom import read is temporarily unavailable."}
-    }
+    assert result.status == expected_status
+    assert result.headers["Cache-Control"] == "private, no-store"
+    assert orjson.loads(result.body) == {"error": expected_error}
 
 
 @pytest.mark.asyncio

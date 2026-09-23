@@ -28,6 +28,7 @@ from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
+    CustomImportReadEntityAbsentError,
     CustomImportReadRequestError,
     CustomImportReadUnavailableError,
     ExtensionReadAuthorization,
@@ -108,6 +109,7 @@ _ERRORS = {
     404: ("resource_not_found", "Resource not found."),
     503: ("custom_import_read_unavailable", "Custom import read is temporarily unavailable."),
 }
+_ENTITY_ABSENT_ERROR = ("custom_import_entity_absent", "Requested custom import entity was not found.")
 logger = logging.getLogger(__name__)
 
 
@@ -820,8 +822,8 @@ def _response(body: bytes, status: int):
     )
 
 
-def _error(status: int):
-    code, message = _ERRORS[status]
+def _error(status: int, *, detail: tuple[str, str] | None = None):
+    code, message = _ERRORS[status] if detail is None else detail
     return _response(orjson.dumps({"error": {"code": code, "message": message}}), status)
 
 
@@ -925,6 +927,8 @@ async def serve_custom_import_detail(request: Any, session: Any):
         encoded = orjson.dumps(_detail_payload(detail, parsed_request.target))
         if len(encoded) > _MAX_RESPONSE_BYTES:
             raise CustomImportReadUnavailableError("custom import response exceeds the bound")
+    except CustomImportReadEntityAbsentError:
+        return _error(404, detail=_ENTITY_ABSENT_ERROR)
     except Exception as failure:
         _log_failure(failure)
         return _error(_failure_status(failure))

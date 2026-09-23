@@ -77,6 +77,7 @@ from process.custom_import.read_contracts import (
     CustomImportReadAuthorizationError,
     CustomImportReadCache,
     CustomImportReadCursorError,
+    CustomImportReadEntityAbsentError,
     CustomImportReadError,
     CustomImportReadRequestError,
     CustomImportReadUnavailableError,
@@ -1979,6 +1980,8 @@ async def _entity_winner_locator(
             .limit(2)
         )
     ).all()
+    if not family_rows:
+        raise CustomImportReadEntityAbsentError("selected entity has no eligible root family")
     if len(family_rows) != 1:
         raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
     root_record_id, family_revision_id, entity_binding_id = family_rows[0]
@@ -2119,6 +2122,7 @@ __all__ = (
     "CustomImportReadAuthorizationError",
     "CustomImportReadCache",
     "CustomImportReadCursorError",
+    "CustomImportReadEntityAbsentError",
     "CustomImportReadError",
     "CustomImportReadRequestError",
     "CustomImportReadService",
