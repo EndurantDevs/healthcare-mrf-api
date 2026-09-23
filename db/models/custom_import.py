@@ -66,6 +66,7 @@ __all__ = (
     "CustomImportRootScalar",
     "CustomImportSchemaRevision",
     "CustomImportSelectionProfile",
+    "CustomImportSourceBindingRevision",
     "CustomImportSourceStream",
     "CustomImportWinner",
 )
@@ -453,6 +454,77 @@ class CustomImportSourceStream(_CustomImportModel):
     created_at = _timestamp_column()
 
 
+class CustomImportSourceBindingRevision(_CustomImportModel):
+    """Immutable connector configuration bound to one definition digest."""
+
+    __tablename__ = "custom_import_source_binding_revision"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint(
+            "source_binding_revision_id",
+            name="custom_import_source_binding_revision_pkey",
+        ),
+        UniqueConstraint(
+            "definition_revision_id",
+            "revision_number",
+            name="custom_import_source_binding_revision_number_key",
+        ),
+        UniqueConstraint(
+            "definition_revision_id",
+            "binding_sha256",
+            name="custom_import_source_binding_revision_hash_key",
+        ),
+        UniqueConstraint(
+            "source_binding_revision_id",
+            "dataset_id",
+            "definition_revision_id",
+            "schema_revision_id",
+            name="custom_import_source_binding_revision_owner_key",
+        ),
+        ForeignKeyConstraint(
+            ["definition_revision_id", "dataset_id", "schema_revision_id"],
+            [
+                _reference("custom_import_definition_revision", "definition_revision_id"),
+                _reference("custom_import_definition_revision", "dataset_id"),
+                _reference("custom_import_definition_revision", "schema_revision_id"),
+            ],
+            name="custom_import_source_binding_revision_definition_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "binding_contract = 'custom-import/source-binding/v1' AND "
+            "connector_kind = 'snowflake_bundle' AND revision_number > 0 AND "
+            + _sha256_check("definition_sha256")
+            + " AND "
+            + _sha256_check("schema_sha256")
+            + " AND "
+            + _sha256_check("source_object_fingerprint_sha256")
+            + " AND "
+            + _sha256_check("binding_sha256")
+            + " AND source_object_version ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'"
+            + " AND octet_length(canonical_binding) BETWEEN 2 AND 1048576"
+            + " AND binding_sha256 = pg_catalog.sha256("
+            "convert_to(binding_contract || ':' || canonical_binding, 'UTF8'))",
+            name="custom_import_source_binding_revision_shape_check",
+        ),
+    )
+
+    source_binding_revision_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    dataset_id = Column(BigInteger, nullable=False)
+    definition_revision_id = Column(BigInteger, nullable=False)
+    schema_revision_id = Column(BigInteger, nullable=False)
+    revision_number = Column(Integer, nullable=False)
+    binding_contract = Column(String(63), nullable=False)
+    connector_kind = Column(String(32), nullable=False)
+    definition_sha256 = Column(LargeBinary(32), nullable=False)
+    schema_sha256 = Column(LargeBinary(32), nullable=False)
+    source_object_fingerprint_sha256 = Column(LargeBinary(32), nullable=False)
+    source_object_version = Column(String(255), nullable=False)
+    canonical_binding = Column(Text, nullable=False)
+    binding_sha256 = Column(LargeBinary(32), nullable=False)
+    created_at = _timestamp_column()
+
+
 class CustomImportFieldAlias(_CustomImportModel):
     """Exact per-stream external alias to a stable field slot."""
 
@@ -620,6 +692,22 @@ class CustomImportExecution(_CustomImportModel):
             name="custom_import_execution_bundle_fkey",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            [
+                "source_binding_revision_id",
+                "dataset_id",
+                "definition_revision_id",
+                "schema_revision_id",
+            ],
+            [
+                _reference("custom_import_source_binding_revision", "source_binding_revision_id"),
+                _reference("custom_import_source_binding_revision", "dataset_id"),
+                _reference("custom_import_source_binding_revision", "definition_revision_id"),
+                _reference("custom_import_source_binding_revision", "schema_revision_id"),
+            ],
+            name="custom_import_execution_source_binding_revision_fkey",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             "mechanism IN ('local', 'queued', 'external') AND "
             "state IN ('queued', 'running', 'canceling', 'canceled', 'failed', 'completed', 'no_change')",
@@ -628,6 +716,10 @@ class CustomImportExecution(_CustomImportModel):
         CheckConstraint(
             "request_identity_sha256 IS NULL OR " + _sha256_check("request_identity_sha256"),
             name="custom_import_execution_request_identity_shape_check",
+        ),
+        CheckConstraint(
+            "source_binding_revision_id IS NULL OR request_identity_sha256 IS NOT NULL",
+            name="custom_import_execution_source_binding_identity_check",
         ),
     )
 
@@ -640,6 +732,7 @@ class CustomImportExecution(_CustomImportModel):
     state = Column(String(16), nullable=False)
     capture_bundle_id = Column(BigInteger)
     request_identity_sha256 = Column(LargeBinary(32))
+    source_binding_revision_id = Column(BigInteger)
     terminal_reason = Column(String(64))
     started_at = Column(TIMESTAMP(timezone=True))
     finished_at = Column(TIMESTAMP(timezone=True))
