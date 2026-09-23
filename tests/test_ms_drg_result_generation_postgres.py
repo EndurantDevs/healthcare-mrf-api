@@ -44,12 +44,11 @@ def _dsn() -> str:
     if not raw:
         pytest.skip("HLTHPRT_MS_DRG_AUTHORITY_TEST_DSN is not set")
     url = make_url(raw)
-    if (url.drivername, url.username, url.host, url.port) != (
-        "postgresql",
-        "postgres",
-        "127.0.0.1",
-        5440,
-    ) or re.fullmatch(r"hc_ms_drg_authority_[0-9a-f]{32}", url.database or "") is None:
+    if (
+        (url.drivername, url.username, url.host) != ("postgresql", "postgres", "127.0.0.1")
+        or url.port not in {5432, 5440}
+        or re.fullmatch(r"hc_ms_drg_authority_[0-9a-f]{32}", url.database or "") is None
+    ):
         pytest.fail("MS-DRG authority test requires its dedicated local database")
     return url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
