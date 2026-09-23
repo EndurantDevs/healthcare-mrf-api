@@ -30,6 +30,7 @@ from db.models.custom_import import (
     CustomImportExecution,
     CustomImportLease,
     CustomImportSchemaRevision,
+    CustomImportSourceBindingRevision,
 )
 from process.custom_import import execution as lifecycle
 
@@ -50,6 +51,7 @@ _TABLES = (
     CustomImportDataset.__table__,
     CustomImportSchemaRevision.__table__,
     CustomImportDefinitionRevision.__table__,
+    CustomImportSourceBindingRevision.__table__,
     CustomImportCaptureBundle.__table__,
     CustomImportExecution.__table__,
     CustomImportLease.__table__,

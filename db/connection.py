@@ -253,6 +253,7 @@ class Database:
             pool_size=pool_size,
             max_overflow=max_overflow,
             echo=_is_env_enabled(os.getenv("HLTHPRT_DB_ECHO")),
+            hide_parameters=True,
         )
         self.session_factory = async_sessionmaker(
             self.engine,

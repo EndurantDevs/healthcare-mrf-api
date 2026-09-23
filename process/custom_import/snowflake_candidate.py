@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -80,6 +81,10 @@ from process.custom_import.snowflake_bundle import (
     reconstruct_replayable_parquet_bundle,
     replayable_parquet_captures,
 )
+from process.custom_import.snowflake_source_binding import (
+    SnowflakeSourceBindingError,
+    load_snowflake_source_binding,
+)
 
 __all__ = (
     "SnowflakeBundleCandidateRequest",
@@ -127,6 +132,8 @@ class SnowflakeBundleCandidateRequest:
     bundle_request: SnowflakeBundleRequest
     idempotency_key: str
     lease_token: str | bytes | bytearray | memoryview
+    source_binding_revision_id: int | None = None
+    source_binding_sha256: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -171,7 +178,26 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleCandidateReques
             raise SnowflakeCandidateError("Snowflake bundle candidate identifiers are invalid")
     if request.bundle_request.definition != request.definition:
         raise SnowflakeCandidateError("Snowflake bundle candidate definition does not match its configured bundle")
+    _source_binding_identity(request)
     return request
+
+
+def _source_binding_identity(request: SnowflakeBundleCandidateRequest) -> tuple[int, bytes] | None:
+    """Require a complete retained binding identity when this request has one."""
+
+    revision_id = request.source_binding_revision_id
+    digest = request.source_binding_sha256
+    if revision_id is None and digest is None:
+        return None
+    if (
+        isinstance(revision_id, bool)
+        or not isinstance(revision_id, int)
+        or revision_id <= 0
+        or not isinstance(digest, bytes)
+        or len(digest) != hashlib.sha256().digest_size
+    ):
+        raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
+    return revision_id, digest
 
 
 def _verified_acquisition(acquisition: object) -> SnowflakeAcquisition:
@@ -484,6 +510,8 @@ def _requires_prepared_statement(
 def bundle_request_identity_sha256(
     request: SnowflakeBundleRequest,
     statement: SnowflakeBundleStatement,
+    *,
+    source_binding_sha256: bytes | None = None,
 ) -> bytes:
     """Bind idempotency to a validated request and its resolved SQL mapping."""
 
@@ -501,6 +529,10 @@ def bundle_request_identity_sha256(
     digest = hashlib.sha256(_BUNDLE_REQUEST_IDENTITY_DOMAIN)
     digest.update(request_digest)
     digest.update(statement_digest)
+    if source_binding_sha256 is not None:
+        if not isinstance(source_binding_sha256, bytes) or len(source_binding_sha256) != digest.digest_size:
+            raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
+        digest.update(source_binding_sha256)
     return digest.digest()
 
 
@@ -589,9 +621,49 @@ async def _register_bundle_captures(
         return None
 
 
+async def _validate_bound_source_identity(session, request, prepared_statement):
+    """Match a prepared source query to its retained immutable binding."""
+
+    try:
+        loaded = await load_snowflake_source_binding(
+            session,
+            definition_revision_id=request.definition_revision_id,
+            source_binding_revision_id=request.source_binding_revision_id,
+        )
+    except SnowflakeSourceBindingError as exc:
+        raise SnowflakeCandidateError("Snowflake source binding identity is invalid") from exc
+    if (
+        loaded.dataset_id != request.dataset_id
+        or loaded.schema_revision_id != request.schema_revision_id
+        or loaded.definition != request.definition
+        or not hmac.compare_digest(loaded.source_binding_sha256, request.source_binding_sha256)
+        or loaded.bundle_bindings != request.bundle_request.bindings
+    ):
+        raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
+    approved_by_relation = {relation.relation.parts: relation for relation in loaded.approved_relations}
+    selected_columns = tuple(
+        tuple(
+            approved_by_relation[binding.relation.parts].column_for(field_id) for field_id in binding.selected_field_ids
+        )
+        for binding in loaded.bundle_bindings
+    )
+    snapshot_columns = tuple(
+        approved_by_relation[binding.source_snapshot_token_relation.parts].column_for(
+            binding.semantic_token_metadata_key
+        )
+        for binding in loaded.bundle_bindings
+    )
+    if (
+        selected_columns != prepared_statement.selected_columns_by_stream
+        or snapshot_columns != prepared_statement.source_snapshot_token_columns_by_stream
+    ):
+        raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
+
+
 async def _reserve_bundle_execution(
     session_factory: SessionFactory,
     request: SnowflakeBundleCandidateRequest,
+    prepared_statement: SnowflakeBundleStatement,
     request_identity_sha256: bytes,
 ) -> tuple[ExecutionSubmission, LeaseGrant | None]:
     """Validate, reserve, and claim the current owner before source contact."""
@@ -607,6 +679,8 @@ async def _reserve_bundle_execution(
             await validate_revision_identity(session, validation_request)
         except CandidateRunnerError as exc:
             raise SnowflakeCandidateError("Snowflake registered definition does not match the bundle") from exc
+        if request.source_binding_revision_id is not None:
+            await _validate_bound_source_identity(session, request, prepared_statement)
         submission = await reserve_execution(
             session,
             dataset_id=request.dataset_id,
@@ -615,6 +689,7 @@ async def _reserve_bundle_execution(
             idempotency_key=request.idempotency_key,
             mechanism="local",
             request_identity_sha256=request_identity_sha256,
+            source_binding_revision_id=request.source_binding_revision_id,
         )
         grant = await claim_execution(session, execution_id=submission.execution_id, token=request.lease_token)
     return submission, grant
@@ -754,8 +829,14 @@ async def run_snowflake_bundle_candidate(
     build_statement, acquire = _bundle_connector(connector)
     prepared_statement = _prepared_bundle_statement(build_statement, request)
     _requires_prepared_statement(acquire, request, prepared_statement)
-    request_identity_sha256 = bundle_request_identity_sha256(request.bundle_request, prepared_statement)
-    submission, grant = await _reserve_bundle_execution(session_factory, request, request_identity_sha256)
+    request_identity_sha256 = bundle_request_identity_sha256(
+        request.bundle_request,
+        prepared_statement,
+        source_binding_sha256=request.source_binding_sha256,
+    )
+    submission, grant = await _reserve_bundle_execution(
+        session_factory, request, prepared_statement, request_identity_sha256
+    )
     if grant is None:
         return CandidateRunResult(status="not_claimed", execution_id=submission.execution_id)
     if grant.state != "running":
