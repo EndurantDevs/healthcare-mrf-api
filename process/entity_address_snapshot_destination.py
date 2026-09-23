@@ -313,17 +313,21 @@ async def _capture_geo_preparation(
     db_schema: str,
     stage_table_oid: int,
     projected_rows: int,
+    dependency_bindings=None,
 ) -> EntityAddressGeoAssurancePreparation:
     """Capture the candidate only when it matches the current local dependencies."""
 
     state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
+    signature_sql = geo_projection.projection_relation_signature_sql(
+        db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
+    )
     state = (
         (
             await session.execute(
                 text(
                     "SELECT candidate_geo_assurance_version, candidate_table_oid::bigint, "
                     "candidate_relation_signature, candidate_projected_rows, "
-                    f"{geo_projection.projection_relation_signature_sql(db_schema)} AS current_signature "
+                    f"{signature_sql} AS current_signature "
                     f'FROM "{db_schema}"."{state_table}" WHERE singleton IS TRUE'
                 )
             )
@@ -357,6 +361,7 @@ async def _prepare_moved_destination(
     stage_names: Mapping[str, str],
     stage_oids: tuple[tuple[str, int], ...],
     source_serving_generation: EntityAddressServingGeneration | None,
+    dependency_bindings=None,
 ) -> tuple[
     adoption.PreparedEntityAddressSnapshotAdoption,
     EntityAddressGeoAssurancePreparation,
@@ -375,6 +380,7 @@ async def _prepare_moved_destination(
         context=geo_context_map,
         run_id="",
         stage_rows=stage_rows,
+        **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
     )
     prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
         db_schema=db_schema,
@@ -387,6 +393,7 @@ async def _prepare_moved_destination(
         db_schema=db_schema,
         stage_table_oid=stage_oid,
         projected_rows=projected_rows,
+        **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
     )
     async with _preserve_receipt_settings():
         stage_integrity = await capture_entity_address_stage_integrity_receipt(
@@ -475,13 +482,19 @@ async def prepare_entity_address_archive_destination(
     db_schema: str,
     import_date: str,
     source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None = None,
+    dependency_bindings: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> PreparedEntityAddressSnapshotDestination:
     """Validate, remap, project, and prepare a restored local result.
 
     ``source_serving_generation`` is the source capture's portable origin
     tuple. ``None`` explicitly selects generation-less manual compatibility.
+    ``dependency_bindings`` is trusted local held-relation authority, never
+    peer metadata. Its exact physical identity is checked under locks; only
+    canonical-key signatures survive preparation for the final live recheck.
     """
     _require_caller_transaction(session)
+    if dependency_bindings is not None:
+        dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
     async with db.bind_existing_session(session):
         return await _prepare_bound_destination(
             session,
@@ -491,6 +504,7 @@ async def prepare_entity_address_archive_destination(
             db_schema=db_schema,
             import_date=import_date,
             source_serving_generation=source_serving_generation,
+            **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
         )
 
 
@@ -516,6 +530,7 @@ async def _prepare_bound_destination(
     db_schema: str,
     import_date: str,
     source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
+    dependency_bindings=None,
 ) -> PreparedEntityAddressSnapshotDestination:
     """Prepare while the module database uses the caller-owned session."""
     validated_source_generation = _validated_source_generation(source_serving_generation)
@@ -549,18 +564,17 @@ async def _prepare_bound_destination(
         stage_names=stage_names,
         stage_oids=stage_oids,
         source_serving_generation=validated_source_generation,
-    )
-    restored = _prepared_restore_receipt(
-        validated_owner=validated_owner,
-        normalized_schema=normalized_schema,
-        normalized_date=normalized_date,
-        stage_oids=stage_oids,
-        post_remap_receipt=post_remap_receipt,
-        stage_integrity=stage_integrity,
-        prepared=prepared,
+        **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
     )
     return PreparedEntityAddressSnapshotDestination(
-        restored=restored,
+        restored=_prepared_restore_receipt(
+            validated_owner=validated_owner,
+            normalized_date=normalized_date,
+            stage_oids=stage_oids,
+            post_remap_receipt=post_remap_receipt,
+            stage_integrity=stage_integrity,
+            prepared=prepared,
+        ),
         source_semantic_receipt=source_receipt,
         source_alias_receipt=source_alias,
         destination_alias_receipt=destination_alias,
@@ -572,7 +586,6 @@ async def _prepare_bound_destination(
 def _prepared_restore_receipt(
     *,
     validated_owner: EntityAddressArchiveStageOwnership,
-    normalized_schema: str,
     normalized_date: str,
     stage_oids: tuple[tuple[str, int], ...],
     post_remap_receipt: EntityAddressArchiveReceipt,
@@ -583,7 +596,7 @@ def _prepared_restore_receipt(
 
     return restore.PreparedEntityAddressSnapshotRestore(
         ownership=validated_owner,
-        db_schema=normalized_schema,
+        db_schema=prepared.db_schema,
         import_date=normalized_date,
         stage_relation_oids=stage_oids,
         semantic_receipt=post_remap_receipt,

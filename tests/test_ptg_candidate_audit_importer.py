@@ -1742,6 +1742,8 @@ async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
     assert audit_only_result["candidate_audit_mode"] == "audit_only"
     assert audit_only_result["snapshot_status"] == "validated"
     assert audit_only_result["activation_status"] == "deferred"
+    assert audit_only_result["source_key"] == _target().source_key
+    assert audit_only_result["metrics"]["source_key"] == _target().source_key
     assert audit_only_result["activation_mode"] == "audit_only"
     assert audit_only_result["attestation_status"] == "attested"
     assert (
@@ -2028,9 +2030,7 @@ def _held_audit_only_attestation(report) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_audit_only_redelivery_reuses_held_attestation_without_io(
-    monkeypatch,
-):
+async def test_audit_only_redelivery_reuses_held_attestation_without_io(monkeypatch):
     """Reuse a durable hold without repeating audit or HTTP setup."""
 
     @asynccontextmanager
@@ -2074,6 +2074,8 @@ async def test_audit_only_redelivery_reuses_held_attestation_without_io(
     assert replay_result_by_field["idempotent"] is True
     assert replay_result_by_field["activation_status"] == "deferred"
     assert replay_result_by_field["attestation_digest"] == "ab" * 32
+    assert replay_result_by_field["source_key"] == candidate_target.source_key
+    assert replay_result_by_field["metrics"]["source_key"] == candidate_target.source_key
     assert replay_result_by_field["terminal_progress"] == {
         "unit": "audit_requests",
         "done": 1,

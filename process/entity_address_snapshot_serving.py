@@ -298,6 +298,7 @@ async def _geo_assurance_state(
     *,
     schema_name: str,
     live_table_oid: int,
+    require_current_dependencies: bool = True,
 ) -> tuple[int, int, tuple[tuple[str, int, int], ...]]:
     geo_state_rows = (
         (
@@ -326,7 +327,7 @@ async def _geo_assurance_state(
         type(geo_state["active_geo_assurance_version"]) is not int
         or geo_state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
         or active_table_oid != live_table_oid
-        or active_signature != current_signature
+        or (require_current_dependencies and active_signature != current_signature)
     ):
         raise RuntimeError("entity-address observed serving geo assurance is not active")
     return geo_state["active_geo_assurance_version"], active_table_oid, active_signature
@@ -372,12 +373,18 @@ async def observe_entity_address_serving(
     for _model_name, table_name in _RELATIONS:
         await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN SHARE MODE"))
     await session.execute(text(geo_projection.projection_dependency_lock_sql(schema)))
+    return await _read_observed_serving(session, schema, require_current_dependencies=True)
+
+
+async def _read_observed_serving(session, schema, *, require_current_dependencies):
+    """Read the complete native token after the caller selects its locking purpose."""
     relation_oids = tuple([await _relation_oid(session, schema, table_name) for _, table_name in _RELATIONS])
     alias_schema_version, alias_ruleset_version, alias_generation = await _alias_state(session, schema)
     geo_assurance_version, geo_active_table_oid, geo_active_relation_signature = await _geo_assurance_state(
         session,
         schema_name=schema,
         live_table_oid=relation_oids[0],
+        **({} if require_current_dependencies else {"require_current_dependencies": False}),
     )
     serving_generation = await _result_generation_state(
         session,
@@ -398,6 +405,45 @@ async def observe_entity_address_serving(
     )
 
 
+async def require_entity_address_receive_isolation(session):
+    """Reject stale-snapshot callers without changing an already-used transaction."""
+    if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
+        raise ValueError("entity-address receive observation requires a caller transaction")
+    if await session.scalar(text("SHOW transaction_isolation")) != "read committed":
+        raise RuntimeError("entity-address receive observation requires READ COMMITTED isolation")
+
+
+async def _observe_receive_destination(session, *, schema_name, lock_mode):
+    """Observe destination state without treating it as transferable source authority."""
+    schema = _schema_name(schema_name)
+    if lock_mode not in {"ACCESS SHARE", "SHARE"}:
+        raise ValueError("entity-address receive lock mode is invalid")
+    await require_entity_address_receive_isolation(session)
+    await session.execute(text("SET LOCAL lock_timeout TO '1s'"))
+    await session.execute(text("SET LOCAL statement_timeout TO '3s'"))
+    await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
+    for _model_name, table_name in _RELATIONS:
+        await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN {lock_mode} MODE"))
+    await session.execute(text(geo_projection.projection_dependency_lock_sql(schema)))
+    # A grouped replacement may already have swapped its dependencies. Its
+    # separate dependency fence selects the new package identities; the exact
+    # stored incumbent signature must still match the queued destination token.
+    return await _read_observed_serving(session, schema, require_current_dependencies=False)
+
+
+async def capture_entity_address_receive_admission(session, *, schema_name: str):
+    """Capture an optimistic receive token with ordinary SELECT authority only."""
+    return await _observe_receive_destination(session, schema_name=schema_name, lock_mode="ACCESS SHARE")
+
+
+async def require_entity_address_receive_incumbent(session, *, schema_name: str, expected):
+    """Recheck the entire destination token under publisher writer-order locks."""
+    expected_capture = validate_entity_address_observed_serving_capture(expected)
+    current = await _observe_receive_destination(session, schema_name=schema_name, lock_mode="SHARE")
+    if current != expected_capture:
+        raise RuntimeError("entity-address receive incumbent changed")
+
+
 async def capture_entity_address_observed_serving(
     session,
     *,
@@ -416,6 +462,9 @@ __all__ = [
     "CONTRACT",
     "EntityAddressObservedServingCapture",
     "capture_entity_address_observed_serving",
+    "capture_entity_address_receive_admission",
+    "require_entity_address_receive_incumbent",
+    "require_entity_address_receive_isolation",
     "observe_entity_address_serving",
     "validate_entity_address_observed_serving_capture",
 ]

@@ -16,6 +16,7 @@ generation = importlib.import_module("process.entity_address_result_generation")
 def _session(*, active: bool = True):
     return SimpleNamespace(
         execute=AsyncMock(),
+        scalar=AsyncMock(return_value="read committed"),
         in_transaction=lambda: active,
     )
 
@@ -189,4 +190,56 @@ async def test_observation_rejects_oversize_schema_before_sql():
     with pytest.raises(ValueError, match="safe schema name"):
         await serving.capture_entity_address_observed_serving(session, schema_name="a" * 64)
 
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_receive_admission_uses_read_locks_but_source_observer_stays_strict(monkeypatch):
+    session = _session()
+    _install_observation_results(monkeypatch, "mrf")
+    captured = await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert len([statement for statement in statements[3:10] if " IN ACCESS SHARE MODE" in statement]) == 7
+    assert not any("ISOLATION LEVEL" in statement for statement in statements)
+    assert str(session.scalar.await_args.args[0]) == "SHOW transaction_isolation"
+    assert serving._geo_assurance_state.await_args.kwargs["require_current_dependencies"] is False
+    assert serving.validate_entity_address_observed_serving_capture(captured.as_dict()) == captured
+
+
+@pytest.mark.asyncio
+async def test_receive_final_comparison_uses_writer_order_and_rejects_changed_token(monkeypatch):
+    session = _session()
+    _install_observation_results(monkeypatch, "mrf")
+    expected = (await serving.capture_entity_address_receive_admission(session, schema_name="mrf")).as_dict()
+    session.execute.reset_mock()
+    _install_observation_results(monkeypatch, "mrf")
+    await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements[:3] == [
+        "SET LOCAL lock_timeout TO '1s'",
+        "SET LOCAL statement_timeout TO '3s'",
+        serving.address_alias_sql.alias_advisory_xact_lock_sql(),
+    ]
+    assert len([statement for statement in statements[3:10] if " IN SHARE MODE" in statement]) == 7
+    _install_observation_results(monkeypatch, "mrf")
+    expected["alias_state"]["generation"] += 1
+    with pytest.raises(RuntimeError, match="receive incumbent changed"):
+        await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
+
+
+@pytest.mark.asyncio
+async def test_receive_admission_requires_transaction_before_sql():
+    session = _session(active=False)
+    with pytest.raises(ValueError, match="requires a caller transaction"):
+        await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolation", ["repeatable read", "serializable", "read uncommitted"])
+async def test_receive_admission_rejects_unsupported_isolation_without_changing_it(isolation):
+    session = _session()
+    session.scalar.return_value = isolation
+    with pytest.raises(RuntimeError, match="requires READ COMMITTED isolation"):
+        await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
     session.execute.assert_not_awaited()

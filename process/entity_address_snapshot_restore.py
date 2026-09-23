@@ -182,18 +182,19 @@ async def _create_model_relations(
     *,
     schema_name: str,
     stage_names: Mapping[str, str],
+    import_date: str,
 ) -> None:
-    """Precreate model tables and every native additional index before data-only restore."""
+    """Precreate ordinary stage columns and enabled indexes before data-only restore."""
 
     metadata = MetaData(schema=schema_name)
-    table_by_name = {
-        model.__tablename__: model.__table__.to_metadata(metadata, schema=schema_name) for model in _models()
-    }
     for model in _models():
-        table = table_by_name[model.__tablename__]
+        stage_model = entity_address_unified.make_class(model, import_date)
+        table = stage_model.__table__.to_metadata(metadata, schema=schema_name, name=model.__tablename__)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
         for index in getattr(model, "__my_additional_indexes__", ()) or ():
+            if not entity_address_unified._is_stage_index_enabled(stage_model, index):
+                continue
             await session.execute(
                 text(
                     _additional_index_sql(
@@ -217,13 +218,15 @@ async def precreate_entity_address_archive_restore(
 
     _require_caller_transaction(session)
     schema_name = entity_address_archive_stage_schema(dataset_id)
-    _destination_schema, _normalized_date, stage_names = _stage_plan(
+    _destination_schema, normalized_date, stage_names = _stage_plan(
         db_schema=db_schema,
         import_date=import_date,
     )
     try:
         await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}"))
-        await _create_model_relations(session, schema_name=schema_name, stage_names=stage_names)
+        await _create_model_relations(
+            session, schema_name=schema_name, stage_names=stage_names, import_date=normalized_date
+        )
         return await capture_created_entity_address_archive_stage(session, dataset_id=dataset_id)
     except EntityAddressArchiveOwnershipError as error:
         raise EntityAddressSnapshotRestoreError(str(error)) from error

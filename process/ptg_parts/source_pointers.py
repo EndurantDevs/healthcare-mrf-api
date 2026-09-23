@@ -1459,6 +1459,7 @@ async def _persist_candidate_activation(
     activation_context: _CandidateActivationContext,
     audit_report_digest: bytes,
     expected_audit_only_attestation_digest: bytes | None,
+    rollback_owner_id: str | None,
 ) -> None:
     """Publish pointers and consume the exact attestation in one transaction."""
 
@@ -1470,13 +1471,18 @@ async def _persist_candidate_activation(
         if is_reviewed_audit_only
         else "audited_control"
     )
+    snapshot_attributes = _activated_candidate_attributes(
+        activation_context,
+        activation_mode=activation_mode,
+    )
+    if is_reviewed_audit_only and activation_context.activation_by_field["previous_snapshot_id"] is None:
+        snapshot_attributes["manifest"]["activation"]["first_publication_owner_id"] = (
+            str(rollback_owner_id or "").strip()
+        )
     await _publish_snapshot_in_pointer_transaction(
         session,
         schema_name=schema_name,
-        snapshot_attributes=_activated_candidate_attributes(
-            activation_context,
-            activation_mode=activation_mode,
-        ),
+        snapshot_attributes=snapshot_attributes,
     )
     await _replace_source_plan_pointers(
         session,
@@ -1549,6 +1555,10 @@ async def _activate_source_candidate_tx(
         snapshot_id=snapshot_id,
         expected_current_snapshot_id=expected_current_snapshot_id,
     )
+    if expected_audit_only_attestation_digest is not None and (
+        str(expected_current_snapshot_id or "").strip() or None
+    ) != activation_context.activation_by_field["previous_snapshot_id"]:
+        raise PTG2SourcePointerConflict("requested predecessor does not match the candidate")
     await pin_reviewed_activation_predecessor(
         session,
         schema_name=schema_name,
@@ -1610,6 +1620,7 @@ async def _complete_candidate_activation(
         expected_audit_only_attestation_digest=(
             expected_audit_only_attestation_digest
         ),
+        rollback_owner_id=rollback_owner_id,
     )
     return _candidate_activation_result(
         source_key=source_key,
