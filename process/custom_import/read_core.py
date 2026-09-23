@@ -68,6 +68,7 @@ from process.custom_import.read_contracts import (
     MAX_CURSOR_TTL_SECONDS,
     MAX_DETAIL_CHILDREN,
     MAX_FILTER_TERMS,
+    MAX_NPI_PAGE_SIZE,
     MAX_ORDER_TERMS,
     MAX_PAGE_OFFSET,
     MAX_PAGE_SIZE,
@@ -328,6 +329,17 @@ class PreparedNpiEntityRelation:
 
 
 @dataclass(frozen=True, slots=True)
+class NpiEntityRelationQuery:
+    """Separate selected-context and metric predicates for one provider relation."""
+
+    context_filters: tuple[ReadFilter, ...] | None = None
+    filters: tuple[ReadFilter, ...] = ()
+    order_terms: tuple[ReadOrderTerm, ...] | None = None
+    require_match: bool = True
+    require_exact_context: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _PageWindow:
     """The exact page window used to derive one bounded next cursor."""
 
@@ -433,26 +445,123 @@ class CustomImportReadService:
         *,
         authorization: ExtensionReadAuthorization,
         target: PinnedReadTarget,
-        filters: tuple[ReadFilter, ...] = (),
-        order_terms: tuple[ReadOrderTerm, ...] | None = None,
+        query: NpiEntityRelationQuery = NpiEntityRelationQuery(),
     ) -> PreparedNpiEntityRelation:
         """Prepare one unpaged NPI relation; ``None`` order is filter-only."""
 
         authorization_scope = self._authorize(authorization, target)
-        _validate_npi_entity_relation_request(filters, order_terms)
+        if type(query) is not NpiEntityRelationQuery:
+            raise CustomImportReadRequestError("imported membership mode is invalid")
+        return await self._prepare_npi_entity_relation(
+            session,
+            pinned_target=target,
+            query=query,
+            authorization_scope=authorization_scope,
+        )
+
+    async def _prepare_npi_entity_relation(
+        self,
+        session: AsyncSession,
+        *,
+        pinned_target: PinnedReadTarget,
+        query: NpiEntityRelationQuery,
+        authorization_scope: ExtensionReadScope,
+    ) -> PreparedNpiEntityRelation:
+        """Normalize one validated query and construct its unpaged relation."""
+
+        _validate_npi_entity_relation_request(query.filters, query.order_terms, context_filters=query.context_filters)
+        if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
+            raise CustomImportReadRequestError("imported membership mode is invalid")
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
-            context = await _load_read_context(session, target)
-            normalized_filters = _normalized_filters(filters, context)
-            normalized_order_terms = (
-                () if order_terms is None else _normalize_query_order_terms(order_terms, context, explicit=True)
+            context = await _load_read_context(session, pinned_target)
+            normalized_context_filters, normalized_filters, normalized_order_terms = _normalized_npi_query(
+                context,
+                query.context_filters,
+                query.filters,
+                query.order_terms,
+                query.require_exact_context,
             )
-            _require_order_context_filters(normalized_order_terms, normalized_filters, context)
+            if not query.require_match:
+                if query.context_filters is None:
+                    _require_context_only_filters(normalized_filters, context)
+                elif normalized_filters:
+                    raise CustomImportReadRequestError("metric predicates require imported membership")
+            query_sha256 = _npi_entity_relation_fingerprint(
+                context.target,
+                normalized_filters,
+                normalized_order_terms,
+                context_filters=normalized_context_filters,
+            )
             return PreparedNpiEntityRelation(
-                statement=_npi_entity_relation_statement(context, normalized_filters, normalized_order_terms),
+                statement=_npi_entity_relation_statement(
+                    context,
+                    normalized_filters,
+                    normalized_order_terms,
+                    context_filters=normalized_context_filters,
+                ),
                 normalized_order_terms=normalized_order_terms,
-                query_fingerprint=_npi_entity_relation_fingerprint(normalized_filters, normalized_order_terms),
+                query_fingerprint=query_sha256,
                 authorization_scope_sha256=_scope_digest(authorization_scope),
             )
+
+    async def hydrate_npi_page(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        pinned_target: PinnedReadTarget,
+        prepared: PreparedNpiEntityRelation,
+        entity_values: tuple[str, ...],
+        query: NpiEntityRelationQuery = NpiEntityRelationQuery(),
+    ) -> dict[str, SearchItem]:
+        """Batch the same eligible winners for one native provider page."""
+
+        authorization_scope = self._authorize(authorization, pinned_target)
+        if type(query) is not NpiEntityRelationQuery:
+            raise CustomImportReadRequestError("provider relation query is invalid")
+        _validate_npi_entity_relation_request(query.filters, query.order_terms, context_filters=query.context_filters)
+        _validate_npi_page(entity_values)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+            context = await _load_read_context(session, pinned_target)
+            normalized_context_filters, normalized_filters, normalized_order = _normalized_npi_query(
+                context,
+                query.context_filters,
+                query.filters,
+                query.order_terms,
+            )
+            if (
+                type(prepared) is not PreparedNpiEntityRelation
+                or prepared.query_fingerprint
+                != _npi_entity_relation_fingerprint(
+                    context.target,
+                    normalized_filters,
+                    normalized_order,
+                    context_filters=normalized_context_filters,
+                )
+                or prepared.authorization_scope_sha256 != _scope_digest(authorization_scope)
+            ):
+                raise CustomImportReadUnavailableError("provider page query identity is unavailable")
+            statement = (
+                _filtered_npi_winner_statement(
+                    context,
+                    normalized_filters,
+                    context_filters=normalized_context_filters,
+                )
+                .add_columns(CustomImportEntityBinding.canonical_value)
+                .where(CustomImportEntityBinding.canonical_value.in_(entity_values))
+                .distinct(CustomImportEntityBinding.canonical_value)
+                .order_by(CustomImportEntityBinding.canonical_value, *_winner_order_terms(context, ()))
+            )
+            selected_rows = (await session.execute(statement)).all() if entity_values else ()
+            winners = tuple(
+                _winner_row(selected_row[:-1], context.profile_context_slot > 0) for selected_row in selected_rows
+            )
+            hydrated_items = await _hydrate_search_page_items(session, context, winners)
+            await verify_published_generation(session, pinned_target)
+            return {
+                selected_row[-1]: hydrated_item
+                for selected_row, hydrated_item in zip(selected_rows, hydrated_items, strict=True)
+            }
 
     async def root_detail(
         self,
@@ -1041,6 +1150,8 @@ def _normalize_query_order_terms(
 def _validate_npi_entity_relation_request(
     filters: tuple[ReadFilter, ...],
     order_terms: tuple[ReadOrderTerm, ...] | None,
+    *,
+    context_filters: tuple[ReadFilter, ...] | None = None,
 ) -> None:
     """Reject unbounded relation shapes before context loading."""
 
@@ -1048,10 +1159,48 @@ def _validate_npi_entity_relation_request(
         raise CustomImportReadRequestError("filters must be a tuple")
     if len(filters) > MAX_FILTER_TERMS:
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
+    if context_filters is not None and (type(context_filters) is not tuple or len(context_filters) > MAX_FILTER_TERMS):
+        raise CustomImportReadRequestError("context filter count exceeds the read-core limit")
+    if context_filters is not None and len(filters) + len(context_filters) > MAX_FILTER_TERMS:
+        raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     if order_terms is not None and type(order_terms) is not tuple:
         raise CustomImportReadRequestError("order_terms must be a tuple")
     if order_terms is not None and len(order_terms) > MAX_ORDER_TERMS:
         raise CustomImportReadRequestError("order term count exceeds the read-core limit")
+
+
+def _validate_npi_page(entity_values: tuple[str, ...]) -> None:
+    """Accept only bounded unique canonical NPI values from a native page."""
+
+    if (
+        type(entity_values) is not tuple
+        or len(entity_values) > MAX_NPI_PAGE_SIZE
+        or any(
+            type(value) is not str or len(value) != 10 or not value.isascii() or not value.isdigit()
+            for value in entity_values
+        )
+        or len(set(entity_values)) != len(entity_values)
+    ):
+        raise CustomImportReadRequestError("provider page identities are invalid")
+
+
+def _normalized_npi_query(context, context_filters, filters, order_terms, require_exact_context=False):
+    """Normalize legacy combined filters or v2 context and metric roles."""
+
+    normalized_filters = _normalized_filters(filters, context)
+    normalized_order = () if order_terms is None else _normalize_query_order_terms(order_terms, context, explicit=True)
+    if context_filters is None:
+        _require_order_context_filters(
+            normalized_order, normalized_filters, context, require_exact_context=require_exact_context
+        )
+        return (), normalized_filters, normalized_order
+    normalized_context_filters = _normalized_filters(context_filters, context)
+    context_dimensions = _verify_context_filters(normalized_context_filters, context)
+    _verify_metric_filters(normalized_filters, context_dimensions)
+    _require_order_context_filters(
+        normalized_order, normalized_context_filters, context, require_exact_context=require_exact_context
+    )
+    return normalized_context_filters, normalized_filters, normalized_order
 
 
 def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadContext) -> tuple[_NormalizedFilter, ...]:
@@ -1087,6 +1236,39 @@ def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadConte
             zip(descriptor_texts, normalized_filters, strict=True), key=lambda descriptor_pair: descriptor_pair[0]
         )
     )
+
+
+def _verify_context_filters(filters: tuple[_NormalizedFilter, ...], context: _ReadContext) -> tuple[str, ...]:
+    """Accept only one non-null equality selector for each declared context dimension."""
+
+    profile = next(
+        (
+            profile_candidate
+            for profile_candidate in context.definition.selection_profiles
+            if profile_candidate.profile_id == context.target.profile_id
+        ),
+        None,
+    )
+    if profile is None:
+        raise CustomImportReadUnavailableError("selection profile is not declared by the definition")
+    if len({predicate.field.field_id for predicate in filters}) != len(filters) or any(
+        predicate.field.field_id not in profile.context_dimensions
+        or predicate.operator != "eq"
+        or predicate.value is None
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("context selectors are invalid")
+    return profile.context_dimensions
+
+
+def _verify_metric_filters(filters: tuple[_NormalizedFilter, ...], context_dimensions: tuple[str, ...]) -> None:
+    """Limit v2 metric predicates to the metric comparison operators."""
+
+    if any(
+        predicate.operator not in {"eq", "gt", "lt"} or predicate.field.field_id in context_dimensions
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("metric filters are invalid")
 
 
 def _normalized_order_terms(
@@ -1245,13 +1427,19 @@ def _require_order_context_filters(
     order_terms: tuple[ReadOrderTerm, ...],
     filters: tuple[_NormalizedFilter, ...],
     context: _ReadContext,
+    *,
+    require_exact_context: bool = False,
 ) -> None:
-    """Require an exact selected context before projecting imported order values."""
+    """Require an exact context for imported order or an explicit host contract."""
 
-    if not order_terms:
+    if not order_terms and not require_exact_context:
         return
     profile = next(
-        (item for item in context.definition.selection_profiles if item.profile_id == context.target.profile_id),
+        (
+            profile_candidate
+            for profile_candidate in context.definition.selection_profiles
+            if profile_candidate.profile_id == context.target.profile_id
+        ),
         None,
     )
     if profile is None:
@@ -1272,14 +1460,34 @@ def _require_order_context_filters(
         raise CustomImportReadRequestError("context_required")
 
 
+def _require_context_only_filters(filters: tuple[_NormalizedFilter, ...], context: _ReadContext) -> None:
+    """Keep optional membership limited to declared context equality selectors."""
+
+    profile = next(
+        item for item in context.definition.selection_profiles if item.profile_id == context.target.profile_id
+    )
+    if any(
+        predicate.field.field_id not in profile.context_dimensions
+        or predicate.operator != "eq"
+        or predicate.value is None
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("metric predicates require imported membership")
+
+
 def _npi_entity_relation_fingerprint(
+    target: PinnedReadTarget,
     filters: tuple[_NormalizedFilter, ...],
     order_terms: tuple[ReadOrderTerm, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
 ) -> str:
     """Bind normalized imported query shape to the NPI relation domain."""
 
     query_shape_map = {
+        "target": _target_document(target),
         "adapter": "npi",
+        "context": [normalized_filter.descriptor for normalized_filter in context_filters],
         "filters": [normalized_filter.descriptor for normalized_filter in filters],
         "order": [{"field": term.field_id, "direction": term.direction, "nulls": term.nulls} for term in order_terms],
     }
@@ -1290,11 +1498,29 @@ def _npi_entity_relation_statement(
     context: _ReadContext,
     filters: tuple[_NormalizedFilter, ...],
     order_terms: tuple[ReadOrderTerm, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
 ) -> Select:
     """Project exact NPI bindings and optional winner-local typed sort values."""
 
+    statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
+    columns: list[object] = [CustomImportEntityBinding.canonical_value.label("entity_value")]
+    for ordinal, term in enumerate(order_terms):
+        field = context.definition.fields_by_id[term.field_id]
+        columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
+    return statement.with_only_columns(*columns, maintain_column_froms=True)
+
+
+def _filtered_npi_winner_statement(
+    context: _ReadContext,
+    filters: tuple[_NormalizedFilter, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
+) -> Select:
+    """Apply metric predicates only after one selected winner and context relation."""
+
     statement = (
-        _filtered_winner_statement(context, filters)
+        _filtered_winner_statement(context, context_filters)
         .join(
             CustomImportEntityBinding,
             and_(
@@ -1307,11 +1533,9 @@ def _npi_entity_relation_statement(
             CustomImportEntityBinding.adapter_id == "npi",
         )
     )
-    columns: list[object] = [CustomImportEntityBinding.canonical_value.label("entity_value")]
-    for ordinal, term in enumerate(order_terms):
-        field = context.definition.fields_by_id[term.field_id]
-        columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
-    return statement.with_only_columns(*columns, maintain_column_froms=True)
+    for predicate in filters:
+        statement = statement.where(_predicate_condition(predicate, context))
+    return statement
 
 
 def _winner_statement(context: _ReadContext):
@@ -1910,6 +2134,7 @@ __all__ = (
     "MAX_ORDER_TERMS",
     "MAX_PAGE_SIZE",
     "MAX_READ_TIMEOUT_MS",
+    "NpiEntityRelationQuery",
     "PinnedReadTarget",
     "PreparedNpiEntityRelation",
     "READ_CORE_CONTRACT",

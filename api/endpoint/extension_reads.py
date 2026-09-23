@@ -7,6 +7,9 @@ from typing import Any
 
 from sanic import Blueprint
 
+from api.custom_import_provider_geo import serve_custom_import_provider_geo
+from api.custom_import_provider_http import serve_custom_import_providers
+from api.custom_import_provider_service_http import serve_custom_import_provider_service
 from api.custom_import_read_http import serve_custom_import_detail, serve_custom_import_search
 
 blueprint = Blueprint("custom_import", url_prefix="/extensions/custom-import", version=1)
@@ -28,3 +31,24 @@ async def detail(request: Any):
     """Forward one full-family detail read through the closed signed boundary."""
 
     return await serve_custom_import_detail(request, _session(request))
+
+
+@blueprint.post("/providers", name="custom_import.providers")
+async def providers(request: Any):
+    """Compose imported filtering and ordering through the signed boundary."""
+
+    return await serve_custom_import_providers(request, _session(request))
+
+
+@blueprint.post("/providers/geo", name="custom_import.providers_geo")
+async def providers_geo(request: Any):
+    """Compose a pinned import with a live native geo page."""
+
+    return await serve_custom_import_provider_geo(request, _session(request))
+
+
+@blueprint.post("/providers/by-service", name="custom_import.providers_by_service")
+async def providers_by_service(request: Any):
+    """Compose imported fields with one authorized provider-service claims page."""
+
+    return await serve_custom_import_provider_service(request, _session(request))

@@ -232,6 +232,109 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CustomImportReadErrorResponse'
+  /extensions/custom-import/providers:
+    post:
+      operationId: listProvidersWithCustomImport
+      summary: Compose a signed, pinned import with a native provider page
+      description: |
+        Service-to-service provider-v2 read. Authorization precedes native and
+        imported data access. Imported selection and filtering precede native
+        pagination and exact totals; order-only reads retain absent imports last.
+        The canonical signed body contains all native and imported selectors.
+      parameters:
+        - $ref: '#/components/parameters/CustomImportProviderReadContext'
+        - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
+        - $ref: '#/components/parameters/CustomImportProviderReadSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportProviderRequest'
+      responses:
+        '200':
+          description: Native provider page with one nullable imported projection per row.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportProviderListPage'
+        '400':
+          $ref: '#/components/responses/CustomImportProviderInvalidRequest'
+        '404':
+          $ref: '#/components/responses/CustomImportProviderNotFound'
+        '503':
+          $ref: '#/components/responses/CustomImportProviderUnavailable'
+  /extensions/custom-import/providers/geo:
+    post:
+      operationId: listGeoProvidersWithCustomImport
+      summary: Compose a signed, pinned import with a native geo provider page
+      description: |
+        Service-to-service provider-v2 read. The opaque cursor binds the exact
+        target, effective native and imported query, authorization scope, and expiry.
+        Each page has an exact total within its read snapshot.
+      parameters:
+        - $ref: '#/components/parameters/CustomImportProviderReadContext'
+        - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
+        - $ref: '#/components/parameters/CustomImportProviderReadSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportProviderRequest'
+      responses:
+        '200':
+          description: Geo provider-address page with nullable imported projections.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportProviderGeoPage'
+        '400':
+          $ref: '#/components/responses/CustomImportProviderInvalidRequest'
+        '404':
+          $ref: '#/components/responses/CustomImportProviderNotFound'
+        '503':
+          $ref: '#/components/responses/CustomImportProviderUnavailable'
+  /extensions/custom-import/providers/by-service:
+    post:
+      operationId: listServiceProvidersWithCustomImport
+      summary: Compose a signed, pinned import with a native service provider page
+      description: |
+        Service-to-service provider-v2 read. The signed native query must contain
+        code and code_system. Imported selection and ordering precede native
+        claims thresholds, pagination, and exact totals.
+      parameters:
+        - $ref: '#/components/parameters/CustomImportProviderReadContext'
+        - $ref: '#/components/parameters/CustomImportProviderReadKeyId'
+        - $ref: '#/components/parameters/CustomImportProviderReadSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomImportProviderRequest'
+      responses:
+        '200':
+          description: Native service provider page with nullable imported projections.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CustomImportReadCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomImportProviderServicePage'
+        '400':
+          $ref: '#/components/responses/CustomImportProviderInvalidRequest'
+        '404':
+          $ref: '#/components/responses/CustomImportProviderNotFound'
+        '503':
+          $ref: '#/components/responses/CustomImportProviderUnavailable'
   /plan/:
     get:
       operationId: getPlan
@@ -6895,6 +6998,36 @@ components:
         type: string
         enum: ['private, no-store']
   parameters:
+    CustomImportProviderReadContext:
+      name: X-HealthPorta-Extension-Read-Context
+      in: header
+      required: true
+      description: Base64url-encoded canonical provider-v2 signed request context.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 3072
+        pattern: '^[A-Za-z0-9_-]+$'
+    CustomImportProviderReadKeyId:
+      name: X-HealthPorta-Extension-Read-Key-Id
+      in: header
+      required: true
+      description: Identifier of the configured transport signing key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 32
+        pattern: '^[a-z0-9][a-z0-9-]{0,31}$'
+    CustomImportProviderReadSignature:
+      name: X-HealthPorta-Extension-Read-Signature
+      in: header
+      required: true
+      description: Base64url-encoded provider-v2 HMAC-SHA256 signature.
+      schema:
+        type: string
+        minLength: 43
+        maxLength: 43
+        pattern: '^[A-Za-z0-9_-]{43}$'
     PaginationLimit:
       name: limit
       in: query
@@ -6977,6 +7110,33 @@ components:
         minLength: 1
         maxLength: 512
   responses:
+    CustomImportProviderInvalidRequest:
+      description: The signed provider request or cursor violates the bounded read contract.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CustomImportReadCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CustomImportReadErrorResponse'
+    CustomImportProviderNotFound:
+      description: The permit, target, or authorization boundary is not available to the caller.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CustomImportReadCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CustomImportReadErrorResponse'
+    CustomImportProviderUnavailable:
+      description: The exact pinned provider read cannot be served within its bounded window.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CustomImportReadCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CustomImportReadErrorResponse'
     FHIRFormularyInvalidRequest:
       description: Invalid or unsupported public selector
       headers:
@@ -7021,6 +7181,151 @@ components:
           type: string
         details:
           type: string
+      additionalProperties: true
+    CustomImportProviderRequest:
+      type: object
+      additionalProperties: false
+      required: [target, native_query, context, filters, order, require_match]
+      properties:
+        target:
+          $ref: '#/components/schemas/CustomImportReadTarget'
+        native_query:
+          type: object
+          description: Signed native query values; only name_like on provider list accepts a string array.
+          additionalProperties:
+            oneOf:
+              - type: string
+                maxLength: 2048
+              - type: array
+                minItems: 1
+                maxItems: 16
+                items:
+                  type: string
+                  maxLength: 2048
+        context:
+          type: array
+          maxItems: 3
+          description: Non-null equality selectors for declared selection-context dimensions.
+          items:
+            $ref: '#/components/schemas/CustomImportProviderPredicate'
+        filters:
+          type: array
+          maxItems: 3
+          description: Non-null metric predicates; context and filters together are limited to three terms.
+          items:
+            $ref: '#/components/schemas/CustomImportProviderPredicate'
+        order:
+          type: array
+          nullable: true
+          minItems: 1
+          maxItems: 3
+          items:
+            type: object
+            additionalProperties: false
+            required: [field_id, direction]
+            properties:
+              field_id:
+                type: string
+                pattern: '^[a-z][a-z0-9_]{0,62}$'
+              direction:
+                type: string
+                enum: [asc, desc]
+        require_match:
+          type: boolean
+          description: False requires imported ordering and retains absent imports last.
+    CustomImportProviderPredicate:
+      type: object
+      additionalProperties: false
+      required: [field_id, operator, value]
+      properties:
+        field_id:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,62}$'
+        operator:
+          type: string
+          enum: [eq, gt, lt]
+        value:
+          oneOf:
+            - type: string
+              maxLength: 2048
+            - type: integer
+              format: int64
+            - type: boolean
+    CustomImportProviderResult:
+      type: object
+      required: [npi, custom_import]
+      properties:
+        npi:
+          oneOf:
+            - type: string
+            - type: integer
+              format: int64
+        custom_import:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [target, root_fields, context_fields]
+          properties:
+            target:
+              $ref: '#/components/schemas/CustomImportReadTarget'
+            root_fields:
+              type: array
+              items:
+                $ref: '#/components/schemas/CustomImportReadFieldValue'
+            context_fields:
+              type: array
+              items:
+                $ref: '#/components/schemas/CustomImportReadFieldValue'
+      additionalProperties: true
+    CustomImportProviderListPage:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/CustomImportProviderResult'
+      additionalProperties: true
+    CustomImportProviderGeoPage:
+      type: object
+      additionalProperties: false
+      required: [items, total_count, has_more, next_cursor, result_identity]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CustomImportProviderResult'
+        total_count:
+          type: integer
+          format: int64
+          minimum: 0
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+        result_identity:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+          example: [npi, address_key]
+    CustomImportProviderServicePage:
+      type: object
+      required: [items, pagination, query]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/CustomImportProviderResult'
+        pagination:
+          type: object
+        query:
+          type: object
       additionalProperties: true
     CustomImportReadRequest:
       type: object
