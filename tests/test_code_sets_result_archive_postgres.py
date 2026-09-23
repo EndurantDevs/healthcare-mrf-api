@@ -64,7 +64,7 @@ def _dsn():
         url.drivername != "postgresql"
         or url.username != "postgres"
         or url.host not in {"127.0.0.1", "localhost"}
-        or url.port != 5440
+        or url.port not in {5432, 5440}
     ):
         pytest.fail("code-set archive test requires a dedicated local PostgreSQL database")
     if not re.fullmatch(r"hc_scoped_reference_[0-9a-f]{32}", url.database or ""):

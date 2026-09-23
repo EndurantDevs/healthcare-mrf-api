@@ -26,7 +26,10 @@ def _dsn() -> str:
     if not raw:
         pytest.skip("HLTHPRT_FACILITY_PUBLICATION_TEST_DSN is not set")
     url = make_url(raw)
-    if (url.drivername, url.username, url.host, url.port) != ("postgresql", "postgres", "127.0.0.1", 5440):
+    if (
+        (url.drivername, url.username, url.host) != ("postgresql", "postgres", "127.0.0.1")
+        or url.port not in {5432, 5440}
+    ):
         pytest.fail("facility publication test requires a dedicated local PostgreSQL database")
     if not re.fullmatch(r"hc_facility_publication_[0-9a-f]{32}", url.database or ""):
         pytest.fail("facility publication test requires its dedicated local database")
