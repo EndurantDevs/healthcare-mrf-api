@@ -52,6 +52,14 @@ _DETAIL_BODY = (
     b'{"dataset_key":"synthetic_dataset","definition_revision_id":21,"generation_id":101,'
     b'"profile_id":"synthetic_profile","schema_revision_id":31}}'
 )
+_PROVIDER_VECTOR_BODY = (
+    b'{"context":[{"field_id":"region","operator":"eq","value":"north"}],"filters":'
+    b'[{"field_id":"status","operator":"eq","value":"active"}],"native_query":'
+    b'{"include_total":"true","limit":"2","page":"3","q":"synthetic"},"order":'
+    b'[{"direction":"desc","field_id":"score"}],"require_match":true,"target":'
+    b'{"dataset_key":"synthetic_dataset","definition_revision_id":21,"generation_id":101,'
+    b'"profile_id":"synthetic_profile","schema_revision_id":31}}'
+)
 
 
 def _encoded(value: bytes) -> str:
@@ -76,14 +84,17 @@ def _headers(
     scope: str = "a" * 64,
     request_id: str = "123e4567-e89b-42d3-a456-426614174000",
     path: str = http.CUSTOM_IMPORT_READ_PATH,
+    contract: str = http.CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
+    body_sha256=http.custom_import_read_body_sha256,
+    signature_message=http.custom_import_read_signature_message,
 ) -> dict[str, str]:
     context = json.dumps(
         {
             "audience": http.CUSTOM_IMPORT_READ_AUDIENCE,
             "authorization_scope_sha256": scope,
-            "body_sha256": http.custom_import_read_body_sha256(body),
+            "body_sha256": body_sha256(body),
             "capability": http.CUSTOM_IMPORT_READ_CAPABILITY,
-            "contract": http.CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
+            "contract": contract,
             "expires_at": "2031-01-02T03:05:05Z",
             "issued_at": "2031-01-02T03:04:05Z",
             "issuer": http.CUSTOM_IMPORT_READ_ISSUER,
@@ -97,7 +108,7 @@ def _headers(
     ).encode("ascii")
     signature = hmac.new(
         _KEY,
-        http.custom_import_read_signature_message(_KEY_ID, context),
+        signature_message(_KEY_ID, context),
         hashlib.sha256,
     ).digest()
     return {
@@ -107,8 +118,22 @@ def _headers(
     }
 
 
-def _resigned_headers(*, body: bytes = _BODY, path: str = http.CUSTOM_IMPORT_READ_PATH, **changes) -> dict[str, str]:
-    headers = _headers(body=body, path=path)
+def _resigned_headers(
+    *,
+    body: bytes = _BODY,
+    path: str = http.CUSTOM_IMPORT_READ_PATH,
+    contract: str = http.CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
+    body_sha256=http.custom_import_read_body_sha256,
+    signature_message=http.custom_import_read_signature_message,
+    **changes,
+) -> dict[str, str]:
+    headers = _headers(
+        body=body,
+        path=path,
+        contract=contract,
+        body_sha256=body_sha256,
+        signature_message=signature_message,
+    )
     encoded = headers[http.CUSTOM_IMPORT_READ_CONTEXT_HEADER]
     context = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     for name, value in changes.items():
@@ -119,9 +144,34 @@ def _resigned_headers(*, body: bytes = _BODY, path: str = http.CUSTOM_IMPORT_REA
     canonical = http._canonical_json_bytes(context)
     headers[http.CUSTOM_IMPORT_READ_CONTEXT_HEADER] = _encoded(canonical)
     headers[http.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = _encoded(
-        hmac.new(_KEY, http.custom_import_read_signature_message(_KEY_ID, canonical), hashlib.sha256).digest()
+        hmac.new(_KEY, signature_message(_KEY_ID, canonical), hashlib.sha256).digest()
     )
     return headers
+
+
+def _provider_headers(*, body: bytes = _BODY, path: str) -> dict[str, str]:
+    """Create a provider-only v2 permit from the shared synthetic keyring."""
+
+    return _headers(
+        body=body,
+        path=path,
+        contract=http.CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
+        body_sha256=http.custom_import_provider_body_sha256,
+        signature_message=http.custom_import_provider_signature_message,
+    )
+
+
+def _resigned_provider_headers(*, body: bytes = _BODY, path: str, **changes) -> dict[str, str]:
+    """Re-sign one provider-only v2 permit after changing its context."""
+
+    return _resigned_headers(
+        body=body,
+        path=path,
+        contract=http.CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
+        body_sha256=http.custom_import_provider_body_sha256,
+        signature_message=http.custom_import_provider_signature_message,
+        **changes,
+    )
 
 
 @dataclass
@@ -223,6 +273,26 @@ def test_fixed_cross_service_signing_vector() -> None:
         http.custom_import_read_body_sha256(_BODY) == "92134c5517296b759b9ff515a7990992aebaeb0bb7a27f5d7cb33ebc4e1292cc"
     )
     assert headers[http.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] == "0lPhXUpjLydSp9KP9PfUWW4pKH6urmluooCuO8LdWtQ"
+
+
+@pytest.mark.parametrize(
+    ("path", "signature"),
+    (
+        ("/api/v1/extensions/custom-import/providers", "MLw8nzQsW5TPQyDLljpQdUalI8i0U3ZBnOrI7iHY7_o"),
+        ("/api/v1/extensions/custom-import/providers/geo", "R4lB57L1YbobB2nqunUnZ8-JvsFre5XxVA2LiLYlbA4"),
+        ("/api/v1/extensions/custom-import/providers/by-service", "eZOOZTD-XitZGg5lE2xK4rOfcl1xU1kbBa5pXfG-ZEw"),
+    ),
+)
+def test_fixed_provider_v2_cross_service_signing_vectors(path, signature) -> None:
+    """Provider routes share v2 framing and bind their distinct paths."""
+
+    headers = _provider_headers(body=_PROVIDER_VECTOR_BODY, path=path)
+
+    assert http.CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT == "healthporta.custom-import-extension-read-transport.v2"
+    assert http.custom_import_provider_body_sha256(_PROVIDER_VECTOR_BODY) == (
+        "27cbb313f4bcd26a4a5c2eccd7c227e2bfca55b167692512707afdd2305217d5"
+    )
+    assert headers[http.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] == signature
 
 
 def test_transport_accepts_runtime_multidict_header_keys() -> None:

@@ -13,11 +13,11 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import orjson
 from sanic import response
@@ -43,7 +43,11 @@ from process.custom_import.read_core import (
     SearchRequest,
 )
 
+if TYPE_CHECKING:
+    from api.custom_import_provider_http import _ParsedProviderRequest
+
 CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT = "healthporta.custom-import-extension-read-transport.v1"
+CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT = "healthporta.custom-import-extension-read-transport.v2"
 CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_CONTRACT = "healthporta.custom-import-extension-read-transport-keyring.v1"
 CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV = "HLTHPRT_CUSTOM_IMPORT_EXTENSION_READ_TRANSPORT_KEYRING_JSON"
 CUSTOM_IMPORT_READ_CURSOR_SECRET_ENV = "HLTHPRT_CUSTOM_IMPORT_READ_CURSOR_SECRET_BASE64URL"
@@ -68,6 +72,8 @@ _KEY_BYTES = 32
 _SIGNATURE_BYTES = 32
 _BODY_HASH_DOMAIN = b"HEALTHPORTA_CUSTOM_IMPORT_EXTENSION_READ_BODY_V1\x00"
 _SIGNATURE_DOMAIN = b"HEALTHPORTA_CUSTOM_IMPORT_EXTENSION_READ_TRANSPORT_V1\x00"
+_PROVIDER_BODY_HASH_DOMAIN = b"HEALTHPORTA_CUSTOM_IMPORT_EXTENSION_READ_BODY_V2\x00"
+_PROVIDER_SIGNATURE_DOMAIN = b"HEALTHPORTA_CUSTOM_IMPORT_EXTENSION_READ_TRANSPORT_V2\x00"
 _CURSOR_DOMAIN = b"HEALTHPORTA_CUSTOM_IMPORT_EXTENSION_READ_CURSOR_V1\x00"
 _HEADER_PREFIX = "x-healthporta-extension-read-"
 _HEADER_NAMES = (
@@ -139,6 +145,14 @@ def custom_import_read_body_sha256(body: bytes) -> str:
     return _framed_sha256(_BODY_HASH_DOMAIN, body)
 
 
+def custom_import_provider_body_sha256(body: bytes) -> str:
+    """Return the provider-v2 framed digest for one canonical body."""
+
+    if type(body) is not bytes or not 1 <= len(body) <= _MAX_BODY_BYTES:
+        raise _fail()
+    return _framed_sha256(_PROVIDER_BODY_HASH_DOMAIN, body)
+
+
 def custom_import_read_signature_message(key_id: str, context: bytes) -> bytes:
     """Return the exact HMAC input used by the fixed cross-service contract."""
 
@@ -154,6 +168,47 @@ def custom_import_read_signature_message(key_id: str, context: bytes) -> bytes:
             context,
         )
     )
+
+
+def custom_import_provider_signature_message(key_id: str, context: bytes) -> bytes:
+    """Return the exact provider-v2 HMAC input for a signed context."""
+
+    if _KEY_ID.fullmatch(key_id) is None or not 1 <= len(context) <= _MAX_CONTEXT_BYTES:
+        raise _fail()
+    encoded_key_id = key_id.encode("ascii")
+    return b"".join(
+        (
+            _PROVIDER_SIGNATURE_DOMAIN,
+            len(encoded_key_id).to_bytes(2, "big"),
+            encoded_key_id,
+            len(context).to_bytes(8, "big"),
+            context,
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _TransportContract:
+    """Keep one transport's fixed framing values together."""
+
+    name: str
+    body_sha256: Callable[[bytes], str]
+    signature_message: Callable[[str, bytes], bytes]
+    credential_domain: bytes
+
+
+_GENERIC_TRANSPORT = _TransportContract(
+    CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
+    custom_import_read_body_sha256,
+    custom_import_read_signature_message,
+    _SIGNATURE_DOMAIN,
+)
+_PROVIDER_TRANSPORT = _TransportContract(
+    CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT,
+    custom_import_provider_body_sha256,
+    custom_import_provider_signature_message,
+    _PROVIDER_SIGNATURE_DOMAIN,
+)
 
 
 def _base64url_encode(value: bytes) -> str:
@@ -535,7 +590,12 @@ class _VerifiedTransport:
     target: _TransportTarget
 
 
-def _verified_context(headers: Mapping[str, Any], keyring: _Keyring) -> tuple[bytes, dict[str, object]]:
+def _verified_context(
+    headers: Mapping[str, Any],
+    keyring: _Keyring,
+    *,
+    transport_contract: _TransportContract = _GENERIC_TRANSPORT,
+) -> tuple[bytes, dict[str, object]]:
     context_header, key_id, signature_header = _closed_headers(headers)
     if (
         len(context_header) > _MAX_CONTEXT_CHARACTERS
@@ -549,7 +609,7 @@ def _verified_context(headers: Mapping[str, Any], keyring: _Keyring) -> tuple[by
         raise _fail()
     expected_signature = hmac.new(
         keyring.key_for(key_id),
-        custom_import_read_signature_message(key_id, context),
+        transport_contract.signature_message(key_id, context),
         hashlib.sha256,
     ).digest()
     if not hmac.compare_digest(signature, expected_signature):
@@ -568,14 +628,15 @@ def _verify_transport(
     *,
     headers: Mapping[str, Any],
     body: bytes,
-    request: _ParsedSearchRequest | _ParsedDetailRequest,
+    request: _ParsedSearchRequest | _ParsedDetailRequest | _ParsedProviderRequest,
     trusted_now: str,
     keyring: _Keyring,
     path: str = CUSTOM_IMPORT_READ_PATH,
+    transport_contract: _TransportContract = _GENERIC_TRANSPORT,
 ) -> _VerifiedTransport:
     """Verify one signed transport permit against the exact request."""
 
-    context, context_fields = _verified_context(headers, keyring)
+    context, context_fields = _verified_context(headers, keyring, transport_contract=transport_contract)
     issued_at, issued = _canonical_utc(context_fields.get("issued_at"))
     expires_at, expires = _canonical_utc(context_fields.get("expires_at"))
     _now, now = _canonical_utc(trusted_now)
@@ -593,9 +654,9 @@ def _verify_transport(
         raise _fail()
     expected_by_field = {
         "audience": CUSTOM_IMPORT_READ_AUDIENCE,
-        "body_sha256": custom_import_read_body_sha256(body),
+        "body_sha256": transport_contract.body_sha256(body),
         "capability": CUSTOM_IMPORT_READ_CAPABILITY,
-        "contract": CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT,
+        "contract": transport_contract.name,
         "issuer": CUSTOM_IMPORT_READ_ISSUER,
         "method": "POST",
         "path": path,
@@ -608,8 +669,30 @@ def _verify_transport(
     transport_target = _parse_target(context_fields.get("target"))
     if transport_target != request.target or _target_document(transport_target) != context_fields["target"]:
         raise _fail()
-    credential = _framed_sha256(_SIGNATURE_DOMAIN, context)
+    credential = _framed_sha256(transport_contract.credential_domain, context)
     return _VerifiedTransport(credential=credential, scope=scope, target=transport_target)
+
+
+def _verify_provider_transport(
+    *,
+    headers: Mapping[str, Any],
+    body: bytes,
+    request: _ParsedProviderRequest,
+    trusted_now: str,
+    keyring: _Keyring,
+    path: str,
+) -> _VerifiedTransport:
+    """Verify the provider-only v2 transport without changing generic reads."""
+
+    return _verify_transport(
+        headers=headers,
+        body=body,
+        request=request,
+        trusted_now=trusted_now,
+        keyring=keyring,
+        path=path,
+        transport_contract=_PROVIDER_TRANSPORT,
+    )
 
 
 class _TransportAuthorizer:
@@ -701,15 +784,16 @@ def _page_payload(page: Any, target: _TransportTarget) -> dict[str, object]:
     return {
         "target": _target_document(target),
         "total": page.total,
-        "items": [
-            {
-                "root_fields": [_field_value(value) for value in item.root_fields],
-                "context_fields": [_field_value(value) for value in item.context_fields],
-            }
-            for item in page.items
-        ],
+        "items": [_search_item_payload(item) for item in page.items],
         "next_cursor": page.next_cursor,
         "expires_at": page.expires_at,
+    }
+
+
+def _search_item_payload(item: Any) -> dict[str, object]:
+    return {
+        "root_fields": [_field_value(value) for value in item.root_fields],
+        "context_fields": [_field_value(value) for value in item.context_fields],
     }
 
 
@@ -860,6 +944,9 @@ __all__ = (
     "CUSTOM_IMPORT_READ_TRANSPORT_CONTRACT",
     "CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_CONTRACT",
     "CUSTOM_IMPORT_READ_TRANSPORT_KEYRING_ENV",
+    "CUSTOM_IMPORT_PROVIDER_TRANSPORT_CONTRACT",
+    "custom_import_provider_body_sha256",
+    "custom_import_provider_signature_message",
     "custom_import_read_body_sha256",
     "custom_import_read_signature_message",
     "serve_custom_import_detail",

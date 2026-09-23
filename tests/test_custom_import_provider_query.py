@@ -7,7 +7,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -20,6 +20,7 @@ from process.custom_import.read_core import (
     CustomImportReadService,
     ExtensionReadAuthorization,
     ExtensionReadScope,
+    NpiEntityRelationQuery,
     PinnedReadTarget,
     ReadFilter,
     ReadOrderTerm,
@@ -36,7 +37,12 @@ def _target() -> PinnedReadTarget:
     )
 
 
-def _context(*, aliases: bool = False, context_dimensions: tuple[str, ...] | None = None):
+def _context(
+    *,
+    aliases: bool = False,
+    context_dimensions: tuple[str, ...] | None = None,
+    sortable_fields: tuple[str, ...] | None = None,
+):
     raw = load_json_definition((Path(__file__).with_name("fixtures") / "custom_import/v1_valid.json").read_text())
     if aliases:
         raw["query"].update(
@@ -47,6 +53,8 @@ def _context(*, aliases: bool = False, context_dimensions: tuple[str, ...] | Non
         )
     if context_dimensions is not None:
         raw["selection_profiles"][0]["context_dimensions"] = list(context_dimensions)
+    if sortable_fields is not None:
+        raw["query"]["sortable_fields"] = list(sortable_fields)
     definition = CustomImportDefinition.from_mapping(raw)
     return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
 
@@ -95,14 +103,24 @@ async def test_provider_query_boundary_rejects_unbounded_shapes_before_context_l
     over_limit_filters = tuple(ReadFilter("npi", "eq", "1234567893") for _ in range(read_core.MAX_FILTER_TERMS + 1))
     over_limit_order_terms = tuple(ReadOrderTerm("amount", "asc", "last") for _ in range(read_core.MAX_ORDER_TERMS + 1))
 
-    for filters, order_terms in (([], None), (over_limit_filters, None), ((), []), ((), over_limit_order_terms)):
+    for filters, context_filters, order_terms in (
+        ([], None, None),
+        (over_limit_filters, None, None),
+        ((), over_limit_filters, None),
+        ((ReadFilter("npi", "eq", "1234567893"),) * 2, (ReadFilter("service", "eq", "99213"),) * 2, None),
+        ((), None, []),
+        ((), None, over_limit_order_terms),
+    ):
         with pytest.raises(CustomImportReadRequestError):
             await service.prepare_npi_entity_relation(
                 object(),
                 authorization=ExtensionReadAuthorization("synthetic-token"),
                 target=_target(),
-                filters=filters,
-                order_terms=order_terms,
+                query=NpiEntityRelationQuery(
+                    filters=filters,
+                    context_filters=context_filters,
+                    order_terms=order_terms,
+                ),
             )
 
     load_context.assert_not_awaited()
@@ -124,10 +142,153 @@ def test_provider_query_normalizes_aliases_before_context_binding_and_fingerprin
     )
 
     assert aliased_order == canonical_order == (ReadOrderTerm("amount", "desc", "last"),)
-    assert read_core._npi_entity_relation_fingerprint(aliased_filters, aliased_order) == (
-        read_core._npi_entity_relation_fingerprint(canonical_filters, canonical_order)
+    assert read_core._npi_entity_relation_fingerprint(context.target, aliased_filters, aliased_order) == (
+        read_core._npi_entity_relation_fingerprint(context.target, canonical_filters, canonical_order)
     )
-    assert len(read_core._npi_entity_relation_fingerprint(aliased_filters, aliased_order)) == 64
+    assert len(read_core._npi_entity_relation_fingerprint(context.target, aliased_filters, aliased_order)) == 64
+
+
+def test_provider_v2_query_normalizes_roles_before_binding_and_fingerprinting():
+    context = _context(aliases=True)
+    context_filters, metric_filters, order_terms = read_core._normalized_npi_query(
+        context,
+        (ReadFilter("service", "eq", "99213"),),
+        (ReadFilter("metric", "gt", "5"),),
+        (ReadOrderTerm("metric", "desc", "last"),),
+    )
+
+    assert context_filters[0].field.field_id == "service_code"
+    assert metric_filters[0].field.field_id == "amount"
+    assert order_terms == (ReadOrderTerm("amount", "desc", "last"),)
+    repeated = read_core._normalized_filters((ReadFilter("service", "eq", "99213"),), context)
+    assert read_core._npi_entity_relation_fingerprint(
+        context.target, (), order_terms, context_filters=repeated
+    ) != read_core._npi_entity_relation_fingerprint(context.target, repeated, order_terms)
+
+
+@pytest.mark.parametrize(
+    ("context_filters", "filters"),
+    (
+        ((ReadFilter("metric", "eq", "5"),), ()),
+        ((ReadFilter("service", "neq", "99213"),), ()),
+        ((), (ReadFilter("service", "eq", "99213"),)),
+        ((), (ReadFilter("metric", "gte", "5"),)),
+    ),
+)
+def test_provider_v2_query_rejects_crossed_context_and_metric_roles(context_filters, filters):
+    with pytest.raises(CustomImportReadRequestError):
+        read_core._normalized_npi_query(_context(aliases=True), context_filters, filters, None)
+
+
+def test_provider_v2_relation_applies_metric_predicates_after_context_winner_selection(monkeypatch):
+    context = _context(aliases=True)
+    context_filters = read_core._normalized_filters((ReadFilter("service", "eq", "99213"),), context)
+    metric_filters = read_core._normalized_filters((ReadFilter("metric", "gt", "5"),), context)
+    selected = Mock()
+    joined = Mock()
+    bound = Mock()
+    metric_bound = Mock()
+    selected.join.return_value = joined
+    joined.where.return_value = bound
+    bound.where.return_value = metric_bound
+    observed_context_filters = []
+    observed_metric_filters = []
+
+    def selected_winners(_context, received_context_filters):
+        observed_context_filters.append(received_context_filters)
+        return selected
+
+    def metric_predicate(received_metric_filter, _context):
+        observed_metric_filters.append(received_metric_filter)
+        return object()
+
+    monkeypatch.setattr(read_core, "_filtered_winner_statement", selected_winners)
+    monkeypatch.setattr(read_core, "_predicate_condition", metric_predicate)
+
+    assert (
+        read_core._filtered_npi_winner_statement(context, metric_filters, context_filters=context_filters)
+        is metric_bound
+    )
+    assert observed_context_filters == [context_filters]
+    assert observed_metric_filters == list(metric_filters)
+    assert bound.where.call_count == len(metric_filters)
+
+
+@pytest.mark.asyncio
+async def test_provider_v2_optional_membership_keeps_multi_context_filter_only_queries(monkeypatch):
+    @asynccontextmanager
+    async def bounded(session, *, timeout_ms):
+        del session, timeout_ms
+        yield
+
+    statement = Mock()
+    monkeypatch.setattr(read_core, "_bounded_read_window", bounded)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=_context(aliases=True)))
+    monkeypatch.setattr(read_core, "_npi_entity_relation_statement", statement)
+    service = CustomImportReadService(authorizer=_Allow())
+    query = NpiEntityRelationQuery(
+        context_filters=(ReadFilter("service", "eq", "99213"),),
+        require_match=False,
+    )
+
+    await service.prepare_npi_entity_relation(
+        object(),
+        authorization=ExtensionReadAuthorization("synthetic-token"),
+        target=_target(),
+        query=query,
+    )
+    statement.assert_called_once()
+    with pytest.raises(CustomImportReadRequestError, match="metric predicates require imported membership"):
+        await service.prepare_npi_entity_relation(
+            object(),
+            authorization=ExtensionReadAuthorization("synthetic-token"),
+            target=_target(),
+            query=NpiEntityRelationQuery(
+                context_filters=query.context_filters,
+                filters=(ReadFilter("metric", "gt", "5"),),
+                require_match=False,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filters", "require_match", "rejected"),
+    [
+        ((), False, False),
+        ((ReadFilter("service", "eq", "99213"),), False, False),
+        ((ReadFilter("service_code", "eq", "99213"),), False, False),
+        ((ReadFilter("metric", "eq", "5"),), False, True),
+        ((ReadFilter("service", "eq", "99213"), ReadFilter("metric", "eq", "5")), False, True),
+        ((ReadFilter("amount", "gt", "5"),), False, True),
+        ((ReadFilter("service", "is_null"),), False, True),
+        ((ReadFilter("metric", "eq", "5"),), True, False),
+    ],
+)
+async def test_provider_query_optional_membership_only_accepts_declared_context(
+    monkeypatch, filters, require_match, rejected
+):
+    @asynccontextmanager
+    async def bounded(session, *, timeout_ms):
+        yield
+
+    statement = Mock()
+    monkeypatch.setattr(read_core, "_bounded_read_window", bounded)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=_context(aliases=True)))
+    monkeypatch.setattr(read_core, "_npi_entity_relation_statement", statement)
+    service = CustomImportReadService(authorizer=_Allow())
+    request_arguments_by_name = dict(
+        authorization=ExtensionReadAuthorization("synthetic-token"),
+        target=_target(),
+        query=NpiEntityRelationQuery(filters=filters, require_match=require_match),
+    )
+    if rejected:
+        with pytest.raises(CustomImportReadRequestError, match="metric predicates require imported membership"):
+            await service.prepare_npi_entity_relation(object(), **request_arguments_by_name)
+        statement.assert_not_called()
+    else:
+        await service.prepare_npi_entity_relation(object(), **request_arguments_by_name)
+        statement.assert_called_once()
 
 
 def test_provider_query_order_requires_each_exact_context_dimension():
@@ -162,6 +323,14 @@ def test_provider_query_order_requires_each_exact_context_dimension():
         explicit=True,
     )
     read_core._require_order_context_filters(no_dimension_order, (), no_dimension_context)
+
+
+def test_provider_query_filter_only_can_require_one_exact_child_context():
+    context = _context(aliases=True)
+    with pytest.raises(CustomImportReadRequestError, match="^context_required$"):
+        read_core._require_order_context_filters((), (), context, require_exact_context=True)
+    filters = read_core._normalized_filters((ReadFilter("service", "eq", "99213"),), context)
+    read_core._require_order_context_filters((), filters, context, require_exact_context=True)
 
 
 def test_provider_query_relation_projects_only_requested_typed_sort_columns_without_limit():
@@ -217,5 +386,31 @@ async def test_provider_query_none_order_avoids_defaults_and_caches(monkeypatch)
             session,
             authorization=ExtensionReadAuthorization("synthetic-token"),
             target=_target(),
-            order_terms=(ReadOrderTerm("amount", "asc", "last"),),
+            query=NpiEntityRelationQuery(order_terms=(ReadOrderTerm("amount", "asc", "last"),)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_v2_root_rollup_sort_keeps_the_child_context_guard(monkeypatch):
+    """A child-profile root sort cannot fan out across unselected child winners."""
+
+    @asynccontextmanager
+    async def unbounded_window(session, *, timeout_ms):
+        del session, timeout_ms
+        yield
+
+    context = _context(sortable_fields=("npi",))
+    monkeypatch.setattr(read_core, "_bounded_read_window", unbounded_window)
+    monkeypatch.setattr(read_core, "_load_read_context", AsyncMock(return_value=context))
+    service = CustomImportReadService(authorizer=_Allow())
+
+    with pytest.raises(CustomImportReadRequestError, match="^context_required$"):
+        await service.prepare_npi_entity_relation(
+            object(),
+            authorization=ExtensionReadAuthorization("synthetic-token"),
+            target=_target(),
+            query=NpiEntityRelationQuery(
+                context_filters=(),
+                order_terms=(ReadOrderTerm("npi", "asc", "last"),),
+            ),
         )

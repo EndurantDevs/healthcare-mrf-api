@@ -5,7 +5,10 @@ import os
 import pytest
 from sqlalchemy import text
 
-from api.endpoint import npi as npi_module
+from api.provider_list_sql import (
+    _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES,
+    _PHONE_CANDIDATE_ROWS_CTE,
+)
 from db.models import db
 
 
@@ -45,19 +48,25 @@ def _phone_candidate_membership_sql() -> str:
                NULL::varchar AS type
          WHERE false
     )"""
-    candidate_rows = npi_module._PHONE_CANDIDATE_ROWS_CTE.format(
+    candidate_rows = _PHONE_CANDIDATE_ROWS_CTE.format(
         address_table_sql=empty_address_relation,
         service_types="'primary'",
         direct_phone="false",
     )
     return f"""
-        WITH {npi_module._CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip()},
+        WITH {_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip()},
              {candidate_rows.strip()}
         SELECT provider_npi, address_key::text AS address_key, source_record_id
           FROM phone_candidate_rows
          WHERE provider_directory_matched
       ORDER BY provider_npi
     """
+
+
+def test_phone_candidate_membership_sql_uses_provider_list_ctes():
+    sql = _phone_candidate_membership_sql()
+    assert "current_provider_directory_runs" in sql
+    assert "phone_candidate_rows" in sql
 
 
 async def _insert_endpoint_and_source(session, schema: str, fixture: dict) -> None:

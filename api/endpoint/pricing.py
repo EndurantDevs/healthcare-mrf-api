@@ -26,6 +26,10 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.billing_search_access_contract import BILLING_SEARCH_CACHE_CONTROL
 from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
+from api.custom_import_provider_service_sql import (
+    ProviderServiceImportQuery,
+    build_provider_service_claims_statements,
+)
 from api.control_auth import require_control_auth
 from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.ptg2_candidate_audit import (
@@ -12336,15 +12340,26 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 @blueprint.get("/providers/by-procedure", name="pricing.providers.by_procedure")
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
-async def list_providers_by_procedure(request):
+async def list_providers_by_procedure(request, *, native_args=None, import_context=None):
     """List providers with pricing records matching a procedure or service code."""
-    if "billing_entity_ref" in request.args:
+    if (native_args is None) != (import_context is None):
+        raise InvalidUsage("custom-import provider-service arguments are invalid")
+    if native_args is None:
+        args = request.args
+    else:
+        args = native_args
+    if import_context is not None and type(import_context) is not ProviderServiceImportQuery:
+        raise InvalidUsage("custom-import provider-service context is invalid")
+    if "billing_entity_ref" in args:
+        if import_context is not None:
+            raise InvalidUsage("custom-import provider-service queries cannot use billing search")
         return await serve_billing_search_get(request, _get_session(request))
-    _reject_resolver_only_procedure_search_params(request.args)
+    _reject_resolver_only_procedure_search_params(args)
     begin_capacity_evidence(request)
     session = _get_session(request)
-    args = request.args
     is_state_scan = is_plan_pricing_state_scan(args)
+    if import_context is not None and is_state_scan:
+        raise InvalidUsage("custom-import provider-service queries require the claims lane")
     if (
         is_state_scan
         and getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH)
@@ -12395,6 +12410,10 @@ async def list_providers_by_procedure(request):
     code = str(args.get("code", "")).strip()
     order = _normalize_order(_request_value_or_none(args.get("order")))
     order_by = str(args.get("order_by") or "total_allowed_amount")
+    if import_context is not None and import_context.prepared.normalized_order_terms and any(
+        _request_value_or_none(args.get(name)) is not None for name in ("order", "order_by")
+    ):
+        raise InvalidUsage("custom-import ordering cannot be combined with native ordering")
     ptg_code_system = args.get("code_system") or (_reported_procedure_code_system(code) if code else None)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     include_sources = _parse_bool(args.get("include_sources"), "include_sources", default=False)
@@ -12423,6 +12442,10 @@ async def list_providers_by_procedure(request):
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     args.get("plan_release_id")
     plan_release_id = _validated_plan_release_id(args)
+    if import_context is not None and (
+        plan_id or plan_external_id or source_key or snapshot_id or plan_release_id
+    ):
+        raise InvalidUsage("custom-import provider-service queries require the claims lane")
     if view == "card" and not plan_release_id:
         raise InvalidUsage("Parameter 'view=card' requires plan_release_id")
     projected_result_type = (
@@ -13036,10 +13059,11 @@ async def list_providers_by_procedure(request):
             args,
         )
         filters.append(provider_procedure_table.c.procedure_code.in_(internal_codes))
-    if min_claims is not None:
-        filters.append(provider_procedure_table.c.total_services >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
+    if import_context is None:
+        if min_claims is not None:
+            filters.append(provider_procedure_table.c.total_services >= min_claims)
+        if min_total_cost is not None:
+            filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
     provider_procedure_from = provider_procedure_table.join(
         provider_table,
         provider_table.c.npi == provider_procedure_table.c.npi,
@@ -13056,7 +13080,8 @@ async def list_providers_by_procedure(request):
 
     total = None
     if (
-        len(internal_codes) == 1
+        import_context is None
+        and len(internal_codes) == 1
         and not query_text
         and not state
         and not city
@@ -13106,38 +13131,12 @@ async def list_providers_by_procedure(request):
                 provider_table.c.zip5,
             )
         )
-        grouped_subquery = grouped.subquery()
-        count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-        total = int(count_result.scalar() or 0)
-
-        cost_index_expr = case(
-            (
-                grouped_subquery.c.total_services > 0,
-                cast(grouped_subquery.c.total_allowed_amount, Float) / grouped_subquery.c.total_services,
-            ),
-            else_=None,
-        ).label("cost_index")
-
-        if order_by == "cost_index":
-            query = select(grouped_subquery, cost_index_expr)
-        else:
-            query = select(grouped_subquery)
-        query = _apply_ordering(
-            query,
-            order_by,
-            order,
-            {
-                "npi": grouped_subquery.c.npi,
-                "provider_name": grouped_subquery.c.provider_name,
-                "total_services": grouped_subquery.c.total_services,
-                "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
-                "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
-                "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
-                "matched_service_codes": grouped_subquery.c.matched_service_codes,
-                "cost_index": cost_index_expr,
-            },
+        claims_statements = build_provider_service_claims_statements(
+            grouped, import_context, min_claims, min_total_cost, order_by, order
         )
-        query = query.limit(pagination.limit).offset(pagination.offset)
+        count_result = await session.execute(claims_statements.count_statement)
+        total = int(count_result.scalar() or 0)
+        query = claims_statements.page_statement.limit(pagination.limit).offset(pagination.offset)
     query_result = await session.execute(query)
     provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
     if zip5 and provider_items:
