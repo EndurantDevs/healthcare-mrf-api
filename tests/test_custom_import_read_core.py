@@ -26,6 +26,7 @@ from process.custom_import.read_core import (
     MAX_READ_TIMEOUT_MS,
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
+    CustomImportReadEntityAbsentError,
     CustomImportReadRequestError,
     CustomImportReadService,
     CustomImportReadUnavailableError,
@@ -759,15 +760,42 @@ def test_detail_projects_only_declared_root_and_child_fields(query_context):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("family_rows", ((), ((1, 2, 3), (4, 5, 3))))
-async def test_entity_detail_refuses_absent_or_ambiguous_root_families(query_context, family_rows):
+@pytest.mark.parametrize(
+    ("family_rows", "error_type"),
+    (
+        ((), CustomImportReadEntityAbsentError),
+        (((1, 2, 3), (4, 5, 3)), CustomImportReadUnavailableError),
+    ),
+)
+async def test_entity_detail_distinguishes_absent_from_ambiguous_root_families(
+    monkeypatch, query_context, family_rows, error_type
+):
     session = SimpleNamespace(
         execute=AsyncMock(return_value=SimpleNamespace(all=lambda: family_rows)),
     )
+    verified = AsyncMock()
+    monkeypatch.setattr(read_core, "verify_published_generation", verified)
 
-    with pytest.raises(CustomImportReadUnavailableError, match="^selected entity is not eligible for root detail$"):
+    with pytest.raises(error_type):
         await read_core._entity_winner_locator(session, query_context, EntityLocator("synthetic", "value"))
 
+    assert session.execute.await_count == 1
+    if family_rows:
+        verified.assert_not_awaited()
+    else:
+        verified.assert_awaited_once_with(session, query_context.target)
+
+
+@pytest.mark.asyncio
+async def test_entity_detail_rechecks_finality_before_declaring_absence(monkeypatch, query_context):
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: ())))
+    verified = AsyncMock(side_effect=CustomImportReadUnavailableError("pinned generation is unavailable"))
+    monkeypatch.setattr(read_core, "verify_published_generation", verified)
+
+    with pytest.raises(CustomImportReadUnavailableError, match="pinned generation is unavailable"):
+        await read_core._entity_winner_locator(session, query_context, EntityLocator("synthetic", "value"))
+
+    verified.assert_awaited_once_with(session, query_context.target)
     assert session.execute.await_count == 1
 
 

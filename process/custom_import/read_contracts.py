@@ -38,6 +38,10 @@ class CustomImportReadCursorError(CustomImportReadError):
     """The page cursor is malformed, stale, or bound to another request."""
 
 
+class CustomImportReadEntityAbsentError(CustomImportReadError):
+    """An authorized entity has no eligible family in the pinned target."""
+
+
 class CustomImportReadRequestError(CustomImportReadError):
     """The requested bounded read shape is not permitted by the definition."""
 
@@ -136,6 +140,7 @@ __all__ = (
     "CustomImportReadAuthorizationError",
     "CustomImportReadCache",
     "CustomImportReadCursorError",
+    "CustomImportReadEntityAbsentError",
     "CustomImportReadError",
     "CustomImportReadRequestError",
     "CustomImportReadUnavailableError",
