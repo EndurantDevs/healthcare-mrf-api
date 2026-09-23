@@ -20,6 +20,7 @@ from db.models import (
 )
 from process.clinical_reference_rows import _build_clinical_area_rows
 from process.ext.utils import make_class, push_objects
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
 
 DEFAULT_BATCH_SIZE = 5000
@@ -273,7 +274,7 @@ async def _publish_reference_stages(
     stage_models: ClinicalStageModels,
 ) -> None:
     stage_by_model = stage_models.stage_by_model
-    async with db.transaction():
+    async with db.transaction() as session:
         await _merge_code_catalog_stage(stage_by_model[CodeCatalog], schema)
         await _merge_code_crosswalk_stage(stage_by_model[CodeCrosswalk], schema)
         await _merge_replace_source_table(CodeSynonym, stage_by_model[CodeSynonym], schema)
@@ -287,3 +288,6 @@ async def _publish_reference_stages(
         for model_class in stage_models.shared_models:
             stage_table = stage_by_model[model_class].__tablename__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
+        await publish_local_reference_family_generation(
+            session, importer_id="clinical-reference", schema_name=schema
+        )

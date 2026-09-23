@@ -34,6 +34,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20260923010000_code_sets_result_generation",
     "20260923021000_ms_drg_result_generation",
     "20260922010000_custom_import_execution_request_identity",
+    "20260923022000_clinical_reference_result_generation",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -65,7 +66,9 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     code_sets_revision = "20260923010000_code_sets_result_generation"
     ms_drg_revision = "20260923021000_ms_drg_result_generation"
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
-    assert script.get_heads() == [request_identity_revision]
+    clinical_revision = "20260923022000_clinical_reference_result_generation"
+    assert script.get_heads() == [clinical_revision]
+    assert script.get_revision(clinical_revision).down_revision == request_identity_revision
     assert script.get_revision(request_identity_revision).down_revision == ms_drg_revision
     assert script.get_revision(ms_drg_revision).down_revision == code_sets_revision
     assert script.get_revision(code_sets_revision).down_revision == facility_revision
