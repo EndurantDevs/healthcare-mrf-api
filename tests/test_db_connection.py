@@ -49,6 +49,7 @@ async def test_database_connect_initializes_engine(monkeypatch):
     assert created_by_field["url"].drivername == "postgresql+psycopg"
     assert created_by_field["kwargs"]["pool_size"] == 2
     assert created_by_field["kwargs"]["max_overflow"] == 2
+    assert created_by_field["kwargs"]["hide_parameters"] is True
     assert db.engine is not None
     assert db.session_factory is not None
 

@@ -67,6 +67,7 @@ class _ExecutionRequest:
     mechanism: str
     capture_bundle_id: int | None
     request_identity_sha256: bytes | None
+    source_binding_revision_id: int | None
 
 
 class ExecutionLifecycleError(RuntimeError):
@@ -521,6 +522,7 @@ def _has_matching_execution_identity(
         and execution.schema_revision_id == request.schema_revision_id
         and execution.mechanism == request.mechanism
         and execution.request_identity_sha256 == request.request_identity_sha256
+        and getattr(execution, "source_binding_revision_id", None) == request.source_binding_revision_id
     )
 
 
@@ -543,6 +545,7 @@ def _validated_execution_request(
     mechanism: str,
     capture_bundle_id: int | None,
     request_identity_sha256: bytes | bytearray | memoryview | None,
+    source_binding_revision_id: int | None = None,
 ) -> _ExecutionRequest:
     normalized_dataset_id = _positive_id(dataset_id, "dataset_id")
     normalized_definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
@@ -551,6 +554,13 @@ def _validated_execution_request(
     normalized_idempotency_key = _idempotency_key(idempotency_key)
     normalized_mechanism = _mechanism(mechanism)
     normalized_request_identity_sha256 = _request_identity_sha256(request_identity_sha256)
+    normalized_source_binding_revision_id = _positive_id(
+        source_binding_revision_id,
+        "source_binding_revision_id",
+        allow_none=True,
+    )
+    if normalized_source_binding_revision_id is not None and normalized_request_identity_sha256 is None:
+        raise ValueError("source_binding_revision_id requires request_identity_sha256")
     return _ExecutionRequest(
         dataset_id=normalized_dataset_id,
         definition_revision_id=normalized_definition_revision_id,
@@ -559,6 +569,7 @@ def _validated_execution_request(
         mechanism=normalized_mechanism,
         capture_bundle_id=normalized_capture_bundle_id,
         request_identity_sha256=normalized_request_identity_sha256,
+        source_binding_revision_id=normalized_source_binding_revision_id,
     )
 
 
@@ -574,6 +585,7 @@ async def _insert_execution(session: AsyncSession, request: _ExecutionRequest) -
             state="queued",
             capture_bundle_id=request.capture_bundle_id,
             request_identity_sha256=request.request_identity_sha256,
+            source_binding_revision_id=request.source_binding_revision_id,
         )
         .on_conflict_do_nothing(
             index_elements=(
@@ -665,6 +677,7 @@ async def reserve_execution(
     idempotency_key: str,
     mechanism: str,
     request_identity_sha256: bytes | bytearray | memoryview | None = None,
+    source_binding_revision_id: int | None = None,
 ) -> ExecutionSubmission:
     """Reserve a source-neutral execution before an external acquisition.
 
@@ -683,6 +696,7 @@ async def reserve_execution(
         mechanism=mechanism,
         capture_bundle_id=None,
         request_identity_sha256=request_identity_sha256,
+        source_binding_revision_id=source_binding_revision_id,
     )
     return await _submit_execution(session, request, allow_bound_capture_reuse=True)
 
