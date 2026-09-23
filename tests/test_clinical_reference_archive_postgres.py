@@ -3,6 +3,7 @@
 
 import subprocess
 from dataclasses import replace
+from datetime import datetime, timezone
 from time import perf_counter
 from uuid import uuid4
 
@@ -14,6 +15,55 @@ from process import clinical_reference_result_archive as scoped
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from tests.test_reference_family_archive_postgres import _database_url
+
+
+@pytest.mark.asyncio
+async def test_clinical_automatic_bootstrap_ignores_foreign_shared_rows_but_requires_empty_own_slice():
+    """A generation-less destination may contain unrelated codes, not clinical rows."""
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    live = "clinical_bootstrap_" + uuid4().hex
+    spec = archive.reference_family_spec("clinical-reference")
+    incoming = generation.ReferenceFamilyServingGeneration(str(uuid4()), 1, datetime.now(timezone.utc))
+    try:
+        async with sessions.begin() as session:
+            await archive._create_model_family(session, spec, live)
+            await session.execute(text(
+                f'CREATE TABLE "{live}".reference_family_result_generation ('
+                "importer_id text PRIMARY KEY,local_lineage_id uuid NOT NULL,local_generation bigint NOT NULL,"
+                "origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[])"
+            ))
+            await session.execute(text(
+                f'INSERT INTO "{live}".reference_family_result_generation '
+                "VALUES ('clinical-reference',:lineage,0,NULL,NULL,NULL,NULL)"
+            ), {"lineage": uuid4()})
+            await session.execute(text(
+                f'INSERT INTO "{live}".code_catalog (code_system,code,source) '
+                "VALUES ('TEST','foreign','other_source')"
+            ))
+            incumbent = await archive.capture_reference_family_incumbent(
+                session, importer_id="clinical-reference", schema_name=live
+            )
+            await archive._require_automatic_cutover_generation(session, spec, incumbent, incoming)
+
+            await session.execute(text(
+                f'INSERT INTO "{live}".code_catalog (code_system,code,source) '
+                "VALUES ('TEST','owned','cdc_icd10cm')"
+            ))
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires manual adoption"):
+                await archive._require_automatic_cutover_generation(session, spec, incumbent, incoming)
+            await session.execute(text(f'DELETE FROM "{live}".code_catalog WHERE code=\'owned\''))
+
+            await session.execute(text(
+                f'INSERT INTO "{live}".clinical_area (clinical_area_id,display_name,source) '
+                "VALUES ('area','Synthetic area','cdc_icd10cm')"
+            ))
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires manual adoption"):
+                await archive._require_automatic_cutover_generation(session, spec, incumbent, incoming)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{live}" CASCADE'))
+        await engine.dispose()
 
 
 async def _seed_clinical_source(session, live):
