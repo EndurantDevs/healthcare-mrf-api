@@ -14,6 +14,7 @@ from typing import Any
 
 from db.connection import init_db
 from db.models import CodeCatalog, db
+from process.code_sets_result_archive import _schema, publish_local_generation
 from process.ext.utils import ensure_database
 
 DEFAULT_POS_URL = "https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets"
@@ -233,7 +234,6 @@ async def _ensure_code_catalog(schema: str) -> None:
     )
 
 
-
 async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
     seen_code_keys: set[tuple[str, str]] = set()
     inserted_count = 0
@@ -242,7 +242,7 @@ async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
         if code_key in seen_code_keys:
             continue
         seen_code_keys.add(code_key)
-        await db.status(
+        affected = await db.status(
             f"""
             INSERT INTO {schema}.{CodeCatalog.__tablename__}
                 (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
@@ -255,7 +255,8 @@ async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
                 long_description = excluded.long_description,
                 is_active = excluded.is_active,
                 source = excluded.source,
-                updated_at = excluded.updated_at;
+                updated_at = excluded.updated_at
+            WHERE {CodeCatalog.__tablename__}.source = excluded.source;
             """,
             code_system=code_row.code_system,
             code=code_row.code,
@@ -264,6 +265,8 @@ async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
             long_description=code_row.long_description,
             source=code_row.source,
         )
+        if affected != 1:
+            raise RuntimeError("code-set catalog key is owned by another source")
         inserted_count += 1
     return inserted_count
 
@@ -273,9 +276,7 @@ def _select_test_rows(
     preferred_codes: set[str],
 ) -> list[CodeSetRow]:
     """Prefer representative codes in test mode, with a bounded source fallback."""
-    preferred_rows = [
-        code_row for code_row in code_rows if code_row.code in preferred_codes
-    ]
+    preferred_rows = [code_row for code_row in code_rows if code_row.code in preferred_codes]
     return preferred_rows or code_rows[:10]
 
 
@@ -302,9 +303,14 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
 
     modifier_rows = modifier_code_rows()
     await _ensure_code_catalog(schema)
-    pos_count = await _upsert_code_rows(schema, pos_rows)
-    rc_count = await _upsert_code_rows(schema, rc_rows)
-    modifier_count = await _upsert_code_rows(schema, modifier_rows)
+    async with db.transaction() as session:
+        # ponytail: one short catalog lock; revisit keyed claims if concurrent writer throughput matters.
+        await db.status(f"LOCK TABLE {_schema(schema)}.{CodeCatalog.__tablename__} IN SHARE ROW EXCLUSIVE MODE")
+        pos_count = await _upsert_code_rows(schema, pos_rows)
+        rc_count = await _upsert_code_rows(schema, rc_rows)
+        modifier_count = await _upsert_code_rows(schema, modifier_rows)
+        if not test_mode:
+            await publish_local_generation(session, schema)
     print(
         "Code set import done: "
         f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
