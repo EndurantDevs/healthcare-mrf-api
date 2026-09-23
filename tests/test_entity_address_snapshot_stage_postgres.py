@@ -37,6 +37,32 @@ _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _CI_HOSTS = _LOCAL_HOSTS | {"postgres"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("support_indexes", [False, True])
+async def test_restore_precreation_matches_ordinary_native_stage(monkeypatch, support_indexes):
+    """Preserve ordinary column ordering and configured support-index semantics."""
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", str(int(support_indexes)))
+    session = AsyncMock()
+    _schema, import_date, stage_names = restore._stage_plan(db_schema="mrf", import_date="20260923")
+    await restore._create_model_relations(
+        session, schema_name="synthetic_restore", stage_names=stage_names, import_date=import_date
+    )
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    tables = [statement for statement in statements if "CREATE TABLE" in statement]
+    assert len(tables) == 7
+    for table_name, last_column in (
+        ("entity_address_evidence", "retired_at"),
+        ("facility_anchor_npi_candidate", "updated_at"),
+    ):
+        statement = next(statement for statement in tables if f".{table_name} (" in statement)
+        assert statement.index(f"\t{last_column} ") < statement.index("\taddress_key ")
+    support_code_indexes = [
+        statement for statement in statements if "CREATE INDEX" in statement and "code_location" in statement
+    ]
+    assert len(support_code_indexes) == (2 if support_indexes else 0)
+
+
 def _is_owned_native_test_database(url) -> bool:
     """Accept only the dedicated CI database or a UUID-scoped local database."""
 

@@ -5901,7 +5901,7 @@ def _coordinate_missing_or_invalid_sql(alias: str) -> str:
     )
 
 
-def _geo_projection_reference_sql(db_schema: str) -> tuple[str, str, str, str]:
+def _geo_projection_reference_sql(db_schema: str, *, dependency_bindings=None) -> tuple[str, str, str, str]:
     """Build the exact legacy identity and point predicates for projection."""
 
     target_alias = "projection_target"
@@ -5910,6 +5910,7 @@ def _geo_projection_reference_sql(db_schema: str) -> tuple[str, str, str, str]:
         schema_name=db_schema,
         geo_zip_alias="projection_geo_zip",
         zip_state_alias="projection_zip_state",
+        dependency_bindings=dependency_bindings,
     )
     identity_predicate_sql = provider_address_identity_coherence_sql(
         target_alias,
@@ -5920,6 +5921,8 @@ def _geo_projection_reference_sql(db_schema: str) -> tuple[str, str, str, str]:
     point_join_sql = provider_address_point_reference_join_sql(
         target_alias,
         zcta_alias="projection_zcta",
+        schema_name=db_schema,
+        dependency_bindings=dependency_bindings,
     )
     point_predicate_sql = provider_address_point_coherence_sql(
         target_alias,
@@ -6008,76 +6011,6 @@ def _geo_projection_target_ctes_sql(
     ),"""
 
 
-def _geo_projection_external_evidence_ctes_sql(db_schema: str) -> str:
-    """Build set-wise NPPES and MRF evidence admitted-key CTEs."""
-
-    return f""" projection_nppes AS MATERIALIZED (
-        SELECT DISTINCT projection_target.npi, projection_target.address_key
-          FROM projection_targets AS projection_target
-          JOIN {db_schema}.npi_address AS source_nppes
-            ON source_nppes.npi = projection_target.npi
-           AND source_nppes.address_key = projection_target.address_key
-           AND source_nppes.date_added IS NOT NULL
-         WHERE (projection_target.address_source_mask & 1) <> 0
-           AND projection_target.address_key IS NOT NULL
-    ), projection_mrf AS MATERIALIZED (
-        SELECT DISTINCT projection_target.npi, projection_target.address_key
-          FROM projection_targets AS projection_target
-          JOIN {db_schema}.mrf_address AS source_mrf
-            ON source_mrf.npi = projection_target.npi
-           AND source_mrf.address_key = projection_target.address_key
-           AND {geo_projection.independent_issuer_sql('source_mrf.source_issuer_names')}
-           AND {geo_projection.mrf_lineage_complete_sql('source_mrf')}
-         WHERE projection_target.address_key IS NOT NULL
-    ),"""
-
-
-def _geo_projection_cms_anchor_ctes_sql(
-    db_schema: str,
-    stage_table: str,
-) -> str:
-    """Build CMS target premises and their durable NPPES anchors."""
-
-    return f""" projection_cms_premises AS MATERIALIZED (
-        SELECT DISTINCT projection_target.npi, projection_target.premise_key
-          FROM projection_targets AS projection_target
-         WHERE (projection_target.address_source_mask & 4) <> 0
-           AND projection_target.address_key IS NOT NULL
-           AND projection_target.premise_key IS NOT NULL
-    ), projection_nppes_anchors AS MATERIALIZED (
-        SELECT DISTINCT requested.npi, requested.premise_key
-          FROM projection_cms_premises AS requested
-          JOIN {db_schema}.{stage_table} AS candidate
-            ON candidate.npi = requested.npi
-           AND candidate.premise_key = requested.premise_key
-           AND (candidate.address_source_mask & 1) <> 0
-           AND candidate.type IN ('primary', 'secondary', 'practice', 'site')
-          JOIN {db_schema}.npi_address AS anchor_source
-            ON anchor_source.npi = candidate.npi
-           AND anchor_source.address_key = candidate.address_key
-           AND anchor_source.date_added IS NOT NULL
-    ),"""
-
-
-def _geo_projection_cms_cte_sql(db_schema: str) -> str:
-    """Build CMS evidence admitted keys from source rows and anchors."""
-
-    return f""" projection_cms AS MATERIALIZED (
-        SELECT DISTINCT projection_target.location_key
-          FROM projection_targets AS projection_target
-          JOIN {db_schema}.doctor_clinician_address AS source_doctor
-            ON source_doctor.npi = projection_target.npi
-           AND source_doctor.address_key = projection_target.address_key
-           AND source_doctor.updated_at IS NOT NULL
-          JOIN projection_nppes_anchors AS anchor
-            ON anchor.npi = projection_target.npi
-           AND anchor.premise_key = projection_target.premise_key
-         WHERE (projection_target.address_source_mask & 4) <> 0
-           AND projection_target.address_key IS NOT NULL
-           AND projection_target.premise_key IS NOT NULL
-    ),"""
-
-
 def _geo_projection_update_sql(
     db_schema: str,
     stage_table: str,
@@ -6120,10 +6053,11 @@ def _materialize_geo_assurance_sql(
     stage_table: str,
     *,
     force: bool = False,
+    dependency_bindings=None,
 ) -> str:
     """Project exact evidence and spatial coherence onto finalized stage rows."""
 
-    reference_sql = _geo_projection_reference_sql(db_schema)
+    reference_sql = _geo_projection_reference_sql(db_schema, dependency_bindings=dependency_bindings)
     return "".join(
         (
             _geo_projection_target_ctes_sql(
@@ -6132,9 +6066,15 @@ def _materialize_geo_assurance_sql(
                 _geo_projection_filter_sql(force=force),
                 *reference_sql,
             ),
-            _geo_projection_external_evidence_ctes_sql(db_schema),
-            _geo_projection_cms_anchor_ctes_sql(db_schema, stage_table),
-            _geo_projection_cms_cte_sql(db_schema),
+            geo_projection.projection_external_evidence_ctes_sql(
+                db_schema, dependency_bindings=dependency_bindings
+            ),
+            geo_projection.projection_cms_anchor_ctes_sql(
+                db_schema, stage_table, dependency_bindings=dependency_bindings
+            ),
+            geo_projection.projection_cms_evidence_cte_sql(
+                db_schema, dependency_bindings=dependency_bindings
+            ),
             _geo_projection_update_sql(
                 db_schema,
                 stage_table,
@@ -6180,11 +6120,16 @@ def _record_geo_assurance_candidate_sql(
     db_schema: str,
     stage_table: str,
     projected_rows: int,
+    *,
+    dependency_bindings=None,
 ) -> str:
     db_schema = _validate_schema_name(db_schema)
     stage_table = _validate_schema_name(stage_table)
     state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
     stage_relation = f"{db_schema}.{stage_table}"
+    signature_sql = geo_projection.projection_relation_signature_sql(
+        db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
+    )
     return f"""
     INSERT INTO {db_schema}.{state_table} (
         singleton,
@@ -6197,7 +6142,7 @@ def _record_geo_assurance_candidate_sql(
         true,
         {geo_projection.GEO_ASSURANCE_VERSION},
         to_regclass('{stage_relation}')::oid,
-        {geo_projection.projection_relation_signature_sql(db_schema)},
+        {signature_sql},
         {int(projected_rows)}::bigint
      WHERE to_regclass('{stage_relation}') IS NOT NULL
     ON CONFLICT (singleton) DO UPDATE SET
@@ -6267,6 +6212,7 @@ async def _materialize_geo_assurance(
     context: dict,
     run_id: str,
     stage_rows: int,
+    dependency_bindings=None,
 ) -> int:
     _emit_geo_assurance_progress(run_id, stage_rows)
     started = time.monotonic()
@@ -6275,6 +6221,7 @@ async def _materialize_geo_assurance(
             db_schema,
             stage_table,
             force=force,
+            **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
         )
     )
     elapsed = time.monotonic() - started
@@ -6301,13 +6248,21 @@ async def _project_geo_assurance_transaction(
     stage_table: str,
     *,
     force: bool,
+    dependency_bindings=None,
 ) -> tuple[int, int, int, bool]:
     """Project, validate, and receipt one source-stable stage atomically."""
 
+    if dependency_bindings is not None:
+        dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
+    binding_options = {} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}
     async with db.transaction():
         await _apply_entity_address_transaction_settings()
-        await db.status(geo_projection.projection_dependency_lock_sql(db_schema))
-        current_projection_available = bool(
+        await db.status(geo_projection.projection_dependency_lock_sql(db_schema, **binding_options))
+        if dependency_bindings is not None and not await db.scalar(
+            f"SELECT {geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)}"
+        ):
+            raise RuntimeError("geo assurance dependency binding changed")
+        current_projection_available = dependency_bindings is None and bool(
             await db.scalar(
                 f"SELECT {geo_projection.projection_state_available_sql(db_schema)};"
             )
@@ -6320,6 +6275,7 @@ async def _project_geo_assurance_transaction(
                         db_schema,
                         stage_table,
                         force=effective_force,
+                        **binding_options,
                     )
                 )
             )
@@ -6334,6 +6290,7 @@ async def _project_geo_assurance_transaction(
                 db_schema,
                 stage_table,
                 projected_rows,
+                **binding_options,
             )
         )
         if candidate_table_oid is None:

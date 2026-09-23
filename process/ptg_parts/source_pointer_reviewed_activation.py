@@ -32,7 +32,7 @@ SELECT snapshot.status, snapshot.published_at,
              FROM __SCHEMA__.ptg2_current_plan_source AS plan_pointer
             WHERE plan_pointer.source_key = :source_key
               AND plan_pointer.snapshot_id = :snapshot_id
-              AND plan_pointer.previous_snapshot_id = :predecessor_snapshot_id
+              AND plan_pointer.previous_snapshot_id IS NOT DISTINCT FROM :predecessor_snapshot_id
        ) AS plan_source_count,
        (
            SELECT COUNT(*)
@@ -125,9 +125,9 @@ async def pin_reviewed_activation_predecessor(
         return
     predecessor_snapshot_id = activation_by_field["previous_snapshot_id"]
     if not predecessor_snapshot_id:
-        raise ValueError(
-            "reviewed audit-only activation requires a published predecessor"
-        )
+        # A first publication has no predecessor to retain; its absent-pointer
+        # compare-and-swap and audit-only attestation remain mandatory.
+        return
     schema = _quote_ident(schema_name)
     await session.execute(
         db.text(
@@ -212,11 +212,6 @@ async def completed_reviewed_activation(
     predecessor_snapshot_id = (
         str(expected_current_snapshot_id or "").strip() or None
     )
-    if predecessor_snapshot_id is None:
-        raise ValueError(
-            "reviewed audit-only activation requires "
-            "expected_current_snapshot_id"
-        )
     activation_row = await _reviewed_activation_row(
         session,
         schema_name=schema_name,
@@ -238,6 +233,7 @@ async def completed_reviewed_activation(
         snapshot_id=snapshot_id,
         predecessor_snapshot_id=predecessor_snapshot_id,
         expected_attestation_digest=expected_audit_only_attestation_digest,
+        rollback_owner_id=normalized_owner_id,
     )
     return _completed_activation_result(
         activation_row,
@@ -254,7 +250,7 @@ async def _reviewed_activation_row(
     schema_name: str,
     source_key: str,
     snapshot_id: str,
-    predecessor_snapshot_id: str,
+    predecessor_snapshot_id: str | None,
     rollback_owner_id: str,
 ) -> dict[str, Any]:
     """Load the exact source/pin/attestation state for replay validation."""
@@ -282,14 +278,15 @@ def _require_exact_reviewed_activation(
     *,
     source_key: str,
     snapshot_id: str,
-    predecessor_snapshot_id: str,
+    predecessor_snapshot_id: str | None,
     expected_attestation_digest: bytes,
+    rollback_owner_id: str,
 ) -> None:
     activation = _mapping(_mapping(activation_row.get("manifest")).get("activation"))
     stored_digest = bytes(activation_row.get("attestation_digest") or b"")
     is_exact = (
         activation_row.get("published_at") is not None
-        and str(activation_row.get("previous_snapshot_id") or "")
+        and activation_row.get("previous_snapshot_id")
         == predecessor_snapshot_id
         and activation.get("state") == "activated"
         and activation.get("mode") == "reviewed_audit_only_control"
@@ -303,7 +300,11 @@ def _require_exact_reviewed_activation(
         and activation_row.get("current_snapshot_id") == snapshot_id
         and activation_row.get("current_previous_snapshot_id")
         == predecessor_snapshot_id
-        and str(activation_row.get("rollback_pin_reason") or "").strip()
+        and (
+            bool(str(activation_row.get("rollback_pin_reason") or "").strip())
+            if predecessor_snapshot_id is not None
+            else activation.get("first_publication_owner_id") == rollback_owner_id
+        )
         and int(activation_row.get("plan_source_count") or 0) > 0
         and int(activation_row.get("conflicting_plan_source_count") or 0) == 0
     )
@@ -318,7 +319,7 @@ def _completed_activation_result(
     *,
     source_key: str,
     snapshot_id: str,
-    predecessor_snapshot_id: str,
+    predecessor_snapshot_id: str | None,
     rollback_owner_id: str,
 ) -> dict[str, Any]:
     return {

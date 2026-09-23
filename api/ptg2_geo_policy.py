@@ -9,8 +9,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from api.ptg2_address_policy import postal_box_address_sql
-from api.ptg2_geo_projection import projected_boolean_sql
-
+from api.ptg2_geo_projection import projected_boolean_sql, projection_dependency_relation_sql
 
 _PROVIDER_ADDRESS_GEO_CAPABILITY_SQL = """
     SELECT
@@ -173,6 +172,7 @@ def provider_address_identity_reference_joins_sql(
     schema_name: str,
     geo_zip_alias: str,
     zip_state_alias: str,
+    dependency_bindings=None,
 ) -> str:
     """Join the same canonical postal references used by legacy assurance."""
 
@@ -183,14 +183,20 @@ def provider_address_identity_reference_joins_sql(
     displayed_state = f"UPPER(BTRIM(COALESCE({alias}.state_name, '')))"
     canonical_state = f"UPPER(BTRIM(COALESCE({alias}.state_code, '')))"
     canonical_zip = f"BTRIM(COALESCE({alias}.zip5, ''))"
-    return f"""LEFT JOIN {schema_name}.geo_zip_lookup AS {geo_zip_alias}
+    geo_relation = projection_dependency_relation_sql(
+        schema_name, f"{schema_name}.geo_zip_lookup", dependency_bindings=dependency_bindings
+    )
+    zip_relation = projection_dependency_relation_sql(
+        schema_name, "tiger.zip_state", dependency_bindings=dependency_bindings
+    )
+    return f"""LEFT JOIN {geo_relation} AS {geo_zip_alias}
       ON {geo_zip_alias}.zip_code = {canonical_zip}
      AND UPPER(BTRIM(COALESCE({geo_zip_alias}.state, ''))) = {canonical_state}
      AND {displayed_state} IN (
           UPPER(BTRIM(COALESCE({geo_zip_alias}.state, ''))),
           UPPER(BTRIM(COALESCE({geo_zip_alias}.state_name, '')))
      )
-    LEFT JOIN tiger.zip_state AS {zip_state_alias}
+    LEFT JOIN {zip_relation} AS {zip_state_alias}
       ON {zip_state_alias}.zip = {canonical_zip}
      AND UPPER(BTRIM(COALESCE({zip_state_alias}.stusps, ''))) = {canonical_state}
      AND {displayed_state} = UPPER(BTRIM(COALESCE({zip_state_alias}.stusps, '')))"""
@@ -294,13 +300,18 @@ def provider_address_point_reference_join_sql(
     alias: str,
     *,
     zcta_alias: str,
+    schema_name: str = "mrf",
+    dependency_bindings=None,
 ) -> str:
     """Join the ZIP polygon used by the legacy point-coherence predicate."""
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
     zcta_alias = _validated_sql_identifier(zcta_alias, field_name="reference alias")
+    relation = projection_dependency_relation_sql(
+        schema_name, "tiger.zcta5", dependency_bindings=dependency_bindings
+    )
     return (
-        f"JOIN tiger.zcta5 AS {zcta_alias} "
+        f"JOIN {relation} AS {zcta_alias} "
         f"ON {zcta_alias}.zcta5ce = BTRIM({alias}.zip5)"
     )
 
