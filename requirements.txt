@@ -44,7 +44,7 @@ redis[hiredis]>=5.3.1,<6
 ruamel.ext.msgpack
 sanic>=25.12.1
 shapely>=2.1.2
-snowflake-connector-python==4.7.4
+snowflake-connector-python==4.7.5
 socksio
 SQLAlchemy>=2.0.54
 tracerite>=2.6.5,<2.7.0
