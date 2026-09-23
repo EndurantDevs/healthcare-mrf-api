@@ -512,6 +512,28 @@ def _reissue_captures(captures, mutate):
     return tuple(reissued_captures)
 
 
+def _mutate_invalid_receipt_shape(document, malformed_field):
+    match malformed_field:
+        case "extra_key":
+            document["unexpected"] = True
+        case "missing_limit_field":
+            del document["capture_limits"]["maximum_records"]
+        case "empty_schema":
+            document["result_schema"] = []
+        case "incomplete_schema_entry":
+            del document["result_schema"][0]["nullable"]
+        case "duplicate_schema":
+            document["result_schema"][1] = document["result_schema"][0]
+        case "missing_captures":
+            document["captures"] = []
+        case "incomplete_capture_entry":
+            del document["captures"][0]["content_bytes"]
+        case "wrong_capture_size":
+            document["captures"][0]["content_bytes"] += 1
+        case _:
+            raise AssertionError("unsupported malformed receipt field")
+
+
 def _capture_limits(
     maximum_compressed_bytes: int,
     *,
@@ -555,6 +577,38 @@ def test_bundle_generates_one_safe_statement_with_fixed_order_and_encoding_input
         "parquet_compression": "zstd",
         "partition_rows": 1024,
     }
+
+
+def test_bundle_request_identity_normalizes_binding_and_field_order():
+    connector = _connector(_Adapter(lambda: pytest.fail("request preparation must not fetch")))
+    definition = _definition()
+    bindings = _bindings()
+    reordered_bindings = tuple(replace(binding, selected_field_ids=tuple(reversed(binding.selected_field_ids))) for binding in bindings)
+
+    expected = connector.prepare_request(definition, bindings=bindings)
+    normalized = connector.prepare_request(definition, bindings=tuple(reversed(reordered_bindings)))
+
+    assert normalized.bindings == expected.bindings
+    assert normalized.canonical_request == expected.canonical_request
+    assert normalized.request_sha256 == expected.request_sha256
+
+
+@pytest.mark.parametrize(
+    ("bindings", "message"),
+    (
+        (lambda bindings: (bindings[0], bindings[0]), "exactly cover"),
+        (lambda bindings: (bindings[0],), "exactly cover"),
+        (lambda bindings: (replace(bindings[0], selected_field_ids=("npi",)), bindings[1]), "selected fields"),
+        (
+            lambda bindings: (bindings[0], replace(bindings[1], semantic_token_metadata_key="other_token")),
+            "semantic token metadata must match",
+        ),
+    ),
+)
+def test_bundle_request_rejects_incomplete_or_inconsistent_stream_bindings(bindings, message):
+    connector = _connector(_Adapter(lambda: pytest.fail("invalid request must not fetch")))
+    with pytest.raises(SnowflakeBundleError, match=message):
+        connector.prepare_request(_definition(), bindings=bindings(_bindings()))
 
 
 def test_bundle_rejects_missing_semantic_metadata_and_unapproved_relation():
@@ -797,6 +851,36 @@ def test_bundle_rejects_invalid_semantic_token_metadata(root_tokens, detail_toke
         connector.acquire(request)
 
     assert all(source.close_count == 1 for source in sources)
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "message"),
+    (
+        ("stream_order", "configured stream order"),
+        ("metadata_key", "semantic token metadata does not match"),
+        ("parquet_token", "Parquet result token does not match"),
+        ("schema", "result schema does not match"),
+    ),
+)
+def test_bundle_rejects_inconsistent_adapter_evidence_and_closes_sources(mismatch, message):
+    result, sources = _result(query_id="synthetic-evidence")
+    root, detail = result.stream_results
+    if mismatch == "stream_order":
+        result.stream_results = (detail, root)
+    elif mismatch == "metadata_key":
+        result.stream_results = (replace(root, metadata=replace(root.metadata, semantic_token_metadata_key="other_token")), detail)
+    elif mismatch == "parquet_token":
+        root.parquet_result.source_snapshot_token = "synthetic-other-release"
+    else:
+        root.parquet_result.schema = tuple(reversed(root.parquet_result.schema))
+    connector = _connector(_Adapter(lambda: result))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+
+    with pytest.raises(SnowflakeBundleError, match=message):
+        connector.acquire(request)
+
+    assert all(source.close_count == 1 for source in sources)
+    assert all(reader.close_count == 1 for source in sources for reader in source.readers)
 
 
 def test_bundle_keeps_primary_failure_when_bounded_cleanup_also_fails():
@@ -1076,6 +1160,32 @@ def test_durable_replay_rejects_reissued_capture_limits_that_exceed_the_request_
 
     with pytest.raises(SnowflakeBundleError, match="configured capture limits"):
         _reconstruct(connector, request, reissued_captures)
+
+
+@pytest.mark.parametrize(
+    "malformed_field",
+    (
+        "extra_key",
+        "missing_limit_field",
+        "empty_schema",
+        "incomplete_schema_entry",
+        "duplicate_schema",
+        "missing_captures",
+        "incomplete_capture_entry",
+        "wrong_capture_size",
+    ),
+)
+def test_durable_replay_rejects_reissued_receipts_with_invalid_shape(malformed_field):
+    connector = _connector(_Adapter(lambda: _result(query_id="synthetic-receipt-shape")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    captures = replayable_parquet_captures(connector.acquire(request))
+
+    with pytest.raises(SnowflakeBundleError, match="replay receipt is invalid"):
+        _reconstruct(
+            connector,
+            request,
+            _reissue_captures(captures, lambda document: _mutate_invalid_receipt_shape(document, malformed_field)),
+        )
 
 
 def test_durable_replay_rederives_the_acquisition_identity():
