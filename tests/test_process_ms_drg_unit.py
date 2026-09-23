@@ -7,7 +7,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-
 ms_drg = importlib.import_module("process.ms_drg")
 
 
@@ -129,6 +128,9 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     async def merge_relationship(_stage, _schema, sources):
         calls.append(("relationship", sources))
 
+    async def publish_generation(_session, _schema, *, include_relationships):
+        calls.append(("generation", include_relationships))
+
     monkeypatch.setattr(ms_drg, "db", _FakeDb())
     monkeypatch.setattr(ms_drg, "ensure_database", noop)
     monkeypatch.setattr(ms_drg, "_ensure_tables", noop)
@@ -138,6 +140,7 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     monkeypatch.setattr(ms_drg, "_merge_catalog_stage", merge_catalog)
     monkeypatch.setattr(ms_drg, "_merge_synonym_stage", merge_synonym)
     monkeypatch.setattr(ms_drg, "_merge_relationship_stage", merge_relationship)
+    monkeypatch.setattr(ms_drg, "publish_local_generation", publish_generation)
 
     import_summary = await ms_drg.import_ms_drg(
         include_relationships=False,
@@ -149,6 +152,7 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     assert calls == [
         ("catalog", (ms_drg.SOURCE_MS_DRG,)),
         ("synonym", (ms_drg.SOURCE_MS_DRG,)),
+        ("generation", False),
     ]
 
 

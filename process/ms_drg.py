@@ -13,12 +13,12 @@ from db.connection import init_db
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym, db
 from process.ext.utils import ensure_database, make_class
 from process.ms_drg_contracts import (
-    RelationshipTuple,
     MsDrgImportRequest,
     MsDrgManualSource,
     MsDrgPayloads,
     MsDrgPublishCounts,
     MsDrgRelationshipRows,
+    RelationshipTuple,
 )
 from process.ms_drg_publication import (
     BATCH_SIZE,
@@ -38,12 +38,12 @@ from process.ms_drg_publication import (
     _source_sql_list,
     _synonym_row,
 )
+from process.ms_drg_result_generation import publish_local_generation
 from process.ms_drg_sources import (
     DEFAULT_CMS_MS_DRG_PAGE_URL,
     DEFAULT_MANUAL_TOC_URL,
     MS_DRG_DEFAULT_MAX_BYTES,
     MsDrgCatalogRow,
-    _TableParser,
     _clean_text,
     _discover_sequential_index_urls,
     _download_many,
@@ -59,11 +59,13 @@ from process.ms_drg_sources import (
     _parse_procedure_index_relationships,
     _parse_tables,
     _raise_if_cancelled,
+    _TableParser,
 )
 from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
 
 DEFAULT_CONCURRENCY = 10
 TEST_INDEX_PAGE_LIMIT = 2
+
 
 def _schema() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
@@ -74,14 +76,8 @@ def _now() -> datetime.datetime:
 
 
 def _normalize_import_id(raw_import_id: str | None) -> str:
-    configured_import_id = (
-        raw_import_id or os.getenv("HLTHPRT_MS_DRG_IMPORT_ID") or ""
-    )
-    cleaned_import_id = "".join(
-        character
-        for character in str(configured_import_id)
-        if character.isalnum()
-    )
+    configured_import_id = raw_import_id or os.getenv("HLTHPRT_MS_DRG_IMPORT_ID") or ""
+    cleaned_import_id = "".join(character for character in str(configured_import_id) if character.isalnum())
     if cleaned_import_id:
         return cleaned_import_id[:32]
     return _now().strftime("%Y%m%d")
@@ -113,9 +109,7 @@ def _build_request(
         include_relationships=include_relationships,
         relationship_page_limit=page_limit,
         concurrency=max(int(configured_concurrency), 1),
-        cms_page_url=source_url
-        or os.getenv("HLTHPRT_MS_DRG_CMS_PAGE_URL")
-        or DEFAULT_CMS_MS_DRG_PAGE_URL,
+        cms_page_url=source_url or os.getenv("HLTHPRT_MS_DRG_CMS_PAGE_URL") or DEFAULT_CMS_MS_DRG_PAGE_URL,
         manual_toc_url=manual_toc_url,
         import_suffix=_normalize_import_id(import_id),
         run_id=run_id,
@@ -151,18 +145,13 @@ async def _load_manual_source(
     if not appendix_url:
         raise RuntimeError(f"Could not find MS-DRG Appendix A link in {toc_url}")
     appendix_html = await asyncio.to_thread(_download_text, appendix_url)
-    list_url = (
-        _find_link(appendix_html, r"list\s+of\s+ms-drgs", appendix_url)
-        or appendix_url
-    )
+    list_url = _find_link(appendix_html, r"list\s+of\s+ms-drgs", appendix_url) or appendix_url
     list_html = await asyncio.to_thread(_download_text, list_url)
     catalog_rows = _parse_ms_drg_catalog_rows(list_html)
     if request.test_mode:
         smoke_codes = {"001", "031", "097", "371", "470", "714", "791", "820"}
         catalog_rows = [
-            catalog_record
-            for catalog_record in catalog_rows
-            if catalog_record.code in smoke_codes
+            catalog_record for catalog_record in catalog_rows if catalog_record.code in smoke_codes
         ] or catalog_rows[:20]
     if not catalog_rows:
         raise RuntimeError(f"CMS MS-DRG list produced no rows: {list_url}")
@@ -195,10 +184,7 @@ def _relationship_landing_urls(
     if not procedure_landing:
         missing_link_names.append("procedure code/MS-DRG index")
     if missing_link_names:
-        raise RuntimeError(
-            "Could not find CMS MS-DRG relationship index link(s): "
-            f"{', '.join(missing_link_names)}"
-        )
+        raise RuntimeError(f"Could not find CMS MS-DRG relationship index link(s): {', '.join(missing_link_names)}")
     return diagnosis_landing, procedure_landing
 
 
@@ -216,9 +202,7 @@ async def _download_index_pages(
         request.relationship_page_limit,
     )
     page_payloads = [(first_url, first_html)]
-    page_payloads.extend(
-        await _download_many(page_urls[1:], request.concurrency)
-    )
+    page_payloads.extend(await _download_many(page_urls[1:], request.concurrency))
     return [page_html for _page_url, page_html in page_payloads]
 
 
@@ -287,35 +271,19 @@ def _filter_test_relationships(
 ) -> None:
     if not test_mode or not relationship_rows.relationships:
         return
-    allowed_ms_drg_codes = {
-        catalog_record.code for catalog_record in manual_source.catalog_rows
-    }
+    allowed_ms_drg_codes = {catalog_record.code for catalog_record in manual_source.catalog_rows}
     relationship_rows.relationships = {
         relationship_tuple
         for relationship_tuple in relationship_rows.relationships
-        if (
-            relationship_tuple[0] == "MS_DRG"
-            and relationship_tuple[1] in allowed_ms_drg_codes
-        )
-        or (
-            relationship_tuple[3] == "MS_DRG"
-            and relationship_tuple[4] in allowed_ms_drg_codes
-        )
+        if (relationship_tuple[0] == "MS_DRG" and relationship_tuple[1] in allowed_ms_drg_codes)
+        or (relationship_tuple[3] == "MS_DRG" and relationship_tuple[4] in allowed_ms_drg_codes)
     }
     relationship_rows.procedure_category_by_code = {
         procedure_code: procedure_category
-        for procedure_code, procedure_category in (
-            relationship_rows.procedure_category_by_code.items()
-        )
+        for procedure_code, procedure_category in (relationship_rows.procedure_category_by_code.items())
         if any(
-            (
-                relationship_tuple[3] == "ICD10PCS"
-                and relationship_tuple[4] == procedure_code
-            )
-            or (
-                relationship_tuple[0] == "ICD10PCS"
-                and relationship_tuple[1] == procedure_code
-            )
+            (relationship_tuple[3] == "ICD10PCS" and relationship_tuple[4] == procedure_code)
+            or (relationship_tuple[0] == "ICD10PCS" and relationship_tuple[1] == procedure_code)
             for relationship_tuple in relationship_rows.relationships
         )
     }
@@ -351,6 +319,7 @@ async def _stage_and_publish(
     request: MsDrgImportRequest,
     import_payloads: MsDrgPayloads,
 ) -> MsDrgPublishCounts:
+    """Stage source rows, publish them atomically, and always remove staging tables."""
     stage_suffix = _ms_drg_stage_suffix(request.import_suffix, request.run_id)
     stage_by_model = {
         CodeCatalog: make_class(CodeCatalog, stage_suffix),
@@ -375,25 +344,7 @@ async def _stage_and_publish(
                 stage_by_model[CodeRelationship],
                 import_payloads.relationship_payloads,
             )
-        catalog_sources = SOURCES if request.include_relationships else (SOURCE_MS_DRG,)
-        _raise_if_cancelled(request.run_id)
-        async with db.transaction():
-            await _merge_catalog_stage(
-                stage_by_model[CodeCatalog],
-                schema,
-                catalog_sources,
-            )
-            await _merge_synonym_stage(
-                stage_by_model[CodeSynonym],
-                schema,
-                (SOURCE_MS_DRG,),
-            )
-            if request.include_relationships:
-                await _merge_relationship_stage(
-                    stage_by_model[CodeRelationship],
-                    schema,
-                    (SOURCE_ICD10CM_INDEX, SOURCE_ICD10PCS_INDEX),
-                )
+        await _publish_stage(schema, request, stage_by_model)
         return MsDrgPublishCounts(
             catalog_count,
             synonym_count,
@@ -401,6 +352,27 @@ async def _stage_and_publish(
         )
     finally:
         await _drop_stage_tables(db, schema, stage_by_model.values())
+
+
+async def _publish_stage(schema: str, request: MsDrgImportRequest, stage_by_model: dict) -> None:
+    catalog_sources = SOURCES if request.include_relationships else (SOURCE_MS_DRG,)
+    _raise_if_cancelled(request.run_id)
+    async with db.transaction() as session:
+        # Serialize shared-table publication before reading its serving receipt.
+        await db.status(
+            f"LOCK TABLE {schema}.{CodeCatalog.__tablename__}, "
+            f"{schema}.{CodeSynonym.__tablename__}, "
+            f"{schema}.{CodeRelationship.__tablename__} "
+            "IN SHARE ROW EXCLUSIVE MODE"
+        )
+        await _merge_catalog_stage(stage_by_model[CodeCatalog], schema, catalog_sources)
+        await _merge_synonym_stage(stage_by_model[CodeSynonym], schema, (SOURCE_MS_DRG,))
+        if request.include_relationships:
+            await _merge_relationship_stage(
+                stage_by_model[CodeRelationship], schema, (SOURCE_ICD10CM_INDEX, SOURCE_ICD10PCS_INDEX)
+            )
+        if not request.test_mode:
+            await publish_local_generation(session, schema, include_relationships=request.include_relationships)
 
 
 def _build_summary(
