@@ -2372,12 +2372,23 @@ async def _require_automatic_cutover_generation(session, spec, expected_incumben
             return
         if not all(incumbent_presence_flags):
             raise ReferenceFamilyArchiveError("reference family incumbent is incomplete")
+        shared_names = frozenset()
+        sources = ()
+        if spec.importer_id == "clinical-reference":
+            from process.clinical_reference_publication import CLINICAL_REFERENCE_SOURCES
+            from process.clinical_reference_result_archive import SHARED_MODELS
+
+            shared_names = frozenset(model.__tablename__ for model in SHARED_MODELS)
+            sources = CLINICAL_REFERENCE_SOURCES
         for table_name in spec.table_names:
+            scoped = table_name in shared_names
             populated = await session.scalar(
                 text(
                     f"SELECT EXISTS (SELECT 1 FROM {_quoted(expected_incumbent.schema_name)}."
-                    f"{_quoted(table_name)} LIMIT 1)"
-                )
+                    f"{_quoted(table_name)}"
+                    f"{' WHERE source=ANY(CAST(:sources AS text[]))' if scoped else ''} LIMIT 1)"
+                ),
+                {"sources": list(sources)} if scoped else {},
             )
             if populated:
                 raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
