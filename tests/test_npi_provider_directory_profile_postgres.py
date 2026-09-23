@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.endpoint import npi as npi_module
 from db.connection import Database
+from db.models import ProviderProfileSourcePin
+from process.source_profile_result_pins import pin_guard_statements
 
 florida = importlib.import_module("process.florida_mqa_profile")
 
@@ -165,6 +167,7 @@ def _retention_schema_models(monkeypatch, schema):
     florida.ProviderProfileProjection.__table__.to_metadata(
         metadata, schema=schema, name="provider_profile_projection_old",
     )
+    ProviderProfileSourcePin.__table__.to_metadata(metadata, schema=schema)
     return metadata
 
 
@@ -187,6 +190,8 @@ async def _retention_database(monkeypatch):
         is_schema_created = True
         async with engine.begin() as connection:
             await connection.run_sync(metadata.create_all)
+            for statement in pin_guard_statements(schema):
+                await connection.exec_driver_sql(statement)
         monkeypatch.setattr(florida, "db", database)
         yield database, metadata
     finally:
@@ -284,22 +289,28 @@ async def _retention_payload_snapshot(database):
 
 @pytest.mark.asyncio
 async def test_florida_retention_preserves_other_sources_in_postgresql(monkeypatch, tmp_path):
-    """Delete only obsolete Florida payloads while retaining every audit run."""
+    """Skip a pinned Florida audit and clean an unrelated eligible generation."""
     observed_at, run_rows = _retention_run_cases()
-    deleted_run_ids = {"a" * 32, "b" * 32}
+    deleted_run_ids = {"b" * 32}
     monkeypatch.setattr(florida, "_utcnow", lambda: observed_at)
     async with _retention_database(monkeypatch) as (database, metadata):
         await database.insert(florida.ProviderProfileImportRun.__table__).values(run_rows).status()
         await _seed_retention_payloads(database, run_rows, tmp_path)
         await _seed_retention_generations(database, metadata, observed_at)
+        await database.insert(metadata.tables[
+            f"{florida.ProviderProfileProjection.__table__.schema}.provider_profile_source_pin"
+        ]).values(
+            pin_id=str(uuid.uuid4()), source_key="florida-mqa", run_id="a" * 32,
+            purpose="export", authority_json={},
+        ).status()
         before_by_table = await _retention_payload_snapshot(database)
         retention = await florida._post_success_retention(
             run_id="e" * 32, artifact_root=tmp_path, failed_retention_days=7,
         )
         after_by_table = await _retention_payload_snapshot(database)
         assert retention["deleted_run_ids"] == sorted(deleted_run_ids)
-        assert retention["protected_audit_run_ids"] == ["c" * 32, "d" * 32]
-        assert retention["deleted_rows"] == {"facts": 2, "source_records": 2, "artifacts": 2}
+        assert retention["protected_audit_run_ids"] == ["a" * 32, "c" * 32, "d" * 32]
+        assert retention["deleted_rows"] == {"facts": 1, "source_records": 1, "artifacts": 1}
         for table_name, before_by_run in before_by_table.items():
             assert after_by_table[table_name] == {
                 run_id: retained_payload for run_id, retained_payload in before_by_run.items()
