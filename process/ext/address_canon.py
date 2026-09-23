@@ -2055,18 +2055,21 @@ async def resolve_into_archive(
     gate_sample_limit: int = 20,
     strict_source_predicate: str | None = None,
     cancel_check: Callable[[], Awaitable[None]] | None = None,
+    source_capture: Callable[..., Awaitable[None]] | None = None,
+    zip_restore_complete: bool = False,
 ) -> ResolveStats:
     """Resolve staging addresses into the canonical archive and return gates."""
     started = time.monotonic()
     schema = schema or _schema_name()
     archive_table = await _select_canonical_archive_table(schema, archive_table or archive_table_name())
-    await restore_missing_zip_from_tiger_zcta(
-        staging_table,
-        field_map,
-        schema=schema,
-        cancel_check=cancel_check,
-        only_null_address_key=True,
-    )
+    if not zip_restore_complete:
+        await restore_missing_zip_from_tiger_zcta(
+            staging_table,
+            field_map,
+            schema=schema,
+            cancel_check=cancel_check,
+            only_null_address_key=True,
+        )
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
     staging = _qtable(schema, staging_table)
     archive = _qtable(schema, archive_table)
@@ -2342,6 +2345,8 @@ async def resolve_into_archive(
                 f"stamped={mismatch.staged_address_key} expected={mismatch.computed_address_key} "
                 f"identity={mismatch.identity_key!r}"
             )
+        if source_capture is not None:
+            await source_capture(session, schema=schema, dedup_sql=dedup_cte)
         await _snapshot_strict_source_observations(
             session,
             keyed_table=keyed_table,
