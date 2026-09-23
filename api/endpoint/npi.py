@@ -32,12 +32,47 @@ from sqlalchemy.sql import literal_column, text, tuple_
 from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
                               INTERNAL_PROCEDURE_CODE_SYSTEM,
                               INTERNAL_RX_CODE_SYSTEM)
+from api.custom_import_provider_sql import ProviderImportQuery
+from api.provider_list_sql import (
+    MAX_PROVIDER_LIST_PHONE_CANDIDATES,
+    MIN_PROVIDER_LIST_PHONE_CANDIDATES,
+    _CUSTOM_IMPORT_PROVIDER_RELATION,
+    _address_npi_filter,
+    _address_phone_candidates_cte,
+    _address_phone_candidates_join,
+    _address_phone_digits_filter,
+    _address_site_key_filter,
+    _address_zip5_filter,
+    _extract_name_filters,
+    _is_unified_address_table,
+    _primary_address_order_clause,
+    _provider_import_match_clause,
+    _provider_import_membership_clause,
+    _provider_import_order_clause,
+    _provider_import_relation_cte,
+    _provider_list_address_type_clause,
+    _provider_list_connection,
+    _provider_list_parameters,
+    _provider_list_phone_candidate_limit,
+    _provider_list_statement,
+    _sql_with_ctes,
+    _sql_with_prefix_ctes,
+)
 from api.endpoint.pagination import parse_pagination
 from api.npi_detail_cache_identity import (
     NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
+from api.provider_geo_sql import (
+    ImportedGeoQuery,
+    ImportedGeoStatements,
+    NearbySqlQuery,
+    build_imported_geo_statements,
+    build_native_nearby_count_sql,
+    build_native_nearby_sql,
+    nearby_batch_identities,
+)
 from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
     resolve_provider_specialty_filter,
@@ -5128,107 +5163,28 @@ def _nearby_geo_type_clause(address_table_sql: str) -> str:
     return "AND (a.type = 'primary' OR a.type = 'secondary')"
 
 
-_NEARBY_SQL_TEMPLATE = dedent(
-    """
-    WITH sub_s AS (
-        SELECT d.npi AS npi_code,
-               ROUND(
-                   CAST(
-                       ST_Distance(
-                           Geography(
-                               ST_MakePoint(
-                                   (a.long)::double precision,
-                                   (a.lat)::double precision
-                               )
-                           ),
-                           Geography(
-                               ST_MakePoint(
-                                   CAST(:in_long AS double precision),
-                                   CAST(:in_lat AS double precision)
-                               )
-                           )
-                       ) / 1609.34 AS NUMERIC
-                   ),
-                   2
-               ) AS distance,
-               Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ) <-> Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ) AS cursor_distance_meters,
-               a.*,
-               d.*
-          FROM {address_table_sql} AS a
-          JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-         WHERE ST_DWithin(
-                   Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ),
-                   Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ),
-                   :radius * 1609.34
-               )
-           AND a.lat IS NOT NULL
-           AND a.long IS NOT NULL
-           AND a.address_key IS NOT NULL
-           {taxonomy_where}
-           {geo_precision_clause}
-           {geo_type_clause}
-           {extra_clause}{ilike_clause}{cursor_clause}
-      ORDER BY Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ) <-> Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ) ASC,
-               a.npi ASC,
-               a.address_key ASC,
-               CASE a.type
-                   WHEN 'primary' THEN 0
-                   WHEN 'practice' THEN 1
-                   WHEN 'site' THEN 2
-                   WHEN 'secondary' THEN 3
-                   ELSE 9
-               END ASC,
-               {row_tiebreaker}
-         LIMIT :limit
+def _nearby_sql_query(
+    taxonomy_conditions: str,
+    extra_clause: str,
+    ilike_clause: str,
+    *,
+    use_taxonomy_filter: bool,
+    primary_only: bool = False,
+    address_table_sql: str = "mrf.npi_address",
+    geo_precision_clause: str = "",
+) -> NearbySqlQuery:
+    """Return normalized query fragments for native and imported nearby SQL."""
+
+    return NearbySqlQuery(
+        taxonomy_conditions=taxonomy_conditions,
+        extra_clause=extra_clause,
+        ilike_clause=ilike_clause,
+        use_taxonomy_filter=use_taxonomy_filter,
+        primary_only=primary_only,
+        address_table_sql=address_table_sql,
+        geo_precision_clause=geo_precision_clause,
+        geo_type_clause=_nearby_geo_type_clause(address_table_sql),
     )
-    SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
-      FROM sub_s
-      LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
-      LEFT JOIN mrf.nucc_taxonomy AS nucc
-        ON nucc.code = t.healthcare_provider_taxonomy_code
-  ORDER BY sub_s.cursor_distance_meters ASC,
-           sub_s.npi_code ASC,
-           sub_s.address_key ASC,
-           CASE sub_s.type
-               WHEN 'primary' THEN 0
-               WHEN 'practice' THEN 1
-               WHEN 'site' THEN 2
-               WHEN 'secondary' THEN 3
-               ELSE 9
-           END ASC,
-           {outer_row_tiebreaker};
-    """
-)
 
 
 def _build_nearby_sql(
@@ -5242,90 +5198,20 @@ def _build_nearby_sql(
     geo_precision_clause: str = "",
     cursor_clause: str = "",
 ) -> str:
-    """Build the GiST KNN nearby-provider query for the selected address model.
+    """Build the native KNN nearby-provider query for the selected address model."""
 
-    Do not add a separate latitude/longitude bounding box here. It makes PostgreSQL
-    prefer the B-tree geo_bbox index, which must scan and sort the entire box before
-    applying LIMIT. The geography KNN order lets geo_idx stop after the first page.
-    Exact total counts use a different access pattern and should remain separate.
-    """
-    taxonomy_from = ""
-    taxonomy_where = ""
-    if use_taxonomy_filter:
-        taxonomy_from = (
-            ",\n"
-            "                              (\n"
-            "                                  SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
-            "                                         ARRAY_AGG(int_code) AS codes\n"
-            "                                    FROM mrf.nucc_taxonomy\n"
-            f"                                   WHERE {taxonomy_conditions}\n"
-            "                              ) AS g"
-        )
-        taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
-        if primary_only:
-            taxonomy_where += (
-                "\n                          AND EXISTS ("
-                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
-                "WHERE provider_taxonomy.npi = a.npi "
-                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
-                "AND UPPER(COALESCE("
-                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
-            )
-    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-    row_tiebreaker = (
-        "a.location_key ASC"
-        if address_table_sql.endswith(".entity_address_unified")
-        else "a.type ASC"
-    )
-    outer_row_tiebreaker = (
-        "sub_s.location_key ASC"
-        if address_table_sql.endswith(".entity_address_unified")
-        else "sub_s.type ASC"
-    )
-    return _NEARBY_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
-        taxonomy_where=taxonomy_where,
-        geo_precision_clause=geo_precision_clause,
-        geo_type_clause=geo_type_clause,
-        extra_clause=extra_clause,
-        ilike_clause=ilike_clause,
+    return build_native_nearby_sql(
+        _nearby_sql_query(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=use_taxonomy_filter,
+            primary_only=primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+        ),
         cursor_clause=cursor_clause,
-        row_tiebreaker=row_tiebreaker,
-        outer_row_tiebreaker=outer_row_tiebreaker,
-        address_table_sql=address_table_sql,
     )
-
-
-_NEARBY_COUNT_SQL_TEMPLATE = dedent(
-    """
-    SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
-      FROM {address_table_sql} AS a
-      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-     WHERE ST_DWithin(
-               Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ),
-               Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ),
-               :radius * 1609.34
-           )
-       AND a.lat IS NOT NULL
-       AND a.long IS NOT NULL
-       AND a.address_key IS NOT NULL
-       {taxonomy_where}
-       {geo_precision_clause}
-       {geo_type_clause}
-       {bbox_clause}
-       {extra_clause}{ilike_clause};
-    """
-)
 
 
 def _build_nearby_count_sql(
@@ -5341,38 +5227,17 @@ def _build_nearby_count_sql(
 ) -> str:
     """Build the exact provider-address count query for nearby search."""
 
-    taxonomy_from = ""
-    taxonomy_where = ""
-    if use_taxonomy_filter:
-        taxonomy_from = (
-            ",\n"
-            "       (\n"
-            "           SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
-            "                  ARRAY_AGG(int_code) AS codes\n"
-            "             FROM mrf.nucc_taxonomy\n"
-            f"            WHERE {taxonomy_conditions}\n"
-            "       ) AS g"
-        )
-        taxonomy_where = "\n   AND a.taxonomy_array && g.codes"
-        if primary_only:
-            taxonomy_where += (
-                "\n   AND EXISTS ("
-                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
-                "WHERE provider_taxonomy.npi = a.npi "
-                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
-                "AND UPPER(COALESCE("
-                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
-            )
-    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-    return _NEARBY_COUNT_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
-        taxonomy_where=taxonomy_where,
-        geo_precision_clause=geo_precision_clause,
-        geo_type_clause=geo_type_clause,
+    return build_native_nearby_count_sql(
+        _nearby_sql_query(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=use_taxonomy_filter,
+            primary_only=primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+        ),
         bbox_clause=bbox_clause,
-        extra_clause=extra_clause,
-        ilike_clause=ilike_clause,
-        address_table_sql=address_table_sql,
     )
 
 
@@ -6048,174 +5913,6 @@ def _is_unified_address_serving_requested() -> bool:
     return os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
 
 
-def _is_unified_address_table(address_table_sql: str) -> bool:
-    return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}")
-
-
-def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool = False) -> str:
-    column = f"{alias}.zip5" if _is_unified_address_table(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
-    operator = "ANY (:zip_codes)" if any_array else ":zip_code"
-    return f"{column} = {operator}"
-
-
-def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
-    raw_digits = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g')"
-    if _is_unified_address_table(address_table_sql):
-        return f"COALESCE(NULLIF({alias}.phone_number, ''), {raw_digits}) = :phone_digits"
-    return f"{raw_digits} = :phone_digits"
-
-
-_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = """
-current_provider_directory_runs AS MATERIALIZED (
-    SELECT source.source_id, dataset.dataset_id,
-           COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar
-               AS run_id
-      FROM mrf.provider_directory_source AS source
-      JOIN mrf.provider_directory_endpoint_dataset AS dataset
-        ON dataset.endpoint_id = source.endpoint_id
-     WHERE dataset.is_current IS TRUE
-       AND dataset.status = 'published'
-       AND dataset.published_at IS NOT NULL
-       AND dataset.superseded_at IS NULL
-), matching_provider_directory_phone_rows AS MATERIALIZED (
-    SELECT overlay.npi, overlay.address_key, overlay.source_id,
-           overlay.last_seen_run_id, overlay.source_record_id,
-           overlay.resource_type, overlay.resource_id
-      FROM mrf.provider_directory_address_overlay AS overlay
-     WHERE overlay.phone_number = :phone_digits
-       AND overlay.npi IS NOT NULL
-       AND overlay.address_key IS NOT NULL
-)
-"""
-
-MIN_PROVIDER_LIST_PHONE_CANDIDATES = 100
-MAX_PROVIDER_LIST_PHONE_CANDIDATES = 500
-
-
-def _provider_list_phone_candidate_limit(
-    page_limit: int,
-    page_offset: int = 0,
-    *,
-    count_query: bool = False,
-) -> int:
-    """Bound phone candidates while retaining enough rows for paging/filtering."""
-    if count_query:
-        return MAX_PROVIDER_LIST_PHONE_CANDIDATES
-    requested_window = max(int(page_offset), 0) + max(int(page_limit), 1)
-    return min(
-        max(requested_window * 8, MIN_PROVIDER_LIST_PHONE_CANDIDATES),
-        MAX_PROVIDER_LIST_PHONE_CANDIDATES,
-    )
-
-
-_PHONE_CANDIDATE_ROWS_CTE = """
-phone_candidate_rows AS MATERIALIZED (
-    SELECT DISTINCT
-           COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
-           phone_address.address_key,
-           false AS provider_directory_matched,
-           NULL::varchar AS source_id,
-           NULL::varchar AS source_record_id,
-           phone_address.source_count::integer AS source_count
-      FROM {address_table_sql} AS phone_address
-     WHERE phone_address.type IN ({service_types})
-       AND phone_address.address_key IS NOT NULL
-       AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
-       AND {direct_phone}
-    UNION ALL
-    SELECT DISTINCT
-           overlay.npi::bigint AS provider_npi,
-           overlay.address_key,
-           true AS provider_directory_matched,
-           overlay.source_id::varchar,
-           overlay.source_record_id::varchar,
-           NULL::integer AS source_count
-      FROM matching_provider_directory_phone_rows AS overlay
-      JOIN current_provider_directory_runs AS current_run
-        ON current_run.source_id = overlay.source_id
-       AND current_run.run_id = overlay.last_seen_run_id
-      JOIN mrf.provider_directory_dataset_resource AS dataset_resource
-        ON dataset_resource.dataset_id = current_run.dataset_id
-       AND dataset_resource.resource_type = overlay.resource_type
-       AND dataset_resource.resource_id = overlay.resource_id
-)
-"""
-
-
-_RANKED_PHONE_CANDIDATE_CTES = """
-phone_candidates_unranked AS MATERIALIZED (
-    SELECT candidate.provider_npi, candidate.address_key,
-           BOOL_OR(candidate.provider_directory_matched) AS provider_directory_matched,
-           MAX(candidate.source_count) AS source_count
-      FROM phone_candidate_rows AS candidate
-  GROUP BY candidate.provider_npi, candidate.address_key
-), phone_candidate_best_addresses AS MATERIALIZED (
-    SELECT DISTINCT ON (candidate.provider_npi)
-           candidate.provider_npi, candidate.address_key,
-           candidate.provider_directory_matched, candidate.source_count
-      FROM phone_candidates_unranked AS candidate
-  ORDER BY candidate.provider_npi,
-           candidate.provider_directory_matched DESC,
-           candidate.source_count DESC NULLS LAST,
-           candidate.address_key
-), phone_candidates AS MATERIALIZED (
-    SELECT candidate.provider_npi, candidate.address_key,
-           candidate.provider_directory_matched
-      FROM phone_candidate_best_addresses AS candidate
-  ORDER BY candidate.provider_directory_matched DESC,
-           candidate.source_count DESC NULLS LAST,
-           candidate.provider_npi,
-           candidate.address_key
-     LIMIT :candidate_limit
-), phone_provider_directory_evidence AS MATERIALIZED (
-    SELECT evidence.provider_npi,
-           ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)
-               AS source_record_ids
-      FROM (
-            SELECT candidate.provider_npi, candidate.source_id,
-                   MIN(candidate.source_record_id) AS source_record_id
-              FROM phone_candidate_rows AS candidate
-              JOIN phone_candidates AS selected_candidate
-                ON selected_candidate.provider_npi = candidate.provider_npi
-             WHERE candidate.provider_directory_matched
-               AND candidate.source_id IS NOT NULL
-               AND candidate.source_record_id IS NOT NULL
-          GROUP BY candidate.provider_npi, candidate.source_id
-      ) AS evidence
-  GROUP BY evidence.provider_npi
-)
-"""
-
-
-def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
-    """Return indexed phone candidates, including current FHIR evidence."""
-    if not _is_unified_address_table(address_table_sql):
-        return None
-    direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
-    service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
-    phone_candidate_rows_cte = _PHONE_CANDIDATE_ROWS_CTE.format(
-        address_table_sql=address_table_sql,
-        service_types=service_types,
-        direct_phone=direct_phone,
-    )
-    return ",\n".join(
-        (
-            _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip(),
-            phone_candidate_rows_cte.strip(),
-            _RANKED_PHONE_CANDIDATE_CTES.strip(),
-        )
-    )
-
-
-def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = None) -> str:
-    provider_npi = provider_npi_sql or f"COALESCE({alias}.npi, {alias}.inferred_npi)"
-    return f"""
-          JOIN phone_candidates AS phone_match
-            ON phone_match.provider_npi = {provider_npi}
-           AND phone_match.address_key = {alias}.address_key
-    """
-
-
 def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
     exact_phone = _address_phone_digits_filter("candidate_address", address_table_sql)
     service_location = _provider_list_address_type_clause(
@@ -6239,59 +5936,6 @@ def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -
                 LIMIT 1 OFFSET 0
          ) AS {alias}
     """
-
-
-def _sql_with_prefix_ctes(*ctes: str | None) -> str:
-    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    joined_ctes = ",\n".join(available_ctes)
-    return f"WITH {joined_ctes},\n" if available_ctes else "WITH "
-
-
-def _sql_with_ctes(*ctes: str | None) -> str:
-    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    joined_ctes = ",\n".join(available_ctes)
-    return f"WITH {joined_ctes}\n" if available_ctes else ""
-
-
-def _address_npi_filter(alias: str, address_table_sql: str) -> str:
-    if _is_unified_address_table(address_table_sql):
-        return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"
-    return f"{alias}.npi = :npi_filter"
-
-
-def _address_site_key_filter(alias: str, address_table_sql: str) -> str:
-    if _is_unified_address_table(address_table_sql):
-        return f"{alias}.premise_key = CAST(:address_site_key AS uuid)"
-    return "1=0"
-
-
-def _provider_list_address_type_clause(
-    alias: str,
-    address_table_sql: str,
-    *,
-    include_service_locations: bool,
-) -> str:
-    if include_service_locations and _is_unified_address_table(address_table_sql):
-        type_list = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
-        return f"{alias}.type IN ({type_list})"
-    return f"{alias}.type = 'primary'"
-
-
-def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
-    common = (
-        f"{alias}.npi, "
-        f"({alias}.lat IS NULL OR {alias}.long IS NULL), "
-        f"(NULLIF(TRIM(COALESCE({alias}.first_line, '')), '') IS NULL), "
-    )
-    if _is_unified_address_table(address_table_sql):
-        return (
-            common
-            + f"(COALESCE({alias}.address_precision, '') = 'city_zip'), "
-            + f"{alias}.source_count DESC NULLS LAST, "
-            + f"{alias}.updated_at DESC NULLS LAST, "
-            + f"{alias}.location_key"
-        )
-    return common + f"{alias}.date_added DESC NULLS LAST, {alias}.checksum"
 
 
 def _public_address_column_keys() -> set[str]:
@@ -7007,36 +6651,6 @@ def _build_npi_where_clause(
         organization_expression=ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix),
         entity_type_code=entity_type_code,
     )
-
-
-def _extract_name_filters(request) -> list[str]:
-    args = getattr(request, "args", {}) or {}
-    names: list[str] = []
-    if hasattr(args, "getlist"):
-        names.extend(args.getlist("name_like"))
-    elif hasattr(args, "getall"):
-        try:
-            names.extend(args.getall("name_like"))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("failed to read name_like filters with getall: %s", exc)
-    else:
-        maybe = args.get("name_like")
-        if maybe:
-            names.append(maybe)
-    single = args.get("name_like")
-    if single:
-        names.append(single)
-    normalized_names = []
-    seen_names = set()
-    for name in names:
-        if not name:
-            continue
-        lower = str(name).lower()
-        if lower in seen_names:
-            continue
-        seen_names.add(lower)
-        normalized_names.append(lower)
-    return normalized_names
 
 
 async def _compute_npi_counts():
@@ -8849,49 +8463,106 @@ def _append_unique_search_taxonomy(
 
 
 @blueprint.get("/all")
-async def list_providers(request):
+async def list_providers(request, *, native_args=None, import_context=None):
     """Search, count, or page through public NPI provider records."""
-    is_count_only = str(request.args.get("count_only", "0")).strip() == "1"
-    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
-    response_format = request.args.get("format") or request.args.get("response_format")
+    if (native_args is None) != (import_context is None):
+        raise sanic.exceptions.InvalidUsage(
+            "custom-import provider arguments are invalid"
+        )
+    if import_context is not None and type(import_context) is not ProviderImportQuery:
+        raise sanic.exceptions.InvalidUsage(
+            "custom-import provider context is invalid"
+        )
+    args = request.args if native_args is None else native_args
+    is_count_only = str(args.get("count_only", "0")).strip() == "1"
+    include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
+    response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
     request_session = _request_session(request)
-    legacy_name_like = _extract_name_filters(request)
+    legacy_name_like = _extract_name_filters(request, args=args)
     # Explicit access for route collectors / OpenAPI parity.
+    # Imported calls use ``native_args`` but must retain the real request object.
+    request.args.get("count_only")
+    request.args.get("show")
+    request.args.get("format")
+    request.args.get("response_format")
     request.args.get("q")
     request.args.get("name_like")
+    request.args.get("page")
+    request.args.get("page_size")
     request.args.get("start")
+    request.args.get("offset")
     request.args.get("limit")
     request.args.get("include_total")
     request.args.get("include_sources")
     request.args.get("include_evidence")
+    request.args.get("debug")
     request.args.get("view")
     request.args.get("order_by")
+    request.args.get("classification")
+    request.args.get("specialization")
+    request.args.get("section")
+    request.args.get("display_name")
+    request.args.get("first_name")
+    request.args.get("last_name")
+    request.args.get("organization_name")
     request.args.get("npi")
+    request.args.get("phone")
+    request.args.get("address_key")
     request.args.get("address_site_key")
+    request.args.get("zip_code")
+    request.args.get("postal_code")
+    request.args.get("entity_type_code")
     request.args.get("provider_sex_code")
+    request.args.get("plan_network")
+    request.args.get("has_insurance")
+    request.args.get("city")
+    request.args.get("state")
+    request.args.get("codes")
+    request.args.get("primary_only")
     request.args.get("plan_release_id")
-    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
-    if _is_truthy_arg(request.args.get("debug"), default=False):
+    request.args.get("procedure_codes")
+    request.args.get("procedure_code_system")
+    request.args.get("medication_codes")
+    request.args.get("medication_code_system")
+    request.args.get("year")
+    include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(args.get("include_evidence"), default=False)
+    if _is_truthy_arg(args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
-    q_value = str(request.args.get("q") or "").strip().lower()
-    order_by = str(request.args.get("order_by") or "npi").strip().lower()
+    q_value = str(args.get("q") or "").strip().lower()
+    order_by = str(args.get("order_by") or "npi").strip().lower()
     if order_by not in {"npi", "relevance"}:
         raise sanic.exceptions.InvalidUsage("order_by must be one of: npi, relevance")
     relevance_q = " ".join(_name_search_tokens(q_value))
     if order_by == "relevance" and not relevance_q:
         raise sanic.exceptions.InvalidUsage("order_by=relevance requires q")
-    include_total_raw = request.args.get("include_total")
+    include_total_raw = args.get("include_total")
     include_total = _is_truthy_arg(
         include_total_raw,
-        default=_should_include_npi_all_total(request.args, is_count_only),
+        default=_should_include_npi_all_total(args, is_count_only),
     )
-    view_mode = str(request.args.get("view") or "").strip().lower()
+    view_mode = str(args.get("view") or "").strip().lower()
     if view_mode not in {"", "sitemap", "card"}:
         raise sanic.exceptions.InvalidUsage("view must be one of: sitemap, card")
-    classification = request.args.get("classification")
+    if import_context is not None:
+        if is_count_only or view_mode == "sitemap":
+            raise sanic.exceptions.InvalidUsage(
+                "custom-import provider pages require provider results"
+            )
+        if not include_total:
+            raise sanic.exceptions.InvalidUsage(
+                "custom-import provider pages require exact totals"
+            )
+        if (
+            not import_context.require_match
+            and not import_context.prepared.normalized_order_terms
+        ):
+            raise sanic.exceptions.InvalidUsage(
+                "custom-import provider pages require imported ordering"
+            )
+    classification = args.get("classification")
     is_sitemap_limit_mode = (
         view_mode == "sitemap"
         and str(classification or "").strip().lower() == "pharmacy"
@@ -8903,7 +8574,7 @@ async def list_providers(request):
         if legacy_name_filter not in name_like_values:
             name_like_values.append(legacy_name_filter)
     pagination = parse_pagination(
-        request.args,
+        args,
         default_limit=50,
         max_limit=20000 if is_sitemap_limit_mode else 200,
         default_page=1,
@@ -8913,32 +8584,32 @@ async def list_providers(request):
     )
     start = pagination.offset
     limit = pagination.limit
-    specialization = request.args.get("specialization")
-    section = request.args.get("section")
-    display_name = request.args.get("display_name")
-    first_name = request.args.get("first_name")
-    last_name = request.args.get("last_name")
-    organization_name = request.args.get("organization_name")
-    npi_raw = request.args.get("npi")
-    phone = request.args.get("phone")
-    address_key_raw = request.args.get("address_key")
-    address_site_key_raw = request.args.get(PUBLIC_ADDRESS_SITE_KEY)
-    zip_code_raw = request.args.get("zip_code")
-    postal_code_raw = request.args.get("postal_code")
-    entity_type_code_raw = request.args.get("entity_type_code")
-    provider_sex_code_raw = request.args.get("provider_sex_code")
-    plan_network_ids = request.args.get("plan_network")
-    has_insurance = request.args.get("has_insurance")
-    city = request.args.get("city")
-    state = request.args.get("state")
-    procedure_codes_raw = request.args.get("procedure_codes")
-    procedure_code_system_raw = request.args.get("procedure_code_system")
-    medication_codes_raw = request.args.get("medication_codes")
-    medication_code_system_raw = request.args.get("medication_code_system")
-    year_raw = request.args.get("year")
-    plan_release_id_raw = request.args.get("plan_release_id")
+    specialization = args.get("specialization")
+    section = args.get("section")
+    display_name = args.get("display_name")
+    first_name = args.get("first_name")
+    last_name = args.get("last_name")
+    organization_name = args.get("organization_name")
+    npi_raw = args.get("npi")
+    phone = args.get("phone")
+    address_key_raw = args.get("address_key")
+    address_site_key_raw = args.get(PUBLIC_ADDRESS_SITE_KEY)
+    zip_code_raw = args.get("zip_code")
+    postal_code_raw = args.get("postal_code")
+    entity_type_code_raw = args.get("entity_type_code")
+    provider_sex_code_raw = args.get("provider_sex_code")
+    plan_network_ids = args.get("plan_network")
+    has_insurance = args.get("has_insurance")
+    city = args.get("city")
+    state = args.get("state")
+    procedure_codes_raw = args.get("procedure_codes")
+    procedure_code_system_raw = args.get("procedure_code_system")
+    medication_codes_raw = args.get("medication_codes")
+    medication_code_system_raw = args.get("medication_code_system")
+    year_raw = args.get("year")
+    plan_release_id_raw = args.get("plan_release_id")
     is_primary_only = _is_boolean_query_arg(
-        request.args.get("primary_only"),
+        args.get("primary_only"),
         "primary_only",
         default=True,
     )
@@ -8946,13 +8617,20 @@ async def list_providers(request):
     city = city.upper() if city else None
     state = state.upper() if state else None
 
-    codes = request.args.get("codes")
+    codes = args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
     _validate_section_filters(section, classification, codes)
 
     if plan_network_ids:
-        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
+        try:
+            plan_network_ids = [
+                int(network_id) for network_id in plan_network_ids.split(",")
+            ]
+        except (AttributeError, TypeError, ValueError):
+            raise sanic.exceptions.InvalidUsage(
+                "plan_network must contain integers"
+            ) from None
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
@@ -9148,7 +8826,7 @@ async def list_providers(request):
             "plan_release_id",
         )
     )
-    broad_name_total_deferred = bool(name_like_values) and not any(
+    broad_name_total_deferred = import_context is None and bool(name_like_values) and not any(
         [
             classification,
             specialization,
@@ -9175,7 +8853,7 @@ async def list_providers(request):
             plan_release_id_raw,
         ]
     )
-    inline_name_taxonomy_total = bool(
+    inline_name_taxonomy_total = import_context is None and bool(
         include_total
         and order_by == "npi"
         and name_like_values
@@ -9343,6 +9021,10 @@ async def list_providers(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        if import_context is not None and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
+            address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
         if use_taxonomy_filter and not use_location_first_taxonomy:
@@ -9358,7 +9040,10 @@ async def list_providers(request):
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql,
+                is_bounded=import_context is None,
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
@@ -9380,6 +9065,13 @@ async def list_providers(request):
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        import_relation_cte = _provider_import_relation_cte(import_context)
+        import_membership_clause = _provider_import_membership_clause(
+            import_context,
+            provider_npi_sql,
+        )
+        if import_membership_clause is not None:
+            address_clauses.append(import_membership_clause)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
@@ -9440,9 +9132,9 @@ async def list_providers(request):
                 )
 
         if npi_where and use_taxonomy_filter:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM taxonomy_matched_npi AS fn
                   JOIN {address_table_sql} AS c
@@ -9450,11 +9142,13 @@ async def list_providers(request):
                   {phone_candidates_join}
                  WHERE {' AND '.join(address_clauses)}
                 """
+                ,
+                import_context,
             )
         elif npi_where:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte)}
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c
@@ -9462,27 +9156,31 @@ async def list_providers(request):
                   {phone_candidates_join}
                  WHERE {' AND '.join(address_clauses)}
                 """
+                ,
+                import_context,
             )
         elif use_taxonomy_filter:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte)}
+                {_sql_with_ctes(phone_candidates_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_join}
                  WHERE {' AND '.join(address_clauses)}
-                """
+                """,
+                import_context,
             )
         else:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte)}
+                {_sql_with_ctes(phone_candidates_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                  WHERE {' AND '.join(address_clauses)}
-                """
+                """,
+                import_context,
             )
 
         query_parameters_by_name = {
@@ -9510,13 +9208,17 @@ async def list_providers(request):
         query_parameters_by_name.update(npi_params)
         query_parameters_by_name.update(taxonomy_parameters_by_name)
         query_parameters_by_name.update(plan_scope_parameters)
-        if phone_candidates_cte:
+        if phone_candidates_cte and import_context is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
 
-        async with db.acquire() as conn:
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name,
+            import_context,
+        )
+        async with _provider_list_connection(db, import_context, request_session) as conn:
             count_records = await conn.all(query, **query_parameters_by_name)
         return count_records[0][0] if count_records else 0
 
@@ -9613,11 +9315,15 @@ async def list_providers(request):
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
-                address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
+                address_clauses.append(
+                    _address_phone_digits_filter("c", address_table_sql)
+                )
         if address_key:
             address_clauses.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
@@ -9717,7 +9423,10 @@ async def list_providers(request):
 
     procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
     medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
-    if procedure_filter_unresolved or medication_filter_unresolved:
+    if (
+        import_context is None
+        and (procedure_filter_unresolved or medication_filter_unresolved)
+    ):
         if is_count_only and response_format in {"all", "full_taxonomy", "classification"}:
             return response.json({"rows": {}}, default=str)
         if is_count_only:
@@ -9854,6 +9563,10 @@ async def list_providers(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        if import_context is not None and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
+            address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
         if classification:
@@ -9893,11 +9606,16 @@ async def list_providers(request):
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql,
+                is_bounded=import_context is None,
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
-                address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
+                address_clauses.append(
+                    _address_phone_digits_filter("c", address_table_sql)
+                )
         if address_key:
             address_clauses.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
@@ -9915,6 +9633,14 @@ async def list_providers(request):
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        import_relation_cte = _provider_import_relation_cte(import_context)
+        import_match_clause = _provider_import_match_clause(
+            import_context,
+            provider_npi_sql,
+        )
+        eligible_address_clauses = list(address_clauses)
+        if import_match_clause is not None:
+            eligible_address_clauses.append(import_match_clause)
         lightweight_candidate_columns = tuple(
             dict.fromkeys(
                 NPI_LOCATION_CANDIDATE_COLUMNS
@@ -9946,12 +9672,17 @@ async def list_providers(request):
         search_npi_column_names = tuple(
             column.key for column in _npi_serving_columns()
         )
+        use_import_order = bool(
+            import_context is not None
+            and import_context.prepared.normalized_order_terms
+        )
         search_row_column_names = (
             ("npi_code",)
             + search_npi_column_names
             + projected_candidate_names
             + ("provider_address_total",)
             + (("_provider_total",) if inline_name_taxonomy_total else ())
+            + (("_provider_page_position",) if use_import_order else ())
         )
         search_npi_projection = ", ".join(
             f"b.{column_name}" for column_name in search_npi_column_names
@@ -9969,7 +9700,11 @@ async def list_providers(request):
             )
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
-        use_bounded_broad_name_page = broad_name_total_deferred and order_by == "npi"
+        use_bounded_broad_name_page = (
+            import_context is None
+            and broad_name_total_deferred
+            and order_by == "npi"
+        )
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
@@ -10058,7 +9793,7 @@ async def list_providers(request):
             SELECT {provider_npi_sql} AS npi,
                    MAX(fn.relevance_score) AS relevance_score
               FROM {address_source}
-             WHERE {' and '.join(address_clauses)}
+             WHERE {' and '.join(eligible_address_clauses)}
              GROUP BY {provider_npi_sql}
             """
             page_order_sql = "ORDER BY relevance_score DESC, npi ASC"
@@ -10077,12 +9812,41 @@ async def list_providers(request):
             eligible_npis_sql = f"""
             SELECT DISTINCT {provider_npi_sql} AS npi
               FROM {address_source}
-             WHERE {' and '.join(address_clauses)}
+             WHERE {' and '.join(eligible_address_clauses)}
             """
             page_order_sql = "ORDER BY npi + 0" if plan_network_ids else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
-        if inline_name_taxonomy_total:
+        if use_import_order:
+            import_order_sql = _provider_import_order_clause(
+                import_context,
+                "eligible_npi.npi",
+            )
+            import_membership_filter = (
+                "WHERE imported.entity_value IS NOT NULL"
+                if import_context.require_match
+                else ""
+            )
+            page_npis_sql = f"""
+            SELECT eligible_npi.*,
+                   ROW_NUMBER() OVER (
+                       ORDER BY {import_order_sql}
+                   ) AS _provider_page_position
+              FROM ({eligible_npis_sql}) AS eligible_npi
+         LEFT JOIN {_CUSTOM_IMPORT_PROVIDER_RELATION} AS imported
+                ON imported.entity_value = (eligible_npi.npi)::text
+             {import_membership_filter}
+             ORDER BY {import_order_sql}
+             LIMIT :limit OFFSET :start
+            """
+            sub_s_total_projection = ""
+            sub_s_page_position_projection = (
+                ", pn._provider_page_position AS _provider_page_position"
+            )
+            result_order_sql = (
+                "ORDER BY sub_s._provider_page_position ASC, sub_s.npi_code ASC"
+            )
+        elif inline_name_taxonomy_total:
             page_npis_sql = f"""
             SELECT eligible_npi.*,
                    COUNT(*) OVER () AS provider_total
@@ -10091,6 +9855,7 @@ async def list_providers(request):
              LIMIT :limit OFFSET :start
             """
             sub_s_total_projection = ", pn.provider_total AS _provider_total"
+            sub_s_page_position_projection = ""
         else:
             page_npis_sql = f"""
             {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if plan_network_ids else eligible_npis_sql}
@@ -10098,13 +9863,14 @@ async def list_providers(request):
             LIMIT :limit OFFSET :start
             """
             sub_s_total_projection = ""
-        provider_page_query = text(
+            sub_s_page_position_projection = ""
+        provider_page_query = _provider_list_statement(
             f"""
-        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}page_npis AS (
+        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, import_relation_cte)}page_npis AS (
             {page_npis_sql}
         ),
         sub_s AS (
-            SELECT pn.npi AS npi_code, {search_npi_projection}, g.*{sub_s_relevance_projection}{sub_s_total_projection}
+            SELECT pn.npi AS npi_code, {search_npi_projection}, g.*{sub_s_relevance_projection}{sub_s_total_projection}{sub_s_page_position_projection}
               FROM page_npis AS pn
          LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
@@ -10119,6 +9885,8 @@ async def list_providers(request):
 
     SELECT sub_s.* FROM sub_s {result_order_sql};
     """
+            ,
+            import_context,
         )
 
         def _search_location_from_mapping(
@@ -10157,36 +9925,40 @@ async def list_providers(request):
 
         providers_by_npi = {}
         provider_total: Optional[int] = None
-        async with db.acquire() as conn:
-            query_parameters_by_name = {
-                "start": start,
-                "limit": limit,
-                "classification": classification,
-                "section": section,
-                "display_name": display_name,
-                "codes": codes,
-                "plan_network_array": plan_network_ids,
-                "specialization": specialization,
-                "city": city,
-                "state": state,
-                "zip_code": zip_code,
-                "phone_digits": phone_digits,
-                "address_key": address_key,
-                "address_site_key": address_site_key,
-                "npi_filter": exact_npi,
-                "provider_sex_code": provider_sex_code,
-                **npi_params,
-                **dynamic_code_parameters,
-                **taxonomy_parameters_by_name,
-                **plan_scope_parameters,
-            }
-            if order_by == "relevance":
-                query_parameters_by_name["relevance_q"] = relevance_q
-            if phone_candidates_cte:
-                query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
-                    limit,
-                    start,
-                )
+        query_parameters_by_name = {
+            "start": start,
+            "limit": limit,
+            "classification": classification,
+            "section": section,
+            "display_name": display_name,
+            "codes": codes,
+            "plan_network_array": plan_network_ids,
+            "specialization": specialization,
+            "city": city,
+            "state": state,
+            "zip_code": zip_code,
+            "phone_digits": phone_digits,
+            "address_key": address_key,
+            "address_site_key": address_site_key,
+            "npi_filter": exact_npi,
+            "provider_sex_code": provider_sex_code,
+            **npi_params,
+            **dynamic_code_parameters,
+            **taxonomy_parameters_by_name,
+            **plan_scope_parameters,
+        }
+        if order_by == "relevance":
+            query_parameters_by_name["relevance_q"] = relevance_q
+        if phone_candidates_cte and import_context is None:
+            query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
+                limit,
+                start,
+            )
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name,
+            import_context,
+        )
+        async with _provider_list_connection(db, import_context, request_session) as conn:
             rows_iter = await conn.all(
                 provider_page_query,
                 **query_parameters_by_name,
@@ -10241,7 +10013,11 @@ async def list_providers(request):
         async def _fetch_search_taxonomy_records() -> list[Any]:
             if not providers_by_npi:
                 return []
-            async with db.acquire() as taxonomy_conn:
+            async with _provider_list_connection(
+                db,
+                import_context,
+                request_session,
+            ) as taxonomy_conn:
                 return await taxonomy_conn.all(
                     text(
                         "SELECT taxonomy.*, nucc.display_name AS taxonomy_display "
@@ -10261,38 +10037,51 @@ async def list_providers(request):
                 return await _fetch_provider_enrichment_summary_map(
                     [provider_result.get("npi") for provider_result in provider_results],
                     include_chain=include_chain_enrichment,
-                    session=None,
+                    session=request_session if import_context is not None else None,
                 )
             except Exception as exc:
+                if import_context is not None:
+                    raise
                 logger.debug("Provider enrichment summary fetch failed: %s", exc)
                 return {}
 
-        search_read_tasks = (
-            asyncio.create_task(_fetch_search_taxonomy_records()),
-            asyncio.create_task(
-                _apply_location_statuses(
-                    [
-                        address_candidate
-                        for provider_result in provider_results
-                        for address_candidate in provider_result.get(
-                            "_address_candidates",
-                            [],
-                        )
-                    ],
-                    session=request_session,
-                )
-            ),
-            asyncio.create_task(_fetch_search_enrichment_summary()),
-        )
-        try:
-            taxonomy_records, _, summary_map = await asyncio.gather(
-                *search_read_tasks
+        location_candidates = [
+            address_candidate
+            for provider_result in provider_results
+            for address_candidate in provider_result.get(
+                "_address_candidates",
+                [],
             )
-        except BaseException:
-            for search_read_task in search_read_tasks:
-                search_read_task.cancel()
-            await asyncio.gather(*search_read_tasks, return_exceptions=True)
-            raise
+        ]
+        if import_context is not None:
+            taxonomy_records = await _fetch_search_taxonomy_records()
+            await _apply_location_statuses(
+                location_candidates,
+                session=request_session,
+                use_request_session=True,
+                fail_closed=True,
+            )
+            summary_map = await _fetch_search_enrichment_summary()
+        else:
+            search_read_tasks = (
+                asyncio.create_task(_fetch_search_taxonomy_records()),
+                asyncio.create_task(
+                    _apply_location_statuses(
+                        location_candidates,
+                        session=request_session,
+                    )
+                ),
+                asyncio.create_task(_fetch_search_enrichment_summary()),
+            )
+            try:
+                taxonomy_records, _, summary_map = await asyncio.gather(
+                    *search_read_tasks
+                )
+            except BaseException:
+                for search_read_task in search_read_tasks:
+                    search_read_task.cancel()
+                await asyncio.gather(*search_read_tasks, return_exceptions=True)
+                raise
         for taxonomy_record in taxonomy_records:
             taxonomy_mapping = getattr(
                 taxonomy_record,
@@ -10366,7 +10155,11 @@ async def list_providers(request):
         hydrated_by_location_key: dict[str, dict[str, Any]] = {}
         if is_unified_search and selected_location_keys:
             try:
-                async with db.acquire() as hydration_conn:
+                async with _provider_list_connection(
+                    db,
+                    import_context,
+                    request_session,
+                ) as hydration_conn:
                     hydrated_rows = await hydration_conn.all(
                         text(
                             f"SELECT c.* FROM {address_table_sql} AS c "
@@ -10414,6 +10207,8 @@ async def list_providers(request):
                         )
                     )
             except Exception as exc:
+                if import_context is not None:
+                    raise
                 logger.warning(
                     "NPI search location hydration failed; returning ranked candidates (%s)",
                     exc,
@@ -10485,6 +10280,8 @@ async def list_providers(request):
     async def _count_with_timeout(*, allow_inline_total: bool = True) -> Optional[int]:
         if not include_total:
             return None
+        if import_context is not None:
+            return await get_count(filters_by_name)
         if allow_inline_total and inline_name_taxonomy_total:
             return None
         if broad_name_total_deferred:
@@ -10519,7 +10316,8 @@ async def list_providers(request):
             return None
 
     use_sitemap_fast_path = (
-        view_mode == "sitemap"
+        import_context is None
+        and view_mode == "sitemap"
         and not is_count_only
         and str(classification or "").strip().lower() == "pharmacy"
         and not any(
@@ -10555,6 +10353,17 @@ async def list_providers(request):
     if use_sitemap_fast_path:
         result_rows = await get_sitemap_results(start, limit, "Pharmacy")
         raw_total = None if not include_total else await _count_with_timeout()
+    elif import_context is not None:
+        raw_total = await _count_with_timeout()
+        result_rows, inline_total, summary_map = await get_results(
+            start,
+            limit,
+            filters_by_name,
+        )
+        if inline_total is not None:
+            raw_total = inline_total
+        if raw_total is None:
+            raise RuntimeError("custom-import provider count is required")
     else:
         raw_total, result_payload = await asyncio.gather(
             _count_with_timeout(),
@@ -11040,72 +10849,155 @@ def _populate_near_provider_mapping(
     provider_by_field["npi"] = npi_value
 
 
+async def _fetch_imported_geo_page(
+    import_context: ProviderImportQuery,
+    request_session: Any,
+    imported_statements: ImportedGeoStatements,
+) -> list[Any]:
+    """Check a signed cursor anchor and fetch one exact imported geo page."""
+
+    async with _provider_list_connection(db, import_context, request_session) as connection:
+        if imported_statements.anchor is not None:
+            anchor_count_records = await connection.all(
+                imported_statements.anchor,
+                **imported_statements.parameters,
+            )
+            anchor_count_mapping = (
+                getattr(anchor_count_records[0], "_mapping", None)
+                if anchor_count_records
+                else None
+            )
+            anchor_count = (
+                anchor_count_mapping.get("anchor_count")
+                if anchor_count_mapping is not None
+                else (anchor_count_records[0][0] if anchor_count_records else 0)
+            )
+            if int(anchor_count or 0) != 1:
+                raise sanic.exceptions.InvalidUsage(
+                    "custom-import geo cursor anchor is unavailable"
+                )
+        return await connection.all(
+            imported_statements.page,
+            **imported_statements.parameters,
+        )
+
+
 @blueprint.get("/near/")
-async def get_near_npi(request):
+async def get_near_npi(request, *, native_args=None, import_context=None, prepare_cursor=None):
     """Return providers near coordinates under optional taxonomy filters."""
+    if (native_args is None) != (import_context is None):
+        raise sanic.exceptions.InvalidUsage("custom-import geo arguments are invalid")
+    if import_context is not None and type(import_context) is not ProviderImportQuery:
+        raise sanic.exceptions.InvalidUsage("custom-import geo context is invalid")
+    if (prepare_cursor is None) != (import_context is None):
+        raise sanic.exceptions.InvalidUsage("custom-import geo cursor is invalid")
+    args = request.args if native_args is None else native_args
     request_session = _request_session(request)
+    if import_context is not None and request_session is None:
+        raise RuntimeError("custom-import geo query requires a request session")
+    # Explicit access for route collectors / OpenAPI parity. Imported calls use
+    # native_args but must retain the real request object.
     request.args.get("view")
-    view_mode = str(request.args.get("view") or "").strip().lower()
+    request.args.get("long")
+    request.args.get("lat")
+    request.args.get("codes")
+    request.args.get("plan_network")
+    request.args.get("classification")
+    request.args.get("specialization")
+    request.args.get("section")
+    request.args.get("display_name")
+    request.args.get("procedure_codes")
+    request.args.get("procedure_code_system")
+    request.args.get("medication_codes")
+    request.args.get("medication_code_system")
+    request.args.get("year")
+    request.args.get("plan_release_id")
+    request.args.get("primary_only")
+    request.args.get("entity_type_code")
+    request.args.get("provider_sex_code")
+    request.args.get("q")
+    request.args.get("exclude_npi")
+    request.args.get("limit")
+    request.args.get("include_total")
+    request.args.get("cursor")
+    request.args.get("zip_codes")
+    request.args.get("radius")
+    view_mode = str(args.get("view") or "").strip().lower()
     if view_mode not in {"", "card"}:
         raise sanic.exceptions.InvalidUsage("view must be: card")
     in_long, in_lat = None, None
-    if request.args.get("long"):
-        in_long = float(request.args.get("long"))
-    if request.args.get("lat"):
-        in_lat = float(request.args.get("lat"))
+    try:
+        if args.get("long"):
+            in_long = float(args.get("long"))
+        if args.get("lat"):
+            in_lat = float(args.get("lat"))
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("lat and long must be numbers") from exc
 
-    codes = request.args.get("codes")
+    codes = args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
 
-    plan_network_ids = request.args.get("plan_network")
+    plan_network_ids = args.get("plan_network")
     if plan_network_ids:
-        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
-    classification = request.args.get("classification")
-    specialization = request.args.get("specialization")
-    section = request.args.get("section")
-    display_name = request.args.get("display_name")
-    procedure_codes_raw = request.args.get("procedure_codes")
-    procedure_code_system_raw = request.args.get("procedure_code_system")
-    medication_codes_raw = request.args.get("medication_codes")
-    medication_code_system_raw = request.args.get("medication_code_system")
-    year_raw = request.args.get("year")
-    plan_release_id_raw = request.args.get("plan_release_id")
+        try:
+            plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
+        except (AttributeError, TypeError, ValueError):
+            raise sanic.exceptions.InvalidUsage("plan_network must contain integers") from None
+    classification = args.get("classification")
+    specialization = args.get("specialization")
+    section = args.get("section")
+    display_name = args.get("display_name")
+    procedure_codes_raw = args.get("procedure_codes")
+    procedure_code_system_raw = args.get("procedure_code_system")
+    medication_codes_raw = args.get("medication_codes")
+    medication_code_system_raw = args.get("medication_code_system")
+    year_raw = args.get("year")
+    plan_release_id_raw = args.get("plan_release_id")
     is_primary_only = _is_boolean_query_arg(
-        request.args.get("primary_only"),
+        args.get("primary_only"),
         "primary_only",
         default=True,
     )
     entity_type_code = _normalize_match_candidate_entity_type(
-        request.args.get("entity_type_code"),
+        args.get("entity_type_code"),
         None,
     )
     provider_sex_code = normalize_provider_sex_code(
-        request.args.get("provider_sex_code")
+        args.get("provider_sex_code")
     )
     if entity_type_code == 2 and provider_sex_code is not None:
         raise sanic.exceptions.InvalidUsage(
             "provider_sex_code cannot be combined with entity_type_code=2"
         )
-    request.args.get("q")
-    if _extract_name_filters(request):
+    if _extract_name_filters(request, args=args):
         raise sanic.exceptions.InvalidUsage(
             "name_like is no longer supported on /npi/near/; use q"
         )
-    name_query = str(request.args.get("q") or "").strip()
-    exclude_npi = int(request.args.get("exclude_npi", 0))
-    limit = int(request.args.get("limit", 5))
+    name_query = str(args.get("q") or "").strip()
+    try:
+        exclude_npi = int(args.get("exclude_npi", 0))
+        limit = int(args.get("limit", 5))
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("exclude_npi and limit must be integers") from exc
     if limit < 1:
         raise sanic.exceptions.InvalidUsage("limit must be at least 1")
-    include_total = _is_truthy_arg(request.args.get("include_total"), default=False)
-    cursor_raw = str(request.args.get("cursor") or "").strip()
-    pagination_requested = include_total or bool(cursor_raw)
-    cursor_scope = _nearby_cursor_scope(request.args)
-    initial_cursor = (
-        _decode_nearby_cursor(cursor_raw, cursor_scope) if cursor_raw else None
-    )
+    if import_context is not None and limit > 50:
+        raise sanic.exceptions.InvalidUsage("custom-import geo limit must not exceed 50")
+    include_total = _is_truthy_arg(args.get("include_total"), default=False)
+    cursor_raw = str(args.get("cursor") or "").strip()
+    if import_context is not None:
+        if not include_total:
+            raise sanic.exceptions.InvalidUsage("custom-import geo pages require exact totals")
+        is_pagination_requested = True
+        cursor_scope = None
+        initial_cursor = None
+    else:
+        is_pagination_requested = include_total or bool(cursor_raw)
+        cursor_scope = _nearby_cursor_scope(args)
+        initial_cursor = _decode_nearby_cursor(cursor_raw, cursor_scope) if cursor_raw else None
     zip_codes = []
-    for zip_c in request.args.get("zip_codes", "").split(","):
+    for zip_c in args.get("zip_codes", "").split(","):
         if not zip_c:
             continue
         zip_codes.append(
@@ -11113,7 +11005,7 @@ async def get_near_npi(request):
         )
     has_coordinates = in_long is not None and in_lat is not None
     radius = _normalize_match_candidate_float(
-        request.args.get("radius"),
+        args.get("radius"),
         param_name="radius",
         minimum=0.0,
         maximum=_MATCH_CANDIDATES_MAX_RADIUS_MILES,
@@ -11204,10 +11096,12 @@ async def get_near_npi(request):
                 "medication_codes",
             )
 
-    if (requested_procedure_codes and not procedure_internal_codes) or (
-        requested_medication_codes and not medication_internal_codes
-    ):
-        if pagination_requested:
+    unresolved_code_filter = bool(
+        (requested_procedure_codes and not procedure_internal_codes)
+        or (requested_medication_codes and not medication_internal_codes)
+    )
+    if unresolved_code_filter and import_context is None:
+        if is_pagination_requested:
             return response.json(
                 {
                     "items": [],
@@ -11233,17 +11127,22 @@ async def get_near_npi(request):
             capability_by_name = await _resolve_npi_filter_capabilities()
 
     _validate_section_filters(section, classification, codes)
-    # If only zip was provided, resolve to coordinates first using a separate connection.
+    # If only zip was provided, resolve to coordinates before constructing geo SQL.
     if not has_coordinates and zip_codes and zip_codes[0]:
         zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
-        async with db.acquire() as conn_zip:
-            for coordinate_record in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
-                try:
-                    in_long = float(coordinate_record["intptlon"])
-                    in_lat = float(coordinate_record["intptlat"])
-                except Exception:
-                    in_lat = float(coordinate_record[0])
-                    in_long = float(coordinate_record[1])
+        if import_context is None:
+            async with db.acquire() as conn_zip:
+                zip_rows = await conn_zip.all(text(zip_sql), zip_code=zip_codes[0])
+        else:
+            async with _provider_list_connection(db, import_context, request_session) as conn_zip:
+                zip_rows = await conn_zip.all(text(zip_sql), zip_code=zip_codes[0])
+        for coordinate_record in zip_rows:
+            try:
+                in_long = float(coordinate_record["intptlon"])
+                in_lat = float(coordinate_record["intptlat"])
+            except Exception:
+                in_lat = float(coordinate_record[0])
+                in_long = float(coordinate_record[1])
 
     address_table_sql = await _address_serving_table_sql(
         _public_address_serving_column_keys(),
@@ -11256,6 +11155,8 @@ async def get_near_npi(request):
 
     providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
     extra_filters: list[str] = []
+    if unresolved_code_filter:
+        extra_filters.append("1=0")
     if exclude_npi:
         extra_filters.append("a.npi <> :exclude_npi")
     if plan_network_ids:
@@ -11366,10 +11267,52 @@ async def get_near_npi(request):
         **plan_scope_parameters,
         **dynamic_code_parameters_by_name,
     }
+    imported_statements = None
+    if import_context is not None:
+        geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
+        geo_type_clause = _nearby_geo_type_clause(address_table_sql)
+        nearby_query = NearbySqlQuery(
+            taxonomy_conditions=taxonomy_conditions,
+            extra_clause=extra_clause,
+            ilike_clause=ilike_clause,
+            use_taxonomy_filter=bool(taxonomy_clauses),
+            primary_only=is_primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+            geo_type_clause=geo_type_clause,
+        )
+        cursor_anchor = await prepare_cursor(
+            session=request_session,
+            address_table_sql=address_table_sql,
+            query_parameters=dict(query_parameters_by_name),
+            taxonomy_conditions=taxonomy_conditions,
+            extra_clause=extra_clause,
+            ilike_clause=ilike_clause,
+            primary_only=is_primary_only,
+            use_taxonomy_filter=bool(taxonomy_clauses),
+            limit=limit,
+            geo_precision_clause=geo_precision_clause,
+            geo_type_clause=geo_type_clause,
+        )
+        imported_statements = build_imported_geo_statements(
+            import_context,
+            ImportedGeoQuery(
+                nearby=nearby_query,
+                native_parameters=query_parameters_by_name,
+                limit=limit,
+                cursor_anchor=cursor_anchor,
+            ),
+        )
 
     async def fetch_nearby_rows() -> list[Any]:
-        """Fetch enough KNN rows to page unique provider-address identities."""
-        target_identities = limit + 1 if pagination_requested else limit
+        """Fetch an exact imported page or enough native KNN rows for one page."""
+        if imported_statements is not None:
+            return await _fetch_imported_geo_page(
+                import_context,
+                request_session,
+                imported_statements,
+            )
+        target_identities = limit + 1 if is_pagination_requested else limit
         candidate_limit = max((target_identities + 1) * 4, 16)
         batch_cursor = initial_cursor
         collected_rows: list[Any] = []
@@ -11401,24 +11344,8 @@ async def get_near_npi(request):
                 if not batch_rows:
                     break
                 collected_rows.extend(batch_rows)
-                last_cursor = None
-                for batch_row in batch_rows:
-                    mapping = getattr(batch_row, "_mapping", None)
-                    if mapping is None:
-                        continue
-                    npi_value = mapping.get("npi_code") or mapping.get("npi")
-                    address_key_value = mapping.get("address_key")
-                    distance_value = mapping.get("cursor_distance_meters")
-                    if npi_value is None or address_key_value is None:
-                        continue
-                    identity = (int(npi_value), str(address_key_value).lower())
-                    collected_identities.add(identity)
-                    if distance_value is not None:
-                        last_cursor = (
-                            float(distance_value),
-                            int(npi_value),
-                            str(address_key_value),
-                        )
+                batch_identities, last_cursor = nearby_batch_identities(batch_rows)
+                collected_identities.update(batch_identities)
 
                 if len(collected_identities) >= target_identities:
                     break
@@ -11451,6 +11378,22 @@ async def get_near_npi(request):
     async def fetch_exact_total() -> int:
         """Count exact provider-address matches without the page limit."""
 
+        if imported_statements is not None:
+            async with _provider_list_connection(db, import_context, request_session) as conn:
+                count_records = await conn.all(
+                    imported_statements.count,
+                    **imported_statements.parameters,
+                )
+            if not count_records:
+                return 0
+            count_mapping = getattr(count_records[0], "_mapping", None)
+            total_count_value = (
+                count_mapping.get("total_count")
+                if count_mapping is not None
+                else count_records[0][0]
+            )
+            return int(total_count_value or 0)
+
         count_sql = _build_nearby_count_sql(
             taxonomy_conditions,
             extra_clause,
@@ -11462,18 +11405,25 @@ async def get_near_npi(request):
             bbox_clause=bbox_clause,
         )
         async with db.acquire() as conn:
-            rows = await conn.all(
+            count_records = await conn.all(
                 text(count_sql),
                 **query_parameters_by_name,
                 **bbox_parameters_by_name,
             )
-        if not rows:
+        if not count_records:
             return 0
-        mapping = getattr(rows[0], "_mapping", None)
-        value = mapping.get("total_count") if mapping is not None else rows[0][0]
-        return int(value or 0)
+        count_mapping = getattr(count_records[0], "_mapping", None)
+        total_count_value = (
+            count_mapping.get("total_count")
+            if count_mapping is not None
+            else count_records[0][0]
+        )
+        return int(total_count_value or 0)
 
-    if pagination_requested:
+    if imported_statements is not None:
+        total_count = await fetch_exact_total()
+        res_q = await fetch_nearby_rows()
+    elif is_pagination_requested:
         res_q, total_count = await asyncio.gather(
             fetch_nearby_rows(),
             fetch_exact_total(),
@@ -11576,15 +11526,24 @@ async def get_near_npi(request):
         providers_by_identity[identity] = provider_by_field
 
     all_provider_results = list(providers_by_identity.values())
-    has_more = pagination_requested and len(all_provider_results) > limit
+    has_more = is_pagination_requested and len(all_provider_results) > limit
     provider_results = all_provider_results[:limit]
     next_cursor = None
+    next_import_anchor_parts = None
     if has_more and provider_results:
         final_result = provider_results[-1]
         distance_value = final_result.get("_cursor_distance_meters")
         npi_value = final_result.get("_cursor_npi")
         address_key_value = final_result.get("_cursor_address_key")
-        if distance_value is not None and npi_value is not None and address_key_value:
+        if imported_statements is not None:
+            try:
+                next_import_anchor_parts = [
+                    str(int(npi_value)),
+                    str(uuid.UUID(str(address_key_value))),
+                ]
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("custom-import geo page identity is unavailable") from exc
+        elif distance_value is not None and npi_value is not None and address_key_value:
             next_cursor = _encode_nearby_cursor(
                 cursor_scope,
                 float(distance_value),
@@ -11603,17 +11562,17 @@ async def get_near_npi(request):
             _provider_card_from_mapping(provider_result)
             for provider_result in provider_results
         ]
-    if pagination_requested:
-        return response.json(
-            {
-                "items": provider_results,
-                "total_count": int(total_count or 0),
-                "next_cursor": next_cursor,
-                "has_more": bool(has_more),
-                "result_identity": ["npi", "address_key"],
-            },
-            default=str,
-        )
+    if is_pagination_requested:
+        response_by_key = {
+            "items": provider_results,
+            "total_count": int(total_count or 0),
+            "next_cursor": next_cursor,
+            "has_more": bool(has_more),
+            "result_identity": ["npi", "address_key"],
+        }
+        if imported_statements is not None:
+            response_by_key["_custom_import_next_anchor"] = next_import_anchor_parts
+        return response.json(response_by_key, default=str)
     return response.json(provider_results, default=str)
 
 
@@ -14655,6 +14614,8 @@ async def _fetch_location_status_by_record_id(
     source_record_ids: Sequence[Any],
     *,
     session: Any = None,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> dict[str, str]:
     """Resolve active/inactive/unknown for current PractitionerRole evidence."""
     normalized_record_ids = sorted(
@@ -14676,6 +14637,13 @@ async def _fetch_location_status_by_record_id(
             _runtime_db_schema(),
             overlay_table_sql,
         )
+        if use_request_session and session is not None:
+            query_result = await _execute_stmt(
+                status_query,
+                session=session,
+                params={"source_record_ids": normalized_record_ids},
+            )
+            return _status_map_from_result(query_result)
         async with db.session() as status_session:
             query_result = await _execute_stmt(
                 status_query,
@@ -14684,6 +14652,8 @@ async def _fetch_location_status_by_record_id(
             )
             return _status_map_from_result(query_result)
     except Exception as exc:
+        if fail_closed:
+            raise
         logger.debug("Provider location status lookup failed: %s", exc)
         return {}
 
@@ -14719,6 +14689,8 @@ async def _apply_location_statuses(
     addresses: Sequence[Any],
     *,
     session: Any = None,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> None:
     """Attach conservative per-location status without overriding unknown evidence."""
     source_record_ids = [
@@ -14735,6 +14707,8 @@ async def _apply_location_statuses(
         await _fetch_location_status_by_record_id(
             source_record_ids,
             session=session,
+            use_request_session=use_request_session,
+            fail_closed=fail_closed,
         )
         if source_record_ids
         else {}
