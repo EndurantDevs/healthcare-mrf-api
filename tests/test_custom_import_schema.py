@@ -9,11 +9,12 @@ import sqlalchemy as sa
 
 from db import maintenance
 from db.models import (
-    CustomImportChildCollection,
     CustomImportCapture,
     CustomImportCaptureBundle,
     CustomImportCaptureParquetPart,
+    CustomImportChildCollection,
     CustomImportDataset,
+    CustomImportExecution,
     CustomImportField,
     CustomImportGeneration,
     CustomImportLease,
@@ -30,6 +31,9 @@ MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260914120000_custom_import_v
 DURABLE_CAPTURE_MIGRATION_PATH = (
     ROOT / "alembic" / "versions" / "20260922000000_custom_import_durable_parquet_capture.py"
 )
+EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
+    ROOT / "alembic" / "versions" / "20260922010000_custom_import_execution_request_identity.py"
+)
 
 
 def _migration():
@@ -44,6 +48,17 @@ def _durable_capture_migration():
     spec = importlib.util.spec_from_file_location(
         "custom_import_durable_capture_migration",
         DURABLE_CAPTURE_MIGRATION_PATH,
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _execution_request_identity_migration():
+    spec = importlib.util.spec_from_file_location(
+        "custom_import_execution_request_identity_migration",
+        EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH,
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -135,6 +150,16 @@ def test_runtime_models_keep_generation_selection_and_lease_shapes_explicit():
         "entity_binding_id",
         "context_key_sha256",
     )
+    request_identity_shape = next(
+        constraint
+        for constraint in CustomImportExecution.__table__.constraints
+        if constraint.name == "custom_import_execution_request_identity_shape_check"
+    )
+    assert "request_identity_sha256 IS NULL OR octet_length(request_identity_sha256) = 32" in str(
+        request_identity_shape.sqltext
+    )
+    assert CustomImportExecution.__table__.c.request_identity_sha256.type.length == 32
+    assert CustomImportExecution.__table__.c.request_identity_sha256.nullable is True
 
 
 def test_durable_capture_models_bind_only_immutable_bounded_parquet_parts():
@@ -230,6 +255,38 @@ def test_durable_capture_migration_is_schema_only_and_downgrades_fail_closed(mon
     )
     assert 'DROP TABLE IF EXISTS "custom_import_test"."custom_import_capture_parquet_part"' in downgrade_sql
     assert "DROP COLUMN IF EXISTS payload_contract" in downgrade_sql
+
+
+def test_execution_request_identity_migration_is_schema_only_and_downgrades_fail_closed(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "custom_import_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    migration = _execution_request_identity_migration()
+    upgrade_statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", upgrade_statements.append)
+
+    migration.upgrade()
+
+    upgrade_sql = "\n".join(" ".join(statement.split()) for statement in upgrade_statements)
+    assert migration.revision == "20260922010000_custom_import_execution_request_identity"
+    assert migration.down_revision == "20260923021000_ms_drg_result_generation"
+    assert 'ALTER TABLE "custom_import_test"."custom_import_execution"' in upgrade_sql
+    assert 'ADD COLUMN "request_identity_sha256" BYTEA' in upgrade_sql
+    assert 'request_identity_sha256" IS NULL OR octet_length("request_identity_sha256") = 32' in upgrade_sql
+    assert "INSERT INTO" not in upgrade_sql
+    assert "UPDATE " not in upgrade_sql
+    assert "DEFAULT" not in upgrade_sql
+    assert "INDEX" not in upgrade_sql
+
+    downgrade_statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", downgrade_statements.append)
+    migration.downgrade()
+
+    downgrade_sql = "\n".join(" ".join(statement.split()) for statement in downgrade_statements)
+    assert "LOCK TABLE" in downgrade_sql
+    assert 'request_identity_sha256" IS NOT NULL' in downgrade_sql
+    assert "custom_import_execution_request_identity_downgrade_blocked" in downgrade_sql
+    assert 'DROP CONSTRAINT IF EXISTS "custom_import_execution_request_identity_shape_check"' in downgrade_sql
+    assert 'DROP COLUMN IF EXISTS "request_identity_sha256"' in downgrade_sql
 
 
 def test_migration_is_schema_only_and_installs_content_immutability(monkeypatch):

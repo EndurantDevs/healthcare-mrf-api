@@ -66,6 +66,7 @@ class _ExecutionRequest:
     idempotency_key: str
     mechanism: str
     capture_bundle_id: int | None
+    request_identity_sha256: bytes | None
 
 
 class ExecutionLifecycleError(RuntimeError):
@@ -309,6 +310,19 @@ def _persisted_digest(value: Any) -> bytes:
     return digest
 
 
+def _request_identity_sha256(value: bytes | bytearray | memoryview | None) -> bytes | None:
+    """Normalize the optional immutable caller identity before lifecycle writes."""
+
+    if value is None:
+        return None
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError("request_identity_sha256 must be bytes-like")
+    digest = bytes(value)
+    if len(digest) != hashlib.sha256().digest_size:
+        raise ValueError("request_identity_sha256 must contain exactly 32 bytes")
+    return digest
+
+
 def _validate_execution_state(execution: CustomImportExecution) -> str:
     state = getattr(execution, "state", None)
     if state not in EXECUTION_STATES:
@@ -506,6 +520,7 @@ def _has_matching_execution_identity(
         and execution.definition_revision_id == request.definition_revision_id
         and execution.schema_revision_id == request.schema_revision_id
         and execution.mechanism == request.mechanism
+        and execution.request_identity_sha256 == request.request_identity_sha256
     )
 
 
@@ -527,6 +542,7 @@ def _validated_execution_request(
     idempotency_key: str,
     mechanism: str,
     capture_bundle_id: int | None,
+    request_identity_sha256: bytes | bytearray | memoryview | None,
 ) -> _ExecutionRequest:
     normalized_dataset_id = _positive_id(dataset_id, "dataset_id")
     normalized_definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
@@ -534,6 +550,7 @@ def _validated_execution_request(
     normalized_capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id", allow_none=True)
     normalized_idempotency_key = _idempotency_key(idempotency_key)
     normalized_mechanism = _mechanism(mechanism)
+    normalized_request_identity_sha256 = _request_identity_sha256(request_identity_sha256)
     return _ExecutionRequest(
         dataset_id=normalized_dataset_id,
         definition_revision_id=normalized_definition_revision_id,
@@ -541,6 +558,7 @@ def _validated_execution_request(
         idempotency_key=normalized_idempotency_key,
         mechanism=normalized_mechanism,
         capture_bundle_id=normalized_capture_bundle_id,
+        request_identity_sha256=normalized_request_identity_sha256,
     )
 
 
@@ -555,6 +573,7 @@ async def _insert_execution(session: AsyncSession, request: _ExecutionRequest) -
             mechanism=request.mechanism,
             state="queued",
             capture_bundle_id=request.capture_bundle_id,
+            request_identity_sha256=request.request_identity_sha256,
         )
         .on_conflict_do_nothing(
             index_elements=(
@@ -613,6 +632,7 @@ async def create_execution(
     idempotency_key: str,
     mechanism: str,
     capture_bundle_id: int | None = None,
+    request_identity_sha256: bytes | bytearray | memoryview | None = None,
 ) -> ExecutionSubmission:
     """Create one queued execution or return its exact prior submission.
 
@@ -630,6 +650,7 @@ async def create_execution(
         idempotency_key=idempotency_key,
         mechanism=mechanism,
         capture_bundle_id=capture_bundle_id,
+        request_identity_sha256=request_identity_sha256,
     )
 
     return await _submit_execution(session, request, allow_bound_capture_reuse=False)
@@ -643,6 +664,7 @@ async def reserve_execution(
     schema_revision_id: int,
     idempotency_key: str,
     mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview | None = None,
 ) -> ExecutionSubmission:
     """Reserve a source-neutral execution before an external acquisition.
 
@@ -660,6 +682,7 @@ async def reserve_execution(
         idempotency_key=idempotency_key,
         mechanism=mechanism,
         capture_bundle_id=None,
+        request_identity_sha256=request_identity_sha256,
     )
     return await _submit_execution(session, request, allow_bound_capture_reuse=True)
 
