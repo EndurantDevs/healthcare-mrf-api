@@ -304,6 +304,11 @@ def test_custom_import_extension_detail_openapi_contract():
     assert entity_schema["properties"]["value"]["maxLength"] == 512
     assert "canonical stored value" in entity_schema["properties"]["value"]["description"].lower()
     assert "UTF-8 bytes" in entity_schema["properties"]["value"]["description"]
+    assert "custom_import_entity_absent" in operation["responses"]["404"]["description"]
+    assert (
+        "custom_import_entity_absent"
+        in spec["components"]["schemas"]["CustomImportReadError"]["properties"]["code"]["enum"]
+    )
 
 
 def test_pricing_procedure_scope_refusals_match_shared_handler():
