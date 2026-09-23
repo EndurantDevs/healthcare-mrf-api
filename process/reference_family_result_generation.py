@@ -52,6 +52,15 @@ RELATION_NAMES_BY_IMPORTER = {
     ),
     "pharmacy-economics": ("pharmacy_economics_summary",),
     "terminology-synonyms": ("terminology_synonym",),
+    "clinical-reference": (
+        "code_catalog",
+        "code_crosswalk",
+        "code_synonym",
+        "code_relationship",
+        "clinical_area",
+        "clinical_area_condition",
+        "clinical_area_treatment",
+    ),
     "provider-quality": (
         "pricing_qpp_provider",
         "pricing_svi_zcta",

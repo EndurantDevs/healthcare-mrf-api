@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
 
@@ -48,6 +48,11 @@ from process.reference_family_result_generation import (
 logger = logging.getLogger(__name__)
 
 CONTRACT = "reference-replacement-family.postgres.v1"
+CLINICAL_PROFILE_CONTRACT = "clinical-reference-scoped.postgres.v1"
+
+
+def _profile_contract(importer_id: str) -> str:
+    return CLINICAL_PROFILE_CONTRACT if importer_id == "clinical-reference" else CONTRACT
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
@@ -164,6 +169,8 @@ class ReferenceFamilyStageOwnership:
     relation_oids: tuple[tuple[str, int], ...]
     sequence_oids: tuple[tuple[str, int, str, str], ...] = ()
     auxiliary_oid: int | None = None
+    effect_oids: tuple[tuple[str, int], ...] = ()
+    effect_witness: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +297,18 @@ _SPECS = {
         ),
         ReferenceFamilySpec("pharmacy-economics", (models.PharmacyEconomicsSummary,)),
         ReferenceFamilySpec("terminology-synonyms", (models.TerminologySynonym,)),
+        ReferenceFamilySpec(
+            "clinical-reference",
+            (
+                models.CodeCatalog,
+                models.CodeCrosswalk,
+                models.CodeSynonym,
+                models.CodeRelationship,
+                models.ClinicalArea,
+                models.ClinicalAreaCondition,
+                models.ClinicalAreaTreatment,
+            ),
+        ),
         ReferenceFamilySpec(
             "provider-quality",
             (
@@ -586,7 +605,30 @@ async def _table_receipt(
         schema_sha256 = await _family_schema_identity(session, importer_id, relation_oid, schema_name, table_name)
     except Exception as error:
         raise ReferenceFamilyArchiveError("reference family schema identity is unavailable") from error
-    row_count = await session.scalar(text(f"SELECT count(*)::bigint FROM {_quoted(schema_name)}.{_quoted(table_name)}"))
+    where = ""
+    bindings_by_name = {}
+    if importer_id == "clinical-reference" and table_name in {
+        "code_catalog", "code_crosswalk", "code_synonym", "code_relationship"
+    }:
+        from process.clinical_reference_publication import CLINICAL_REFERENCE_SOURCES
+
+        bindings_by_name = {"sources": list(CLINICAL_REFERENCE_SOURCES)}
+        if schema_name.startswith(_STAGE_PREFIX):
+            foreign = await session.scalar(
+                text(
+                    f"SELECT EXISTS(SELECT 1 FROM {_quoted(schema_name)}.{_quoted(table_name)} "
+                    "WHERE (source=ANY(CAST(:sources AS text[]))) IS NOT TRUE)"
+                ),
+                bindings_by_name,
+            )
+            if foreign:
+                raise ReferenceFamilyArchiveError("clinical reference stage contains foreign sources")
+        else:
+            where = " WHERE source=ANY(CAST(:sources AS text[]))"
+    row_count = await session.scalar(
+        text(f"SELECT count(*)::bigint FROM {_quoted(schema_name)}.{_quoted(table_name)}{where}"),
+        bindings_by_name,
+    )
     if type(row_count) is not int or row_count < 0:
         raise ReferenceFamilyArchiveError("reference family row count is invalid")
     return ReferenceTableReceipt(model_type.__name__, table_name, schema_sha256, row_count)
@@ -916,7 +958,7 @@ def validate_reference_family_validation_receipt(receipt_value: object) -> Refer
     spec = reference_family_spec(receipt_value["importer_id"])
     if (
         receipt_value["contract"] != VALIDATION_CONTRACT
-        or receipt_value["profile_contract"] != CONTRACT
+        or receipt_value["profile_contract"] != _profile_contract(spec.importer_id)
         or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["package_id"])) is None
         or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["manifest_sha256"])) is None
         or type(receipt_value["stage_schema_oid"]) is not int
@@ -1044,7 +1086,19 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
         if spec.importer_id not in _OWNED_SEQUENCES:
             await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
         columns = ", ".join(_quoted(column.name) for column in models_by_table[table.table_name].__table__.columns)
-        await session.execute(text(f"INSERT INTO {stage_ref} ({columns}) SELECT {columns} FROM {source_ref}"))
+        where = ""
+        bindings_by_name = {}
+        if spec.importer_id == "clinical-reference" and table.table_name in {
+            "code_catalog", "code_crosswalk", "code_synonym", "code_relationship"
+        }:
+            from process.clinical_reference_publication import CLINICAL_REFERENCE_SOURCES
+
+            where = " WHERE source=ANY(CAST(:sources AS text[]))"
+            bindings_by_name = {"sources": list(CLINICAL_REFERENCE_SOURCES)}
+        await session.execute(
+            text(f"INSERT INTO {stage_ref} ({columns}) SELECT {columns} FROM {source_ref}{where}"),
+            bindings_by_name,
+        )
     if spec.importer_id == "mrf":
         source_archive = f"{_quoted(capture.schema_name)}.{_quoted(archive_table_name())}"
         stage_aux = f"{_quoted(stage_schema)}.{_quoted(STAGE_TABLE)}"
@@ -1173,6 +1227,21 @@ async def _owned_sequences(
     )
 
 
+async def _clinical_effect_oids(session: Any, schema_name: str) -> list[tuple[str, int]]:
+    """Identify the complete protected clinical before-image set, when present."""
+    from process.clinical_reference_result_archive import SHARED_MODELS, before_name
+
+    effect_oids = []
+    for model in SHARED_MODELS:
+        name = before_name(model)
+        oid = await _relation_oid(session, schema_name, name)
+        if oid is not None:
+            effect_oids.append((name, oid))
+    if effect_oids and len(effect_oids) != len(SHARED_MODELS):
+        raise ReferenceFamilyArchiveError("clinical reference before-image set is incomplete")
+    return effect_oids
+
+
 async def capture_reference_family_stage_ownership(
     session: Any,
     *,
@@ -1192,6 +1261,10 @@ async def capture_reference_family_stage_ownership(
             raise ReferenceFamilyArchiveError("reference family owned relation is missing")
         relation_oids.append((table_name, relation_oid))
     owned_oids = {oid for _, oid in relation_oids}
+    effect_oids = []
+    if spec.importer_id == "clinical-reference":
+        effect_oids = await _clinical_effect_oids(session, schema_name)
+        owned_oids.update(oid for _, oid in effect_oids)
     auxiliary_oid = None
     if spec.importer_id == "mrf":
         auxiliary_oid = await _relation_oid(session, schema_name, STAGE_TABLE)
@@ -1226,6 +1299,7 @@ async def capture_reference_family_stage_ownership(
         tuple(relation_oids),
         sequence_oids,
         auxiliary_oid,
+        tuple(sorted(effect_oids)),
     )
 
 
@@ -1243,7 +1317,7 @@ async def verify_reference_family_stage_ownership(
         importer_id=ownership.importer_id,
         dataset_id=ownership.dataset_id,
     )
-    if observed != ownership:
+    if replace(observed, effect_witness=ownership.effect_witness) != ownership:
         raise ReferenceFamilyArchiveError("reference family stage ownership differs")
     return observed
 
@@ -1288,14 +1362,14 @@ async def cleanup_reference_family_stage(
     await _lock_family(
         session,
         ownership.schema_name,
-        reference_family_spec(ownership.importer_id).archive_names,
+        (*reference_family_spec(ownership.importer_id).archive_names, *(name for name, _ in ownership.effect_oids)),
         "ACCESS EXCLUSIVE",
         nowait=True,
     )
     await verify_reference_family_stage_ownership(session, ownership)
     relations = ", ".join(
         f"{_quoted(ownership.schema_name)}.{_quoted(name)}"
-        for name in reference_family_spec(ownership.importer_id).archive_names
+        for name in (*reference_family_spec(ownership.importer_id).archive_names, *(name for name, _ in ownership.effect_oids))
     )
     await session.execute(text(f"DROP TABLE {relations} RESTRICT"))
     if int(
@@ -1513,6 +1587,12 @@ def _is_reviewed_index_element(value: object) -> bool:
         return True
     return value in {
         "lower(synonym)",
+        "lower(display_name)",
+        "lower(short_description)",
+        "upper(from_system)",
+        "upper(from_code)",
+        "upper(to_system)",
+        "upper(to_code)",
         "LEFT(postal_code, 5)",
         "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
     }
@@ -1657,6 +1737,7 @@ async def _verify_stage_owner(
     ownership: ReferenceFamilyStageOwnership,
     expected_owner_oid: int,
 ) -> None:
+    """Verify ownership of every staged relation before using the sealed stage."""
     if type(expected_owner_oid) is not int or expected_owner_oid <= 0:
         raise ReferenceFamilyArchiveError("reference family stage owner is invalid")
     schema_owner = await session.scalar(
@@ -1665,12 +1746,11 @@ async def _verify_stage_owner(
     )
     if schema_owner != expected_owner_oid:
         raise ReferenceFamilyArchiveError("reference family stage owner differs")
-    relation_oids = tuple(
-        sorted(
-            ownership.relation_oids
-            + (((STAGE_TABLE, ownership.auxiliary_oid),) if ownership.auxiliary_oid is not None else ())
-        )
-    )
+    if ownership.importer_id == "clinical-reference" and not isinstance(ownership, ReferenceFamilyStageOwnership):
+        raise ReferenceFamilyArchiveError("clinical reference stage owner is invalid")
+    effect_oids = ownership.effect_oids if isinstance(ownership, ReferenceFamilyStageOwnership) else ()
+    auxiliary_oids = ((STAGE_TABLE, ownership.auxiliary_oid),) if ownership.auxiliary_oid is not None else ()
+    relation_oids = tuple(sorted(ownership.relation_oids + effect_oids + auxiliary_oids))
     relation_rows = list(
         (
             await session.execute(
@@ -1724,7 +1804,7 @@ async def prepare_reference_family_activation(
     _require_transaction(session)
     validated_manifest = validate_reference_family_manifest(manifest)
     if (
-        profile_contract != CONTRACT
+        profile_contract != _profile_contract(ownership.importer_id)
         or re.fullmatch(r"[0-9a-f]{64}", str(package_id)) is None
         or validated_manifest.importer_id != ownership.importer_id
     ):
@@ -1805,7 +1885,10 @@ async def _lock_and_verify_activation(
     expected_incumbent: ReferenceFamilyIncumbent,
 ) -> None:
     async with _bounded_capture(session):
-        await _lock_family(session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE")
+        await _lock_family(
+            session, ownership.schema_name,
+            (*spec.archive_names, *(name for name, _ in ownership.effect_oids)), "ACCESS EXCLUSIVE"
+        )
         incumbent_names = tuple(name for name, oid in expected_incumbent.relation_oids if oid is not None)
         if incumbent_names:
             await _lock_family(session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE")
@@ -1962,7 +2045,14 @@ async def _activation_receipt(
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
     if any(type(oid) is not int or oid <= 0 for _, oid in live_pairs):
         raise ReferenceFamilyArchiveError("reference family activated relation is unavailable")
-    if tuple(sorted(live_pairs)) != ownership.relation_oids:
+    expected_live_oids = (
+        tuple(sorted({**dict(expected_incumbent.relation_oids), **{
+            name: oid for name, oid in ownership.relation_oids
+            if name.startswith("clinical_area")
+        }}.items()))
+        if spec.importer_id == "clinical-reference" else ownership.relation_oids
+    )
+    if tuple(sorted(live_pairs)) != expected_live_oids:
         raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
     if spec.importer_id == "mrf":
         observed_tables = tuple(
@@ -2010,6 +2100,8 @@ async def activate_reference_family_stage(
     """Manually rotate one complete family inside the caller-owned transaction."""
 
     _require_transaction(session)
+    if isinstance(ownership, ReferenceFamilyStageOwnership) and ownership.importer_id == "clinical-reference":
+        raise ReferenceFamilyArchiveError("clinical reference requires scoped activation")
     if isinstance(ownership, ReferenceFamilyStageOwnership) and ownership.importer_id == "facility-anchors":
         raise ReferenceFamilyArchiveError("facility activation requires protected contribution preparation")
     if authority != "manual":
@@ -2027,11 +2119,7 @@ async def activate_reference_family_stage(
         raise ReferenceFamilyArchiveError("reference family activation scope differs")
     spec = reference_family_spec(ownership.importer_id)
     await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
-    tables = await _validate_stage_manifest(
-        session,
-        ownership=ownership,
-        manifest=validated_manifest,
-    )
+    tables = await _validate_stage_manifest(session, ownership=ownership, manifest=validated_manifest)
     predecessor_schema_name = await _rotate_family_relations(
         session,
         spec,
@@ -2060,6 +2148,65 @@ async def activate_reference_family_stage(
     )
 
 
+async def _activate_clinical_reference_stage(
+    session: Any,
+    spec: ReferenceFamilySpec,
+    ownership: ReferenceFamilyStageOwnership,
+    expected_incumbent: ReferenceFamilyIncumbent,
+) -> tuple[str, list[tuple[str, int | None]]]:
+    """Retain clinical-owned rows and rotate only the area tables."""
+    from process.clinical_reference_result_archive import (
+        SHARED_MODELS,
+        before_name,
+        replace_shared_sources,
+        verify_shared_before_image_witness,
+    )
+
+    predecessor_schema_name = reference_family_predecessor_schema(ownership.dataset_id)
+    if len(ownership.effect_oids) != len(SHARED_MODELS) or ownership.effect_witness is None:
+        raise ReferenceFamilyArchiveError("clinical reference protected before-image is missing")
+    await verify_shared_before_image_witness(
+        session, destination=expected_incumbent.schema_name,
+        stage=ownership.schema_name, witness=ownership.effect_witness,
+    )
+    await session.execute(text(f"CREATE SCHEMA {_quoted(predecessor_schema_name)}"))
+    for model in SHARED_MODELS:
+        name = before_name(model)
+        await session.execute(text(
+            f"ALTER TABLE {_quoted(ownership.schema_name)}.{_quoted(name)} "
+            f"SET SCHEMA {_quoted(predecessor_schema_name)}"
+        ))
+        await session.execute(text(
+            f"ALTER TABLE {_quoted(predecessor_schema_name)}.{_quoted(name)} "
+            f"RENAME TO {_quoted(model.__tablename__)}"
+        ))
+    for model in spec.model_types[len(SHARED_MODELS):]:
+        name = model.__tablename__
+        if dict(expected_incumbent.relation_oids)[name] is not None:
+            await session.execute(text(
+                f"ALTER TABLE {_quoted(expected_incumbent.schema_name)}.{_quoted(name)} "
+                f"SET SCHEMA {_quoted(predecessor_schema_name)}"
+            ))
+        await session.execute(text(
+            f"ALTER TABLE {_quoted(ownership.schema_name)}.{_quoted(name)} "
+            f"SET SCHEMA {_quoted(expected_incumbent.schema_name)}"
+        ))
+    await replace_shared_sources(
+        session, destination=expected_incumbent.schema_name, replacement=ownership.schema_name
+    )
+    for model in SHARED_MODELS:
+        await session.execute(text(f"DROP TABLE {_quoted(ownership.schema_name)}.{_quoted(model.__tablename__)}"))
+    await _drop_empty_stage_schema(session, ownership)
+    live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
+    expected_oids_by_name = {
+        **dict(expected_incumbent.relation_oids),
+        **{name: oid for name, oid in ownership.relation_oids if name not in {model.__tablename__ for model in SHARED_MODELS}},
+    }
+    if dict(live_pairs) != expected_oids_by_name:
+        raise ReferenceFamilyArchiveError("clinical reference activated relation OIDs differ")
+    return predecessor_schema_name, live_pairs
+
+
 async def _complete_validated_stage_activation(
     session: Any,
     spec: ReferenceFamilySpec,
@@ -2069,6 +2216,8 @@ async def _complete_validated_stage_activation(
 ) -> tuple[str | None, list[tuple[str, int | None]]]:
     """Rotate, merge MRF canonical rows, and verify the activated relation OIDs."""
 
+    if spec.importer_id == "clinical-reference":
+        return await _activate_clinical_reference_stage(session, spec, ownership, expected_incumbent)
     predecessor_schema_name = await _rotate_family_relations(session, spec, ownership, expected_incumbent)
     if spec.importer_id == "mrf":
         await _merge_mrf_canonical_address(session, ownership, expected_incumbent.schema_name, manifest.auxiliary)

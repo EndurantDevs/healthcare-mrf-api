@@ -15,6 +15,7 @@ import pytest
 from process import reference_family_archive as archive
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import ReferenceFamilyServingGeneration
+from process.source_profile_result_archive import StageOwnership as ProfileStageOwnership
 
 
 @pytest.mark.asyncio
@@ -103,6 +104,24 @@ async def test_mrf_stage_owner_includes_canonical_auxiliary(auxiliary_owner):
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage owner differs"):
             await archive._verify_stage_owner(session, ownership, 7)
     assert session.execute.await_args.args[1] == {"relation_oids": [11, 12]}
+
+
+@pytest.mark.asyncio
+async def test_profile_stage_owner_uses_shared_verification_without_clinical_effects():
+    ownership = ProfileStageOwnership("massachusetts-borim-profile", UUID(int=1), 10, (("profile_fact", 11),))
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=7),
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                mappings=Mock(return_value=[{"relname": "profile_fact", "oid": 11, "relowner": 7}])
+            )
+        ),
+    )
+
+    await archive._verify_stage_owner(session, ownership, 7)
+    assert session.execute.await_args.args[1] == {"relation_oids": [11]}
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="clinical reference stage owner is invalid"):
+        await archive._verify_stage_owner(session, replace(ownership, importer_id="clinical-reference"), 7)
 
 
 def test_registry_is_closed_to_exact_ordered_replacement_families():

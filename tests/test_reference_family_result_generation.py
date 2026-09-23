@@ -58,6 +58,15 @@ def test_closed_relation_families_are_ordered_and_distinct():
         ),
         "pharmacy-economics": ("pharmacy_economics_summary",),
         "terminology-synonyms": ("terminology_synonym",),
+        "clinical-reference": (
+            "code_catalog",
+            "code_crosswalk",
+            "code_synonym",
+            "code_relationship",
+            "clinical_area",
+            "clinical_area_condition",
+            "clinical_area_treatment",
+        ),
         "provider-quality": (
             "pricing_qpp_provider",
             "pricing_svi_zcta",
@@ -70,6 +79,16 @@ def test_closed_relation_families_are_ordered_and_distinct():
         ),
     }
     assert all(len(names) == len(set(names)) for names in generation.RELATION_NAMES_BY_IMPORTER.values())
+
+
+def test_clinical_generation_relation_order_matches_models():
+    """The clinical ledger binds all seven model tables in their reviewed order."""
+    from process.reference_family_archive import reference_family_spec
+
+    assert (
+        generation.RELATION_NAMES_BY_IMPORTER["clinical-reference"]
+        == reference_family_spec("clinical-reference").table_names
+    )
 
 
 def test_generation_authority_accepts_complete_family_state():

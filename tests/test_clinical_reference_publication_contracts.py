@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractAsyncContextManager
 import importlib
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import process.clinical_reference_publication as publication
-from process.control_cancel import ImportCancelledError
 from db.models import (
     ClinicalArea,
     ClinicalAreaCondition,
@@ -20,6 +19,7 @@ from db.models import (
     CodeRelationship,
     CodeSynonym,
 )
+from process.control_cancel import ImportCancelledError
 
 clinical = importlib.import_module("process.clinical_reference")
 
@@ -382,6 +382,13 @@ async def test_publication_replaces_owned_sources(monkeypatch):
     """Validated stages replace every owned live source inside one transaction."""
     recording_db = _RecordingDb(scalar_value=2)
     monkeypatch.setattr(publication, "db", recording_db)
+    async def publish_generation(session, *, importer_id, schema_name):
+        assert session.events is recording_db.events
+        assert importer_id == "clinical-reference"
+        assert schema_name == "unit"
+        recording_db.events.append("generation-published")
+
+    monkeypatch.setattr(publication, "publish_local_reference_family_generation", publish_generation)
     stage_models = _complete_stage_models()
     indexes = SimpleNamespace(
         concepts_by_identity={},
@@ -405,6 +412,7 @@ async def test_publication_replaces_owned_sources(monkeypatch):
     assert "DELETE FROM unit.code_catalog" in sql_text
     assert "ALTER TABLE IF EXISTS" in sql_text
     assert "transaction-enter" in recording_db.events
+    assert recording_db.events[-2] == "generation-published"
     assert "transaction-exit" in recording_db.events
 
 
