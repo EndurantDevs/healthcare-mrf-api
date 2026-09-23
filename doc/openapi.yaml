@@ -215,7 +215,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CustomImportReadErrorResponse'
         '404':
-          description: The permit, target, or authorization boundary is not available to the caller.
+          description: A verified signed detail request returns `custom_import_entity_absent` when its selected generation has no eligible family for the entity. Other 404 responses keep permit, target, and authorization failures opaque.
           headers:
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
@@ -7540,7 +7540,7 @@ components:
       properties:
         code:
           type: string
-          enum: [custom_import_read_request_invalid, resource_not_found, custom_import_read_unavailable]
+          enum: [custom_import_read_request_invalid, resource_not_found, custom_import_entity_absent, custom_import_read_unavailable]
         message:
           type: string
     PtgAuditOccurrenceResponse:
