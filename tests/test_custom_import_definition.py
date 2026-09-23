@@ -501,6 +501,14 @@ def test_source_tokens_reject_empty_stream_observations(definition):
         )
 
 
+def test_source_tokens_reject_duplicate_identical_observations(definition):
+    with pytest.raises(SourceSnapshotError, match="exactly one snapshot token observation"):
+        validate_source_snapshot_tokens(
+            definition,
+            {"providers": ["snapshot-1", "snapshot-1"], "rates": ["snapshot-1"]},
+        )
+
+
 def test_family_build_requires_a_child_collection_mapping(definition):
     with pytest.raises(DefinitionError, match="children must contain one bounded array"):
         assemble_root_families(definition, [], [])

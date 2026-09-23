@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+import hashlib
+import inspect
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,18 +21,41 @@ from process.custom_import.capture import (
     _validated_parquet_schema,
     iter_records,
 )
-from process.custom_import.capture_store import CaptureReceipt, register_capture_bundle
+from process.custom_import.capture_store import (
+    CaptureReceipt,
+    ReplayableParquetCapture,
+    load_replayable_parquet_bundle,
+    register_capture_bundle,
+    register_replayable_parquet_bundle,
+)
 from process.custom_import.definition import CustomImportDefinition, Field, SourceStream
-from process.custom_import.execution import create_execution, lease_token_sha256
-from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
+from process.custom_import.execution import (
+    ExecutionSubmission,
+    LeaseGrant,
+    bind_execution_capture_bundle,
+    claim_execution,
+    create_execution,
+    finish_execution,
+    heartbeat_execution,
+    lease_token_sha256,
+    reserve_execution,
+)
+from process.custom_import.family import (
+    SourceSnapshotError,
+    assemble_root_families,
+    validate_source_snapshot_tokens,
+)
 from process.custom_import.runner import (
     CandidateRunnerError,
     CandidateRunRequest,
     CandidateRunResult,
+    reject_duplicate_canonical_root_keys,
     run_candidate,
+    run_claimed_candidate,
     validate_definition_canonical,
 )
 from process.custom_import.runner_registry import validate_revision_identity
+from process.custom_import.runner_types import LeaseAuthorityLost as _LeaseLost
 from process.custom_import.runner_types import SessionFactory
 from process.custom_import.snowflake import (
     SNOWFLAKE_RESULT_STREAM,
@@ -42,10 +68,24 @@ from process.custom_import.snowflake import (
     SnowflakeRelation,
     SnowflakeResultPartitionManifest,
 )
+from process.custom_import.snowflake_bundle import (
+    SnowflakeBundleAcquisition,
+    SnowflakeBundleAcquisitionConnector,
+    SnowflakeBundleError,
+    SnowflakeBundleReplay,
+    SnowflakeBundleRequest,
+    SnowflakeBundleStatement,
+    _validated_bundle_statement,
+    prepare_bundle_replay,
+    reconstruct_replayable_parquet_bundle,
+    replayable_parquet_captures,
+)
 
 __all__ = (
+    "SnowflakeBundleCandidateRequest",
     "SnowflakeCandidateError",
     "SnowflakeCandidateRequest",
+    "run_snowflake_bundle_candidate",
     "run_snowflake_candidate",
 )
 
@@ -56,11 +96,13 @@ class SnowflakeCandidateError(ValueError):
 
 @dataclass(frozen=True)
 class SnowflakeCandidateRequest:
-    """A root and optional child acquisition with one shared source snapshot.
+    """A legacy root acquisition with optional child replay data.
 
     Acquisitions retain the connector's fixed Parquet transport stream. Their
     roles bind them to the definition's sole root and optional child stream;
     this boundary cannot create a shared snapshot from independent reads.
+    ``run_snowflake_candidate`` rejects child streams before storage; the
+    one-statement bundle candidate path owns that later publication join.
     """
 
     dataset_id: int
@@ -71,6 +113,19 @@ class SnowflakeCandidateRequest:
     idempotency_key: str
     lease_token: str | bytes | bytearray | memoryview
     child_acquisition: SnowflakeAcquisition | None = None
+
+
+@dataclass(frozen=True)
+class SnowflakeBundleCandidateRequest:
+    """One configured multi-stream bundle and its durable candidate identity."""
+
+    dataset_id: int
+    definition_revision_id: int
+    schema_revision_id: int
+    definition: CustomImportDefinition
+    bundle_request: SnowflakeBundleRequest
+    idempotency_key: str
+    lease_token: str | bytes | bytearray | memoryview
 
 
 @dataclass(frozen=True)
@@ -95,6 +150,26 @@ def _validated_request(request: object) -> SnowflakeCandidateRequest:
     for value in (request.dataset_id, request.definition_revision_id, request.schema_revision_id):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise SnowflakeCandidateError("Snowflake candidate identifiers are invalid")
+    return request
+
+
+def _validated_bundle_request(request: object) -> SnowflakeBundleCandidateRequest:
+    if not isinstance(request, SnowflakeBundleCandidateRequest):
+        raise SnowflakeCandidateError("Snowflake bundle candidate request is invalid")
+    if not isinstance(request.definition, CustomImportDefinition) or not isinstance(
+        request.bundle_request, SnowflakeBundleRequest
+    ):
+        raise SnowflakeCandidateError("Snowflake bundle candidate definition is invalid")
+    try:
+        validate_definition_canonical(request.definition)
+        lease_token_sha256(request.lease_token)
+    except (CandidateRunnerError, ValueError) as exc:
+        raise SnowflakeCandidateError("Snowflake bundle candidate request is invalid") from exc
+    for value in (request.dataset_id, request.definition_revision_id, request.schema_revision_id):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise SnowflakeCandidateError("Snowflake bundle candidate identifiers are invalid")
+    if request.bundle_request.definition != request.definition:
+        raise SnowflakeCandidateError("Snowflake bundle candidate definition does not match its configured bundle")
     return request
 
 
@@ -304,9 +379,13 @@ async def run_snowflake_candidate(
     session_factory: SessionFactory,
     request: SnowflakeCandidateRequest,
 ) -> CandidateRunResult:
-    """Register one verified result bundle, commit its execution, then run it."""
+    """Register and run one legacy single-stream Snowflake candidate."""
 
     request = _validated_request(request)
+    if request.definition.child_collections:
+        raise SnowflakeCandidateError(
+            "multi-stream Snowflake publication requires the one-statement bundle candidate path"
+        )
     if not callable(session_factory):
         raise SnowflakeCandidateError("Snowflake candidate requires a session factory")
     prepared = _prepare_candidate(request)
@@ -356,3 +435,354 @@ async def run_snowflake_candidate(
             complete_scope=True,
         ),
     )
+
+
+_BUNDLE_REQUEST_IDENTITY_DOMAIN = b"custom-import/snowflake-bundle-request-identity/v1\x00"
+
+
+def _bundle_connector(
+    connector: object,
+) -> tuple[Callable[[SnowflakeBundleRequest], object], Callable[..., object]]:
+    """Require the pure preflight and prepared-acquisition seam before reservation."""
+
+    build_statement = getattr(connector, "build_statement", None)
+    acquire = getattr(connector, "acquire", None)
+    if not callable(build_statement) or not callable(acquire):
+        raise SnowflakeCandidateError("Snowflake bundle candidate requires a bundle acquisition connector")
+    return build_statement, acquire
+
+
+def _prepared_bundle_statement(
+    build_statement: Callable[[SnowflakeBundleRequest], object],
+    request: SnowflakeBundleCandidateRequest,
+) -> SnowflakeBundleStatement:
+    """Build the complete approved source mapping without contacting a source."""
+
+    try:
+        statement = _validated_bundle_statement(build_statement(request.bundle_request))
+    except (SnowflakeBundleError, TypeError, ValueError) as exc:
+        raise SnowflakeCandidateError("Snowflake bundle statement cannot be prepared") from exc
+    if statement.request != request.bundle_request:
+        raise SnowflakeCandidateError("Snowflake bundle statement does not match the configured bundle request")
+    return statement
+
+
+def _requires_prepared_statement(
+    acquire: Callable[..., object],
+    request: SnowflakeBundleCandidateRequest,
+    statement: SnowflakeBundleStatement,
+) -> None:
+    """Reject an incompatible connector before it can leave a running reservation."""
+
+    try:
+        inspect.signature(acquire).bind(request.bundle_request, prepared_statement=statement)
+    except (TypeError, ValueError) as exc:
+        raise SnowflakeCandidateError("Snowflake bundle acquisition must accept a prepared statement") from exc
+
+
+def _bundle_request_identity_sha256(
+    request: SnowflakeBundleCandidateRequest,
+    statement: SnowflakeBundleStatement,
+) -> bytes:
+    """Bind idempotency to both declared request inputs and resolved SQL mapping."""
+
+    try:
+        request_digest = bytes.fromhex(request.bundle_request.request_sha256)
+        statement_digest = bytes.fromhex(statement.statement_sha256)
+    except ValueError as exc:
+        raise SnowflakeCandidateError("Snowflake bundle statement identity is invalid") from exc
+    digest = hashlib.sha256(_BUNDLE_REQUEST_IDENTITY_DOMAIN)
+    digest.update(request_digest)
+    digest.update(statement_digest)
+    return digest.digest()
+
+
+def _acquired_bundle(
+    acquire: Callable[..., object],
+    request: SnowflakeBundleCandidateRequest,
+    prepared_statement: SnowflakeBundleStatement,
+) -> SnowflakeBundleAcquisition:
+    try:
+        acquisition = acquire(request.bundle_request, prepared_statement=prepared_statement)
+    except SnowflakeConnectorError as exc:
+        raise SnowflakeCandidateError("Snowflake bundle cannot be acquired") from exc
+    if not isinstance(acquisition, SnowflakeBundleAcquisition) or acquisition.statement != prepared_statement:
+        raise SnowflakeCandidateError("Snowflake acquired bundle does not match the prepared bundle statement")
+    return acquisition
+
+
+def _prepared_bundle_captures(acquisition: SnowflakeBundleAcquisition) -> tuple[ReplayableParquetCapture, ...]:
+    """Decode and seal a closed acquisition outside the event loop."""
+
+    prepare_bundle_replay(acquisition)
+    return replayable_parquet_captures(acquisition)
+
+
+def _bundle_candidate_run_request(
+    request: SnowflakeBundleCandidateRequest,
+    execution_id: int,
+    *,
+    roots: tuple[Mapping[str, Any], ...],
+    children_by_collection: Mapping[str, tuple[Mapping[str, Any], ...]],
+) -> CandidateRunRequest:
+    return CandidateRunRequest(
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+        execution_id=execution_id,
+        lease_token=request.lease_token,
+        definition=request.definition,
+        roots=roots,
+        children_by_collection=children_by_collection,
+        complete_scope=True,
+    )
+
+
+async def _register_bundle_captures(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+    captures: tuple[ReplayableParquetCapture, ...],
+) -> int | None:
+    """Retain a newly acquired bundle only while its claimant owns the fence."""
+
+    validation_request = _bundle_candidate_run_request(
+        request,
+        grant.execution_id,
+        roots=(),
+        children_by_collection={},
+    )
+    try:
+        async with session_factory() as session, session.begin():
+            try:
+                await validate_revision_identity(session, validation_request)
+            except CandidateRunnerError as exc:
+                raise SnowflakeCandidateError("Snowflake registered definition does not match the bundle") from exc
+            capture_bundle = await register_replayable_parquet_bundle(
+                session,
+                dataset_id=request.dataset_id,
+                definition_revision_id=request.definition_revision_id,
+                schema_revision_id=request.schema_revision_id,
+                captures=captures,
+            )
+            binding = await bind_execution_capture_bundle(
+                session,
+                execution_id=grant.execution_id,
+                dataset_id=request.dataset_id,
+                definition_revision_id=request.definition_revision_id,
+                schema_revision_id=request.schema_revision_id,
+                capture_bundle_id=capture_bundle.capture_bundle_id,
+                fence=grant.fence,
+                token=request.lease_token,
+            )
+            if binding is None:
+                raise _LeaseLost("Snowflake bundle candidate lease is no longer current")
+            return binding.capture_bundle_id
+    except _LeaseLost:
+        return None
+
+
+async def _reserve_bundle_execution(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    request_identity_sha256: bytes,
+) -> tuple[ExecutionSubmission, LeaseGrant | None]:
+    """Validate, reserve, and claim the current owner before source contact."""
+
+    validation_request = _bundle_candidate_run_request(
+        request,
+        1,
+        roots=(),
+        children_by_collection={},
+    )
+    async with session_factory() as session, session.begin():
+        try:
+            await validate_revision_identity(session, validation_request)
+        except CandidateRunnerError as exc:
+            raise SnowflakeCandidateError("Snowflake registered definition does not match the bundle") from exc
+        submission = await reserve_execution(
+            session,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+            idempotency_key=request.idempotency_key,
+            mechanism="local",
+            request_identity_sha256=request_identity_sha256,
+        )
+        grant = await claim_execution(session, execution_id=submission.execution_id, token=request.lease_token)
+    return submission, grant
+
+
+async def _renew_bundle_lease(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+) -> LeaseGrant | None:
+    """Renew the source owner's exact fence immediately around source work."""
+
+    async with session_factory() as session, session.begin():
+        return await heartbeat_execution(
+            session,
+            execution_id=grant.execution_id,
+            fence=grant.fence,
+            token=request.lease_token,
+        )
+
+
+async def _load_bundle_replay(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    prepared_statement: SnowflakeBundleStatement,
+    capture_bundle_id: int,
+) -> SnowflakeBundleReplay:
+    """Reload and verify the durable bundle without reaching its source connector."""
+
+    async with session_factory() as session:
+        durable_captures = await load_replayable_parquet_bundle(
+            session,
+            capture_bundle_id=capture_bundle_id,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+        )
+    try:
+        return await asyncio.to_thread(reconstruct_replayable_parquet_bundle, prepared_statement, durable_captures)
+    except SnowflakeBundleError as exc:
+        raise SnowflakeCandidateError("Snowflake durable bundle cannot be replayed") from exc
+
+
+async def _reservation_unavailable_result(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+) -> CandidateRunResult:
+    """Acknowledge a winning cancellation or report an unavailable lease."""
+
+    async with session_factory() as session, session.begin():
+        transition = await finish_execution(
+            session,
+            execution_id=grant.execution_id,
+            fence=grant.fence,
+            token=request.lease_token,
+            terminal_state="canceled",
+        )
+    status = "canceled" if transition.state == "canceled" else "lease_lost"
+    return CandidateRunResult(status=status, execution_id=grant.execution_id)
+
+
+async def _unbound_capture_result(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+) -> CandidateRunResult:
+    """Fail closed when a resumed reservation lacks a durable source capture."""
+
+    async with session_factory() as session, session.begin():
+        transition = await finish_execution(
+            session,
+            execution_id=grant.execution_id,
+            fence=grant.fence,
+            token=request.lease_token,
+            terminal_state="failed",
+            terminal_reason="unbound_source_capture",
+        )
+    if transition.state == "failed":
+        raise SnowflakeCandidateError("Snowflake bundle has an unbound source capture; submit a new execution")
+    return await _reservation_unavailable_result(session_factory, request, grant)
+
+
+async def _fence_source_capture_failure(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+) -> None:
+    """Fail the current owner without replacing a cancellation or newer lease."""
+
+    async with session_factory() as session, session.begin():
+        await finish_execution(
+            session,
+            execution_id=grant.execution_id,
+            fence=grant.fence,
+            token=request.lease_token,
+            terminal_state="failed",
+            terminal_reason="source_capture_failed",
+        )
+
+
+async def _run_claimed_bundle_candidate(
+    session_factory: SessionFactory,
+    request: SnowflakeBundleCandidateRequest,
+    grant: LeaseGrant,
+    replay: SnowflakeBundleReplay,
+) -> CandidateRunResult:
+    """Pass the durable replay through the existing generic fenced runner."""
+
+    candidate_request = _bundle_candidate_run_request(
+        request,
+        grant.execution_id,
+        roots=replay.roots,
+        children_by_collection=replay.children_by_collection,
+    )
+    admitted = reject_duplicate_canonical_root_keys(
+        candidate_request.definition,
+        assemble_root_families(
+            candidate_request.definition,
+            candidate_request.roots,
+            candidate_request.children_by_collection,
+        ),
+    )
+    return await run_claimed_candidate(session_factory, candidate_request, grant, admitted)
+
+
+async def run_snowflake_bundle_candidate(
+    session_factory: SessionFactory,
+    connector: SnowflakeBundleAcquisitionConnector,
+    request: SnowflakeBundleCandidateRequest,
+) -> CandidateRunResult:
+    """Fence one reservation, then acquire or replay it into the generic runner."""
+
+    request = _validated_bundle_request(request)
+    if not callable(session_factory):
+        raise SnowflakeCandidateError("Snowflake bundle candidate requires a session factory")
+    build_statement, acquire = _bundle_connector(connector)
+    prepared_statement = _prepared_bundle_statement(build_statement, request)
+    _requires_prepared_statement(acquire, request, prepared_statement)
+    request_identity_sha256 = _bundle_request_identity_sha256(request, prepared_statement)
+    submission, grant = await _reserve_bundle_execution(session_factory, request, request_identity_sha256)
+    if grant is None:
+        return CandidateRunResult(status="not_claimed", execution_id=submission.execution_id)
+    if grant.state != "running":
+        return await _reservation_unavailable_result(session_factory, request, grant)
+    capture_bundle_id = submission.capture_bundle_id
+    if capture_bundle_id is None:
+        if not submission.created:
+            return await _unbound_capture_result(session_factory, request, grant)
+        renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
+        if renewed_grant is None or renewed_grant.state != "running":
+            return await _reservation_unavailable_result(session_factory, request, grant)
+        grant = renewed_grant
+        try:
+            acquisition = await asyncio.to_thread(_acquired_bundle, acquire, request, prepared_statement)
+        except Exception:
+            await _fence_source_capture_failure(session_factory, request, grant)
+            raise
+        renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
+        if renewed_grant is None or renewed_grant.state != "running":
+            return await _reservation_unavailable_result(session_factory, request, grant)
+        grant = renewed_grant
+        try:
+            captures = await asyncio.to_thread(_prepared_bundle_captures, acquisition)
+        except Exception as exc:
+            await _fence_source_capture_failure(session_factory, request, grant)
+            if isinstance(exc, SnowflakeBundleError):
+                raise SnowflakeCandidateError("Snowflake bundle acquisition cannot be retained") from exc
+            raise
+        renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
+        if renewed_grant is None or renewed_grant.state != "running":
+            return await _reservation_unavailable_result(session_factory, request, grant)
+        grant = renewed_grant
+        capture_bundle_id = await _register_bundle_captures(session_factory, request, grant, captures)
+        if capture_bundle_id is None:
+            return await _reservation_unavailable_result(session_factory, request, grant)
+    replay = await _load_bundle_replay(session_factory, request, prepared_statement, capture_bundle_id)
+    return await _run_claimed_bundle_candidate(session_factory, request, grant, replay)

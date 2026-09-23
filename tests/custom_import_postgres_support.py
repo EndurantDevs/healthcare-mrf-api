@@ -68,6 +68,9 @@ _FINALITY_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260917130000_cust
 _DURABLE_CAPTURE_MIGRATION_PATH = (
     _ROOT / "alembic" / "versions" / "20260922000000_custom_import_durable_parquet_capture.py"
 )
+_EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20260922010000_custom_import_execution_request_identity.py"
+)
 
 
 def digest(label: str) -> bytes:
@@ -113,6 +116,7 @@ def _install_custom_import_migrations(sync_connection, schema_name: str) -> None
         (_BASE_MIGRATION_PATH, "custom_import_v1_test_migration"),
         (_FINALITY_MIGRATION_PATH, "custom_import_finality_test_migration"),
         (_DURABLE_CAPTURE_MIGRATION_PATH, "custom_import_durable_capture_test_migration"),
+        (_EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH, "custom_import_execution_request_identity_test_migration"),
     ):
         migration = _migration(path, module_name)
         migration._schema = lambda: schema_name

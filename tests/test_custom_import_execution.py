@@ -107,6 +107,7 @@ class _SyntheticSession:
                 mechanism=column_values["mechanism"],
                 state=column_values["state"],
                 capture_bundle_id=column_values.get("capture_bundle_id"),
+                request_identity_sha256=column_values.get("request_identity_sha256"),
                 terminal_reason=None,
                 started_at=None,
                 finished_at=None,
@@ -164,6 +165,7 @@ async def _submission(session: _SyntheticSession, *, key: str = "synthetic-reque
         idempotency_key=key,
         mechanism="queued",
         capture_bundle_id=None,
+        request_identity_sha256=None,
     )
 
 
@@ -187,6 +189,57 @@ async def test_duplicate_submission_returns_the_same_execution_and_rejects_drift
             idempotency_key="synthetic-request",
             mechanism="external",
         )
+
+
+@pytest.mark.asyncio
+async def test_request_identity_is_exact_and_checked_before_execution_writes():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-request-identity").digest()
+    reservation = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-request-identity",
+        mechanism="local",
+        request_identity_sha256=bytearray(identity),
+    )
+
+    replay = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-request-identity",
+        mechanism="local",
+        request_identity_sha256=memoryview(identity),
+    )
+    assert replay.execution_id == reservation.execution_id
+    assert session.executions[reservation.execution_id].request_identity_sha256 == identity
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.reserve_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-request-identity",
+            mechanism="local",
+            request_identity_sha256=hashlib.sha256(b"different-identity").digest(),
+        )
+
+    statements_before_invalid_identity = len(session.statements)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        await lifecycle.reserve_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-invalid-request-identity",
+            mechanism="local",
+            request_identity_sha256=b"short",
+        )
+    assert len(session.statements) == statements_before_invalid_identity
 
 
 @pytest.mark.asyncio
@@ -843,13 +896,11 @@ async def test_root_transaction_and_clean_session_guards_fail_closed():
 
 @pytest.mark.asyncio
 async def test_lifecycle_storage_guards_cover_disappearing_rows_and_exhausted_authority():
+    """Reject missing storage and exhausted authority without manufacturing state."""
     session = _SyntheticSession()
     submission = await _submission(session)
     await lifecycle._lock_execution_by_request(
-        session,
-        dataset_id=11,
-        definition_revision_id=22,
-        idempotency_key="synthetic-request",
+        session, dataset_id=11, definition_revision_id=22, idempotency_key="synthetic-request"
     )
 
     class _MissingDatasetSession(_SyntheticSession):
@@ -879,6 +930,7 @@ async def test_lifecycle_storage_guards_cover_disappearing_rows_and_exhausted_au
         idempotency_key="missing",
         mechanism="queued",
         capture_bundle_id=None,
+        request_identity_sha256=None,
     )
     assert await lifecycle._locked_submission_execution(empty, request, None) is None
 

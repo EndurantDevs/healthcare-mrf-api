@@ -625,6 +625,10 @@ class CustomImportExecution(_CustomImportModel):
             "state IN ('queued', 'running', 'canceling', 'canceled', 'failed', 'completed', 'no_change')",
             name="custom_import_execution_state_check",
         ),
+        CheckConstraint(
+            "request_identity_sha256 IS NULL OR " + _sha256_check("request_identity_sha256"),
+            name="custom_import_execution_request_identity_shape_check",
+        ),
     )
 
     execution_id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -635,6 +639,7 @@ class CustomImportExecution(_CustomImportModel):
     mechanism = Column(String(16), nullable=False)
     state = Column(String(16), nullable=False)
     capture_bundle_id = Column(BigInteger)
+    request_identity_sha256 = Column(LargeBinary(32))
     terminal_reason = Column(String(64))
     started_at = Column(TIMESTAMP(timezone=True))
     finished_at = Column(TIMESTAMP(timezone=True))

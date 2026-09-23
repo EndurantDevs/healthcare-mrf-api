@@ -82,11 +82,9 @@ def validate_source_snapshot_tokens(
     for stream_id, observed in stream_tokens.items():
         if not isinstance(observed, (list, tuple)) or not observed:
             raise SourceSnapshotError(f"stream {stream_id} has no bounded token observations")
-        stream_values = {_validated_source_snapshot_token(stream_id, token) for token in observed}
-        if len(stream_values) != 1:
-            raise SourceSnapshotError(f"stream {stream_id} lacks one snapshot token")
-        token = next(iter(stream_values))
-        shared_tokens.add(token)
+        if len(observed) != 1:
+            raise SourceSnapshotError(f"stream {stream_id} must have exactly one snapshot token observation")
+        shared_tokens.add(_validated_source_snapshot_token(stream_id, observed[0]))
     if len(shared_tokens) != 1:
         raise SourceSnapshotError("source streams do not share one snapshot token")
     return next(iter(shared_tokens))
