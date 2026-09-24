@@ -224,7 +224,7 @@ def test_adapter_fetches_one_generated_bundle_with_fixed_connection_policy(monke
         credentials,
     )
 
-    assert cursor.executed == [statement.sql]
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", statement.sql]
     assert arguments == {
         "account": "example",
         "user": "reader",
@@ -325,7 +325,12 @@ def test_adapter_closes_when_result_construction_or_execute_fails(monkeypatch, c
     cursor = _Cursor(())
     connection, _arguments = _connect(monkeypatch, cursor)
 
-    def fail_execute(_sql: str) -> None:
+    executed_statements = []
+
+    def fail_execute(sql: str) -> None:
+        executed_statements.append(sql)
+        if sql == "USE SECONDARY ROLES NONE":
+            return
         raise RuntimeError("private server detail")
 
     cursor.execute = fail_execute
@@ -334,6 +339,28 @@ def test_adapter_closes_when_result_construction_or_execute_fails(monkeypatch, c
             _bundle_statement(), credentials
         )
     assert "private server detail" not in str(failure.value)
+    assert executed_statements == ["USE SECONDARY ROLES NONE", _bundle_statement().sql]
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize(
+    ("method_name", "statement"),
+    (("fetch_parquet", _legacy_statement()), ("fetch_bundle", _bundle_statement())),
+)
+def test_adapter_closes_when_role_initialization_fails(monkeypatch, credentials, method_name, statement):
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+    executed_statements = []
+
+    def fail_initialization(sql: str) -> None:
+        executed_statements.append(sql)
+        raise RuntimeError("synthetic initialization failure")
+
+    cursor.execute = fail_initialization
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    with pytest.raises(SnowflakeConnectorError, match=r"Snowflake (?:bundle )?read failed"):
+        getattr(adapter, method_name)(statement, credentials)
+    assert executed_statements == ["USE SECONDARY ROLES NONE"]
     assert cursor.closed and connection.closed
 
 
@@ -523,7 +550,7 @@ def test_adapter_fetches_legacy_single_stream_reads(monkeypatch, credentials):
         next(iterator)
     result.close_partition_iterator()
     result.close()
-    assert cursor.executed == [_legacy_statement().sql]
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", _legacy_statement().sql]
     assert cursor.closed and connection.closed
 
 
