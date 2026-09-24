@@ -243,6 +243,76 @@ async def test_request_identity_is_exact_and_checked_before_execution_writes():
 
 
 @pytest.mark.asyncio
+async def test_cancel_before_reservation_retains_an_exact_request_tombstone():
+    session = _SyntheticSession()
+    request_by_name = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "idempotency_key": "synthetic-cancel-first",
+        "mechanism": "local",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-cancel-first").digest(),
+    }
+    assert await lifecycle.lookup_execution_request(session, **request_by_name) is None
+    statements_before_invalid_reason = len(session.statements)
+    with pytest.raises(ValueError, match="terminal_reason"):
+        await lifecycle.cancel_execution_request(session, **request_by_name, terminal_reason=" invalid")
+    assert len(session.statements) == statements_before_invalid_reason
+
+    canceled = await lifecycle.cancel_execution_request(session, **request_by_name)
+    lookup = await lifecycle.lookup_execution_request(session, **request_by_name)
+    replay = await lifecycle.reserve_execution(session, **request_by_name)
+    assert canceled.state == lookup.state == replay.state == "canceled"
+    assert canceled.execution_id == lookup.execution_id == replay.execution_id
+    assert canceled.changed is True and replay.created is False
+    assert await lifecycle.claim_execution(session, execution_id=canceled.execution_id, token=_WORKER) is None
+    assert (await lifecycle.cancel_execution_request(session, **request_by_name)).changed is False
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.lookup_execution_request(
+            session, **{**request_by_name, "request_identity_sha256": hashlib.sha256(b"different").digest()}
+        )
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.cancel_execution_request(
+            session, **{**request_by_name, "request_identity_sha256": hashlib.sha256(b"different").digest()}
+        )
+    assert session.executions[canceled.execution_id].state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_lookup_rejects_dirty_sessions_before_refreshing_execution():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-pending-lookup").digest()
+    submission = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-pending-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+    )
+    execution = session.executions[submission.execution_id]
+    execution.terminal_reason = "pending-edit"
+    session.dirty = [execution]
+    statement_count = len(session.statements)
+
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="clean session"):
+        await lifecycle.lookup_execution_request(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-pending-lookup",
+            mechanism="local",
+            request_identity_sha256=identity,
+        )
+
+    assert len(session.statements) == statement_count
+    assert execution.terminal_reason == "pending-edit"
+
+
+@pytest.mark.asyncio
 async def test_reservation_replays_its_bound_execution():
     """A reservation replays its running execution with the retained bundle."""
 

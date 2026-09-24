@@ -36,6 +36,7 @@ from process.custom_import.snowflake import (
 from process.custom_import.snowflake_bundle import (
     SnowflakeBundleAcquisitionConnector,
     SnowflakeBundleBinding,
+    SnowflakeBundleEncoding,
     SnowflakeBundleError,
     SnowflakeBundleRequest,
     SnowflakeBundleResult,
@@ -335,11 +336,13 @@ def _fixed38_root_payload(score: Decimal | None) -> bytes:
     )
 
 
-def _fenced_failure_dependencies(monkeypatch, *, transition_state: str):
+def _fenced_failure_dependencies(monkeypatch, *, transition_state: str, reservation_created: bool = True):
     grant = SimpleNamespace(execution_id=1, fence=1, state="running")
 
     async def reserved_execution(*_arguments):
-        return SimpleNamespace(execution_id=1, capture_bundle_id=None, created=True), grant
+        return SimpleNamespace(
+            execution_id=1, capture_bundle_id=None, created=reservation_created, state="queued"
+        ), grant
 
     async def current_lease(*_arguments):
         return grant
@@ -549,6 +552,522 @@ def _capture_limits(
     )
 
 
+def test_bundle_contract_guards_reject_invalid_boundary_values(monkeypatch):
+    for callback, message in (
+        (lambda: snowflake_bundle._field_id("Not_Snake", "field"), "lower_snake_case"),
+        (lambda: snowflake_bundle._snapshot_token(""), "snapshot token"),
+        (lambda: snowflake_bundle._canonical_identity("test", {"value": {"not-json"}}), "canonically serialized"),
+        (lambda: snowflake_bundle._diagnostic_query_id("line\nbreak"), "printable"),
+        (lambda: snowflake_bundle._capture_limits(object()), "declared capture-limit"),
+        (lambda: snowflake_bundle._receipt_sha256(None), "receipt digest"),
+    ):
+        with pytest.raises((SnowflakeBundleError, ValueError), match=message):
+            callback()
+
+    monkeypatch.setattr(snowflake_bundle, "MAX_MANIFEST_CANONICAL_BYTES", 1)
+    with pytest.raises(SnowflakeBundleError, match="canonical byte limit"):
+        snowflake_bundle._canonical_identity("test", {"value": "x"})
+    monkeypatch.setattr(snowflake_bundle, "MAX_DIAGNOSTIC_QUERY_ID_BYTES", 1)
+    with pytest.raises(SnowflakeBundleError, match="byte limit"):
+        snowflake_bundle._diagnostic_query_id("xx")
+    with pytest.raises(SnowflakeBundleError, match="result-byte bounds"):
+        snowflake_bundle._capture_limits(
+            replace(
+                snowflake_bundle.DEFAULT_CAPTURE_LIMITS, maximum_decoded_bytes=snowflake_bundle.MAX_RESULT_BYTES + 1
+            )
+        )
+
+
+def test_bundle_value_objects_fail_closed_for_invalid_shapes():
+    snapshot_relation, root_relation, _detail_relation = _relations()
+    for callback, message in (
+        (lambda: SnowflakeBundleEncoding(True), "bounded positive integer"),
+        (lambda: SnowflakeBundleEncoding(1, "none"), "compression"),
+        (
+            lambda: SnowflakeBundleBinding(
+                "root_source", object(), snapshot_relation.relation, ("npi",), "semantic_snapshot"
+            ),
+            "declared relation",
+        ),
+        (
+            lambda: SnowflakeBundleBinding(
+                "root_source", root_relation.relation, object(), ("npi",), "semantic_snapshot"
+            ),
+            "snapshot relation",
+        ),
+        (
+            lambda: SnowflakeBundleBinding(
+                "root_source", root_relation.relation, snapshot_relation.relation, (), "semantic_snapshot"
+            ),
+            "from 1 through",
+        ),
+        (
+            lambda: SnowflakeBundleBinding(
+                "root_source", root_relation.relation, snapshot_relation.relation, ("npi", "npi"), "semantic_snapshot"
+            ),
+            "unique",
+        ),
+        (lambda: SnowflakeBundleRequest(object(), _bindings()), "custom-import definition"),
+        (lambda: SnowflakeBundleRequest(_definition(), ()), "one binding"),
+        (lambda: SnowflakeBundleRequest(_definition(), (object(),)), "declared binding type"),
+        (lambda: SnowflakeBundleRequest(_definition(), _bindings(), encoding=object()), "encoding"),
+    ):
+        with pytest.raises(SnowflakeBundleError, match=message):
+            callback()
+
+    document = json.loads(_definition().canonical)
+    document["streams"][0]["format"] = "json"
+    with pytest.raises(SnowflakeBundleError, match="fixed Parquet result shape"):
+        SnowflakeBundleRequest(CustomImportDefinition.from_mapping(document), _bindings())
+
+    bundle_result, partition_sources = _result(query_id="query-value-contracts")
+    stream_result = bundle_result.stream_results[0]
+    with pytest.raises(SnowflakeBundleError, match="invalid observation count"):
+        SnowflakeBundleStreamMetadata("root_source", "semantic_snapshot", [])
+    with pytest.raises(SnowflakeBundleError, match="stream metadata is invalid"):
+        SnowflakeBundleStreamResult(object(), stream_result.parquet_result)
+    with pytest.raises(SnowflakeBundleError, match="must own a Parquet result"):
+        SnowflakeBundleStreamResult(stream_result.metadata, object())
+    with pytest.raises(SnowflakeBundleError, match="requires one stream result"):
+        SnowflakeBundleResult(())
+    with pytest.raises(SnowflakeBundleError, match="stream results are invalid"):
+        SnowflakeBundleResult((object(),))
+    with pytest.raises(SnowflakeBundleError, match="cleanup callback"):
+        SnowflakeBundleResult(bundle_result.stream_results, on_close=object())
+    bundle_result.close()
+    bundle_result.close()
+    assert all(partition_source.close_count == 1 for partition_source in partition_sources)
+
+
+def test_bundle_statement_contracts_reject_drift():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-contract")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+
+    for callback, message in (
+        (lambda: SnowflakeBundleStatement(object(), (), ()), "declared bundle request"),
+        (
+            lambda: SnowflakeBundleStatement(request, (), statement.source_snapshot_token_columns_by_stream),
+            "columns must match",
+        ),
+        (
+            lambda: SnowflakeBundleStatement(
+                request,
+                ((SnowflakeDeclaredColumn("npi", "root_npi"),), statement.selected_columns_by_stream[1]),
+                statement.source_snapshot_token_columns_by_stream,
+            ),
+            "do not match",
+        ),
+        (
+            lambda: SnowflakeBundleStatement(
+                request,
+                statement.selected_columns_by_stream,
+                (
+                    SnowflakeDeclaredColumn("wrong", "snapshot_token"),
+                    statement.source_snapshot_token_columns_by_stream[1],
+                ),
+            ),
+            "does not match",
+        ),
+        (
+            lambda: SnowflakeBundleStatement(request, statement.selected_columns_by_stream, ()),
+            "snapshot columns must match",
+        ),
+        (
+            lambda: SnowflakeBundleStatement(
+                request,
+                (object(), statement.selected_columns_by_stream[1]),
+                statement.source_snapshot_token_columns_by_stream,
+            ),
+            "columns must use",
+        ),
+        (
+            lambda: SnowflakeBundleStatement(
+                request,
+                statement.selected_columns_by_stream,
+                (object(), statement.source_snapshot_token_columns_by_stream[1]),
+            ),
+            "snapshot columns must use",
+        ),
+    ):
+        with pytest.raises(SnowflakeBundleError, match=message):
+            callback()
+
+
+def test_bundle_acquisition_contracts_reject_drift():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-contract")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+    acquisition = connector.acquire(request, prepared_statement=statement)
+
+    for callback, message in (
+        (
+            lambda: replace(acquisition, statement=object()),
+            "generated bundle statement",
+        ),
+        (
+            lambda: replace(
+                acquisition,
+                capture_limits=replace(
+                    acquisition.capture_limits, maximum_records=acquisition.capture_limits.maximum_records - 1
+                ),
+            ),
+            "capture limits",
+        ),
+        (lambda: replace(acquisition, stream_captures=acquisition.stream_captures[:-1]), "exactly cover"),
+        (lambda: replace(acquisition, stream_captures=acquisition.stream_captures[::-1]), "declared stream order"),
+        (lambda: replace(acquisition.stream_captures[0], schema=()), "capture schema"),
+        (lambda: replace(acquisition.stream_captures[0], captures=()), "Parquet partitions"),
+    ):
+        with pytest.raises(SnowflakeBundleError, match=message):
+            callback()
+
+    object.__setattr__(request, "request_sha256", "0" * 64)
+    with pytest.raises(SnowflakeBundleError, match="stale identity seal"):
+        snowflake_bundle._validated_bundle_request(request)
+    object.__setattr__(statement, "statement_sha256", "0" * 64)
+    with pytest.raises(SnowflakeBundleError, match="stale identity seal"):
+        snowflake_bundle._validated_bundle_statement(statement)
+    with pytest.raises(SnowflakeBundleError, match="declared bundle request"):
+        snowflake_bundle._validated_bundle_request(object())
+    with pytest.raises(SnowflakeBundleError, match="bundle statement is invalid"):
+        snowflake_bundle._validated_bundle_statement(object())
+
+    schema_mismatch = replace(
+        acquisition.stream_captures[0],
+        schema=(SnowflakeResultColumn("wrong", "TEXT", False),),
+    )
+    with pytest.raises(SnowflakeBundleError, match="capture schema does not match"):
+        snowflake_bundle._validated_stream_capture_manifests(
+            connector.build_statement(connector.prepare_request(_definition(), bindings=_bindings())),
+            (schema_mismatch, acquisition.stream_captures[1]),
+            acquisition.source_snapshot_token,
+            acquisition.capture_limits,
+        )
+
+
+def test_bundle_connector_rejects_invalid_runtime_dependencies_and_mappings():
+    adapter = _Adapter(lambda: _result(query_id="query-runtime")[0])
+    for options, message in (
+        ({"approved_relations": (), "credential_provider": _Credentials(), "adapter": adapter}, "from 1 through"),
+        (
+            {"approved_relations": (object(),), "credential_provider": _Credentials(), "adapter": adapter},
+            "declared relation",
+        ),
+        (
+            {
+                "approved_relations": (_relations()[0], _relations()[0]),
+                "credential_provider": _Credentials(),
+                "adapter": adapter,
+            },
+            "identifiers must be unique",
+        ),
+        (
+            {"approved_relations": _relations(), "credential_provider": object(), "adapter": adapter},
+            "credential provider",
+        ),
+        ({"approved_relations": _relations(), "credential_provider": _Credentials(), "adapter": object()}, "adapter"),
+    ):
+        with pytest.raises(SnowflakeBundleError, match=message):
+            SnowflakeBundleAcquisitionConnector(**options)
+
+    connector = _connector(adapter)
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    with pytest.raises(SnowflakeBundleError, match="selected field is not declared"):
+        connector._approved_columns(request, replace(request.bindings[0], selected_field_ids=("unknown",)))
+    with pytest.raises(SnowflakeBundleError, match="snapshot token column is not declared"):
+        connector._approved_snapshot_token_column(replace(request.bindings[0], semantic_token_metadata_key="unknown"))
+
+    restricted_request = SnowflakeBundleRequest(
+        _definition(),
+        _bindings(),
+        capture_limits=replace(snowflake_bundle.DEFAULT_CAPTURE_LIMITS, maximum_records=1),
+    )
+    with pytest.raises(SnowflakeBundleError, match="capture limits do not match"):
+        connector.build_statement(restricted_request)
+
+    connector._credential_provider = SimpleNamespace(load_key_pair=lambda: object())
+    with pytest.raises(SnowflakeBundleError, match="invalid key-pair"):
+        connector.acquire(request)
+    invalid_result_connector = _connector(_Adapter(lambda: object()))
+    with pytest.raises(SnowflakeBundleError, match="invalid result"):
+        invalid_result_connector.acquire(request)
+
+
+def test_bundle_replay_rejects_corrupt_in_memory_evidence():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-replay-contract")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    replay = prepare_bundle_replay(acquisition)
+    root, detail = replay.streams
+
+    for callback, message in (
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplayStream(root.stream_id, [], root.receipt, root.parts),
+            "tuple of mappings",
+        ),
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplayStream(
+                root.stream_id, root.records, detail.receipt, root.parts
+            ),
+            "receipt",
+        ),
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplayStream(root.stream_id, root.records, root.receipt, ()),
+            "non-empty bytes",
+        ),
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplayStream(
+                root.stream_id, root.records, root.receipt, (root.parts[0][:-1],)
+            ),
+            "byte count",
+        ),
+        (lambda: snowflake_bundle_replay.SnowflakeBundleReplay(object(), _SNAPSHOT, replay.streams), "definition"),
+        (lambda: snowflake_bundle_replay.SnowflakeBundleReplay(_definition(), _SNAPSHOT, object()), "streams"),
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplay(_definition(), _SNAPSHOT, replay.streams[::-1]),
+            "declared order",
+        ),
+        (
+            lambda: snowflake_bundle_replay.SnowflakeBundleReplay(_definition(), "different-snapshot", replay.streams),
+            "acquisition evidence",
+        ),
+        (lambda: snowflake_bundle_replay._verified_bundle_acquisition(object()), "acquisition is invalid"),
+    ):
+        with pytest.raises(SnowflakeBundleError, match=message):
+            callback()
+
+
+def test_bundle_replay_rejects_invalid_field_types_and_partition_schema():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-replay-schema")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    root_fields = tuple(field for field in _definition().fields if field.collection is None)
+    score = next(field for field in root_fields if field.field_id == "score")
+    assert snowflake_bundle_replay._is_bundle_column_type_valid(pa.null(), score) is False
+    assert snowflake_bundle_replay._is_bundle_column_type_valid(pa.null(), replace(score, nullable=True)) is True
+    assert (
+        snowflake_bundle_replay._is_bundle_column_type_valid(pa.float64(), SimpleNamespace(value_type="other")) is False
+    )
+    with pytest.raises(SnowflakeBundleError, match="integer result is invalid"):
+        snowflake_bundle_replay._normalized_integer_replay_values({"score": Decimal("1.5")}, (score,))
+
+    root_stream = _definition().source_streams[0]
+    root_capture = acquisition.stream_captures[0]
+    with pytest.raises(SnowflakeBundleError, match="schema does not match"):
+        snowflake_bundle_replay._validate_replay_partition_schema(
+            root_capture.captures[0], fields=(score,), limits=acquisition.capture_limits
+        )
+    tampered_capture = replace(root_capture)
+    object.__setattr__(tampered_capture, "schema", ())
+    with pytest.raises(SnowflakeBundleError, match="result schema"):
+        snowflake_bundle_replay._replay_stream_records(
+            tampered_capture,
+            stream=root_stream,
+            fields=root_fields,
+            limits=acquisition.capture_limits,
+            decoded_bytes=0,
+        )
+
+
+def test_bundle_replay_rejects_invalid_decoded_records(monkeypatch):
+    connector = _connector(_Adapter(lambda: _result(query_id="query-replay-records")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    root_fields = tuple(field for field in _definition().fields if field.collection is None)
+    root_stream = _definition().source_streams[0]
+    root_capture = acquisition.stream_captures[0]
+    valid_value_by_field = {"npi": "1003000126", "score": 7, "enabled": True}
+    monkeypatch.setattr(
+        snowflake_bundle_replay,
+        "iter_records",
+        lambda *_args, **_kwargs: iter((SimpleNamespace(values={"wrong": "value"}),)),
+    )
+    with pytest.raises(SnowflakeBundleError, match="record fields"):
+        snowflake_bundle_replay._replay_stream_records(
+            root_capture,
+            stream=root_stream,
+            fields=root_fields,
+            limits=acquisition.capture_limits,
+            decoded_bytes=0,
+        )
+    monkeypatch.setattr(
+        snowflake_bundle_replay,
+        "iter_records",
+        lambda *_args, **_kwargs: iter(
+            (SimpleNamespace(values=valid_value_by_field), SimpleNamespace(values=valid_value_by_field))
+        ),
+    )
+    with pytest.raises(SnowflakeBundleError, match="aggregate record"):
+        snowflake_bundle_replay._replay_stream_records(
+            root_capture,
+            stream=root_stream,
+            fields=root_fields,
+            limits=replace(acquisition.capture_limits, maximum_records=1),
+            decoded_bytes=0,
+        )
+    monkeypatch.setattr(
+        snowflake_bundle_replay,
+        "_validate_replay_partition_schema",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(snowflake_bundle_replay.CaptureError("corrupt")),
+    )
+    with pytest.raises(SnowflakeBundleError, match="cannot be decoded"):
+        snowflake_bundle_replay._replay_stream_records(
+            root_capture,
+            stream=root_stream,
+            fields=root_fields,
+            limits=acquisition.capture_limits,
+            decoded_bytes=0,
+        )
+
+
+def test_durable_replay_rejects_stale_statement_identity():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-replay-stale")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+    captures = replayable_parquet_captures(connector.acquire(request, prepared_statement=statement))
+    object.__setattr__(statement, "statement_sha256", "0" * 64)
+
+    with pytest.raises(SnowflakeBundleError, match="stale identity seal"):
+        reconstruct_replayable_parquet_bundle(statement, captures)
+
+
+def test_durable_replay_rejects_corrupt_receipts_and_unsealed_acquisitions():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-durable-integrity")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    acquisition = connector.acquire(request)
+    captures = replayable_parquet_captures(acquisition)
+    first_capture = captures[0]
+    different_part = b"x" * len(first_capture.parts[0])
+    with pytest.raises(SnowflakeBundleError, match="receipt digest"):
+        snowflake_bundle_replay.SnowflakeBundleReplayStream(
+            first_capture.receipt.stream_id,
+            (),
+            first_capture.receipt,
+            (different_part, *first_capture.parts[1:]),
+        )
+
+    object.__setattr__(acquisition, "manifest_sha256", "0" * 64)
+    with pytest.raises(SnowflakeBundleError, match="stale nested identity seal"):
+        snowflake_bundle_replay._verified_bundle_acquisition(acquisition)
+    with pytest.raises(SnowflakeBundleError, match="acquisition seal is invalid"):
+        snowflake_bundle_replay._verified_bundle_acquisition(
+            object.__new__(snowflake_bundle.SnowflakeBundleAcquisition)
+        )
+
+    with pytest.raises(SnowflakeBundleError, match="captures are invalid"):
+        snowflake_bundle_replay._validated_durable_captures(_definition(), ())
+    with pytest.raises(SnowflakeBundleError, match="do not match the declared streams"):
+        snowflake_bundle_replay._validated_durable_captures(_definition(), captures[:1])
+
+    malformed_definition = json.loads(_definition().canonical)
+    malformed_definition["streams"][0]["format"] = "json"
+    with pytest.raises(SnowflakeBundleError, match="fixed Parquet result shape"):
+        snowflake_bundle_replay._validated_durable_captures(
+            CustomImportDefinition.from_mapping(malformed_definition), captures
+        )
+
+    oversized_capture_by_stream = {
+        _definition().source_streams[0].stream_id: SimpleNamespace(
+            parts=(b"x",) * (snowflake_bundle_replay.MAX_RESULT_PARTITIONS + 1)
+        ),
+        _definition().source_streams[1].stream_id: SimpleNamespace(parts=(b"x",)),
+    }
+    with pytest.raises(SnowflakeBundleError, match="stream partitions exceed"):
+        snowflake_bundle_replay._validate_durable_partition_counts(_definition(), oversized_capture_by_stream)
+
+
+def test_durable_replay_rechecks_receipt_schema(monkeypatch):
+    connector = _connector(_Adapter(lambda: _result(query_id="query-durable-recheck")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+    captures = replayable_parquet_captures(connector.acquire(request))
+    definition = _definition()
+    captures_by_stream = {capture.receipt.stream_id: capture for capture in captures}
+    durable_receipt_by_stream = {
+        stream_id: snowflake_bundle._durable_bundle_receipt(capture)
+        for stream_id, capture in captures_by_stream.items()
+    }
+    first_stream = definition.source_streams[0]
+    durable_receipt_by_stream[first_stream.stream_id] = replace(
+        durable_receipt_by_stream[first_stream.stream_id], result_schema=()
+    )
+    monkeypatch.setattr(
+        snowflake_bundle_replay,
+        "_validated_durable_bundle",
+        lambda _statement, _captures: (
+            statement,
+            definition,
+            captures_by_stream,
+            _SNAPSHOT,
+            durable_receipt_by_stream,
+        ),
+    )
+    with pytest.raises(SnowflakeBundleError, match="receipt schema"):
+        reconstruct_replayable_parquet_bundle(statement, captures)
+
+
+def test_durable_replay_rechecks_capture_seals_and_record_fields(monkeypatch):
+    connector = _connector(_Adapter(lambda: _result(query_id="query-durable-capture")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    first_capture = replayable_parquet_captures(connector.acquire(request))[0]
+    definition = _definition()
+    first_stream = definition.source_streams[0]
+    fields = tuple(field for field in definition.fields if field.collection is None)
+    capture_sha256s = tuple("expected" for _part in first_capture.parts)
+    sealed = SimpleNamespace(manifest=SimpleNamespace(capture_sha256="different", compressed_bytes=1, decoded_bytes=1))
+    monkeypatch.setattr(snowflake_bundle_replay, "capture_stream", lambda *_args, **_kwargs: sealed)
+    with pytest.raises(SnowflakeBundleError, match="capture seal"):
+        snowflake_bundle_replay._replay_durable_stream(
+            first_capture,
+            first_stream,
+            fields,
+            capture_sha256s=capture_sha256s,
+            limits=request.capture_limits,
+            capture_compressed_bytes=0,
+            capture_decoded_bytes=0,
+            decoded_bytes=0,
+        )
+
+    sealed.manifest.capture_sha256 = "expected"
+    monkeypatch.setattr(snowflake_bundle_replay, "_validate_replay_partition_schema", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        snowflake_bundle_replay,
+        "iter_records",
+        lambda *_args, **_kwargs: iter((SimpleNamespace(values={"wrong": "value"}),)),
+    )
+    with pytest.raises(SnowflakeBundleError, match="record fields"):
+        snowflake_bundle_replay._replay_durable_stream(
+            first_capture,
+            first_stream,
+            fields,
+            capture_sha256s=capture_sha256s,
+            limits=request.capture_limits,
+            capture_compressed_bytes=0,
+            capture_decoded_bytes=0,
+            decoded_bytes=0,
+        )
+
+
+def test_durable_replay_rechecks_arrow_accounting(monkeypatch):
+    class InvalidBatchReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_batches(self, **_kwargs):
+            return iter((SimpleNamespace(nbytes=True),))
+
+    monkeypatch.setattr(snowflake_bundle_replay, "_validate_parquet_envelope", lambda _payload: None)
+    monkeypatch.setattr(snowflake_bundle_replay, "_open_parquet_reader", lambda _payload, _limits: InvalidBatchReader())
+    with pytest.raises(snowflake_bundle_replay.CaptureError, match="payload is invalid"):
+        snowflake_bundle_replay._aggregate_parquet_arrow_bytes(
+            SimpleNamespace(payload=object()), limits=snowflake_bundle.DEFAULT_CAPTURE_LIMITS, decoded_bytes=0
+        )
+
+
 def test_bundle_generates_one_safe_statement_with_fixed_order_and_encoding_inputs():
     adapter = _Adapter(lambda: _result(query_id="query-a")[0])
     connector = _connector(adapter)
@@ -583,7 +1102,9 @@ def test_bundle_request_identity_normalizes_binding_and_field_order():
     connector = _connector(_Adapter(lambda: pytest.fail("request preparation must not fetch")))
     definition = _definition()
     bindings = _bindings()
-    reordered_bindings = tuple(replace(binding, selected_field_ids=tuple(reversed(binding.selected_field_ids))) for binding in bindings)
+    reordered_bindings = tuple(
+        replace(binding, selected_field_ids=tuple(reversed(binding.selected_field_ids))) for binding in bindings
+    )
 
     expected = connector.prepare_request(definition, bindings=bindings)
     normalized = connector.prepare_request(definition, bindings=tuple(reversed(reordered_bindings)))
@@ -609,6 +1130,21 @@ def test_bundle_request_rejects_incomplete_or_inconsistent_stream_bindings(bindi
     connector = _connector(_Adapter(lambda: pytest.fail("invalid request must not fetch")))
     with pytest.raises(SnowflakeBundleError, match=message):
         connector.prepare_request(_definition(), bindings=bindings(_bindings()))
+
+
+def test_bundle_request_identity_requires_the_exact_validated_statement():
+    connector = _connector(_Adapter(lambda: _result(query_id="query-a")[0]))
+    request = connector.prepare_request(_definition(), bindings=_bindings())
+    statement = connector.build_statement(request)
+    assert len(snowflake_candidate.bundle_request_identity_sha256(request, statement)) == 32
+
+    changed_request = connector.prepare_request(_definition_with_revision(2), bindings=_bindings())
+    with pytest.raises(SnowflakeCandidateError, match="does not match"):
+        snowflake_candidate.bundle_request_identity_sha256(changed_request, statement)
+
+    object.__setattr__(statement, "statement_sha256", "0" * 64)
+    with pytest.raises(SnowflakeCandidateError, match="identity is invalid"):
+        snowflake_candidate.bundle_request_identity_sha256(request, statement)
 
 
 def test_bundle_rejects_missing_semantic_metadata_and_unapproved_relation():
@@ -868,7 +1404,10 @@ def test_bundle_rejects_inconsistent_adapter_evidence_and_closes_sources(mismatc
     if mismatch == "stream_order":
         result.stream_results = (detail, root)
     elif mismatch == "metadata_key":
-        result.stream_results = (replace(root, metadata=replace(root.metadata, semantic_token_metadata_key="other_token")), detail)
+        result.stream_results = (
+            replace(root, metadata=replace(root.metadata, semantic_token_metadata_key="other_token")),
+            detail,
+        )
     elif mismatch == "parquet_token":
         root.parquet_result.source_snapshot_token = "synthetic-other-release"
     else:
@@ -1602,10 +2141,10 @@ async def test_bundle_candidate_does_not_reacquire_an_unbound_reservation(monkey
     connector = _connector(_Adapter(lambda: _result(query_id="query-unbound-reservation")[0]))
     bundle_request = connector.prepare_request(_definition(), bindings=_bindings())
     connector_calls = []
-    grant = SimpleNamespace(execution_id=1, fence=1, state="running")
+    grant = SimpleNamespace(execution_id=1, fence=2, state="running")
 
     async def reserved_execution(*_arguments):
-        return SimpleNamespace(execution_id=1, capture_bundle_id=None, created=False), grant
+        return SimpleNamespace(execution_id=1, capture_bundle_id=None, created=False, state="running"), grant
 
     async def reject_unbound(*_arguments):
         raise SnowflakeCandidateError("unbound source capture")
@@ -1733,7 +2272,8 @@ async def test_bundle_candidate_rejects_a_stale_request_seal_before_reservation(
     "error_class",
     (SnowflakeBundleError, SnowflakeConnectorError, SnowflakeCredentialError),
 )
-async def test_bundle_candidate_wraps_acquisition_failure(monkeypatch, error_class):
+@pytest.mark.parametrize("reservation_created", (True, False))
+async def test_bundle_candidate_wraps_acquisition_failure(monkeypatch, error_class, reservation_created):
     connector = _connector(_Adapter(lambda: _result(query_id="query-acquisition-failure")[0]))
     bundle_request = connector.prepare_request(_definition(), bindings=_bindings())
 
@@ -1748,7 +2288,9 @@ async def test_bundle_candidate_wraps_acquisition_failure(monkeypatch, error_cla
         to_thread_calls.append(function)
         return function(*arguments)
 
-    session_factory, transitions = _fenced_failure_dependencies(monkeypatch, transition_state="canceled")
+    session_factory, transitions = _fenced_failure_dependencies(
+        monkeypatch, transition_state="canceled", reservation_created=reservation_created
+    )
 
     monkeypatch.setattr(snowflake_candidate.asyncio, "to_thread", inline_to_thread)
 

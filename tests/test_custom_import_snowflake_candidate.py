@@ -14,12 +14,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import process.custom_import.snowflake_candidate as snowflake_candidate
 from process.custom_import import snowflake
 from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import assemble_root_families
 from process.custom_import.runner_codec import child_key_hash, new_family_hash, root_key_hash
+from process.custom_import.snowflake_bundle import SnowflakeBundleBinding, SnowflakeBundleRequest
 from process.custom_import.snowflake_candidate import (
+    SnowflakeBundleCandidateRequest,
     SnowflakeCandidateError,
     SnowflakeCandidateRequest,
     _prepare_candidate,
@@ -178,6 +181,111 @@ def _request(
         idempotency_key="synthetic-snowflake-candidate",
         lease_token="synthetic-snowflake-lease",
     )
+
+
+def _bundle_request(definition: CustomImportDefinition) -> SnowflakeBundleRequest:
+    relation = snowflake.SnowflakeRelation(database="synthetic", schema="public", name="root_records")
+    return SnowflakeBundleRequest(
+        definition=definition,
+        bindings=(
+            SnowflakeBundleBinding(
+                stream_id="snowflake_result",
+                relation=relation,
+                source_snapshot_token_relation=relation,
+                selected_field_ids=("npi", "display_name"),
+                semantic_token_metadata_key="source_snapshot",
+            ),
+        ),
+    )
+
+
+def _bundle_candidate_request(definition: CustomImportDefinition) -> SnowflakeBundleCandidateRequest:
+    return SnowflakeBundleCandidateRequest(
+        dataset_id=1,
+        definition_revision_id=1,
+        schema_revision_id=1,
+        definition=definition,
+        bundle_request=_bundle_request(definition),
+        idempotency_key="synthetic-bundle-candidate",
+        lease_token="synthetic-bundle-lease",
+    )
+
+
+def test_candidate_contract_guards_reject_invalid_request_identity():
+    definition = _definition()
+    acquisition = _acquisition(definition)
+    request = _request(definition, acquisition)
+    bundle_request = _bundle_candidate_request(definition)
+    for callback, message in (
+        (lambda: snowflake_candidate._validated_request(object()), "request is invalid"),
+        (
+            lambda: snowflake_candidate._validated_request(replace(request, definition=object())),
+            "definition is invalid",
+        ),
+        (lambda: snowflake_candidate._validated_request(replace(request, lease_token=object())), "request is invalid"),
+        (lambda: snowflake_candidate._validated_request(replace(request, dataset_id=True)), "identifiers are invalid"),
+        (lambda: snowflake_candidate._validated_bundle_request(object()), "request is invalid"),
+        (
+            lambda: snowflake_candidate._validated_bundle_request(replace(bundle_request, definition=object())),
+            "definition is invalid",
+        ),
+        (
+            lambda: snowflake_candidate._validated_bundle_request(replace(bundle_request, lease_token=object())),
+            "request is invalid",
+        ),
+        (
+            lambda: snowflake_candidate._validated_bundle_request(replace(bundle_request, dataset_id=True)),
+            "identifiers are invalid",
+        ),
+        (lambda: snowflake_candidate._verified_acquisition(object()), "acquisition is invalid"),
+    ):
+        with pytest.raises(SnowflakeCandidateError, match=message):
+            callback()
+
+    with pytest.raises(SnowflakeCandidateError, match="does not match"):
+        snowflake_candidate._validated_bundle_request(
+            replace(bundle_request, definition=_definition(with_nullable_root_field=True))
+        )
+
+
+def test_candidate_replay_rejects_invalid_field_types_and_records(monkeypatch):
+    definition = _definition()
+    acquisition = _acquisition(definition)
+    with pytest.raises(SnowflakeCandidateError, match="definition identity"):
+        snowflake_candidate._validate_stream_scope(
+            _definition(with_nullable_root_field=True),
+            _definition(with_nullable_root_field=True).source_streams[0],
+            acquisition,
+        )
+
+    fields = definition.fields
+    assert snowflake_candidate._is_column_type_valid(pa.null(), fields[0]) is False
+    assert snowflake_candidate._is_column_type_valid(pa.int64(), fields[0]) is False
+    assert snowflake_candidate._is_column_type_valid(pa.int64(), fields[1]) is False
+    assert snowflake_candidate._is_column_type_valid(pa.bool_(), fields[1]) is False
+
+    monkeypatch.setattr(
+        snowflake_candidate,
+        "iter_records",
+        lambda *_args, **_kwargs: iter((SimpleNamespace(values={"wrong": "value"}),)),
+    )
+    with pytest.raises(SnowflakeCandidateError, match="result fields"):
+        snowflake_candidate._decode_records(acquisition, fields=fields)
+    monkeypatch.setattr(
+        snowflake_candidate,
+        "_validate_partition_schema",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(snowflake_candidate.CaptureError("corrupt")),
+    )
+    with pytest.raises(SnowflakeCandidateError, match="cannot be replayed"):
+        snowflake_candidate._decode_records(acquisition, fields=fields)
+
+
+@pytest.mark.asyncio
+async def test_legacy_candidate_rejects_noncallable_session_factory_after_validation():
+    definition = _definition()
+
+    with pytest.raises(SnowflakeCandidateError, match="session factory"):
+        await run_snowflake_candidate(object(), _request(definition, _acquisition(definition)))
 
 
 def test_bridge_replays_each_partition_before_preparing_a_root_candidate():

@@ -85,6 +85,7 @@ __all__ = (
     "SnowflakeBundleCandidateRequest",
     "SnowflakeCandidateError",
     "SnowflakeCandidateRequest",
+    "bundle_request_identity_sha256",
     "run_snowflake_bundle_candidate",
     "run_snowflake_candidate",
 )
@@ -480,14 +481,20 @@ def _requires_prepared_statement(
         raise SnowflakeCandidateError("Snowflake bundle acquisition must accept a prepared statement") from exc
 
 
-def _bundle_request_identity_sha256(
-    request: SnowflakeBundleCandidateRequest,
+def bundle_request_identity_sha256(
+    request: SnowflakeBundleRequest,
     statement: SnowflakeBundleStatement,
 ) -> bytes:
-    """Bind idempotency to both declared request inputs and resolved SQL mapping."""
+    """Bind idempotency to a validated request and its resolved SQL mapping."""
 
     try:
-        request_digest = bytes.fromhex(request.bundle_request.request_sha256)
+        statement = _validated_bundle_statement(statement)
+    except SnowflakeBundleError as exc:
+        raise SnowflakeCandidateError("Snowflake bundle statement identity is invalid") from exc
+    if statement.request != request:
+        raise SnowflakeCandidateError("Snowflake bundle statement does not match the configured request")
+    try:
+        request_digest = bytes.fromhex(request.request_sha256)
         statement_digest = bytes.fromhex(statement.statement_sha256)
     except ValueError as exc:
         raise SnowflakeCandidateError("Snowflake bundle statement identity is invalid") from exc
@@ -747,7 +754,7 @@ async def run_snowflake_bundle_candidate(
     build_statement, acquire = _bundle_connector(connector)
     prepared_statement = _prepared_bundle_statement(build_statement, request)
     _requires_prepared_statement(acquire, request, prepared_statement)
-    request_identity_sha256 = _bundle_request_identity_sha256(request, prepared_statement)
+    request_identity_sha256 = bundle_request_identity_sha256(request.bundle_request, prepared_statement)
     submission, grant = await _reserve_bundle_execution(session_factory, request, request_identity_sha256)
     if grant is None:
         return CandidateRunResult(status="not_claimed", execution_id=submission.execution_id)
@@ -755,7 +762,7 @@ async def run_snowflake_bundle_candidate(
         return await _reservation_unavailable_result(session_factory, request, grant)
     capture_bundle_id = submission.capture_bundle_id
     if capture_bundle_id is None:
-        if not submission.created:
+        if submission.state != "queued" or grant.fence != 1:
             return await _unbound_capture_result(session_factory, request, grant)
         renewed_grant = await _renew_bundle_lease(session_factory, request, grant)
         if renewed_grant is None or renewed_grant.state != "running":

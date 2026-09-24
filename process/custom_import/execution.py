@@ -687,6 +687,76 @@ async def reserve_execution(
     return await _submit_execution(session, request, allow_bound_capture_reuse=True)
 
 
+async def lookup_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+) -> ExecutionSubmission | None:
+    """Read an exact request without creating work or changing a lease."""
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    request = _validated_execution_request(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism=mechanism,
+        capture_bundle_id=None,
+        request_identity_sha256=request_identity_sha256,
+    )
+    if request.request_identity_sha256 is None:
+        raise ValueError("request_identity_sha256 is required")
+    execution = await _submission_snapshot(
+        session,
+        definition_revision_id=request.definition_revision_id,
+        idempotency_key=request.idempotency_key,
+    )
+    if execution is None:
+        return None
+    if not _has_matching_execution_identity(execution, request):
+        raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
+    return _submission_result(execution, is_created=False)
+
+
+async def cancel_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+    terminal_reason: str | None = None,
+) -> ExecutionTransition:
+    """Cancel an exact request, retaining a canceled row if it arrives first."""
+
+    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
+    identity = _request_identity_sha256(request_identity_sha256)
+    if identity is None:
+        raise ValueError("request_identity_sha256 is required")
+    submission = await reserve_execution(
+        session,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism=mechanism,
+        request_identity_sha256=identity,
+    )
+    return await request_cancellation(
+        session,
+        execution_id=submission.execution_id,
+        terminal_reason=terminal_reason,
+    )
+
+
 async def _submit_execution(
     session: AsyncSession,
     request: _ExecutionRequest,
@@ -1157,11 +1227,13 @@ __all__ = (
     "TERMINAL_STATES",
     "bind_execution_capture_bundle",
     "cancel_execution",
+    "cancel_execution_request",
     "claim_execution",
     "create_execution",
     "finish_execution",
     "heartbeat_execution",
     "lease_token_sha256",
+    "lookup_execution_request",
     "request_cancellation",
     "require_separate_publication_transaction",
     "reserve_execution",

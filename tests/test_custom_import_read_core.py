@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import hmac
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -1063,3 +1064,245 @@ async def test_exact_counts_reject_noninteger_or_negative_results():
 def test_undeclared_child_collection_is_not_hydrated(query_context):
     with pytest.raises(read_core.CustomImportReadUnavailableError, match="undeclared child collection"):
         read_core._detail_child(SimpleNamespace(collection_slot=2), object(), query_context, {}, {})
+
+
+class _AllowingAuthorizer:
+    def authorize(self, authorization, *, target):
+        del authorization, target
+        return read_core.ExtensionReadScope("synthetic:scope")
+
+
+@pytest.mark.asyncio
+async def test_read_service_rejects_unavailable_cursor_and_invalid_public_shapes(monkeypatch):
+    authorization = ExtensionReadAuthorization("synthetic-secret")
+    service = CustomImportReadService(authorizer=_AllowingAuthorizer())
+
+    with pytest.raises(CustomImportReadUnavailableError, match="cursor is unavailable"):
+        await service.search(object(), authorization=authorization, request=SearchRequest(_target()))
+    with pytest.raises(CustomImportReadRequestError, match="imported membership mode"):
+        await service.prepare_npi_entity_relation(
+            object(), authorization=authorization, target=_target(), query=object()
+        )
+    with pytest.raises(CustomImportReadRequestError, match="provider relation query"):
+        await service.hydrate_npi_page(
+            object(),
+            authorization=authorization,
+            pinned_target=_target(),
+            prepared=object(),
+            entity_values=(),
+            query=object(),
+        )
+    with pytest.raises(CustomImportReadRequestError, match="root detail request"):
+        await service.root_detail_for_entity(object(), authorization=authorization, request=object())
+
+    plan = read_core._SearchPlan(filters=(), order_terms=(), page_size=1, fingerprint="a" * 64)
+    with pytest.raises(CustomImportReadUnavailableError, match="cursor is unavailable"):
+        service._cursor_offset(SearchRequest(_target(), cursor="cursor"), plan, "b" * 64, 1_000)
+    with pytest.raises(CustomImportReadUnavailableError, match="cursor is unavailable"):
+        service._next_search_cursor(
+            SimpleNamespace(target=_target()),
+            plan,
+            "b" * 64,
+            read_core._PageWindow(offset=0, total=2, returned_count=1, issued_at=1_000, expires_at=1_100),
+        )
+
+    winner = WinnerLocator(1, 2, 3, b"w" * 32)
+    scope = read_core.ExtensionReadScope("synthetic:scope")
+    cached = read_core.RootDetail(_target(), winner, (), (), read_core._scope_digest(scope))
+    cached_service = CustomImportReadService(authorizer=_AllowingAuthorizer(), cache=_ValueCache(cached))
+
+    async def verified(_session, _target):
+        return None
+
+    monkeypatch.setattr(read_core, "verify_published_generation", verified)
+    assert await cached_service._root_detail_from_context(
+        object(), SimpleNamespace(target=_target()), winner, scope
+    ) == (cached, None)
+
+
+def test_read_contract_helpers_reject_unencodable_and_undeclared_values(query_context):
+    for entity_value in (1, "\ud800"):
+        with pytest.raises(CustomImportReadRequestError, match="entity value is malformed"):
+            EntityLocator("synthetic", entity_value)
+    with pytest.raises(CustomImportReadRequestError, match="timezone-aware timestamp"):
+        read_core._normalized_timestamp("not-a-timestamp", "observed_at")
+    with pytest.raises(CustomImportReadRequestError, match="order_terms must be a tuple"):
+        read_core._normalize_query_order_terms([], query_context, explicit=True)
+    with pytest.raises(CustomImportReadRequestError, match="order field"):
+        read_core._normalized_order_terms((object(),), query_context)
+    with pytest.raises(CustomImportReadRequestError, match="order field"):
+        read_core._normalized_order_terms((read_core.ReadOrderTerm("unknown", "asc", "last"),), query_context)
+
+    unselected_profile_context = replace(query_context, target=replace(_target(), profile_id="missing"))
+    with pytest.raises(CustomImportReadUnavailableError, match="selection profile"):
+        read_core._verify_context_filters((), unselected_profile_context)
+    with pytest.raises(CustomImportReadUnavailableError, match="selection profile"):
+        read_core._require_order_context_filters((), (), unselected_profile_context, require_exact_context=True)
+
+    profile = query_context.definition.selection_profiles[0]
+    field = query_context.definition.fields_by_id[profile.context_dimensions[0]]
+    null_context = read_core._NormalizedFilter(field, "eq", None, None)
+    selected_profile_context = replace(
+        query_context,
+        target=replace(query_context.target, profile_id=profile.profile_id),
+    )
+    with pytest.raises(CustomImportReadRequestError, match="context_required"):
+        read_core._require_order_context_filters(
+            (), (null_context,), selected_profile_context, require_exact_context=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_read_context_loaders_reject_missing_or_drifted_persisted_rows(monkeypatch, query_context):
+    async def verified(_session, _target):
+        return None
+
+    monkeypatch.setattr(read_core, "verify_published_generation", verified)
+    missing = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: None)))
+    with pytest.raises(CustomImportReadUnavailableError, match="pinned generation"):
+        await read_core._eligible_definition_rows(missing, _target())
+
+    empty_rows = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: ())))
+    )
+    with pytest.raises(CustomImportReadUnavailableError, match="child collections"):
+        await read_core._collection_slots(empty_rows, _target(), query_context.definition)
+    with pytest.raises(CustomImportReadUnavailableError, match="field bindings"):
+        await read_core._verified_field_rows(empty_rows, _target(), query_context.definition, {"rates": 1})
+
+    persisted_rows = []
+    for field in query_context.definition.fields:
+        persisted_rows.append(
+            SimpleNamespace(
+                field_name=field.field_id,
+                field_slot=field.field_slot,
+                collection_slot=0 if field.collection is None else 1,
+                field_type=field.value_type,
+                is_nullable=field.nullable,
+                projection_slot=0 if field.projection_slot is None else field.projection_slot,
+            )
+        )
+    persisted_rows[0].field_slot += 1
+    drifted_rows = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: persisted_rows)))
+    )
+    with pytest.raises(CustomImportReadUnavailableError, match="field binding is invalid"):
+        await read_core._verified_field_rows(drifted_rows, _target(), query_context.definition, {"rates": 1})
+
+
+@pytest.mark.asyncio
+async def test_read_core_rejects_invalid_membership_flags_before_context_loading():
+    service = CustomImportReadService(authorizer=None)
+    with pytest.raises(CustomImportReadRequestError, match="imported membership mode"):
+        await service._prepare_npi_entity_relation(
+            object(),
+            pinned_target=_target(),
+            query=read_core.NpiEntityRelationQuery(require_match=1),
+            authorization_scope=read_core.ExtensionReadScope("synthetic:scope"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_root_detail_caches_only_after_a_verified_non_cached_hydration(monkeypatch):
+    @asynccontextmanager
+    async def unrestricted_window(_session, *, timeout_ms):
+        del timeout_ms
+        yield
+
+    winner = WinnerLocator(1, 2, 3, b"w" * 32)
+    scope = read_core.ExtensionReadScope("synthetic:scope")
+    detail = read_core.RootDetail(_target(), winner, (), (), read_core._scope_digest(scope))
+    cache = _CacheSpy()
+    service = CustomImportReadService(authorizer=_AllowingAuthorizer(), cache=cache)
+
+    async def load_context(_session, target):
+        return SimpleNamespace(target=target)
+
+    async def locate_winner(_session, _context, _entity):
+        return winner
+
+    monkeypatch.setattr(read_core, "_bounded_read_window", unrestricted_window)
+    monkeypatch.setattr(read_core, "_load_read_context", load_context)
+    monkeypatch.setattr(read_core, "_entity_winner_locator", locate_winner)
+    selected_row = AsyncMock(return_value=object())
+    hydrate = AsyncMock(return_value=detail)
+    verify = AsyncMock()
+    monkeypatch.setattr(read_core, "_selected_winner_row", selected_row)
+    monkeypatch.setattr(read_core, "_hydrate_root_detail", hydrate)
+    monkeypatch.setattr(read_core, "verify_published_generation", verify)
+    request = read_core.RootDetailRequest(
+        _target(),
+        EntityLocator("synthetic", "value"),
+        read_core._FULL_FAMILY_ENTITLEMENT,
+    )
+
+    assert (
+        await service.root_detail_for_entity(
+            object(), authorization=ExtensionReadAuthorization("synthetic-secret"), request=request
+        )
+        == detail
+    )
+    assert await service._root_detail(object(), target=_target(), winner=winner, authorization_scope=scope) == detail
+    assert cache.set_calls == 2
+    assert verify.await_count == 2
+    assert selected_row.await_count == 2
+    assert hydrate.await_count == 2
+
+    verify.side_effect = CustomImportReadUnavailableError("synthetic finality failure")
+    with pytest.raises(CustomImportReadUnavailableError, match="synthetic finality failure"):
+        await service._root_detail(object(), target=_target(), winner=winner, authorization_scope=scope)
+    assert verify.await_count == 3
+    assert cache.set_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_bounded_read_window_rejects_elapsed_and_database_timeouts(monkeypatch):
+    @asynccontextmanager
+    async def unrestricted_timeout(_session, *, timeout_ms):
+        del timeout_ms
+        yield
+
+    monkeypatch.setattr(read_core, "_local_statement_timeout", unrestricted_timeout)
+    clock_values = iter((0.0, 1.0))
+    monkeypatch.setattr(read_core, "time", SimpleNamespace(monotonic=lambda: next(clock_values, 1.0)))
+    has_entered_window = False
+    with pytest.raises(CustomImportReadUnavailableError, match="bounded read is unavailable"):
+        async with read_core._bounded_read_window(object(), timeout_ms=1):
+            has_entered_window = True
+    assert has_entered_window
+
+    timeout_driver = RuntimeError("database timeout")
+    timeout_driver.sqlstate = "57014"
+    monkeypatch.setattr(read_core, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    with pytest.raises(CustomImportReadUnavailableError, match="bounded read is unavailable"):
+        async with read_core._bounded_read_window(object(), timeout_ms=1):
+            raise DBAPIError(None, None, timeout_driver)
+
+    non_timeout_driver = RuntimeError("database failure")
+    non_timeout_driver.sqlstate = "23505"
+    with pytest.raises(DBAPIError):
+        async with read_core._bounded_read_window(object(), timeout_ms=1):
+            raise DBAPIError(None, None, non_timeout_driver)
+
+
+def test_read_order_contract_rejects_oversized_declared_order():
+    declared_order_terms = tuple(
+        read_core.ReadOrderTerm("npi", "asc", "last") for _ in range(read_core.MAX_ORDER_TERMS + 1)
+    )
+    context = SimpleNamespace(definition=SimpleNamespace(query=SimpleNamespace(order_terms=declared_order_terms)))
+    with pytest.raises(CustomImportReadRequestError, match="order term count"):
+        read_core._normalize_query_order_terms((), context, explicit=False)
+
+
+@pytest.mark.asyncio
+async def test_entity_detail_rejects_a_winner_removed_between_selection_and_hydration(query_context):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=(
+                SimpleNamespace(all=lambda: ((1, 2, 3),)),
+                SimpleNamespace(one_or_none=lambda: None),
+            )
+        )
+    )
+    with pytest.raises(CustomImportReadUnavailableError, match="selected entity is not eligible"):
+        await read_core._entity_winner_locator(session, query_context, EntityLocator("synthetic", "value"))

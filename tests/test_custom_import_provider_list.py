@@ -288,6 +288,17 @@ def test_extract_name_filters_uses_the_supplied_native_arguments():
     ]
 
 
+def test_extract_name_filters_retains_single_name_when_getall_fails():
+    class FailingMultiValueArgs:
+        def getall(self, _key):
+            raise ValueError("invalid multi-value input")
+
+        def get(self, _key):
+            return "Synthetic"
+
+    assert npi_module._extract_name_filters(SimpleNamespace(args={}), args=FailingMultiValueArgs()) == ["synthetic"]
+
+
 def _postgres_order_contexts(direction: str) -> tuple[ProviderImportQuery, ProviderImportQuery]:
     relation_statement = select(
         literal("1000000002").label("entity_value"),
