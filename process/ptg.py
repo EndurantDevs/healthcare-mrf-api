@@ -3248,7 +3248,7 @@ async def _process_table_of_contents(
                 file_type = "allowed-amounts"
             else:
                 continue
-            location = normalize_tic_source_url(catalog_entry.original_url)
+            location = normalize_tic_source_url(catalog_entry.original_url, source_index_url=catalog_entry.from_index_url or toc_url)
             if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
                 continue
             file_metadata_by_field = {
@@ -3307,7 +3307,7 @@ async def _process_table_of_contents(
             location = entry.get("location")
             if not _is_toc_body_file_location(location):
                 continue
-            location = normalize_tic_source_url(location)
+            location = normalize_tic_source_url(location, source_index_url=toc_url)
             if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
                 continue
             file_metadata_by_field = dict(toc_metadata_by_field)
@@ -3347,7 +3347,7 @@ async def _process_table_of_contents(
             location = entry.get("location")
             if not _is_toc_body_file_location(location):
                 continue
-            location = normalize_tic_source_url(location)
+            location = normalize_tic_source_url(location, source_index_url=toc_url)
             if not _is_requested_toc_body_file_url(
                 location,
                 file_url_match_tokens,

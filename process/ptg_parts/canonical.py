@@ -207,22 +207,53 @@ def canonicalize_url(url: str) -> str:
 def _healthsparq_tenant_from_source_index(
     source_index_url: str | None,
     *,
-    target_hostname: str | None,
+    target_url,
 ) -> str | None:
     """Return the bounded HealthSparq tenant segment for one source index."""
 
     source_index = urlsplit(html.unescape(str(source_index_url or "").strip()))
     if (
-        target_hostname != "mrf.healthsparq.com"
-        or source_index.hostname != target_hostname
+        target_url.hostname != "mrf.healthsparq.com"
+        or source_index.hostname != target_url.hostname
     ):
         return None
     path_segments = [segment for segment in source_index.path.split("/") if segment]
-    if len(path_segments) < 2 or path_segments[1].casefold() != "prd":
+    if (
+        len(path_segments) < 2
+        or path_segments[1].casefold() != "prd"
+        or any(segment in {".", ".."} for segment in path_segments)
+    ):
         return None
     tenant = unquote(path_segments[0])
     if _HEALTHSPARQ_TENANT_RE.fullmatch(tenant) is None:
         return None
+    if len(path_segments) >= 6 and target_url.path.startswith(("/prd/mrf/", "//prd/mrf/")):
+        target_path = "/" + target_url.path.lstrip("/")
+        target_segments = target_path.split("/")[1:]
+        if (
+            source_index.scheme != "https"
+            or target_url.scheme != "https"
+            or source_index.netloc.lower() != target_url.netloc.lower()
+            or source_index.netloc.lower() != "mrf.healthsparq.com"
+            or source_index.query
+            or source_index.fragment
+            or target_url.query
+            or target_url.fragment
+            or "//" in source_index.path
+            or "%" in source_index.path
+            or "%" in target_url.path
+            or len(path_segments) < 8
+            or path_segments[2] != "mrf"
+            or path_segments[6] != "tableOfContents"
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}", path_segments[5]) is None
+            or not source_index.path.endswith((".json", ".json.gz"))
+            or len(target_segments) < 7
+            or target_segments[:5] != path_segments[1:6]
+            or target_segments[5] != "inNetworkRates"
+            or not target_url.path.endswith(".json.gz")
+            or any(segment in {"", ".", ".."} for segment in target_segments)
+        ):
+            return None
     return tenant
 
 
@@ -238,7 +269,7 @@ def _normalize_healthsparq_source_url(
     if normalized_path.startswith("/prd/") or normalized_path == "/prd":
         tenant = _healthsparq_tenant_from_source_index(
             source_index_url,
-            target_hostname=parsed.hostname,
+            target_url=parsed,
         )
         if tenant is not None:
             return urlunsplit(
@@ -253,6 +284,13 @@ def _normalize_healthsparq_source_url(
         if parsed.path.startswith("//"):
             return raw_url
     if parsed.path.startswith("//"):
+        source_path_segments = [
+            segment
+            for segment in urlsplit(str(source_index_url or "")).path.split("/")
+            if segment
+        ]
+        if len(source_path_segments) >= 6:
+            return raw_url
         return urlunsplit(
             (
                 parsed.scheme,

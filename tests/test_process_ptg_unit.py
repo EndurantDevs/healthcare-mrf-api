@@ -4135,6 +4135,80 @@ def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(
     assert pushed_ptg_file_rows[1]["url"] == target_source_url
 
 
+def _write_same_namespace_toc(tmp_path, prefix):
+    """Write two synthetic rate-file references for a targeted TOC test."""
+
+    toc_path = tmp_path / "toc.json"
+    toc_path.write_text(
+        json.dumps(
+            {
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [
+                            {
+                                "plan_name": f"Synthetic Plan {suffix}",
+                                "plan_id": f"00000000{number}",
+                                "plan_market_type": "group",
+                            }
+                        ],
+                        "in_network_files": [
+                            {"location": f"{prefix}rate-{suffix}.json.gz"}
+                        ],
+                    }
+                    for number, suffix in enumerate(("a", "b"), start=1)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return toc_path
+
+
+def test_ptg2_targeted_toc_jobs_repair_same_namespace_file_locations(
+    monkeypatch, tmp_path
+):
+    """Only targeted jobs use the parent's exact dated namespace."""
+
+    index = (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/ISSUER_A/BRAND_B/"
+        "2026-09-05/tableOfContents/index.json.gz"
+    )
+    prefix = (
+        "https://mrf.healthsparq.com//prd/mrf/ISSUER_A/BRAND_B/"
+        "2026-09-05/inNetworkRates/"
+    )
+    toc_path = _write_same_namespace_toc(tmp_path, prefix)
+    pushed_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=toc_path)
+        return artifact, artifact
+
+    async def fake_push_objects(catalog_rows, _cls, **_kwargs):
+        pushed_rows.extend(catalog_rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            index,
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=["rate-a", "rate-b"],
+            max_files=2,
+        )
+    )
+
+    expected_urls = [
+        f"{prefix.replace('.com//prd/', '.com/tenant-a/prd/')}rate-{suffix}.json.gz"
+        for suffix in ("a", "b")
+    ]
+    assert [job["url"] for job in jobs] == expected_urls
+    assert [catalog_row["url"] for catalog_row in pushed_rows[1:]] == expected_urls
+
+
 def _write_mixed_body_location_toc(tmp_path) -> Path:
     """Write HTTP MRF and unsupported body locations in one TOC."""
 
