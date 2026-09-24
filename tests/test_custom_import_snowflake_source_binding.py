@@ -10,6 +10,7 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
@@ -661,3 +662,170 @@ def test_bundle_identity_preserves_unbound_digest_and_validates_optional_binding
             snowflake_candidate.bundle_request_identity_sha256(
                 bundle_request, statement, source_binding_sha256=invalid_digest
             )
+
+
+@pytest.mark.asyncio
+async def test_retained_source_binding_scan_rejects_foreign_or_malformed_revisions():
+    definition = _definition()
+    binding = _binding(definition)
+    row = _loaded_rows(definition, binding)[0]
+    registration = SimpleNamespace(dataset_id=11, definition_revision_id=12, schema_revision_id=13)
+
+    def session_with(*rows):
+        result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+        return SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    assert await source_binding._locked_source_binding_revisions(session_with(row), registration) == (row,)
+    for field, value in (
+        ("dataset_id", 99),
+        ("definition_revision_id", 99),
+        ("schema_revision_id", 99),
+        ("revision_number", True),
+        ("revision_number", "1"),
+        ("revision_number", 0),
+        ("revision_number", source_binding.MAX_REVISION_NUMBER + 1),
+    ):
+        malformed = SimpleNamespace(**{**vars(row), field: value})
+        with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="revision state"):
+            await source_binding._locked_source_binding_revisions(session_with(malformed), registration)
+
+
+def test_source_binding_replay_rejects_ambiguous_or_corrupt_retained_identity():
+    definition = _definition()
+    binding = _binding(definition)
+    row = _loaded_rows(definition, binding)[0]
+
+    assert source_binding._matching_binding_revision((row,), binding) is row
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="ambiguous"):
+        source_binding._matching_binding_revision((row, row), binding)
+    corrupt_digest = SimpleNamespace(**{**vars(row), "binding_sha256": b"x" * 32})
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="canonical state"):
+        source_binding._matching_binding_revision((corrupt_digest,), binding)
+    unrelated = SimpleNamespace(binding_sha256=b"x" * 32, canonical_binding="{}")
+    assert source_binding._matching_binding_revision((unrelated,), binding) is None
+
+    assert source_binding._next_binding_revision(()) == 1
+    assert source_binding._next_binding_revision((row,)) == 2
+    exhausted = SimpleNamespace(revision_number=source_binding.MAX_REVISION_NUMBER)
+    with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="limit"):
+        source_binding._next_binding_revision((exhausted,))
+
+
+def test_source_binding_document_rejects_malformed_identity_and_stream_shapes():
+    definition = _definition()
+    for key, value in (
+        ("contract", "unsupported"),
+        ("definition_sha256", 1),
+        ("role", "invalid role"),
+        ("streams", {}),
+    ):
+        document = _binding_document(definition)
+        document[key] = value
+        with pytest.raises(source_binding.SnowflakeSourceBindingError):
+            source_binding.SnowflakeSourceBinding.from_mapping(document)
+
+    for key, value in (
+        ("relation", "synthetic.public.root_records"),
+        ("semantic_token_metadata_key", "invalid selector"),
+        ("columns", {}),
+    ):
+        document = _binding_document(definition)
+        document["streams"][0][key] = value
+        with pytest.raises(source_binding.SnowflakeSourceBindingError):
+            source_binding.SnowflakeSourceBinding.from_mapping(document)
+
+
+def test_source_binding_value_objects_reject_invalid_relationships():
+    binding = _binding(_definition())
+    stream = binding.streams[0]
+    for candidate in (
+        lambda: replace(stream.snapshot, relation=object()),
+        lambda: replace(stream, relation=object()),
+        lambda: replace(stream, snapshot=object()),
+        lambda: replace(stream, columns=[]),
+        lambda: replace(stream, columns=(stream.columns[0], stream.columns[0])),
+        lambda: replace(binding, source_object=object()),
+        lambda: replace(binding, streams=[]),
+        lambda: replace(binding, streams=(stream, stream)),
+    ):
+        with pytest.raises(source_binding.SnowflakeSourceBindingError):
+            candidate()
+
+
+def test_source_binding_registration_rejects_incompatible_declarations():
+    definition = _definition()
+    binding = _binding(definition)
+    for invalid_definition, invalid_binding in ((None, binding), (definition, None)):
+        with pytest.raises(source_binding.SnowflakeSourceBindingError, match="registration inputs"):
+            source_binding._validated_registration_binding(invalid_definition, invalid_binding)
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="definition is invalid"):
+        binding.bundle_components(object())
+
+    for stream_index, key, value in (
+        (0, "semantic_token_metadata_key", "npi"),
+        (1, "stream_id", "unexpected"),
+        (
+            0,
+            "columns",
+            [
+                {"field_id": "npi", "column_identifier": "wrong"},
+                {"field_id": "score", "column_identifier": "root_score"},
+            ],
+        ),
+    ):
+        document = _binding_document(definition)
+        document["streams"][stream_index][key] = value
+        with pytest.raises(source_binding.SnowflakeSourceBindingError):
+            source_binding.SnowflakeSourceBinding.from_mapping(document).bundle_components(definition)
+
+
+@pytest.mark.asyncio
+async def test_source_binding_load_requires_one_exact_row():
+    for rows in ((), ((object(), object(), object()),) * 2):
+        result = SimpleNamespace(all=lambda: rows)
+        session = SimpleNamespace(execute=AsyncMock(return_value=result))
+        with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="unavailable"):
+            await source_binding.load_snowflake_source_binding(
+                session, definition_revision_id=12, source_binding_revision_id=14
+            )
+
+
+@pytest.mark.asyncio
+async def test_source_binding_receipt_requires_exact_readback_identity(monkeypatch):
+    definition = _definition()
+    binding = _binding(definition)
+    binding_row, definition_row, schema_row = _loaded_rows(definition, binding)
+    loaded = source_binding._loaded_snowflake_source_binding(binding_row, definition_row, schema_row)
+    registration = SimpleNamespace(dataset_id=11, definition_revision_id=12, schema_revision_id=13)
+    loader = AsyncMock(return_value=loaded)
+    monkeypatch.setattr(source_binding, "load_snowflake_source_binding", loader)
+    session = object()
+
+    async def readback():
+        return await source_binding._readback_receipt(
+            session,
+            definition=definition,
+            binding=binding,
+            definition_registration=registration,
+            binding_revision=binding_row,
+            created=False,
+        )
+
+    receipt = await readback()
+    assert receipt.source_binding_revision_id == 14
+    assert receipt.source_binding_sha256 == bytes.fromhex(binding.digest)
+    assert receipt.created is False
+    loader.assert_awaited_with(session, definition_revision_id=12, source_binding_revision_id=14)
+
+    for field, wrong_value in (
+        ("dataset_id", 99),
+        ("definition_revision_id", 99),
+        ("schema_revision_id", 99),
+        ("source_binding_revision_id", 99),
+        ("source_binding_sha256", b"x" * 32),
+        ("definition", object()),
+        ("binding", object()),
+    ):
+        loader.return_value = replace(loaded, **{field: wrong_value})
+        with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="readback"):
+            await readback()

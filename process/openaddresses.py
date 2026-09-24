@@ -16,6 +16,7 @@ import tempfile
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -811,17 +812,17 @@ def _iter_geojson_features(path: Path) -> Iterable[dict[str, Any]]:
                 yield from _iter_geojson_lines(handle)
                 return
 
-    has_yielded_feature = False
+    yielded_count = 0
     try:
         with _open_geojson(path) as handle:
             for feature in ijson.items(handle, "features.item"):
-                has_yielded_feature = True
+                yielded_count += 1
                 yield feature
     except ijson.JSONError:
         with _open_geojson(path) as handle:
-            yield from _iter_geojson_lines(handle)
+            yield from islice(_iter_geojson_lines(handle), yielded_count, None)
         return
-    if has_yielded_feature:
+    if yielded_count:
         return
     with _open_geojson(path) as handle:
         for feature in ijson.items(handle, "item"):
