@@ -72,8 +72,7 @@ class SnowflakePythonConnectorAdapter:
         connection = None
         cursor = None
         try:
-            connection = self._connect(credentials)
-            cursor = connection.cursor()
+            connection, cursor = self._connect(credentials)
             cursor.execute(statement.sql)
             query_id = getattr(cursor, "sfqid", None)
             if not isinstance(query_id, str) or not query_id.strip():
@@ -115,8 +114,7 @@ class SnowflakePythonConnectorAdapter:
         connection = None
         cursor = None
         try:
-            connection = self._connect(credentials)
-            cursor = connection.cursor()
+            connection, cursor = self._connect(credentials)
             cursor.execute(statement.sql)
             query_id = getattr(cursor, "sfqid", None)
             if not isinstance(query_id, str) or not query_id.strip():
@@ -157,26 +155,35 @@ class SnowflakePythonConnectorAdapter:
             _best_effort_close(cursor, connection)
             raise
 
-    def _connect(self, credentials: SnowflakeKeyPairCredentials) -> Any:
-        """Open the fixed policy connection for bundle reads."""
+    def _connect(self, credentials: SnowflakeKeyPairCredentials) -> tuple[Any, Any]:
+        """Open a fixed-primary-role session before executing generated reads."""
 
-        return snowflake.connector.connect(
-            account=credentials.account,
-            user=credentials.user,
-            authenticator="SNOWFLAKE_JWT",
-            private_key=_private_key_der(credentials),
-            role=self._role,
-            warehouse=self._warehouse,
-            autocommit=False,
-            client_session_keep_alive=False,
-            login_timeout=_LOGIN_TIMEOUT_SECONDS,
-            network_timeout=_NETWORK_TIMEOUT_SECONDS,
-            socket_timeout=_NETWORK_TIMEOUT_SECONDS,
-            session_parameters={
-                "QUERY_TAG": _QUERY_TAG,
-                "STATEMENT_TIMEOUT_IN_SECONDS": _STATEMENT_TIMEOUT_SECONDS,
-            },
-        )
+        connection = None
+        cursor = None
+        try:
+            connection = snowflake.connector.connect(
+                account=credentials.account,
+                user=credentials.user,
+                authenticator="SNOWFLAKE_JWT",
+                private_key=_private_key_der(credentials),
+                role=self._role,
+                warehouse=self._warehouse,
+                autocommit=False,
+                client_session_keep_alive=False,
+                login_timeout=_LOGIN_TIMEOUT_SECONDS,
+                network_timeout=_NETWORK_TIMEOUT_SECONDS,
+                socket_timeout=_NETWORK_TIMEOUT_SECONDS,
+                session_parameters={
+                    "QUERY_TAG": _QUERY_TAG,
+                    "STATEMENT_TIMEOUT_IN_SECONDS": _STATEMENT_TIMEOUT_SECONDS,
+                },
+            )
+            cursor = connection.cursor()
+            cursor.execute("USE SECONDARY ROLES NONE")
+            return connection, cursor
+        except BaseException:
+            _best_effort_close(cursor, connection)
+            raise
 
 
 class _SnowflakeParquetPartitionSources:

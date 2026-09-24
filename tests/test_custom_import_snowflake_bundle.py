@@ -1907,7 +1907,7 @@ def test_python_adapter_replays_empty_stream_offline(monkeypatch):
     )
     replay = prepare_bundle_replay(acquisition)
 
-    assert cursor.executed == [acquisition.statement.sql]
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", acquisition.statement.sql]
     assert acquisition.source_snapshot_token == _SNAPSHOT
     assert acquisition.diagnostic_query_id == "synthetic-common-query"
     assert [stream.receipt.source_snapshot_token for stream in replay.streams] == [
