@@ -150,6 +150,50 @@ def test_source_url_normalization_repairs_healthsparq_leading_path_slashes():
     ) == "https://example.test//rates/file.json.gz?token=value"
 
 
+def test_healthsparq_toc_location_repair_requires_matching_dated_namespace():
+    index = (
+        "https://mrf.healthsparq.com/tenant-a/prd/mrf/ISSUER_A/BRAND_B/"
+        "2026-09-05/tableOfContents/index.json.gz"
+    )
+    malformed = (
+        "https://mrf.healthsparq.com//prd/mrf/ISSUER_A/BRAND_B/"
+        "2026-09-05/inNetworkRates/rate-a.json.gz"
+    )
+    assert canonical.normalize_tic_source_url(
+        malformed, source_index_url=index
+    ) == malformed.replace(".com//prd/", ".com/tenant-a/prd/")
+    single_slash = malformed.replace(".com//prd/", ".com/prd/")
+    assert canonical.normalize_tic_source_url(
+        single_slash, source_index_url=index
+    ) == malformed.replace(".com//prd/", ".com/tenant-a/prd/")
+
+    for denied in (
+        malformed.replace("ISSUER_A", "ISSUER_OTHER"),
+        malformed.replace("BRAND_B", "BRAND_OTHER"),
+        malformed.replace("2026-09-05", "2026-08-05"),
+        single_slash.replace("ISSUER_A", "ISSUER_OTHER"),
+        single_slash.replace("BRAND_B", "BRAND_OTHER"),
+        single_slash.replace("2026-09-05", "2026-08-05"),
+        malformed.replace("mrf.healthsparq.com", "other.example.test"),
+        malformed.replace("//prd/", "//tenant-b/prd/"),
+        malformed.replace("rate-a.json.gz", "../rate-a.json.gz"),
+        malformed + "?sig=synthetic",
+    ):
+        assert canonical.normalize_tic_source_url(
+            denied, source_index_url=index
+        ) == denied
+    assert canonical.normalize_tic_source_url(
+        malformed, source_index_url=index.replace("tableOfContents", "other")
+    ) == malformed
+    assert canonical.normalize_tic_source_url(
+        malformed, source_index_url=index + "?sig=synthetic"
+    ) == malformed
+    assert canonical.normalize_tic_source_url(
+        malformed,
+        source_index_url=index.replace("tableOfContents/index.json.gz", "tableOfContents/../index.json.gz"),
+    ) == malformed
+
+
 def test_bounded_reader_enforces_zero_read_readall_and_readinto_contracts():
     """Every read shape must share the same decompressed-byte limit."""
 
