@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import gzip
 import json
 
 import pytest
@@ -174,9 +175,38 @@ def test_openaddresses_iter_geojson_features_reads_line_delimited_features(tmp_p
         },
     ]
     path = tmp_path / "source.geojson"
-    path.write_text("\n".join(json.dumps(feature) for feature in features), encoding="utf-8")
+    path.write_text("\n\n".join(json.dumps(feature) for feature in features), encoding="utf-8")
 
     assert list(openaddresses._iter_geojson_features(path)) == features
+
+
+@pytest.mark.parametrize("shape", ("collection", "array", "gzip_collection"))
+def test_openaddresses_iter_geojson_features_reads_streamed_shapes(tmp_path, shape):
+    feature_map = {"type": "Feature", "properties": {"id": "synthetic"}, "geometry": None}
+    payload = [feature_map] if shape == "array" else {"type": "FeatureCollection", "features": [feature_map]}
+    encoded = json.dumps(payload).encode()
+    path = tmp_path / ("source.geojson.gz" if shape == "gzip_collection" else "source.geojson")
+    path.write_bytes(gzip.compress(encoded) if shape == "gzip_collection" else encoded)
+
+    assert list(openaddresses._iter_geojson_features(path)) == [feature_map]
+
+
+def test_openaddresses_iter_geojson_features_falls_back_to_json_lines(tmp_path):
+    first_feature_map = {"type": "Feature", "properties": {"id": "first"}, "geometry": None}
+    second_feature_map = {"type": "Feature", "properties": {"id": "second"}, "geometry": None}
+    third_feature_map = {"type": "Feature", "properties": {"id": "third"}, "geometry": None}
+    path = tmp_path / "source.geojson"
+    path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": [first_feature_map, second_feature_map]})
+        + "\n"
+        + json.dumps(third_feature_map)
+    )
+
+    assert list(openaddresses._iter_geojson_features(path)) == [
+        first_feature_map,
+        second_feature_map,
+        third_feature_map,
+    ]
 
 
 def test_openaddresses_lookup_sql_uses_strict_fuzzy_guards():
