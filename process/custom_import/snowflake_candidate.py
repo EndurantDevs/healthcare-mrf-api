@@ -648,8 +648,12 @@ async def _validate_bound_source_identity(session, request, prepared_statement):
         for binding in loaded.bundle_bindings
     )
     snapshot_columns = tuple(
-        approved_by_relation[binding.source_snapshot_token_relation.parts].column_for(
-            binding.semantic_token_metadata_key
+        (
+            None
+            if binding.source_snapshot_token_relation is None
+            else approved_by_relation[binding.source_snapshot_token_relation.parts].column_for(
+                binding.semantic_token_metadata_key
+            )
         )
         for binding in loaded.bundle_bindings
     )

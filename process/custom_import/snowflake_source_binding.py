@@ -153,23 +153,30 @@ class _SourceObject:
 
 @dataclass(frozen=True)
 class _SnapshotBinding:
-    relation: SnowflakeRelation
+    relation: SnowflakeRelation | None
     selector: str
-    column_identifier: str
+    column_identifier: str | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.relation, SnowflakeRelation):
+        if self.relation is None:
+            if self.column_identifier is not None:
+                raise SnowflakeSourceBindingError("source binding snapshot column is invalid")
+        elif not isinstance(self.relation, SnowflakeRelation):
             raise SnowflakeSourceBindingError("source binding snapshot relation is invalid")
         selector = _field_id(self.selector)
-        try:
-            column = SnowflakeDeclaredColumn(
-                field_id=selector,
-                column_identifier=_identifier(self.column_identifier),
-            )
-        except (SnowflakeConnectorError, TypeError) as exc:
-            raise SnowflakeSourceBindingError("source binding snapshot column is invalid") from exc
+        if self.relation is None:
+            column_identifier = None
+        else:
+            try:
+                column = SnowflakeDeclaredColumn(
+                    field_id=selector,
+                    column_identifier=_identifier(self.column_identifier),
+                )
+            except (SnowflakeConnectorError, TypeError) as exc:
+                raise SnowflakeSourceBindingError("source binding snapshot column is invalid") from exc
+            column_identifier = column.column_identifier
         object.__setattr__(self, "selector", selector)
-        object.__setattr__(self, "column_identifier", column.column_identifier)
+        object.__setattr__(self, "column_identifier", column_identifier)
 
 
 @dataclass(frozen=True)
@@ -198,9 +205,9 @@ class _StreamBinding:
         object.__setattr__(self, "stream_id", stream_id)
 
 
-def _stream_binding(value: object) -> _StreamBinding:
-    stream = _exact_mapping(
-        value,
+def _stream_binding(stream_mapping: object) -> _StreamBinding:
+    stream_document = _exact_mapping(
+        stream_mapping,
         frozenset(
             {
                 "columns",
@@ -212,16 +219,20 @@ def _stream_binding(value: object) -> _StreamBinding:
             }
         ),
     )
-    raw_columns = stream["columns"]
+    raw_columns = stream_document["columns"]
     if not isinstance(raw_columns, list):
         raise SnowflakeSourceBindingError("source binding stream columns are invalid")
     return _StreamBinding(
-        stream_id=_field_id(stream["stream_id"]),
-        relation=_relation(stream["relation"]),
+        stream_id=_field_id(stream_document["stream_id"]),
+        relation=_relation(stream_document["relation"]),
         snapshot=_SnapshotBinding(
-            relation=_relation(stream["source_snapshot_token_relation"]),
-            selector=stream["semantic_token_metadata_key"],
-            column_identifier=stream["source_snapshot_token_column_identifier"],
+            relation=(
+                None
+                if stream_document["source_snapshot_token_relation"] is None
+                else _relation(stream_document["source_snapshot_token_relation"])
+            ),
+            selector=stream_document["semantic_token_metadata_key"],
+            column_identifier=stream_document["source_snapshot_token_column_identifier"],
         ),
         columns=tuple(_declared_column(column) for column in raw_columns),
     )
@@ -336,7 +347,9 @@ class SnowflakeSourceBinding:
                     "relation": list(stream.relation.parts),
                     "semantic_token_metadata_key": stream.snapshot.selector,
                     "source_snapshot_token_column_identifier": stream.snapshot.column_identifier,
-                    "source_snapshot_token_relation": list(stream.snapshot.relation.parts),
+                    "source_snapshot_token_relation": (
+                        None if stream.snapshot.relation is None else list(stream.snapshot.relation.parts)
+                    ),
                     "stream_id": stream.stream_id,
                 }
                 for stream in self.streams
@@ -384,8 +397,15 @@ class SnowflakeSourceBinding:
         binding_by_stream = {stream.stream_id: stream for stream in self.streams}
         if set(binding_by_stream) != {stream.stream_id for stream in definition.source_streams}:
             raise SnowflakeSourceBindingError("source binding stream coverage does not match the definition")
+        supports_query_identity_snapshot = (
+            len(definition.source_streams) == 1 and definition.source_streams[0].record_kind == "root"
+        )
         for source_stream in definition.source_streams:
             snapshot = binding_by_stream[source_stream.stream_id].snapshot
+            if snapshot.relation is None and not supports_query_identity_snapshot:
+                raise SnowflakeSourceBindingError(
+                    "source binding query-identity snapshot requires exactly one root stream"
+                )
             if snapshot.selector in definition.fields_by_id:
                 raise SnowflakeSourceBindingError("source binding snapshot selector collides with a field")
             if snapshot.selector != source_stream.snapshot_token:
@@ -420,15 +440,16 @@ class SnowflakeSourceBinding:
                 raise SnowflakeSourceBindingError("source binding aliases do not match selected columns")
         for column in stream_binding.columns:
             _register_approved_column(columns_by_relation, relation_by_key, stream_binding.relation, column)
-        _register_approved_column(
-            columns_by_relation,
-            relation_by_key,
-            stream_binding.snapshot.relation,
-            SnowflakeDeclaredColumn(
-                field_id=stream_binding.snapshot.selector,
-                column_identifier=stream_binding.snapshot.column_identifier,
-            ),
-        )
+        if stream_binding.snapshot.relation is not None:
+            _register_approved_column(
+                columns_by_relation,
+                relation_by_key,
+                stream_binding.snapshot.relation,
+                SnowflakeDeclaredColumn(
+                    field_id=stream_binding.snapshot.selector,
+                    column_identifier=stream_binding.snapshot.column_identifier,
+                ),
+            )
         return SnowflakeBundleBinding(
             stream_id=source_stream.stream_id,
             relation=stream_binding.relation,
