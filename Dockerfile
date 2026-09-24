@@ -156,6 +156,7 @@ COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
 RUN uv pip install --python /opt/venv/bin/python --no-cache --no-build --no-deps /tmp/ptg2-address-canon-wheels/*.whl \
     && uv pip check --python /opt/venv/bin/python \
     && rm -rf /tmp/ptg2-address-canon-wheels
+COPY custom_import_snowflake_operator.py /opt/custom_import_snowflake_operator.py
 COPY logging.yaml main.py alembic.ini /opt/
 
 USER nobody:nogroup
