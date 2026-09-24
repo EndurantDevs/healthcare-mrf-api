@@ -339,7 +339,7 @@ def _extract_name_filters(request, *, args=None) -> list[str]:
     elif hasattr(args, "getall"):
         try:
             names.extend(args.getall("name_like"))
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             _LOGGER.debug("failed to read name_like filters with getall: %s", exc)
     else:
         maybe_name = args.get("name_like")
