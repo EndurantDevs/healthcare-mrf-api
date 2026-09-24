@@ -83,6 +83,11 @@ def test_documented_container_commands_are_packaged():
         assert f"COPY {command} /opt/{command}" in runtime_stage
 
 
+def test_snowflake_operator_wrapper_is_packaged_at_its_fixed_worker_path():
+    runtime_stage = (ROOT / "Dockerfile").read_text().split("\nFROM ")[-1]
+    assert "COPY custom_import_snowflake_operator.py /opt/custom_import_snowflake_operator.py" in runtime_stage
+
+
 def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path):
     dockerfile = (ROOT / "Dockerfile").read_text()
     lock_script = (ROOT / "scripts/python_locks.py").read_text()
