@@ -129,6 +129,13 @@ def _diagnostic_query_id(value: object) -> str | None:
     return value
 
 
+def _query_identity_snapshot_token(query_id: object) -> str:
+    query_id = _diagnostic_query_id(query_id)
+    if query_id is None or not query_id.strip():
+        raise SnowflakeBundleError("bundle query-identity snapshot requires a statement identity")
+    return _snapshot_token(f"snowflake-query:{query_id}")
+
+
 def _remaining_partition_limits(
     limits: CaptureLimits,
     *,
@@ -339,7 +346,7 @@ class SnowflakeBundleBinding:
 
     stream_id: str
     relation: SnowflakeRelation
-    source_snapshot_token_relation: SnowflakeRelation
+    source_snapshot_token_relation: SnowflakeRelation | None
     selected_field_ids: tuple[str, ...]
     semantic_token_metadata_key: str | None
 
@@ -347,7 +354,9 @@ class SnowflakeBundleBinding:
         object.__setattr__(self, "stream_id", _field_id(self.stream_id, "bundle stream id"))
         if not isinstance(self.relation, SnowflakeRelation):
             raise SnowflakeBundleError("bundle relation must use the declared relation type")
-        if not isinstance(self.source_snapshot_token_relation, SnowflakeRelation):
+        if self.source_snapshot_token_relation is not None and not isinstance(
+            self.source_snapshot_token_relation, SnowflakeRelation
+        ):
             raise SnowflakeBundleError("bundle source snapshot relation must use the declared relation type")
         if (
             not isinstance(self.selected_field_ids, tuple)
@@ -393,35 +402,22 @@ class SnowflakeBundleRequest:
         bindings_by_stream = {binding.stream_id: binding for binding in self.bindings}
         if len(bindings_by_stream) != len(self.bindings) or set(bindings_by_stream) != set(streams_by_id):
             raise SnowflakeBundleError("bundle bindings must exactly cover the declared source streams")
-        normalized_bindings = []
-        for stream in self.definition.source_streams:
-            binding = bindings_by_stream[stream.stream_id]
-            if stream.format != "parquet" or stream.compression != "none" or stream.record_path is not None:
-                raise SnowflakeBundleError("bundle streams must use the fixed Parquet result shape")
-            expected_field_ids = _stream_field_ids(self.definition, stream)
-            if set(binding.selected_field_ids) != set(expected_field_ids):
-                raise SnowflakeBundleError("bundle selected fields must exactly cover their declared stream scope")
-            if binding.semantic_token_metadata_key is None:
-                raise SnowflakeBundleError("bundle streams require explicit semantic token metadata")
-            if binding.semantic_token_metadata_key != stream.snapshot_token:
-                raise SnowflakeBundleError("bundle semantic token metadata must match the declared stream selector")
-            normalized_bindings.append(
-                SnowflakeBundleBinding(
-                    stream_id=binding.stream_id,
-                    relation=binding.relation,
-                    source_snapshot_token_relation=binding.source_snapshot_token_relation,
-                    selected_field_ids=expected_field_ids,
-                    semantic_token_metadata_key=binding.semantic_token_metadata_key,
-                )
-            )
-        bindings = tuple(normalized_bindings)
+        if any(binding.source_snapshot_token_relation is None for binding in self.bindings) and not (
+            len(self.definition.source_streams) == 1 and self.definition.source_streams[0].record_kind == "root"
+        ):
+            raise SnowflakeBundleError("bundle query-identity snapshot requires exactly one root stream")
+        bindings = _normalized_bundle_bindings(self.definition, bindings_by_stream)
         request_identity_by_key = {
             "bindings": [
                 {
                     "relation": list(binding.relation.parts),
                     "selected_field_ids": list(binding.selected_field_ids),
                     "semantic_token_metadata_key": binding.semantic_token_metadata_key,
-                    "source_snapshot_token_relation": list(binding.source_snapshot_token_relation.parts),
+                    "source_snapshot_token_relation": (
+                        None
+                        if binding.source_snapshot_token_relation is None
+                        else list(binding.source_snapshot_token_relation.parts)
+                    ),
                     "stream_id": binding.stream_id,
                 }
                 for binding in bindings
@@ -439,6 +435,34 @@ class SnowflakeBundleRequest:
         object.__setattr__(self, "request_sha256", digest)
 
 
+def _normalized_bundle_bindings(
+    definition: CustomImportDefinition,
+    bindings_by_stream: dict[str, SnowflakeBundleBinding],
+) -> tuple[SnowflakeBundleBinding, ...]:
+    normalized_bindings = []
+    for stream in definition.source_streams:
+        binding = bindings_by_stream[stream.stream_id]
+        if stream.format != "parquet" or stream.compression != "none" or stream.record_path is not None:
+            raise SnowflakeBundleError("bundle streams must use the fixed Parquet result shape")
+        expected_field_ids = _stream_field_ids(definition, stream)
+        if set(binding.selected_field_ids) != set(expected_field_ids):
+            raise SnowflakeBundleError("bundle selected fields must exactly cover their declared stream scope")
+        if binding.semantic_token_metadata_key is None:
+            raise SnowflakeBundleError("bundle streams require explicit semantic token metadata")
+        if binding.semantic_token_metadata_key != stream.snapshot_token:
+            raise SnowflakeBundleError("bundle semantic token metadata must match the declared stream selector")
+        normalized_bindings.append(
+            SnowflakeBundleBinding(
+                stream_id=binding.stream_id,
+                relation=binding.relation,
+                source_snapshot_token_relation=binding.source_snapshot_token_relation,
+                selected_field_ids=expected_field_ids,
+                semantic_token_metadata_key=binding.semantic_token_metadata_key,
+            )
+        )
+    return tuple(normalized_bindings)
+
+
 def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
     """Rebuild a request before source work trusts its cached identity seal."""
 
@@ -451,7 +475,11 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
                 SnowflakeBundleBinding(
                     stream_id=binding.stream_id,
                     relation=SnowflakeRelation(*binding.relation.parts),
-                    source_snapshot_token_relation=SnowflakeRelation(*binding.source_snapshot_token_relation.parts),
+                    source_snapshot_token_relation=(
+                        None
+                        if binding.source_snapshot_token_relation is None
+                        else SnowflakeRelation(*binding.source_snapshot_token_relation.parts)
+                    ),
                     selected_field_ids=tuple(binding.selected_field_ids),
                     semantic_token_metadata_key=binding.semantic_token_metadata_key,
                 )
@@ -481,7 +509,7 @@ class SnowflakeBundleStatement:
 
     request: SnowflakeBundleRequest
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...]
-    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn, ...]
+    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...]
     sql: str = field(init=False)
     canonical_statement: str = field(init=False, repr=False)
     statement_sha256: str = field(init=False)
@@ -509,10 +537,19 @@ class SnowflakeBundleStatement:
                 raise SnowflakeBundleError("bundle statement columns must use declared column values")
             if tuple(column.field_id for column in selected_columns) != binding.selected_field_ids:
                 raise SnowflakeBundleError("bundle statement columns do not match the configured selected fields")
-            if not isinstance(snapshot_column, SnowflakeDeclaredColumn):
-                raise SnowflakeBundleError("bundle statement snapshot columns must use declared column values")
-            if snapshot_column.field_id != binding.semantic_token_metadata_key:
-                raise SnowflakeBundleError("bundle statement snapshot column does not match semantic token metadata")
+            if snapshot_column is None:
+                if binding.source_snapshot_token_relation is not None:
+                    raise SnowflakeBundleError("bundle statement snapshot columns must use declared column values")
+            else:
+                if (
+                    not isinstance(snapshot_column, SnowflakeDeclaredColumn)
+                    or binding.source_snapshot_token_relation is None
+                ):
+                    raise SnowflakeBundleError("bundle statement snapshot columns must use declared column values")
+                if snapshot_column.field_id != binding.semantic_token_metadata_key:
+                    raise SnowflakeBundleError(
+                        "bundle statement snapshot column does not match semantic token metadata"
+                    )
 
         sql = _bundle_sql(
             self.request,
@@ -543,7 +580,7 @@ def _validated_bundle_statement(statement: object) -> SnowflakeBundleStatement:
                 for selected_columns in statement.selected_columns_by_stream
             ),
             source_snapshot_token_columns_by_stream=tuple(
-                SnowflakeDeclaredColumn(column.field_id, column.column_identifier)
+                None if column is None else SnowflakeDeclaredColumn(column.field_id, column.column_identifier)
                 for column in statement.source_snapshot_token_columns_by_stream
             ),
         )
@@ -558,7 +595,7 @@ def _bundle_sql_branches(
     request: SnowflakeBundleRequest,
     fields: tuple[Field, ...],
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
-    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn, ...],
+    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...],
 ) -> tuple[list[str], list[str]]:
     metadata_branches, data_branches = [], []
     for ordinal, (binding, selected_columns, snapshot_column) in enumerate(
@@ -571,13 +608,19 @@ def _bundle_sql_branches(
         start=1,
     ):
         selected_by_field = {column.field_id: column for column in selected_columns}
+        snapshot_token_expression = (
+            "CAST(NULL AS TEXT)"
+            if snapshot_column is None
+            else (
+                f"(SELECT {_quoted_identifier(snapshot_column.column_identifier)} "
+                f"FROM {binding.source_snapshot_token_relation.quoted_sql})"
+            )
+        )
         metadata_values = [
             f"{_METADATA_ROW_KIND} AS {_quoted_identifier(_BUNDLE_ROW_KIND_COLUMN)}",
             f"{ordinal} AS {_quoted_identifier(_STREAM_ORDINAL_COLUMN)}",
             f"'{binding.stream_id}' AS {_quoted_identifier(_STREAM_ID_COLUMN)}",
-            f"(SELECT {_quoted_identifier(snapshot_column.column_identifier)} "
-            f"FROM {binding.source_snapshot_token_relation.quoted_sql}) "
-            f"AS {_quoted_identifier(_SOURCE_SNAPSHOT_TOKEN_COLUMN)}",
+            f"{snapshot_token_expression} AS {_quoted_identifier(_SOURCE_SNAPSHOT_TOKEN_COLUMN)}",
             *(f"NULL AS {_quoted_identifier(field.field_id)}" for field in fields),
         ]
         metadata_branches.append(f"SELECT {', '.join(metadata_values)}")
@@ -603,7 +646,7 @@ def _bundle_sql_branches(
 def _bundle_sql(
     request: SnowflakeBundleRequest,
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
-    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn, ...],
+    source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...],
 ) -> str:
     """Render the fixed metadata-and-data union for one approved bundle."""
 
@@ -673,7 +716,7 @@ class SnowflakeBundleStreamResult:
 
 @dataclass
 class SnowflakeBundleResult:
-    """One adapter response; its query id is diagnostic and never an identity input."""
+    """One adapter response; a null snapshot binding uses its query id as its source token."""
 
     stream_results: tuple[SnowflakeBundleStreamResult, ...]
     query_id: str | None = None
@@ -768,6 +811,9 @@ class SnowflakeBundleAcquisition:
         if capture_limits != self.statement.request.capture_limits:
             raise SnowflakeBundleError("bundle acquisition capture limits do not match its request")
         diagnostic_query_id = _diagnostic_query_id(self.diagnostic_query_id)
+        if any(binding.source_snapshot_token_relation is None for binding in self.statement.request.bindings):
+            if snapshot_token != _query_identity_snapshot_token(diagnostic_query_id):
+                raise SnowflakeBundleError("bundle query-identity token does not match the statement identity")
         if not isinstance(self.stream_captures, tuple) or len(self.stream_captures) != len(
             self.statement.request.bindings
         ):
@@ -1016,7 +1062,9 @@ class SnowflakeBundleAcquisitionConnector:
                 raise SnowflakeBundleError("bundle source aliases do not match the selected column bindings")
         return columns
 
-    def _approved_snapshot_token_column(self, binding: SnowflakeBundleBinding) -> SnowflakeDeclaredColumn:
+    def _approved_snapshot_token_column(self, binding: SnowflakeBundleBinding) -> SnowflakeDeclaredColumn | None:
+        if binding.source_snapshot_token_relation is None:
+            return None
         approved_relation = self._approved_by_relation.get(binding.source_snapshot_token_relation.parts)
         if approved_relation is None:
             raise SnowflakeBundleError("bundle source snapshot relation identifier is not approved")
@@ -1048,9 +1096,13 @@ def _bundle_snapshot_token(
             raise SnowflakeBundleError("bundle result semantic token metadata does not match configuration")
         snapshot_tokens_by_stream[binding.stream_id] = stream_result.metadata.source_snapshot_tokens
     try:
-        return validate_source_snapshot_tokens(statement.request.definition, snapshot_tokens_by_stream)
+        source_snapshot_token = validate_source_snapshot_tokens(statement.request.definition, snapshot_tokens_by_stream)
     except SourceSnapshotError as exc:
         raise SnowflakeBundleError("bundle streams require one shared semantic snapshot token") from exc
+    if any(binding.source_snapshot_token_relation is None for binding in expected_bindings):
+        if source_snapshot_token != _query_identity_snapshot_token(bundle_result.query_id):
+            raise SnowflakeBundleError("bundle query-identity token does not match the statement identity")
+    return source_snapshot_token
 
 
 def _seal_bundle(
