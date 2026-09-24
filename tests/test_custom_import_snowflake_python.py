@@ -7,7 +7,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from asyncio import CancelledError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
@@ -537,3 +537,128 @@ def test_adapter_wraps_invalid_private_key_material(monkeypatch):
 
     with pytest.raises(SnowflakeCredentialError, match="cannot be loaded"):
         snowflake_python._private_key_der(credentials)
+
+
+def test_legacy_adapter_and_partition_sources_reject_invalid_transport_states(monkeypatch, credentials):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    with pytest.raises(SnowflakeConnectorError, match="generated Snowflake statement"):
+        adapter.fetch_parquet(object(), credentials)
+    with pytest.raises(SnowflakeCredentialError, match="key-pair credentials"):
+        adapter.fetch_parquet(_legacy_statement(), object())
+
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),), query_id=" ")
+    connection, _arguments = _connect(monkeypatch, cursor)
+    with pytest.raises(SnowflakeConnectorError, match="statement identity"):
+        adapter.fetch_parquet(_legacy_statement(), credentials)
+    assert cursor.closed and connection.closed
+
+    schema = (SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),)
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    connection = _Connection(cursor)
+    partition_sources = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=connection,
+        cursor=cursor,
+        result_schema=schema,
+    )
+    reader = next(iter(partition_sources))
+    reader.close()
+    with pytest.raises(SnowflakeConnectorError, match="already consumed"):
+        next(iter(partition_sources))
+    partition_sources.close()
+    partition_sources.close()
+    assert cursor.closed and connection.closed
+
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(cursor), cursor=cursor, result_schema=schema
+    )
+    monkeypatch.setattr(snowflake_python, "_FETCH_ROWS", 1)
+    cursor._rows = [("1234567893",)]
+    assert partition_source._next_partition_rows(None) == ([("1234567893",)], None, False)
+    partition_source.close()
+
+    cursor = _Cursor((("",),), description=(_Metadata("npi", "TEXT", False),))
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(cursor), cursor=cursor, result_schema=schema
+    )
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 4)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        partition_source._next_partition_rows(None)
+    partition_source.close()
+
+
+def test_bundle_transport_rejects_malformed_metadata():
+    statement = _bundle_statement()
+    valid_description = _description()
+    for description, message in (
+        (
+            valid_description[:0] + (replace(valid_description[0], scale=1),) + valid_description[1:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:1] + (replace(valid_description[1], scale=1),) + valid_description[2:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:2] + (replace(valid_description[2], is_nullable=True),) + valid_description[3:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:3] + (replace(valid_description[3], type_name="BOOLEAN"),) + valid_description[4:],
+            "snapshot metadata",
+        ),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            snowflake_python._bundle_result_schemas(statement, description)
+
+    for metadata_rows, message in (
+        ((), "metadata observations are incomplete"),
+        (((0, 1, "wrong", "synthetic-snapshot", None, None),), "metadata row"),
+        ((_metadata_row(), _metadata_row()), "exactly one per stream"),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            snowflake_python._bundle_stream_metadata(statement, _Cursor(metadata_rows))
+    with pytest.raises(SnowflakeConnectorError, match="row kind"):
+        snowflake_python._bundle_row_kind((True,))
+
+
+def test_bundle_transport_rejects_invalid_stream_ownership_and_result_rows():
+    statement = _bundle_statement()
+    valid_description = _description()
+    schemas = snowflake_python._bundle_result_schemas(statement, valid_description)
+    cursor = _Cursor(())
+    connection = _Connection(cursor)
+    owner = snowflake_python._SnowflakeBundlePartitionSources(
+        connection=connection,
+        cursor=cursor,
+        statement=statement,
+        schemas=schemas,
+        pending_row=None,
+    )
+    with pytest.raises(SnowflakeConnectorError, match="configured order"):
+        owner.next_partition_rows(1)
+    with pytest.raises(SnowflakeConnectorError, match="not contiguous"):
+        owner.finish_stream(1)
+    for result_row, message in (
+        ("bad", "result row"),
+        ((1,), "result row"),
+        ((0, 1, "root_source", None, "npi", None), "data row"),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            owner._split_row(result_row, 0)
+    stream = owner.stream_sources(0)
+    stream.close()
+    stream.close()
+    owner.close()
+    with pytest.raises(SnowflakeConnectorError, match="result is closed"):
+        owner.next_partition_rows(0)
+    assert cursor.closed and connection.closed
+
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_schema(_legacy_statement(), ())
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_schema(_legacy_statement(), (_Metadata("wrong", "TEXT", False),))
+    assert snowflake_python._is_nullable(SimpleNamespace(is_nullable=None)) is True
+    assert snowflake_python._uses_decimal_storage("TEXT") is False
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_row_variable_bytes(("a", "b"), (SnowflakeResultColumn("value", "TEXT", True),))

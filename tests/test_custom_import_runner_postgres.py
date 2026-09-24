@@ -56,9 +56,11 @@ from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
 from process.custom_import.execution import (
     IdempotencyConflict,
+    cancel_execution_request,
     claim_execution,
     create_execution,
     finish_execution,
+    lookup_execution_request,
     request_cancellation,
     reserve_execution,
 )
@@ -709,7 +711,7 @@ async def _seed_mapping_drift_execution(
 ) -> tuple[int, bytes]:
     """Persist one legacy, live, expired, or terminal bundle reservation."""
 
-    baseline_identity = snowflake_candidate._bundle_request_identity_sha256(request, statement)
+    baseline_identity = snowflake_candidate.bundle_request_identity_sha256(request.bundle_request, statement)
     async with case.sessions() as session, session.begin():
         submission = await reserve_execution(
             session,
@@ -883,6 +885,67 @@ async def test_snowflake_bundle_rehydrates_durable_streams_before_exact_activati
             assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
             assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
         assert pointer is not None and pointer.generation_id == run_result.generation_id
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bundle_cancel_first_retains_tombstone_without_source_contact():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bundle_cancel_first", _snowflake_bundle_definition())
+        acquirer, request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="cancel_first",
+            root_rows=(("1234567893", "Canceled Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        identity = snowflake_candidate.bundle_request_identity_sha256(
+            request.bundle_request, acquirer.build_statement(request.bundle_request)
+        )
+        exact_request_by_name = {
+            "dataset_id": seed.dataset_id,
+            "definition_revision_id": seed.definition_revision_id,
+            "schema_revision_id": seed.schema_revision_id,
+            "idempotency_key": request.idempotency_key,
+            "mechanism": "local",
+            "request_identity_sha256": identity,
+        }
+        async with case.sessions() as session, session.begin():
+            canceled = await cancel_execution_request(session, **exact_request_by_name)
+
+        result = await run_snowflake_bundle_candidate(case.sessions, acquirer, request)
+        async with case.sessions() as session, session.begin():
+            lookup = await lookup_execution_request(session, **exact_request_by_name)
+        assert result.status == "not_claimed" and result.execution_id == canceled.execution_id
+        assert lookup is not None and lookup.execution_id == canceled.execution_id
+        assert lookup.state == "canceled" and acquirer.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_snowflake_bundle_pre_reserved_first_claim_reads_source_once():
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "snowflake_bundle_pre_reserved", _snowflake_bundle_definition())
+        acquirer, request = _snowflake_bundle_candidate_request(
+            seed,
+            suffix="pre_reserved",
+            root_rows=(("1234567893", "Reserved Bundle"),),
+            child_rows=(("1234567893", "SYNTHETIC", Decimal("12.50")),),
+        )
+        identity = snowflake_candidate.bundle_request_identity_sha256(
+            request.bundle_request, acquirer.build_statement(request.bundle_request)
+        )
+        async with case.sessions() as session, session.begin():
+            reserved = await reserve_execution(
+                session,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+                idempotency_key=request.idempotency_key,
+                mechanism="local",
+                request_identity_sha256=identity,
+            )
+
+        result = await run_snowflake_bundle_candidate(case.sessions, acquirer, request)
+        assert result.status == "activated" and result.execution_id == reserved.execution_id
+        assert acquirer.calls == 1
 
 
 @pytest.mark.asyncio
