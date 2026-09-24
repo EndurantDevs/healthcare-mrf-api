@@ -33,6 +33,7 @@ from process.custom_import.snowflake_bundle import (
     _SOURCE_SNAPSHOT_TOKEN_COLUMN,
     _STREAM_ID_COLUMN,
     _STREAM_ORDINAL_COLUMN,
+    _query_identity_snapshot_token,
     SnowflakeBundleResult,
     SnowflakeBundleStatement,
     SnowflakeBundleStreamMetadata,
@@ -120,7 +121,11 @@ class SnowflakePythonConnectorAdapter:
             if not isinstance(query_id, str) or not query_id.strip():
                 raise SnowflakeConnectorError("Snowflake did not return a statement identity")
             schemas = _bundle_result_schemas(statement, cursor.description)
-            metadata, source_snapshot_token, pending_row = _bundle_stream_metadata(statement, cursor)
+            metadata, source_snapshot_token, pending_row = _bundle_stream_metadata(
+                statement,
+                cursor,
+                query_id=query_id,
+            )
             partition_sources = _SnowflakeBundlePartitionSources(
                 connection=connection,
                 cursor=cursor,
@@ -320,6 +325,8 @@ def _bundle_result_schemas(
 def _bundle_stream_metadata(
     statement: SnowflakeBundleStatement,
     cursor: Any,
+    *,
+    query_id: str | None = None,
 ) -> tuple[tuple[SnowflakeBundleStreamMetadata, ...], str, Sequence[object] | None]:
     """Read exactly one configured semantic-token observation before bundle rows."""
 
@@ -339,11 +346,16 @@ def _bundle_stream_metadata(
             or any(metadata_value is not None for metadata_value in result_row[4:])
         ):
             raise SnowflakeConnectorError("Snowflake bundle metadata row does not match the generated statement")
+        source_snapshot_token = result_row[3]
+        if binding.source_snapshot_token_relation is None:
+            if source_snapshot_token is not None:
+                raise SnowflakeConnectorError("Snowflake bundle metadata row does not match the generated statement")
+            source_snapshot_token = _query_identity_snapshot_token(query_id)
         stream_metadata_items.append(
             SnowflakeBundleStreamMetadata(
                 stream_id=binding.stream_id,
                 semantic_token_metadata_key=binding.semantic_token_metadata_key,
-                source_snapshot_tokens=(result_row[3],),
+                source_snapshot_tokens=(source_snapshot_token,),
             )
         )
     pending_row = cursor.fetchone()

@@ -147,7 +147,11 @@ def _rebuilt_bundle_statement(
             SnowflakeBundleBinding(
                 stream_id=binding.stream_id,
                 relation=SnowflakeRelation(*binding.relation.parts),
-                source_snapshot_token_relation=SnowflakeRelation(*binding.source_snapshot_token_relation.parts),
+                source_snapshot_token_relation=(
+                    None
+                    if binding.source_snapshot_token_relation is None
+                    else SnowflakeRelation(*binding.source_snapshot_token_relation.parts)
+                ),
                 selected_field_ids=tuple(binding.selected_field_ids),
                 semantic_token_metadata_key=binding.semantic_token_metadata_key,
             )
@@ -166,7 +170,7 @@ def _rebuilt_bundle_statement(
             for selected_columns in supplied_statement.selected_columns_by_stream
         ),
         source_snapshot_token_columns_by_stream=tuple(
-            SnowflakeDeclaredColumn(column.field_id, column.column_identifier)
+            None if column is None else SnowflakeDeclaredColumn(column.field_id, column.column_identifier)
             for column in supplied_statement.source_snapshot_token_columns_by_stream
         ),
     )
