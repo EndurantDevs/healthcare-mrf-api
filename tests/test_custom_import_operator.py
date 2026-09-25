@@ -130,6 +130,8 @@ def _execution_evidence_generation_values(generation: bool) -> dict[str, object]
         "generation_schema_revision_id": 7 if generation else None,
         "generation_execution_id": 17 if generation else None,
         "generation_capture_bundle_id": 11 if generation else None,
+        "generation_producing_fence": 4 if generation else None,
+        "generation_producing_token_sha256": _DIGEST if generation else None,
         "generation_source_bundle_sha256": _DIGEST if generation else None,
         "seal_generation_id": 19 if generation else None,
         "seal_dataset_id": 3 if generation else None,
@@ -137,6 +139,7 @@ def _execution_evidence_generation_values(generation: bool) -> dict[str, object]
         "seal_schema_revision_id": 7 if generation else None,
         "seal_execution_id": 17 if generation else None,
         "seal_capture_bundle_id": 11 if generation else None,
+        "seal_token_sha256": _DIGEST if generation else None,
         "seal_contract": "custom-import-generation-seal/v1" if generation else None,
         "sealing_fence": 4 if generation else None,
         "sealed_root_count": 2 if generation else None,
@@ -198,6 +201,7 @@ def _execution_evidence_row(*, generation: bool = True, current_generation_id: i
         "no_change_sealed_at": None,
         "ever_published": generation,
         "no_change_event_exists": False,
+        "current_event_exists": generation and current_generation_id == 19,
     }
 
 
@@ -350,7 +354,8 @@ async def test_execution_evidence_is_one_safe_retained_snapshot():
         "idempotency_key",
         "request_identity_sha256",
         "snapshot_token",
-        "token_sha256",
+        ".producing_token AS ",
+        ".sealing_token AS ",
         "custom_import_lease",
     ):
         assert forbidden not in rendered
