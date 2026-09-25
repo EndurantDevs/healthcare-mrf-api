@@ -533,6 +533,8 @@ async def _seed_completed_generation(
     suffix: str,
     ordinal: int,
     prior_generation: CustomImportGeneration | None,
+    *,
+    source_binding_revision_id: int | None = None,
 ) -> tuple[CustomImportExecution, CustomImportGeneration]:
     token = f"synthetic-generation-lease-{ordinal}-{suffix}"
     lease_now = dt.datetime.now(dt.UTC)
@@ -544,6 +546,8 @@ async def _seed_completed_generation(
         idempotency_key=f"synthetic-completed-{ordinal}-{suffix}",
         mechanism="local",
         state="running",
+        source_binding_revision_id=source_binding_revision_id,
+        request_identity_sha256=digest(f"synthetic-request:{suffix}") if source_binding_revision_id else None,
     )
     session.add(execution)
     await session.flush()
@@ -588,6 +592,8 @@ async def _seed_no_change_execution(
     session: AsyncSession,
     seed: _PublicationSeed,
     suffix: str,
+    *,
+    source_binding_revision_id: int | None = None,
 ) -> tuple[CustomImportExecution, CustomImportGeneration, str]:
     no_change_token = f"synthetic-lease-{suffix}"
     lease_now = dt.datetime.now(dt.UTC)
@@ -599,6 +605,8 @@ async def _seed_no_change_execution(
         idempotency_key=f"synthetic-no-change-{suffix}",
         mechanism="local",
         state="running",
+        source_binding_revision_id=source_binding_revision_id,
+        request_identity_sha256=digest(f"synthetic-request:{suffix}") if source_binding_revision_id else None,
     )
     session.add(no_change)
     await session.flush()
