@@ -12,6 +12,7 @@ from process.custom_import.operator import (
     OperatorInvariantError,
     OperatorObjectNotFound,
     OperatorTransactionRequired,
+    inspect_execution_evidence,
     inspect_execution,
     inspect_generation,
 )
@@ -29,6 +30,11 @@ class _Result:
 
     def one_or_none(self):
         return self.row
+
+    def all(self):
+        if self.row is None:
+            return []
+        return list(self.row) if isinstance(self.row, tuple) else [self.row]
 
 
 class _Session:
@@ -114,6 +120,85 @@ def _generation_row(
     }
 
 
+def _execution_evidence_generation_values(generation: bool) -> dict[str, object]:
+    return {
+        "evidence_generation_id": 19 if generation else None,
+        "generation_dataset_id": 3 if generation else None,
+        "generation_definition_revision_id": 5 if generation else None,
+        "generation_schema_revision_id": 7 if generation else None,
+        "generation_execution_id": 17 if generation else None,
+        "generation_capture_bundle_id": 11 if generation else None,
+        "generation_source_bundle_sha256": _DIGEST if generation else None,
+        "seal_generation_id": 19 if generation else None,
+        "seal_dataset_id": 3 if generation else None,
+        "seal_definition_revision_id": 5 if generation else None,
+        "seal_schema_revision_id": 7 if generation else None,
+        "seal_execution_id": 17 if generation else None,
+        "seal_capture_bundle_id": 11 if generation else None,
+        "seal_contract": "custom-import-generation-seal/v1" if generation else None,
+        "sealing_fence": 4 if generation else None,
+        "sealed_root_count": 2 if generation else None,
+        "sealed_family_count": 2 if generation else None,
+        "generation_family_count": 2 if generation else None,
+        "family_child_count": 3 if generation else None,
+        "winner_count": 2 if generation else None,
+        "profile_count": 1 if generation else None,
+        "root_scalar_count": 4 if generation else None,
+        "child_scalar_count": 6 if generation else None,
+        "materialization_sha256": _DIGEST if generation else None,
+        "sealed_effective_output_sha256": _DIGEST if generation else None,
+        "sealed_at": _NOW if generation else None,
+    }
+
+
+def _execution_evidence_row(*, generation: bool = True, current_generation_id: int | None = 19):
+    """Return a synthetic execution-evidence statement mapping."""
+
+    return {
+        **_execution_row(state="completed"),
+        "execution_source_binding_revision_id": 23,
+        "definition_id": 5,
+        "definition_dataset_id": 3,
+        "definition_schema_revision_id": 7,
+        "definition_sha256": _DIGEST,
+        "stored_schema_revision_id": 7,
+        "schema_dataset_id": 3,
+        "schema_sha256": _DIGEST,
+        "binding_revision_id": 23,
+        "binding_dataset_id": 3,
+        "binding_definition_revision_id": 5,
+        "binding_schema_revision_id": 7,
+        "binding_definition_sha256": _DIGEST,
+        "binding_schema_sha256": _DIGEST,
+        "source_binding_sha256": _DIGEST,
+        "capture_id": 11,
+        "capture_dataset_id": 3,
+        "capture_definition_revision_id": 5,
+        "capture_schema_revision_id": 7,
+        "capture_manifest_sha256": _DIGEST,
+        **_execution_evidence_generation_values(generation),
+        "current_generation_id": current_generation_id,
+        "current_definition_revision_id": 5 if current_generation_id is not None else None,
+        "current_schema_revision_id": 7 if current_generation_id is not None else None,
+        "pointer_version": 8 if current_generation_id is not None else None,
+        "pointer_changed_at": _NOW if current_generation_id is not None else None,
+        "no_change_execution_id": None,
+        "no_change_dataset_id": None,
+        "no_change_definition_revision_id": None,
+        "no_change_schema_revision_id": None,
+        "no_change_capture_bundle_id": None,
+        "no_change_candidate_generation_id": None,
+        "no_change_contract": None,
+        "no_change_base_generation_id": None,
+        "no_change_base_pointer_version": None,
+        "no_change_effective_output_sha256": None,
+        "no_change_receipt_sha256": None,
+        "no_change_sealed_at": None,
+        "ever_published": generation,
+        "no_change_event_exists": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_execution_status_is_safe_and_uses_one_caller_owned_snapshot():
     session = _Session(_execution_row())
@@ -177,6 +262,165 @@ async def test_inspection_requires_a_transaction_and_hides_dataset_mismatch():
     with pytest.raises(OperatorObjectNotFound):
         await inspect_execution(missing, dataset_id=4, execution_id=17)
     assert len(missing.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_is_one_safe_retained_snapshot():
+    session = _Session(_execution_evidence_row())
+
+    evidence = await inspect_execution_evidence(session, dataset_id=3, execution_id=17)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert statement.get_execution_options()["autoflush"] is False
+    assert evidence.execution.execution_id == 17
+    assert {field.name for field in fields(evidence.execution)}.isdisjoint(
+        {"lease", "idempotency_key", "terminal_reason"}
+    )
+    assert evidence.definition_sha256 == _DIGEST.hex()
+    assert evidence.schema_sha256 == _DIGEST.hex()
+    assert evidence.source_binding_revision_id == 23
+    assert evidence.source_binding_sha256 == _DIGEST.hex()
+    assert evidence.capture_manifest_sha256 == _DIGEST.hex()
+    assert evidence.current is not None and evidence.current.generation_id == 19
+    assert evidence.generation is not None
+    assert evidence.generation.generation_id == 19
+    assert evidence.generation.source_bundle_sha256 == _DIGEST.hex()
+    assert evidence.generation.seal is not None
+    assert evidence.generation.seal.materialization_sha256 == _DIGEST.hex()
+    assert evidence.generation.publication_state == "current"
+    rendered = str(statement)
+    for forbidden in (
+        "canonical_binding",
+        "canonical_definition",
+        "canonical_manifest",
+        "canonical_schema",
+        "idempotency_key",
+        "request_identity_sha256",
+        "snapshot_token",
+        "token_sha256",
+        "custom_import_lease",
+    ):
+        assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_keeps_an_incomplete_execution_distinct_from_invalid_evidence():
+    row = _execution_evidence_row(generation=False)
+    row["state"] = "running"
+    row["finished_at"] = None
+    evidence = await inspect_execution_evidence(
+        _Session(row),
+        dataset_id=3,
+        execution_id=17,
+    )
+
+    assert evidence.generation is None
+    assert evidence.current is not None and evidence.current.generation_id == 19
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["completed", "no_change"])
+async def test_execution_evidence_rejects_terminal_execution_without_generation(state):
+    row = _execution_evidence_row(generation=False)
+    row["state"] = state
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_rejects_orphaned_generation_evidence():
+    row = _execution_evidence_row(generation=False)
+    row["sealed_root_count"] = 2
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("binding_definition_sha256", bytes(reversed(_DIGEST))),
+        ("capture_definition_revision_id", 13),
+        ("generation_capture_bundle_id", 13),
+        ("seal_execution_id", 13),
+    ],
+)
+async def test_execution_evidence_rejects_mismatched_joins(field, value):
+    mismatched_evidence_by_field = {**_execution_evidence_row(), field: value}
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(mismatched_evidence_by_field), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_refuses_ambiguous_multi_generation_evidence():
+    recovered = _execution_evidence_row()
+    recovered["evidence_generation_id"] = 23
+    recovered["seal_generation_id"] = 23
+    session = _Session((_execution_evidence_row(), recovered))
+
+    with pytest.raises(OperatorInvariantError, match="ambiguous"):
+        await inspect_execution_evidence(
+            session,
+            dataset_id=3,
+            execution_id=17,
+        )
+    assert "LIMIT 2" in str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_selects_an_exact_recovery_candidate():
+    recovered = _execution_evidence_row()
+    recovered["evidence_generation_id"] = 23
+    recovered["seal_generation_id"] = 23
+    recovered["ever_published"] = False
+    session = _Session(recovered)
+
+    evidence = await inspect_execution_evidence(session, dataset_id=3, execution_id=17, candidate_generation_id=23)
+
+    assert evidence.generation is not None
+    assert evidence.generation.generation_id == 23
+    assert evidence.generation.publication_state == "sealed_unpublished"
+    statement = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "mrf.custom_import_generation.execution_id = mrf.custom_import_execution.execution_id" in statement
+    assert "custom_import_generation.generation_id = 23" in statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_generation_id", [23, 29])
+async def test_execution_evidence_rejects_missing_or_foreign_candidate(candidate_generation_id):
+    session = _Session(_execution_evidence_row(generation=False))
+
+    with pytest.raises(OperatorObjectNotFound):
+        await inspect_execution_evidence(
+            session, dataset_id=3, execution_id=17, candidate_generation_id=candidate_generation_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_requires_a_transaction_and_exact_execution():
+    inactive = _Session(_execution_evidence_row(), active=False)
+    with pytest.raises(OperatorTransactionRequired):
+        await inspect_execution_evidence(inactive, dataset_id=3, execution_id=17)
+    assert inactive.statements == []
+
+    missing = _Session(None)
+    with pytest.raises(OperatorObjectNotFound):
+        await inspect_execution_evidence(missing, dataset_id=3, execution_id=17)
+    assert len(missing.statements) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dataset_id, execution_id", [(0, 1), (1, 0), (True, 1), (1, 2**63)])
+async def test_execution_evidence_rejects_invalid_identifiers_without_sql(dataset_id, execution_id):
+    session = _Session(_execution_evidence_row())
+
+    with pytest.raises(OperatorInspectionError):
+        await inspect_execution_evidence(session, dataset_id=dataset_id, execution_id=execution_id)
+
+    assert session.statements == []
 
 
 @pytest.mark.asyncio

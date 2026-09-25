@@ -3,13 +3,30 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.custom_import import CustomImportDataset, CustomImportPublicationEvent
-from process.custom_import.operator import OperatorObjectNotFound, inspect_execution, inspect_generation
-from process.custom_import.publication import activate_generation, record_no_change
-from tests.custom_import_postgres_support import digest, isolated_publication_case, seed_publication_graph
+from db.models.custom_import import (
+    CustomImportDataset,
+    CustomImportGeneration,
+    CustomImportLease,
+    CustomImportPublicationEvent,
+)
+from process.custom_import.execution import resume_execution
+from process.custom_import.operator import (
+    OperatorInvariantError,
+    OperatorObjectNotFound,
+    inspect_execution,
+    inspect_execution_evidence,
+    inspect_generation,
+)
+from process.custom_import.publication import activate_generation, record_no_change, seal_generation
+from tests.custom_import_postgres_support import (
+    digest,
+    isolated_publication_case,
+    lease_digest,
+    seed_publication_graph,
+)
 from tests.test_custom_import_publication_postgres import (
     _downgrade_finality_schema,
     _finality_insert_duplicate_legacy_publication_events,
@@ -265,6 +282,81 @@ async def test_operator_inspection_tracks_sealed_current_superseded_and_no_chang
         await _assert_superseded_and_current_states(case, graph)
         await _record_graph_no_change_in_transaction(case, graph)
         await _assert_no_change_state(case, graph)
+
+
+async def _create_second_execution_candidate(case, graph) -> int:
+    recovery_token = "synthetic-evidence-recovery"
+    async with case.sessions() as session:
+        async with session.begin():
+            await session.execute(
+                update(CustomImportLease)
+                .where(CustomImportLease.execution_id == graph.no_change_execution_id)
+                .values(expires_at=func.clock_timestamp() - text("interval '1 second'"))
+            )
+    async with case.sessions() as session:
+        async with session.begin():
+            takeover = await resume_execution(session, execution_id=graph.no_change_execution_id, token=recovery_token)
+            assert takeover is not None and takeover.fence == 2
+            source_generation = await session.get(CustomImportGeneration, graph.no_change_candidate_generation_id)
+            assert source_generation is not None
+            recovery_generation = CustomImportGeneration(
+                dataset_id=graph.dataset_id,
+                definition_revision_id=graph.definition_revision_id,
+                schema_revision_id=graph.schema_revision_id,
+                execution_id=graph.no_change_execution_id,
+                capture_bundle_id=graph.capture_bundle_id,
+                source_bundle_sha256=source_generation.source_bundle_sha256,
+                candidate_sha256=digest("synthetic-evidence-second-candidate"),
+                root_count=0,
+                family_count=0,
+                producing_fence=takeover.fence,
+                producing_token_sha256=lease_digest(recovery_token),
+            )
+            session.add(recovery_generation)
+            await session.flush()
+            second_generation_id = recovery_generation.generation_id
+    async with case.sessions() as session:
+        async with session.begin():
+            await seal_generation(
+                session,
+                dataset_id=graph.dataset_id,
+                generation_id=second_generation_id,
+                lease_fence=takeover.fence,
+                lease_token=recovery_token,
+            )
+    return second_generation_id
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_selects_second_candidate_from_one_execution():
+    async with isolated_publication_case() as case:
+        async with case.sessions() as session:
+            async with session.begin():
+                graph = await seed_publication_graph(session)
+        second_generation_id = await _create_second_execution_candidate(case, graph)
+        async with case.sessions() as session:
+            async with session.begin():
+                with pytest.raises(OperatorInvariantError, match="ambiguous"):
+                    await inspect_execution_evidence(
+                        session, dataset_id=graph.dataset_id, execution_id=graph.no_change_execution_id
+                    )
+                evidence = await inspect_execution_evidence(
+                    session,
+                    dataset_id=graph.dataset_id,
+                    execution_id=graph.no_change_execution_id,
+                    candidate_generation_id=second_generation_id,
+                )
+                assert evidence.generation is not None
+                assert evidence.generation.generation_id == second_generation_id
+                assert evidence.generation.publication_state == "sealed_unpublished"
+                assert evidence.generation.seal is not None and evidence.generation.seal.sealing_fence == 2
+                with pytest.raises(OperatorObjectNotFound):
+                    await inspect_execution_evidence(
+                        session,
+                        dataset_id=graph.dataset_id,
+                        execution_id=graph.no_change_execution_id,
+                        candidate_generation_id=graph.second_generation_id,
+                    )
 
 
 @pytest.mark.asyncio
