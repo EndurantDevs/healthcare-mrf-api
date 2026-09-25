@@ -13,7 +13,11 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from db.connection import db
+from db.models.custom_import import CustomImportDataset, CustomImportSourceBindingRevision
 from process.custom_import.cli import _read_stdin
 from process.custom_import.definition import CustomImportDefinition, canonical_json, load_json_definition
 from process.custom_import.definition_store import DefinitionRegistrationError, _normalized_dataset_key
@@ -29,6 +33,7 @@ from process.custom_import.snowflake_source_binding import (
     SnowflakeSourceBinding,
     SnowflakeSourceBindingError,
     SnowflakeSourceBindingReceipt,
+    SnowflakeSourceBindingUnavailableError,
     load_snowflake_source_binding,
     register_snowflake_source_binding,
 )
@@ -149,6 +154,52 @@ def _registration_receipt(
     )
 
 
+async def _committed_registration_receipt(
+    session: AsyncSession,
+    *,
+    dataset_key: str,
+    registration: SnowflakeSourceBindingReceipt,
+    definition: CustomImportDefinition,
+    binding: SnowflakeSourceBinding,
+) -> str:
+    """Verify one committed registration in a fresh session before reporting it."""
+
+    loaded = await load_snowflake_source_binding(
+        session,
+        definition_revision_id=registration.definition_revision_id,
+        source_binding_revision_id=registration.source_binding_revision_id,
+    )
+    identity_rows = (
+        await session.execute(
+            select(CustomImportDataset.dataset_key, CustomImportSourceBindingRevision.revision_number)
+            .select_from(CustomImportSourceBindingRevision)
+            .join(CustomImportDataset, CustomImportDataset.dataset_id == CustomImportSourceBindingRevision.dataset_id)
+            .where(
+                CustomImportSourceBindingRevision.source_binding_revision_id == registration.source_binding_revision_id
+            )
+            .where(CustomImportSourceBindingRevision.dataset_id == registration.dataset_id)
+            .where(CustomImportSourceBindingRevision.definition_revision_id == registration.definition_revision_id)
+            .where(CustomImportSourceBindingRevision.schema_revision_id == registration.schema_revision_id)
+        )
+    ).all()
+    if (
+        len(identity_rows) != 1
+        or identity_rows[0] != (dataset_key, registration.revision_number)
+        or loaded.dataset_id != registration.dataset_id
+        or loaded.definition_revision_id != registration.definition_revision_id
+        or loaded.schema_revision_id != registration.schema_revision_id
+        or loaded.source_binding_revision_id != registration.source_binding_revision_id
+        or loaded.definition != definition
+        or loaded.definition.digest != definition.digest
+        or loaded.definition.schema_digest != definition.schema_digest
+        or loaded.binding != binding
+        or loaded.source_binding_sha256 != registration.source_binding_sha256
+        or loaded.source_binding_sha256 != bytes.fromhex(binding.digest)
+    ):
+        raise SnowflakeSourceBindingUnavailableError("committed registration does not match")
+    return _registration_receipt(registration, loaded.definition, loaded.binding)
+
+
 async def _register_snowflake_binding(*, stream: Any | None = None, database=db) -> str:
     """Commit one canonical registration before returning its redacted receipt."""
 
@@ -162,7 +213,14 @@ async def _register_snowflake_binding(*, stream: Any | None = None, database=db)
                 definition=definition,
                 binding=binding,
             )
-            return _registration_receipt(result, definition, binding)
+        async with database.session() as session:
+            return await _committed_registration_receipt(
+                session,
+                dataset_key=dataset_key,
+                registration=result,
+                definition=definition,
+                binding=binding,
+            )
     finally:
         await database.disconnect()
 
