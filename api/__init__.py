@@ -5,6 +5,7 @@ from sanic.blueprints import Blueprint
 from sanic.exceptions import SanicException
 
 from api.control import blueprint as control_blueprint, control_error
+from api.control_execution_evidence import blueprint as execution_evidence_blueprint
 from api.metrics import blueprint as metrics_blueprint
 from api.endpoint.formulary import blueprint as v1_formulary
 from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
@@ -64,6 +65,7 @@ def init_api(api):
     api.register_middleware(_capacity_process_request_guard, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)
+    api.blueprint(execution_evidence_blueprint)
     api.blueprint(profile_capacity_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(

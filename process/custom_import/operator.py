@@ -90,6 +90,7 @@ _EXECUTION_EVIDENCE_COLUMNS = (
     CustomImportExecution.source_binding_revision_id.label("execution_source_binding_revision_id"),
     CustomImportExecution.mechanism,
     CustomImportExecution.state,
+    CustomImportExecution.terminal_reason,
     CustomImportExecution.started_at,
     CustomImportExecution.finished_at,
     CustomImportExecution.created_at,
@@ -119,6 +120,8 @@ _EXECUTION_EVIDENCE_COLUMNS = (
     CustomImportGeneration.schema_revision_id.label("generation_schema_revision_id"),
     CustomImportGeneration.execution_id.label("generation_execution_id"),
     CustomImportGeneration.capture_bundle_id.label("generation_capture_bundle_id"),
+    CustomImportGeneration.producing_fence.label("generation_producing_fence"),
+    CustomImportGeneration.producing_token_sha256.label("generation_producing_token_sha256"),
     CustomImportGeneration.source_bundle_sha256.label("generation_source_bundle_sha256"),
     CustomImportGenerationSeal.generation_id.label("seal_generation_id"),
     CustomImportGenerationSeal.dataset_id.label("seal_dataset_id"),
@@ -126,6 +129,7 @@ _EXECUTION_EVIDENCE_COLUMNS = (
     CustomImportGenerationSeal.schema_revision_id.label("seal_schema_revision_id"),
     CustomImportGenerationSeal.execution_id.label("seal_execution_id"),
     CustomImportGenerationSeal.capture_bundle_id.label("seal_capture_bundle_id"),
+    CustomImportGenerationSeal.sealing_token_sha256.label("seal_token_sha256"),
     *_SEAL_STATUS_COLUMNS,
     *_CURRENT_STATUS_COLUMNS,
     CustomImportNoChangeSeal.execution_id.label("no_change_execution_id"),
@@ -144,6 +148,8 @@ _GENERATION_EVIDENCE_FIELDS = (
     "generation_schema_revision_id",
     "generation_execution_id",
     "generation_capture_bundle_id",
+    "generation_producing_fence",
+    "generation_producing_token_sha256",
     "generation_source_bundle_sha256",
 )
 _SEAL_EVIDENCE_FIELDS = (
@@ -153,6 +159,7 @@ _SEAL_EVIDENCE_FIELDS = (
     "seal_schema_revision_id",
     "seal_execution_id",
     "seal_capture_bundle_id",
+    "seal_token_sha256",
     "seal_contract",
     "sealing_fence",
     "sealed_root_count",
@@ -237,6 +244,7 @@ class ExecutionEvidenceExecution:
     capture_bundle_id: int | None
     mechanism: str
     state: str
+    failure_class: Literal["candidate_rejected", "other_failed", "canceled"] | None
     started_at: dt.datetime | None
     finished_at: dt.datetime | None
     created_at: dt.datetime
@@ -380,6 +388,16 @@ def _lease_status(row) -> LeaseStatus | None:
     return LeaseStatus(fence=fence, heartbeat_at=heartbeat_at, expires_at=expires_at)
 
 
+def _failure_class(
+    state: str, terminal_reason: object
+) -> Literal["candidate_rejected", "other_failed", "canceled"] | None:
+    if terminal_reason is not None and (type(terminal_reason) is not str or len(terminal_reason) > 64):
+        raise OperatorInvariantError("custom import operator evidence is invalid")
+    if state == "failed":
+        return "candidate_rejected" if terminal_reason == "candidate_rejected" else "other_failed"
+    return "canceled" if state == "canceled" else None
+
+
 def _evidence_execution_status(row) -> ExecutionEvidenceExecution:
     state = row["state"]
     mechanism = row["mechanism"]
@@ -393,6 +411,7 @@ def _evidence_execution_status(row) -> ExecutionEvidenceExecution:
         capture_bundle_id=_stored_optional_id(row["capture_bundle_id"]),
         mechanism=mechanism,
         state=state,
+        failure_class=_failure_class(state, row.get("terminal_reason")),
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         created_at=row["created_at"],
@@ -539,17 +558,16 @@ def _publication_state(
     return "sealed_unpublished" if seal is not None else "unsealed"
 
 
-def _ever_published_expression():
-    return (
-        exists()
-        .where(
-            CustomImportPublicationEvent.dataset_id == CustomImportGeneration.dataset_id,
-            CustomImportPublicationEvent.execution_id == CustomImportGeneration.execution_id,
-            CustomImportPublicationEvent.to_generation_id == CustomImportGeneration.generation_id,
-            CustomImportPublicationEvent.event_kind.in_(("activated", "rolled_back")),
-        )
-        .label("ever_published")
+def _ever_published_expression(*, require_finality: bool = False):
+    conditions = (
+        CustomImportPublicationEvent.dataset_id == CustomImportGeneration.dataset_id,
+        CustomImportPublicationEvent.execution_id == CustomImportGeneration.execution_id,
+        CustomImportPublicationEvent.to_generation_id == CustomImportGeneration.generation_id,
+        CustomImportPublicationEvent.event_kind.in_(("activated", "rolled_back")),
     )
+    if require_finality:
+        conditions += (CustomImportPublicationEvent.finality_contract == _FINALITY_CONTRACT,)
+    return exists().where(*conditions).label("ever_published")
 
 
 def _no_change_event_expression():
@@ -568,6 +586,23 @@ def _no_change_event_expression():
             CustomImportPublicationEvent.finality_contract == _FINALITY_CONTRACT,
         )
         .label("no_change_event_exists")
+    )
+
+
+def _current_event_expression():
+    return (
+        exists()
+        .where(
+            CustomImportPublicationEvent.dataset_id == CustomImportGeneration.dataset_id,
+            CustomImportPublicationEvent.definition_revision_id == CustomImportGeneration.definition_revision_id,
+            CustomImportPublicationEvent.schema_revision_id == CustomImportGeneration.schema_revision_id,
+            CustomImportPublicationEvent.execution_id == CustomImportGeneration.execution_id,
+            CustomImportPublicationEvent.to_generation_id == CustomImportGeneration.generation_id,
+            CustomImportPublicationEvent.committed_pointer_version == CustomImportCurrentGeneration.pointer_version,
+            CustomImportPublicationEvent.event_kind.in_(("activated", "rolled_back")),
+            CustomImportPublicationEvent.finality_contract == _FINALITY_CONTRACT,
+        )
+        .label("current_event_exists")
     )
 
 
@@ -656,8 +691,9 @@ def _execution_evidence_statement(dataset_id: int, execution_id: int, candidate_
     return (
         select(
             *_EXECUTION_EVIDENCE_COLUMNS,
-            _ever_published_expression(),
+            _ever_published_expression(require_finality=True),
             _no_change_event_expression(),
+            _current_event_expression(),
         )
         .select_from(CustomImportExecution)
         .outerjoin(
@@ -830,6 +866,9 @@ def _evidence_generation_seal(
         or not _is_stored_id(evidence_snapshot["seal_schema_revision_id"], execution.schema_revision_id)
         or not _is_stored_id(evidence_snapshot["seal_execution_id"], execution.execution_id)
         or not _is_stored_id(evidence_snapshot["seal_capture_bundle_id"], execution.capture_bundle_id)
+        or not _is_stored_id(evidence_snapshot["generation_producing_fence"], evidence_snapshot["sealing_fence"])
+        or _digest(evidence_snapshot["generation_producing_token_sha256"])
+        != _digest(evidence_snapshot["seal_token_sha256"])
     ):
         raise OperatorInvariantError("custom import operator evidence is invalid")
     seal = _evidence_seal_status(evidence_snapshot)
@@ -863,11 +902,35 @@ def _evidence_generation_no_change(
     return no_change
 
 
+def _evidence_publication_state(evidence_snapshot, generation_id, current, seal, no_change) -> PublicationState:
+    ever_published = evidence_snapshot["ever_published"]
+    no_change_event_exists = evidence_snapshot["no_change_event_exists"]
+    current_event_exists = evidence_snapshot["current_event_exists"]
+    if any(
+        type(exists_value) is not bool
+        for exists_value in (ever_published, no_change_event_exists, current_event_exists)
+    ):
+        raise OperatorInvariantError("custom import operator evidence is invalid")
+    publication_state = _publication_state(
+        generation_id=generation_id,
+        current=current,
+        seal=seal,
+        no_change=no_change,
+        ever_published=ever_published,
+        no_change_event_exists=no_change_event_exists,
+    )
+    if publication_state == "current" and not current_event_exists:
+        raise OperatorInvariantError("custom import operator evidence is invalid")
+    return publication_state
+
+
 def _evidence_generation(
     evidence_snapshot,
     execution: ExecutionEvidenceExecution,
     current: CurrentGenerationStatus | None,
 ) -> ExecutionEvidenceGeneration | None:
+    """Require exact execution, seal, event, and pointer links for one candidate."""
+
     generation_id = evidence_snapshot["evidence_generation_id"]
     if generation_id is None:
         if any(
@@ -902,18 +965,7 @@ def _evidence_generation(
     ):
         raise OperatorInvariantError("custom import operator evidence is invalid")
     no_change = _evidence_generation_no_change(evidence_snapshot, execution, generation_id)
-    ever_published = evidence_snapshot["ever_published"]
-    no_change_event_exists = evidence_snapshot["no_change_event_exists"]
-    if type(ever_published) is not bool or type(no_change_event_exists) is not bool:
-        raise OperatorInvariantError("custom import operator evidence is invalid")
-    publication_state = _publication_state(
-        generation_id=generation_id,
-        current=current,
-        seal=seal,
-        no_change=no_change,
-        ever_published=ever_published,
-        no_change_event_exists=no_change_event_exists,
-    )
+    publication_state = _evidence_publication_state(evidence_snapshot, generation_id, current, seal, no_change)
     return ExecutionEvidenceGeneration(
         generation_id=generation_id,
         source_bundle_sha256=source_bundle_sha256,
