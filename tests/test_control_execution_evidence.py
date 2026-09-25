@@ -111,8 +111,9 @@ def _evidence(*, state="completed", publication_state="current", generation=True
 
 
 class _Session:
-    def __init__(self, *, dataset_id=7):
+    def __init__(self, *, dataset_id=7, locator_rows=None):
         self.dataset_id = dataset_id
+        self.locator_rows = locator_rows
         self.statements = []
         self.active = False
 
@@ -132,7 +133,10 @@ class _Session:
         if len(self.statements) == 1:
             assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
             return None
-        return SimpleNamespace(all=lambda: [SimpleNamespace(execution_id=23, dataset_id=self.dataset_id)])
+        locator_rows = self.locator_rows
+        if locator_rows is None:
+            locator_rows = [SimpleNamespace(execution_id=23, dataset_id=self.dataset_id)]
+        return SimpleNamespace(all=lambda: locator_rows)
 
 
 @pytest.fixture
@@ -180,6 +184,18 @@ async def test_non_ascii_bearer_is_forbidden_before_body_and_database(read_token
 
 
 @pytest.mark.asyncio
+async def test_non_bearer_scheme_is_forbidden_without_database_access(read_token):
+    session = _Session()
+    request = _request()
+    request.headers = {"Authorization": "Token synthetic-read-token"}
+
+    reply = await reader.serve_execution_evidence(request, session)
+
+    assert reply.status == 403 and _payload(reply) == {"error": "forbidden"}
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body",
     [
@@ -197,6 +213,21 @@ async def test_closed_request_rejects_invalid_pins_without_database(read_token, 
     request.body = body
     reply = await reader.serve_execution_evidence(request, session)
     assert reply.status == 400 and _payload(reply) == {"error": "invalid_request"}
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_query_string_and_existing_transaction_fail_before_evidence_read(read_token):
+    session = _Session()
+    request = _request()
+    request.query_string = "candidate_generation_id=31"
+    reply = await reader.serve_execution_evidence(request, session)
+    assert reply.status == 400 and _payload(reply) == {"error": "invalid_request"}
+    assert session.statements == []
+
+    session.active = True
+    reply = await reader.serve_execution_evidence(_request(), session)
+    assert reply.status == 503 and _payload(reply) == {"error": "evidence_unavailable"}
     assert session.statements == []
 
 
@@ -240,6 +271,27 @@ async def test_locator_dataset_mismatch_does_not_call_inspector(read_token, monk
     monkeypatch.setattr(reader, "inspect_execution_evidence", inspect)
     reply = await reader.serve_execution_evidence(_request(), session)
     assert reply.status == 404 and _payload(reply) == {"error": "not_found"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locator_rows", "status", "error"),
+    [
+        ([], 404, "not_found"),
+        ([SimpleNamespace(execution_id=23, dataset_id=7)] * 2, 503, "evidence_unavailable"),
+    ],
+)
+async def test_missing_or_ambiguous_execution_locator_never_selects_candidate(
+    read_token, monkeypatch, locator_rows, status, error
+):
+    session = _Session(locator_rows=locator_rows)
+
+    async def inspect(*_args, **_kwargs):
+        pytest.fail("an unbound execution locator must not inspect a candidate")
+
+    monkeypatch.setattr(reader, "inspect_execution_evidence", inspect)
+    reply = await reader.serve_execution_evidence(_request(), session)
+    assert reply.status == status and _payload(reply) == {"error": error}
 
 
 @pytest.mark.asyncio
@@ -295,6 +347,41 @@ async def test_no_change_is_terminal_but_not_current(read_token, monkeypatch):
         "receipt_sha256": "9" * 64,
         "sealed_at": "2026-01-02T00:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        replace(_evidence(), execution=replace(_evidence().execution, finished_at=_NOW.replace(tzinfo=None))),
+        replace(_evidence(), execution=replace(_evidence().execution, dataset_id=8)),
+        _evidence(state="no_change", publication_state="current", no_change=True),
+        _evidence(publication_state="no_change", no_change=True),
+        replace(_evidence(), current=CurrentGenerationStatus(99, 11, 13, 3, _NOW)),
+    ],
+    ids=["naive-terminal-time", "foreign-execution", "invalid-no-change", "invalid-completed", "stale-pointer"],
+)
+async def test_inconsistent_retained_projection_fails_closed(read_token, monkeypatch, evidence):
+    async def inspect(*_args, **_kwargs):
+        return evidence
+
+    monkeypatch.setattr(reader, "inspect_execution_evidence", inspect)
+    reply = await reader.serve_execution_evidence(_request(), _Session())
+    assert reply.status == 503 and _payload(reply) == {"error": "evidence_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_route_passes_only_request_and_scoped_session_to_reader(monkeypatch):
+    session = object()
+    request = SimpleNamespace(ctx=SimpleNamespace(sa_session=session))
+
+    async def serve(actual_request, actual_session):
+        assert actual_request is request
+        assert actual_session is session
+        return "scoped reply"
+
+    monkeypatch.setattr(reader, "serve_execution_evidence", serve)
+    assert await reader.execution_evidence(request) == "scoped reply"
 
 
 @pytest.mark.asyncio
