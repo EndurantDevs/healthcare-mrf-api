@@ -362,6 +362,17 @@ async def test_execution_evidence_is_one_safe_retained_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_execution_evidence_classifies_retained_candidate_rejection():
+    row = _execution_evidence_row(generation=False, current_generation_id=None)
+    row.update(state="failed", terminal_reason="candidate_rejected")
+
+    evidence = await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+    assert evidence.execution.failure_class == "candidate_rejected"
+    assert evidence.generation is None
+
+
+@pytest.mark.asyncio
 async def test_execution_evidence_keeps_an_incomplete_execution_distinct_from_invalid_evidence():
     row = _execution_evidence_row(generation=False)
     row["state"] = "running"
@@ -424,6 +435,8 @@ async def test_execution_evidence_rejects_mismatched_joins(field, value):
         ("sealed_root_count", -1),
         ("seal_generation_id", 13),
         ("no_change_event_exists", None),
+        ("current_event_exists", False),
+        ("terminal_reason", 42),
         ("current_definition_revision_id", 13),
         ("dataset_id", 13),
     ],
