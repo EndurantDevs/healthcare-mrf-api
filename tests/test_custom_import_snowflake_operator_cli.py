@@ -428,6 +428,44 @@ async def test_registration_operator_commits_and_replays_the_same_revisions():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ("binding_digest", "dataset_key", "revision_number"))
+async def test_registration_operator_suppresses_receipt_when_committed_readback_mismatches(monkeypatch, mismatch):
+    database = _Database()
+    if mismatch == "binding_digest":
+        original_load = operator_cli.load_snowflake_source_binding
+
+        async def mismatched_load(*arguments, **keywords):
+            loaded = await original_load(*arguments, **keywords)
+            return replace(loaded, source_binding_sha256=b"x" * 32)
+
+        monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", mismatched_load)
+    else:
+        original_register = operator_cli.register_snowflake_source_binding
+
+        async def mismatched_register(*arguments, **keywords):
+            if mismatch == "dataset_key":
+                keywords["dataset_key"] = "synthetic_other_registration"
+            receipt = await original_register(*arguments, **keywords)
+            return (
+                replace(receipt, revision_number=receipt.revision_number + 1)
+                if mismatch == "revision_number"
+                else receipt
+            )
+
+        monkeypatch.setattr(operator_cli, "register_snowflake_source_binding", mismatched_register)
+
+    async with isolated_publication_case() as case:
+        database.session = case.sessions
+        with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError):
+            await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+
+        async with case.sessions() as session:
+            for model in (CustomImportDataset, CustomImportDefinitionRevision, CustomImportSourceBindingRevision):
+                assert await session.scalar(select(func.count()).select_from(model)) == 1
+        assert database.connected == database.disconnected == 1
+
+
+@pytest.mark.asyncio
 async def test_registration_operator_rolls_back_when_persisted_readback_does_not_match(monkeypatch):
     database = _Database()
     original_load = source_binding.load_snowflake_source_binding

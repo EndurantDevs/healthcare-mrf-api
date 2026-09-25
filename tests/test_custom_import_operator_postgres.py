@@ -21,6 +21,7 @@ from process.custom_import.operator import (
     inspect_generation,
 )
 from process.custom_import.publication import activate_generation, record_no_change, seal_generation
+from tests import test_custom_import_snowflake_operator_cli as registration_cli_tests
 from tests.custom_import_postgres_support import (
     digest,
     isolated_publication_case,
@@ -35,6 +36,13 @@ from tests.test_custom_import_publication_postgres import (
     _finality_insert_minimal_identity,
     _finality_table,
     _upgrade_finality_schema,
+)
+
+# Run database-backed CLI cases in the native PostgreSQL CI shard.
+test_cli_replay = registration_cli_tests.test_registration_operator_commits_and_replays_the_same_revisions
+test_cli_rollback = registration_cli_tests.test_registration_operator_rolls_back_when_persisted_readback_does_not_match
+test_cli_mismatch = (
+    registration_cli_tests.test_registration_operator_suppresses_receipt_when_committed_readback_mismatches
 )
 
 
