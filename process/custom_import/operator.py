@@ -890,6 +890,8 @@ def _evidence_generation(
         raise OperatorInvariantError("custom import operator evidence is invalid")
     source_bundle_sha256 = _digest(evidence_snapshot["generation_source_bundle_sha256"])
     seal = _evidence_generation_seal(evidence_snapshot, execution, generation_id)
+    if seal is None and execution.state in {"completed", "no_change"}:
+        raise OperatorInvariantError("custom import operator evidence is invalid")
     if (
         current is not None
         and current.generation_id == generation_id

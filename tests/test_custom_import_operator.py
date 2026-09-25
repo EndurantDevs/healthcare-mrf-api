@@ -8,6 +8,8 @@ from dataclasses import fields
 import pytest
 
 from process.custom_import.operator import (
+    _NO_CHANGE_EVIDENCE_FIELDS,
+    _SEAL_EVIDENCE_FIELDS,
     OperatorInspectionError,
     OperatorInvariantError,
     OperatorObjectNotFound,
@@ -199,6 +201,56 @@ def _execution_evidence_row(*, generation: bool = True, current_generation_id: i
     }
 
 
+def _unsealed_execution_evidence_row():
+    row = _execution_evidence_row(current_generation_id=None)
+    row.update(dict.fromkeys(_SEAL_EVIDENCE_FIELDS))
+    row.update(state="running", finished_at=None, ever_published=False)
+    return row
+
+
+def _no_change_execution_evidence_row():
+    row = _execution_evidence_row(current_generation_id=13)
+    row.update(
+        no_change_execution_id=17,
+        no_change_dataset_id=3,
+        no_change_definition_revision_id=5,
+        no_change_schema_revision_id=7,
+        no_change_capture_bundle_id=11,
+        no_change_candidate_generation_id=19,
+        no_change_contract="custom-import-no-change-seal/v1",
+        no_change_base_generation_id=13,
+        no_change_base_pointer_version=8,
+        no_change_effective_output_sha256=_DIGEST,
+        no_change_receipt_sha256=_DIGEST,
+        no_change_sealed_at=_NOW,
+        no_change_event_exists=True,
+        ever_published=False,
+        state="no_change",
+    )
+    return row
+
+
+def _without_optional_evidence_row():
+    row = _execution_evidence_row(generation=False, current_generation_id=None)
+    row.update(state="running", finished_at=None, capture_bundle_id=None, execution_source_binding_revision_id=None)
+    for field in (
+        "binding_revision_id",
+        "binding_dataset_id",
+        "binding_definition_revision_id",
+        "binding_schema_revision_id",
+        "binding_definition_sha256",
+        "binding_schema_sha256",
+        "source_binding_sha256",
+        "capture_id",
+        "capture_dataset_id",
+        "capture_definition_revision_id",
+        "capture_schema_revision_id",
+        "capture_manifest_sha256",
+    ):
+        row[field] = None
+    return row
+
+
 @pytest.mark.asyncio
 async def test_execution_status_is_safe_and_uses_one_caller_owned_snapshot():
     session = _Session(_execution_row())
@@ -352,6 +404,136 @@ async def test_execution_evidence_rejects_mismatched_joins(field, value):
     mismatched_evidence_by_field = {**_execution_evidence_row(), field: value}
     with pytest.raises(OperatorInvariantError):
         await inspect_execution_evidence(_Session(mismatched_evidence_by_field), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("execution_id", 0),
+        ("state", "unknown"),
+        ("definition_dataset_id", 13),
+        ("binding_dataset_id", 13),
+        ("capture_dataset_id", 13),
+        ("sealing_fence", 0),
+        ("sealed_root_count", -1),
+        ("seal_generation_id", 13),
+        ("no_change_event_exists", None),
+        ("current_definition_revision_id", 13),
+        ("dataset_id", 13),
+    ],
+)
+async def test_execution_evidence_rejects_invalid_retained_values(field, value):
+    row = _execution_evidence_row()
+    row[field] = value
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_distinguishes_absent_optional_binding_and_capture():
+    evidence = await inspect_execution_evidence(
+        _Session(_without_optional_evidence_row()), dataset_id=3, execution_id=17
+    )
+
+    assert evidence.source_binding_revision_id is None
+    assert evidence.source_binding_sha256 is None
+    assert evidence.capture_manifest_sha256 is None
+    assert evidence.generation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orphan_field, value",
+    [("binding_dataset_id", 3), ("capture_dataset_id", 3)],
+)
+async def test_execution_evidence_rejects_orphaned_optional_evidence(orphan_field, value):
+    row = _without_optional_evidence_row()
+    row[orphan_field] = value
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_distinguishes_an_unsealed_generation():
+    evidence = await inspect_execution_evidence(
+        _Session(_unsealed_execution_evidence_row()), dataset_id=3, execution_id=17
+    )
+
+    assert evidence.generation is not None
+    assert evidence.generation.seal is None
+    assert evidence.generation.publication_state == "unsealed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["completed", "no_change"])
+async def test_execution_evidence_rejects_terminal_generation_without_seal(state):
+    row = _unsealed_execution_evidence_row()
+    row.update(state=state, finished_at=_NOW)
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("orphaned_contract", [True, False])
+async def test_execution_evidence_rejects_incomplete_or_orphaned_seal(orphaned_contract):
+    row = _unsealed_execution_evidence_row()
+    if orphaned_contract:
+        row["seal_contract"] = "custom-import-generation-seal/v1"
+    else:
+        row.update(
+            seal_generation_id=19,
+            seal_dataset_id=3,
+            seal_definition_revision_id=5,
+            seal_schema_revision_id=7,
+            seal_execution_id=17,
+            seal_capture_bundle_id=11,
+        )
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_reports_retained_no_change():
+    evidence = await inspect_execution_evidence(
+        _Session(_no_change_execution_evidence_row()), dataset_id=3, execution_id=17
+    )
+
+    assert evidence.generation is not None
+    assert evidence.generation.publication_state == "no_change"
+    assert evidence.generation.no_change is not None
+    assert evidence.generation.no_change.base_generation_id == 13
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("no_change_base_generation_id", 0),
+        ("no_change_candidate_generation_id", 13),
+        ("no_change_contract", None),
+    ],
+)
+async def test_execution_evidence_rejects_inconsistent_no_change(field, value):
+    row = _no_change_execution_evidence_row()
+    row[field] = value
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_rejects_orphaned_no_change_columns():
+    row = _execution_evidence_row()
+    row.update(dict.fromkeys(_NO_CHANGE_EVIDENCE_FIELDS))
+    row["no_change_receipt_sha256"] = _DIGEST
+
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
 
 
 @pytest.mark.asyncio
