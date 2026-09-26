@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
@@ -887,3 +888,120 @@ async def test_native_multi_table_activation_is_atomic_and_preserves_indexes():
             ):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
+
+
+@pytest.fixture
+async def source_reader():
+    """Own one source family and a separate SELECT-only role; always remove both."""
+    database_url = _database_url()
+    namespace_token, dataset_id = uuid4().hex, uuid4()
+    source_schema = f"rf_read_{namespace_token}"
+    unrelated, reader = f"rf_keep_{namespace_token}", f"rf_reader_{namespace_token}"
+    stage = archive.reference_family_stage_schema(dataset_id)
+    admin_engine = create_async_engine(database_url)
+    admin_sessions = async_sessionmaker(admin_engine, expire_on_commit=False)
+    reader_engine = create_async_engine(database_url, connect_args={"server_settings": {"role": reader}})
+    reader_sessions = async_sessionmaker(reader_engine, expire_on_commit=False)
+    try:
+        async with admin_sessions.begin() as session:
+            await _create_places_fixture(session, source_schema, unrelated)
+            authority = await result_generation.publish_local_reference_family_generation(
+                session, importer_id="places-zcta", schema_name=source_schema
+            )
+            await session.execute(text(f'CREATE ROLE "{reader}" NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB'))
+            database = await session.scalar(text("SELECT current_database()"))
+            await session.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{reader}"'))
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "{source_schema}" TO "{reader}"'))
+            await session.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{source_schema}" TO "{reader}"'))
+
+        yield SimpleNamespace(
+            sessions=reader_sessions,
+            admin=admin_sessions,
+            source=source_schema,
+            unrelated=unrelated,
+            reader=reader,
+            stage=stage,
+            dataset_id=dataset_id,
+            authority=authority,
+        )
+    finally:
+        await reader_engine.dispose()
+        async with admin_sessions.begin() as session:
+            for schema in (stage, source_schema, unrelated):
+                await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            exists = await session.scalar(text("SELECT 1 FROM pg_roles WHERE rolname=:role"), {"role": reader})
+            if exists:
+                await session.execute(text(f'DROP OWNED BY "{reader}"'))
+                await session.execute(text(f'DROP ROLE "{reader}"'))
+        await admin_engine.dispose()
+
+
+async def _prepare_reader_clone(source_reader, concurrent_update):
+    """Capture old row versions while proving replacement waits for clone commit."""
+
+    async def metadata(_source_session):
+        if concurrent_update:
+            async with source_reader.admin.begin() as session:
+                await session.execute(text("SET LOCAL lock_timeout='500ms'"))
+                await session.execute(
+                    text(f"UPDATE \"{source_reader.source}\".pricing_places_zcta SET measure_name='new'")
+                )
+        return {"source_release": "synthetic"}
+
+    async def persist(session, prepared):
+        assert prepared.ownership.schema_name == source_reader.stage
+        assert (
+            await session.scalar(text(f'SELECT measure_name FROM "{source_reader.stage}".pricing_places_zcta')) == "old"
+        )
+        with pytest.raises(DBAPIError) as blocked:
+            async with source_reader.admin.begin() as other:
+                await other.execute(
+                    text(f'LOCK TABLE "{source_reader.source}".pricing_places_zcta IN ACCESS EXCLUSIVE MODE NOWAIT')
+                )
+        assert blocked.value.orig.sqlstate == "55P03"
+
+    return await archive.prepare_reference_family_archive_source(
+        source_reader.sessions,
+        importer_id="places-zcta",
+        schema_name=source_reader.source,
+        source_metadata=None,
+        source_metadata_factory=metadata,
+        dataset_id=source_reader.dataset_id,
+        on_prepared=persist,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrent_update", [False, True])
+async def test_readonly_source_export(source_reader, concurrent_update):
+    """A SELECT-only source can clone, export its stable snapshot, and release only the clone."""
+    async with source_reader.sessions.begin() as session:
+        assert await session.scalar(text("SELECT current_user")) == source_reader.reader
+        assert not await session.scalar(
+            text("SELECT has_table_privilege(current_user, :table, 'INSERT,UPDATE,DELETE,TRUNCATE,MAINTAIN')"),
+            {"table": f'"{source_reader.source}".pricing_places_zcta'},
+        )
+
+    prepared = await _prepare_reader_clone(source_reader, concurrent_update)
+    assert prepared.manifest.source_serving_generation == source_reader.authority.serving_generation
+    async with source_reader.admin.begin() as session:
+        await session.execute(
+            text(f'LOCK TABLE "{source_reader.source}".pricing_places_zcta IN ACCESS EXCLUSIVE MODE NOWAIT')
+        )
+
+    async def copy(capture):
+        async with source_reader.sessions.begin() as session:
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
+            assert (
+                await session.scalar(text(f'SELECT measure_name FROM "{source_reader.stage}".pricing_places_zcta'))
+                == "old"
+            )
+
+    await archive.export_prepared_reference_family_archive(source_reader.sessions, prepared=prepared, archive_copy=copy)
+    async with source_reader.sessions.begin() as session:
+        await archive.cleanup_reference_family_stage(session, prepared.ownership)
+    async with source_reader.admin.begin() as session:
+        assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": source_reader.stage}) is None
+        assert await session.scalar(text(f'SELECT count(*) FROM "{source_reader.source}".pricing_places_zcta')) == 1
+        assert await session.scalar(text(f'SELECT count(*) FROM "{source_reader.unrelated}".keep_me')) == 1

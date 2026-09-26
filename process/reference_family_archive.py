@@ -548,10 +548,10 @@ async def _lock_family(
 
 
 async def _lock_source_family(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
-    """Use the ordinary finalizer's table-before-summary lock order."""
+    """Pin source relations before summaries; repeatable read pins their row versions."""
 
     names = RELATION_NAMES_BY_IMPORTER["mrf"] if spec.importer_id == "mrf" else spec.table_names
-    await _lock_family(session, schema_name, names, "SHARE")
+    await _lock_family(session, schema_name, names, "ACCESS SHARE")
 
 
 async def _has_source_generation_authority(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> bool:
