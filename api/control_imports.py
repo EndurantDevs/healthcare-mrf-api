@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -90,10 +91,14 @@ from process.ptg_singleton_direct_control import (
     protected_singleton_direct_presence,
 )
 from process.ptg_frozen_control import normalize_protected_rate_params
+from process.places_zcta_handoff import HANDOFF_FORMAT, is_protected_places_publication_enabled
 
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
-from process.control_lifecycle import acquire_control_run_worker_action_lock
+from process.control_lifecycle import (
+    _where_no_places_handoff,
+    acquire_control_run_worker_action_lock,
+)
 from process.live_progress import enqueue_live_progress, estimate_payload_from_live, progress_payload_from_live, read_live_progress
 from process.ptg_allowed_amount_blank import (
     ALLOWED_AMOUNT_BLANK_ERROR,
@@ -287,6 +292,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.places_zcta",
         "target_function": "process_data",
+        "job_prefix": "places_zcta_start",
     },
     "lodes": {
         "queue": "arq:LODES",
@@ -1628,7 +1634,15 @@ async def _allowed_amount_blank_terminal_metrics(
 
 
 async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
+    """Persist a failed worker only while its observed run still owns the attempt."""
     if run.get("status") not in {"starting", "running", "finalizing"}:
+        return run
+    if (
+        run.get("importer") == "places-zcta"
+        and run.get("status") == "finalizing"
+        and isinstance(run.get("metrics"), dict)
+        and run["metrics"].get("places_handoff") is not None
+    ):
         return run
     if (
         str(run.get("importer") or "") == "ptg"
@@ -1651,10 +1665,8 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
     metrics_map = dict(run.get("metrics") or {})
     metrics_map["terminal_worker_state"] = worker_status
     error_dict = _worker_job_failure_error(failed_item)
-    await db.execute(
-        update(ImportRun)
-        .where(ImportRun.run_id == run["run_id"])
-        .values(
+    updated = await db.execute(
+        _worker_failure_update_statement(run).values(
             status="failed",
             phase_detail="worker job failed",
             heartbeat_at=now,
@@ -1664,6 +1676,11 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
             error=error_dict,
         )
     )
+    if updated.rowcount != 1:
+        latest = (
+            await db.execute(select(ImportRun).where(ImportRun.run_id == run["run_id"]).limit(1))
+        ).scalar_one_or_none()
+        return normalize_run(latest) if latest is not None else run
     return {
         **run,
         "status": "failed",
@@ -1674,6 +1691,26 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
         "metrics": metrics_map,
         "error": error_dict,
     }
+
+
+def _worker_failure_update_statement(run: dict[str, Any]):
+    """Fence a stale worker report from replacing a newer PLACES handoff."""
+    statement = _where_no_places_handoff(
+        update(ImportRun).where(
+            ImportRun.run_id == run["run_id"],
+            ImportRun.importer == run["importer"],
+            ImportRun.status == run["status"],
+        )
+    )
+    if run["importer"] == "places-zcta":
+        progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+        for key in ("attempt_id", "attempt_started_at"):
+            field = ImportRun.progress[key].as_string()
+            expected_attempt_value = progress.get(key)
+            statement = statement.where(
+                field == expected_attempt_value if expected_attempt_value is not None else field.is_(None)
+            )
+    return statement
 
 
 async def _active_worker_state(run: dict[str, Any]) -> dict[str, Any]:
@@ -3513,6 +3550,14 @@ async def create_import_run(
         "import_id": import_id,
         "retry_of_run_id": retry_of_run_id,
     }
+    if importer == "places-zcta":
+        adapter = _SINGLE_JOB_ADAPTERS[importer]
+        import_run_values_by_name["metrics"] = {
+            "enqueue_adapter": "arq_single_job",
+            "queue": adapter["queue"],
+            "function": adapter["function"],
+            "job_id": _enqueue_job_options(adapter, import_run_values_by_name)["_job_id"],
+        }
     try:
         blocking_run = await _admit_import_row(
             importer,
@@ -3550,25 +3595,44 @@ async def create_import_run(
         }
     )
     import_run_values_by_name.update(enqueue_result)
-    await db.execute(
-        update(ImportRun)
-        .where(ImportRun.run_id == run_id)
-        .values(
-            status=import_run_values_by_name["status"],
-            phase_detail=import_run_values_by_name["phase_detail"],
-            heartbeat_at=import_run_values_by_name["heartbeat_at"],
-            progress=import_run_values_by_name["progress"],
-            metrics=import_run_values_by_name["metrics"],
-            error=import_run_values_by_name["error"],
-        )
-    )
-    import_run_values_by_name = _serialize_run_timestamps(
-        import_run_values_by_name
-    )
-    public_run_by_name = normalize_run(import_run_values_by_name)
+    public_run_by_name = await _persist_enqueue_result(run_id, importer, import_run_values_by_name)
     enqueue_status_event(public_run_by_name)
     _write_run_live_progress(public_run_by_name, publish_event=False)
     return public_run_by_name, True
+
+
+async def _persist_enqueue_result(run_id: str, importer: str, run_values_by_name: dict[str, Any]) -> dict[str, Any]:
+    """Keep late PLACES enqueue acknowledgements behind the initial run state."""
+    statement = update(ImportRun).where(ImportRun.run_id == run_id)
+    if importer == "places-zcta":
+        statement = _where_no_places_handoff(
+            statement.where(
+                ImportRun.importer == importer,
+                ImportRun.status == "queued",
+                ImportRun.phase_detail == "created",
+                ImportRun.finished_at.is_(None),
+                ImportRun.progress["attempt_id"].as_string().is_(None),
+                ImportRun.progress["attempt_started_at"].as_string().is_(None),
+            )
+        )
+    updated = await db.execute(
+        statement.values(
+            status=run_values_by_name["status"],
+            phase_detail=run_values_by_name["phase_detail"],
+            heartbeat_at=run_values_by_name["heartbeat_at"],
+            progress=run_values_by_name["progress"],
+            metrics=run_values_by_name["metrics"],
+            error=run_values_by_name["error"],
+        )
+    )
+    if importer == "places-zcta" and updated.rowcount != 1:
+        latest = (
+            await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
+        ).scalar_one_or_none()
+        if latest is None:
+            raise RuntimeError("PLACES run disappeared after enqueue acknowledgement")
+        return normalize_run(latest)
+    return normalize_run(_serialize_run_timestamps(run_values_by_name))
 
 
 def _enqueue_progress(message: str) -> dict[str, Any]:
@@ -3949,9 +4013,26 @@ def _is_queued_arq_cancel(
 async def request_cancel(run_id: str) -> dict[str, Any] | None:
     """Mark an active run for cancellation and signal its worker."""
 
+    if is_protected_places_publication_enabled():
+        importer = (await db.execute(select(ImportRun.importer).where(ImportRun.run_id == run_id))).scalar_one_or_none()
+        if importer == "places-zcta":
+            return await _request_protected_places_cancel(run_id)
+
     current = await get_import_run(run_id)
     if not current:
         return None
+    if (
+        current.get("importer") == "places-zcta"
+        and isinstance(current.get("metrics"), dict)
+        and current["metrics"].get("places_handoff") is not None
+    ):
+        return await _request_protected_places_cancel(run_id)
+    return await _request_worker_cancel(current)
+
+
+async def _request_worker_cancel(current: dict[str, Any]) -> dict[str, Any] | None:
+    """Apply the ordinary worker cancellation path to the selected run."""
+    run_id = current["run_id"]
     if str(current.get("importer") or "") == "ptg":
         await require_not_wave_owned_run(db, run_id)
     if current.get("status") in TERMINAL_STATUSES:
@@ -3967,10 +4048,7 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         raise ValueError(f"importer does not support canceling active runs: {current.get('importer')}")
     now = utc_now()
     current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
-    is_pending_adapter = (
-        current.get("status") == "queued"
-        and run_metrics_by_name.get("enqueue_adapter") == "pending"
-    )
+    is_pending_adapter = current.get("status") == "queued" and run_metrics_by_name.get("enqueue_adapter") == "pending"
     worker_cancel_signal_map = await _cancel_signal_for_run(
         current,
         run_id=run_id,
@@ -3979,12 +4057,10 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     )
     run_metrics_by_name["cancel_signal"] = worker_cancel_signal_map
     canceled_before_start = is_pending_adapter or (
-        is_queued_arq
-        and _is_queued_arq_cancel_completed(worker_cancel_signal_map)
+        is_queued_arq and _is_queued_arq_cancel_completed(worker_cancel_signal_map)
     )
-    has_terminalized_active_worker = (
-        _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map)
-        and (not is_queued_arq or canceled_before_start)
+    has_terminalized_active_worker = _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map) and (
+        not is_queued_arq or canceled_before_start
     )
     cancel_state_by_name = _cancel_state_by_name(
         canceled_before_start=canceled_before_start,
@@ -3998,6 +4074,157 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         cancel_state_by_name=cancel_state_by_name,
         run_metrics_by_name=run_metrics_by_name,
     )
+
+
+async def _request_protected_places_cancel(run_id: str) -> dict[str, Any] | None:
+    """Fence the exact PLACES attempt in PostgreSQL before any worker signal."""
+    async with db.transaction():
+        current = await _lock_places_cancel_run(run_id)
+        if current is None:
+            return None
+        if current["status"] in TERMINAL_STATUSES:
+            return normalize_run(current)
+        attempt, handoff = _places_cancel_attempt(current)
+        await _fence_places_cancel(current, attempt)
+    if handoff is not None:
+        updated = await get_import_run(run_id)
+        if updated is not None:
+            _write_run_live_progress(updated, publish_event=False)
+            enqueue_status_event(updated)
+        return updated
+    signal, canceled_before_start, terminalized_worker = await _signal_places_cancel(current)
+    await _record_places_cancel_signal(run_id, attempt, signal, canceled_before_start, terminalized_worker)
+    updated = await get_import_run(run_id)
+    if updated is not None and updated["status"] in {"canceling", "canceled"}:
+        _write_run_live_progress(updated, publish_event=False)
+        enqueue_status_event(updated)
+    return updated
+
+
+async def _lock_places_cancel_run(run_id):
+    """Read the native run while holding its transaction-owned row lock."""
+    run_row = (
+        await db.execute(select(ImportRun.__table__).where(ImportRun.run_id == run_id).with_for_update())
+    ).first()
+    return _raw_connection_run(run_row) if run_row is not None else None
+
+
+def _places_cancel_attempt(current):
+    """Require a complete attempt and matching handoff before cancellation."""
+    run_id = current["run_id"]
+    if current["importer"] != "places-zcta":
+        raise RuntimeError("PLACES cancellation owner changed")
+    if current["status"] not in ACTIVE_STATUSES:
+        raise RuntimeError("PLACES cancellation requires an active run")
+    progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
+    metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
+    attempt = _cancel_attempt_pair(progress)
+    handoff = metrics.get("places_handoff")
+    if current["status"] in {"running", "finalizing"} and attempt is None:
+        raise RuntimeError("PLACES cancellation requires an exact active attempt")
+    if attempt is None and (progress.get("attempt_id") is not None or progress.get("attempt_started_at") is not None):
+        raise RuntimeError("PLACES cancellation has an incomplete attempt identity")
+    if attempt is not None and re.fullmatch(re.escape(run_id) + r":[0-9a-f]{32}", attempt[0]) is None:
+        raise RuntimeError("PLACES cancellation attempt identity is invalid")
+    if handoff is not None and (
+        not isinstance(handoff, dict)
+        or current["status"] not in {"finalizing", "canceling"}
+        or attempt is None
+        or handoff.get("format") != HANDOFF_FORMAT
+        or handoff.get("run_id") != run_id
+        or (handoff.get("attempt_id"), handoff.get("attempt_started_at")) != attempt
+    ):
+        raise RuntimeError("PLACES cancellation handoff identity differs")
+    if current["status"] == "finalizing" and handoff is None:
+        raise RuntimeError("PLACES finalizing run has no protected handoff")
+    return attempt, handoff
+
+
+async def _fence_places_cancel(current, attempt):
+    """Persist cancellation on the exact locked attempt before worker signals."""
+    progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
+    statement = (
+        update(ImportRun)
+        .where(ImportRun.run_id == current["run_id"], ImportRun.importer == "places-zcta")
+        .where(ImportRun.status == current["status"])
+        .values(
+            status="canceling",
+            phase_detail="cancel requested",
+            heartbeat_at=utc_now(),
+            finished_at=None,
+            progress=_cancel_progress_by_name(canceled_now=False, current_progress=progress),
+        )
+    )
+    if attempt is not None:
+        statement = statement.where(
+            ImportRun.progress["attempt_id"].as_string() == attempt[0],
+            ImportRun.progress["attempt_started_at"].as_string() == attempt[1],
+        )
+    elif current["status"] in {"queued", "starting", "canceling"}:
+        statement = statement.where(
+            ImportRun.progress["attempt_id"].as_string().is_(None),
+            ImportRun.progress["attempt_started_at"].as_string().is_(None),
+        )
+    if await db.status(statement) != 1:
+        raise RuntimeError("PLACES cancellation attempt changed")
+
+
+async def _signal_places_cancel(current):
+    """Signal a durably fenced attempt and classify its worker outcome."""
+    metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
+    is_queued_arq = _is_queued_arq_cancel(current, metrics)
+    is_pending_adapter = current["status"] == "queued" and metrics.get("enqueue_adapter") == "pending"
+    signal = await _cancel_signal_for_run(
+        current,
+        run_id=current["run_id"],
+        is_pending_adapter=is_pending_adapter,
+        is_queued_arq=is_queued_arq,
+    )
+    canceled_before_start = is_pending_adapter or (is_queued_arq and _is_queued_arq_cancel_completed(signal))
+    terminalized_worker = _has_terminalized_active_worker_cancel_signal(signal) and (
+        not is_queued_arq or canceled_before_start
+    )
+    return signal, canceled_before_start, terminalized_worker
+
+
+async def _record_places_cancel_signal(run_id, attempt, signal, canceled_before_start, terminalized_worker):
+    """Persist the signal only while the original attempt remains canceling."""
+    async with db.transaction():
+        latest = await _lock_places_cancel_run(run_id)
+        latest_progress = (
+            latest.get("progress") if latest is not None and isinstance(latest.get("progress"), dict) else {}
+        )
+        latest_metrics = latest.get("metrics") if latest is not None and isinstance(latest.get("metrics"), dict) else {}
+        if (
+            latest is not None
+            and latest["status"] == "canceling"
+            and latest["importer"] == "places-zcta"
+            and _cancel_attempt_pair(latest_progress) == attempt
+            and latest_metrics.get("places_handoff") is None
+        ):
+            state = _cancel_state_by_name(
+                canceled_before_start=canceled_before_start,
+                has_terminalized_active_worker=terminalized_worker,
+                current_progress=latest_progress,
+            )
+            signal_metrics_by_name = {**latest_metrics, "cancel_signal": signal}
+            signal_at = utc_now()
+            if (
+                await db.status(
+                    update(ImportRun)
+                    .where(ImportRun.run_id == run_id, ImportRun.status == "canceling")
+                    .values(
+                        status=state["status"],
+                        phase_detail=state["phase_detail"],
+                        heartbeat_at=signal_at,
+                        finished_at=signal_at if state["canceled_now"] else None,
+                        progress=state["progress"],
+                        metrics=signal_metrics_by_name,
+                    )
+                )
+                != 1
+            ):
+                raise RuntimeError("PLACES cancellation changed after worker signal")
 
 
 def _cancel_state_by_name(

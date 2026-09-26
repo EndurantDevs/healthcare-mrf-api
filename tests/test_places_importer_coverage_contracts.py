@@ -165,7 +165,8 @@ async def test_places_index_builder_and_publish_swap_preserve_declared_indexes(m
     monkeypatch.setattr(places, "ensure_database", AsyncMock())
     monkeypatch.setattr(places, "make_class", lambda *_args: stage)
     monkeypatch.setattr(places, "_validated_places_stage_rows", AsyncMock(return_value=4))
-    monkeypatch.setattr(places, "_create_places_stage_indexes", AsyncMock())
+    create_stage_indexes = AsyncMock()
+    monkeypatch.setattr(places, "_create_places_stage_indexes", create_stage_indexes)
     monkeypatch.setattr(places.db, "execute_ddl", AsyncMock())
     monkeypatch.setattr(places.db, "status", status)
     monkeypatch.setattr(places.db, "transaction", lambda: _Transaction())
@@ -186,10 +187,13 @@ async def test_places_index_builder_and_publish_swap_preserve_declared_indexes(m
         importer_id="places-zcta",
         schema_name="mrf",
     )
+    create_stage_indexes.assert_awaited_once_with(stage, "mrf")
 
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("pricing_places_zcta_old" in statement for statement in sql_statement_list)
-    assert any("places_stage_idx_metric" in statement for statement in sql_statement_list)
+    assert any(
+        "places_stage_idx_0 RENAME TO pricing_places_zcta_idx_metric" in statement for statement in sql_statement_list
+    )
 
 
 @pytest.mark.asyncio

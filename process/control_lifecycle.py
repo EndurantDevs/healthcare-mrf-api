@@ -74,6 +74,12 @@ def _committed_target_result(
 
     context = control_context.get("context")
     if (
+        target_module == "process.places_zcta"
+        and isinstance(context, dict)
+        and context.get("control_run_handoff_committed") is True
+    ):
+        return context.get("_control_committed_result")
+    if (
         target_module not in {"process.npi", "process.massachusetts_profile", "process.kentucky_profile", "process.tennessee_profile", "process.rhode_island_profile", "process.new_york_profile"}
         or not isinstance(context, dict)
         or context.get("control_run_terminal_committed") is not True
@@ -426,6 +432,8 @@ async def control_single_job_start(
     committed_result = _committed_target_result(ctx, target_module=target_module)
     if committed_result is not None:
         target_result = committed_result
+    if target_module == "process.places_zcta" and ctx["context"].get("control_run_handoff_committed") is True:
+        return {"status": "finalizing", "run_id": run_id, "result": target_result}
     await _project_control_target_success(
         run_id,
         target_module=target_module,
@@ -547,6 +555,7 @@ async def _is_control_run_heartbeat_persisted(
         .where(ImportRun.run_id == run_id)
         .where(ImportRun.status.notin_(blocked_statuses))
     )
+    stmt = _where_no_places_handoff(stmt)
     if attempt_id and attempt_started_at:
         stmt = _where_control_attempt(
             stmt,
@@ -560,6 +569,16 @@ async def _is_control_run_heartbeat_persisted(
 
 
 _persist_control_run_heartbeat = _is_control_run_heartbeat_persisted
+
+
+def _where_no_places_handoff(stmt):
+    """Leave a durable PLACES handoff exclusively with its trusted publisher."""
+    return stmt.where(
+        or_(
+            ImportRun.importer != "places-zcta",
+            ImportRun.metrics["places_handoff"].as_string().is_(None),
+        )
+    )
 
 
 def _control_run_heartbeat_update_values(
@@ -993,7 +1012,7 @@ async def mark_control_run(
         )
     )
     if should_update_database:
-        stmt = update(ImportRun).where(ImportRun.run_id == run_id)
+        stmt = _where_no_places_handoff(update(ImportRun).where(ImportRun.run_id == run_id))
         if expected_state is not None:
             stmt = stmt.where(
                 ImportRun.importer == expected_state[0],
@@ -1289,6 +1308,7 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
         "finished_at",
         "preserve_control_run_finished_at",
         "control_run_terminal_committed",
+        "control_run_handoff_committed",
         "_control_committed_heartbeat_at",
         "_control_committed_finished_at",
         "_control_committed_result",
