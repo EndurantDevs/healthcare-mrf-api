@@ -132,7 +132,12 @@ def _address_zip5_filter(
     *,
     any_array: bool = False,
 ) -> str:
-    column = f"{alias}.zip5" if _is_unified_address_table(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
+    # Match the serving ZIP indexes, including rows without a populated zip5.
+    column = (
+        f"COALESCE({alias}.zip5, LEFT(COALESCE({alias}.postal_code, ''), 5))"
+        if _is_unified_address_table(address_table_sql)
+        else f"LEFT({alias}.postal_code, 5)"
+    )
     operator = "ANY (:zip_codes)" if any_array else ":zip_code"
     return f"{column} = {operator}"
 

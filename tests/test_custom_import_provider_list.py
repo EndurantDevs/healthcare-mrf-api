@@ -432,6 +432,32 @@ class _PostgresConnectionProxy:
         return execution_result.all()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("any_array", [False, True])
+async def test_postgres_unified_zip_filter_uses_postal_fallback(any_array):
+    predicate = provider_list_sql_module._address_zip5_filter(
+        "c", "mrf.entity_address_unified", any_array=any_array
+    )
+    statement = text(
+        f"""
+        SELECT c.npi FROM (VALUES
+            (1000000001::bigint, '12345'::varchar, '54321'::varchar),
+            (1000000002, NULL, '12345-6789'),
+            (1000000003, '54321', '12345-6789'),
+            (1000000004, NULL, NULL),
+            (1000000005, NULL, ''),
+            (1000000006, NULL, '54321')
+        ) AS c(npi, zip5, postal_code)
+        WHERE {predicate}
+        ORDER BY c.npi
+        """
+    )
+    parameters = {"zip_codes": ["12345"]} if any_array else {"zip_code": "12345"}
+    async with transaction_session() as session:
+        matched_npis = (await session.execute(statement, parameters)).scalars().all()
+    assert matched_npis == [1000000001, 1000000002]
+
+
 async def _seed_postgres_provider_list_tables(session) -> None:
     await session.execute(text("CREATE SCHEMA mrf"))
     await session.execute(text("CREATE TABLE mrf.npi (npi bigint PRIMARY KEY)"))
