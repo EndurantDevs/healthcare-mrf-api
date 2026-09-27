@@ -1286,7 +1286,7 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
         f"'{location_type}'" in page_sql
         for location_type in ("primary", "secondary", "practice", "site")
     )
-    assert "c.zip5 = :zip_code" in page_sql
+    assert "COALESCE(c.zip5, LEFT(COALESCE(c.postal_code, ''), 5)) = :zip_code" in page_sql
     assert "phone_candidates AS MATERIALIZED" in page_sql
     assert "provider_directory_address_overlay AS overlay" in page_sql
     assert "provider_directory_endpoint_dataset AS dataset" in page_sql
