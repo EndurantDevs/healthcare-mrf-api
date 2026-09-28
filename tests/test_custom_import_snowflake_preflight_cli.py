@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
 import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -658,6 +660,173 @@ def test_preflight_receipt_rejects_malformed_empty_or_partial_observations():
                 limits=_limits(),
                 include_sample=False,
             )
+
+
+def test_preflight_receipt_rejects_invalid_result_fields_before_rendering():
+    loaded = _loaded_binding()
+    complete_result = _complete_result(loaded)
+    invalid_results = (
+        (replace(complete_result, source_binding_sha256="0" * 64), "preflight result is invalid"),
+        (
+            replace(
+                complete_result,
+                validation=SimpleNamespace(definition_valid=True, mapping_valid=True, runtime_supported=1),
+            ),
+            "preflight flags are invalid",
+        ),
+        (
+            replace(
+                complete_result,
+                observations=(SnowflakePreflightStreamObservation("other_source", 1, 8, "exact"), _observations()[1]),
+            ),
+            "preflight observation is invalid",
+        ),
+    )
+
+    for invalid_result, message in invalid_results:
+        with pytest.raises(ValueError, match=message):
+            operator_cli._preflight_receipt(
+                invalid_result,
+                definition=loaded.definition,
+                source_binding_sha256=loaded.source_binding_sha256,
+                limits=_limits(),
+                include_sample=False,
+            )
+
+    with pytest.raises(ValueError, match="preflight sample flag is invalid"):
+        operator_cli._preflight_receipt(
+            complete_result,
+            definition=loaded.definition,
+            source_binding_sha256=loaded.source_binding_sha256,
+            limits=_limits(),
+            include_sample=1,
+        )
+
+
+def test_preflight_payload_helpers_reject_invalid_states_and_shapes():
+    loaded = _loaded_binding()
+    limits = _limits()
+    family = _complete_result(loaded).sample.families[0]
+
+    with pytest.raises(ValueError, match="unavailable preflight sample is invalid"):
+        operator_cli._complete_preflight_families(SimpleNamespace(status="unavailable", sample=object()), limits)
+    with pytest.raises(ValueError, match="complete preflight sample is invalid"):
+        operator_cli._complete_preflight_families(SimpleNamespace(status="complete", sample=None), limits)
+    with pytest.raises(ValueError, match="complete preflight reason is invalid"):
+        operator_cli._preflight_reason(SimpleNamespace(status="complete", unavailable_reason="synthetic"))
+    with pytest.raises(ValueError, match="preflight status is invalid"):
+        operator_cli._preflight_reason(SimpleNamespace(status="unexpected", unavailable_reason=None))
+    with pytest.raises(ValueError, match="preflight family children are invalid"):
+        operator_cli._preflight_family_payload(
+            RootFamily(root_key=family.root_key, root=family.root, children={}), loaded.definition, limits
+        )
+    with pytest.raises(ValueError, match="preflight child records are invalid"):
+        operator_cli._preflight_family_payload(
+            RootFamily(root_key=family.root_key, root=family.root, children={"details": []}), loaded.definition, limits
+        )
+    with pytest.raises(ValueError, match="preflight record is invalid"):
+        operator_cli._preflight_family_payload(
+            RootFamily(root_key=family.root_key, root=family.root, children={"details": ({},)}),
+            loaded.definition,
+            limits,
+        )
+
+
+def test_preflight_payload_helpers_keep_only_safe_scalars_and_diagnostics():
+    assert operator_cli._preflight_scalar(Decimal("2.50")) == "2.50"
+    with pytest.raises(ValueError, match="preflight scalar is invalid"):
+        operator_cli._preflight_scalar(1.5)
+    with pytest.raises(ValueError, match="preflight diagnostics are invalid"):
+        operator_cli._rejection_diagnostic_payloads(SimpleNamespace(rejection_diagnostics=[]), _limits())
+    with pytest.raises(ValueError, match="preflight diagnostic is invalid"):
+        operator_cli._preflight_diagnostic(object())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_primary_failure", (False, True))
+async def test_preflight_disconnect_preserves_primary_failure_over_cleanup_failure(has_primary_failure):
+    async def disconnect():
+        raise RuntimeError("synthetic cleanup failure")
+
+    database = SimpleNamespace(disconnect=disconnect)
+    if has_primary_failure:
+        await operator_cli._disconnect_preflight_database(database, has_primary_failure=True)
+    else:
+        with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+            await operator_cli._disconnect_preflight_database(database, has_primary_failure=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_primary_failure", (False, True))
+async def test_preflight_disconnect_waits_for_inflight_cleanup_after_cancellation(has_primary_failure):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completion = asyncio.Event()
+
+    async def disconnect():
+        started.set()
+        await release.wait()
+        completion.set()
+
+    operation = asyncio.create_task(
+        operator_cli._disconnect_preflight_database(
+            SimpleNamespace(disconnect=disconnect), has_primary_failure=has_primary_failure
+        )
+    )
+    await started.wait()
+    operation.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    if has_primary_failure:
+        await operation
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    assert completion.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_primary_failure", (False, True))
+async def test_preflight_disconnect_handles_cancelled_cleanup_task(has_primary_failure):
+    async def disconnect():
+        raise asyncio.CancelledError
+
+    database = SimpleNamespace(disconnect=disconnect)
+    if has_primary_failure:
+        await operator_cli._disconnect_preflight_database(database, has_primary_failure=True)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await operator_cli._disconnect_preflight_database(database, has_primary_failure=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_primary_failure", (False, True))
+async def test_preflight_disconnect_handles_cleanup_error_after_initial_cancellation(monkeypatch, has_primary_failure):
+    shield_calls = []
+
+    async def disconnect():
+        raise RuntimeError("synthetic cleanup failure")
+
+    async def shield(task):
+        shield_calls.append(None)
+        if len(shield_calls) == 1:
+            raise asyncio.CancelledError
+        return await task
+
+    monkeypatch.setattr(operator_cli.asyncio, "shield", shield)
+    database = SimpleNamespace(disconnect=disconnect)
+    if has_primary_failure:
+        await operator_cli._disconnect_preflight_database(database, has_primary_failure=True)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await operator_cli._disconnect_preflight_database(database, has_primary_failure=False)
+    assert len(shield_calls) == 2
+
+
+def test_preflight_command_requires_parser_limits():
+    with pytest.raises(ValueError, match="preflight limits are unavailable"):
+        operator_cli._run_preflight_command(SimpleNamespace(), None)
 
 
 def test_preflight_command_redacts_operation_errors(monkeypatch, capsys):
