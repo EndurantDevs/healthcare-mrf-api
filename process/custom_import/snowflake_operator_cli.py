@@ -11,6 +11,8 @@ import json
 import re
 import secrets
 import sys
+from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -29,6 +31,7 @@ from process.custom_import.cli import _MISSING, _read_stdin, _receipt_only_datab
 from process.custom_import.definition import CustomImportDefinition, canonical_json, load_json_definition
 from process.custom_import.definition_store import DefinitionRegistrationError, _normalized_dataset_key
 from process.custom_import.execution import IdempotencyConflict, lookup_execution_request
+from process.custom_import.family import RootFamily
 from process.custom_import.runner import CandidateRunResult
 from process.custom_import.runner_registry import database_now
 from process.custom_import.snowflake import FixedLocalKeyPairCredentialProvider
@@ -38,7 +41,20 @@ from process.custom_import.snowflake_candidate import (
     bundle_request_identity_sha256,
     run_snowflake_bundle_candidate,
 )
-from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter
+from process.custom_import.snowflake_preflight import (
+    DEFAULT_MAX_CHILD_ROWS,
+    DEFAULT_MAX_ELAPSED_SECONDS,
+    DEFAULT_MAX_ROOT_KEYS,
+    DEFAULT_MAX_TOTAL_BYTES,
+    SnowflakePreflightError,
+    SnowflakePreflightLimits,
+    SnowflakePreflightRejectionDiagnostic,
+    SnowflakePreflightResult,
+    SnowflakePreflightSample,
+    SnowflakePreflightStreamObservation,
+    preflight_snowflake_bundle,
+)
+from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter, SnowflakePythonPreflightAdapter
 from process.custom_import.snowflake_source_binding import (
     SnowflakeSourceBinding,
     SnowflakeSourceBindingError,
@@ -64,6 +80,27 @@ _SAFE_STATUSES = frozenset(
         "sealed_unpublished",
     }
 )
+_SAFE_PREFLIGHT_REASONS = frozenset(
+    {
+        "byte_limit",
+        "child_limit_reached",
+        "definition_invalid",
+        "duplicate_root_key",
+        "family_invalid",
+        "limits_invalid",
+        "mapping_invalid",
+        "query_timeout",
+        "query_unavailable",
+        "result_invalid",
+        "result_schema_invalid",
+        "root_data_incomplete",
+        "root_key_missing",
+        "runtime_integer_unsupported",
+        "runtime_type_unsupported",
+        "snapshot_invalid",
+    }
+)
+_GENERIC_REJECTION_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", flags=re.ASCII)
 
 
 class _ResumeUnavailableError(RuntimeError):
@@ -109,6 +146,14 @@ def _parser() -> argparse.ArgumentParser:
         operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--idempotency-key", required=True, type=_idempotency_key)
+    preflight = commands.add_parser("preflight", allow_abbrev=False)
+    preflight.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
+    preflight.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
+    preflight.add_argument("--maximum-root-keys", default=DEFAULT_MAX_ROOT_KEYS, type=_positive_identifier)
+    preflight.add_argument("--maximum-child-rows", default=DEFAULT_MAX_CHILD_ROWS, type=_positive_identifier)
+    preflight.add_argument("--maximum-total-bytes", default=DEFAULT_MAX_TOTAL_BYTES, type=_positive_identifier)
+    preflight.add_argument("--maximum-elapsed-seconds", default=DEFAULT_MAX_ELAPSED_SECONDS, type=_positive_identifier)
+    preflight.add_argument("--include-sample", action="store_true")
     return parser
 
 
@@ -261,6 +306,372 @@ def _receipt(result: CandidateRunResult) -> str:
     if result.generation_id is not None:
         receipt_by_field["generation_id"] = result.generation_id
     return json.dumps(receipt_by_field, separators=(",", ":"), sort_keys=True)
+
+
+def _preflight_limits(parsed: argparse.Namespace) -> SnowflakePreflightLimits:
+    """Build the core's bounded limit contract from fixed CLI fields."""
+
+    return SnowflakePreflightLimits(
+        maximum_root_keys=parsed.maximum_root_keys,
+        maximum_child_rows=parsed.maximum_child_rows,
+        maximum_total_bytes=parsed.maximum_total_bytes,
+        maximum_elapsed_seconds=parsed.maximum_elapsed_seconds,
+    )
+
+
+def _preflight_receipt(
+    preflight_result: SnowflakePreflightResult,
+    *,
+    definition: CustomImportDefinition,
+    source_binding_sha256: bytes,
+    limits: SnowflakePreflightLimits,
+    include_sample: bool,
+) -> str:
+    """Render one validated result without exposing source execution metadata."""
+
+    _validate_preflight_result(preflight_result, definition, source_binding_sha256, limits)
+    complete_families = _complete_preflight_families(preflight_result, limits)
+    receipt_by_field: dict[str, object] = {
+        "definition_sha256": preflight_result.definition_sha256,
+        "schema_sha256": preflight_result.schema_sha256,
+        "source_binding_sha256": preflight_result.source_binding_sha256,
+        "flags": _preflight_flags(preflight_result),
+        "observations": _scoped_stream_payloads(preflight_result, definition, limits),
+        "observed_bytes": preflight_result.observed_bytes,
+        "status": preflight_result.status,
+        "reason": _preflight_reason(preflight_result),
+        "family_count": len(complete_families),
+    }
+    if type(include_sample) is not bool:
+        raise ValueError("preflight sample flag is invalid")
+    if include_sample:
+        receipt_by_field.update(_preflight_sample_payload(preflight_result, definition, limits, complete_families))
+    return json.dumps(receipt_by_field, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def _validate_preflight_result(
+    preflight_result: object,
+    definition: CustomImportDefinition,
+    source_binding_sha256: bytes,
+    limits: SnowflakePreflightLimits,
+) -> None:
+    if (
+        not isinstance(preflight_result, SnowflakePreflightResult)
+        or not isinstance(definition, CustomImportDefinition)
+        or not isinstance(source_binding_sha256, bytes)
+        or len(source_binding_sha256) != 32
+        or not isinstance(limits, SnowflakePreflightLimits)
+        or preflight_result.definition_sha256 != definition.digest
+        or preflight_result.schema_sha256 != definition.schema_digest
+        or preflight_result.source_binding_sha256 != source_binding_sha256.hex()
+        or type(preflight_result.observed_bytes) is not int
+        or not 0 <= preflight_result.observed_bytes <= limits.maximum_total_bytes
+    ):
+        raise ValueError("preflight result is invalid")
+
+
+def _preflight_flags(preflight_result: SnowflakePreflightResult) -> dict[str, bool]:
+    validation = preflight_result.validation
+    flag_by_name = {
+        "definition_valid": getattr(validation, "definition_valid", None),
+        "mapping_valid": getattr(validation, "mapping_valid", None),
+        "runtime_supported": getattr(validation, "runtime_supported", None),
+    }
+    if any(type(value) is not bool for value in flag_by_name.values()):
+        raise ValueError("preflight flags are invalid")
+    return flag_by_name
+
+
+def _scoped_stream_payloads(
+    preflight_result: SnowflakePreflightResult,
+    definition: CustomImportDefinition,
+    limits: SnowflakePreflightLimits,
+) -> list[dict[str, object]]:
+    observations = preflight_result.observations
+    expected_stream_ids = tuple(stream.stream_id for stream in definition.source_streams)
+    validation = preflight_result.validation
+    if not isinstance(observations, tuple):
+        raise ValueError("preflight observations are invalid")
+    if (
+        observations == ()
+        and preflight_result.status == "unavailable"
+        and preflight_result.observed_bytes == 0
+        and preflight_result.rejection_diagnostics == ()
+        and getattr(validation, "mapping_valid", None) is False
+        and getattr(validation, "runtime_supported", None) is False
+        and (
+            (
+                preflight_result.unavailable_reason == "definition_invalid"
+                and getattr(validation, "definition_valid", None) is False
+            )
+            or (
+                preflight_result.unavailable_reason in {"limits_invalid", "mapping_invalid"}
+                and getattr(validation, "definition_valid", None) is True
+            )
+        )
+    ):
+        return []
+    if len(observations) != len(expected_stream_ids):
+        raise ValueError("preflight observations are invalid")
+    return [
+        _preflight_observation(observation, stream_id, limits)
+        for observation, stream_id in zip(observations, expected_stream_ids, strict=True)
+    ]
+
+
+def _preflight_observation(
+    observation: object,
+    expected_stream_id: str,
+    limits: SnowflakePreflightLimits,
+) -> dict[str, object]:
+    if (
+        not isinstance(observation, SnowflakePreflightStreamObservation)
+        or observation.stream_id != expected_stream_id
+        or type(observation.observed_rows) is not int
+        or observation.observed_rows < 0
+        or type(observation.observed_bytes) is not int
+        or not 0 <= observation.observed_bytes <= limits.maximum_total_bytes
+        or observation.precision not in {"exact", "lower_bound", "unknown"}
+    ):
+        raise ValueError("preflight observation is invalid")
+    return {
+        "stream_id": observation.stream_id,
+        "observed_rows": observation.observed_rows,
+        "observed_bytes": observation.observed_bytes,
+        "precision": observation.precision,
+    }
+
+
+def _complete_preflight_families(
+    preflight_result: SnowflakePreflightResult,
+    limits: SnowflakePreflightLimits,
+) -> tuple[RootFamily, ...]:
+    if preflight_result.status == "unavailable":
+        if preflight_result.sample is not None:
+            raise ValueError("unavailable preflight sample is invalid")
+        return ()
+    sample = preflight_result.sample
+    if (
+        preflight_result.status != "complete"
+        or not isinstance(sample, SnowflakePreflightSample)
+        or not isinstance(sample.families, tuple)
+        or len(sample.families) > limits.maximum_root_keys
+        or not all(isinstance(family, RootFamily) for family in sample.families)
+    ):
+        raise ValueError("complete preflight sample is invalid")
+    return sample.families
+
+
+def _preflight_reason(preflight_result: SnowflakePreflightResult) -> str | None:
+    if preflight_result.status == "complete":
+        if preflight_result.unavailable_reason is not None:
+            raise ValueError("complete preflight reason is invalid")
+        return None
+    if preflight_result.status != "unavailable":
+        raise ValueError("preflight status is invalid")
+    return (
+        preflight_result.unavailable_reason
+        if preflight_result.unavailable_reason in _SAFE_PREFLIGHT_REASONS
+        else "unavailable"
+    )
+
+
+def _preflight_sample_payload(
+    preflight_result: SnowflakePreflightResult,
+    definition: CustomImportDefinition,
+    limits: SnowflakePreflightLimits,
+    complete_families: tuple[RootFamily, ...],
+) -> dict[str, object]:
+    if preflight_result.status == "complete":
+        return {
+            "sample": {
+                "families": [_preflight_family_payload(family, definition, limits) for family in complete_families]
+            }
+        }
+    return {"rejection_diagnostics": _rejection_diagnostic_payloads(preflight_result, limits)}
+
+
+def _preflight_family_payload(
+    family: RootFamily,
+    definition: CustomImportDefinition,
+    limits: SnowflakePreflightLimits,
+) -> dict[str, object]:
+    child_field_ids_by_name = {
+        collection.name: tuple(field.field_id for field in definition.fields if field.collection == collection.name)
+        for collection in definition.child_collections
+    }
+    if not isinstance(family.children, Mapping) or set(family.children) != set(child_field_ids_by_name):
+        raise ValueError("preflight family children are invalid")
+    return {
+        "root": _preflight_record(family.root, tuple(field.field_id for field in definition.root_fields)),
+        "children": {
+            collection_name: _preflight_child_records(
+                family.children[collection_name],
+                field_ids,
+                limits,
+            )
+            for collection_name, field_ids in child_field_ids_by_name.items()
+        },
+    }
+
+
+def _preflight_child_records(
+    records: object,
+    field_ids: tuple[str, ...],
+    limits: SnowflakePreflightLimits,
+) -> list[dict[str, object]]:
+    if not isinstance(records, tuple) or len(records) > limits.maximum_child_rows:
+        raise ValueError("preflight child records are invalid")
+    return [_preflight_record(record, field_ids) for record in records]
+
+
+def _preflight_record(record: object, field_ids: tuple[str, ...]) -> dict[str, object]:
+    if not isinstance(record, Mapping) or set(record) != set(field_ids):
+        raise ValueError("preflight record is invalid")
+    return {field_id: _preflight_scalar(record[field_id]) for field_id in field_ids}
+
+
+def _preflight_scalar(value: object) -> str | int | bool | None:
+    if value is None or isinstance(value, (str, bool)) or type(value) is int:
+        return value
+    if isinstance(value, Decimal) and value.is_finite():
+        return format(value, "f")
+    raise ValueError("preflight scalar is invalid")
+
+
+def _rejection_diagnostic_payloads(
+    preflight_result: SnowflakePreflightResult,
+    limits: SnowflakePreflightLimits,
+) -> list[dict[str, object]]:
+    diagnostics = preflight_result.rejection_diagnostics
+    if not isinstance(diagnostics, tuple) or len(diagnostics) > limits.maximum_root_keys:
+        raise ValueError("preflight diagnostics are invalid")
+    return [_preflight_diagnostic(diagnostic) for diagnostic in diagnostics]
+
+
+def _preflight_diagnostic(diagnostic: object) -> dict[str, object]:
+    if (
+        not isinstance(diagnostic, SnowflakePreflightRejectionDiagnostic)
+        or not isinstance(diagnostic.root_key, tuple)
+        or not diagnostic.root_key
+        or _GENERIC_REJECTION_CODE.fullmatch(diagnostic.code) is None
+    ):
+        raise ValueError("preflight diagnostic is invalid")
+    return {
+        "root_key": [_preflight_scalar(value) for value in diagnostic.root_key],
+        "code": diagnostic.code,
+    }
+
+
+async def _disconnect_preflight_database(database: Any, *, has_primary_failure: bool) -> None:
+    """Finish one disconnect without masking a body failure or first SIGINT."""
+
+    disconnect_task = asyncio.create_task(database.disconnect())
+    try:
+        await asyncio.shield(disconnect_task)
+    except asyncio.CancelledError as cancellation:
+        if disconnect_task.cancelled():
+            if not has_primary_failure:
+                raise
+            return
+        try:
+            await asyncio.shield(disconnect_task)
+        except Exception:
+            if has_primary_failure:
+                return
+        if not has_primary_failure:
+            raise cancellation
+    except Exception:
+        if not has_primary_failure:
+            raise
+
+
+async def _preflight_retained_snowflake_binding(
+    *,
+    definition_revision_id: int,
+    source_binding_revision_id: int,
+    limits: SnowflakePreflightLimits,
+    include_sample: bool,
+    database=db,
+) -> str:
+    """Run one bounded retained-binding preflight without lifecycle writes."""
+
+    with _receipt_only_database_output(database):
+        engine = None
+        previous_echo = _MISSING
+        has_primary_failure = False
+        try:
+            await database.connect()
+            engine = getattr(database, "engine", None)
+            previous_echo = getattr(engine, "echo", _MISSING)
+            _set_engine_echo(database, False)
+            async with database.session() as session:
+                loaded_binding = await load_snowflake_source_binding(
+                    session,
+                    definition_revision_id=definition_revision_id,
+                    source_binding_revision_id=source_binding_revision_id,
+                )
+            preflight_result = _run_snowflake_preflight(loaded_binding, limits)
+            # Let a pending first SIGINT become primary before cleanup awaits.
+            await asyncio.sleep(0)
+            rendered = _preflight_receipt(
+                preflight_result,
+                definition=loaded_binding.definition,
+                source_binding_sha256=loaded_binding.source_binding_sha256,
+                limits=limits,
+                include_sample=include_sample,
+            )
+            # Receipt rendering is also synchronous before the cleanup boundary.
+            await asyncio.sleep(0)
+            return rendered
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if previous_echo is not _MISSING:
+                engine.echo = previous_echo
+            await _disconnect_preflight_database(database, has_primary_failure=has_primary_failure)
+
+
+def _run_snowflake_preflight(loaded_binding: Any, limits: SnowflakePreflightLimits) -> SnowflakePreflightResult:
+    """Compose the fixed local credential and generated preflight adapter."""
+
+    source_adapter = SnowflakePythonConnectorAdapter(
+        role=loaded_binding.binding.role,
+        warehouse=loaded_binding.binding.warehouse,
+    )
+    with FixedLocalKeyPairCredentialProvider(FIXED_CREDENTIAL_DIRECTORY) as credential_provider:
+        bundle_connector = SnowflakeBundleAcquisitionConnector(
+            approved_relations=loaded_binding.approved_relations,
+            credential_provider=credential_provider,
+            adapter=source_adapter,
+        )
+        preflight_adapter = SnowflakePythonPreflightAdapter(
+            connector=source_adapter,
+            credential_provider=credential_provider,
+        )
+        return preflight_snowflake_bundle(
+            loaded_binding.definition,
+            loaded_binding.binding,
+            bundle_connector,
+            preflight_adapter,
+            limits=limits,
+        )
+
+
+def _run_preflight_command(parsed: argparse.Namespace, limits: SnowflakePreflightLimits | None) -> str:
+    """Run one bounded preflight after fixed parser validation."""
+
+    if limits is None:
+        raise ValueError("preflight limits are unavailable")
+    return asyncio.run(
+        _preflight_retained_snowflake_binding(
+            definition_revision_id=parsed.definition_revision_id,
+            source_binding_revision_id=parsed.source_binding_revision_id,
+            limits=limits,
+            include_sample=parsed.include_sample,
+        )
+    )
 
 
 async def _run_retained_snowflake_binding(
@@ -484,7 +895,12 @@ async def _run_resumed_snowflake_binding(
 def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = None) -> int:
     """Register or run a retained binding while emitting only compact safe receipts."""
 
-    parsed = _parser().parse_args(arguments)
+    parser = _parser()
+    parsed = parser.parse_args(arguments)
+    try:
+        preflight_limits = _preflight_limits(parsed) if parsed.command == "preflight" else None
+    except SnowflakePreflightError:
+        parser.error("invalid")
     try:
         if parsed.command == "register":
             rendered = asyncio.run(_register_snowflake_binding(stream=stream))
@@ -497,7 +913,7 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
                 )
             )
             rendered = _receipt(candidate_result)
-        else:
+        elif parsed.command == "resume":
             candidate_result = asyncio.run(
                 _run_resumed_snowflake_binding(
                     definition_revision_id=parsed.definition_revision_id,
@@ -506,6 +922,8 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
                 )
             )
             rendered = _receipt(candidate_result)
+        else:
+            rendered = _run_preflight_command(parsed, preflight_limits)
         print(rendered)
         return 0
     except KeyboardInterrupt:
