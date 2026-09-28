@@ -2,7 +2,8 @@
 
 use super::super::canonical::test_python_stable_json;
 use super::super::contracts::{
-    PROVIDER_DIRECTORY_PROJECTION_COPY_MAGIC, PROVIDER_DIRECTORY_PROJECTION_COPY_MAX_OWNED_IO_BYTES,
+    NpiIdentityPolicy, PROVIDER_DIRECTORY_PROJECTION_COPY_MAGIC,
+    PROVIDER_DIRECTORY_PROJECTION_COPY_MAX_OWNED_IO_BYTES,
 };
 use super::super::encode::decode_provider_directory_projection_copy_spool;
 use super::super::fhir_values::test_microdegrees;
@@ -16,6 +17,13 @@ fn v2_arguments_are_strict_and_locator_free() {
     let valid = [RECIPE_ID, PARTITION_ID, "7", "ndjson"].map(str::to_owned);
     let (context, _framing) = test_parse_arguments(&valid).unwrap();
     assert_eq!(context.partition_ordinal, 7);
+    assert_eq!(context.npi_identity_policy, NpiIdentityPolicy::Legacy);
+
+    let explicit = [RECIPE_ID, PARTITION_ID, "7", "ndjson", "explicit-only-v1"].map(str::to_owned);
+    let (context, _framing) = test_parse_arguments(&explicit).unwrap();
+    assert_eq!(context.npi_identity_policy, NpiIdentityPolicy::ExplicitOnly);
+    let invalid_policy = [RECIPE_ID, PARTITION_ID, "7", "ndjson", "unknown-v1"].map(str::to_owned);
+    assert!(test_parse_arguments(&invalid_policy).is_err());
 
     for invalid in [
         ["short", PARTITION_ID, "7", "ndjson"],

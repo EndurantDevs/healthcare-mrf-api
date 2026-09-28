@@ -2,7 +2,9 @@
 use super::canonical::{sha256_bytes, stable_hash};
 use super::contracts::SEMANTIC_EVIDENCE_HASH_DOMAIN;
 use super::contracts::SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID;
-use super::contracts::{invalid_data, ProjectedResourceRow, ProjectionCopyContext};
+use super::contracts::{
+    invalid_data, NpiIdentityPolicy, ProjectedResourceRow, ProjectionCopyContext,
+};
 use super::fhir_values::{fhir_list, normalized_address, normalized_period};
 use super::fhir_values::{normalized_position, normalized_text, optional_text};
 use super::fhir_values::{profile_concepts, profile_contacts, profile_names};
@@ -72,7 +74,12 @@ pub fn project_resource(
         "{:020}:{payload_hash}:{:020}",
         context.partition_ordinal, input_ordinal_u64
     );
-    let summary_npi = summary_npi(resource, resource_type, resource_id)?;
+    let summary_npi = summary_npi(
+        resource,
+        resource_type,
+        resource_id,
+        context.npi_identity_policy,
+    )?;
     let active = active_status(resource, resource_type)?;
     let effective_start = period_object.and_then(|period| normalized_text(period.get("start"), 64));
     let effective_end = period_object.and_then(|period| normalized_text(period.get("end"), 64));
@@ -359,6 +366,7 @@ fn summary_npi(
     resource: &Map<String, Value>,
     resource_type: &str,
     resource_id: &str,
+    policy: NpiIdentityPolicy,
 ) -> io::Result<Option<i64>> {
     if !matches!(
         resource_type,
@@ -383,11 +391,20 @@ fn summary_npi(
         if !descriptor.contains("npi") && !descriptor.contains("national provider") {
             continue;
         }
+        if policy == NpiIdentityPolicy::ExplicitOnly
+            && value
+                .chars()
+                .any(|character| character.is_numeric() && !character.is_ascii_digit())
+        {
+            continue;
+        }
         let digits = value
             .chars()
             .filter(|character| character.is_ascii_digit())
             .collect::<String>();
-        let npi = digits.parse::<i64>().ok().filter(valid_npi);
+        let npi = digits.parse::<i64>().ok().filter(|npi| {
+            valid_npi(npi) && (policy == NpiIdentityPolicy::Legacy || valid_assignable_npi(*npi))
+        });
         if digits.len() == 10
             && let Some(npi) = npi
         {
@@ -396,6 +413,9 @@ fn summary_npi(
     }
     if let Some((_system_rank, _ordinal, npi)) = candidates.into_iter().min() {
         return Ok(Some(npi));
+    }
+    if policy == NpiIdentityPolicy::ExplicitOnly {
+        return Ok(None);
     }
     if matches!(resource_type, "Organization" | "Practitioner")
         && resource_id.len() == 10
@@ -438,6 +458,24 @@ fn json_scalar_text(value: Option<&Value>) -> String {
 
 fn valid_npi(npi: &i64) -> bool {
     (1_000_000_000..=2_999_999_999).contains(npi)
+}
+
+fn valid_assignable_npi(npi: i64) -> bool {
+    if !valid_npi(&npi) {
+        return false;
+    }
+    let digits = npi.to_string().into_bytes();
+    let mut sum = 24 + i32::from(digits[9] - b'0');
+    for (index, digit) in digits[..9].iter().enumerate() {
+        let value = i32::from(*digit - b'0');
+        if index % 2 == 0 {
+            let doubled = value * 2;
+            sum += if doubled > 9 { doubled - 9 } else { doubled };
+        } else {
+            sum += value;
+        }
+    }
+    sum % 10 == 0
 }
 
 fn active_status(resource: &Map<String, Value>, resource_type: &str) -> io::Result<Option<bool>> {

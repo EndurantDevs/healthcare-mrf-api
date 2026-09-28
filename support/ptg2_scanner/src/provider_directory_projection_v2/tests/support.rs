@@ -1,7 +1,8 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 use super::super::contracts::{
-    ProjectionCopyContext, ProviderDirectoryInputFraming, ProviderDirectoryProjectionCopySpool,
+    NpiIdentityPolicy, ProjectionCopyContext, ProviderDirectoryInputFraming,
+    ProviderDirectoryProjectionCopySpool,
 };
 use super::super::encode::project_provider_directory_copy;
 use serde_json::Value;
@@ -14,6 +15,7 @@ pub fn context() -> ProjectionCopyContext {
         recipe_id: RECIPE_ID.to_owned(),
         partition_id: PARTITION_ID.to_owned(),
         partition_ordinal: 7,
+        npi_identity_policy: NpiIdentityPolicy::Legacy,
     }
 }
 

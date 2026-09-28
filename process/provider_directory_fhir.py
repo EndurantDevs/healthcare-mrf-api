@@ -345,6 +345,15 @@ from process.provider_directory_time_partition import (
     parse_utc_instant,
 )
 from process import provider_directory_profile as profile_artifact
+from process.provider_directory_identifier_policy import (
+    CMS_NPD_PSEUDO_EIN_SYSTEM,
+    CMS_NPD_SOURCE_ID,
+    identifier_descriptor as _identifier_descriptor,
+    identifier_value as _identifier_value,
+    npi_from_resource_id as _npi_from_resource_id,
+    resource_npi as _policy_resource_npi,
+    tax_id as _tin,
+)
 from process import provider_directory_profile_capacity as profile_capacity
 from process import (
     provider_directory_profile_capacity_runtime as profile_capacity_runtime,
@@ -7292,80 +7301,20 @@ def _first_reference(value: Any) -> str | None:
     return refs[0] if refs else None
 
 
-def _identifier_descriptor(identifier: dict[str, Any]) -> str:
-    identifier_type = identifier.get("type") if isinstance(identifier.get("type"), dict) else {}
-    descriptor_parts = [
-        identifier.get("system"),
-        identifier_type.get("text"),
-    ]
-    for coding in identifier_type.get("coding") or []:
-        if not isinstance(coding, dict):
-            continue
-        descriptor_parts.extend((coding.get("system"), coding.get("code"), coding.get("display")))
-    return " ".join(str(part).lower() for part in descriptor_parts if part)
-
-
-def _identifier_value(
-    resource: dict[str, Any],
-    *tokens: str,
-    allow_systemless: bool = False,
-) -> str | None:
-    lowered_tokens = tuple(token.lower() for token in tokens)
-    systemless_value = None
-    for identifier in resource.get("identifier") or []:
-        if not isinstance(identifier, dict):
-            continue
-        value = _clean_text(identifier.get("value"))
-        if not value:
-            continue
-        descriptor = _identifier_descriptor(identifier)
-        if any(token in descriptor for token in lowered_tokens):
-            return value
-        if allow_systemless and not identifier.get("system") and not identifier.get("type"):
-            systemless_value = systemless_value or value
-    return systemless_value
+def _resource_npi(
+    resource: dict[str, Any], *, source_id: str, allow_id_fallback: bool = True
+) -> int | None:
+    resource_id = (
+        _resource_id(resource)
+        if allow_id_fallback and source_id != CMS_NPD_SOURCE_ID
+        else None
+    )
+    return _policy_resource_npi(resource, source_id=source_id, resource_id=resource_id)
 
 
 def _npi(resource: dict[str, Any]) -> int | None:
-    recognized_system = "http://hl7.org/fhir/sid/us-npi"
-    best_candidate: tuple[int, int, int] | None = None
-    for index, identifier in enumerate(resource.get("identifier") or []):
-        if not isinstance(identifier, dict):
-            continue
-        value = _clean_text(identifier.get("value"))
-        if not value or not any(
-            token in _identifier_descriptor(identifier) for token in ("us-npi", "npi")
-        ):
-            continue
-        digits = "".join(ch for ch in value if ch.isdigit())
-        if len(digits) != 10:
-            continue
-        priority = int(
-            (_clean_text(identifier.get("system")) or "").lower()
-            != recognized_system
-        )
-        candidate = (priority, index, int(digits))
-        if best_candidate is None or candidate < best_candidate:
-            best_candidate = candidate
-    return best_candidate[2] if best_candidate is not None else None
-
-
-def _npi_from_resource_id(resource_id: str | None) -> int | None:
-    text = _clean_text(resource_id)
-    if not text or not re.fullmatch(r"[0-9]{10}", text):
-        return None
-    return int(text)
-
-
-def _resource_npi(resource: dict[str, Any]) -> int | None:
-    return _npi(resource) or _npi_from_resource_id(_resource_id(resource))
-
-
-def _tin(resource: dict[str, Any]) -> str | None:
-    value = _identifier_value(resource, "tax", "tin", "ein")
-    if not value:
-        return None
-    return value[:64]
+    """Retain the identifier-only helper for existing legacy callers."""
+    return _resource_npi(resource, source_id="", allow_id_fallback=False)
 
 
 def _telecom(resource: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8077,7 +8026,7 @@ def _parse_practitioner_resource(
     family, given, full_name = _name(resource)
     return ProviderDirectoryPractitioner, {
         **base,
-        "npi": _resource_npi(resource),
+        "npi": _resource_npi(resource, source_id=base["source_id"]),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
         "names": _normalized_human_names(resource.get("name")),
@@ -8115,7 +8064,7 @@ def _parse_organization_resource(
 ) -> tuple[type, dict[str, Any]]:
     return ProviderDirectoryOrganization, {
         **base,
-        "npi": _resource_npi(resource),
+        "npi": _resource_npi(resource, source_id=base["source_id"]),
         "tax_id": _tin(resource),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
@@ -8179,7 +8128,7 @@ def _parse_practitioner_role_resource(
     period_start, period_end = _period(resource)
     return ProviderDirectoryPractitionerRole, {
         **base,
-        "npi": _npi(resource),
+        "npi": _resource_npi(resource, source_id=base["source_id"], allow_id_fallback=False),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
         "practitioner_ref": _first_reference(resource.get("practitioner")),
@@ -8205,7 +8154,7 @@ def _parse_healthcare_service_resource(
         **base,
         "provided_by_ref": _first_reference(resource.get("providedBy")),
         "accepting_patients": _plan_net_accepting_patients(resource),
-        "npi": _npi(resource),
+        "npi": _resource_npi(resource, source_id=base["source_id"], allow_id_fallback=False),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
         "name": _clean_text(resource.get("name")),
@@ -25067,7 +25016,9 @@ async def backfill_provider_directory_resource_id_npis(
     """Backfill payer rows that use the FHIR resource id as the NPI."""
     schema = db_schema or _schema()
     cleaned_source_ids = _clean_source_id_list(source_ids)
-    query_params_by_name: dict[str, Any] = {}
+    query_params_by_name: dict[str, Any] = {
+        "cms_npd_source_id": CMS_NPD_SOURCE_ID,
+    }
     scope_clauses: list[str] = []
     if cleaned_source_ids:
         scope_clauses.append("resource.source_id = ANY(CAST(:source_ids AS varchar[]))")
@@ -25103,6 +25054,7 @@ async def backfill_provider_directory_resource_id_npis(
                    SET npi = resource.resource_id::bigint,
                        updated_at = now()
                  WHERE resource.npi IS NULL
+                   AND resource.source_id <> :cms_npd_source_id
                    AND resource.resource_id ~ '^[0-9]{{10}}$'
                    {scope_sql};
                 """,
@@ -25119,7 +25071,11 @@ async def _assert_no_resource_npi_candidates(
 ) -> None:
     """Refuse admitted publication if canonical NPI repair is still required."""
 
-    cleaned_source_ids = _clean_source_id_list(source_ids)
+    cleaned_source_ids = [
+        source_id
+        for source_id in _clean_source_id_list(source_ids)
+        if source_id != CMS_NPD_SOURCE_ID
+    ]
     if not cleaned_source_ids:
         return
     for resource_type, table_name in (
