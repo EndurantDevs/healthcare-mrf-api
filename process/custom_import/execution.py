@@ -710,6 +710,7 @@ async def lookup_execution_request(
     idempotency_key: str,
     mechanism: str,
     request_identity_sha256: bytes | bytearray | memoryview,
+    source_binding_revision_id: int | None = None,
 ) -> ExecutionSubmission | None:
     """Read an exact request without creating work or changing a lease."""
 
@@ -723,6 +724,7 @@ async def lookup_execution_request(
         mechanism=mechanism,
         capture_bundle_id=None,
         request_identity_sha256=request_identity_sha256,
+        source_binding_revision_id=source_binding_revision_id,
     )
     if request.request_identity_sha256 is None:
         raise ValueError("request_identity_sha256 is required")

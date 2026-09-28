@@ -9,6 +9,7 @@ import logging
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -326,6 +327,35 @@ async def test_status_uses_exact_operator_transaction(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_status_receipts_preserve_incremental_base_and_omit_unavailable_evidence(monkeypatch):
+    observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    database = _LifecycleDatabase(object())
+
+    async def inspect_execution(*_unused, **_operation_keywords):
+        return replace(_execution_status(observed_at), capture_bundle_id=None, lease=None)
+
+    async def inspect_generation(*_unused, **_operation_keywords):
+        return replace(
+            _generation_status(observed_at),
+            base_generation_id=18,
+            current=None,
+            publication_state="superseded",
+        )
+
+    monkeypatch.setattr(cli, "inspect_execution", inspect_execution)
+    monkeypatch.setattr(cli, "inspect_generation", inspect_generation)
+    execution_receipt = await _lifecycle_receipt(["status", "--dataset-id", "5", "--execution-id", "17"], database)
+    generation_receipt = await _lifecycle_receipt(["status", "--dataset-id", "5", "--generation-id", "19"], database)
+
+    assert "capture_bundle_id" not in execution_receipt
+    assert "lease_fence" not in execution_receipt
+    assert generation_receipt["base_generation_id"] == 18
+    assert "current_generation_id" not in generation_receipt
+    assert "current_pointer_version" not in generation_receipt
+    assert database.events == ["connect", "begin", "commit", "disconnect"] * 2
+
+
+@pytest.mark.asyncio
 async def test_cancel_noop_is_emitted_once(monkeypatch):
     session = object()
     database = _LifecycleDatabase(session)
@@ -430,7 +460,17 @@ async def test_activate_preserves_exact_replay_receipt(monkeypatch):
     )
 
     assert receipt["replayed"] is True
-    assert calls == [(session, {"dataset_id": 5, "target_generation_id": 19, "expected_generation_id": None, "expected_pointer_version": 0})]
+    assert calls == [
+        (
+            session,
+            {
+                "dataset_id": 5,
+                "target_generation_id": 19,
+                "expected_generation_id": None,
+                "expected_pointer_version": 0,
+            },
+        )
+    ]
     assert database.events == ["connect", "begin", "commit", "disconnect"]
 
 
@@ -444,6 +484,136 @@ def test_activate_rejects_nonempty_pointer_without_generation(capsys):
     assert caught.value.code == 2
     assert captured.out == ""
     assert captured.err == '{"code":"invalid_arguments","status":"error"}\n'
+
+
+@pytest.mark.parametrize(
+    ("command_arguments", "invalid_identifier"),
+    (
+        (["status", "--dataset-id", "0", "--execution-id", "17"], "0"),
+        (
+            ["status", "--dataset-id", str(cli._MAX_BIGINT + 1), "--execution-id", "17"],
+            str(cli._MAX_BIGINT + 1),
+        ),
+        (
+            [
+                "activate",
+                "--dataset-id",
+                "5",
+                "--target-generation-id",
+                "19",
+                "--expected-pointer-version",
+                "-1",
+            ],
+            "-1",
+        ),
+        (
+            [
+                "activate",
+                "--dataset-id",
+                "5",
+                "--target-generation-id",
+                "19",
+                "--expected-pointer-version",
+                str(cli._MAX_BIGINT + 1),
+            ],
+            str(cli._MAX_BIGINT + 1),
+        ),
+    ),
+)
+def test_lifecycle_rejects_invalid_identifier_boundaries_without_echo(command_arguments, invalid_identifier, capsys):
+    with pytest.raises(SystemExit) as caught:
+        cli.run_command(command_arguments)
+
+    captured_output = capsys.readouterr()
+    assert caught.value.code == 2
+    assert captured_output.out == ""
+    assert captured_output.err == '{"code":"invalid_arguments","status":"error"}\n'
+    assert invalid_identifier not in captured_output.err
+
+
+@pytest.mark.parametrize(
+    ("command_arguments", "operation_name", "response_factory"),
+    (
+        (
+            ["status", "--dataset-id", "5", "--execution-id", "17"],
+            "inspect_execution",
+            lambda observed_at, _operation_keywords: replace(_execution_status(observed_at), execution_id=18),
+        ),
+        (
+            ["status", "--dataset-id", "5", "--generation-id", "19"],
+            "inspect_generation",
+            lambda observed_at, _operation_keywords: replace(_generation_status(observed_at), generation_id=20),
+        ),
+        (
+            ["status", "--dataset-id", "5", "--generation-id", "19"],
+            "inspect_generation",
+            lambda observed_at, _operation_keywords: replace(_generation_status(observed_at), current=object()),
+        ),
+        (
+            ["cancel", "--execution-id", "23"],
+            "request_cancellation",
+            lambda _observed_at, _operation_keywords: ExecutionTransition(24, "canceling", True),
+        ),
+        (
+            ["activate", "--dataset-id", "5", "--target-generation-id", "19", "--expected-pointer-version", "0"],
+            "activate_generation",
+            lambda _observed_at, operation_keywords: _publication_result("rolled_back", operation_keywords),
+        ),
+    ),
+)
+def test_lifecycle_rejects_mismatched_operator_responses(
+    monkeypatch, capsys, command_arguments, operation_name, response_factory
+):
+    database = _LifecycleDatabase(object())
+    observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    async def operation(*_unused, **operation_keywords):
+        return response_factory(observed_at, operation_keywords)
+
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(cli, operation_name, operation)
+
+    exit_code = cli.run_command(command_arguments)
+
+    captured_output = capsys.readouterr()
+    assert exit_code == 1
+    assert captured_output.out == ""
+    assert captured_output.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == ["connect", "begin", "rollback", "disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_receipt_rejects_an_unrecognized_command():
+    with pytest.raises(ValueError, match="lifecycle command is invalid"):
+        await cli._lifecycle_receipt(object(), SimpleNamespace(command="unknown"))
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_status_does_not_require_an_engine_echo_attribute(monkeypatch):
+    observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    database = _LifecycleDatabase(object())
+    database.engine = object()
+
+    async def connect():
+        database.events.append("connect")
+
+    async def disconnect():
+        database.events.append("disconnect")
+
+    async def inspect_execution(*_unused, **_operation_keywords):
+        return _execution_status(observed_at)
+
+    monkeypatch.setattr(database, "connect", connect)
+    monkeypatch.setattr(database, "disconnect", disconnect)
+    monkeypatch.setattr(cli, "inspect_execution", inspect_execution)
+
+    rendered = await cli._run_lifecycle_command(
+        _lifecycle_arguments(["status", "--dataset-id", "5", "--execution-id", "17"]),
+        database=database,
+    )
+
+    assert json.loads(rendered)["status"] == "ok"
+    assert database.events == ["connect", "begin", "commit", "disconnect"]
 
 
 def test_lifecycle_commit_failure_disconnects_and_redacts(monkeypatch, capsys):
