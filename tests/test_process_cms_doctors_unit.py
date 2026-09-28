@@ -2,6 +2,7 @@
 
 import importlib
 import io
+import re
 import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -102,10 +103,9 @@ def test_cms_doctor_identifiers_and_schema_names_are_bounded(cms_doctors_module)
     assert cms_doctors_module._normalize_import_id(" run-ABC_123 ") == "runABC123"
     fallback_import_id = cms_doctors_module._normalize_import_id("---")
     missing_import_id = cms_doctors_module._normalize_import_id(None)
-    assert len(fallback_import_id) == 8
-    assert fallback_import_id.isdigit()
-    assert len(missing_import_id) == 8
-    assert missing_import_id.isdigit()
+    assert re.fullmatch(r"[0-9]{14}[0-9a-f]{8}", fallback_import_id)
+    assert re.fullmatch(r"[0-9]{14}[0-9a-f]{8}", missing_import_id)
+    assert fallback_import_id != missing_import_id
     assert cms_doctors_module._archived_identifier("current") == "current_old"
     archived_long_name = cms_doctors_module._archived_identifier("x" * 80)
     assert len(archived_long_name) == cms_doctors_module.POSTGRES_IDENTIFIER_MAX_LENGTH
@@ -314,19 +314,25 @@ async def test_cms_doctor_catalog_fallback_fails_closed(cms_doctors_module):
 
 @pytest.mark.parametrize("has_requested_dataset", [False, True])
 async def test_custom_cms_dataset_never_falls_back_to_default_title(
-    monkeypatch, cms_doctors_module, has_requested_dataset,
+    monkeypatch,
+    cms_doctors_module,
+    has_requested_dataset,
 ):
     monkeypatch.setattr(cms_doctors_module, "DEFAULT_DOCTORS_DATASET_ID", "synthetic-dataset")
-    catalog_datasets = [{
-        "title": "National Downloadable File",
-        "description": "Doctors and Clinicians directory",
-        "distribution": [{"downloadURL": "https://example.test/default.csv"}],
-    }]
+    catalog_datasets = [
+        {
+            "title": "National Downloadable File",
+            "description": "Doctors and Clinicians directory",
+            "distribution": [{"downloadURL": "https://example.test/default.csv"}],
+        }
+    ]
     if has_requested_dataset:
-        catalog_datasets.append({
-            "identifier": "synthetic-dataset",
-            "distribution": [{"downloadURL": "https://example.test/requested.csv"}],
-        })
+        catalog_datasets.append(
+            {
+                "identifier": "synthetic-dataset",
+                "distribution": [{"downloadURL": "https://example.test/requested.csv"}],
+            }
+        )
     client = _CatalogClient(
         get_responses=(
             _CatalogResponse(enter_error=OSError("metastore unavailable")),
@@ -364,6 +370,7 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
     monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
     monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
+    monkeypatch.setattr(cms_doctors_module, "_stage_doctors_sidecars", AsyncMock())
     monkeypatch.setitem(
         __import__("sys").modules,
         "aiohttp",
@@ -399,6 +406,7 @@ async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cm
     monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
     monkeypatch.setattr(cms_doctors_module, "import_doctor_education", AsyncMock())
+    monkeypatch.setattr(cms_doctors_module, "_stage_doctors_sidecars", AsyncMock())
     monkeypatch.setitem(
         __import__("sys").modules,
         "aiohttp",

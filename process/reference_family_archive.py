@@ -281,7 +281,10 @@ _SPECS = {
         ReferenceFamilySpec("geo", (models.GeoZipLookup,)),
         ReferenceFamilySpec("geo-census", (models.GeoZipCensusProfile,), ("geo",)),
         ReferenceFamilySpec("lodes", (models.LODESWorkplaceAggregate,)),
-        ReferenceFamilySpec("cms-doctors", (models.DoctorClinicianAddress, models.CMSDoctorEducation)),
+        ReferenceFamilySpec(
+            "cms-doctors",
+            (models.DoctorClinicianAddress, models.CMSDoctorEducation, models.CMSDoctorGroupSite),
+        ),
         ReferenceFamilySpec("facility-anchors", (models.FacilityAnchor, models.FacilityAddressContribution)),
         ReferenceFamilySpec("tiger", (ZipState, Zip_zcta5)),
         ReferenceFamilySpec(
@@ -790,6 +793,20 @@ def _manifest_table_receipts(raw_tables: object, spec: ReferenceFamilySpec) -> t
     return tuple(receipts)
 
 
+def _manifest_family_spec(manifest_value) -> ReferenceFamilySpec:
+    """Recognize only the exact historical CMS payload, without changing stage ownership."""
+    spec = reference_family_spec(manifest_value["importer_id"])
+    if (
+        spec.importer_id == "cms-doctors"
+        and isinstance(manifest_value["tables"], list)
+        and len(manifest_value["tables"]) == 2
+    ):
+        # Historical payloads remain byte-identical; restore ownership still uses
+        # the current three-table family, with an independently verified empty group table.
+        spec = ReferenceFamilySpec(spec.importer_id, (models.DoctorClinicianAddress, models.CMSDoctorEducation))
+    return spec
+
+
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
     """Validate the portable closed-family receipt without granting authority."""
 
@@ -815,7 +832,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         raise ReferenceFamilyArchiveError("reference family manifest is invalid")
     if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation"}:
         raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
-    spec = reference_family_spec(manifest_value["importer_id"])
+    spec = _manifest_family_spec(manifest_value)
     if spec.importer_id == "label" and authority != "tracked-generation":
         raise ReferenceFamilyArchiveError("label source generation is required")
     auxiliary = _validate_mrf_auxiliary_receipt(manifest_value.get("auxiliary")) if spec.importer_id == "mrf" else None
@@ -1248,6 +1265,130 @@ async def verify_reference_family_stage_ownership(
     return observed
 
 
+def _is_legacy_cms_manifest(manifest: ReferenceFamilyManifest) -> bool:
+    return manifest.importer_id == "cms-doctors" and len(manifest.tables) == 2
+
+
+def _has_matching_manifest_stage_tables(manifest, tables) -> bool:
+    if not _is_legacy_cms_manifest(manifest):
+        return tables == manifest.tables
+    return (
+        len(tables) == 3
+        and tables[:2] == manifest.tables
+        and tables[2].model_name == "CMSDoctorGroupSite"
+        and tables[2].table_name == "cms_doctor_group_site"
+        and tables[2].row_count == 0
+    )
+
+
+def _legacy_cms_group_columns():
+    """Describe the synthesized group's columns from the trusted model."""
+    columns = []
+    for position, column in enumerate(models.CMSDoctorGroupSite.__table__.columns, 1):
+        type_name = str(column.type.compile(dialect=postgresql.dialect())).lower()
+        type_name = type_name.replace("varchar", "character varying")
+        is_collatable = type_name == "text" or type_name.startswith("character varying")
+        columns.append(
+            {
+                "attnum": position,
+                "attname": column.name,
+                "type": type_name,
+                "attnotnull": not column.nullable,
+                "attgenerated": "",
+                "attidentity": "",
+                "collation_schema": "pg_catalog" if is_collatable else None,
+                "collation_name": "default" if is_collatable else None,
+                "default_expression": None,
+            }
+        )
+    return columns
+
+
+def _legacy_cms_group_constraints(columns, constraints):
+    """Describe the primary key and version-dependent NOT NULL catalog entries."""
+    # PostgreSQL 18 also exposes NOT NULL constraints; column identity above
+    # verifies their semantics on earlier supported PostgreSQL versions.
+    expected_constraints = [
+        {
+            "contype": "p",
+            "condeferrable": False,
+            "condeferred": False,
+            "convalidated": True,
+            "key_columns": "{1}",
+            "referenced_columns": None,
+            "referenced_table": None,
+            "referenced_in_archive_schema": None,
+            "check_expression": None,
+        }
+    ]
+    if any(constraint["contype"] == "n" for constraint in constraints):
+        expected_constraints.extend(
+            {
+                **expected_constraints[0],
+                "contype": "n",
+                "key_columns": "{" + str(column["attnum"]) + "}",
+            }
+            for column in columns
+            if column["attnotnull"]
+        )
+    return expected_constraints
+
+
+def _legacy_cms_group_indexes():
+    """Describe the reviewed primary key and two lookup indexes."""
+    indexes = []
+    for attribute, is_primary, opclass, is_collatable in (
+        (1, True, "int8_ops", False),
+        (2, False, "int8_ops", False),
+        (4, False, "text_ops", True),
+    ):
+        indexes.append(
+            {
+                "indisunique": is_primary,
+                "indisprimary": is_primary,
+                "indimmediate": True,
+                "indisvalid": True,
+                "indnkeyatts": 1,
+                "indnatts": 1,
+                "method": "btree",
+                "predicate": None,
+                "expressions": None,
+                "keys": str(attribute),
+                "options": "0",
+                "key_attributes": [
+                    {
+                        "position": 0,
+                        "attribute_number": attribute,
+                        "collation_schema": "pg_catalog" if is_collatable else None,
+                        "collation_name": "default" if is_collatable else None,
+                        "opclass_schema": "pg_catalog",
+                        "opclass_name": opclass,
+                    }
+                ],
+            }
+        )
+    return indexes
+
+
+async def _require_legacy_cms_group_schema(session, schema_name: str) -> None:
+    """Reject synthesized empty tables whose schema differs from the trusted model."""
+    relation_oid = await _relation_oid(session, schema_name, models.CMSDoctorGroupSite.__tablename__)
+    columns = _legacy_cms_group_columns()
+    observed_columns = await catalog_identity._catalog_columns(session, relation_oid)
+    constraints = await catalog_identity._catalog_constraints(session, relation_oid, schema_name)
+    for constraint in constraints:
+        if isinstance(constraint["contype"], bytes):
+            constraint["contype"] = constraint["contype"].decode("ascii")
+    expected_constraints = _legacy_cms_group_constraints(columns, constraints)
+    observed_indexes = await catalog_identity._catalog_indexes(session, relation_oid)
+    if (
+        observed_columns != columns
+        or sorted(map(_canonical_json, constraints)) != sorted(map(_canonical_json, expected_constraints))
+        or sorted(map(_canonical_json, observed_indexes)) != sorted(map(_canonical_json, _legacy_cms_group_indexes()))
+    ):
+        raise ReferenceFamilyArchiveError("legacy CMS synthesized group schema differs")
+
+
 async def _validate_stage_manifest(
     session: Any,
     *,
@@ -1267,7 +1408,11 @@ async def _validate_stage_manifest(
         auxiliary=validated.auxiliary,
         source_serving_generation=validated.source_serving_generation,
     )
-    if observed.as_dict() != validated.as_dict():
+    if _is_legacy_cms_manifest(validated):
+        if not _has_matching_manifest_stage_tables(validated, observed.tables):
+            raise ReferenceFamilyArchiveError("reference family restored stage differs")
+        await _require_legacy_cms_group_schema(session, ownership.schema_name)
+    elif observed.as_dict() != validated.as_dict():
         raise ReferenceFamilyArchiveError("reference family restored stage differs")
     return observed.tables
 
@@ -1987,7 +2132,10 @@ async def _activation_receipt(
             dependencies=manifest.dependencies,
             source_serving_generation=manifest.source_serving_generation,
         )
-        if local_manifest.as_dict() != manifest.as_dict():
+        if _is_legacy_cms_manifest(manifest):
+            if local_manifest.tables != tables or not _has_matching_manifest_stage_tables(manifest, tables):
+                raise ReferenceFamilyArchiveError("reference family activated receipt differs")
+        elif local_manifest.as_dict() != manifest.as_dict():
             raise ReferenceFamilyArchiveError("reference family activated receipt differs")
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
@@ -2107,7 +2255,7 @@ async def activate_validated_reference_family_stage(
     spec = reference_family_spec(ownership.importer_id)
     await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
-    incoming_generation = _cutover_source_generation(cutover)
+    incoming_generation = _activation_source_generation(validated_manifest, cutover)
     if cutover.authority == "automatic":
         await _require_automatic_cutover_generation(
             session,
@@ -2166,6 +2314,8 @@ async def _apply_validated_contribution(session, ownership, expected_incumbent, 
 def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, validation, cutover) -> None:
     """Bind the protected receipt to the exact stage, package, and incumbent."""
 
+    if _is_legacy_cms_manifest(manifest) and cutover.authority != "manual":
+        raise ReferenceFamilyArchiveError("legacy CMS archive requires manual activation")
     manifest_sha256 = hashlib.sha256(_canonical_json(manifest.as_dict())).hexdigest()
     if (
         manifest.importer_id != ownership.importer_id
@@ -2178,9 +2328,15 @@ def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, 
         or validation.stage_schema_oid != ownership.schema_oid
         or validation.relation_oids != ownership.relation_oids
         or validation.manifest_sha256 != manifest_sha256
-        or validation.tables != manifest.tables
+        or not _has_matching_manifest_stage_tables(manifest, validation.tables)
     ):
         raise ReferenceFamilyArchiveError("reference family validation authority differs")
+
+
+def _activation_source_generation(manifest, cutover):
+    """Keep a legacy two-relation generation as provenance, never current-family authority."""
+    incoming_generation = _cutover_source_generation(cutover)
+    return None if _is_legacy_cms_manifest(manifest) else incoming_generation
 
 
 def _cutover_source_generation(cutover):
