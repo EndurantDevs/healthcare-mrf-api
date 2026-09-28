@@ -2,11 +2,15 @@
 
 """Source-neutral FHIR payload to physical projection row transformation."""
 from __future__ import annotations
+
 import re
 from typing import Any, Iterable, Mapping
+
+from process.provider_directory_projection_contract import CMS_NPD_NPI_IDENTITY_POLICY
 from process.provider_directory_projection_fhir_values import (
     fhir_list,
     invalid_fhir_field,
+    is_valid_npi,
     normalized_address_map,
     normalized_period_map,
     normalized_position_map,
@@ -29,7 +33,6 @@ from process.provider_directory_projection_types import (
     ProviderDirectoryProjectionError,
     stable_json,
 )
-
 
 _SUPPORTED_RESOURCE_TYPES = frozenset({
         "Endpoint",
@@ -370,6 +373,8 @@ def _summary_npi(
     fhir_resource_map: Mapping[str, Any],
     resource_type: str,
     resource_id: str,
+    *,
+    explicit_only: bool = False,
 ) -> int | None:
     if resource_type not in _NPI_RESOURCE_TYPES:
         return None
@@ -384,12 +389,23 @@ def _summary_npi(
         descriptor = f"{identifier_system} {_identifier_type_text(identifier_map)}"
         if "npi" not in descriptor and "national provider" not in descriptor:
             continue
+        if explicit_only and any(
+            character.isnumeric() and not character.isascii()
+            for character in identifier_text
+        ):
+            continue
         digits = "".join(character for character in identifier_text if character.isdigit())
-        if len(digits) == 10 and 1_000_000_000 <= int(digits) <= 2_999_999_999:
+        if len(digits) == 10 and (
+            is_valid_npi(digits)
+            if explicit_only
+            else 1_000_000_000 <= int(digits) <= 2_999_999_999
+        ):
             system_rank = int(identifier_system != "http://hl7.org/fhir/sid/us-npi")
             ranked_candidates.append((system_rank, identifier_ordinal, int(digits)))
     if ranked_candidates:
         return min(ranked_candidates)[2]
+    if explicit_only:
+        return None
     resource_id_npi = (
         int(resource_id)
         if len(resource_id) == 10 and resource_id.isdigit()
@@ -440,6 +456,14 @@ def _profile_evidence_map(
     }
 
 
+def _is_explicit_npi_policy(claim: ProjectionShardClaim) -> bool:
+    """Validate the recipe-bound NPI rule before transforming a resource."""
+    policy = claim.recipe_lease.recipe.transform_context.get("npi_identity_policy")
+    if policy not in (None, CMS_NPD_NPI_IDENTITY_POLICY):
+        raise ProviderDirectoryProjectionError("provider_directory_projection_npi_identity_policy_invalid")
+    return policy == CMS_NPD_NPI_IDENTITY_POLICY
+
+
 def projection_resource_row(
     fhir_resource_map: Mapping[str, Any],
     *,
@@ -474,13 +498,19 @@ def projection_resource_row(
     if raw_metadata is not None and not isinstance(raw_metadata, Mapping):
         raise invalid_fhir_field("meta")
     metadata_map = raw_metadata or {}
+    is_explicit_only = _is_explicit_npi_policy(claim)
     projection_row_map = {
         "resource_type": resource_type,
         "resource_id": resource_id,
         "proof_partition_id": claim.shard.partition_id,
         "payload_hash": payload_hash,
         "source_rank": f"{claim.shard.partition_ordinal:020d}:{payload_hash}:{input_ordinal:020d}",
-        "summary_npi": _summary_npi(fhir_resource_map, resource_type, resource_id),
+        "summary_npi": _summary_npi(
+            fhir_resource_map,
+            resource_type,
+            resource_id,
+            explicit_only=is_explicit_only,
+        ),
         "summary_address_count": address_count,
         "summary_addressed_location": resource_type == "Location" and address_count > 0,
         "summary_geocoded_location": bool(typed_evidence_map["geocodes"]),
