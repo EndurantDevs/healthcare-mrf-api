@@ -1,15 +1,14 @@
 """The public image carries importer dependencies, not deployment tooling."""
 
 import ast
-from pathlib import Path
 import re
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from scripts.python_locks import LOCK_INPUTS, validate
-
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_OPERATOR_SCRIPTS = {
@@ -83,8 +82,10 @@ def test_documented_container_commands_are_packaged():
         assert f"COPY {command} /opt/{command}" in runtime_stage
 
 
-def test_snowflake_operator_wrapper_is_packaged_at_its_fixed_worker_path():
+def test_custom_import_operator_wrappers_are_packaged_at_their_fixed_paths():
     runtime_stage = (ROOT / "Dockerfile").read_text().split("\nFROM ")[-1]
+    assert "ENV PATH=/opt/venv/bin:${PATH}" in runtime_stage
+    assert "COPY custom_import_cli.py /opt/custom_import_cli.py" in runtime_stage
     assert "COPY custom_import_snowflake_operator.py /opt/custom_import_snowflake_operator.py" in runtime_stage
 
 

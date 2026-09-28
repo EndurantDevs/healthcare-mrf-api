@@ -248,6 +248,8 @@ def test_preflight_adapter_executes_generated_statement_once_with_bounded_timeou
     preflight_cursor.close()
     assert cursor.close_count == 1
     assert connection.close_count == 1
+    with pytest.raises(SnowflakeConnectorError, match="preflight cursor is closed"):
+        preflight_cursor.fetchone()
 
 
 def test_preflight_adapter_bounds_login_timeout_to_the_requested_second(monkeypatch, credentials):
@@ -352,6 +354,80 @@ def test_preflight_adapter_closes_resources_after_execute_and_fetch_errors(monke
 
     cursor.fetchone = fail_fetch
     with pytest.raises(SnowflakeConnectorError, match="preflight result fetch failed"):
+        preflight_cursor.fetchone()
+    assert cursor.close_count == 1
+    assert connection.close_count == 1
+
+
+def test_preflight_adapter_rejects_invalid_connector_and_credentials(credentials):
+    with pytest.raises(SnowflakeConnectorError, match="Snowflake Python connector"):
+        SnowflakePythonPreflightAdapter(connector=object(), credential_provider=_CredentialProvider(credentials))
+
+    adapter = SnowflakePythonPreflightAdapter(
+        connector=SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh"),
+        credential_provider=_CredentialProvider(object()),
+    )
+    with pytest.raises(SnowflakeCredentialError, match="invalid key-pair value"):
+        adapter.open_preflight(_statement(), timeout_seconds=1)
+
+
+def test_preflight_adapter_rejects_non_string_query_identity_and_closes_resources(monkeypatch, credentials):
+    statement = _statement()
+    cursor = _Cursor((), description=_description(statement), query_id=1)
+    connection, _arguments = _connect(monkeypatch, cursor)
+    adapter, _provider = _adapter(credentials)
+
+    with pytest.raises(SnowflakeConnectorError, match="statement identity is invalid"):
+        adapter.open_preflight(statement, timeout_seconds=1)
+
+    assert cursor.close_count == 1
+    assert connection.close_count == 1
+
+
+def test_preflight_adapter_closes_resources_after_base_exceptions(monkeypatch, credentials):
+    statement = _statement()
+    cursor = _Cursor((), description=_description(statement))
+    connection, _arguments = _connect(monkeypatch, cursor)
+
+    def interrupt_execute(sql: str) -> None:
+        cursor.executed.append(sql)
+        if sql != "USE SECONDARY ROLES NONE":
+            raise KeyboardInterrupt
+
+    cursor.execute = interrupt_execute
+    adapter, _provider = _adapter(credentials)
+    with pytest.raises(KeyboardInterrupt):
+        adapter.open_preflight(statement, timeout_seconds=1)
+    assert cursor.close_count == 1
+    assert connection.close_count == 1
+
+    cursor = _Cursor((), description=_description(statement))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    adapter, _provider = _adapter(credentials)
+    preflight_cursor = adapter.open_preflight(statement, timeout_seconds=1)
+
+    def interrupt_fetch() -> None:
+        raise KeyboardInterrupt
+
+    cursor.fetchone = interrupt_fetch
+    with pytest.raises(KeyboardInterrupt):
+        preflight_cursor.fetchone()
+    assert cursor.close_count == 1
+    assert connection.close_count == 1
+
+
+def test_preflight_cursor_closes_resources_after_connector_fetch_error(monkeypatch, credentials):
+    statement = _statement()
+    cursor = _Cursor((), description=_description(statement))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    adapter, _provider = _adapter(credentials)
+    preflight_cursor = adapter.open_preflight(statement, timeout_seconds=1)
+
+    def fail_fetch() -> None:
+        raise SnowflakeConnectorError("synthetic connector failure")
+
+    cursor.fetchone = fail_fetch
+    with pytest.raises(SnowflakeConnectorError, match="synthetic connector failure"):
         preflight_cursor.fetchone()
     assert cursor.close_count == 1
     assert connection.close_count == 1
