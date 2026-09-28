@@ -21,6 +21,7 @@ from process.custom_import.snowflake import (
     MAX_RESULT_PARTITION_BYTES,
     SnowflakeConnectorError,
     SnowflakeCredentialError,
+    SnowflakeCredentialProvider,
     SnowflakeKeyPairCredentials,
     SnowflakeParquetResult,
     SnowflakeReadStatement,
@@ -39,6 +40,7 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleStreamMetadata,
     SnowflakeBundleStreamResult,
 )
+from process.custom_import.snowflake_preflight import SnowflakePreflightStatement
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
 _FETCH_ROWS = 1_024
@@ -160,9 +162,16 @@ class SnowflakePythonConnectorAdapter:
             _best_effort_close(cursor, connection)
             raise
 
-    def _connect(self, credentials: SnowflakeKeyPairCredentials) -> tuple[Any, Any]:
+    def _connect(
+        self,
+        credentials: SnowflakeKeyPairCredentials,
+        *,
+        timeout_seconds: int = _STATEMENT_TIMEOUT_SECONDS,
+    ) -> tuple[Any, Any]:
         """Open a fixed-primary-role session before executing generated reads."""
 
+        timeout_seconds = _execution_timeout(timeout_seconds)
+        login_timeout = min(_LOGIN_TIMEOUT_SECONDS, timeout_seconds)
         connection = None
         cursor = None
         try:
@@ -175,12 +184,12 @@ class SnowflakePythonConnectorAdapter:
                 warehouse=self._warehouse,
                 autocommit=False,
                 client_session_keep_alive=False,
-                login_timeout=_LOGIN_TIMEOUT_SECONDS,
-                network_timeout=_NETWORK_TIMEOUT_SECONDS,
-                socket_timeout=_NETWORK_TIMEOUT_SECONDS,
+                login_timeout=login_timeout,
+                network_timeout=timeout_seconds,
+                socket_timeout=timeout_seconds,
                 session_parameters={
                     "QUERY_TAG": _QUERY_TAG,
-                    "STATEMENT_TIMEOUT_IN_SECONDS": _STATEMENT_TIMEOUT_SECONDS,
+                    "STATEMENT_TIMEOUT_IN_SECONDS": timeout_seconds,
                 },
             )
             cursor = connection.cursor()
@@ -189,6 +198,111 @@ class SnowflakePythonConnectorAdapter:
         except BaseException:
             _best_effort_close(cursor, connection)
             raise
+
+
+class SnowflakePythonPreflightAdapter:
+    """Open one generated preflight cursor with fixed credential composition."""
+
+    def __init__(
+        self,
+        *,
+        connector: SnowflakePythonConnectorAdapter,
+        credential_provider: SnowflakeCredentialProvider,
+    ) -> None:
+        if not isinstance(connector, SnowflakePythonConnectorAdapter):
+            raise SnowflakeConnectorError("preflight adapter requires the Snowflake Python connector")
+        if not callable(getattr(credential_provider, "load_key_pair", None)):
+            raise SnowflakeCredentialError("preflight adapter requires a fixed key-pair credential provider")
+        self._connector = connector
+        self._credential_provider = credential_provider
+
+    def open_preflight(
+        self,
+        statement: SnowflakePreflightStatement,
+        *,
+        timeout_seconds: int,
+    ) -> _SnowflakePreflightCursor:
+        """Execute one generated preview statement and transfer its cursor ownership."""
+
+        if not isinstance(statement, SnowflakePreflightStatement):
+            raise SnowflakeConnectorError("preflight adapter requires a generated Snowflake preflight statement")
+        timeout_seconds = _execution_timeout(timeout_seconds)
+        connection = None
+        cursor = None
+        try:
+            credentials = self._credential_provider.load_key_pair()
+            if not isinstance(credentials, SnowflakeKeyPairCredentials):
+                raise SnowflakeCredentialError("credential provider returned an invalid key-pair value")
+            connection, cursor = self._connector._connect(credentials, timeout_seconds=timeout_seconds)
+            cursor.execute(statement.sql)
+            _preflight_result_schema(statement, cursor.description)
+            query_id = getattr(cursor, "sfqid", None)
+            if query_id is not None and not isinstance(query_id, str):
+                raise SnowflakeConnectorError("Snowflake preflight statement identity is invalid")
+            preflight_cursor = _SnowflakePreflightCursor(
+                connection=connection,
+                cursor=cursor,
+                column_ids=statement.column_ids,
+                query_id=query_id,
+            )
+            connection = None
+            cursor = None
+            return preflight_cursor
+        except SnowflakeConnectorError:
+            _best_effort_close(cursor, connection)
+            raise
+        except Exception as exc:
+            _best_effort_close(cursor, connection)
+            raise SnowflakeConnectorError("Snowflake preflight read failed") from exc
+        except BaseException:
+            _best_effort_close(cursor, connection)
+            raise
+
+
+class _SnowflakePreflightCursor:
+    """One cursor owner for the bounded preflight row protocol."""
+
+    def __init__(
+        self,
+        *,
+        connection: Any,
+        cursor: Any,
+        column_ids: tuple[str, ...],
+        query_id: str | None,
+    ) -> None:
+        self._connection = connection
+        self._cursor = cursor
+        self.column_ids = column_ids
+        self.query_id = query_id
+        self._closed = False
+
+    def fetchone(self) -> Sequence[object] | None:
+        """Read one row and close both owned resources if it fails."""
+
+        if self._closed:
+            raise SnowflakeConnectorError("Snowflake preflight cursor is closed")
+        try:
+            return self._cursor.fetchone()
+        except SnowflakeConnectorError:
+            _best_effort_close(self)
+            raise
+        except Exception as exc:
+            _best_effort_close(self)
+            raise SnowflakeConnectorError("Snowflake preflight result fetch failed") from exc
+        except BaseException:
+            _best_effort_close(self)
+            raise
+
+    def close(self) -> None:
+        """Close the cursor and its exact connection once, attempting both."""
+
+        if self._closed:
+            return
+        self._closed = True
+        cursor, connection = self._cursor, self._connection
+        self._cursor = None
+        self._connection = None
+        _close_resources(cursor, connection)
 
 
 class _SnowflakeParquetPartitionSources:
@@ -575,6 +689,56 @@ def _result_schema(statement: SnowflakeReadStatement, description: object) -> tu
             )
         )
     return tuple(result_columns)
+
+
+def _preflight_result_schema(statement: SnowflakePreflightStatement, description: object) -> None:
+    """Require the generated preview's exact labels and capture-supported types."""
+
+    column_ids = statement.column_ids
+    if (
+        not isinstance(column_ids, tuple)
+        or not column_ids
+        or not all(isinstance(column_id, str) and column_id for column_id in column_ids)
+        or not isinstance(description, Sequence)
+        or len(description) != len(column_ids)
+        or tuple(getattr(metadata, "name", None) for metadata in description) != column_ids
+    ):
+        raise SnowflakeConnectorError("Snowflake preflight result schema does not match the generated statement")
+    source_types = tuple(_source_type(metadata) for metadata in description)
+    if (
+        not all(_is_integral_fixed(source_types[index]) for index in (0, 1, 3, 5))
+        or any(source_types[index] != "TEXT" for index in (2, 4))
+        or any(
+            not _supports_preflight_field_type(field.value_type, source_type)
+            for field, source_type in zip(
+                sorted(statement.definition.fields, key=lambda field: field.field_slot),
+                source_types[6:],
+                strict=True,
+            )
+        )
+    ):
+        raise SnowflakeConnectorError("Snowflake preflight result schema does not match the generated statement")
+
+
+def _is_integral_fixed(source_type: str) -> bool:
+    return source_type.startswith("FIXED(") and _fixed_type_parts(source_type)[1] == 0
+
+
+def _supports_preflight_field_type(value_type: str, source_type: str) -> bool:
+    if value_type == "string":
+        return source_type == "TEXT"
+    if value_type == "integer":
+        return _is_integral_fixed(source_type)
+    if value_type == "decimal":
+        return source_type.startswith("FIXED(")
+    return value_type == "boolean" and source_type == "BOOLEAN"
+
+
+def _execution_timeout(value: object) -> int:
+    maximum_timeout = min(_NETWORK_TIMEOUT_SECONDS, _STATEMENT_TIMEOUT_SECONDS)
+    if type(value) is not int or not 1 <= value <= maximum_timeout:
+        raise SnowflakeConnectorError(f"Snowflake execution timeout must be from 1 through {maximum_timeout} seconds")
+    return value
 
 
 def _source_type(metadata: object) -> str:

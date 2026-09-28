@@ -14,6 +14,8 @@ It is intended for readers on GitHub who need to understand:
 - [Import index](./imports/README.md): every import command in one place
 - [Custom-import operator CLI](./custom-import-operator-cli.md): validation,
   lifecycle operations, and retained Snowflake capture resume
+- [Snowflake preflight](./custom-import-snowflake-preflight.md): bounded local
+  validation and complete-family preview for retained source bindings
 - [MRF source discovery DevOps](./devops/mrf-source-discovery.md): payer/TPA source catalog schedules, smokes, and troubleshooting
 - [PTG2 source snapshot GC DevOps](./devops/ptg2-source-snapshot-gc.md): old source-snapshot cleanup guardrails and verification
 - [Legacy PTG orphan sweeper](./devops/ptg2-legacy-orphan-sweeper.md): bounded dry-run/apply cleanup for pre-shared dynamic relation families
