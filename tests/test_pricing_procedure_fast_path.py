@@ -203,3 +203,45 @@ async def test_single_code_default_search_avoids_repeated_grouping(monkeypatch):
         "pricing_procedure.provider_count" in statement
         for statement in statements
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "thresholds",
+    ({"min_claims": "12"}, {"min_total_cost": "120"}, {"min_claims": "12", "min_total_cost": "120"}),
+)
+async def test_native_claims_thresholds_filter_rows_before_count_and_page(monkeypatch, thresholds):
+    monkeypatch.setattr(
+        pricing_module, "_resolve_internal_codes_for_request", _resolve_single_internal_code
+    )
+    request = make_request(
+        [FakeResult(scalar=0), FakeResult(rows=[])],
+        args={
+            "code": "99213", "code_system": "CPT", "year": "2023",
+            "limit": "2", "offset": "4", "order": "asc", **thresholds,
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    body = json.loads(response.body)
+    assert set(body) == {"items", "pagination", "query"}
+    assert body["items"] == []
+    assert body["pagination"] == {"total": 0, "limit": 2, "offset": 4, "page": 3}
+    statements = [
+        str(args[0].compile(compile_kwargs={"literal_binds": True}))
+        for args, _kwargs in request.ctx.sa_session.executions
+    ]
+    assert len(statements) == 2
+    for statement in statements:
+        assert "GROUP BY" in statement
+        for name, column in (("min_claims", "total_services"), ("min_total_cost", "total_allowed_amount")):
+            if name in thresholds:
+                predicate = f"mrf.pricing_provider_procedure.{column} >= {float(thresholds[name])}"
+                assert statement.index(predicate) < statement.index("GROUP BY")
+                assert body["query"][name] == float(thresholds[name])
+        assert "custom_import" not in statement
+    assert "LIMIT" not in statements[0] and "OFFSET" not in statements[0]
+    page_query = request.ctx.sa_session.executions[-1][0][0]
+    assert tuple(str(clause).rsplit(".", 1)[-1] for clause in page_query._order_by_clauses) == ("total_allowed_amount ASC",)
+    assert "LIMIT 2 OFFSET 4" in statements[1]
