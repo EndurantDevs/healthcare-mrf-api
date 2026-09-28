@@ -49,7 +49,7 @@ def test_closed_relation_families_are_ordered_and_distinct():
         "geo": ("geo_zip_lookup",),
         "geo-census": ("geo_zip_census_profile",),
         "lodes": ("lodes_workplace_aggregate",),
-        "cms-doctors": ("doctor_clinician_address", "cms_doctor_education"),
+        "cms-doctors": ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site"),
         "facility-anchors": ("facility_anchor", "facility_address_contribution"),
         "tiger": ("zip_state", "zcta5"),
         "medicare-enrollment": (

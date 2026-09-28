@@ -25,6 +25,7 @@ from db.json_mixin import JSONOutputMixin
 
 __all__ = (
     "CMSDoctorEducation",
+    "CMSDoctorGroupSite",
     "ProviderProfileArtifact",
     "ProviderProfileFact",
     "ProviderProfileImportRun",
@@ -55,6 +56,35 @@ class CMSDoctorEducation(Base, JSONOutputMixin):
     generation_id = Column(String(64), nullable=False)
     source_json = Column(JSON, nullable=False)
     imported_at = Column(TIMESTAMP, nullable=False)
+
+
+class CMSDoctorGroupSite(Base, JSONOutputMixin):
+    """One source row at clinician, enrollment, group, and site grain."""
+
+    __tablename__ = "cms_doctor_group_site"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("row_number"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("org_pac_id",), "name": "org"},
+    ]
+
+    row_number = Column(BigInteger, nullable=False, autoincrement=False)
+    npi = Column(BigInteger, nullable=False)
+    ind_enrl_id = Column(String(64))
+    org_pac_id = Column(String(64))
+    adrs_id = Column(TEXT)
+    facility_name = Column(TEXT)
+    num_org_mem = Column(Integer)
+    address_checksum = Column(BigInteger)
+    generation_id = Column(String(64), nullable=False)
+    source_json = Column(JSON, nullable=False)
+    observed_at = Column(TIMESTAMP, nullable=False)
+    membership_start_at = Column(TIMESTAMP)
+    membership_end_at = Column(TIMESTAMP)
 
 
 class ProviderProfileImportRun(Base, JSONOutputMixin):

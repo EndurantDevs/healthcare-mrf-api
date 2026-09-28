@@ -7,15 +7,18 @@ import datetime
 import hashlib
 import logging
 import os
+import secrets
 import tempfile
 from pathlib import PurePath
 
 from arq import create_pool
 
-from db.models import CMSDoctorEducation, DoctorClinicianAddress, db
-from process.control_cancel import raise_if_cancelled
-from process.control_lifecycle import mark_control_run
-from process.cms_doctors_rows import doctor_address_row
+from db.models import CMSDoctorEducation, CMSDoctorGroupSite, DoctorClinicianAddress, db
+from process.cms_doctors_artifact import (
+    retain_doctors_artifact,
+    validate_doctors_artifact_root,
+    verify_doctors_artifact,
+)
 from process.cms_doctors_education import (
     discard_education_stage,
     import_doctor_education,
@@ -23,9 +26,17 @@ from process.cms_doctors_education import (
     swap_education_stage,
     validate_education_stage,
 )
+from process.cms_doctors_groups import (
+    discard_group_site_stage,
+    import_group_site_rows,
+    swap_group_site_stage,
+    validate_group_site_stage,
+)
+from process.cms_doctors_rows import doctor_address_row
+from process.control_cancel import raise_if_cancelled
+from process.control_lifecycle import mark_control_run
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
-from process.ext.utils import (ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects)
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.redis_config import build_redis_settings
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
@@ -83,7 +94,7 @@ def _normalize_import_id(raw: str | None) -> str:
         cleaned = "".join(ch for ch in str(raw) if ch.isalnum())
         if cleaned:
             return cleaned[:32]
-    return datetime.datetime.now().strftime("%Y%m%d")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S") + secrets.token_hex(4)
 
 
 def _archived_identifier(name: str, suffix: str = "_old") -> str:
@@ -261,6 +272,27 @@ async def _download_doctors_source(client, url: str, source_path: str) -> None:
                 destination.write(chunk)
 
 
+async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode):
+    """Stage the retained source, education, and group-site records together."""
+    if not test_mode:
+        ctx["context"]["artifact"] = retain_doctors_artifact(source_path, url)
+    ctx["context"]["education"] = await import_doctor_education(
+        source_path, url, ctx, task, DEFAULT_DOCTORS_DATASET_ID,
+    )
+    if not test_mode and (
+        ctx["context"]["artifact"]["content_sha256"]
+        != ctx["context"]["education"]["content_sha256"]
+    ):
+        raise RuntimeError("cms_doctors_artifact_digest_mismatch")
+    ctx["context"]["group_site"] = await import_group_site_rows(
+        source_path, ctx, task, ctx["context"]["education"],
+    )
+    group_stage = make_class(CMSDoctorGroupSite, ctx["import_date"])
+    await _create_stage_indexes(
+        group_stage, _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"),
+    )
+
+
 async def import_cms_doctors_data(ctx, task=None):
     """Download and import the current CMS doctors address dataset."""
 
@@ -273,6 +305,8 @@ async def import_cms_doctors_data(ctx, task=None):
     test_mode = bool(ctx["context"].get("test_mode", False))
 
     await ensure_database(test_mode)
+    if not test_mode:
+        validate_doctors_artifact_root()
 
     import_date = ctx["import_date"]
     stage_cls = make_class(DoctorClinicianAddress, import_date)
@@ -293,9 +327,7 @@ async def import_cms_doctors_data(ctx, task=None):
             source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
 
             await _download_doctors_source(client, url, source_path)
-            ctx["context"]["education"] = await import_doctor_education(
-                source_path, url, ctx, task, DEFAULT_DOCTORS_DATASET_ID,
-            )
+            await _stage_doctors_sidecars(source_path, url, ctx, task, test_mode)
             accepted_rows += await _import_doctors_source(
                 source_path,
                 ctx=ctx,
@@ -306,6 +338,7 @@ async def import_cms_doctors_data(ctx, task=None):
                 test_row_limit=test_row_limit,
             )
     except BaseException:
+        await discard_group_site_stage(ctx)
         await discard_education_stage(ctx)
         raise
     finally:
@@ -337,8 +370,7 @@ async def startup(ctx):
     stage_cls = make_class(DoctorClinicianAddress, import_date)
 
     await _ensure_schema_exists(db_schema)
-    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
-    await db.create_table(stage_cls.__table__, checkfirst=True)
+    await db.create_table(stage_cls.__table__, checkfirst=False)
     await _create_stage_indexes(stage_cls, db_schema)
 
     logger.info("CMS Doctors startup ready: schema=%s import_date=%s", db_schema, import_date)
@@ -404,16 +436,18 @@ async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str
                     f"RENAME TO {old_live_name};"
                 )
         await swap_education_stage(import_date, db_schema)
+        await swap_group_site_stage(import_date, db_schema)
         await publish_local_reference_family_generation(db, importer_id="cms-doctors", schema_name=db_schema)
 
 
 async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> dict:
     """Discard this test run's stages and report success without publishing."""
-    for model in (DoctorClinicianAddress, CMSDoctorEducation):
+    for model in (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite):
         stage_cls = make_class(model, ctx["import_date"])
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__}")
     context = ctx.get("context") or {}
     context.pop("education_stage_owned", None)
+    context.pop("group_site_stage_owned", None)
     metrics_by_name = {"rows": stage_rows, "education": context.get("education"), "published": False}
     await mark_control_run(
         str(context.get("control_run_id") or ctx.get("control_run_id") or ""),
@@ -423,6 +457,38 @@ async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> 
         metrics=metrics_by_name,
     )
     return metrics_by_name
+
+
+async def _validate_cms_doctors_publication_sources(import_date, db_schema, context):
+    """Validate both staged datasets against the retained source artifact."""
+    education_manifest = context.get("education")
+    if not education_manifest:
+        raise RuntimeError("cms_education_manifest_missing")
+    await validate_education_stage(import_date, db_schema, education_manifest)
+    group_receipt = context.get("group_site")
+    if not group_receipt or group_receipt["source_rows"] != education_manifest["source_rows"]:
+        raise RuntimeError("cms_group_site_source_rows_mismatch")
+    await validate_group_site_stage(import_date, db_schema, group_receipt)
+    artifact_receipt = context.get("artifact")
+    if (
+        not isinstance(artifact_receipt, dict)
+        or artifact_receipt.get("content_sha256") != education_manifest["content_sha256"]
+    ):
+        raise RuntimeError("cms_doctors_artifact_receipt_mismatch")
+    verify_doctors_artifact(artifact_receipt)
+    return education_manifest, group_receipt
+
+
+def _cms_doctors_terminal_progress(stage_rows):
+    """Describe the completed publication for the control run."""
+    return {
+        "unit": "rows",
+        "done": stage_rows,
+        "total": stage_rows,
+        "pct": 100,
+        "message": "succeeded",
+        "phase": "cms-doctors published",
+    }
 
 
 async def _publish_cms_doctors_generation(ctx):
@@ -449,28 +515,23 @@ async def _publish_cms_doctors_generation(ctx):
             f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
         )
 
-    education_manifest = context.get("education")
-    if not education_manifest:
-        raise RuntimeError("cms_education_manifest_missing")
-    await validate_education_stage(import_date, db_schema, education_manifest)
+    education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
+        import_date, db_schema, context,
+    )
     address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
     await raise_if_cancelled(ctx, {})
     await _publish_cms_doctors_stage(stage_cls, db_schema, import_date)
     context.pop("education_stage_owned", None)
+    context.pop("group_site_stage_owned", None)
 
     logger.info("CMS Doctors publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
-    terminal_progress_by_name = {
-        "unit": "rows",
-        "done": stage_rows,
-        "total": stage_rows,
-        "pct": 100,
-        "message": "succeeded",
-        "phase": "cms-doctors published",
-    }
+    terminal_progress_by_name = _cms_doctors_terminal_progress(stage_rows)
     terminal_metrics_by_name = {
         "rows": stage_rows,
         "education": education_manifest,
+        "group_site": group_receipt,
+        **({"artifact": context["artifact"]} if context.get("artifact") else {}),
         **({"address_resolve": address_stats.__dict__} if address_stats else {}),
     }
     await mark_control_run(
@@ -492,6 +553,7 @@ async def publish_cms_doctors_generation(ctx):
     try:
         return await _publish_cms_doctors_generation(ctx)
     finally:
+        await discard_group_site_stage(ctx)
         await discard_education_stage(ctx)
 
 

@@ -4,7 +4,7 @@
 import importlib.util
 from pathlib import Path
 
-_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260920130000_geo_result_generation.py"
+_MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260929000000_cms_doctor_group_site.py"
 _SPEC = importlib.util.spec_from_file_location("reference_family_generation_fixture_migration", _MIGRATION_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MIGRATION = importlib.util.module_from_spec(_SPEC)
@@ -12,4 +12,5 @@ _SPEC.loader.exec_module(_MIGRATION)
 
 
 def generation_shape_check() -> str:
-    return _MIGRATION._shape_check({**_MIGRATION._CARDINALITY, "geo": 1, "geo-census": 1})
+    previous, counts = _MIGRATION._shape_support()
+    return previous._shape({**counts, "cms-doctors": 3})

@@ -123,6 +123,7 @@ def test_registry_is_closed_to_exact_ordered_replacement_families():
     assert archive.reference_family_spec("cms-doctors").table_names == (
         "doctor_clinician_address",
         "cms_doctor_education",
+        "cms_doctor_group_site",
     )
     assert archive.reference_family_spec("mrf-address").table_names == (
         "mrf_address",

@@ -22,12 +22,18 @@ from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
-
 cms_doctors = importlib.import_module("process.cms_doctors")
 doctor_rows = importlib.import_module("process.cms_doctors_rows")
 lodes = importlib.import_module("process.lodes")
 places = importlib.import_module("process.places_zcta")
 attributes = importlib.import_module("process.attributes")
+_ARTIFACT_DIGEST = "a" * 64
+_ARTIFACT_RECEIPT = {
+    "content_sha256": _ARTIFACT_DIGEST,
+    "content_bytes": 4,
+    "file_name": f"{_ARTIFACT_DIGEST}.csv",
+    "source_url": "https://example.test/doctors.csv",
+}
 
 
 class _AsyncResponse:
@@ -358,6 +364,22 @@ async def test_cms_publish_fails_closed_below_minimum_and_skips_empty_worker(mon
     await cms_doctors.publish_cms_doctors_generation({"context": {"run": 0}})
 
 
+def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
+    expected_metrics_by_name = {
+        "rows": 4,
+        "education": {
+            "education_rows": 4, "source_rows": 4,
+            "content_sha256": _ARTIFACT_DIGEST,
+        },
+        "group_site": {"source_rows": 4},
+        "artifact": _ARTIFACT_RECEIPT,
+        "address_resolve": address_stats.__dict__,
+    }
+    assert marked.await_args.kwargs["metrics"] == expected_metrics_by_name
+    assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
+    assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
+
+
 @pytest.mark.asyncio
 async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypatch):
     """A valid stage atomically replaces the live generation and retains metrics."""
@@ -365,7 +387,12 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     status = AsyncMock()
     worker_context_by_key = {
         "import_date": "run", "context": {
-            "run": 1, "education": {"education_rows": 4},
+            "run": 1, "education": {
+                "education_rows": 4, "source_rows": 4,
+                "content_sha256": _ARTIFACT_DIGEST,
+            },
+            "group_site": {"source_rows": 4},
+            "artifact": _ARTIFACT_RECEIPT,
             "control_run_id": "control", "start": "started", "education_stage_owned": True,
         },
     }
@@ -399,7 +426,11 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
     monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "publish_local_reference_family_generation", AsyncMock())
 
     terminal_result = await cms_doctors.publish_cms_doctors_generation(worker_context_by_key)
@@ -408,13 +439,8 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
     assert terminal_result["address_resolve"] == address_stats.__dict__
-    assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
-    assert marked.await_args.kwargs["metrics"] == {
-        "rows": 4,
-        "education": {"education_rows": 4},
-        "address_resolve": address_stats.__dict__,
-    }
-    assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
+    verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
+    _assert_cms_publish_metrics(marked, terminal_result, address_stats)
 
 
 @pytest.mark.asyncio
@@ -433,17 +459,75 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
     monkeypatch.setattr(cms_doctors, "publish_local_reference_family_generation", AsyncMock())
 
     await cms_doctors.publish_cms_doctors_generation(
-        {"import_date": "run", "context": {"run": 1, "education": {"education_rows": 10000}, "control_run_id": "control", "start": "start"}}
+        {"import_date": "run", "context": {
+            "run": 1,
+            "education": {"education_rows": 10000, "source_rows": 10000,
+                          "content_sha256": _ARTIFACT_DIGEST},
+            "group_site": {"source_rows": 10000},
+            "artifact": _ARTIFACT_RECEIPT,
+            "control_run_id": "control", "start": "start",
+        }}
     )
+    verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     assert marked.await_args.kwargs["metrics"] == {
         "rows": cms_doctors.DEFAULT_MIN_ROWS,
-        "education": {"education_rows": 10000},
+        "education": {"education_rows": 10000, "source_rows": 10000,
+                      "content_sha256": _ARTIFACT_DIGEST},
+        "group_site": {"source_rows": 10000},
+        "artifact": _ARTIFACT_RECEIPT,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "artifact_state", ("missing", "malformed", "digest_mismatch", "changed")
+)
+async def test_cms_publish_requires_intact_retained_artifact_before_swap(
+    monkeypatch, artifact_state,
+):
+    """A staged generation cannot publish when its source artifact is unproved."""
+
+    run_context_by_key = {
+        "run": 1,
+        "education": {"source_rows": 4, "content_sha256": _ARTIFACT_DIGEST},
+        "group_site": {"source_rows": 4},
+        "artifact": _ARTIFACT_RECEIPT,
+    }
+    if artifact_state == "missing":
+        run_context_by_key.pop("artifact")
+    elif artifact_state == "malformed":
+        run_context_by_key["artifact"] = ["unexpected"]
+    elif artifact_state == "digest_mismatch":
+        run_context_by_key["artifact"] = {**_ARTIFACT_RECEIPT, "content_sha256": "b" * 64}
+    verify = create_autospec(cms_doctors.verify_doctors_artifact)
+    if artifact_state == "changed":
+        verify.side_effect = RuntimeError("cms_doctors_artifact_changed")
+    publish = AsyncMock()
+    monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: SimpleNamespace(__tablename__="doctor_stage"))
+    monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=4))
+    monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
+    monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify)
+    monkeypatch.setattr(cms_doctors, "_publish_cms_doctors_stage", publish)
+
+    expected = "artifact_changed" if artifact_state == "changed" else "artifact_receipt_mismatch"
+    with pytest.raises(RuntimeError, match=expected):
+        await cms_doctors.publish_cms_doctors_generation(
+            {"import_date": "run", "context": run_context_by_key}
+        )
+    publish.assert_not_awaited()
+    assert verify.call_count == int(artifact_state == "changed")
 
 
 @pytest.mark.asyncio
@@ -454,6 +538,7 @@ async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
     stage_by_model = {
         cms_doctors.DoctorClinicianAddress: SimpleNamespace(__tablename__="doctor_stage"),
         cms_doctors.CMSDoctorEducation: SimpleNamespace(__tablename__="education_stage"),
+        cms_doctors.CMSDoctorGroupSite: SimpleNamespace(__tablename__="group_stage"),
     }
     marked = create_autospec(cms_doctors.mark_control_run)
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
@@ -471,6 +556,7 @@ async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
     assert result["published"] is False
     assert [call.args[0] for call in status.await_args_list] == [
         "DROP TABLE IF EXISTS mrf.doctor_stage", "DROP TABLE IF EXISTS mrf.education_stage",
+        "DROP TABLE IF EXISTS mrf.group_stage",
     ]
     assert marked.await_args.kwargs["progress_message"] == "succeeded"
 
@@ -488,6 +574,8 @@ async def test_cms_worker_downloads_one_source_closes_client_and_marks_run(monke
     monkeypatch.setattr(cms_doctors, "_download_doctors_source", AsyncMock())
     monkeypatch.setattr(cms_doctors, "_import_doctors_source", AsyncMock(return_value=7))
     monkeypatch.setattr(cms_doctors, "import_doctor_education", AsyncMock(return_value={"education_rows": 7}))
+    monkeypatch.setattr(cms_doctors, "import_group_site_rows", AsyncMock(return_value={"source_rows": 7}))
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(cms_doctors, "DEFAULT_DOCTORS_DATASET_ID", "synthetic-cms-dataset")
     worker_context_by_key = {"import_date": "run", "context": {}}
 
@@ -524,7 +612,32 @@ async def test_cms_startup_and_entrypoint_build_stage_and_enqueue_exact_task(mon
 
     assert worker_context_by_key["import_date"] == "run01"
     assert worker_context_by_key["context"]["run"] == 0
-    assert "DROP TABLE IF EXISTS" in status.await_args.args[0]
+    status.assert_not_awaited()
+    cms_doctors.db.create_table.assert_awaited_once_with("table", checkfirst=False)
     pool.enqueue_job.assert_awaited_once_with(
         "process_data", {"test_mode": True}, _queue_name=cms_doctors.CMS_DOCTORS_QUEUE_NAME
     )
+
+
+def test_cms_default_stage_ids_are_unique_per_worker(monkeypatch):
+    """Independent workers must never share a date-only staging table name."""
+    suffixes = iter(("11111111", "22222222"))
+    monkeypatch.setattr(cms_doctors.secrets, "token_hex", lambda _size: next(suffixes))
+    first = cms_doctors._normalize_import_id(None)
+    second = cms_doctors._normalize_import_id(None)
+    assert first != second
+    assert len(first) == len(second) == 22
+
+
+@pytest.mark.asyncio
+async def test_cms_artifact_root_is_checked_before_source_download(monkeypatch):
+    """Missing durable storage fails before the worker fetches source bytes."""
+    fetch_url = AsyncMock()
+    monkeypatch.setenv("HLTHPRT_CMS_DOCTORS_ARTIFACT_ROOT", "")
+    monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", fetch_url)
+    with pytest.raises(RuntimeError, match="artifact_root_required"):
+        await cms_doctors.import_cms_doctors_data({"import_date": "run", "context": {}}, {})
+    fetch_url.assert_not_awaited()
