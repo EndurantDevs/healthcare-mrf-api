@@ -14,6 +14,7 @@ pub const PROVIDER_DIRECTORY_PROJECTION_MAX_RESOURCE_COUNT: usize = 100_000;
 pub const COPY_SPOOL_CONTRACT_ID: &str =
     "healthporta.provider-directory.native-projection-copy-spool.v2";
 pub const TRANSFORM_CONTRACT_ID: &str = "healthporta.provider-directory.fhir-profile-projection.v2";
+pub const EXPLICIT_NPI_ONLY_POLICY: &str = "explicit-only-v1";
 pub const COPY_CONTRACT_ID: &str = "healthporta.postgresql.binary-copy.v1";
 pub const COPY_COLUMN_CONTRACT_ID: &str =
     "healthporta.provider-directory.projection-stage-columns.v1";
@@ -55,11 +56,18 @@ impl ProviderDirectoryInputFraming {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NpiIdentityPolicy {
+    Legacy,
+    ExplicitOnly,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionCopyContext {
     pub recipe_id: String,
     pub partition_id: String,
     pub partition_ordinal: u32,
+    pub npi_identity_policy: NpiIdentityPolicy,
 }
 
 #[derive(Clone, Debug)]

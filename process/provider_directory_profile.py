@@ -22,7 +22,12 @@ from process.provider_directory_profile_reference_sql import (
 from process.provider_directory_profile_source_spec_contract import (
     validated_profile_source_spec,
 )
-
+from process.provider_directory_projection_fhir_values import (
+    NPI_LUHN_PREFIX_DIGIT_SUM,
+    NPI_MAX,
+    NPI_MIN,
+    is_valid_npi,
+)
 
 PROFILE_TABLE = "provider_directory_profile"
 PROFILE_EVIDENCE_TABLE = "provider_directory_profile_evidence"
@@ -65,9 +70,6 @@ PROFILE_EVIDENCE_FACT_TYPES = (
 )
 PROFILE_AFFILIATION_ROLE_BUCKETS = 32
 PROFILE_NPI_BATCH_SIZE = 5_000_000
-NPI_MIN = 1_000_000_000
-NPI_MAX = 2_999_999_999
-NPI_LUHN_PREFIX_DIGIT_SUM = 24
 
 PROFILE_INDEX_SUFFIXES = ("generation_idx",)
 PROFILE_EVIDENCE_INDEX_SUFFIXES = (
@@ -124,25 +126,6 @@ def sibling_table_ref(table_ref: str, table_name: str) -> str:
     if not separator:
         return quote_identifier(table_name)
     return f"{qualifier}.{quote_identifier(table_name)}"
-
-
-def is_valid_npi(value: Any) -> bool:
-    """Return whether a value is a CMS-assignable NPI with a valid check digit."""
-    value_text = str(value).strip()
-    if len(value_text) != 10 or not value_text.isascii() or not value_text.isdigit():
-        return False
-    npi_value = int(value_text)
-    if not NPI_MIN <= npi_value <= NPI_MAX:
-        return False
-    digits = [int(digit) for digit in value_text]
-    digit_sum = NPI_LUHN_PREFIX_DIGIT_SUM + digits[-1]
-    for position, digit in enumerate(digits[:-1], start=1):
-        if position % 2:
-            doubled = digit * 2
-            digit_sum += doubled - 9 if doubled > 9 else doubled
-        else:
-            digit_sum += digit
-    return digit_sum % 10 == 0
 
 
 def valid_npi_sql(value_sql: str) -> str:

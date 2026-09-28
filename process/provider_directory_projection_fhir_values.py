@@ -4,13 +4,36 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 import math
+from decimal import Decimal
 from typing import Any, Mapping
 
 from process.provider_directory_projection_types import (
     ProviderDirectoryProjectionError,
 )
+
+NPI_MIN = 1_000_000_000
+NPI_MAX = 2_999_999_999
+NPI_LUHN_PREFIX_DIGIT_SUM = 24
+
+
+def is_valid_npi(value: Any) -> bool:
+    """Return whether a value is a CMS-assignable NPI with a valid check digit."""
+    value_text = str(value).strip()
+    if len(value_text) != 10 or not value_text.isascii() or not value_text.isdigit():
+        return False
+    npi_value = int(value_text)
+    if not NPI_MIN <= npi_value <= NPI_MAX:
+        return False
+    digits = [int(digit) for digit in value_text]
+    digit_sum = NPI_LUHN_PREFIX_DIGIT_SUM + digits[-1]
+    for position, digit in enumerate(digits[:-1], start=1):
+        if position % 2:
+            doubled = digit * 2
+            digit_sum += doubled - 9 if doubled > 9 else doubled
+        else:
+            digit_sum += digit
+    return digit_sum % 10 == 0
 
 
 def invalid_fhir_field(field_name: str) -> ProviderDirectoryProjectionError:

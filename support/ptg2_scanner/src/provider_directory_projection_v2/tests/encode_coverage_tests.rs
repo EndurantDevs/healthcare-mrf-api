@@ -1,5 +1,6 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+use super::super::contracts::NpiIdentityPolicy;
 use super::*;
 use serde_json::json;
 
@@ -8,6 +9,7 @@ fn context() -> ProjectionCopyContext {
         recipe_id: "a".repeat(64),
         partition_id: "b".repeat(64),
         partition_ordinal: 7,
+        npi_identity_policy: NpiIdentityPolicy::Legacy,
     }
 }
 
