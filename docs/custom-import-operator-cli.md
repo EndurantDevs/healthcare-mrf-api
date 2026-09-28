@@ -24,6 +24,22 @@ receipt. This does not guarantee that an active worker has already stopped:
 python -m custom_import_cli cancel --execution-id 17
 ```
 
+Resume an existing retained Snowflake capture with its same definition, source
+binding, and idempotency key:
+
+```sh
+python -m custom_import_snowflake_operator resume \
+  --definition-revision-id 12 --source-binding-revision-id 14 \
+  --idempotency-key synthetic-recovery
+```
+
+This source-specific command rebuilds the retained request and statement but
+does not open source credentials or acquire the source again. It accepts only
+an existing capture-bound execution in `running` or `canceling` state with an
+expired database lease. Queued, terminal, live-lease, unbound, and mismatched
+executions fail with a redacted receipt. A `canceling` execution is only
+acknowledged as canceled. The command never automatically retries.
+
 Activate an initial generation only while the current pointer is absent:
 
 ```sh
@@ -51,5 +67,6 @@ cleanup. Errors omit database diagnostics and record payloads. A connection
 cleanup failure can occur after commit: a failed command does not prove rollback.
 Reconcile exact state with `status` before another mutation.
 
-Use `--help` on the entry point or any command for its arguments. Generic resume,
-discovery, preview, and estimate are not exposed by this entry point yet.
+Use `--help` on the entry point or any command for its arguments. Generic
+resume, discovery, preview, and estimate remain unavailable from
+`custom_import_cli`.

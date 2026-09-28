@@ -108,6 +108,7 @@ class _SyntheticSession:
                 state=column_values["state"],
                 capture_bundle_id=column_values.get("capture_bundle_id"),
                 request_identity_sha256=column_values.get("request_identity_sha256"),
+                source_binding_revision_id=column_values.get("source_binding_revision_id"),
                 terminal_reason=None,
                 started_at=None,
                 finished_at=None,
@@ -310,6 +311,46 @@ async def test_lookup_rejects_dirty_sessions_before_refreshing_execution():
 
     assert len(session.statements) == statement_count
     assert execution.terminal_reason == "pending-edit"
+
+
+@pytest.mark.asyncio
+async def test_lookup_requires_the_exact_optional_source_binding_revision():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-bound-lookup").digest()
+    await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+        source_binding_revision_id=44,
+    )
+
+    exact = await lifecycle.lookup_execution_request(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+        source_binding_revision_id=44,
+    )
+    assert exact is not None and exact.execution_id == 1
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.lookup_execution_request(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-bound-lookup",
+            mechanism="local",
+            request_identity_sha256=identity,
+            source_binding_revision_id=45,
+        )
 
 
 @pytest.mark.asyncio
