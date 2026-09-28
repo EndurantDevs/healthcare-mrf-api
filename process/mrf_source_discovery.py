@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import ssl
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -2928,7 +2929,7 @@ def _candidate_source_key(
             if identity_part
         )
     )
-    return f"{source_key_base[:80]}-{source_id[-8:]}"
+    return f"{source_key_base[:80]}-{source_id[-12:]}"
 
 
 def _candidate_source_row(
@@ -2985,10 +2986,12 @@ def _candidate_to_rows(
     now: dt.datetime,
     *,
     discovery_run_id: str | None = None,
+    payer_id: str | None = None,
+    source_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Convert one source candidate into payer and source database rows."""
 
-    payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
+    payer_id = payer_id or f"mrfpayer_{uuid.uuid4().hex}"
     source_url = candidate.index_url or candidate.human_url
     aliases = sorted(
         {
@@ -3000,14 +3003,7 @@ def _candidate_to_rows(
     )
     candidate_metadata = _candidate_metadata(candidate, aliases)
     target_payer_query = _candidate_target_payer_query(candidate)
-    source_identity_dict: dict[str, Any] = {
-        "payer": payer_id,
-        "url": _canonical_or_none(source_url),
-        "provider": candidate.provider,
-    }
-    if target_payer_query:
-        source_identity_dict["target_payer_query"] = target_payer_query
-    source_id = _id("mrfsource", source_identity_dict)
+    source_id = source_id or f"mrfsource_{uuid.uuid4().hex}"
     payer_row_dict = _candidate_payer_row(
         candidate, now, payer_id, aliases, candidate_metadata
     )
@@ -3108,33 +3104,13 @@ def _merge_payer_candidate_row(
     }
 
 
-async def _store_candidates(
-    candidates: list[SourceCandidate],
-    *,
-    discovery_run_id: str | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Normalize and persist discovered payer and source rows."""
-    now = _utc_now()
-    payer_rows_by_id: dict[str, dict[str, Any]] = {}
-    source_rows_by_id: dict[str, dict[str, Any]] = {}
-    for candidate in candidates:
-        payer_row, source_row = _candidate_to_rows(
-            candidate,
-            now,
-            discovery_run_id=discovery_run_id,
-        )
-        existing = payer_rows_by_id.get(payer_row["payer_id"])
-        if existing:
-            _merge_payer_candidate_row(existing, payer_row, candidate)
-        else:
-            payer_rows_by_id[payer_row["payer_id"]] = payer_row
-        if source_row:
-            source_rows_by_id[source_row["source_id"]] = source_row
-    payer_rows = list(payer_rows_by_id.values())
-    source_rows = list(source_rows_by_id.values())
-    await push_objects(payer_rows, MRFPayer, rewrite=True, use_copy=False)
-    await push_objects(source_rows, MRFSource, rewrite=True, use_copy=False)
-    return payer_rows, source_rows
+from process.mrf_payer_identity import (
+    _curated_payer_row_key,
+    _preserved_payer_updates,
+    _preserved_source_updates,
+    is_candidate_bound_to_source as _candidate_matches_stored_source,
+    store_candidates as _store_candidates,
+)
 
 
 async def _retag_sources_for_discovery_run(
