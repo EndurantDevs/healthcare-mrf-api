@@ -586,6 +586,44 @@ async def test_get_near_npi(monkeypatch):
     assert "search_taxonomy_codes" not in response_body[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code_filter", ("procedure_codes", "medication_codes"))
+@pytest.mark.parametrize("include_total", (False, True))
+async def test_native_geo_unresolved_codes_keep_empty_response_and_skip_database(
+    monkeypatch, code_filter, include_total
+):
+    resolver = AsyncMock(return_value=([], None))
+    monkeypatch.setattr(npi_module, "_resolve_internal_filter_codes", resolver)
+    monkeypatch.setattr(npi_module, "_resolve_filter_year", AsyncMock(return_value=(2023, "requested")))
+
+    def unexpected_query(*_args, **_kwargs):
+        raise AssertionError("unresolved native codes reached downstream query work")
+
+    for name in (
+        "_resolve_npi_filter_capabilities", "_address_serving_table_sql",
+        "_plan_release_npi_scope", "build_imported_geo_statements",
+    ):
+        monkeypatch.setattr(npi_module, name, unexpected_query)
+    monkeypatch.setattr(npi_module, "db", types.SimpleNamespace(acquire=unexpected_query))
+    request = types.SimpleNamespace(
+        args={
+            "lat": "41.0", "long": "-87.0", code_filter: "123",
+            "year": "2023", "include_total": str(include_total).lower(),
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    response = await npi_module.get_near_npi(request)
+
+    assert response.status == 200
+    assert json.loads(response.body) == (
+        {"items": [], "total_count": 0, "next_cursor": None, "has_more": False,
+         "result_identity": ["npi", "address_key"]}
+        if include_total else []
+    )
+    resolver.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     ("radius_value", "expected_radius"),
     [(None, 10.0), ("0", 0.0), ("2.5", 2.5), ("100", 100.0)],
