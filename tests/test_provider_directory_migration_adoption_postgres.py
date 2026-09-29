@@ -121,6 +121,11 @@ async def main():
         def seed(sync_connection):
             models_by_table = _model_by_table_fullname()
             future_strict_tables = {
+                "provider_directory_organization_identity",
+                "provider_directory_site_identity",
+                "provider_directory_entity_source_binding",
+                "provider_directory_entity_release_evidence",
+                "provider_directory_cms_doctors_group_binding",
                 "provider_directory_profile_build_checkpoint",
                 "provider_directory_profile_capacity_lease_consumption",
                 "provider_directory_profile_capacity_preflight_receipt",
