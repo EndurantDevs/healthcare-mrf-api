@@ -154,6 +154,7 @@ async def main():
                 "provider_directory_rooted_graph_dataset",
                 "provider_directory_rooted_graph_dataset_resource",
                 "provider_directory_cms_npd_stale_candidate",
+                "provider_directory_cms_npd_resource_witness",
             }
             target_tables = [
                 table

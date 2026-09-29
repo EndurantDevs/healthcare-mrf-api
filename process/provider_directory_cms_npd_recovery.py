@@ -37,7 +37,9 @@ async def is_disposed(fhir: Any, dataset_id: str) -> bool:
     )
 
 
-async def reusable_vector_candidate(fhir: Any, endpoint_id: str, identity: dict[str, Any]) -> str | None:
+async def reusable_vector_candidate(
+    fhir: Any, endpoint_id: str, identity: dict[str, Any], *, previous_dataset_id: str | None = None
+) -> str | None:
     """Resume an exact recurring vector after its first candidate was disposed."""
 
     dataset = _table(fhir, "provider_directory_endpoint_dataset")
@@ -47,6 +49,7 @@ async def reusable_vector_candidate(fhir: Any, endpoint_id: str, identity: dict[
         "AND candidate.publication_metadata_json::jsonb -> 'source_release' = CAST(:release AS jsonb) "
         "AND (candidate.status IN (:acquiring, :validated) "
         "OR (candidate.status=:published AND candidate.is_current=true)) "
+        "AND (CAST(:previous_dataset_id AS text) IS NULL OR candidate.previous_dataset_id=:previous_dataset_id) "
         f"AND {candidate_available_sql('candidate', fhir._schema())} "
         "ORDER BY candidate.created_at DESC, candidate.dataset_id DESC LIMIT 1",
         endpoint_id=endpoint_id,
@@ -54,6 +57,7 @@ async def reusable_vector_candidate(fhir: Any, endpoint_id: str, identity: dict[
         acquiring=fhir.ENDPOINT_DATASET_ACQUIRING,
         validated=fhir.ENDPOINT_DATASET_VALIDATED,
         published=fhir.ENDPOINT_DATASET_PUBLISHED,
+        previous_dataset_id=previous_dataset_id,
     )
     return row[0] if row is not None else None
 
@@ -194,6 +198,15 @@ async def dispose_changed_vector(fhir: Any, candidate: Any, identity: dict[str, 
         prior_status = await _dispose_locked(fhir, candidate, identity)
     if prior_status == fhir.ENDPOINT_DATASET_ACQUIRING:
         await _clear_failed_rows(fhir, candidate, identity)
+
+
+async def retire_unwitnessed_validated_candidate(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
+    """Exclude an exact old sealed candidate before witnessed reacquisition."""
+
+    async with fhir.db.transaction():
+        prior_status = await _dispose_locked(fhir, candidate, identity)
+        if prior_status != fhir.ENDPOINT_DATASET_VALIDATED:
+            raise RuntimeError("cms_npd_witness_upgrade_candidate_state_changed")
 
 
 async def dispose_prior_vectors(fhir: Any, endpoint_id: str, new_vector_sha256: str) -> None:

@@ -146,6 +146,8 @@ async def test_current_observation_requires_exact_covered_publication(monkeypatc
         yield object()
 
     monkeypatch.setattr(fhir.db, "session", session)
+    has_witnesses = AsyncMock(return_value=True)
+    monkeypatch.setattr(fhir.db, "scalar", has_witnesses)
     monkeypatch.setattr(fhir, "_schema", lambda: "synthetic")
     monkeypatch.setattr(fhir, "_endpoint_dataset_state", AsyncMock(return_value=state_by_field))
     accepted = importlib.import_module("api.provider_directory_cms_generation")
@@ -155,6 +157,9 @@ async def test_current_observation_requires_exact_covered_publication(monkeypatc
     monkeypatch.setattr(coverage, "require_cms_coverage", covered)
     assert await cms._current_observed_publication(_observation()) == state_by_field
     covered.assert_awaited_once()
+    has_witnesses.return_value = False
+    assert await cms._current_observed_publication(_observation()) is None
+    has_witnesses.return_value = True
     state_by_field["publication_metadata_json"]["source_release"]["manifest_sha256"] = "d" * 64
     assert await cms._current_observed_publication(_observation()) is None
 
@@ -391,6 +396,54 @@ def test_complete_scope_and_exact_release_vector_are_required():
 
 
 @pytest.mark.asyncio
+async def test_empty_witness_group_is_zero_but_unknown_group_is_rejected():
+    """A complete eight-file receipt may contain one empty resource family."""
+
+    identity = cms.release_identity(_receipt())
+    identity["files"]["03-Endpoint.ndjson"]["distinct_count"] = 0
+    projected_counts = [(resource_type, 1, 1) for resource_type in cms.RESOURCE_TYPES if resource_type != "Endpoint"]
+    database = SimpleNamespace(all=AsyncMock(return_value=projected_counts))
+    fake_fhir = SimpleNamespace(
+        _schema=lambda: "mrf",
+        _qt=lambda schema, name: f"{schema}.{name}",
+        ProviderDirectoryDatasetResource=SimpleNamespace(__tablename__="provider_directory_dataset_resource"),
+        db=database,
+    )
+    candidate = SimpleNamespace(dataset_id="dataset-synthetic")
+    await cms._assert_witness_counts(fake_fhir, candidate, identity)
+    database.all.return_value = projected_counts + [("UnknownResource", 1, 1)]
+    with pytest.raises(RuntimeError, match="cms_npd_witness_counts_incomplete"):
+        await cms._assert_witness_counts(fake_fhir, candidate, identity)
+
+
+@pytest.mark.asyncio
+async def test_witness_replay_reads_hashes_without_raw_payload():
+    """A changed raw payload fails replay without fetching large source JSON."""
+
+    witness_by_field = {
+        "dataset_id": "dataset-synthetic",
+        "source_id": "cms-npd",
+        "release_id": "a" * 64,
+        "resource_type": "Location",
+        "resource_id": "site-1",
+        "raw_payload_sha256": "b" * 64,
+        "normalized_payload_hash": "c" * 64,
+        "raw_payload_json": {"resourceType": "Location", "id": "site-1", "text": "x" * 100_000},
+    }
+    stored_by_field = {
+        field: field_value for field, field_value in witness_by_field.items() if field != "raw_payload_json"
+    }
+    query_response = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [stored_by_field]))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, query_response, None, query_response]))
+    await cms._insert_verified_witnesses(session, {witness_by_field["resource_id"]: witness_by_field})
+    selected_columns = set(session.execute.call_args_list[1].args[0].selected_columns.keys())
+    assert selected_columns == set(stored_by_field)
+    witness_by_field["raw_payload_sha256"] = "d" * 64
+    with pytest.raises(RuntimeError, match="cms_npd_witness_payload_conflict"):
+        await cms._insert_verified_witnesses(session, {witness_by_field["resource_id"]: witness_by_field})
+
+
+@pytest.mark.asyncio
 async def test_rollback_parameters_require_exact_cms_source_before_database_access(monkeypatch):
     database_setup = AsyncMock()
     monkeypatch.setattr(fhir, "ensure_database", database_setup)
@@ -604,6 +657,7 @@ async def test_missing_identity_evidence_blocks_validation_and_publication(monke
     monkeypatch.setattr(cms, "_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(cms, "_stream_file", AsyncMock(return_value=1))
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
+    monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms.source, "verify_release", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cms.source, "verify_retained_release", lambda *_args: None)
     monkeypatch.setattr(
@@ -697,9 +751,9 @@ async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path)
     persist = AsyncMock()
     fake_fhir = SimpleNamespace(
         RESOURCE_MODELS_BY_TYPE={"Organization": model},
-        _persist_endpoint_dataset_rows=persist,
         _raise_if_resource_import_cancelled=AsyncMock(),
     )
+    monkeypatch.setattr(cms, "_persist_source_batch", persist)
     monkeypatch.setattr(cms, "BATCH_MAX_DECODED_BYTES", 1)
     monkeypatch.setattr(cms, "_parse_batch_row", lambda *_args: (model, {"id": "synthetic"}))
     candidate = SimpleNamespace(
@@ -728,6 +782,7 @@ async def test_retained_verification_failure_never_reaches_validation(
     monkeypatch.setattr(cms, "_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(cms, "_stream_file", AsyncMock(return_value=1))
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
+    monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
     finalizer = AsyncMock(return_value={"validated": True})
     publisher = AsyncMock()
@@ -787,6 +842,7 @@ async def test_replaced_release_after_validation_never_reaches_cutover(monkeypat
     monkeypatch.setattr(cms, "_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(cms, "_stream_file", AsyncMock(return_value=1))
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
+    monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
     finalizer = AsyncMock(return_value={"validated": True})
 
@@ -841,6 +897,7 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
     monkeypatch.setattr(cms, "_candidate", candidate_factory)
     monkeypatch.setattr(cms, "_stream_file", AsyncMock(return_value=1))
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
+    monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
     local_rechecks = []
     monkeypatch.setattr(cms.source, "verify_retained_release", lambda *_args: local_rechecks.append(True))

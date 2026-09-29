@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -17,7 +18,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from db.models import ProviderDirectoryCMSNPDResourceWitness
 from process import cms_npd_source as source
 from process import provider_directory_cms_npd_recovery as recovery
 from process.provider_directory_source_local_publication import (
@@ -354,13 +358,57 @@ async def _admission_candidate(
             existing_dataset_id = await recovery.reusable_vector_candidate(fhir, endpoint_id, identity)
             if existing_dataset_id is None:
                 candidate_key = f"cms-npd-reacquire:{identity['vector_sha256']}:{run_id}"
-    return await _candidate(
+    selected_candidate = await _candidate(
         fhir,
         endpoint_id,
         run_id,
         identity,
         candidate_key=candidate_key,
         existing_dataset_id=existing_dataset_id,
+    )
+    return await _reacquire_unwitnessed_candidate(fhir, endpoint_id, run_id, identity, selected_candidate)
+
+
+async def _reacquire_unwitnessed_candidate(
+    fhir: Any, endpoint_id: str, run_id: str, identity: dict[str, Any], selected_candidate: Any
+) -> Any:
+    """Upgrade a sealed pre-witness candidate without editing its authority."""
+
+    if not (selected_candidate.already_validated or selected_candidate.already_published):
+        return selected_candidate
+    if not sum(file_by_field["distinct_count"] for file_by_field in identity["files"].values()):
+        return selected_candidate
+    if await _has_raw_witnesses(fhir, selected_candidate.dataset_id):
+        return selected_candidate
+    # An older sealed candidate cannot be edited. Reacquire into a stable new
+    # candidate while a published predecessor remains the current authority.
+    if selected_candidate.already_validated:
+        await recovery.retire_unwitnessed_validated_candidate(fhir, selected_candidate, identity)
+    predecessor_id = (
+        selected_candidate.dataset_id
+        if selected_candidate.already_published
+        else selected_candidate.previous_dataset_id
+    )
+    reusable_id = await recovery.reusable_vector_candidate(
+        fhir, endpoint_id, identity, previous_dataset_id=predecessor_id
+    )
+    return await _candidate(
+        fhir,
+        endpoint_id,
+        run_id,
+        identity,
+        candidate_key=f"cms-npd-witness-upgrade:{selected_candidate.dataset_id}:{run_id}",
+        existing_dataset_id=reusable_id,
+    )
+
+
+async def _has_raw_witnesses(fhir: Any, dataset_id: str) -> bool:
+    witness_table = fhir._qt(fhir._schema(), ProviderDirectoryCMSNPDResourceWitness.__tablename__)
+    return bool(
+        await fhir.db.scalar(
+            f"SELECT EXISTS (SELECT 1 FROM {witness_table} WHERE dataset_id=:dataset_id)",
+            dataset_id=dataset_id,
+        )
     )
 
 
@@ -380,9 +428,108 @@ def _parse_batch_row(fhir: Any, resource: dict[str, Any], candidate: Any) -> tup
     return model, resource_row_by_field
 
 
+def _source_witnesses_by_id(
+    raw_resources: list[dict[str, Any]], candidate: Any, resource_type: str
+) -> dict[str, dict[str, Any]]:
+    """Deduplicate identical raw occurrences under one release identity."""
+
+    witness_by_id: dict[str, dict[str, Any]] = {}
+    for raw_resource_by_field in raw_resources:
+        resource_id = raw_resource_by_field["id"]
+        raw_payload = json.dumps(
+            raw_resource_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        raw_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+        existing_witness = witness_by_id.get(resource_id)
+        if existing_witness is not None and existing_witness["raw_payload_sha256"] != raw_hash:
+            raise RuntimeError("cms_npd_witness_payload_conflict")
+        witness_by_id[resource_id] = {
+            "dataset_id": candidate.dataset_id,
+            "source_id": SOURCE_ID,
+            "release_id": candidate.source_release["vector_sha256"],
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "raw_payload_sha256": raw_hash,
+            "raw_payload_json": raw_resource_by_field,
+        }
+    return witness_by_id
+
+
+async def _insert_verified_witnesses(session: Any, witness_by_id: dict[str, dict[str, Any]]) -> None:
+    """Insert new witnesses and check replay using fixed-size bindings and hashes."""
+
+    table = ProviderDirectoryCMSNPDResourceWitness.__table__
+    replay_fields = (
+        "dataset_id",
+        "source_id",
+        "release_id",
+        "resource_type",
+        "resource_id",
+        "raw_payload_sha256",
+        "normalized_payload_hash",
+    )
+    first_witness = next(iter(witness_by_id.values()))
+    await session.execute(
+        pg_insert(table)
+        .values(list(witness_by_id.values()))
+        .on_conflict_do_nothing(index_elements=["dataset_id", "resource_type", "resource_id"]),
+    )
+    stored_witnesses = (
+        (
+            await session.execute(
+                select(*(table.c[field] for field in replay_fields)).where(
+                    table.c.dataset_id == first_witness["dataset_id"],
+                    table.c.resource_type == first_witness["resource_type"],
+                    table.c.resource_id.in_(witness_by_id),
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if len(stored_witnesses) != len(witness_by_id) or any(
+        any(stored_witness[field] != witness_by_id[stored_witness["resource_id"]][field] for field in replay_fields)
+        for stored_witness in stored_witnesses
+    ):
+        raise RuntimeError("cms_npd_witness_payload_conflict")
+
+
+async def _persist_source_batch(
+    fhir: Any,
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    raw_resources: list[dict[str, Any]],
+    candidate: Any,
+    resource_type: str,
+) -> None:
+    """Commit normalized rows and their complete CMS witnesses together."""
+
+    if len(resource_rows) != len(raw_resources):
+        raise RuntimeError("cms_npd_witness_batch_invalid")
+    witness_by_id = _source_witnesses_by_id(raw_resources, candidate, resource_type)
+    async with fhir.db.transaction() as session:
+        normalized_rows = await fhir._persist_endpoint_dataset_rows(
+            model,
+            resource_rows,
+            candidate.dataset_id,
+            resource_hash_contract=candidate.resource_hash_contract,
+            semantic_projection_as_of=candidate.semantic_projection_as_of,
+        )
+        normalized_by_id = {normalized_row["resource_id"]: normalized_row for normalized_row in normalized_rows}
+        if set(normalized_by_id) != set(witness_by_id) or any(
+            normalized_row["resource_type"] != resource_type or normalized_row["dataset_id"] != candidate.dataset_id
+            for normalized_row in normalized_rows
+        ):
+            raise RuntimeError("cms_npd_witness_projection_mismatch")
+        for resource_id, witness in witness_by_id.items():
+            witness["normalized_payload_hash"] = normalized_by_id[resource_id]["payload_hash"]
+        await _insert_verified_witnesses(session, witness_by_id)
+
+
 async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str, ctx: dict, task: dict) -> int:
     model = fhir.RESOURCE_MODELS_BY_TYPE[resource_type]
     resource_rows: list[dict[str, Any]] = []
+    raw_resources: list[dict[str, Any]] = []
     row_count = 0
     batch_bytes = 0
     with zstd.open(path, "rb") as decoded:
@@ -399,27 +546,17 @@ async def _stream_file(fhir: Any, path: Path, candidate: Any, resource_type: str
             if parsed_model is not model:
                 raise source.CmsNpdSourceError("cms_npd_resource_invalid")
             resource_rows.append(resource_row_by_field)
+            raw_resources.append(resource)
             row_count += 1
             batch_bytes += len(line)
             if len(resource_rows) >= BATCH_SIZE or batch_bytes >= BATCH_MAX_DECODED_BYTES:
-                await fhir._persist_endpoint_dataset_rows(
-                    model,
-                    resource_rows,
-                    candidate.dataset_id,
-                    resource_hash_contract=candidate.resource_hash_contract,
-                    semantic_projection_as_of=candidate.semantic_projection_as_of,
-                )
+                await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
                 resource_rows.clear()
+                raw_resources.clear()
                 batch_bytes = 0
                 await fhir._raise_if_resource_import_cancelled(ctx, task)
     if resource_rows:
-        await fhir._persist_endpoint_dataset_rows(
-            model,
-            resource_rows,
-            candidate.dataset_id,
-            resource_hash_contract=candidate.resource_hash_contract,
-            semantic_projection_as_of=candidate.semantic_projection_as_of,
-        )
+        await _persist_source_batch(fhir, model, resource_rows, raw_resources, candidate, resource_type)
     return row_count
 
 
@@ -637,6 +774,40 @@ async def _assert_counts(fhir: Any, candidate: Any, identity: dict[str, Any]) ->
     return expected_by_type
 
 
+async def _assert_witness_counts(fhir: Any, candidate: Any, identity: dict[str, Any]) -> None:
+    """Require one exact raw witness for every normalized release row."""
+
+    resource_table = fhir._qt(fhir._schema(), fhir.ProviderDirectoryDatasetResource.__tablename__)
+    witness_table = fhir._qt(fhir._schema(), ProviderDirectoryCMSNPDResourceWitness.__tablename__)
+    projection_count_rows = await fhir.db.all(
+        "SELECT resource.resource_type, count(*) AS projected_count, "
+        "count(witness.resource_id) FILTER (WHERE witness.source_id=:source_id "
+        "AND witness.release_id=:release_id "
+        "AND witness.normalized_payload_hash=resource.payload_hash "
+        "AND witness.raw_payload_json->>'resourceType'=resource.resource_type "
+        "AND witness.raw_payload_json->>'id'=resource.resource_id) AS witnessed_count "
+        f"FROM {resource_table} AS resource LEFT JOIN {witness_table} AS witness "
+        "ON witness.dataset_id=resource.dataset_id AND witness.resource_type=resource.resource_type "
+        "AND witness.resource_id=resource.resource_id "
+        "WHERE resource.dataset_id=:dataset_id GROUP BY resource.resource_type",
+        source_id=SOURCE_ID,
+        release_id=identity["vector_sha256"],
+        dataset_id=candidate.dataset_id,
+    )
+    count_by_type = {
+        str(projection_count_row[0]): (int(projection_count_row[1]), int(projection_count_row[2]))
+        for projection_count_row in projection_count_rows
+    }
+    expected_count_by_type = {
+        resource_type: identity["files"][name]["distinct_count"] for name, resource_type in source.RESOURCE_FILES
+    }
+    if set(count_by_type) - RESOURCE_SET or any(
+        count_by_type.get(resource_type, (0, 0)) != (count, count)
+        for resource_type, count in expected_count_by_type.items()
+    ):
+        raise RuntimeError("cms_npd_witness_counts_incomplete")
+
+
 async def _validate_candidate(fhir: Any, candidate: Any, identity: dict, counts_by_type: dict) -> None:
     """Validate the complete resource vector without moving the serving pointer."""
 
@@ -726,6 +897,7 @@ async def _run_acquired(
                 raise RuntimeError("cms_npd_file_row_count_changed")
     counts_by_type = await _assert_counts(fhir, candidate, identity)
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
+    await _assert_witness_counts(fhir, candidate, identity)
     await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
     await _validate_candidate(fhir, candidate, identity, counts_by_type)
@@ -778,6 +950,10 @@ async def _current_observed_publication(observed: source.ObservedRelease) -> dic
         or release.get("generated_at") != observed.manifest.generated_at
         or not isinstance(state.get("acquisition_root_run_id"), str)
         or not state["acquisition_root_run_id"]
+    ):
+        return None
+    if sum(file["distinct_count"] for file in release["files"].values()) and not await _has_raw_witnesses(
+        fhir, state["dataset_id"]
     ):
         return None
     return state

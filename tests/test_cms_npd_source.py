@@ -27,8 +27,10 @@ def _source(rows_by_file=None):
     payloads_by_file = {}
     entries_by_file = {}
     for filename, resource_type in RESOURCE_FILES:
-        raw = rows_by_file.get(filename) or (
-            json.dumps({"resourceType": resource_type, "id": "synthetic-1"}).encode() + b"\n"
+        raw = (
+            rows_by_file[filename]
+            if filename in rows_by_file
+            else json.dumps({"resourceType": resource_type, "id": "synthetic-1"}).encode() + b"\n"
         )
         payloads_by_file[filename] = zstd.compress(raw)
         entries_by_file[filename] = {

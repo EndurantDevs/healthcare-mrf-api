@@ -97,6 +97,7 @@ MIGRATION_PREFIXES = (
     "20260930010000",
     "20260930020000",
     "20260930030000",
+    "20260930040000",
 )
 
 
@@ -188,7 +189,42 @@ def cms_artifact_root():
             assert not directory.exists()
 
 
-def retained_release(root, *, revision="first"):
+def _site_fixture():
+    """Keep source-only location identifiers and references in the release."""
+
+    return {
+        "id": "site-1",
+        "identifier": [{"system": "https://example.test/site", "value": "site-source-1"}],
+        "name": "Example Site",
+        "address": {"id": "address-source-1", "line": ["1 Sample Street"], "city": "Example City"},
+        "managingOrganization": {"reference": "Organization/network-1"},
+        "partOf": {"reference": "Location/parent-site", "type": "Location", "display": "Parent Site"},
+        "endpoint": [
+            {"identifier": {"system": "https://example.test/endpoint", "value": "site-endpoint"}, "type": "Endpoint"}
+        ],
+    }
+
+
+def _plan_fixture():
+    """Keep rich references and an otherwise unmapped extension."""
+
+    return {
+        "id": "plan-1",
+        "network": [{"reference": "Organization/network-1"}, {"reference": "Organization/unresolved"}],
+        "ownedBy": {
+            "reference": "Organization/insurer-1",
+            "identifier": {"system": "https://example.test/organization", "value": "insurer-source-1"},
+            "type": "Organization",
+            "display": "Example Insurer",
+        },
+        "endpoint": [{"reference": "Endpoint/endpoint-1", "display": "Plan Endpoint"}],
+        "extension": [
+            {"url": "https://example.test/fhir/StructureDefinition/source-note", "valueString": "Synthetic value"}
+        ],
+    }
+
+
+def retained_release(root, *, revision="first", empty_resource_type=None):
     """Acquire and seal eight compressed files through the real source validator."""
     resources_by_type = {
         "Organization": [
@@ -199,18 +235,10 @@ def retained_release(root, *, revision="first"):
             },
             {"id": "insurer-1", "name": "Example Insurer"},
         ],
-        "Location": [
-            {"id": "site-1", "name": "Example Site", "managingOrganization": {"reference": "Organization/network-1"}}
-        ],
+        "Location": [_site_fixture()],
         "Endpoint": [{"id": "endpoint-1", "status": "active", "address": "https://example.test/fhir"}],
         "HealthcareService": [{"id": "service-1", "providedBy": {"reference": "Organization/network-1"}}],
-        "InsurancePlan": [
-            {
-                "id": "plan-1",
-                "network": [{"reference": "Organization/network-1"}, {"reference": "Organization/unresolved"}],
-                "ownedBy": {"reference": "Organization/insurer-1"},
-            }
-        ],
+        "InsurancePlan": [_plan_fixture()],
         "Practitioner": [{"id": "1234567893"}],
         "PractitionerRole": [
             {
@@ -228,6 +256,9 @@ def retained_release(root, *, revision="first"):
             }
         ],
     }
+    if empty_resource_type is not None:
+        assert empty_resource_type in resources_by_type
+        resources_by_type[empty_resource_type] = []
     rows_by_file = {
         name: b"".join(
             json.dumps({"resourceType": kind, **resource_by_field}).encode() + b"\n"

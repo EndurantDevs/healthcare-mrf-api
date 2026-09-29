@@ -2,10 +2,12 @@
 """End-to-end retained CMS admission through real migration guards and cutover."""
 
 import asyncio
+import hashlib
+import json
 from contextvars import Context
 from itertools import count
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.exc import DBAPIError
@@ -29,6 +31,26 @@ async def _admit(directory, receipt, run_id, task=None):
         return await cms._run_acquired({"context": {}}, task, run_id, directory, receipt, None)
     with release_probe_client(directory) as client:
         return await cms._run_acquired({"context": {}}, task or {}, run_id, directory, receipt, client)
+
+
+async def _admit_without_witnesses(monkeypatch, directory, receipt, run_id, *, before_publish=None):
+    """Model a release sealed before raw witness storage was installed."""
+
+    async def persist_legacy_rows(fhir_module, model, parsed_rows, _raw_resources, candidate, _resource_type):
+        await fhir_module._persist_endpoint_dataset_rows(
+            model,
+            parsed_rows,
+            candidate.dataset_id,
+            resource_hash_contract=candidate.resource_hash_contract,
+            semantic_projection_as_of=candidate.semantic_projection_as_of,
+        )
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(cms, "_persist_source_batch", persist_legacy_rows)
+        legacy.setattr(cms, "_assert_witness_counts", AsyncMock())
+        if before_publish is not None:
+            legacy.setattr(cms, "publish_validated_source_local_dataset", before_publish)
+        return await _admit(directory, receipt, run_id)
 
 
 async def _assert_current(database, dataset_id):
@@ -56,7 +78,49 @@ async def _resource_identities(database):
     )
 
 
+async def _assert_raw_witnesses(database, admission_result, receipt):
+    """Compare complete raw release facts with their normalized row bindings."""
+
+    witnesses = await database.all(
+        "SELECT witness.resource_type, witness.resource_id, witness.source_id, witness.release_id, "
+        "witness.raw_payload_json, witness.normalized_payload_hash, resource.payload_hash, "
+        "witness.raw_payload_sha256 "
+        "FROM mrf.provider_directory_cms_npd_resource_witness AS witness "
+        "JOIN mrf.provider_directory_dataset_resource AS resource "
+        "ON resource.dataset_id=witness.dataset_id AND resource.resource_type=witness.resource_type "
+        "AND resource.resource_id=witness.resource_id "
+        "WHERE witness.dataset_id=:dataset_id",
+        dataset_id=admission_result["dataset_id"],
+    )
+    assert len(witnesses) == admission_result["resource_count"]
+    assert {witness_row[0] for witness_row in witnesses} == cms.RESOURCE_SET
+    assert all(
+        witness_row[2] == "cms-npd" and witness_row[3] == receipt["vector_sha256"] and witness_row[5] == witness_row[6]
+        for witness_row in witnesses
+    )
+    assert all(
+        witness_row[7]
+        == hashlib.sha256(
+            json.dumps(witness_row[4], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        for witness_row in witnesses
+    )
+    raw_by_type = {witness_row[0]: witness_row[4] for witness_row in witnesses}
+    location = raw_by_type["Location"]
+    assert location["identifier"][0]["value"] == "site-source-1"
+    assert location["address"]["id"] == "address-source-1"
+    assert location["partOf"]["display"] == "Parent Site"
+    assert location["endpoint"][0]["identifier"]["value"] == "site-endpoint"
+    plan = raw_by_type["InsurancePlan"]
+    assert plan["endpoint"][0]["display"] == "Plan Endpoint"
+    assert plan["ownedBy"]["identifier"]["value"] == "insurer-source-1"
+    assert plan["ownedBy"]["type"] == "Organization" and plan["ownedBy"]["display"] == "Example Insurer"
+    assert plan["extension"][0]["valueString"] == "Synthetic value"
+
+
 async def _assert_source_facts(database, admission_result, receipt):
+    """Verify the sealed release, projected rows, raw witnesses, and network facts."""
+
     state = await fhir._endpoint_dataset_state(admission_result["dataset_id"])
     assert state["publication_metadata_json"]["source_release"] == cms.release_identity(receipt)
     seal = await database.first(
@@ -73,6 +137,9 @@ async def _assert_source_facts(database, admission_result, receipt):
     assert {resource_row[0] for resource_row in payloads} == cms.RESOURCE_SET
     assert next(resource_row[1] for resource_row in payloads if resource_row[0] == "Practitioner")["npi"] is None
     assert all(resource_row[1]["tax_id"] is None for resource_row in payloads if resource_row[0] == "Organization")
+    normalized_location = next(resource_row[1] for resource_row in payloads if resource_row[0] == "Location")
+    assert "identifier" not in normalized_location and "part_of_ref" not in normalized_location
+    await _assert_raw_witnesses(database, admission_result, receipt)
     network_rows = await database.all(
         "SELECT network_resource_id, network_refs, owned_by_ref "
         "FROM mrf.provider_directory_insurance_network_plan_evidence WHERE release_id=:release_id",
@@ -93,6 +160,12 @@ async def _assert_published_payload_guard(database, dataset_id):
     with pytest.raises(DBAPIError, match="cms_npd_published_resource_immutable"):
         await database.status(
             "UPDATE mrf.provider_directory_dataset_resource SET payload_json='{}'::jsonb WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+    with pytest.raises(DBAPIError, match="cms_npd_resource_witness_immutable"):
+        await database.status(
+            "UPDATE mrf.provider_directory_cms_npd_resource_witness "
+            "SET raw_payload_json='{}'::jsonb WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
 
@@ -142,6 +215,13 @@ async def _assert_failed_disposition(database, dataset_id, receipt):
             )
             == 0
         )
+    assert (
+        await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_cms_npd_resource_witness WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+        == 0
+    )
     disposition = await database.first(
         "SELECT prior_status, vector_sha256 FROM mrf.provider_directory_cms_npd_stale_candidate "
         "WHERE dataset_id=:dataset_id",
@@ -181,6 +261,7 @@ async def test_complete_release_publishes_with_real_database_guards(monkeypatch,
         await _assert_published_payload_guard(database, admission_result["dataset_id"])
         replay = await _admit(directory, receipt, "cms-test-replay")
         assert replay["dataset_id"] == admission_result["dataset_id"] and replay["replayed"] is True
+        await _assert_source_facts(database, replay, receipt)
         next_directory, next_receipt = retained_release(cms_artifact_root, revision="second")
         replacement = await _admit(next_directory, next_receipt, "cms-test-second")
         assert replacement["dataset_id"] != admission_result["dataset_id"]
@@ -303,6 +384,173 @@ async def test_online_recurrence_republishes_a_superseded_vector(monkeypatch, cm
         await _assert_source_facts(database, recurred, first_receipt)
         replay = await _admit(first_directory, first_receipt, "cms-test-recurred-replay")
         assert replay["dataset_id"] == recurred["dataset_id"] and replay["replayed"] is True
+
+
+@pytest.mark.asyncio
+async def test_pre_witness_published_release_is_reacquired_without_mutating_current(monkeypatch, cms_artifact_root):
+    """An exact old release stays current until its witnessed successor cuts over."""
+
+    directory, receipt = retained_release(cms_artifact_root)
+    async with admission_database(monkeypatch) as database:
+        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-legacy-published")
+        await _assert_current(database, legacy["dataset_id"])
+        assert (
+            await database.scalar(
+                "SELECT count(*) FROM mrf.provider_directory_cms_npd_resource_witness WHERE dataset_id=:dataset_id",
+                dataset_id=legacy["dataset_id"],
+            )
+            == 0
+        )
+
+        with monkeypatch.context() as interrupted:
+
+            async def pause_before_first_witness(*_args):
+                await _assert_current(database, legacy["dataset_id"])
+                raise RuntimeError("synthetic_witness_upgrade_pause")
+
+            interrupted.setattr(cms, "_persist_source_batch", pause_before_first_witness)
+            with pytest.raises(RuntimeError, match="synthetic_witness_upgrade_pause"):
+                await _admit(directory, receipt, "cms-upgrade-interrupted")
+        interrupted_candidate = await database.first(
+            "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset "
+            "WHERE status='acquiring' AND previous_dataset_id=:legacy_id",
+            legacy_id=legacy["dataset_id"],
+        )
+        assert interrupted_candidate is not None
+        await _assert_current(database, legacy["dataset_id"])
+        upgraded = await _admit(directory, receipt, "cms-upgrade-resumed")
+        assert upgraded["dataset_id"] == interrupted_candidate[0]
+        await _assert_current(database, upgraded["dataset_id"])
+        await _assert_source_facts(database, upgraded, receipt)
+        replay = await _admit(directory, receipt, "cms-upgrade-replay")
+        assert replay["dataset_id"] == upgraded["dataset_id"] and replay["replayed"] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_check_upgrades_current_release_without_witnesses(monkeypatch, cms_artifact_root):
+    directory, receipt = retained_release(cms_artifact_root)
+    with release_probe_client(directory) as client:
+        observed = cms.source.observe_release(client=client)
+    async with admission_database(monkeypatch) as database:
+        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-daily-legacy")
+        await _assert_current(database, legacy["dataset_id"])
+        acquired = Mock(return_value=(directory, receipt))
+
+        async def verify_retained(path, release_receipt, _client):
+            await asyncio.to_thread(cms.source.verify_retained_release, path, release_receipt)
+
+        with monkeypatch.context() as daily:
+            daily.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
+            daily.setattr(cms.source, "observe_release", lambda **_kwargs: observed)
+            daily.setattr(cms.source, "acquire_release", acquired)
+            daily.setattr(cms, "_verify_release", verify_retained)
+            upgraded = await cms.run({"context": {}}, {"import_resources": True, "full_refresh": True}, "cms-daily")
+        acquired.assert_called_once()
+        assert upgraded["dataset_id"] != legacy["dataset_id"]
+        assert upgraded["cms_npd_check"]["outcome"] == "acquisition_required"
+        await _assert_current(database, upgraded["dataset_id"])
+        await _assert_source_facts(database, upgraded, receipt)
+
+
+@pytest.mark.asyncio
+async def test_disposed_witness_upgrade_retries_without_replacing_legacy(monkeypatch, cms_artifact_root):
+    directory, receipt = retained_release(cms_artifact_root)
+    alternate_directory, _ = retained_release(cms_artifact_root, revision="alternate-upgrade")
+    filename = cms.source.RESOURCE_FILES[0][0] + ".zst"
+    retained_file = directory / filename
+    retained_bytes = retained_file.read_bytes()
+    alternate_bytes = (alternate_directory / filename).read_bytes()
+    async with admission_database(monkeypatch) as database:
+        legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-retry-legacy")
+        original_verify = cms.source.verify_release
+        verification_calls = count(1)
+
+        def swap_after_intake(*args, **kwargs):
+            verified = original_verify(*args, **kwargs)
+            if next(verification_calls) == 1:
+                retained_file.write_bytes(alternate_bytes)
+            return verified
+
+        with monkeypatch.context() as changed:
+            changed.setattr(cms.source, "verify_release", swap_after_intake)
+            with pytest.raises(cms.source.CmsNpdSourceError, match="cms_npd_retained_file_missing"):
+                await _admit(directory, receipt, "cms-upgrade-disposed")
+        await _assert_current(database, legacy["dataset_id"])
+        legacy_state = await fhir._endpoint_dataset_state(legacy["dataset_id"])
+        failed_id = fhir._endpoint_dataset_candidate_id(
+            legacy_state["endpoint_id"],
+            tuple(sorted(cms.RESOURCE_SET)),
+            f"cms-npd-witness-upgrade:{legacy['dataset_id']}:cms-upgrade-disposed",
+        )
+        await _assert_failed_disposition(database, failed_id, receipt)
+        retained_file.write_bytes(retained_bytes)
+        retried = await _admit(directory, receipt, "cms-upgrade-restored")
+        assert retried["dataset_id"] not in {legacy["dataset_id"], failed_id}
+        await _assert_current(database, retried["dataset_id"])
+        await _assert_source_facts(database, retried, receipt)
+
+
+@pytest.mark.asyncio
+async def test_pre_witness_validated_candidate_gets_fresh_exact_release(monkeypatch, cms_artifact_root):
+    """A sealed old candidate is left intact while a new one gains witnesses."""
+
+    directory, receipt = retained_release(cms_artifact_root)
+    async with admission_database(monkeypatch) as database:
+        incumbent = await _admit(directory, receipt, "cms-incumbent")
+        next_directory, next_receipt = retained_release(cms_artifact_root, revision="validated-legacy")
+        with pytest.raises(RuntimeError, match="synthetic_legacy_publish_hold"):
+            await _admit_without_witnesses(
+                monkeypatch,
+                next_directory,
+                next_receipt,
+                "cms-legacy-validated",
+                before_publish=AsyncMock(side_effect=RuntimeError("synthetic_legacy_publish_hold")),
+            )
+        legacy_candidate = await database.first(
+            "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset "
+            "WHERE status='validated' AND publication_metadata_json::jsonb "
+            "-> 'source_release' ->> 'vector_sha256'=:release_id",
+            release_id=next_receipt["vector_sha256"],
+        )
+        assert legacy_candidate is not None
+        await _assert_current(database, incumbent["dataset_id"])
+        with pytest.raises(DBAPIError, match="cms_npd_resource_witness_immutable"):
+            await database.status(
+                "INSERT INTO mrf.provider_directory_cms_npd_resource_witness "
+                "(dataset_id, source_id, release_id, resource_type, resource_id, raw_payload_sha256, "
+                "normalized_payload_hash, raw_payload_json) "
+                "SELECT dataset_id, 'cms-npd', :release_id, resource_type, resource_id, :raw_hash, "
+                "payload_hash, jsonb_build_object('resourceType', resource_type, 'id', resource_id) "
+                "FROM mrf.provider_directory_dataset_resource "
+                "WHERE dataset_id=:dataset_id AND resource_type='Location'",
+                dataset_id=legacy_candidate[0],
+                release_id=next_receipt["vector_sha256"],
+                raw_hash="a" * 64,
+            )
+        upgraded = await _admit(next_directory, next_receipt, "cms-upgrade-validated")
+        assert upgraded["dataset_id"] != legacy_candidate[0]
+        assert (await fhir._endpoint_dataset_state(legacy_candidate[0]))["status"] == "validated"
+        await _assert_current(database, upgraded["dataset_id"])
+        await _assert_source_facts(database, upgraded, next_receipt)
+
+
+@pytest.mark.asyncio
+async def test_complete_release_accepts_an_empty_member(monkeypatch, cms_artifact_root):
+    """Zero source rows produce zero witnesses without losing the eight-file seal."""
+
+    directory, receipt = retained_release(cms_artifact_root, empty_resource_type="Endpoint")
+    assert receipt["files"]["03-Endpoint.ndjson"]["row_count"] == 0
+    async with admission_database(monkeypatch) as database:
+        admitted = await _admit(directory, receipt, "cms-empty-endpoint")
+        assert admitted["resource_count"] == 8
+        await _assert_current(database, admitted["dataset_id"])
+        witnessed_types = await database.all(
+            "SELECT resource_type, count(*) FROM mrf.provider_directory_cms_npd_resource_witness "
+            "WHERE dataset_id=:dataset_id GROUP BY resource_type",
+            dataset_id=admitted["dataset_id"],
+        )
+        assert {resource_type for resource_type, _count in witnessed_types} == cms.RESOURCE_SET - {"Endpoint"}
+        assert sum(count for _resource_type, count in witnessed_types) == 8
 
 
 @pytest.mark.asyncio
@@ -471,22 +719,21 @@ async def test_interrupted_stale_cleanup_resumes_before_next_vector(monkeypatch,
     async with admission_database(monkeypatch) as database:
         incumbent = await _admit(first_directory, first_receipt, "cms-test-incumbent")
         stale_directory, stale_receipt = retained_release(cms_artifact_root, revision="stale-interrupted")
-        original_verify = cms.source.verify_release
+        original_verify = cms._verify_release
         original_cleanup = recovery._clear_failed_rows
-        checks = count(1)
 
-        def changed_vector(*_args, **_kwargs):
-            if next(checks) == 2:
+        async def changed_vector(directory, receipt, client):
+            if client is None:
                 raise cms.source.CmsNpdSourceError("cms_npd_source_vector_changed")
-            return original_verify(*_args, **_kwargs)
+            return await original_verify(directory, receipt, client)
 
-        monkeypatch.setattr(cms.source, "verify_release", changed_vector)
+        monkeypatch.setattr(cms, "_verify_release", changed_vector)
         monkeypatch.setattr(
             recovery, "_clear_failed_rows", AsyncMock(side_effect=RuntimeError("synthetic_cleanup_interruption"))
         )
         with pytest.raises(RuntimeError, match="synthetic_cleanup_interruption"):
             await _admit(stale_directory, stale_receipt, "cms-test-stale-interrupted")
-        monkeypatch.setattr(cms.source, "verify_release", original_verify)
+        monkeypatch.setattr(cms, "_verify_release", original_verify)
         monkeypatch.setattr(recovery, "_clear_failed_rows", original_cleanup)
         incumbent_state = await fhir._endpoint_dataset_state(incumbent["dataset_id"])
         stale_id = fhir._endpoint_dataset_candidate_id(
