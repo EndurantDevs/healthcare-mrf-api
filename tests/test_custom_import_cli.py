@@ -18,11 +18,13 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import log as sqlalchemy_log
 
+import custom_import_cli
 from process.custom_import import cli, publication
 from process.custom_import.definition_store import RegisteredDefinition
 from process.custom_import.execution import ExecutionTransition
 from process.custom_import.operator import CurrentGenerationStatus, ExecutionStatus, GenerationStatus, LeaseStatus
 from process.custom_import.publication import PublicationReceipt
+from tests.test_custom_import_operator import _Session, _execution_evidence_row, _without_optional_evidence_row
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 
@@ -353,6 +355,120 @@ async def test_status_receipts_preserve_incremental_base_and_omit_unavailable_ev
     assert "current_generation_id" not in generation_receipt
     assert "current_pointer_version" not in generation_receipt
     assert database.events == ["connect", "begin", "commit", "disconnect"] * 2
+
+
+@pytest.mark.parametrize("has_capture", (True, False))
+def test_captures_entrypoint_reads_retained_evidence(monkeypatch, capsys, has_capture):
+    evidence_map = _execution_evidence_row() if has_capture else _without_optional_evidence_row()
+    evidence_map.update(canonical_manifest="synthetic-private-payload", snapshot_token="synthetic-private-token")
+    session = _Session(evidence_map)
+    database = _LifecycleDatabase(session, emit_output=True)
+    monkeypatch.setattr(cli, "db", database)
+    monkeypatch.setattr(sys, "argv", ["custom_import_cli", "captures", "--dataset-id", "3", "--execution-id", "17"])
+
+    exit_code = custom_import_cli.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "capture": {"bundle_id": 11, "manifest_sha256": bytes(range(32)).hex()} if has_capture else None,
+        "command": "captures",
+        "dataset_id": 3,
+        "definition_revision_id": 5,
+        "execution_id": 17,
+        "schema_revision_id": 7,
+        "state": "completed" if has_capture else "running",
+        "status": "ok",
+    }
+    assert database.events == ["connect", "begin", "commit", "disconnect"]
+    assert database.disconnected_echo is True
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert statement.is_select and statement.get_execution_options()["autoflush"] is False
+    assert statement.compile().params["dataset_id_1"] == 3
+    assert statement.compile().params["execution_id_1"] == 17
+    for forbidden in ("canonical_manifest", "snapshot_token", "custom_import_capture_parquet_part"):
+        assert forbidden not in str(statement)
+
+
+@pytest.mark.parametrize(
+    "changed_fields",
+    (
+        {"dataset_id": 4},
+        {"execution_id": 18},
+        {"capture_id": 12},
+        {"capture_dataset_id": 4},
+        {"capture_definition_revision_id": 6},
+        {"capture_schema_revision_id": 8},
+        {"capture_manifest_sha256": b"synthetic-private-digest"},
+    ),
+)
+def test_captures_rejects_mismatched_retained_evidence(monkeypatch, capsys, changed_fields):
+    evidence_map = _execution_evidence_row()
+    evidence_map.update(changed_fields)
+    database = _LifecycleDatabase(_Session(evidence_map))
+    monkeypatch.setattr(cli, "db", database)
+
+    exit_code = cli.run_command(["captures", "--dataset-id", "3", "--execution-id", "17"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == '{"code":"failed","status":"error"}\n'
+    assert database.events == ["connect", "begin", "rollback", "disconnect"]
+
+
+@pytest.mark.parametrize("is_ambiguous", (True, False))
+def test_captures_rejects_missing_or_ambiguous_evidence(monkeypatch, capsys, is_ambiguous):
+    evidence_rows = (_execution_evidence_row(), _execution_evidence_row()) if is_ambiguous else None
+    database = _LifecycleDatabase(_Session(evidence_rows))
+    monkeypatch.setattr(cli, "db", database)
+
+    exit_code = cli.run_command(["captures", "--dataset-id", "3", "--execution-id", "17"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"code": "failed" if is_ambiguous else "not_found", "status": "error"}
+    assert database.events == ["connect", "begin", "rollback", "disconnect"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        [],
+        ["--dataset-id", "3"],
+        ["--execution-id", "17"],
+        ["--dataset-id", "0", "--execution-id", "17"],
+        ["--dataset-id", "3", "--execution-id", str(cli._MAX_BIGINT + 1)],
+        ["--dataset-id", "3", "--generation-id", "19"],
+        ["--dataset-id", "3", "--execution-id", "17", "--include-sample", "synthetic-private-value"],
+    ),
+)
+def test_captures_rejects_invalid_arguments(monkeypatch, capsys, arguments):
+    monkeypatch.setattr(cli, "db", object())
+    with pytest.raises(SystemExit) as caught:
+        cli.run_command(["captures", *arguments])
+
+    captured = capsys.readouterr()
+    assert caught.value.code == 2
+    assert captured.out == ""
+    assert captured.err == '{"code":"invalid_arguments","status":"error"}\n'
+
+
+@pytest.mark.asyncio
+async def test_capture_receipt_requires_exact_operator_identity():
+    evidence = await cli.inspect_execution_evidence(_Session(_execution_evidence_row()), dataset_id=3, execution_id=17)
+    invalid_evidence = (
+        object(),
+        replace(evidence, execution=object()),
+        replace(evidence, execution=replace(evidence.execution, dataset_id=4)),
+        replace(evidence, execution=replace(evidence.execution, execution_id=18)),
+    )
+    for invalid in invalid_evidence:
+        with pytest.raises(ValueError, match="operator evidence is invalid"):
+            cli._capture_receipt(invalid, dataset_id=3, execution_id=17)
 
 
 @pytest.mark.asyncio
@@ -745,6 +861,6 @@ def test_module_cli_help_lists_lifecycle_commands(tmp_path):
 
     assert completed.returncode == 0
     assert completed.stderr == b""
-    for command in (b"status", b"cancel", b"activate", b"rollback"):
+    for command in (b"status", b"captures", b"cancel", b"activate", b"rollback"):
         assert command in completed.stdout
     assert b"resume" not in completed.stdout

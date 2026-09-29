@@ -23,10 +23,13 @@ from process.custom_import.execution import (
 )
 from process.custom_import.operator import (
     CurrentGenerationStatus,
+    ExecutionEvidenceExecution,
+    ExecutionEvidenceStatus,
     ExecutionStatus,
     GenerationStatus,
     OperatorObjectNotFound,
     inspect_execution,
+    inspect_execution_evidence,
     inspect_generation,
 )
 from process.custom_import.publication import (
@@ -79,6 +82,10 @@ def _parser() -> argparse.ArgumentParser:
     status_identity = status.add_mutually_exclusive_group(required=True)
     status_identity.add_argument("--execution-id", type=_positive_identifier)
     status_identity.add_argument("--generation-id", type=_positive_identifier)
+
+    captures = commands.add_parser("captures", allow_abbrev=False, help="inspect one execution's retained capture")
+    captures.add_argument("--dataset-id", required=True, type=_positive_identifier)
+    captures.add_argument("--execution-id", required=True, type=_positive_identifier)
 
     cancel = commands.add_parser("cancel", allow_abbrev=False, help="request cancellation for one execution")
     cancel.add_argument("--execution-id", required=True, type=_positive_identifier)
@@ -232,6 +239,35 @@ def _generation_status_receipt(status: GenerationStatus, *, dataset_id: int, gen
     return _receipt_json(receipt_dict)
 
 
+def _capture_receipt(evidence: ExecutionEvidenceStatus, *, dataset_id: int, execution_id: int) -> str:
+    """Render only checked capture identity and the retained manifest digest."""
+
+    if not isinstance(evidence, ExecutionEvidenceStatus):
+        raise ValueError("operator evidence is invalid")
+    execution = evidence.execution
+    if not isinstance(execution, ExecutionEvidenceExecution) or (execution.dataset_id, execution.execution_id) != (
+        dataset_id,
+        execution_id,
+    ):
+        raise ValueError("operator evidence is invalid")
+    return _receipt_json(
+        {
+            "capture": (
+                {"bundle_id": execution.capture_bundle_id, "manifest_sha256": evidence.capture_manifest_sha256}
+                if execution.capture_bundle_id is not None
+                else None
+            ),
+            "command": "captures",
+            "dataset_id": execution.dataset_id,
+            "definition_revision_id": execution.definition_revision_id,
+            "execution_id": execution.execution_id,
+            "schema_revision_id": execution.schema_revision_id,
+            "state": execution.state,
+            "status": "ok",
+        }
+    )
+
+
 def _transition_receipt(command: str, *, execution_id: int, transition: ExecutionTransition) -> str:
     if not isinstance(transition, ExecutionTransition) or transition.execution_id != execution_id:
         raise ValueError("execution transition is invalid")
@@ -361,6 +397,11 @@ async def _publication_command(session: Any, parsed: argparse.Namespace) -> str:
 async def _lifecycle_receipt(session: Any, parsed: argparse.Namespace) -> str:
     if parsed.command == "status":
         return await _status_receipt(session, parsed)
+    if parsed.command == "captures":
+        evidence = await inspect_execution_evidence(
+            session, dataset_id=parsed.dataset_id, execution_id=parsed.execution_id
+        )
+        return _capture_receipt(evidence, dataset_id=parsed.dataset_id, execution_id=parsed.execution_id)
     if parsed.command == "cancel":
         transition = await request_cancellation(session, execution_id=parsed.execution_id)
         return _transition_receipt("cancel", execution_id=parsed.execution_id, transition=transition)
