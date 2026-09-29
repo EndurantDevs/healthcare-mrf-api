@@ -25,6 +25,7 @@ def _binding(
     plan_id="99-0000001",
     market_type="group",
     role="in_network",
+    logical_scope_present=False,
 ):
     return PlanReleaseSnapshotBinding(
         binding_ordinal=0,
@@ -34,6 +35,7 @@ def _binding(
         plan_market_type=market_type,
         role=role,
         required=True,
+        logical_scope_present=logical_scope_present,
     )
 
 
@@ -346,6 +348,48 @@ def test_binding_readiness_rejects_physical_scope_mismatch(
     )
 
     assert is_ready is False
+
+
+@pytest.mark.parametrize(
+    ("logical_scope_present", "serving_updates", "expected"),
+    [
+        (True, {"plan_id": "99-9999999"}, True),
+        (False, {"plan_id": "99-9999999"}, False),
+        (True, {"plan_id": "99-9999999", "source_key": "other-source"}, False),
+        (True, {"plan_id": "99-9999999", "plan_market_type": "individual"}, False),
+    ],
+)
+def test_shared_snapshot_logical_plan_readiness(
+    monkeypatch,
+    logical_scope_present,
+    serving_updates,
+    expected,
+):
+    _install_snapshot_guards(
+        monkeypatch,
+        _serving_table_descriptor(**serving_updates),
+    )
+    binding = plan_release_serving._plan_release_binding_from_row(
+        _binding_row(logical_scope_present=logical_scope_present)
+    )
+
+    assert binding is not None
+    assert asyncio.run(
+        plan_release_readiness.is_release_binding_serving_ready(object(), binding)
+    ) is expected
+
+
+def test_release_queries_prove_exact_logical_scope():
+    from api import plan_release_pricing_projection, plan_release_serving_resolution
+
+    for query in (
+        *plan_release_pricing_projection.plan_release_serving_queries("mrf"),
+        plan_release_serving_resolution._PLAN_RELEASE_SERVING_SQL,
+    ):
+        assert "ptg2_v3_snapshot_plan_scope scope" in query
+        assert "scope.snapshot_id = binding.snapshot_id" in query
+        assert "scope.plan_id = binding.plan_id" in query
+        assert "scope.plan_market_type = binding.plan_market_type" in query
 
 
 @pytest.mark.parametrize("coverage_exists", [False, True])
