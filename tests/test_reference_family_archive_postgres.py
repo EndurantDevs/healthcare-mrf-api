@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from dataclasses import replace
 from uuid import uuid4
 
 import asyncpg
@@ -12,11 +13,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as result_generation
-from tests.reference_family_generation_fixture import generation_shape_check
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
 
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
@@ -64,6 +65,8 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
         ),
         {"importer_id": importer_id, "lineage_id": uuid4()},
     )
+    connection = await session.connection() if isinstance(session, AsyncSession) else session
+    await install_source_generation_guards(connection, schema_name)
 
 
 async def _manifest(sessions, importer_id: str, schema_name: str, *, dependencies=None):
@@ -255,6 +258,7 @@ async def test_source_capture_binds_tracked_serving_generation():
         manifest = await _manifest(sessions, "places-zcta", live_schema)
 
         assert manifest.publication_authority == "tracked-generation"
+        assert manifest.source_capture_contract == archive.GUARDED_SOURCE_CAPTURE_CONTRACT
         assert manifest.source_serving_generation == authority.serving_generation
         assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
     finally:
@@ -302,6 +306,97 @@ async def _validated_places_candidate(
     return ownership, manifest, incumbent, validation, sealed_owner_oid
 
 
+async def _candidate_with_generation(session, candidate, package_id, source_generation, *, guarded=True):
+    ownership, manifest, incumbent, _validation, owner = candidate
+    manifest = replace(
+        manifest,
+        publication_authority="tracked-generation",
+        source_serving_generation=result_generation.validate_reference_family_serving_generation(source_generation),
+        source_capture_contract=archive.GUARDED_SOURCE_CAPTURE_CONTRACT if guarded else None,
+    )
+    validation = await archive.prepare_reference_family_activation(
+        session,
+        ownership=ownership,
+        manifest=manifest,
+        package_id=package_id,
+        profile_contract=archive.CONTRACT,
+        sealed_owner_oid=owner,
+    )
+    return ownership, manifest, incumbent, validation, owner
+
+
+async def _activate_validated_candidate(session, candidate, cutover):
+    ownership, manifest, incumbent, validation, _owner = candidate
+    return await archive.activate_validated_reference_family_stage(
+        session,
+        ownership=ownership,
+        manifest=manifest,
+        expected_incumbent=incumbent,
+        validation_receipt=validation,
+        cutover=cutover,
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_tracked_archive_stays_manual_and_untracked_until_local_publication():
+    """Legacy provenance cannot authorize automatic activation or trusted re-export."""
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex[:10]
+    live_schema, unrelated_schema = f"rf_legacy_{token}", f"rf_legacy_keep_{token}"
+    dataset_id, package_id = uuid4(), "f" * 64
+    stage_schema = archive.reference_family_stage_schema(dataset_id)
+    try:
+        candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
+        source_generation_by_field = {
+            "origin_lineage_id": str(uuid4()),
+            "origin_generation": 7,
+            "published_at": "2026-09-14T10:00:00Z",
+        }
+        async with sessions.begin() as session:
+            candidate = await _candidate_with_generation(
+                session, candidate, package_id, source_generation_by_field, guarded=False
+            )
+        owner = candidate[-1]
+        cutover = archive.ReferenceFamilyCutoverAuthority(
+            package_id, archive.CONTRACT, owner, owner, "automatic", source_generation_by_field
+        )
+        async with sessions.begin() as session:
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires guarded source capture"):
+                await _activate_validated_candidate(session, candidate, cutover)
+        async with sessions.begin() as session:
+            await _activate_validated_candidate(session, candidate, replace(cutover, authority="manual"))
+            adopted = await result_generation.read_reference_family_result_generation_authority(
+                session, importer_id="places-zcta", schema_name=live_schema
+            )
+            assert adopted.serving_generation.as_dict() == source_generation_by_field
+            assert not await session.scalar(
+                text(f'SELECT source_revision_tracked FROM "{live_schema}".reference_family_result_generation')
+            )
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="source generation is unavailable"):
+            await _manifest(sessions, "places-zcta", live_schema)
+        async with sessions.begin() as session:
+            published = await result_generation.publish_local_reference_family_generation(
+                session, importer_id="places-zcta", schema_name=live_schema
+            )
+            assert published.local_generation == 1
+            assert published.serving_generation.origin_lineage_id == published.local_lineage_id
+        recaptured = await _manifest(sessions, "places-zcta", live_schema)
+        assert recaptured.source_capture_contract == archive.GUARDED_SOURCE_CAPTURE_CONTRACT
+        assert recaptured.source_serving_generation == published.serving_generation
+    finally:
+        async with engine.begin() as connection:
+            for schema_name in (
+                stage_schema,
+                archive.reference_family_predecessor_schema(dataset_id),
+                live_schema,
+                unrelated_schema,
+            ):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        await engine.dispose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("populated", [False, True])
 async def test_automatic_generationless_bootstrap_requires_empty_incumbent(populated):
@@ -314,7 +409,7 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
     dataset_id, package_id = uuid4(), "d" * 64
     stage_schema = archive.reference_family_stage_schema(dataset_id)
     try:
-        ownership, manifest, incumbent, validation, sealed_owner_oid = await _validated_places_candidate(
+        candidate = await _validated_places_candidate(
             sessions,
             live_schema,
             unrelated_schema,
@@ -322,6 +417,7 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
             package_id,
             populated=populated,
         )
+        sealed_owner_oid = candidate[-1]
         cutover = archive.ReferenceFamilyCutoverAuthority(
             package_id,
             archive.CONTRACT,
@@ -335,25 +431,14 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
             },
         )
         async with sessions() as session, session.begin():
+            candidate = await _candidate_with_generation(
+                session, candidate, package_id, cutover.source_serving_generation
+            )
             if populated:
                 with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires manual adoption"):
-                    await archive.activate_validated_reference_family_stage(
-                        session,
-                        ownership=ownership,
-                        manifest=manifest,
-                        expected_incumbent=incumbent,
-                        validation_receipt=validation,
-                        cutover=cutover,
-                    )
+                    await _activate_validated_candidate(session, candidate, cutover)
             else:
-                await archive.activate_validated_reference_family_stage(
-                    session,
-                    ownership=ownership,
-                    manifest=manifest,
-                    expected_incumbent=incumbent,
-                    validation_receipt=validation,
-                    cutover=cutover,
-                )
+                await _activate_validated_candidate(session, candidate, cutover)
     finally:
         async with engine.begin() as connection:
             for schema_name in (stage_schema, live_schema, unrelated_schema):
@@ -425,6 +510,9 @@ async def test_automatic_bootstrap_accepts_all_absent_incumbent():
             "automatic",
             source_generation_by_field,
         )
+        async with sessions() as session, session.begin():
+            candidate = await _candidate_with_generation(session, candidate, package_id, source_generation_by_field)
+        ownership, manifest, _, validation, _ = candidate
         await _assert_absent_bootstrap_rollback(sessions, candidate, incumbent, cutover, live_schema, stage_schema)
         async with sessions() as session, session.begin():
             receipt = await archive.activate_validated_reference_family_stage(
@@ -584,7 +672,9 @@ async def _install_places_generation_authority(session, live_schema: str):
 async def _activate_automatic_candidate(session, candidate, package_id, source_generation_by_field):
     """Activate one trusted candidate with automatic generation authority."""
 
-    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+    ownership, manifest, incumbent, validation, sealed_owner_oid = await _candidate_with_generation(
+        session, candidate, package_id, source_generation_by_field
+    )
     return await archive.activate_validated_reference_family_stage(
         session,
         ownership=ownership,

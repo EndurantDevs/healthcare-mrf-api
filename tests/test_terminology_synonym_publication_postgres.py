@@ -19,6 +19,12 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from tests.reference_family_generation_fixture import (
+    generation_shape_check,
+    install_source_generation_guards,
+    install_source_generation_guards_from_dsn,
+)
+
 
 terminology_synonyms = importlib.import_module("process.terminology_synonyms")
 generation = importlib.import_module("process.reference_family_result_generation")
@@ -90,7 +96,8 @@ async def _prepare_relations(
     await connection.execute(
         f'CREATE TABLE "{schema}".reference_family_result_generation ('
         "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
-        "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[])"
+        "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
+        f"CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))"
     )
     await connection.execute(
         f'INSERT INTO "{schema}".reference_family_result_generation VALUES ($1,$2,0)',
@@ -102,6 +109,7 @@ async def _prepare_relations(
             f"INSERT INTO {_qualified(schema, table)} (marker) VALUES ($1)",
             [(marker,) for marker in marker_list],
         )
+    await install_source_generation_guards_from_dsn(os.environ["HLTHPRT_TERMINOLOGY_PUBLICATION_POSTGRES_DSN"], schema)
     return {
         table: await _relation_state(connection, schema, table)
         for table in marker_list_by_table
@@ -148,6 +156,7 @@ async def test_terminology_generation_migration_admits_one_exact_relation(monkey
             assert await connection.scalar(text(
                 f'SELECT count(*) FROM "{schema}".reference_family_result_generation'
             )) == 11
+            await install_source_generation_guards(connection, schema)
             published = await generation.publish_local_reference_family_generation(
                 connection, importer_id="terminology-synonyms", schema_name=schema
             )

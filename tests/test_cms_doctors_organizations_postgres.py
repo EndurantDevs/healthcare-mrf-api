@@ -20,7 +20,7 @@ from process import cms_doctors_sites as sites
 from process.control_cancel import ImportCancelledError
 from process.ext.utils import make_class
 from process.provider_directory_entity_identity import bind_cms_doctors_site, bind_entity_resource
-from tests.reference_family_generation_fixture import generation_shape_check
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
 
 cms_doctors = importlib.import_module("process.cms_doctors")
 
@@ -341,7 +341,7 @@ async def _create_serving_fixture(staged):
         f'CREATE TABLE "{staged.schema}".reference_family_result_generation ('
         "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
         "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
-        f"CHECK ({generation_shape_check()}))"
+        f"CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))"
     )
     await models.db.status(
         text(
@@ -350,6 +350,8 @@ async def _create_serving_fixture(staged):
         ),
         lineage=uuid4(),
     )
+    async with models.db.engine.begin() as connection:
+        await install_source_generation_guards(connection, staged.schema)
 
 
 @pytest.mark.asyncio

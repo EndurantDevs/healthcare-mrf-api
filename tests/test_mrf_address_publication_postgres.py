@@ -13,6 +13,7 @@ from db.connection import Database
 from process import mrf_publication_receipt as receipt
 from process import reference_family_result_generation as generation
 from process.mrf_address_publication import lock_publication_family
+from tests.reference_family_generation_fixture import install_source_generation_guards
 from tests.test_mrf_publication_receipt_postgres import _MIGRATION
 from tests.test_reference_family_result_generation_postgres import (
     _MRF_MIGRATION_PATH,
@@ -36,29 +37,35 @@ async def _assert_pinned_publication_blocks_writes(engine, sessions, schema):
             assert blocked.value.orig.sqlstate == "55P03"
 
 
-async def _assert_relevant_address_changes_require_republication(engine, schema, admit, key):
+async def _assert_relevant_address_changes_require_republication(database, schema, admit, key):
     """Reject changed, invalid, or missing MRF canonical-address contributions."""
 
     for table_name in ("mrf_address", "mrf_address_evidence", "address_archive_v2"):
-        async with engine.begin() as connection:
+        async with database.transaction() as connection:
             await connection.execute(
                 text(f"UPDATE \"{schema}\".{table_name} SET value='changed' WHERE address_key=:key"), {"key": key}
             )
-        with pytest.raises(RuntimeError, match="content differs"):
+        is_tracked_source = table_name != "address_archive_v2"
+        with pytest.raises(RuntimeError, match="generation differs" if is_tracked_source else "content differs"):
             await admit()
-        async with engine.begin() as connection:
+        async with database.transaction() as connection:
             await connection.execute(
                 text(f"UPDATE \"{schema}\".{table_name} SET value='original' WHERE address_key=:key"), {"key": key}
             )
+        if is_tracked_source:
+            # Restoring bytes does not erase a committed source revision.
+            with pytest.raises(RuntimeError, match="generation differs"):
+                await admit()
+            await _complete_address_publication(database, schema)
         await admit()
     for assignment in ("source_bits=0", "merged_into=address_key"):
-        async with engine.begin() as connection:
+        async with database.transaction() as connection:
             await connection.execute(
                 text(f'UPDATE "{schema}".address_archive_v2 SET {assignment} WHERE address_key=:key'), {"key": key}
             )
         with pytest.raises(RuntimeError, match="coverage is incomplete"):
             await admit()
-        async with engine.begin() as connection:
+        async with database.transaction() as connection:
             await connection.execute(
                 text(
                     f'UPDATE "{schema}".address_archive_v2 SET source_bits=16, merged_into=NULL WHERE address_key=:key'
@@ -67,11 +74,14 @@ async def _assert_relevant_address_changes_require_republication(engine, schema,
             )
 
 
-async def _assert_missing_address_rejected(engine, schema, admit):
+async def _assert_missing_address_rejected(database, schema, admit):
     """Reject a serving MRF address relation with an uncovered null key."""
 
-    async with engine.begin() as connection:
+    async with database.transaction() as connection:
         await connection.execute(text(f'UPDATE "{schema}".mrf_address_evidence SET address_key=NULL'))
+    with pytest.raises(RuntimeError, match="generation differs"):
+        await admit()
+    await _complete_address_publication(database, schema)
     with pytest.raises(RuntimeError, match="coverage is incomplete"):
         await admit()
 
@@ -117,6 +127,7 @@ async def _create_address_publication_schema(engine, schema, key):
         await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
         await _run_migration(connection, _MRF_MIGRATION_PATH, "upgrade")
         await _run_migration(connection, _MIGRATION, "upgrade")
+        await install_source_generation_guards(connection, schema)
 
 
 @pytest.mark.asyncio
@@ -154,8 +165,8 @@ async def test_address_coverage_and_content_are_bound_to_completion(monkeypatch)
             )
         await _require_completed_address_publication(sessions, schema)
         admit = lambda: _require_completed_address_publication(sessions, schema)
-        await _assert_relevant_address_changes_require_republication(engine, schema, admit, key)
-        await _assert_missing_address_rejected(engine, schema, admit)
+        await _assert_relevant_address_changes_require_republication(database, schema, admit, key)
+        await _assert_missing_address_rejected(database, schema, admit)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

@@ -2,6 +2,7 @@
 """One native geo swap proves exact schema, ordering, and rollback."""
 
 import subprocess
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -48,8 +49,10 @@ async def _prepare_geo_candidate(sessions, live_schema, dataset_id):
                 "VALUES ('10001', 'New York', 'new york', 'NY', 40.7, -73.9)"
             )
         )
+        await generation.publish_local_reference_family_generation(session, importer_id="geo", schema_name=live_schema)
     manifest = await _manifest(sessions, "geo", live_schema)
     assert tuple(table.table_name for table in manifest.tables) == ("geo_zip_lookup",)
+    assert manifest.source_capture_contract == archive.GUARDED_SOURCE_CAPTURE_CONTRACT
     async with sessions() as session, session.begin():
         stage_ownership = await archive.precreate_reference_family_restore(
             session, importer_id="geo", dataset_id=dataset_id
@@ -105,31 +108,36 @@ async def _activation_binding(sessions, stage_ownership, manifest, live_schema, 
             session, importer_id="geo", schema_name=live_schema
         )
         sealed_owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
-        validation_receipt = await archive.prepare_reference_family_activation(
-            session,
-            ownership=stage_ownership,
-            manifest=manifest,
-            package_id=package_id,
-            profile_contract=archive.CONTRACT,
-            sealed_owner_oid=sealed_owner_oid,
-        )
     return {
         "ownership": stage_ownership,
         "manifest": manifest,
         "expected_incumbent": incumbent,
-        "validation_receipt": validation_receipt,
         "package_id": package_id,
         "sealed_owner_oid": sealed_owner_oid,
     }
 
 
 async def _activate(session, activation_by_field, source_generation_by_field):
+    """Bind each synthetic generation case to its manifest and validated stage."""
+
+    manifest = replace(
+        activation_by_field["manifest"],
+        source_serving_generation=generation.validate_reference_family_serving_generation(source_generation_by_field),
+    )
+    validation_receipt = await archive.prepare_reference_family_activation(
+        session,
+        ownership=activation_by_field["ownership"],
+        manifest=manifest,
+        package_id=activation_by_field["package_id"],
+        profile_contract=archive.CONTRACT,
+        sealed_owner_oid=activation_by_field["sealed_owner_oid"],
+    )
     return await archive.activate_validated_reference_family_stage(
         session,
         ownership=activation_by_field["ownership"],
-        manifest=activation_by_field["manifest"],
+        manifest=manifest,
         expected_incumbent=activation_by_field["expected_incumbent"],
-        validation_receipt=activation_by_field["validation_receipt"],
+        validation_receipt=validation_receipt,
         cutover=archive.ReferenceFamilyCutoverAuthority(
             activation_by_field["package_id"],
             archive.CONTRACT,
@@ -200,7 +208,7 @@ async def test_geo_replacement_keeps_indexes_and_fences_generation_and_failure(t
         activation_by_field = await _activation_binding(sessions, stage_ownership, manifest, live_schema, package_id)
         source_generation_by_field = {
             "origin_lineage_id": initial_authority.local_lineage_id,
-            "origin_generation": 2,
+            "origin_generation": initial_authority.serving_generation.origin_generation + 1,
             "published_at": "2026-09-20T10:00:00Z",
         }
         await _assert_atomic_activation(

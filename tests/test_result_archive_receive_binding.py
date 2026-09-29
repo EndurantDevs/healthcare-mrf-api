@@ -13,12 +13,60 @@ from process.ptg_parts import result_archive_receive_binding as subject
 from process.ptg_parts.frozen_rate_binding import FROZEN_RATE_FILE_BINDING_OPTION
 from process.ptg_parts.frozen_rate_files import FrozenRateFileMismatchError
 from process.ptg_parts.ptg2_invalid_price_exclusion import INVALID_PRICE_EXCLUSION_POLICY_FIELD
+from process.ptg_parts.result_archive_published_authority import _authority_from_identity
+from process.ptg_parts.result_archive_published_identity import validate_published_result_identity
 from process.ptg_parts.result_archive_source_authority import PtgResultArchiveSourceAuthorityError
+from tests.test_result_archive_candidate_preparation_postgres import _frozen_params
+from tests.test_result_archive_published_identity import _published_row
 
 
 class _TransactionSession:
     def in_transaction(self) -> bool:
         return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt", [None, []])
+async def test_candidate_initialization_rejects_non_mapping_source_receipt(receipt):
+    """Malformed callbacks keep the frozen authority validator's typed rejection."""
+
+    with pytest.raises(PtgResultArchiveSourceAuthorityError, match="receipt is invalid"):
+        await initialization.initialize_result_archive_candidate(
+            _TransactionSession(),
+            schema_name=initialization.resolve_ptg2_schema(),
+            staging_schema_name="staging_archive",
+            source_snapshot_key=1,
+            destination_snapshot_id="local-snapshot",
+            frozen_binding_params=_frozen_params()[1],
+            authenticated_source_archive_metadata=receipt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_published_result_initialization_rejects_mixed_or_reused_source_identity(monkeypatch):
+    receipt = _authority_from_identity("operation-1", validate_published_result_identity(_published_row())).as_dict()
+    destination = initialization.resolve_ptg2_schema()
+    arguments_by_name = {
+        "schema_name": destination,
+        "staging_schema_name": "staging_archive",
+        "source_snapshot_key": receipt["identity"]["snapshot_key"],
+        "destination_snapshot_id": "local-snapshot",
+        "authenticated_source_archive_metadata": receipt,
+        "reviewed_source_key": receipt["source_key"],
+    }
+    with pytest.raises(initialization.ResultArchiveCandidateInitializationError, match="cannot carry frozen"):
+        await initialization.initialize_result_archive_candidate(
+            _TransactionSession(), frozen_binding_params={"unexpected": True}, **arguments_by_name
+        )
+    with pytest.raises(ValueError, match="distinct staging"):
+        await initialization.initialize_result_archive_candidate(
+            _TransactionSession(), frozen_binding_params={}, **{**arguments_by_name, "staging_schema_name": destination}
+        )
+    monkeypatch.setattr(subject, "published_result_run_id", lambda *_: receipt["identity"]["import_run_id"])
+    with pytest.raises(initialization.ResultArchiveCandidateInitializationError, match="new local attempt"):
+        await initialization.initialize_result_archive_candidate(
+            _TransactionSession(), frozen_binding_params={}, **arguments_by_name
+        )
 
 
 def _source_receipt(**overrides):
@@ -91,6 +139,28 @@ async def test_receive_binding_rejects_non_integer_snapshot_keys_before_database
             source_key="source-a",
             authenticated_source_archive_metadata={},
         )
+
+
+@pytest.mark.asyncio
+async def test_frozen_receive_rejects_valid_published_receipt_before_database_access(monkeypatch) -> None:
+    receipt = _authority_from_identity("operation-1", validate_published_result_identity(_published_row())).as_dict()
+    monkeypatch.setattr(subject, "resolve_ptg2_schema", lambda: "mrf")
+
+    with pytest.raises(
+        initialization.ResultArchiveCandidateInitializationError,
+        match="receive binding is invalid",
+    ) as captured:
+        await subject.receive_frozen_binding_params(
+            _TransactionSession(),
+            schema_name="mrf",
+            staging_schema_name="stage",
+            source_snapshot_key=17,
+            destination_snapshot_id="destination-snapshot",
+            source_key=receipt["source_key"],
+            authenticated_source_archive_metadata=receipt,
+        )
+
+    assert isinstance(captured.value.__cause__, PtgResultArchiveSourceAuthorityError)
 
 
 def test_received_parameters_preserve_optional_invalid_price_policy(monkeypatch) -> None:
