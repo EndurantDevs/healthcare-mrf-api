@@ -143,13 +143,21 @@ def _no_change_projection(no_change) -> dict | None:
 
 
 def _generation_projection(evidence: ExecutionEvidenceStatus, candidate_generation_id: int | None) -> dict | None:
-    """Classify a pinned terminal candidate without selecting a current fallback."""
+    """Classify a pinned or uniquely recovered terminal candidate."""
 
     execution = evidence.execution
     generation = evidence.generation
     if candidate_generation_id is None:
-        if execution.state not in {"failed", "canceled"} or generation is not None or execution.failure_class is None:
+        if execution.state not in {"failed", "canceled"} or execution.failure_class is None:
             raise _Unavailable("no-generation terminal evidence is unavailable")
+        if generation is not None and (
+            execution.state != "canceled"
+            or generation.publication_state not in {"unsealed", "sealed_unpublished"}
+            or generation.no_change is not None
+            or evidence.current is not None
+            and evidence.current.generation_id == generation.generation_id
+        ):
+            raise _Unavailable("canceled generation evidence is unavailable")
         return None
     if (
         execution.state not in {"completed", "no_change"}
@@ -250,6 +258,10 @@ async def serve_execution_evidence(request, session):
                 execution_id=execution_id,
                 candidate_generation_id=candidate_generation_id,
             )
+            if candidate_generation_id is None and evidence.execution.state in {"completed", "no_change"}:
+                if evidence.generation is None:
+                    raise _Unavailable("terminal generation evidence is unavailable")
+                candidate_generation_id = evidence.generation.generation_id
             response_dict = _projection(
                 evidence,
                 dataset_id=dataset_id,

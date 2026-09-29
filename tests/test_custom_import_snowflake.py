@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -18,11 +19,21 @@ from types import SimpleNamespace
 import pytest
 
 from process.custom_import import snowflake
+from process.custom_import import snowflake_bundle
+import process.custom_import.capture as capture_module
 from process.custom_import.capture import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 _PRIVATE_KEY_PEM = "-----BEGIN PRIVATE KEY-----\nsynthetic-key-material\n-----END PRIVATE KEY-----\n"
+
+
+def test_optional_capture_runtime_fails_closed_when_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "process.custom_import.capture", None)
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="capture runtime is unavailable"):
+        snowflake._capture_runtime()
+    with pytest.raises(snowflake_bundle.SnowflakeBundleError, match="bundle acquisition runtime is unavailable"):
+        snowflake_bundle._capture_runtime()
 
 
 def _definition() -> CustomImportDefinition:
@@ -710,9 +721,15 @@ def test_partition_manifests_at_definition_and_connector_boundaries_seal(partiti
         (lambda: snowflake._printable_text("", "value", maximum_bytes=8), snowflake.SnowflakeConnectorError),
         (lambda: snowflake._printable_text("\ud800", "value", maximum_bytes=8), snowflake.SnowflakeConnectorError),
         (lambda: snowflake._printable_text("too long", "value", maximum_bytes=2), snowflake.SnowflakeConnectorError),
-        (lambda: snowflake._printable_text("line\nbreak", "value", maximum_bytes=32), snowflake.SnowflakeConnectorError),
+        (
+            lambda: snowflake._printable_text("line\nbreak", "value", maximum_bytes=32),
+            snowflake.SnowflakeConnectorError,
+        ),
         (lambda: snowflake._credential_text("", "secret", maximum_bytes=8), snowflake.SnowflakeCredentialError),
-        (lambda: snowflake._credential_text("env:SECRET", "secret", maximum_bytes=32), snowflake.SnowflakeCredentialError),
+        (
+            lambda: snowflake._credential_text("env:SECRET", "secret", maximum_bytes=32),
+            snowflake.SnowflakeCredentialError,
+        ),
         (lambda: snowflake._credential_text("\ud800", "secret", maximum_bytes=8), snowflake.SnowflakeCredentialError),
         (lambda: snowflake._credential_text("too long", "secret", maximum_bytes=2), snowflake.SnowflakeCredentialError),
         (lambda: snowflake._credential_principal("", "principal"), snowflake.SnowflakeCredentialError),
@@ -1073,9 +1090,7 @@ def test_connector_request_and_statement_boundaries_fail_closed():
         connector.build_statement(unapproved_request)
     mismatched_request = snowflake.SnowflakeReadRequest(
         relation=approved.relation,
-        selected_columns=(
-            snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="different_npi"),
-        ),
+        selected_columns=(snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="different_npi"),),
         definition_sha256=_definition().digest,
         schema_sha256=_definition().schema_digest,
     )
@@ -1115,9 +1130,7 @@ def test_acquisition_and_capture_replay_detect_tampered_evidence(monkeypatch):
         {
             "manifest": replace(
                 acquisition.manifest,
-                result_partitions=(
-                    replace(acquisition.manifest.result_partitions[0], content_sha256=other_digest),
-                ),
+                result_partitions=(replace(acquisition.manifest.result_partitions[0], content_sha256=other_digest),),
             )
         },
         {"manifest": replace(acquisition.manifest, content_sha256=other_digest)},
@@ -1150,9 +1163,9 @@ def test_acquisition_and_capture_replay_detect_tampered_evidence(monkeypatch):
             capture_limits=CaptureLimits(),
         )
     monkeypatch.setattr(
-        snowflake,
+        capture_module,
         "verify_capture",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(snowflake.CaptureError("invalid")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(capture_module.CaptureError("invalid")),
     )
     with pytest.raises(snowflake.SnowflakeConnectorError, match="cannot be replayed"):
         snowflake._verified_capture_receipts(

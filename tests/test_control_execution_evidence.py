@@ -385,18 +385,33 @@ async def test_route_passes_only_request_and_scoped_session_to_reader(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_explicit_null_candidate_requires_failed_or_canceled_without_generation(read_token, monkeypatch):
+async def test_explicit_null_candidate_recovers_unique_terminal_generation(read_token, monkeypatch):
     session = _Session()
+
+    async def completed(*_args, **pins):
+        assert pins["candidate_generation_id"] is None
+        return _evidence()
+
+    monkeypatch.setattr(reader, "inspect_execution_evidence", completed)
+    reply = await reader.serve_execution_evidence(_request(candidate_generation_id=None), session)
+    assert reply.status == 200 and _payload(reply)["generation"]["generation_id"] == 31
+
+    async def missing_generation(*_args, **_kwargs):
+        return _evidence(state="completed", generation=False)
+
+    monkeypatch.setattr(reader, "inspect_execution_evidence", missing_generation)
+    reply = await reader.serve_execution_evidence(_request(candidate_generation_id=None), session)
+    assert reply.status == 503 and _payload(reply) == {"error": "evidence_unavailable"}
 
     async def failed(*_args, **_kwargs):
         return _evidence(state="failed", generation=False)
 
     monkeypatch.setattr(reader, "inspect_execution_evidence", failed)
     reply = await reader.serve_execution_evidence(_request(candidate_generation_id=None), session)
-    payload = _payload(reply)
+    execution_payload = _payload(reply)
     assert reply.status == 200
-    assert payload["execution"]["failure_class"] == "candidate_rejected"
-    assert payload["generation"] is None and payload["capture"] is None
+    assert execution_payload["execution"]["failure_class"] == "candidate_rejected"
+    assert execution_payload["generation"] is None and execution_payload["capture"] is None
 
     async def bad(*_args, **_kwargs):
         evidence = _evidence(state="failed")
@@ -405,6 +420,29 @@ async def test_explicit_null_candidate_requires_failed_or_canceled_without_gener
     monkeypatch.setattr(reader, "inspect_execution_evidence", bad)
     reply = await reader.serve_execution_evidence(_request(candidate_generation_id=None), session)
     assert reply.status == 503 and _payload(reply) == {"error": "evidence_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication_state", ("unsealed", "sealed_unpublished"))
+async def test_cancelled_request_hides_unpublished_generation(read_token, monkeypatch, publication_state):
+    evidence = _evidence(state="canceled", publication_state=publication_state)
+    evidence = replace(
+        evidence,
+        current=None,
+        generation=replace(
+            evidence.generation, seal=None if publication_state == "unsealed" else evidence.generation.seal
+        ),
+    )
+
+    async def inspect(*_args, **_kwargs):
+        return evidence
+
+    monkeypatch.setattr(reader, "inspect_execution_evidence", inspect)
+    reply = await reader.serve_execution_evidence(_request(candidate_generation_id=None), _Session())
+    assert reply.status == 200
+    payload = _payload(reply)
+    assert payload["execution"]["state"] == "canceled"
+    assert payload["generation"] is None
 
 
 async def _seed_bound_graph(case):
@@ -504,6 +542,15 @@ async def _assert_retained_no_change(case, pins):
     assert response_document["generation"]["publication_state"] == "no_change"
     assert response_document["generation"]["current_pointer"] is None
     assert response_document["generation"]["no_change"]["base_generation_id"] == pins.first_generation_id
+    recovered_request = _bound_request(
+        pins, candidate_generation_id=pins.no_change_generation_id, key=pins.no_change_key
+    )
+    recovered_body = json.loads(recovered_request.body)
+    recovered_body["candidate_generation_id"] = None
+    recovered_request.body = json.dumps(recovered_body).encode()
+    recovered_reply = await _read_bound_case(case, recovered_request)
+    assert recovered_reply.status == 200
+    assert _payload(recovered_reply)["generation"]["generation_id"] == pins.no_change_generation_id
 
 
 @pytest.mark.asyncio
@@ -521,6 +568,13 @@ async def test_retained_locator_and_current_publication_use_one_read_snapshot(re
             "pointer_version": 1,
         }
         assert response_document["source_binding"]["revision_id"] == pins.binding_id
+        recovered_request = _bound_request(pins)
+        recovered_body = json.loads(recovered_request.body)
+        recovered_body["candidate_generation_id"] = None
+        recovered_request.body = json.dumps(recovered_body).encode()
+        recovered_reply = await _read_bound_case(case, recovered_request)
+        assert recovered_reply.status == 200
+        assert _payload(recovered_reply)["generation"]["generation_id"] == pins.first_generation_id
         reply = await _read_bound_case(case, _bound_request(pins, candidate_generation_id=pins.second_generation_id))
         assert reply.status == 404 and _payload(reply) == {"error": "not_found"}
         reply = await _read_bound_case(case, _bound_request(pins, dataset_id=pins.dataset_id + 1))

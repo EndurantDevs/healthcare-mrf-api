@@ -7,6 +7,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -14,12 +15,13 @@ import pytest
 from process.custom_import import snowflake_preflight
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import MAX_SCALAR_INTEGER, MIN_SCALAR_INTEGER, FamilyRejection
-from process.custom_import.snowflake import SnowflakeApprovedRelation, SnowflakeDeclaredColumn
+from process.custom_import.snowflake import SnowflakeApprovedRelation, SnowflakeConnectorError, SnowflakeDeclaredColumn
 from process.custom_import.snowflake_bundle import (
     DEFAULT_BUNDLE_ENCODING,
     SnowflakeBundleAcquisitionConnector,
     SnowflakeBundleBinding,
     SnowflakeBundleRequest,
+    SnowflakeBundleStatementBuilder,
 )
 from process.custom_import.snowflake_preflight import (
     SnowflakePreflightError,
@@ -36,8 +38,16 @@ from process.custom_import.snowflake_source_binding import (
     SOURCE_BINDING_CONTRACT,
     SnowflakeSourceBinding,
 )
+from process.custom_import.snowflake_preflight_schema import validate_preflight_result_schema
 
 _TOKEN = "synthetic-snapshot"
+
+
+def test_preflight_result_schema_rejects_missing_generated_statement_metadata():
+    with pytest.raises(SnowflakeConnectorError, match="result schema does not match"):
+        validate_preflight_result_schema(object(), ())
+
+
 _DEFINITION_DOCUMENT = {
     "contract": "custom-import/v1",
     "revision": {"definition": 1, "schema": 1},
@@ -311,6 +321,38 @@ def _bundle_statement(definition, binding):
     return connector.build_statement(request), request, approved_relations
 
 
+def test_statement_builder_matches_acquisition_connector_sql():
+    definition = _definition()
+    binding = _binding(definition)
+    approved_relations, bundle_bindings = binding.bundle_components(definition)
+    connector = _connector(definition, binding)
+    builder = SnowflakeBundleStatementBuilder(approved_relations=approved_relations)
+
+    connector_request = connector.prepare_request(definition, bindings=bundle_bindings)
+    builder_request = builder.prepare_request(definition, bindings=bundle_bindings)
+
+    assert builder_request == connector_request
+    assert builder.build_statement(builder_request) == connector.build_statement(connector_request)
+
+
+def test_preflight_accepts_statement_builder_by_connector_keyword():
+    definition = _definition()
+    binding = _binding(definition)
+    approved_relations, _ = binding.bundle_components(definition)
+    adapter = _Adapter(_complete_rows)
+
+    result = preflight_snowflake_bundle(
+        definition=definition,
+        binding=binding,
+        connector=SnowflakeBundleStatementBuilder(approved_relations=approved_relations),
+        adapter=adapter,
+        limits=SnowflakePreflightLimits(maximum_root_keys=1, maximum_child_rows=2),
+    )
+
+    assert result.status == "complete"
+    assert adapter.cursor.closed
+
+
 def _row(
     statement, kind, *, stream_ordinal=None, stream_id=None, key_ordinal=None, token=None, multiplicity=None, **fields
 ):
@@ -421,6 +463,106 @@ def _run(rows, *, limits=SnowflakePreflightLimits(maximum_root_keys=1, maximum_c
     return result, adapter
 
 
+_WIRE_TEST_FIXED_COLUMNS = (
+    "__ci_preflight_kind",
+    "__ci_preflight_stream_ordinal",
+    "__ci_preflight_stream_id",
+    "__ci_preflight_key_ordinal",
+    "__ci_preflight_source_snapshot_token",
+    "__ci_preflight_key_multiplicity",
+)
+_WIRE_TEST_COLUMNS = (*_WIRE_TEST_FIXED_COLUMNS, "key_value", "root_value", "child_value")
+_WIRE_TEST_VALUE = "\u03ba\x00" * 128
+_WIRE_PROTOCOL_VALUES = (
+    (
+        "metadata_token",
+        {
+            "__ci_preflight_kind": 0,
+            "__ci_preflight_stream_ordinal": 1,
+            "__ci_preflight_stream_id": "root_source",
+            "__ci_preflight_source_snapshot_token": _WIRE_TEST_VALUE,
+        },
+    ),
+    (
+        "selected_key",
+        {
+            "__ci_preflight_kind": 1,
+            "__ci_preflight_stream_ordinal": 0,
+            "__ci_preflight_key_ordinal": 1,
+            "__ci_preflight_key_multiplicity": 1,
+            "key_value": _WIRE_TEST_VALUE,
+        },
+    ),
+    (
+        "selected_root",
+        {
+            "__ci_preflight_kind": 2,
+            "__ci_preflight_stream_ordinal": 1,
+            "__ci_preflight_stream_id": "root_source",
+            "root_value": _WIRE_TEST_VALUE,
+        },
+    ),
+    (
+        "selected_child",
+        {
+            "__ci_preflight_kind": 2,
+            "__ci_preflight_stream_ordinal": 2,
+            "__ci_preflight_stream_id": "child_source",
+            "child_value": _WIRE_TEST_VALUE,
+        },
+    ),
+    (
+        "root_r_plus_one",
+        {
+            "__ci_preflight_kind": 1,
+            "__ci_preflight_stream_ordinal": 0,
+            "__ci_preflight_key_ordinal": 2,
+            "__ci_preflight_key_multiplicity": 1,
+            "key_value": _WIRE_TEST_VALUE,
+        },
+    ),
+    (
+        "child_c_plus_one",
+        {
+            "__ci_preflight_kind": 2,
+            "__ci_preflight_stream_ordinal": 2,
+            "__ci_preflight_stream_id": "child_source",
+            "child_value": _WIRE_TEST_VALUE,
+        },
+    ),
+)
+
+
+def _wire_test_row(column_ids, **values):
+    return tuple(values.get(column) for column in column_ids)
+
+
+def _sqlite_wire_budget_rows(raw_rows, column_ids, maximum_total_bytes):
+    """Execute generated sizing syntax, not Snowflake type-metadata behavior."""
+
+    fields = tuple(SimpleNamespace(field_id=column) for column in column_ids[6:])
+    branch = "SELECT " + ", ".join(f'? AS "{column}"' for column in column_ids)
+    statement = snowflake_preflight._preview_sql(
+        ('"__ci_preflight_seed" AS (SELECT 1)',),
+        (branch,) * len(raw_rows),
+        column_ids,
+        fields,
+        SnowflakePreflightLimits(maximum_total_bytes=maximum_total_bytes),
+    )
+    with sqlite3.connect(":memory:") as connection:
+        connection.create_function("TO_VARCHAR", 1, str)
+        connection.create_function("OCTET_LENGTH", 1, lambda value: len(value.encode("utf-8")))
+        return tuple(connection.execute(statement, tuple(value for raw_row in raw_rows for value in raw_row)))
+
+
+def _wire_budget_bytes(raw_rows, column_ids):
+    schema_allowance = 4096 + sum(256 + len(column) for column in column_ids)
+    return schema_allowance + sum(
+        2 + sum(5 if value is None else 3 + 6 * len(str(value).encode("utf-8")) for value in raw_row)
+        for raw_row in raw_rows
+    )
+
+
 def test_preflight_keeps_root_sentinel_as_lower_bound():
     result, adapter = _run(_complete_rows)
 
@@ -444,6 +586,93 @@ def test_preflight_keeps_root_sentinel_as_lower_bound():
     assert "LIMIT 3" in statement.sql
     assert "DROP" not in statement.sql
     assert adapter.cursor.closed
+
+
+def test_preflight_statement_bounds_every_raw_cell_before_returning_the_selected_sample():
+    result, adapter = _run(_complete_rows)
+
+    assert result.status == "complete"
+    statement, _timeout_seconds = adapter.calls[0]
+    schema_allowance = 4096 + sum(256 + len(column) for column in statement.column_ids)
+    assert '"__ci_preflight_raw" AS (SELECT' in statement.sql
+    assert '"__ci_preflight_wire" AS (SELECT COALESCE(SUM(2 +' in statement.sql
+    assert f') + {schema_allowance} AS "__ci_preflight_wire_bytes"' in statement.sql
+    assert 'FROM "__ci_preflight_raw" CROSS JOIN "__ci_preflight_wire"' in statement.sql
+    assert '"__ci_preflight_wire_bytes" <= 1048576 UNION ALL SELECT 3 AS "__ci_preflight_kind"' in statement.sql
+    assert 'FROM "__ci_preflight_wire" WHERE "__ci_preflight_wire_bytes" > 1048576' in statement.sql
+    for column in statement.column_ids:
+        assert (
+            f'CASE WHEN "{column}" IS NULL THEN 5 ELSE 3 + 6 * OCTET_LENGTH(TO_VARCHAR("{column}")) END'
+            in statement.sql
+        )
+    assert statement.sql.endswith('"note_id" ASC NULLS FIRST')
+
+
+def test_preflight_wire_allowance_grows_with_wide_null_schemas():
+    columns = tuple(f"field_{ordinal:03d}" for ordinal in range(256))
+    wire_cte = snowflake_preflight._wire_budget_cte(columns)
+    schema_allowance = 4096 + sum(256 + len(column) for column in columns)
+
+    assert f') + {schema_allowance} AS "__ci_preflight_wire_bytes"' in wire_cte
+    assert wire_cte.count("CASE WHEN") == len(columns)
+
+
+@pytest.mark.parametrize(("protocol_role", "column_values"), _WIRE_PROTOCOL_VALUES)
+def test_wire_budget_bounds_raw_rows_at_limit(protocol_role, column_values):
+    protocol_row = _wire_test_row(_WIRE_TEST_COLUMNS, **column_values)
+    budget_boundary = _wire_budget_bytes((protocol_row,), _WIRE_TEST_COLUMNS)
+    expected_sentinel = (3,) + (None,) * (len(_WIRE_TEST_COLUMNS) - 1)
+
+    assert _sqlite_wire_budget_rows((protocol_row,), _WIRE_TEST_COLUMNS, budget_boundary) == (protocol_row,), (
+        protocol_role
+    )
+    assert _sqlite_wire_budget_rows((protocol_row,), _WIRE_TEST_COLUMNS, budget_boundary - 1) == (expected_sentinel,), (
+        protocol_role
+    )
+
+
+def test_wire_budget_counts_wide_nulls_and_preserves_order():
+    column_ids = (*_WIRE_TEST_FIXED_COLUMNS, *(f"field_{ordinal:03d}" for ordinal in range(128)))
+    raw_rows = (
+        _wire_test_row(
+            column_ids,
+            __ci_preflight_kind=0,
+            __ci_preflight_stream_ordinal=2,
+            __ci_preflight_stream_id="second",
+        ),
+        _wire_test_row(
+            column_ids,
+            __ci_preflight_kind=0,
+            __ci_preflight_stream_ordinal=1,
+            __ci_preflight_stream_id="first",
+        ),
+        _wire_test_row(
+            column_ids,
+            __ci_preflight_kind=1,
+            __ci_preflight_stream_ordinal=0,
+            __ci_preflight_key_ordinal=2,
+            __ci_preflight_key_multiplicity=1,
+        ),
+        _wire_test_row(
+            column_ids,
+            __ci_preflight_kind=1,
+            __ci_preflight_stream_ordinal=0,
+            __ci_preflight_key_ordinal=1,
+            __ci_preflight_key_multiplicity=1,
+        ),
+    )
+    budget_boundary = _wire_budget_bytes(raw_rows, column_ids)
+    expected_sentinel = (3,) + (None,) * (len(column_ids) - 1)
+
+    returned_rows = _sqlite_wire_budget_rows(raw_rows, column_ids, budget_boundary)
+
+    assert tuple((result_row[0], result_row[1], result_row[3]) for result_row in returned_rows) == (
+        (0, 1, None),
+        (0, 2, None),
+        (1, 0, 1),
+        (1, 0, 2),
+    )
+    assert _sqlite_wire_budget_rows(raw_rows, column_ids, budget_boundary - 1) == (expected_sentinel,)
 
 
 def test_preflight_normalizes_out_of_slot_stream_fields_before_mapping_comparison():
@@ -637,6 +866,40 @@ def test_preflight_marks_observations_unknown_after_the_client_byte_limit():
     assert result.status == "unavailable"
     assert result.unavailable_reason == "byte_limit"
     assert {item.precision for item in result.observations} == {"unknown"}
+
+
+def test_preflight_discards_an_overbudget_database_sentinel_without_reading_source_values():
+    result, adapter = _run(lambda statement: [_row(statement, 3)])
+
+    assert result.status == "unavailable"
+    assert result.unavailable_reason == "byte_limit"
+    assert result.observed_bytes == 0
+    assert result.sample is None
+    assert {item.precision for item in result.observations} == {"unknown"}
+    assert adapter.cursor.fetch_count == 1
+    assert adapter.cursor.closed
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        lambda statement: _row(statement, 3, stream_ordinal=0),
+        lambda statement: _row(statement, 3, token="value"),
+        lambda statement: _row(statement, 3, npi="synthetic-value"),
+        lambda statement: _row(statement, 3.0),
+    ),
+    ids=("ordinal", "token", "data", "non_integral_kind"),
+)
+def test_preflight_rejects_malformed_database_byte_limit_sentinels_before_client_counting(monkeypatch, row):
+    monkeypatch.setattr(snowflake_preflight, "_row_bytes", lambda _values: pytest.fail("sentinel reached byte counter"))
+
+    result, adapter = _run(lambda statement: [row(statement)])
+
+    assert result.status == "unavailable"
+    assert result.unavailable_reason == "result_invalid"
+    assert result.sample is None
+    assert {item.precision for item in result.observations} == {"unknown"}
+    assert adapter.cursor.closed
 
 
 def test_preflight_discards_work_that_exceeds_the_elapsed_limit():
@@ -998,7 +1261,7 @@ def test_preflight_stops_row_processing_when_the_elapsed_limit_expires(clock_val
         lambda _statement: ["not-a-result-row"],
         lambda statement: [_row(statement, 0, stream_ordinal=1, stream_id="root_source", token=object())],
         lambda statement: [_row(statement, True)],
-        lambda statement: [_row(statement, 3)],
+        lambda statement: [_row(statement, 4)],
     ),
     ids=("non-sequence", "unsupported-scalar", "boolean-kind", "unknown-kind"),
 )
@@ -1243,6 +1506,7 @@ def test_preflight_counts_supported_wire_scalars_and_rejects_unsafe_values():
     assert snowflake_preflight._value_bytes(Decimal("12.5")) == 4
     assert snowflake_preflight._value_bytes(datetime(2026, 1, 2, 3, 4, 5)) == 19
     assert snowflake_preflight._value_bytes(date(2026, 1, 2)) == 10
+    assert snowflake_preflight._value_bytes("\u03ba\x00\u2603") == len("\u03ba\x00\u2603".encode("utf-8"))
     with pytest.raises(TypeError):
         snowflake_preflight._value_bytes(object())
     assert not snowflake_preflight._has_valid_key(())

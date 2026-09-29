@@ -264,25 +264,41 @@ async def _register_snowflake_binding(*, stream: Any | None = None, database=db)
     """Commit one canonical registration before returning its redacted receipt."""
 
     dataset_key, definition, binding = _registration_from_stdin(stream)
-    try:
-        await database.connect()
-        async with database.session() as session, session.begin():
-            result = await register_snowflake_source_binding(
-                session,
-                dataset_key=dataset_key,
-                definition=definition,
-                binding=binding,
-            )
-        async with database.session() as session:
-            return await _committed_registration_receipt(
-                session,
-                dataset_key=dataset_key,
-                registration=result,
-                definition=definition,
-                binding=binding,
-            )
-    finally:
-        await database.disconnect()
+    with _receipt_only_database_output(database):
+        engine = None
+        previous_echo = _MISSING
+        has_primary_failure = False
+        try:
+            await database.connect()
+            engine = getattr(database, "engine", None)
+            previous_echo = getattr(engine, "echo", _MISSING)
+            _set_engine_echo(database, False)
+            async with database.session() as session, session.begin():
+                registration = await register_snowflake_source_binding(
+                    session,
+                    dataset_key=dataset_key,
+                    definition=definition,
+                    binding=binding,
+                )
+            async with database.session() as session:
+                return await _committed_registration_receipt(
+                    session,
+                    dataset_key=dataset_key,
+                    registration=registration,
+                    definition=definition,
+                    binding=binding,
+                )
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if previous_echo is not _MISSING:
+                engine.echo = previous_echo
+            try:
+                await database.disconnect()
+            except Exception:
+                if not has_primary_failure:
+                    raise
 
 
 def _receipt(result: CandidateRunResult) -> str:
@@ -681,36 +697,52 @@ async def _run_retained_snowflake_binding(
     idempotency_key: str,
     database=db,
 ) -> CandidateRunResult:
-    await database.connect()
-    try:
-        async with database.session() as session:
-            loaded = await load_snowflake_source_binding(
-                session,
-                definition_revision_id=definition_revision_id,
-                source_binding_revision_id=source_binding_revision_id,
-            )
-        adapter = SnowflakePythonConnectorAdapter(role=loaded.binding.role, warehouse=loaded.binding.warehouse)
-        with FixedLocalKeyPairCredentialProvider(FIXED_CREDENTIAL_DIRECTORY) as credential_provider:
-            connector = SnowflakeBundleAcquisitionConnector(
-                approved_relations=loaded.approved_relations,
-                credential_provider=credential_provider,
-                adapter=adapter,
-            )
-            bundle_request = connector.prepare_request(loaded.definition, bindings=loaded.bundle_bindings)
-            request = SnowflakeBundleCandidateRequest(
-                dataset_id=loaded.dataset_id,
-                definition_revision_id=loaded.definition_revision_id,
-                schema_revision_id=loaded.schema_revision_id,
-                definition=loaded.definition,
-                bundle_request=bundle_request,
-                idempotency_key=idempotency_key,
-                lease_token=secrets.token_urlsafe(32),
-                source_binding_revision_id=loaded.source_binding_revision_id,
-                source_binding_sha256=loaded.source_binding_sha256,
-            )
-            return await run_snowflake_bundle_candidate(database.session, connector, request)
-    finally:
-        await database.disconnect()
+    with _receipt_only_database_output(database):
+        engine = None
+        previous_echo = _MISSING
+        has_primary_failure = False
+        try:
+            await database.connect()
+            engine = getattr(database, "engine", None)
+            previous_echo = getattr(engine, "echo", _MISSING)
+            _set_engine_echo(database, False)
+            async with database.session() as session:
+                loaded = await load_snowflake_source_binding(
+                    session,
+                    definition_revision_id=definition_revision_id,
+                    source_binding_revision_id=source_binding_revision_id,
+                )
+            adapter = SnowflakePythonConnectorAdapter(role=loaded.binding.role, warehouse=loaded.binding.warehouse)
+            with FixedLocalKeyPairCredentialProvider(FIXED_CREDENTIAL_DIRECTORY) as credential_provider:
+                connector = SnowflakeBundleAcquisitionConnector(
+                    approved_relations=loaded.approved_relations,
+                    credential_provider=credential_provider,
+                    adapter=adapter,
+                )
+                bundle_request = connector.prepare_request(loaded.definition, bindings=loaded.bundle_bindings)
+                request = SnowflakeBundleCandidateRequest(
+                    dataset_id=loaded.dataset_id,
+                    definition_revision_id=loaded.definition_revision_id,
+                    schema_revision_id=loaded.schema_revision_id,
+                    definition=loaded.definition,
+                    bundle_request=bundle_request,
+                    idempotency_key=idempotency_key,
+                    lease_token=secrets.token_urlsafe(32),
+                    source_binding_revision_id=loaded.source_binding_revision_id,
+                    source_binding_sha256=loaded.source_binding_sha256,
+                )
+                return await run_snowflake_bundle_candidate(database.session, connector, request)
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if previous_echo is not _MISSING:
+                engine.echo = previous_echo
+            try:
+                await database.disconnect()
+            except Exception:
+                if not has_primary_failure:
+                    raise
 
 
 def _resume_source_access_forbidden(*_args: object, **_kwargs: object) -> None:

@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import func, select
 
 import process.custom_import.snowflake_candidate as snowflake_candidate
+import process.custom_import.snowflake_binding as binding_contract
 import process.custom_import.snowflake_source_binding as source_binding
 from db.models.custom_import import CustomImportExecution, CustomImportSourceBindingRevision
 from process.custom_import.definition import CustomImportDefinition
@@ -209,6 +210,9 @@ def test_binding_derives_complete_approved_relations_and_generated_bundle_identi
 
 def test_binding_rejects_unknown_keys_paths_and_incomplete_field_mapping():
     definition = _definition()
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="JSON is invalid"):
+        source_binding.SnowflakeSourceBinding.from_json('{"contract":')
+
     document = _binding_document(definition)
     document["sql"] = "SELECT"
     with pytest.raises(source_binding.SnowflakeSourceBindingError):
@@ -249,6 +253,21 @@ def test_binding_rejects_unknown_keys_paths_and_incomplete_field_mapping():
     document["streams"][1]["source_snapshot_token_column_identifier"] = "root_snapshot_token"
     with pytest.raises(source_binding.SnowflakeSourceBindingError, match="physical column mapping"):
         source_binding.SnowflakeSourceBinding.from_json(json.dumps(document)).bundle_components(definition)
+
+
+def test_shared_relation_rejects_conflicting_field_mapping():
+    relation = binding_contract.SnowflakeRelation("synthetic", "public", "records")
+    columns_by_relation = {}
+    relation_by_key = {}
+    binding_contract._register_approved_column(
+        columns_by_relation, relation_by_key, relation,
+        binding_contract.SnowflakeDeclaredColumn("npi", "first_npi"),
+    )
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="field mapping is inconsistent"):
+        binding_contract._register_approved_column(
+            columns_by_relation, relation_by_key, relation,
+            binding_contract.SnowflakeDeclaredColumn("npi", "second_npi"),
+        )
 
 
 def test_snapshot_mapping_changes_binding_digest_and_legacy_rows_fail_closed():

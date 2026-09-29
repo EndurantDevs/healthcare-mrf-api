@@ -19,26 +19,22 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Callable, Protocol
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Protocol
 
 from process.custom_import._source_text import (
     _SourceTextValidationError,
     validate_snapshot_token,
 )
-from process.custom_import.capture import (
-    CaptureError,
-    CaptureLimits,
-    CaptureManifest,
-    SealedCapture,
-    capture_stream,
-    verify_capture,
-)
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import (
     CONTRACT_VERSION,
     CustomImportDefinition,
     SourceStream,
     canonical_json,
 )
+
+if TYPE_CHECKING:
+    from process.custom_import.capture import SealedCapture
 
 CONNECTOR_CONTRACT = "custom-import/snowflake-acquisition/v1"
 PARQUET_RESULT_FORMAT = "parquet"
@@ -83,6 +79,22 @@ class SnowflakeConnectorError(ValueError):
 
 class SnowflakeCredentialError(SnowflakeConnectorError):
     """The fixed local key-pair credential material is unavailable or malformed."""
+
+
+def _capture_runtime() -> tuple[Any, Any, Any, Any, Any]:
+    """Load the optional capture runtime only for acquisition or replay work."""
+
+    try:
+        from process.custom_import.capture import (
+            CaptureError,
+            CaptureManifest,
+            SealedCapture,
+            capture_stream,
+            verify_capture,
+        )
+    except ModuleNotFoundError as exc:
+        raise SnowflakeConnectorError("capture runtime is unavailable") from exc
+    return CaptureError, CaptureManifest, SealedCapture, capture_stream, verify_capture
 
 
 def _identifier(value: Any, label: str) -> str:
@@ -1070,6 +1082,7 @@ class SnowflakeAcquisitionConnector:
         """Fetch and seal an adapter result without decoding or registering it."""
 
         statement = self.build_statement(request)
+        _capture_runtime()
         credentials = self._credential_provider.load_key_pair()
         if not isinstance(credentials, SnowflakeKeyPairCredentials):
             raise SnowflakeConnectorError("credential provider returned an invalid key-pair value")
@@ -1175,6 +1188,7 @@ def _capture_result_partitions(
 ) -> tuple[tuple[SealedCapture, ...], tuple[SnowflakeResultPartitionManifest, ...], str]:
     """Capture adapter readers one at a time under one aggregate result budget."""
 
+    capture_error, _, _, capture_stream, _ = _capture_runtime()
     captures: list[SealedCapture] = []
     receipts: list[SnowflakeResultPartitionManifest] = []
     content_hasher = _ResultContentHasher()
@@ -1201,7 +1215,7 @@ def _capture_result_partitions(
                         source_snapshot_token=adapter_result.source_snapshot_token,
                         limits=partition_limits,
                     )
-                except (CaptureError, OSError) as exc:
+                except (capture_error, OSError) as exc:
                     raise SnowflakeConnectorError("result partition cannot be captured within the byte limits") from exc
                 receipt = _capture_receipt(
                     capture,
@@ -1228,7 +1242,8 @@ def _capture_receipt(
 ) -> SnowflakeResultPartitionManifest:
     """Expose one sealed capture as a bounded content receipt for its result slot."""
 
-    if not isinstance(capture, SealedCapture) or not isinstance(capture.manifest, CaptureManifest):
+    _, capture_manifest_type, sealed_capture_type, _, _ = _capture_runtime()
+    if not isinstance(capture, sealed_capture_type) or not isinstance(capture.manifest, capture_manifest_type):
         raise SnowflakeConnectorError("result partition must use a sealed capture")
     capture_manifest = capture.manifest
     if capture_manifest.source_snapshot_token != source_snapshot_token:
@@ -1260,6 +1275,7 @@ def _verified_capture_receipts(
 ) -> tuple[tuple[SnowflakeResultPartitionManifest, ...], str]:
     """Replay-verify capture payloads while enforcing the aggregate byte budget."""
 
+    capture_error, _, _, _, verify_capture = _capture_runtime()
     if len(captures) > MAX_RESULT_PARTITIONS:
         raise SnowflakeConnectorError("result partition manifest exceeds the partition limit")
     receipts: list[SnowflakeResultPartitionManifest] = []
@@ -1285,7 +1301,7 @@ def _verified_capture_receipts(
         )
         try:
             verify_capture(capture, SNOWFLAKE_RESULT_STREAM, limits=partition_limits)
-        except CaptureError as exc:
+        except capture_error as exc:
             raise SnowflakeConnectorError("result capture cannot be replayed within the byte limits") from exc
         compressed_bytes += capture_manifest.compressed_bytes
         decoded_bytes += capture_manifest.decoded_bytes

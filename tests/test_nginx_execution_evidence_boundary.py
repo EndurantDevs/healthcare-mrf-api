@@ -11,6 +11,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_PATH = "/control/v1/custom-import/execution-evidence"
+STOP_REQUEST_PATH = "/control/v1/custom-import/execution-stop-request"
+STOP_FINALIZE_PATH = "/control/v1/custom-import/execution-stop-finalize"
+PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH)
 
 
 def _unused_port():
@@ -83,7 +86,7 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
         (private_directory / "synthetic.conf").write_text(
             f"""server {{
                 listen 127.0.0.1:{private_port};
-                location = {EVIDENCE_PATH} {{ proxy_pass http://127.0.0.1:{upstream_port}; }}
+                {"".join(f"location = {path} {{ proxy_pass http://127.0.0.1:{upstream_port}; }}" for path in PRIVATE_PATHS)}
                 location / {{ return 404; }}
             }}"""
         )
@@ -96,17 +99,18 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
     with subprocess.Popen([*command_parts, "-g", "daemon off;"], stderr=subprocess.PIPE, text=True) as process:
         try:
             _wait_for_listener(process, public_port)
-            for path in (
-                EVIDENCE_PATH,
-                EVIDENCE_PATH + "/",
-                EVIDENCE_PATH + "/nested",
-                EVIDENCE_PATH + "?probe=1",
-                "/control//v1/custom-import/execution-evidence",
-                "/control/v1/custom-import/%65xecution-evidence",
-                "/control/v1/custom-import%2fexecution-evidence",
-                "/api/../control/v1/custom-import/execution-evidence",
-            ):
-                assert _request(public_port, path) == (404, None), path
+            for private_path in PRIVATE_PATHS:
+                for path in (
+                    private_path,
+                    private_path + "/",
+                    private_path + "/nested",
+                    private_path + "?probe=1",
+                    private_path.replace("/control/v1/", "/control//v1/"),
+                    private_path.replace("/execution-", "/%65xecution-"),
+                    private_path.replace("/custom-import/", "/custom-import%2f"),
+                    "/api/../" + private_path.removeprefix("/"),
+                ):
+                    assert _request(public_port, path) == (404, None), path
             for path in (
                 "/api/v1/healthcheck/live",
                 "/control/v1/custom-import/another-route",
@@ -114,7 +118,8 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
             ):
                 assert _request(public_port, path) == (204, "Bearer synthetic")
             if private_enabled:
-                assert _request(private_port, EVIDENCE_PATH) == (204, "Bearer synthetic")
+                for private_path in PRIVATE_PATHS:
+                    assert _request(private_port, private_path) == (204, "Bearer synthetic")
                 assert _request(private_port, "/api/v1/healthcheck/live") == (404, None)
         finally:
             process.terminate()

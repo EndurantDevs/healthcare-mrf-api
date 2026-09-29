@@ -938,6 +938,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     assert "COUNT(*) OVER () AS provider_total" in page_sql
     assert "ORDER BY taxonomy.npi, taxonomy.checksum" in str(conn.all.await_args_list[1].args[0])
     assert not any("SELECT COUNT(DISTINCT" in str(call.args[0]) for call in conn.all.await_args_list)
+    assert not any("custom_import_provider_relation" in str(call.args[0]) for call in conn.all.await_args_list)
 
 
 @pytest.mark.asyncio
