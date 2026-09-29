@@ -9,18 +9,10 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from process.custom_import._source_text import _SourceTextValidationError, validate_snapshot_token
-from process.custom_import.capture import (
-    CaptureError,
-    CaptureLimits,
-    CaptureManifest,
-    SealedCapture,
-    capture_stream,
-    verify_capture,
-)
-from process.custom_import.capture_store import ReplayableParquetCapture
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CONTRACT_VERSION, CustomImportDefinition, Field, SourceStream
 from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
 from process.custom_import.snowflake import (
@@ -40,6 +32,10 @@ from process.custom_import.snowflake import (
     SnowflakeRelation,
     SnowflakeResultColumn,
 )
+
+if TYPE_CHECKING:
+    from process.custom_import.capture import CaptureManifest, SealedCapture
+    from process.custom_import.capture_store import ReplayableParquetCapture
 
 BUNDLE_CONNECTOR_CONTRACT = "custom-import/snowflake-bundle-acquisition/v1"
 PARQUET_COMPRESSION = "zstd"
@@ -64,6 +60,22 @@ _DATA_ROW_KIND = 1
 
 class SnowflakeBundleError(SnowflakeConnectorError):
     """A one-statement Snowflake bundle is malformed or cannot be sealed."""
+
+
+def _capture_runtime() -> tuple[Any, Any, Any, Any, Any]:
+    """Load capture support only when the acquisition path needs it."""
+
+    try:
+        from process.custom_import.capture import (
+            CaptureError,
+            CaptureManifest,
+            SealedCapture,
+            capture_stream,
+            verify_capture,
+        )
+    except ModuleNotFoundError as exc:
+        raise SnowflakeBundleError("bundle acquisition runtime is unavailable") from exc
+    return CaptureError, CaptureManifest, SealedCapture, capture_stream, verify_capture
 
 
 def _field_id(value: object, label: str) -> str:
@@ -776,6 +788,7 @@ class SnowflakeBundleStreamCapture:
     captures: tuple[SealedCapture, ...]
 
     def __post_init__(self) -> None:
+        _, _, sealed_capture_type, _, _ = _capture_runtime()
         object.__setattr__(self, "stream_id", _field_id(self.stream_id, "bundle capture stream id"))
         if (
             not isinstance(self.schema, tuple)
@@ -786,7 +799,7 @@ class SnowflakeBundleStreamCapture:
         if (
             not isinstance(self.captures, tuple)
             or not self.captures
-            or not all(isinstance(capture, SealedCapture) for capture in self.captures)
+            or not all(isinstance(capture, sealed_capture_type) for capture in self.captures)
         ):
             raise SnowflakeBundleError("bundle capture requires schema-bearing Parquet partitions")
 
@@ -915,6 +928,7 @@ def _verify_stream_capture(
     decoded_bytes: int,
     partition_count: int,
 ) -> tuple[int, int, int]:
+    capture_error, capture_manifest_type, _, _, verify_capture = _capture_runtime()
     if len(stream_capture.captures) > MAX_RESULT_PARTITIONS:
         raise SnowflakeBundleError("bundle stream partitions exceed the result limit")
     if len(stream_capture.captures) > MAX_BUNDLE_PARTITIONS - partition_count:
@@ -922,7 +936,7 @@ def _verify_stream_capture(
     stream_compressed_bytes = 0
     for capture in stream_capture.captures:
         manifest = capture.manifest
-        if not isinstance(manifest, CaptureManifest):
+        if not isinstance(manifest, capture_manifest_type):
             raise SnowflakeBundleError("bundle capture manifest is invalid")
         if manifest.source_snapshot_token != source_snapshot_token:
             raise SnowflakeBundleError("bundle capture token does not match semantic metadata")
@@ -939,7 +953,7 @@ def _verify_stream_capture(
         )
         try:
             verify_capture(capture, stream, limits=partition_limits)
-        except CaptureError as exc:
+        except capture_error as exc:
             raise SnowflakeBundleError("bundle capture cannot be replayed") from exc
         compressed_bytes += manifest.compressed_bytes
         stream_compressed_bytes += manifest.compressed_bytes
@@ -948,32 +962,31 @@ def _verify_stream_capture(
     return compressed_bytes, decoded_bytes, partition_count
 
 
-class SnowflakeBundleAcquisitionConnector:
-    """Build, execute, and seal only one allowlisted parent/child bundle statement."""
+def _approved_relation_mapping(
+    approved_relations: tuple[SnowflakeApprovedRelation, ...],
+) -> dict[tuple[str, str, str], SnowflakeApprovedRelation]:
+    if not isinstance(approved_relations, tuple) or not 1 <= len(approved_relations) <= MAX_APPROVED_RELATIONS:
+        raise SnowflakeBundleError("approved relations must contain from 1 through 128 entries")
+    if not all(isinstance(relation, SnowflakeApprovedRelation) for relation in approved_relations):
+        raise SnowflakeBundleError("approved relations must use declared relation values")
+    relation_keys = tuple(relation.relation.parts for relation in approved_relations)
+    if len(relation_keys) != len(set(relation_keys)):
+        raise SnowflakeBundleError("approved relation identifiers must be unique")
+    return {relation.relation.parts: relation for relation in approved_relations}
+
+
+class SnowflakeBundleStatementBuilder:
+    """Build only one allowlisted parent/child bundle statement."""
 
     def __init__(
         self,
         *,
         approved_relations: tuple[SnowflakeApprovedRelation, ...],
-        credential_provider: SnowflakeCredentialProvider,
-        adapter: SnowflakeBundleAdapter,
         capture_limits: CaptureLimits = DEFAULT_CAPTURE_LIMITS,
     ) -> None:
-        if not isinstance(approved_relations, tuple) or not 1 <= len(approved_relations) <= MAX_APPROVED_RELATIONS:
-            raise SnowflakeBundleError("approved relations must contain from 1 through 128 entries")
-        if not all(isinstance(relation, SnowflakeApprovedRelation) for relation in approved_relations):
-            raise SnowflakeBundleError("approved relations must use declared relation values")
-        relation_keys = tuple(relation.relation.parts for relation in approved_relations)
-        if len(relation_keys) != len(set(relation_keys)):
-            raise SnowflakeBundleError("approved relation identifiers must be unique")
-        if not callable(getattr(credential_provider, "load_key_pair", None)):
-            raise SnowflakeBundleError("credential provider must load a key pair")
-        if not callable(getattr(adapter, "fetch_bundle", None)):
-            raise SnowflakeBundleError("bundle adapter must fetch one generated bundle")
+        approved_by_relation = _approved_relation_mapping(approved_relations)
         capture_limits = _capture_limits(capture_limits)
-        self._approved_by_relation = {relation.relation.parts: relation for relation in approved_relations}
-        self._credential_provider = credential_provider
-        self._adapter = adapter
+        self._approved_by_relation = approved_by_relation
         self._capture_limits = capture_limits
 
     def prepare_request(
@@ -1006,44 +1019,6 @@ class SnowflakeBundleAcquisitionConnector:
             source_snapshot_token_columns_by_stream=snapshot_token_columns,
         )
 
-    def acquire(
-        self,
-        request: SnowflakeBundleRequest,
-        *,
-        prepared_statement: SnowflakeBundleStatement | None = None,
-    ) -> SnowflakeBundleAcquisition:
-        """Execute exactly one generated statement, validate metadata, and seal bytes."""
-
-        statement = self.build_statement(request)
-        if prepared_statement is not None:
-            prepared_statement = _validated_bundle_statement(prepared_statement)
-            if prepared_statement != statement:
-                raise SnowflakeBundleError("prepared bundle statement does not match the configured statement")
-            statement = prepared_statement
-        credentials = self._credential_provider.load_key_pair()
-        if not isinstance(credentials, SnowflakeKeyPairCredentials):
-            raise SnowflakeBundleError("credential provider returned an invalid key-pair value")
-        bundle_result: object | None = None
-        is_complete = False
-        try:
-            bundle_result = self._adapter.fetch_bundle(statement, credentials)
-            if not isinstance(bundle_result, SnowflakeBundleResult):
-                raise SnowflakeBundleError("bundle adapter returned an invalid result")
-            try:
-                acquisition = _seal_bundle(statement, bundle_result, self._capture_limits)
-            except SnowflakeBundleError:
-                raise
-            except SnowflakeConnectorError as exc:
-                raise SnowflakeBundleError("bundle result cannot be sealed") from exc
-            is_complete = True
-            return acquisition
-        finally:
-            if isinstance(bundle_result, SnowflakeBundleResult):
-                if is_complete:
-                    bundle_result.close()
-                else:
-                    _close_after_failure(bundle_result)
-
     def _approved_columns(
         self,
         request: SnowflakeBundleRequest,
@@ -1072,6 +1047,65 @@ class SnowflakeBundleAcquisitionConnector:
         if column is None:
             raise SnowflakeBundleError("bundle source snapshot token column is not declared for the approved relation")
         return column
+
+
+class SnowflakeBundleAcquisitionConnector(SnowflakeBundleStatementBuilder):
+    """Build, execute, and seal only one allowlisted parent/child bundle statement."""
+
+    def __init__(
+        self,
+        *,
+        approved_relations: tuple[SnowflakeApprovedRelation, ...],
+        credential_provider: SnowflakeCredentialProvider,
+        adapter: SnowflakeBundleAdapter,
+        capture_limits: CaptureLimits = DEFAULT_CAPTURE_LIMITS,
+    ) -> None:
+        super().__init__(approved_relations=approved_relations, capture_limits=capture_limits)
+        if not callable(getattr(credential_provider, "load_key_pair", None)):
+            raise SnowflakeBundleError("credential provider must load a key pair")
+        if not callable(getattr(adapter, "fetch_bundle", None)):
+            raise SnowflakeBundleError("bundle adapter must fetch one generated bundle")
+        self._credential_provider = credential_provider
+        self._adapter = adapter
+
+    def acquire(
+        self,
+        request: SnowflakeBundleRequest,
+        *,
+        prepared_statement: SnowflakeBundleStatement | None = None,
+    ) -> SnowflakeBundleAcquisition:
+        """Execute exactly one generated statement, validate metadata, and seal bytes."""
+
+        statement = self.build_statement(request)
+        if prepared_statement is not None:
+            prepared_statement = _validated_bundle_statement(prepared_statement)
+            if prepared_statement != statement:
+                raise SnowflakeBundleError("prepared bundle statement does not match the configured statement")
+            statement = prepared_statement
+        _capture_runtime()
+        credentials = self._credential_provider.load_key_pair()
+        if not isinstance(credentials, SnowflakeKeyPairCredentials):
+            raise SnowflakeBundleError("credential provider returned an invalid key-pair value")
+        bundle_result: object | None = None
+        is_complete = False
+        try:
+            bundle_result = self._adapter.fetch_bundle(statement, credentials)
+            if not isinstance(bundle_result, SnowflakeBundleResult):
+                raise SnowflakeBundleError("bundle adapter returned an invalid result")
+            try:
+                acquisition = _seal_bundle(statement, bundle_result, self._capture_limits)
+            except SnowflakeBundleError:
+                raise
+            except SnowflakeConnectorError as exc:
+                raise SnowflakeBundleError("bundle result cannot be sealed") from exc
+            is_complete = True
+            return acquisition
+        finally:
+            if isinstance(bundle_result, SnowflakeBundleResult):
+                if is_complete:
+                    bundle_result.close()
+                else:
+                    _close_after_failure(bundle_result)
 
 
 def _close_after_failure(result: SnowflakeBundleResult) -> None:
@@ -1165,6 +1199,7 @@ def _capture_stream_result(
     decoded_bytes: int,
     partition_count: int,
 ) -> tuple[tuple[SealedCapture, ...], int, int, int]:
+    capture_error, _, _, capture_stream, _ = _capture_runtime()
     captures = []
     stream_compressed_bytes = 0
     partition_iterator = parquet_result.consume_partition_sources()
@@ -1191,7 +1226,7 @@ def _capture_stream_result(
                         source_snapshot_token=source_snapshot_token,
                         limits=partition_limits,
                     )
-                except (CaptureError, OSError) as exc:
+                except (capture_error, OSError) as exc:
                     raise SnowflakeBundleError("bundle result partition cannot be captured") from exc
                 compressed_bytes += capture.manifest.compressed_bytes
                 stream_compressed_bytes += capture.manifest.compressed_bytes

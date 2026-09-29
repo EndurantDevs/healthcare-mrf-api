@@ -547,6 +547,86 @@ async def test_postgres_overlapping_request_identity_reservations_wait_and_rejec
             )
 
 
+async def _bound_request_pins(case):
+    """Seed one immutable source binding for the concurrency proof."""
+
+    async with case.sessions() as setup, setup.begin():
+        definition = await setup.get(CustomImportDefinitionRevision, case.definition_revision_id)
+        schema = await setup.get(CustomImportSchemaRevision, case.schema_revision_id)
+        assert definition is not None and schema is not None
+        contract = "custom-import/source-binding/v1"
+        canonical_binding = "{}"
+        binding = CustomImportSourceBindingRevision(
+            dataset_id=case.dataset_id,
+            definition_revision_id=case.definition_revision_id,
+            schema_revision_id=case.schema_revision_id,
+            revision_number=1,
+            binding_contract=contract,
+            connector_kind="snowflake_bundle",
+            definition_sha256=definition.definition_sha256,
+            schema_sha256=schema.schema_sha256,
+            source_object_fingerprint_sha256=hashlib.sha256(b"synthetic-source").digest(),
+            source_object_version="v1",
+            canonical_binding=canonical_binding,
+            binding_sha256=hashlib.sha256(f"{contract}:{canonical_binding}".encode()).digest(),
+        )
+        setup.add(binding)
+        await setup.flush()
+        binding_id = binding.source_binding_revision_id
+    return {
+        "dataset_id": case.dataset_id,
+        "definition_revision_id": case.definition_revision_id,
+        "schema_revision_id": case.schema_revision_id,
+        "source_binding_revision_id": binding_id,
+        "idempotency_key": "synthetic-pre-cancel-overlap",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-pre-cancel-overlap").digest(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_bound_cancellation_precedes_competing_reservation():
+    """A stop fence wins a concurrent replay of the same bound request."""
+
+    async with _postgres_case() as case:
+        request_pins = await _bound_request_pins(case)
+        async with case.sessions() as stopper, case.sessions() as competitor:
+            stop_transaction = await stopper.begin()
+            competitor_transaction = await competitor.begin()
+            replay_task = None
+            try:
+                canceled = await lifecycle.request_bound_execution_cancellation(stopper, **request_pins)
+                competitor_pid = await _backend_pid(competitor)
+                replay_task = asyncio.create_task(
+                    lifecycle.reserve_execution(competitor, **request_pins, mechanism="local")
+                )
+                await _wait_for_backend_lock(case, backend_pid=competitor_pid)
+                assert replay_task.done() is False
+
+                await stop_transaction.commit()
+                replay = await asyncio.wait_for(replay_task, timeout=_LOCK_OBSERVATION_TIMEOUT_SECONDS)
+                await competitor_transaction.commit()
+            finally:
+                await _cancel_task(replay_task)
+                if competitor_transaction.is_active:
+                    await competitor_transaction.rollback()
+                if stop_transaction.is_active:
+                    await stop_transaction.rollback()
+
+        execution, lease = await _read_execution_and_lease(case, canceled.execution_id)
+        assert canceled.changed is True and canceled.state == "canceled"
+        assert replay.created is False and replay.state == "canceled"
+        assert replay.execution_id == canceled.execution_id
+        assert execution.source_binding_revision_id == request_pins["source_binding_revision_id"]
+        assert execution.request_identity_sha256 == request_pins["request_identity_sha256"]
+        assert lease.fence == 0
+        assert await _claim(case, canceled.execution_id, _WORKER) is None
+        finalized = await _in_transaction(
+            case, lambda session: lifecycle.finalize_stopped_execution_request(session, **request_pins)
+        )
+        assert finalized.execution_id == canceled.execution_id
+        assert finalized.state == "canceled" and finalized.changed is False
+
+
 @pytest.mark.asyncio
 async def test_postgres_request_identity_storage_shape_and_downgrade_guard():
     async with _postgres_case() as case:

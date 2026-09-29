@@ -7,6 +7,7 @@ from sanic.exceptions import SanicException
 from api.control import blueprint as control_blueprint
 from api.control import control_error
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
+from api.control_execution_stop import blueprint as execution_stop_blueprint
 from api.endpoint.clinical import blueprint as v1_clinical
 from api.endpoint.codes import blueprint as v1_codes
 from api.endpoint.coverage import blueprint as v1_coverage
@@ -68,6 +69,7 @@ def init_api(api):
     api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)
     api.blueprint(execution_evidence_blueprint)
+    api.blueprint(execution_stop_blueprint)
     api.blueprint(profile_capacity_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(

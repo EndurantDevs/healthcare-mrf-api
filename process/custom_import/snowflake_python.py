@@ -41,6 +41,13 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleStreamResult,
 )
 from process.custom_import.snowflake_preflight import SnowflakePreflightStatement
+from process.custom_import.snowflake_preflight_schema import (
+    _fixed_type_parts,
+    _is_integral_fixed,
+    _metadata_integer,
+    _source_type as _preflight_source_type,
+    validate_preflight_result_schema,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
 _FETCH_ROWS = 1_024
@@ -48,8 +55,6 @@ _QUERY_TAG = "custom-import/v1-snowflake"
 _LOGIN_TIMEOUT_SECONDS = 30
 _NETWORK_TIMEOUT_SECONDS = 120
 _STATEMENT_TIMEOUT_SECONDS = 120
-_SUPPORTED_SOURCE_TYPES = frozenset({"BOOLEAN", "FIXED", "TEXT"})
-_FIXED_SOURCE_TYPE = re.compile(r"^FIXED\(([1-9]|[1-2][0-9]|3[0-8]),([0-9]|[1-2][0-9]|3[0-7])\)$")
 _MIN_INT64 = -(2**63)
 _MAX_INT64 = 2**63 - 1
 
@@ -694,44 +699,7 @@ def _result_schema(statement: SnowflakeReadStatement, description: object) -> tu
 def _preflight_result_schema(statement: SnowflakePreflightStatement, description: object) -> None:
     """Require the generated preview's exact labels and capture-supported types."""
 
-    column_ids = statement.column_ids
-    if (
-        not isinstance(column_ids, tuple)
-        or not column_ids
-        or not all(isinstance(column_id, str) and column_id for column_id in column_ids)
-        or not isinstance(description, Sequence)
-        or len(description) != len(column_ids)
-        or tuple(getattr(metadata, "name", None) for metadata in description) != column_ids
-    ):
-        raise SnowflakeConnectorError("Snowflake preflight result schema does not match the generated statement")
-    source_types = tuple(_source_type(metadata) for metadata in description)
-    if (
-        not all(_is_integral_fixed(source_types[index]) for index in (0, 1, 3, 5))
-        or any(source_types[index] != "TEXT" for index in (2, 4))
-        or any(
-            not _supports_preflight_field_type(field.value_type, source_type)
-            for field, source_type in zip(
-                sorted(statement.definition.fields, key=lambda field: field.field_slot),
-                source_types[6:],
-                strict=True,
-            )
-        )
-    ):
-        raise SnowflakeConnectorError("Snowflake preflight result schema does not match the generated statement")
-
-
-def _is_integral_fixed(source_type: str) -> bool:
-    return source_type.startswith("FIXED(") and _fixed_type_parts(source_type)[1] == 0
-
-
-def _supports_preflight_field_type(value_type: str, source_type: str) -> bool:
-    if value_type == "string":
-        return source_type == "TEXT"
-    if value_type == "integer":
-        return _is_integral_fixed(source_type)
-    if value_type == "decimal":
-        return source_type.startswith("FIXED(")
-    return value_type == "boolean" and source_type == "BOOLEAN"
+    validate_preflight_result_schema(statement, description, field_types=SNOWFLAKE_FIELD_TYPES)
 
 
 def _execution_timeout(value: object) -> int:
@@ -742,32 +710,7 @@ def _execution_timeout(value: object) -> int:
 
 
 def _source_type(metadata: object) -> str:
-    type_name = getattr(metadata, "type_name", None)
-    type_code = getattr(metadata, "type_code", None)
-    if (
-        type_name is None
-        and isinstance(type_code, int)
-        and not isinstance(type_code, bool)
-        and 0 <= type_code < len(SNOWFLAKE_FIELD_TYPES)
-    ):
-        type_name = SNOWFLAKE_FIELD_TYPES[type_code].name
-    if isinstance(type_name, str) and type_name:
-        normalized = type_name.upper()
-        if normalized == "FIXED":
-            precision = _metadata_integer(metadata, "precision", minimum=1, maximum=38)
-            scale = _metadata_integer(metadata, "scale", minimum=0, maximum=min(precision, 37))
-            return f"FIXED({precision},{scale})"
-        if normalized in _SUPPORTED_SOURCE_TYPES:
-            return normalized
-        raise SnowflakeConnectorError("Snowflake result column type is not supported by the capture runtime")
-    raise SnowflakeConnectorError("Snowflake result column type is unavailable")
-
-
-def _metadata_integer(metadata: object, name: str, *, minimum: int, maximum: int) -> int:
-    number = getattr(metadata, name, None)
-    if isinstance(number, bool) or not isinstance(number, int) or not minimum <= number <= maximum:
-        raise SnowflakeConnectorError(f"Snowflake result {name} is invalid")
-    return number
+    return _preflight_source_type(metadata, field_types=SNOWFLAKE_FIELD_TYPES)
 
 
 def _is_nullable(metadata: object) -> bool:
@@ -905,13 +848,6 @@ def _uses_decimal_storage(source_type: str) -> bool:
         return False
     precision, scale = _fixed_type_parts(source_type)
     return scale != 0 or precision > 18
-
-
-def _fixed_type_parts(source_type: str) -> tuple[int, int]:
-    fixed_match = _FIXED_SOURCE_TYPE.fullmatch(source_type)
-    if fixed_match is None:
-        raise SnowflakeConnectorError("Snowflake result column type is not supported by the Parquet encoder")
-    return int(fixed_match.group(1)), int(fixed_match.group(2))
 
 
 def _close_resources(*resources: object | None) -> None:

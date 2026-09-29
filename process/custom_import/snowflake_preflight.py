@@ -33,15 +33,15 @@ from process.custom_import.snowflake import (
     SnowflakeDeclaredColumn,
 )
 from process.custom_import.snowflake_bundle import (
-    SnowflakeBundleAcquisitionConnector,
     SnowflakeBundleBinding,
     SnowflakeBundleError,
     SnowflakeBundleRequest,
+    SnowflakeBundleStatementBuilder,
     SnowflakeBundleStatement,
     _query_identity_snapshot_token,
     _validated_bundle_statement,
 )
-from process.custom_import.snowflake_source_binding import SnowflakeSourceBinding, SnowflakeSourceBindingError
+from process.custom_import.snowflake_binding import SnowflakeSourceBinding, SnowflakeSourceBindingError
 
 DEFAULT_MAX_ROOT_KEYS = 32
 DEFAULT_MAX_CHILD_ROWS = 256
@@ -61,6 +61,10 @@ _MULTIPLICITY_COLUMN = "__ci_preflight_key_multiplicity"
 _METADATA_KIND = 0
 _KEY_KIND = 1
 _DATA_KIND = 2
+_BYTE_LIMIT_KIND = 3
+_RAW_CTE = "__ci_preflight_raw"
+_WIRE_CTE = "__ci_preflight_wire"
+_WIRE_BYTES_COLUMN = "__ci_preflight_wire_bytes"
 _PRECISIONS = frozenset({"exact", "lower_bound", "unknown"})
 
 
@@ -249,6 +253,7 @@ class SnowflakePreflightStatement:
                 _preview_branches(definition, bundle_statement, binding_by_stream, columns_by_stream, fields, limits),
                 columns,
                 fields,
+                limits,
             )
         except (
             AttributeError,
@@ -326,7 +331,7 @@ def preflight_snowflake_bundle(
 def _prepare_preflight(
     definition_value: object,
     binding_value: object,
-    connector: object,
+    builder: object,
     limits: SnowflakePreflightLimits,
 ) -> _PreparedPreflight:
     definition = _canonical_definition(definition_value)
@@ -339,9 +344,9 @@ def _prepare_preflight(
         if binding != binding_value:
             raise ValueError
         approved_relations, bundle_bindings = binding.bundle_components(definition)
-        if not isinstance(connector, SnowflakeBundleAcquisitionConnector):
+        if not isinstance(builder, SnowflakeBundleStatementBuilder):
             raise TypeError
-        request = connector.prepare_request(definition, bindings=bundle_bindings)
+        request = builder.prepare_request(definition, bindings=bundle_bindings)
         if not isinstance(request, SnowflakeBundleRequest):
             raise TypeError
         expected_request = SnowflakeBundleRequest(
@@ -350,7 +355,7 @@ def _prepare_preflight(
             encoding=request.encoding,
             capture_limits=request.capture_limits,
         )
-        bundle_statement = connector.build_statement(request)
+        bundle_statement = builder.build_statement(request)
         if not isinstance(bundle_statement, SnowflakeBundleStatement):
             raise TypeError
         _validate_statement_mapping(bundle_statement, request, expected_request, approved_relations)
@@ -513,6 +518,7 @@ def _preview_sql(
     branches: tuple[str, ...],
     columns: tuple[str, ...],
     fields: tuple[Field, ...],
+    limits: SnowflakePreflightLimits,
 ) -> str:
     order = ", ".join(
         (
@@ -522,10 +528,48 @@ def _preview_sql(
             *(f"{_quoted(field.field_id)} ASC NULLS FIRST" for field in fields),
         )
     )
+    selected_columns = ", ".join(_quoted(column) for column in columns)
+    raw_cte = (
+        f"{_quoted(_RAW_CTE)} AS (SELECT {selected_columns} FROM ({' UNION ALL '.join(branches)}) "
+        f"AS {_quoted('__ci_preflight')})"
+    )
+    wire_cte = _wire_budget_cte(columns)
+    wire_bytes = _quoted(_WIRE_BYTES_COLUMN)
     return (
-        f"WITH {''.join(ctes)} SELECT {', '.join(_quoted(column) for column in columns)} "
-        f"FROM ({' UNION ALL '.join(branches)}) "
-        f"AS {_quoted('__ci_preflight')} ORDER BY {order}"
+        f"WITH {''.join(ctes)}, {raw_cte}, {wire_cte} "
+        f"SELECT {selected_columns} FROM {_quoted(_RAW_CTE)} CROSS JOIN {_quoted(_WIRE_CTE)} "
+        f"WHERE {wire_bytes} <= {limits.maximum_total_bytes} UNION ALL "
+        f"{_byte_limit_branch(fields)} FROM {_quoted(_WIRE_CTE)} "
+        f"WHERE {wire_bytes} > {limits.maximum_total_bytes} ORDER BY {order}"
+    )
+
+
+def _wire_budget_cte(columns: tuple[str, ...]) -> str:
+    """Bound every raw result cell before the driver can materialize it."""
+
+    row_cost = " + ".join(_wire_value_cost(column) for column in columns)
+    schema_allowance = 4096 + sum(256 + len(column) for column in columns)
+    return (
+        f"{_quoted(_WIRE_CTE)} AS (SELECT COALESCE(SUM(2 + {row_cost}), 0) + {schema_allowance} "
+        f"AS {_quoted(_WIRE_BYTES_COLUMN)} FROM {_quoted(_RAW_CTE)})"
+    )
+
+
+def _wire_value_cost(column: str) -> str:
+    value = _quoted(column)
+    return f"CASE WHEN {value} IS NULL THEN 5 ELSE 3 + 6 * OCTET_LENGTH(TO_VARCHAR({value})) END"
+
+
+def _byte_limit_branch(fields: tuple[Field, ...]) -> str:
+    return _select_branch(
+        kind=_BYTE_LIMIT_KIND,
+        stream_ordinal="NULL",
+        stream_id="NULL",
+        key_ordinal="NULL",
+        token="NULL",
+        multiplicity="NULL",
+        field_values={field.field_id: "NULL" for field in fields},
+        fields=fields,
     )
 
 
@@ -725,6 +769,9 @@ def _read_rows(
         result_values = _row_values(result_row, len(prepared.statement.column_ids))
         if result_values is None:
             return state, "result_invalid"
+        sentinel_reason = _byte_limit_sentinel_reason(result_values)
+        if sentinel_reason is not None:
+            return state, sentinel_reason
         result_bytes = _row_bytes(result_values)
         if result_bytes is None:
             return state, "result_invalid"
@@ -734,6 +781,14 @@ def _read_rows(
         reason = _record_result_row(prepared.definition, state, result_values, result_bytes, prepared.statement.limits)
         if reason is not None:
             return state, reason
+
+
+def _byte_limit_sentinel_reason(values: tuple[object, ...]) -> str | None:
+    if values[0] != _BYTE_LIMIT_KIND:
+        return None
+    if type(values[0]) is int and all(value is None for value in values[1:]):
+        return "byte_limit"
+    return "result_invalid"
 
 
 def _record_result_row(
