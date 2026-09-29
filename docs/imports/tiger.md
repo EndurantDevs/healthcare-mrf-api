@@ -16,8 +16,13 @@ sequence or coerces geometry to text.
 Generation authority remains in the configured application schema's
 `reference_family_result_generation` table. Only the `tiger` importer routes its
 ledger there while addressing serving relations in the fixed `tiger` schema.
-Migration adds a generation-less row without changing TIGER ownership, grants,
-tables, or installed data. Before explicit bootstrap, automatic generation
+Migration adds a generation-less row without changing TIGER ownership, table or
+schema grants, tables, or installed data. Revision protection grants execution of
+only the new authority function to the catalog-verified existing owners of both
+supported tables; it does not install protected-table triggers. Missing,
+unsupported, or changed owners require explicit function privilege provisioning.
+The protected owner installs the guards during explicit publication or bootstrap.
+Before explicit bootstrap, automatic generation
 capture is unavailable; legacy tables are not silently adopted.
 
 ## Explicit bootstrap or replacement

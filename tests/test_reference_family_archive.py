@@ -237,6 +237,19 @@ def test_manifest_binds_explicit_provenance_but_remains_manual_only():
         archive.validate_reference_family_manifest(tampered)
 
 
+def test_mrf_archive_rejects_shared_diagnostics_in_legacy_inventory():
+    spec = archive.reference_family_spec("mrf")
+    assert "log" not in spec.archive_names
+    tables = [
+        archive.ReferenceTableReceipt(model.__name__, model.__tablename__, "a" * 64, 0).as_dict()
+        for model in spec.model_types
+    ]
+    assert len(archive._manifest_table_receipts(tables, spec)) == 13
+    tables.insert(8, archive.ReferenceTableReceipt("ImportLog", "log", "a" * 64, 0).as_dict())
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="manifest table set is invalid"):
+        archive._manifest_table_receipts(tables, spec)
+
+
 def test_manifest_preserves_tracked_source_generation_authority():
     source_generation = archive.ReferenceFamilyServingGeneration(
         "c8f27af1-56ba-4cda-82d8-0fc67650918f",
@@ -252,6 +265,68 @@ def test_manifest_preserves_tracked_source_generation_authority():
     assert archive.validate_reference_family_manifest(manifest.as_dict()) == manifest
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="manifest is invalid"):
         archive.validate_reference_family_manifest({**manifest.as_dict(), "publication_authority": "manual-only"})
+
+
+def test_guarded_capture_is_distinct_digest_bound_manifest_evidence():
+    legacy = replace(
+        _manifest(), publication_authority="tracked-generation", source_serving_generation=_serving_generation()
+    )
+    guarded = replace(legacy, source_capture_contract=archive.GUARDED_SOURCE_CAPTURE_CONTRACT)
+    assert "source_capture_contract" not in legacy.as_dict()
+    assert archive.validate_reference_family_manifest(guarded.as_dict()) == guarded
+    assert archive._validation_digest(legacy.as_dict()) != archive._validation_digest(guarded.as_dict())
+    receipt_fields = _validation_receipt()
+    receipt_fields["manifest_sha256"] = archive.hashlib.sha256(archive._canonical_json(legacy.as_dict())).hexdigest()
+    receipt_fields["validation_sha256"] = archive._validation_digest(
+        {key: value for key, value in receipt_fields.items() if key != "validation_sha256"}
+    )
+    receipt = archive.validate_reference_family_validation_receipt(receipt_fields)
+    cutover = archive.ReferenceFamilyCutoverAuthority(
+        "a" * 64, archive.CONTRACT, 12, 12, "automatic", _serving_generation()
+    )
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="validation authority differs"):
+        archive._require_validated_cutover_binding(_ownership(), _incumbent(), guarded, receipt, cutover)
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="differs from captured manifest"):
+        archive._activation_source_generation(
+            guarded, replace(cutover, source_serving_generation=_serving_generation(2))
+        )
+
+
+@pytest.mark.parametrize("contract", [None, "", "unknown", 1])
+def test_manifest_rejects_invalid_guarded_capture_contract(contract):
+    manifest = replace(
+        _manifest(), publication_authority="tracked-generation", source_serving_generation=_serving_generation()
+    )
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="source capture contract is invalid"):
+        archive.validate_reference_family_manifest({**manifest.as_dict(), "source_capture_contract": contract})
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="source capture contract is invalid"):
+        replace(
+            manifest, importer_id="label", source_capture_contract=archive.GUARDED_SOURCE_CAPTURE_CONTRACT
+        ).as_dict()
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="source capture contract is invalid"):
+        replace(_manifest(), source_capture_contract=archive.GUARDED_SOURCE_CAPTURE_CONTRACT).as_dict()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("absent", [False, True])
+async def test_legacy_tracked_manifest_cannot_enter_automatic_cutover(absent):
+    manifest = replace(
+        _manifest(), publication_authority="tracked-generation", source_serving_generation=_serving_generation()
+    )
+    incumbent = _incumbent(relation_oids=(("pricing_places_zcta", None if absent else 12),))
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires guarded source capture"):
+        await archive.activate_validated_reference_family_stage(
+            session,
+            ownership=_ownership(),
+            manifest=manifest,
+            expected_incumbent=incumbent,
+            validation_receipt=_validation_receipt(),
+            cutover=archive.ReferenceFamilyCutoverAuthority(
+                "a" * 64, archive.CONTRACT, 12, 12, "automatic", manifest.source_serving_generation
+            ),
+        )
+    session.execute.assert_not_awaited()
 
 
 def test_manifest_preserves_exact_portable_dependencies_without_changing_legacy_receipts():

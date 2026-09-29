@@ -113,11 +113,10 @@ async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypat
         serving_generation=None if state == "incomplete" else _serving_generation(), relation_oids=(99,)
     )
     monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority))
-    monkeypatch.setattr(
-        archive,
-        "current_reference_family_relation_oids",
-        AsyncMock(return_value=(99,) if state == "invalid-snapshot" else (10,)),
+    capture_generation = AsyncMock(
+        return_value=_serving_generation(), side_effect=RuntimeError("drifted") if state == "drifted" else None
     )
+    monkeypatch.setattr(archive, "capture_reference_family_serving_generation", capture_generation)
     manifest = AsyncMock(return_value=_manifest())
     monkeypatch.setattr(archive, "_family_manifest", manifest)
     capture_argument_map = dict(
@@ -134,6 +133,10 @@ async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypat
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="source generation|source snapshot"):
             await archive._capture_reference_family_source(session, **capture_argument_map)
         assert manifest.await_count == int(state == "invalid-snapshot")
+    if state in {"untracked", "incomplete"}:
+        capture_generation.assert_not_awaited()
+    else:
+        capture_generation.assert_awaited_once_with(session, importer_id="places-zcta", schema_name="synthetic")
 
 
 @pytest.mark.asyncio

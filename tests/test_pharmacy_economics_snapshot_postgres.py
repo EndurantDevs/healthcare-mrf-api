@@ -16,6 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards_from_dsn
+
 economics = importlib.import_module("process.pharmacy_economics")
 generation = importlib.import_module("process.reference_family_result_generation")
 archive = importlib.import_module("process.reference_family_archive")
@@ -90,13 +92,15 @@ async def _case(monkeypatch):
         await connection.execute(
             f'CREATE TABLE "{schema}".reference_family_result_generation ('
             "importer_id text PRIMARY KEY,local_lineage_id uuid,local_generation bigint,"
-            "origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[])"
+            "origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],"
+            f"CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))"
         )
         await connection.execute(
             f'INSERT INTO "{schema}".reference_family_result_generation VALUES ($1,$2,0)',
             "pharmacy-economics",
             uuid4(),
         )
+        await install_source_generation_guards_from_dsn(dsn, schema)
         yield connection, schema
     finally:
         await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

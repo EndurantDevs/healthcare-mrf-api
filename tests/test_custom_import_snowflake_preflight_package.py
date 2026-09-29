@@ -45,17 +45,23 @@ def test_legacy_exports_keep_the_pure_contract_identity():
     assert snowflake_source_binding.SnowflakeSourceBindingError is snowflake_binding.SnowflakeSourceBindingError
 
 
-def test_wheel_contains_only_the_declared_process_modules(preflight_wheel: Path):
+def test_wheel_contains_only_the_declared_contract_modules(preflight_wheel: Path):
     with zipfile.ZipFile(preflight_wheel) as archive:
-        process_members = frozenset(name for name in archive.namelist() if name.startswith("process/"))
+        module_members = frozenset(name for name in archive.namelist() if name.endswith(".py"))
+        assert not any(name.startswith("process/") for name in archive.namelist())
         license_members = [name for name in archive.namelist() if name.endswith(".dist-info/licenses/LICENSE")]
         assert len(license_members) == 1
         assert archive.read(license_members[0]) == (_REPOSITORY_ROOT / "LICENSE").read_bytes()
 
-    assert process_members == frozenset((*WHEEL_INITIALIZERS, *CANONICAL_MODULES))
+    assert module_members == frozenset(
+        (*WHEEL_INITIALIZERS, *("custom_import_preflight/" + Path(name).name for name in CANONICAL_MODULES))
+    )
 
 
-def test_installed_wheel_runs_preflight_without_engine_dependencies(preflight_wheel: Path, tmp_path: Path):
+@pytest.mark.parametrize("native_source", [False, True])
+def test_installed_wheel_runs_preflight_with_or_without_native_source(
+    preflight_wheel: Path, tmp_path: Path, native_source
+):
     consumer_directory = tmp_path / "consumer"
     subprocess.run(
         [
@@ -73,7 +79,13 @@ def test_installed_wheel_runs_preflight_without_engine_dependencies(preflight_wh
         text=True,
     )
     completed = subprocess.run(
-        [sys.executable, "-I", str(_CONSUMER_SCRIPT), str(consumer_directory)],
+        [
+            sys.executable,
+            "-I",
+            str(_CONSUMER_SCRIPT),
+            str(consumer_directory),
+            *([str(_REPOSITORY_ROOT)] if native_source else []),
+        ],
         check=False,
         cwd=tmp_path,
         capture_output=True,

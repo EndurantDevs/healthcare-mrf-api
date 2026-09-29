@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process.tiger_result_generation import publish_tiger_generation
+from tests.reference_family_generation_fixture import install_source_generation_guards
 from tests.test_cms_doctors_archive_postgres import _command, _migration
 
 
@@ -86,6 +87,13 @@ async def _install_authority_as_app(session, schema, role):
         await generation.capture_reference_family_serving_generation(session, importer_id="tiger", schema_name="tiger")
     await _migration(session, "20260920110000_tiger_result_generation", "downgrade")
     await _migration(session, "20260920110000_tiger_result_generation", "upgrade")
+    await install_source_generation_guards(await session.connection(), schema)
+    assert not await session.scalar(text(f"SELECT source_revision_tracked FROM {ledger} WHERE importer_id='tiger'"))
+    assert not await session.scalar(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid IN ('tiger.zip_state'::regclass,'tiger.zcta5'::regclass))"
+        )
+    )
     await session.execute(text("RESET ROLE"))
 
 

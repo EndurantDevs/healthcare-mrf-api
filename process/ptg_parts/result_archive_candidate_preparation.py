@@ -65,8 +65,10 @@ class PreparedResultArchiveCandidate:
     destination_snapshot_id: str
     source_snapshot_id: str
     allowed_amount_row_counts: Mapping[str, int]
-    frozen_binding_sha256: str
+    frozen_binding_sha256: str | None
     requires_fresh_destination_attestation: bool = True
+    authority_contract: str | None = None
+    authority_sha256: str | None = None
 
 
 def _safe_identifier(value: str, *, label: str) -> str:
@@ -580,37 +582,71 @@ async def _locked_candidate_inputs(
     return destination_candidate, source_snapshot_id
 
 
-async def prepare_result_archive_candidate_evidence(
+async def _prepare_published_result_candidate(
     session: Any,
     *,
-    schema_name: str,
-    staging_schema_name: str,
+    destination_schema: str,
+    staging_schema: str,
     source_snapshot_key: int,
-    destination_snapshot_id: str,
+    destination_snapshot: str,
+    frozen_binding_params: Mapping[str, Any],
+    published_result_receipt: Mapping[str, Any],
+) -> PreparedResultArchiveCandidate:
+    """Authenticate copied result evidence and prepare only destination-owned rows."""
+    if frozen_binding_params:
+        raise ResultArchiveCandidatePreparationError("published result cannot carry frozen input parameters")
+    from process.ptg_parts.result_archive_candidate_initialization import ResultArchiveCandidateInitializationError
+    from process.ptg_parts.result_archive_receive_binding import (
+        authenticate_published_result_stage,
+        validate_local_published_result,
+    )
+
+    try:
+        staged = await authenticate_published_result_stage(
+            session,
+            staging_schema_name=staging_schema,
+            source_snapshot_key=source_snapshot_key,
+            receipt=published_result_receipt,
+        )
+        if staged.source_snapshot_id == destination_snapshot:
+            raise ResultArchiveCandidatePreparationError("published result requires a remapped destination snapshot")
+        digest = await validate_local_published_result(
+            session,
+            schema_name=destination_schema,
+            snapshot_id=destination_snapshot,
+            receipt=published_result_receipt,
+        )
+    except (ValueError, ResultArchiveCandidateInitializationError) as exc:
+        raise ResultArchiveCandidatePreparationError("published result candidate evidence differs") from exc
+    await _lock_staged_allowed_amount_family(session, staging_schema_name=staging_schema)
+    counts = await _copy_allowed_amount_evidence(
+        session,
+        schema_name=destination_schema,
+        staging_schema_name=staging_schema,
+        source_snapshot_id=staged.source_snapshot_id,
+        destination_snapshot_id=destination_snapshot,
+    )
+    return PreparedResultArchiveCandidate(
+        contract=RESULT_ARCHIVE_CANDIDATE_PREPARATION_CONTRACT,
+        destination_snapshot_id=destination_snapshot,
+        source_snapshot_id=staged.source_snapshot_id,
+        allowed_amount_row_counts=counts,
+        frozen_binding_sha256=None,
+        authority_contract=published_result_receipt["contract"],
+        authority_sha256=digest,
+    )
+
+
+async def _prepare_frozen_result_candidate(
+    session: Any,
+    *,
+    destination_schema: str,
+    staging_schema: str,
+    source_snapshot_key: int,
+    destination_snapshot: str,
     frozen_binding_params: Mapping[str, Any],
 ) -> PreparedResultArchiveCandidate:
-    """Attach copied allowed evidence to a pre-created local candidate only.
-
-    ``session`` is an already-open caller transaction.  ``schema_name`` must
-    be the configured PTG schema because the native frozen-binding store uses
-    that schema to retain immutable attempt evidence.  The caller must prepare
-    the destination candidate's source records and manifest independently;
-    staged source metadata is compared, never adopted as destination authority.
-    Fresh destination candidate attestation and activation remain separate.
-    """
-
-    is_in_transaction = getattr(session, "in_transaction", None)
-    if not callable(is_in_transaction) or not is_in_transaction():
-        raise ResultArchiveCandidatePreparationError(
-            "archive candidate preparation requires an already-open caller transaction"
-        )
-    destination_schema = _safe_identifier(schema_name, label="schema_name")
-    staging_schema = _safe_identifier(staging_schema_name, label="staging_schema_name")
-    destination_snapshot = _required_snapshot_id(destination_snapshot_id, label="destination_snapshot_id")
-    if destination_schema == staging_schema:
-        raise ValueError("staging_schema_name must differ from schema_name")
-    if destination_schema != resolve_ptg2_schema():
-        raise ValueError("schema_name must match the configured PTG schema")
+    """Prepare a destination candidate under the existing frozen-file contract."""
     destination_candidate, source_snapshot_id = await _locked_candidate_inputs(
         session,
         destination_schema=destination_schema,
@@ -638,6 +674,52 @@ async def prepare_result_archive_candidate_evidence(
         source_snapshot_id=source_snapshot_id,
         allowed_amount_row_counts=counts,
         frozen_binding_sha256=frozen_binding_digest,
+    )
+
+
+async def prepare_result_archive_candidate_evidence(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_id: str,
+    frozen_binding_params: Mapping[str, Any],
+    published_result_receipt: Mapping[str, Any] | None = None,
+) -> PreparedResultArchiveCandidate:
+    """Compare staged evidence against local authority in the caller transaction.
+    Require the configured schema; fresh attestation and activation remain separate.
+    """
+
+    is_in_transaction = getattr(session, "in_transaction", None)
+    if not callable(is_in_transaction) or not is_in_transaction():
+        raise ResultArchiveCandidatePreparationError(
+            "archive candidate preparation requires an already-open caller transaction"
+        )
+    destination_schema = _safe_identifier(schema_name, label="schema_name")
+    staging_schema = _safe_identifier(staging_schema_name, label="staging_schema_name")
+    destination_snapshot = _required_snapshot_id(destination_snapshot_id, label="destination_snapshot_id")
+    if destination_schema == staging_schema:
+        raise ValueError("staging_schema_name must differ from schema_name")
+    if destination_schema != resolve_ptg2_schema():
+        raise ValueError("schema_name must match the configured PTG schema")
+    if published_result_receipt is not None:
+        return await _prepare_published_result_candidate(
+            session,
+            destination_schema=destination_schema,
+            staging_schema=staging_schema,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot=destination_snapshot,
+            frozen_binding_params=frozen_binding_params,
+            published_result_receipt=published_result_receipt,
+        )
+    return await _prepare_frozen_result_candidate(
+        session,
+        destination_schema=destination_schema,
+        staging_schema=staging_schema,
+        source_snapshot_key=source_snapshot_key,
+        destination_snapshot=destination_snapshot,
+        frozen_binding_params=frozen_binding_params,
     )
 
 

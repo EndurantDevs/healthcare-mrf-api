@@ -16,6 +16,7 @@ from db import models
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process.provider_quality_parts import model_helpers, publish_helpers, table_helpers
+from tests.reference_family_generation_fixture import install_source_generation_guards
 from tests.test_reference_family_archive_postgres import _database_url
 from tests.test_reference_family_result_generation_postgres import (
     _CENSUS_MIGRATION_PATH,
@@ -91,6 +92,7 @@ async def _create_quality_publication(sessions, schema):
         await archive._create_model_family(session, spec, schema, create_indexes=False)
         await _create_table(session, models.PricingProcedureTaxonomySignal, schema)
         await _upgrade_generation_chain(await session.connection())
+        await install_source_generation_guards(await session.connection(), schema)
 
     for model_type in (*spec.model_types, models.PricingProcedureTaxonomySignal):
         await table_helpers._ensure_indexes(model_type, schema)

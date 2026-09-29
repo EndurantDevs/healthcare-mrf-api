@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "custom-import-preflight"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pure bounded preflight contracts"
 requires-python = ">=3.14"
 dependencies = ["PyYAML>=6.0.3"]
 
 [tool.setuptools]
-packages = ["process", "process.custom_import"]
+packages = ["custom_import_preflight"]
 include-package-data = false

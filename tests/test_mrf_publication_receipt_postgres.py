@@ -14,6 +14,7 @@ from sqlalchemy.pool import NullPool
 from db.connection import Database
 from process import mrf_publication_receipt as receipt
 from process import reference_family_result_generation as generation
+from tests.reference_family_generation_fixture import install_source_generation_guards
 from tests.test_reference_family_result_generation_postgres import (
     _MRF_MIGRATION_PATH,
     _REFERENCE_MIGRATION_PATH,
@@ -324,6 +325,7 @@ async def _create_receipt_schema(engine, schema):
         await _run_migration(connection, _REFERENCE_MIGRATION_PATH, "upgrade")
         await _run_migration(connection, _MRF_MIGRATION_PATH, "upgrade")
         await _run_migration(connection, _MIGRATION, "upgrade")
+        await install_source_generation_guards(connection, schema)
 
 
 async def _publish_mrf_authority(database, schema):

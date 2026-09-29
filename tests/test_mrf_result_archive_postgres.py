@@ -21,7 +21,7 @@ from process import initial, plan_summary
 from process import mrf_publication_receipt as publication_receipt
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-from tests.reference_family_generation_fixture import generation_shape_check
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
 
 _DSN_ENV = "HLTHPRT_MRF_RESULT_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"hc_mrf_archive_[0-9a-f]{32}\Z")
@@ -78,10 +78,10 @@ async def _configure_synthetic_plan_summary_tables(connection, schema, patch):
         table = getattr(plan_summary, attribute).to_metadata(metadata, schema=schema)
         patch.setattr(plan_summary, attribute, table)
         if table.name not in {"plan", "plan_search_summary"}:
-            await connection.run_sync(lambda sync, table=table: table.create(sync))
+            await connection.run_sync(lambda sync, table=table: table.create(sync, checkfirst=True))
 
 
-async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema):
+async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema, *, initialize=True):
     """Build the real summary and receipt after the fixture's family rotation."""
 
     database = Database(engine=engine, session_factory=sessions)
@@ -97,7 +97,8 @@ async def _complete_synthetic_publication(monkeypatch, engine, sessions, schema)
         patch.setattr(plan_summary, "db", database)
         patch.setattr(plan_summary, "ensure_database", ready)
         async with engine.begin() as connection:
-            await _prepare_synthetic_publication_schema(connection, schema)
+            if initialize:
+                await _prepare_synthetic_publication_schema(connection, schema)
             await _configure_synthetic_plan_summary_tables(connection, schema, patch)
         patch.setattr(
             plan_summary,
@@ -154,9 +155,12 @@ def _database_url() -> str:
     return database_url.set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 
-async def _create_family(session, schema_name: str) -> None:
+async def _create_family(session, schema_name: str, *, revision_guards=True) -> None:
     await session.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gin"))
     await archive._create_model_family(session, archive.reference_family_spec("mrf"), schema_name)
+    diagnostic_table = initial.ImportLog.__table__.to_metadata(MetaData(), schema=schema_name)
+    connection = await session.connection()
+    await connection.run_sync(lambda sync: diagnostic_table.create(sync))
     await session.execute(
         text(
             f'CREATE TABLE "{schema_name}".reference_family_result_generation ('
@@ -175,6 +179,8 @@ async def _create_family(session, schema_name: str) -> None:
         ),
         {"mrf_lineage_id": uuid4(), "address_lineage_id": uuid4()},
     )
+    if revision_guards:
+        await install_source_generation_guards(await session.connection(), schema_name)
 
 
 async def _insert_family_rows(session, schema_name: str, marker: str) -> None:
@@ -205,7 +211,6 @@ async def _insert_family_rows(session, schema_name: str, marker: str) -> None:
             "plan_drug_tier_stats",
             "(plan_id, drug_tier, drug_count) VALUES (:plan_id, 'generic', 1)",
         ),
-        ("log", "(issuer_id, checksum, text) VALUES (1, 1, :marker)"),
         (
             "plan_npi_raw",
             "(npi, checksum_network, name_or_facility_name) VALUES (1000000001, 1, :marker)",
@@ -230,6 +235,10 @@ async def _insert_family_rows(session, schema_name: str, marker: str) -> None:
             text(f'INSERT INTO "{schema_name}"."{table_name}" {values_sql}'),
             {"marker": marker, "plan_id": plan_id},
         )
+    await session.execute(
+        text(f'INSERT INTO "{schema_name}".log (issuer_id, checksum, text) VALUES (1, 1, :marker)'),
+        {"marker": marker},
+    )
 
 
 async def _copy_prepared_stage(session, prepared, restored) -> None:
@@ -408,6 +417,7 @@ async def _seed_mrf_roundtrip(session, source_schema, destination_schema, unrela
         importer_id="mrf",
         schema_name=destination_schema,
         source_generation=first_source.serving_generation,
+        source_revision_tracked=True,
     )
     await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v2'"))
     await session.execute(text(f"UPDATE \"{source_schema}\".plan SET marketing_name = 'source-v2'"))
@@ -447,7 +457,8 @@ async def _assert_committed_activation(sessions, destination_schema, unrelated_s
             session, importer_id="mrf", schema_name=destination_schema
         )
         assert adopted.serving_generation == activation_by_field["source_generation"]
-        assert len(adopted.relation_oids) == 13
+        assert len(adopted.relation_oids) == 12
+        assert await session.scalar(text(f'SELECT text FROM "{destination_schema}".log')) == "destination-v1"
         assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v2"
         assert (
             await session.scalar(text(f'SELECT marketing_name FROM "{destination_schema}".plan_search_summary'))
@@ -553,7 +564,6 @@ async def _exercise_mrf_roundtrip(
     unrelated_schema,
     prepared_dataset_id,
     restored_dataset_id,
-    source_generation,
 ) -> None:
     """Exercise address conflicts, rollbacks, and successful MRF archive activation."""
 
@@ -568,7 +578,7 @@ async def _exercise_mrf_roundtrip(
         "incumbent": incumbent,
         "validation": validation,
         "owner_oid": owner_oid,
-        "source_generation": source_generation,
+        "source_generation": manifest.source_serving_generation,
     }
     await _assert_destination_address_conflict_rejected(sessions, destination_schema, key, activation_by_field)
     await _assert_replaced_sequence_rejected(sessions, ownership)
@@ -580,8 +590,98 @@ async def _exercise_mrf_roundtrip(
 
 
 @pytest.mark.asyncio
+async def test_mrf_revision_migration_narrows_legacy_identity_without_trusting_it():
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    schema = "mrf_legacy_diagnostics_" + uuid4().hex
+    migration = _MIGRATION_PATH.with_name("20260929040000_reference_source_generation_guard.py")
+    origin = uuid4()
+    try:
+        async with sessions.begin() as session:
+            await _create_family(session, schema, revision_guards=False)
+            result_oids = await generation.current_reference_family_relation_oids(
+                session, importer_id="mrf", schema_name=schema
+            )
+            log_oid = await session.scalar(text(f"SELECT '\"{schema}\".log'::regclass::oid::bigint"))
+            legacy_oids = [*result_oids[:8], log_oid, *result_oids[8:]]
+            await session.execute(
+                text(
+                    f'UPDATE "{schema}".reference_family_result_generation SET local_generation=4, '
+                    "origin_lineage_id=:origin, origin_generation=17, published_at='2026-09-01T00:00:00Z', "
+                    "relation_oids=:oids WHERE importer_id='mrf'"
+                ),
+                {"origin": origin, "oids": legacy_oids},
+            )
+            await install_source_generation_guards(await session.connection(), schema)
+            narrowed = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=schema
+            )
+            assert narrowed.relation_oids == result_oids
+            assert narrowed.local_generation == 4
+            assert narrowed.serving_generation.origin_lineage_id == str(origin)
+            assert narrowed.serving_generation.origin_generation == 17
+            assert not await session.scalar(
+                text(
+                    f'SELECT source_revision_tracked FROM "{schema}".reference_family_result_generation '
+                    "WHERE importer_id='mrf'"
+                )
+            )
+            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
+                await _run_migration(await session.connection(), schema, "downgrade", migration)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shared_diagnostics_preserve_adopted_mrf_generation():
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    schema = "mrf_diagnostics_" + uuid4().hex
+    try:
+        async with sessions.begin() as session:
+            await _create_family(session, schema)
+            await _insert_family_rows(session, schema, "result")
+            adopted = await generation.publish_adopted_reference_family_generation(
+                session,
+                importer_id="mrf",
+                schema_name=schema,
+                source_generation={
+                    "origin_lineage_id": str(uuid4()),
+                    "origin_generation": 17,
+                    "published_at": "2026-09-01T00:00:00Z",
+                },
+                source_revision_tracked=True,
+            )
+        async with sessions.begin() as session:
+            await session.execute(
+                text(f'''INSERT INTO "{schema}".log (issuer_id, checksum, text, source)
+                         VALUES (1, 2, 'synthetic diagnostic', 'ptg')''')
+            )
+        async with sessions.begin() as session:
+            assert (
+                await generation.read_reference_family_result_generation_authority(
+                    session, importer_id="mrf", schema_name=schema
+                )
+                == adopted
+            )
+            await session.execute(text(f"UPDATE \"{schema}\".issuer SET issuer_name='changed result'"))
+        async with sessions.begin() as session:
+            changed = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=schema
+            )
+            assert changed.local_generation == adopted.local_generation + 1
+            assert changed.serving_generation.origin_lineage_id == adopted.local_lineage_id
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back(monkeypatch):
-    """Transfer all 14 serving relations with frozen data, CAS, and atomic generation."""
+    """Transfer 13 serving relations, preserving diagnostics, CAS, and atomic generation."""
 
     engine = create_async_engine(_database_url())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -600,7 +700,7 @@ async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back(mon
     }
     try:
         async with sessions() as session, session.begin():
-            source_authority = await _seed_mrf_roundtrip(session, source_schema, destination_schema, unrelated_schema)
+            await _seed_mrf_roundtrip(session, source_schema, destination_schema, unrelated_schema)
         await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema)
         await _exercise_mrf_roundtrip(
             sessions,
@@ -609,7 +709,6 @@ async def test_mrf_model_family_roundtrip_retains_predecessor_and_rolls_back(mon
             unrelated_schema,
             prepared_dataset_id,
             restored_dataset_id,
-            source_authority.serving_generation,
         )
     finally:
         async with engine.begin() as connection:
@@ -642,6 +741,7 @@ async def _initialize_published_mrf_schema(session, schema_name):
         ),
         {"mrf_lineage_id": uuid4(), "address_lineage_id": uuid4()},
     )
+    await install_source_generation_guards(await session.connection(), schema_name)
     await session.commit()
 
 
@@ -695,6 +795,7 @@ async def _activate_manual_archive(sessions, destination_schema, manifest, owner
 
 
 async def _run_interleaved_archive_cycle(
+    engine,
     sessions,
     monkeypatch,
     source_schema,
@@ -717,6 +818,9 @@ async def _run_interleaved_archive_cycle(
         await session.execute(text(f"UPDATE \"{source_schema}\".issuer SET issuer_name = 'source-v3'"))
         await session.commit()
 
+    with pytest.raises(RuntimeError, match="completion generation differs"):
+        await _prepare_restored_candidate(sessions, source_schema, second_prepared, second_restored)
+    await _complete_synthetic_publication(monkeypatch, engine, sessions, source_schema, initialize=False)
     manifest, ownership = await _prepare_restored_candidate(
         sessions,
         source_schema,
@@ -1078,6 +1182,7 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
         )
 
         await _run_interleaved_archive_cycle(
+            engine,
             sessions,
             monkeypatch,
             source_schema,
@@ -1087,17 +1192,16 @@ async def test_mrf_archive_rotation_survives_an_interleaved_ordinary_import(monk
 
         async with sessions() as session, session.begin():
             assert await session.scalar(text(f'SELECT issuer_name FROM "{destination_schema}".issuer')) == "source-v3"
-            assert (
-                await session.scalar(
+            assert list(
+                await session.scalars(
                     text(
-                        "SELECT count(*) FROM pg_catalog.pg_class AS relation "
+                        "SELECT relation.relname FROM pg_catalog.pg_class AS relation "
                         "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
                         "WHERE namespace.nspname=:schema_name AND relation.relname LIKE '%\\_old' ESCAPE '\\'"
                     ),
                     {"schema_name": destination_schema},
                 )
-                == 0
-            )
+            ) == ["log_old"]
     finally:
         async with engine.begin() as connection:
             for schema_name in owned_schemas:

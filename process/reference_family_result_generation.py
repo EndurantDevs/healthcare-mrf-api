@@ -26,7 +26,6 @@ RELATION_NAMES_BY_IMPORTER = {
         "plan_drug_raw",
         "plan_drug_stats",
         "plan_drug_tier_stats",
-        "log",
         "plan_npi_raw",
         "plan_networktier",
         "mrf_address",
@@ -355,6 +354,10 @@ async def capture_reference_family_serving_generation(
     )
     if authority.serving_generation is None or authority.relation_oids != current_oids:
         raise RuntimeError("reference family serving generation is unavailable or drifted")
+    if importer_id != "label":
+        from process.reference_source_generation import require_reference_revision_tracking
+
+        await require_reference_revision_tracking(database, importer_id=importer_id, schema_name=schema_name)
     return authority.serving_generation
 
 
@@ -376,6 +379,9 @@ async def publish_local_reference_family_generation(
                 database, importer_id="label", schema=schema, consumed_dependencies={}
             )
         )
+    from process.reference_source_generation import install_reference_revision_guards
+
+    await install_reference_revision_guards(database, importer_id=importer, schema_name=schema)
     current = await read_reference_family_result_generation_authority(
         database, importer_id=importer, schema_name=schema, lock=True
     )
@@ -387,7 +393,7 @@ async def publish_local_reference_family_generation(
         database,
         text(
             f"UPDATE {_quoted(_authority_schema(importer, schema))}.{_quoted(TABLE_NAME)} SET "
-            "local_generation=:next_generation, origin_lineage_id=local_lineage_id, "
+            "local_generation=:next_generation, origin_lineage_id=local_lineage_id, source_revision_tracked=TRUE, "
             "origin_generation=:next_generation, published_at=clock_timestamp(), "
             "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
             "RETURNING importer_id, local_lineage_id, local_generation, origin_lineage_id, "
@@ -419,50 +425,63 @@ async def _adopt_label_generation(
     return _label_authority(await adopt_label_generation(database, schema=schema, source_generation=source))
 
 
+async def _adopted_generation_fields(database, importer, schema, source_generation) -> dict[str, Any]:
+    """Bind adopted provenance and its exact local relation inventory."""
+
+    if source_generation is None:
+        return {
+            "origin_lineage_id": None,
+            "origin_generation": None,
+            "published_at": None,
+            "relation_oids": None,
+        }
+    source = validate_reference_family_serving_generation(source_generation)
+    return {
+        "origin_lineage_id": source.origin_lineage_id,
+        "origin_generation": source.origin_generation,
+        "published_at": source.published_at,
+        "relation_oids": list(
+            await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
+        ),
+    }
+
+
 async def publish_adopted_reference_family_generation(
     database: Any,
     *,
     importer_id: str,
     schema_name: str,
     source_generation: Mapping[str, Any] | ReferenceFamilyServingGeneration | None,
+    source_revision_tracked: bool = False,
 ) -> ReferenceFamilyResultGenerationAuthority:
-    """Preserve a source origin or explicitly clear generation-less adoption."""
+    """Preserve provenance; trust revisions only with validated guarded capture."""
 
     importer = _importer_id(importer_id)
     schema = _schema_name(schema_name)
+    if type(source_revision_tracked) is not bool or (source_revision_tracked and source_generation is None):
+        raise ValueError("reference family adopted revision tracking is invalid")
     if importer == "label":
         return await _adopt_label_generation(database, schema, source_generation)
+    from process.reference_source_generation import install_reference_revision_guards
+
+    await install_reference_revision_guards(database, importer_id=importer, schema_name=schema)
     current = await read_reference_family_result_generation_authority(
         database, importer_id=importer, schema_name=schema, lock=True
     )
-    if source_generation is None:
-        update_by_field = {
-            "origin_lineage_id": None,
-            "origin_generation": None,
-            "published_at": None,
-            "relation_oids": None,
-        }
-    else:
-        source_serving_generation = validate_reference_family_serving_generation(source_generation)
-        update_by_field = {
-            "origin_lineage_id": source_serving_generation.origin_lineage_id,
-            "origin_generation": source_serving_generation.origin_generation,
-            "published_at": source_serving_generation.published_at,
-            "relation_oids": list(
-                await current_reference_family_relation_oids(database, importer_id=importer, schema_name=schema)
-            ),
-        }
+    update_by_field = await _adopted_generation_fields(database, importer, schema, source_generation)
     updated = await _first(
         database,
         text(
             f"UPDATE {_quoted(_authority_schema(importer, schema))}.{_quoted(TABLE_NAME)} SET "
             "origin_lineage_id=CAST(:origin_lineage_id AS uuid), "
+            "source_revision_tracked=:source_revision_tracked, "
             "origin_generation=:origin_generation, published_at=CAST(:published_at AS timestamptz), "
             "relation_oids=CAST(:relation_oids AS bigint[]) WHERE importer_id=:importer_id "
             "RETURNING importer_id, local_lineage_id, local_generation, origin_lineage_id, "
             "origin_generation, published_at, relation_oids"
         ),
         importer_id=importer,
+        source_revision_tracked=source_revision_tracked,
         **update_by_field,
     )
     if updated is None:

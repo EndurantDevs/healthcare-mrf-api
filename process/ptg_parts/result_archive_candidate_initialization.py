@@ -127,9 +127,11 @@ class InitializedResultArchiveCandidate:
     source_snapshot_id: str
     source_count: int
     plan_scope_count: int
-    frozen_binding_sha256: str
+    frozen_binding_sha256: str | None
     reused: bool
     requires_fresh_destination_attestation: bool = True
+    authority_contract: str | None = None
+    authority_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,7 @@ class _AuthenticatedStagedCandidate:
     coverage_scope_id: bytes
     plan_scopes: tuple[tuple[str, str], ...]
     source_records: tuple[Mapping[str, Any], ...]
+    invalid_price_exclusion_policy: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -380,10 +383,10 @@ async def _staged_plan_scopes(
     plan_scope_rows = await _rows(
         session,
         f"""
-        SELECT plan_id, plan_market_type
+        SELECT plan_id, lower(plan_market_type) AS plan_market_type
           FROM {_quote_ident(staging_schema)}.ptg2_v3_snapshot_plan_scope
          WHERE snapshot_id = :snapshot_id
-         ORDER BY plan_id, plan_market_type
+         ORDER BY plan_id, lower(plan_market_type)
          FOR SHARE
         """,
         {"snapshot_id": source_snapshot_id},
@@ -1112,6 +1115,7 @@ async def initialize_result_archive_candidate(
     destination_snapshot_id: str,
     frozen_binding_params: Mapping[str, Any],
     authenticated_source_archive_metadata: Mapping[str, Any],
+    reviewed_source_key: str | None = None,
 ) -> InitializedResultArchiveCandidate:
     """Create or exactly reuse one destination-local building candidate.
 
@@ -1122,6 +1126,23 @@ async def initialize_result_archive_candidate(
     """
 
     _require_transaction(session)
+    from process.ptg_parts.result_archive_published_authority import PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+
+    if (
+        isinstance(authenticated_source_archive_metadata, Mapping)
+        and authenticated_source_archive_metadata.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+    ):
+        if frozen_binding_params:
+            raise ResultArchiveCandidateInitializationError("published result cannot carry frozen input parameters")
+        return await _initialize_published_result_candidate(
+            session,
+            schema_name=schema_name,
+            staging_schema_name=staging_schema_name,
+            source_snapshot_key=source_snapshot_key,
+            destination_snapshot_id=destination_snapshot_id,
+            receipt=authenticated_source_archive_metadata,
+            reviewed_source_key=reviewed_source_key,
+        )
     admission = _validated_local_admission(
         schema_name=schema_name,
         staging_schema_name=staging_schema_name,
@@ -1130,6 +1151,13 @@ async def initialize_result_archive_candidate(
         frozen_binding_params=frozen_binding_params,
         authenticated_source_archive_metadata=authenticated_source_archive_metadata,
     )
+    return await _initialize_frozen_result_candidate(session, admission, frozen_binding_params)
+
+
+async def _initialize_frozen_result_candidate(
+    session: Any, admission: _LocalCandidateAdmission, frozen_binding_params: Mapping[str, Any]
+) -> InitializedResultArchiveCandidate:
+    """Persist or exactly replay a candidate under its protected frozen admission."""
     await _lock_local_candidate(session, admission.destination_snapshot_id)
     staged = await _authenticated_staged_candidate(
         session,
@@ -1162,6 +1190,149 @@ async def initialize_result_archive_candidate(
         staged,
         source_count=source_count,
         is_new_snapshot=is_new_snapshot,
+    )
+
+
+def _published_candidate_metadata(
+    staged: _AuthenticatedStagedCandidate, receipt: Mapping[str, Any], snapshot: str, source_key: str, run_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Replace remote activation authority with receipt-bound local building metadata."""
+    identity = receipt["identity"]
+    manifest = copy.deepcopy(dict(staged.source_manifest))
+    for field_name in _REMOTE_AUTHORITY_FIELDS | {"source_file_import_id", "result_archive_source"}:
+        manifest.pop(field_name, None)
+    manifest.update(
+        snapshot_id=snapshot,
+        source_key=source_key,
+        import_month=identity["import_month"],
+        activation={
+            "contract": PTG2_CANDIDATE_ACTIVATION_CONTRACT,
+            "state": "building",
+            "source_key": source_key,
+            "plan_id": staged.primary_plan_id,
+            "plan_market_type": staged.primary_plan_market_type,
+            "expected_previous_snapshot_id": None,
+        },
+        result_archive_source=copy.deepcopy(receipt),
+    )
+    # Existing protected evidence must fail closed, including partial markers.
+    validate_frozen_candidate_evidence(manifest, candidate_run_id=run_id, database_binding=None, database_sources=None)
+    options_by_name = {
+        "source_key": source_key,
+        "plan_ids": sorted({plan for plan, _ in staged.plan_scopes}),
+        "plan_market_types": sorted({market for _, market in staged.plan_scopes}),
+        "snapshot_arch": _SNAPSHOT_ARCH,
+        "storage_generation": _STORAGE_GENERATION,
+        "auto_activate_candidates": False,
+        "result_archive_source": copy.deepcopy(receipt),
+        "result_archive_candidate_manifest_sha256": result_archive_manifest_sha256(manifest),
+    }
+    if staged.invalid_price_exclusion_policy is not None:
+        options_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = copy.deepcopy(staged.invalid_price_exclusion_policy)
+    return manifest, options_by_name
+
+
+async def _persist_published_candidate(
+    session: Any,
+    *,
+    destination: str,
+    staging: str,
+    snapshot: str,
+    run_id: str,
+    staged: _AuthenticatedStagedCandidate,
+    manifest: Mapping[str, Any],
+    options_by_name: Mapping[str, Any],
+) -> tuple[int, bool]:
+    """Insert or exactly replay local rows and require a complete isolated source graph."""
+    identity = options_by_name["result_archive_source"]["identity"]
+    is_new_run = await _is_new_run_after_insert(
+        session,
+        schema_name=destination,
+        import_run_id=run_id,
+        import_month=identity["import_month"],
+        options=options_by_name,
+    )
+    is_new_snapshot = await _is_new_snapshot_after_insert(
+        session,
+        schema_name=destination,
+        snapshot_id=snapshot,
+        import_run_id=run_id,
+        import_month=identity["import_month"],
+        manifest=manifest,
+    )
+    await _insert_or_verify_scope(session, schema_name=destination, snapshot_id=snapshot, staged=staged)
+    source_count = await _copy_source_graph(
+        session,
+        destination_schema=destination,
+        staging_schema=staging,
+        source_snapshot_id=staged.source_snapshot_id,
+        destination_snapshot_id=snapshot,
+    )
+    await _assert_local_attempt_isolated(session, schema_name=destination, snapshot_id=snapshot, import_run_id=run_id)
+    if is_new_run != is_new_snapshot or source_count != identity["source_count"]:
+        raise ResultArchiveCandidateInitializationError("published result local attempt has incomplete evidence")
+    return source_count, is_new_snapshot
+
+
+async def _initialize_published_result_candidate(
+    session: Any,
+    *,
+    schema_name: str,
+    staging_schema_name: str,
+    source_snapshot_key: int,
+    destination_snapshot_id: str,
+    receipt: Mapping[str, Any],
+    reviewed_source_key: str | None,
+) -> InitializedResultArchiveCandidate:
+    """Create a reviewed destination attempt without asserting frozen input provenance."""
+    from process.ptg_parts.result_archive_published_authority import validate_ptg_published_result_source_authority
+    from process.ptg_parts.result_archive_receive_binding import (
+        authenticate_published_result_stage,
+        published_result_authority_sha256,
+        published_result_run_id,
+        validate_local_published_result,
+    )
+
+    destination = _required_schema(schema_name, field_name="schema_name")
+    staging = _required_schema(staging_schema_name, field_name="staging_schema_name")
+    snapshot = _required_snapshot_id(destination_snapshot_id, field_name="destination snapshot")
+    if destination != resolve_ptg2_schema() or destination == staging:
+        raise ValueError("published result requires distinct staging and configured destination schemas")
+    receipt = validate_ptg_published_result_source_authority(receipt)
+    identity = receipt["identity"]
+    source_key = _required_source_key(reviewed_source_key)
+    if source_key != identity["source_key"] or snapshot == identity["snapshot_id"]:
+        raise ResultArchiveCandidateInitializationError("published result reviewed destination scope differs")
+    run_id = published_result_run_id(destination, snapshot, receipt)
+    if run_id == identity["import_run_id"]:
+        raise ResultArchiveCandidateInitializationError("published result requires a new local attempt")
+    await _lock_local_candidate(session, snapshot)
+    staged = await authenticate_published_result_stage(
+        session, staging_schema_name=staging, source_snapshot_key=source_snapshot_key, receipt=receipt
+    )
+    manifest, options_by_name = _published_candidate_metadata(staged, receipt, snapshot, source_key, run_id)
+    source_count, is_new_snapshot = await _persist_published_candidate(
+        session,
+        destination=destination,
+        staging=staging,
+        snapshot=snapshot,
+        run_id=run_id,
+        staged=staged,
+        manifest=manifest,
+        options_by_name=options_by_name,
+    )
+    await validate_local_published_result(session, schema_name=destination, snapshot_id=snapshot, receipt=receipt)
+    return InitializedResultArchiveCandidate(
+        contract=RESULT_ARCHIVE_CANDIDATE_INITIALIZATION_CONTRACT,
+        destination_snapshot_id=snapshot,
+        destination_import_run_id=run_id,
+        source_snapshot_id=staged.source_snapshot_id,
+        source_count=source_count,
+        plan_scope_count=len(staged.plan_scopes),
+        frozen_binding_sha256=None,
+        reused=not is_new_snapshot,
+        authority_contract=receipt["contract"],
+        authority_sha256=published_result_authority_sha256(receipt),
     )
 
 

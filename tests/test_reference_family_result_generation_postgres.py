@@ -18,6 +18,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from tests.reference_family_generation_fixture import install_source_generation_guards
+
 generation = importlib.import_module("process.reference_family_result_generation")
 _DSN_ENV = "HLTHPRT_REFERENCE_FAMILY_ARCHIVE_TEST_DSN"
 _LOCAL_DATABASE = re.compile(r"^hc_reference_family_[0-9a-f]{32}$")
@@ -266,6 +268,7 @@ async def _assert_adoption_rollback(engine, schema, incumbent_authority, source_
                 importer_id=importer_id,
                 schema_name=schema,
                 source_generation=source_generation_by_field,
+                source_revision_tracked=True,
             )
             assert adopted.local_generation == 1
             assert adopted.serving_generation.origin_generation == 2
@@ -309,6 +312,7 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
             table_names = {name for names in generation.RELATION_NAMES_BY_IMPORTER.values() for name in names}
             for table_name in table_names - {"facility_address_contribution", "cms_doctor_group_site"}:
                 await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
+            await install_source_generation_guards(connection, schema)
 
         authority_by_importer = await _publish_initial_generations(engine, schema)
         incumbent_authority = authority_by_importer["places-zcta"]

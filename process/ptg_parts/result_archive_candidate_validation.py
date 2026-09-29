@@ -37,6 +37,10 @@ from process.ptg_parts.result_archive_adoption import (
     RESULT_ARCHIVE_ADOPTION_CONTRACT,
     PreparedResultArchiveLayout,
 )
+from process.ptg_parts.result_archive_candidate_initialization import (
+    ResultArchiveCandidateInitializationError,
+    _required_source_key,
+)
 from process.ptg_parts.result_archive_candidate_preparation import (
     RESULT_ARCHIVE_CANDIDATE_PREPARATION_CONTRACT,
     PreparedResultArchiveCandidate,
@@ -90,7 +94,7 @@ _LOCKED_CANDIDATE_SQL = """
         ON layout.snapshot_key = binding.snapshot_key
       JOIN {schema}.ptg2_v4_snapshot_map_root v4_root
         ON v4_root.snapshot_key = layout.snapshot_key
-      JOIN {schema}.ptg2_frozen_source_file_binding frozen
+      LEFT JOIN {schema}.ptg2_frozen_source_file_binding frozen
         ON frozen.internal_run_id = snapshot.import_run_id
       LEFT JOIN {schema}.ptg2_current_source_snapshot current_pointer
         ON current_pointer.source_key = :source_key
@@ -171,12 +175,12 @@ def _validate_preparation_receipts(
     return snapshot_id
 
 
-def _validated_source_key(value: Any) -> str:
-    """Use frozen-binding admission for the lifecycle lock and pointer identity."""
+def _validated_source_key(value: Any, *, exact_published: bool = False) -> str:
+    """Keep published source identity exact; frozen bindings retain legacy normalization."""
 
     try:
-        return _canonical_source_key(value)
-    except FrozenRateFileValidationError as exc:
+        return _required_source_key(value) if exact_published else _canonical_source_key(value)
+    except (FrozenRateFileValidationError, ResultArchiveCandidateInitializationError) as exc:
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation destination source scope is unavailable"
         ) from exc
@@ -187,6 +191,7 @@ async def _candidate_source_key(
     *,
     schema_name: str,
     snapshot_id: str,
+    exact_published: bool = False,
 ) -> str:
     source_key_query = await session.execute(
         text(
@@ -198,7 +203,7 @@ async def _candidate_source_key(
     )
     source_key_rows = source_key_query.all()
     raw_source_key = source_key_rows[0][0] if len(source_key_rows) == 1 else None
-    return _validated_source_key(raw_source_key)
+    return _validated_source_key(raw_source_key, exact_published=exact_published)
 
 
 async def _locked_candidate_row(
@@ -274,6 +279,39 @@ def _validated_layout_serving_index(
     return serving_index
 
 
+async def _validate_published_layout_authority(
+    session: Any,
+    *,
+    schema_name: str,
+    receipt: Mapping[str, Any],
+    prepared_layout: PreparedResultArchiveLayout,
+) -> None:
+    """Join the adopted map and finalizer to the sealed published-result receipt."""
+
+    identity = receipt["identity"]
+    mapping_digest = bytes(prepared_layout.mapping_digest).hex()
+    if (
+        prepared_layout.source_snapshot_key != identity["snapshot_key"]
+        or mapping_digest != identity["layout_mapping_digest"]
+        or mapping_digest != identity["map_digest"]
+    ):
+        raise ResultArchiveCandidateValidationError("published result layout differs from source authority")
+    finalizer_query = await session.execute(
+        text(
+            f"SELECT state, map_digest FROM {_quote_ident(schema_name)}.ptg2_v4_finalizer_map_root "
+            "WHERE snapshot_key = :snapshot_key FOR KEY SHARE"
+        ),
+        {"snapshot_key": prepared_layout.destination_snapshot_key},
+    )
+    finalizer_rows = finalizer_query.all()
+    if (
+        len(finalizer_rows) != 1
+        or finalizer_rows[0][0] != "complete"
+        or bytes(finalizer_rows[0][1] or b"").hex() != identity["finalizer_map_digest"]
+    ):
+        raise ResultArchiveCandidateValidationError("published result finalizer differs from source authority")
+
+
 async def _validate_logical_preparation(
     session: Any,
     *,
@@ -282,10 +320,43 @@ async def _validate_logical_preparation(
     candidate_row: Mapping[str, Any],
     prepared_candidate: PreparedResultArchiveCandidate,
 ) -> None:
+    """Recheck the local candidate's logical evidence before audit staging."""
+
     expected_counts_by_table = {
         str(table_name): int(row_count)
         for table_name, row_count in prepared_candidate.allowed_amount_row_counts.items()
     }
+    if prepared_candidate.authority_contract is not None:
+        from process.ptg_parts.result_archive_candidate_initialization import ResultArchiveCandidateInitializationError
+        from process.ptg_parts.result_archive_published_authority import PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+        from process.ptg_parts.result_archive_receive_binding import validate_local_published_result
+
+        if (
+            prepared_candidate.authority_contract != PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+            or prepared_candidate.frozen_binding_sha256 is not None
+        ):
+            raise ResultArchiveCandidateValidationError("published result preparation authority is invalid")
+        receipt = _mapping(candidate_row.get("manifest")).get("result_archive_source")
+        try:
+            authority_digest = await validate_local_published_result(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                receipt=receipt,
+            )
+        except (ValueError, RuntimeError, ResultArchiveCandidateInitializationError) as exc:
+            raise ResultArchiveCandidateValidationError("published result local authority differs") from exc
+        is_authority_matching = (
+            authority_digest == prepared_candidate.authority_sha256
+            and receipt["identity"]["snapshot_id"] == prepared_candidate.source_snapshot_id
+            and candidate_row.get("frozen_binding_sha256") is None
+        )
+    else:
+        is_authority_matching = (
+            isinstance(prepared_candidate.frozen_binding_sha256, str)
+            and str(candidate_row.get("frozen_binding_sha256") or "") == prepared_candidate.frozen_binding_sha256
+            and prepared_candidate.authority_sha256 is None
+        )
     if (
         expected_counts_by_table
         != await _allowed_amount_counts(
@@ -293,7 +364,7 @@ async def _validate_logical_preparation(
             schema_name=schema_name,
             snapshot_id=snapshot_id,
         )
-        or str(candidate_row.get("frozen_binding_sha256") or "") != prepared_candidate.frozen_binding_sha256
+        or not is_authority_matching
     ):
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation logical evidence differs from its preparation receipt"
@@ -305,6 +376,7 @@ def _candidate_attributes(
     *,
     source_key: str,
     serving_index: Mapping[str, Any],
+    exact_published: bool = False,
 ) -> dict[str, Any]:
     status = str(candidate_row.get("status") or "").strip().lower()
     run_status = str(candidate_row.get("run_status") or "").strip().lower()
@@ -324,7 +396,7 @@ def _candidate_attributes(
         raise ResultArchiveCandidateValidationError(
             "archive candidate validation destination state is not building or replayable"
         )
-    if _validated_source_key(activation.get("source_key")) != source_key:
+    if _validated_source_key(activation.get("source_key"), exact_published=exact_published) != source_key:
         raise ResultArchiveCandidateValidationError("archive candidate validation destination source scope changed")
     manifest["serving_index"] = copy.deepcopy(dict(serving_index))
     return candidate_snapshot_attributes(
@@ -463,6 +535,13 @@ async def _validated_audit_target(
         candidate_row=candidate_state,
         prepared_candidate=prepared_candidate,
     )
+    if prepared_candidate.authority_contract is not None:
+        await _validate_published_layout_authority(
+            session,
+            schema_name=schema_name,
+            receipt=_mapping(candidate_state.get("manifest"))["result_archive_source"],
+            prepared_layout=prepared_layout,
+        )
     candidate_sources = await _source_records(
         session,
         schema_name=schema_name,
@@ -480,6 +559,7 @@ async def _validated_audit_target(
         candidate_state,
         source_key=source_key,
         serving_index=serving_index,
+        exact_published=prepared_candidate.authority_contract is not None,
     )
     try:
         audit_target = validate_candidate_audit_target_state(
@@ -531,6 +611,7 @@ async def validate_result_archive_candidate_for_audit(
         session,
         schema_name=destination_schema,
         snapshot_id=snapshot_id,
+        exact_published=prepared_candidate.authority_contract is not None,
     )
     await acquire_ptg2_source_lifecycle_lock(session, source_key=source_key)
     candidate_state = await _locked_candidate_row(
