@@ -3,6 +3,8 @@ import types
 from unittest.mock import AsyncMock
 
 import pytest
+
+from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
 import sanic.exceptions
 
 pytest.importorskip("pytz")
@@ -193,7 +195,7 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
 
     assert "provider_enrichment" in response_payload
     assert response_payload["provider_enrichment"]["summary"]["status"] == "enriched"
-    fetch_detail.assert_awaited_once_with(1518379601, include_chain=False)
+    fetch_detail.assert_awaited_once_with(1518379601, include_chain=False, session=None)
 
 
 @pytest.mark.asyncio
@@ -263,7 +265,7 @@ async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
     response_payload = json.loads(response.body)
 
     assert response_payload["provider_enrichment"]["summary"]["status"] == "enriched"
-    fetch_detail.assert_awaited_once_with(1518379601, include_chain=True)
+    fetch_detail.assert_awaited_once_with(1518379601, include_chain=True, session=None)
 
 
 @pytest.mark.asyncio
@@ -301,7 +303,7 @@ async def test_get_npi_can_return_summary_view(monkeypatch):
         "summary": {"status": "enriched"},
         "ffs_visibility": {"show_mode": "default", "chain_hidden": False},
     }
-    fetch_summary_detail.assert_awaited_once_with(1518379601, include_chain=False)
+    fetch_summary_detail.assert_awaited_once_with(1518379601, include_chain=False, session=None)
 
 
 @pytest.mark.asyncio

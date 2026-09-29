@@ -56,8 +56,11 @@ def education_source_manifest(
         "content_sha256": content_sha256,
         "downloaded_at": datetime.utcnow().isoformat(),
     }
+    generation_by_field = {
+        key: manifest_by_name[key] for key in ("source_key", "dataset_id", "schema_version", "content_sha256")
+    }
     manifest_by_name["generation_id"] = hashlib.sha256(
-        json.dumps(manifest_by_name, sort_keys=True).encode()
+        json.dumps(generation_by_field, sort_keys=True).encode()
     ).hexdigest()
     return manifest_by_name
 

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
     ProviderDirectoryCMSDoctorsGroupBinding,
+    ProviderDirectoryCMSDoctorsSiteBinding,
     ProviderDirectoryEntityReleaseEvidence,
     ProviderDirectoryEntitySourceBinding,
     ProviderDirectoryOrganizationIdentity,
@@ -44,7 +45,7 @@ def _validated_entity_batch(
     release_id: str,
     resources: list[Mapping[str, Any]],
 ) -> tuple[str, list[str], dict[str, tuple[str, dict[str, Any]]]]:
-    if not isinstance(resources, list) or not resources or len(resources) > 100:
+    if not isinstance(resources, list) or not resources or len(resources) > 1_000:
         raise ValueError("provider_directory_entity_batch_invalid")
     resource_type = _source_resource_identity(source_id, release_id, resources[0])[0]
     payloads_by_resource_id: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -74,7 +75,7 @@ async def _read_entity_batch(
     binding = ProviderDirectoryEntitySourceBinding.__table__
     evidence = ProviderDirectoryEntityReleaseEvidence.__table__
     id_column = _IDENTITY_BY_RESOURCE_TYPE[resource_type][1]
-    # ponytail: this source/type lock serializes batches; shard only if measured throughput needs it.
+    # This source/type lock serializes batches; shard only if measured throughput needs it.
     await session.execute(
         text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
         {"identity_key": f"provider-directory-entity-batch:{source_id}:{resource_type}"},
@@ -150,7 +151,7 @@ async def bind_entity_batch(
     release_id: str,
     resources: list[Mapping[str, Any]],
 ) -> list[UUID]:
-    """Bind up to 100 same-type resources and exact release facts in one transaction."""
+    """Bind up to 1,000 same-type resources and exact release facts in one transaction."""
     resource_type, ordered_resource_ids, payloads_by_resource_id = _validated_entity_batch(
         source_id,
         release_id,
@@ -223,7 +224,7 @@ async def bind_cms_doctors_group_batch(session: AsyncSession, *, org_pac_ids: li
     ordered_org_pac_ids = [_validated_org_pac_id(org_pac_id) for org_pac_id in org_pac_ids]
     unique_org_pac_ids = list(dict.fromkeys(ordered_org_pac_ids))
     binding = ProviderDirectoryCMSDoctorsGroupBinding.__table__
-    # ponytail: one CMS Doctors lock serializes batches; shard only if measured throughput needs it.
+    # One CMS Doctors lock serializes batches; shard only if measured throughput needs it.
     await session.execute(
         text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
         {"identity_key": "provider-directory-cms-doctors-group-batch"},
@@ -262,3 +263,51 @@ async def bind_cms_doctors_group_batch(session: AsyncSession, *, org_pac_ids: li
 async def bind_cms_doctors_group(session: AsyncSession, *, org_pac_id: str) -> UUID:
     """Bind one nonblank source PAC ID without inferring a FHIR match."""
     return (await bind_cms_doctors_group_batch(session, org_pac_ids=[org_pac_id]))[0]
+
+
+def _validated_adrs_id(adrs_id: str) -> str:
+    if not isinstance(adrs_id, str) or not adrs_id or adrs_id != adrs_id.strip() or len(adrs_id) > 256:
+        raise ValueError("cms_doctors_site_adrs_id_invalid")
+    return adrs_id
+
+
+async def bind_cms_doctors_site_batch(session: AsyncSession, *, adrs_ids: list[str]) -> list[UUID]:
+    """Bind exact CMS Doctors practice-location IDs without FHIR cross-links."""
+    if not isinstance(adrs_ids, list) or not adrs_ids or len(adrs_ids) > 100:
+        raise ValueError("cms_doctors_site_batch_invalid")
+    ordered_adrs_ids = [_validated_adrs_id(adrs_id) for adrs_id in adrs_ids]
+    unique_adrs_ids = list(dict.fromkeys(ordered_adrs_ids))
+    binding = ProviderDirectoryCMSDoctorsSiteBinding.__table__
+    await session.execute(
+        text("SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
+        {"identity_key": "provider-directory-cms-doctors-site-batch"},
+    )
+    binding_rows = (
+        await session.execute(
+            select(binding.c.adrs_id, binding.c.site_id).where(binding.c.adrs_id.in_(unique_adrs_ids))
+        )
+    ).all()
+    site_ids_by_adrs_id = {adrs_id: site_id for adrs_id, site_id in binding_rows}
+    new_site_ids_by_adrs_id = {adrs_id: uuid4() for adrs_id in unique_adrs_ids if adrs_id not in site_ids_by_adrs_id}
+    created_at = datetime.now(timezone.utc)
+    if new_site_ids_by_adrs_id:
+        await session.execute(
+            ProviderDirectorySiteIdentity.__table__.insert().values(
+                [{"site_id": site_id, "created_at": created_at} for site_id in new_site_ids_by_adrs_id.values()]
+            )
+        )
+        await session.execute(
+            binding.insert().values(
+                [
+                    {"adrs_id": adrs_id, "site_id": site_id, "created_at": created_at}
+                    for adrs_id, site_id in new_site_ids_by_adrs_id.items()
+                ]
+            )
+        )
+    site_ids_by_adrs_id.update(new_site_ids_by_adrs_id)
+    return [site_ids_by_adrs_id[adrs_id] for adrs_id in ordered_adrs_ids]
+
+
+async def bind_cms_doctors_site(session: AsyncSession, *, adrs_id: str) -> UUID:
+    """Bind one complete, nonblank source address ID."""
+    return (await bind_cms_doctors_site_batch(session, adrs_ids=[adrs_id]))[0]

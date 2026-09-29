@@ -9,6 +9,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from process.provider_directory_identifier_policy import (
+    CMS_NPD_PSEUDO_EIN_SYSTEM,
+    CMS_NPD_SOURCE_ID,
+)
 from process.tin_npi_connector_evidence import (
     FhirOrganizationEvidenceResult,
     FhirTinNpiEvidence,
@@ -114,6 +118,9 @@ def _classify_effective_identifier(
 ) -> tuple[str | None, FhirOrganizationEvidenceState | None]:
     """Classify one active identifier or return its terminal period error."""
 
+    if identifier.get("system") == CMS_NPD_PSEUDO_EIN_SYSTEM:
+        return None, None
+
     is_npi = _has_identifier_match(
         identifier,
         systems=identifier_rule.npi_systems,
@@ -148,6 +155,7 @@ def _select_effective_identifiers(
     *,
     identifier_rule: FhirTinNpiIdentifierRule,
     evidence_cutoff: dt.datetime,
+    source_id: str = "",
 ) -> (
     tuple[tuple[Mapping[str, Any], ...], tuple[Mapping[str, Any], ...]]
     | FhirOrganizationEvidenceResult
@@ -175,6 +183,17 @@ def _select_effective_identifiers(
     if not npi_identifiers:
         return _state_result(FhirOrganizationEvidenceState.MISSING_NPI)
     if not ein_identifiers:
+        if source_id == CMS_NPD_SOURCE_ID:
+            try:
+                npis = tuple(
+                    sorted({_normalize_npi(identifier.get("value")) for identifier in npi_identifiers})
+                )
+            except TinNpiConnectorError:
+                return _state_result(FhirOrganizationEvidenceState.MALFORMED_NPI)
+            return FhirOrganizationEvidenceResult(
+                FhirOrganizationEvidenceState.MISSING_EIN,
+                npi_candidates=npis,
+            )
         return _state_result(FhirOrganizationEvidenceState.MISSING_EIN)
     return tuple(npi_identifiers), tuple(ein_identifiers)
 
@@ -344,12 +363,15 @@ def _extract_verified_organization_evidence(
         identifiers,
         identifier_rule=identifier_rule,
         evidence_cutoff=evidence_cutoff,
+        source_id=context.source_id,
     )
     if isinstance(selected, FhirOrganizationEvidenceResult):
         return selected
     normalized = _normalize_selected_identifiers(*selected)
     if isinstance(normalized, FhirOrganizationEvidenceResult):
         return normalized
+    if context.source_id == CMS_NPD_SOURCE_ID and len(normalized.npis) != 1:
+        raise TinNpiConnectorError("CMS direct EIN has ambiguous NPI evidence")
     return _matched_evidence_result(
         resource,
         context,

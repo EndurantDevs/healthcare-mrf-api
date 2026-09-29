@@ -117,6 +117,26 @@ def test_legacy_numeric_suffix_keeps_canonical_and_physical_npi():
     assert canonical_row["npi"] == physical_row["summary_npi"] == 1234567893
 
 
+def test_cms_affiliation_preserves_direct_plan_references_without_inference():
+    affiliation_by_field = {
+        "resourceType": "OrganizationAffiliation",
+        "id": "affiliation-example",
+        "organization": {"reference": "Organization/insurer-example"},
+        "participatingOrganization": {"reference": "Organization/group-example"},
+        "insurancePlan": [
+            {"reference": "InsurancePlan/plan-example"},
+            {"reference": "InsurancePlan/unresolved"},
+        ],
+    }
+    _, explicit_row = parse_fhir_resource("cms-npd", affiliation_by_field)
+    _, sparse_row = parse_fhir_resource(
+        "cms-npd", {key: value for key, value in affiliation_by_field.items() if key != "insurancePlan"}
+    )
+    assert explicit_row["insurance_plan_refs"] == ["InsurancePlan/plan-example", "InsurancePlan/unresolved"]
+    assert sparse_row["insurance_plan_refs"] == []
+    assert "relationship_type" not in explicit_row and "ownership_status" not in explicit_row
+
+
 @pytest.mark.parametrize(
     "resource_type",
     ("HealthcareService", "Organization", "Practitioner", "PractitionerRole"),

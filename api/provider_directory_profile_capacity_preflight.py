@@ -9,12 +9,15 @@ either projects authority facts in a read-only transaction or durably records
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import ipaddress
 
 from sanic import response
 from sanic.exceptions import BadRequest, Forbidden, SanicException
 
 from api.control_auth import require_control_auth
+from process.provider_directory_capacity_reservation_snapshot import capacity_reservation_snapshot
 from process.provider_directory_fhir import (
     ProviderDirectoryArtifactBuildStale,
     provider_directory_profile_capacity_authority_projection,
@@ -28,13 +31,29 @@ from process.provider_directory_profile_capacity_preflight_contract import (
 from process.provider_directory_profile_capacity_runtime import (
     ProviderDirectoryProfileCapacityConfigurationError,
 )
+from process.provider_directory_profile_runtime_observation import (
+    ProviderDirectoryProfileRuntimeObservationError,
+)
 from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     ProviderDirectoryProfileSelectionStale,
 )
-from process.provider_directory_profile_runtime_observation import (
-    ProviderDirectoryProfileRuntimeObservationError,
-)
+
+fhir = importlib.import_module("process.provider_directory_fhir")
+_RESERVATION_SNAPSHOT_TIMEOUT_SECONDS = 30.0
+
+
+async def control_capacity_reservation_snapshot(request):
+    """Return bounded read-only reservation observations through the shared control gate."""
+    require_control_auth(request)
+    try:
+        async with asyncio.timeout(_RESERVATION_SNAPSHOT_TIMEOUT_SECONDS):
+            snapshot_by_field = await capacity_reservation_snapshot(fhir)
+            return response.json(snapshot_by_field, headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise SanicException(
+            "capacity reservation snapshot unavailable", status_code=503, headers={"Cache-Control": "no-store"}
+        ) from None
 
 
 async def control_provider_directory_profile_capacity_preflight(request):
@@ -119,4 +138,9 @@ def register_profile_capacity_preflight_route(control_blueprint) -> None:
         control_profile_capacity_authority_projection,
         "/provider-directory/profile-capacity-authority-projection",
         methods=("POST",),
+    )
+    control_blueprint.add_route(
+        control_capacity_reservation_snapshot,
+        "/provider-directory/profile-capacity-reservation-snapshot",
+        methods=("GET",),
     )

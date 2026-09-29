@@ -10,6 +10,8 @@ from db.models.hospital_price import *
 from db.models.hospital_price_facts import *
 from db.models.hospital_price_header import *
 from db.models.provider_directory_entity_identity import *
+from db.models.provider_directory_entity_redirect import *
+from db.models.provider_directory_cms_npd_resource_witness import *
 from db.models.provider_directory_insurance_network_identity import *
 from db.models.provider_directory_mrf_payer_binding import *
 from db.models.provider_directory_resource_identity import *

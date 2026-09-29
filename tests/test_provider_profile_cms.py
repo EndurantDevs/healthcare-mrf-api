@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
+
 from api import provider_profile as profile_api
 from api import provider_profile_cms as cms_api
 from api.endpoint import npi as npi_api

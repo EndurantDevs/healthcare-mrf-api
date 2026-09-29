@@ -9,6 +9,7 @@ import os
 import re
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -16,14 +17,45 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db import models
+from db.connection import Database
 from process import reference_family_archive as archive
+from process.entity_address_cutover_contract import _ServingRelationLockTimeout
 from process import reference_family_result_generation as generation
+from tests.cms_doctors_preparation_postgres_support import doctors_snapshot, pending_publisher_locks
 
 _CMS_REVISION = "20260920100000_cms_doctors_result_generation"
 _GROUP_REVISION = "20260929000000_cms_doctor_group_site"
+
+
+def test_group_index_compatibility_keeps_constraint_order_pairs_separate():
+    """Accept each exact index transition without mixing catalog orders or constraint versions."""
+    hash_pairs = list(archive._cms_group_index_schema_hashes())
+    all_hashes = {digest for pair in hash_pairs for digest in pair}
+    assert len(hash_pairs) == 3 and len(all_hashes) == 6
+    group = archive.ReferenceTableReceipt("CMSDoctorGroupSite", "cms_doctor_group_site", "a" * 64, 1)
+    clinician = archive.ReferenceTableReceipt("DoctorClinicianAddress", "doctor_clinician_address", "b" * 64, 1)
+    education = archive.ReferenceTableReceipt("CMSDoctorEducation", "cms_doctor_education", "c" * 64, 1)
+    for source_hash, stage_hash in hash_pairs:
+        manifest = archive.ReferenceFamilyManifest(
+            "cms-doctors", (clinician, education, replace(group, schema_sha256=source_hash)), {}, "d" * 64, "e" * 64
+        )
+        observed = replace(
+            manifest, tables=(clinician, education, replace(group, schema_sha256=stage_hash)), schema_sha256="f" * 64
+        )
+        assert archive._has_matching_manifest_stage_tables(manifest, observed.tables)
+        assert archive._has_matching_family_manifest(manifest, observed)
+        assert archive._has_matching_manifest_stage_tables(observed, observed.tables)
+        assert archive._has_matching_family_manifest(observed, observed)
+        assert not archive._has_matching_manifest_stage_tables(observed, manifest.tables)
+        assert not archive._has_matching_family_manifest(observed, manifest)
+        for other_hash in all_hashes - {source_hash, stage_hash}:
+            assert not archive._has_matching_manifest_stage_tables(
+                manifest, (clinician, education, replace(group, schema_sha256=other_hash))
+            )
 
 
 def _database_url():
@@ -52,7 +84,7 @@ async def _migration(session, revision, action):
     await connection.run_sync(apply)
 
 
-async def _create_source(session, schema):
+async def _create_source(session, schema, *, has_adrs_index=True):
     legacy_spec = archive.ReferenceFamilySpec(
         "cms-doctors",
         (models.DoctorClinicianAddress, models.CMSDoctorEducation),
@@ -80,6 +112,10 @@ async def _create_source(session, schema):
     await _migration(session, _CMS_REVISION, "downgrade")
     await _migration(session, _CMS_REVISION, "upgrade")
     await _migration(session, _GROUP_REVISION, "upgrade")
+    if has_adrs_index:
+        await session.execute(
+            text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
+        )
     await session.execute(
         text(
             f"INSERT INTO \"{schema}\".doctor_clinician_address (npi, address_checksum, city) VALUES (1000000004, 1, 'Example')"
@@ -153,7 +189,9 @@ async def _roundtrip(sessions, prepared, url, path):
             str(path),
         )
 
+    original_manifest = archive._canonical_json(prepared.manifest.as_dict())
     await archive.export_prepared_reference_family_archive(sessions, prepared=prepared, archive_copy=dump)
+    original_dump = path.read_bytes()
     listing = await _command("pg_restore", "--list", str(path))
     assert all(
         name in listing
@@ -187,11 +225,102 @@ async def _roundtrip(sessions, prepared, url, path):
             await session.scalar(text(f'SELECT org_pac_id FROM "{restored.schema_name}".cms_doctor_group_site'))
             == "0012345678"
         )
+        await _assert_group_index_tampering(session, restored, prepared.manifest)
+        await _assert_restored_activation(session, restored, prepared.manifest)
+    assert archive._canonical_json(prepared.manifest.as_dict()) == original_manifest
+    assert path.read_bytes() == original_dump
     return restored
 
 
+async def _assert_group_index_tampering(session, ownership, manifest):
+    """Reject unrelated index, column and other-table changes under either accepted shape."""
+    group_table = f'"{ownership.schema_name}".cms_doctor_group_site'
+    address_index = _group_address_index(ownership.schema_name)
+    for statements in (
+        (f"CREATE INDEX extra_lookup ON {group_table} (adrs_id)",),
+        (f"ALTER TABLE {group_table} ALTER COLUMN generation_id DROP NOT NULL",),
+        (f"ALTER TABLE {group_table} ADD CHECK (npi > 0)",),
+        (f'CREATE INDEX extra_school ON "{ownership.schema_name}".cms_doctor_education (medical_school)',),
+        (
+            f"DROP INDEX {address_index}",
+            f"CREATE INDEX partial_lookup ON {group_table} (adrs_id) WHERE adrs_id IS NOT NULL",
+        ),
+    ):
+        await _assert_rejected_group_mutation(session, ownership, manifest, statements)
+
+
+def _group_address_index(schema):
+    """Name only the model-created address index in this owned schema."""
+    name = archive._index_name_for_table("cms_doctor_group_site", f"{schema}_cms_doctor_group_site_idx_adrs")
+    return f'"{schema}"."{name}"'
+
+
+async def _assert_rejected_group_mutation(session, ownership, manifest, statements):
+    """Roll back each structural mutation after proving it fails stage validation."""
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="restored stage differs"):
+        async with session.begin_nested():
+            for statement in statements:
+                await session.execute(text(statement))
+            await archive.validate_reference_family_stage(session, ownership=ownership, manifest=manifest)
+
+
+async def _assert_restored_activation(session, ownership, manifest):
+    """Exercise both cutover paths without retaining their disposable predecessors."""
+    schema = os.environ["HLTHPRT_DB_SCHEMA"]
+    incumbent = await archive.capture_reference_family_incumbent(session, importer_id="cms-doctors", schema_name=schema)
+    owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
+    package_id = hashlib.sha256(archive._canonical_json(manifest.as_dict())).hexdigest()
+    validation = await archive.prepare_reference_family_activation(
+        session,
+        ownership=ownership,
+        manifest=manifest,
+        package_id=package_id,
+        profile_contract=archive.CONTRACT,
+        sealed_owner_oid=owner_oid,
+    )
+    assert validation.manifest_sha256 == package_id
+    assert validation.tables[2].schema_sha256 == await archive.catalog_identity._schema_identity(
+        session, dict(ownership.relation_oids)["cms_doctor_group_site"], ownership.schema_name, "cms_doctor_group_site"
+    )
+    cutover = archive.ReferenceFamilyCutoverAuthority(
+        package_id,
+        archive.CONTRACT,
+        owner_oid,
+        owner_oid,
+        "manual",
+        manifest.source_serving_generation.as_dict(),
+    )
+    for protected in (False, True):
+        savepoint = await session.begin_nested()
+        try:
+            if protected:
+                receipt = await archive.activate_validated_reference_family_stage(
+                    session,
+                    ownership=ownership,
+                    manifest=manifest,
+                    expected_incumbent=incumbent,
+                    validation_receipt=validation,
+                    cutover=cutover,
+                )
+            else:
+                receipt = await archive.activate_reference_family_stage(
+                    session,
+                    ownership=ownership,
+                    manifest=manifest,
+                    expected_incumbent=incumbent,
+                    authority="manual",
+                )
+            assert receipt.tables == validation.tables
+            assert (
+                await session.scalar(text(f'SELECT org_pac_id FROM "{schema}".cms_doctor_group_site')) == "0012345678"
+            )
+        finally:
+            await savepoint.rollback()
+
+
 @pytest.mark.asyncio
-async def test_clinician_migration_and_native_archive_are_one_closed_generation(monkeypatch, tmp_path):
+@pytest.mark.parametrize("has_adrs_index", [False, True])
+async def test_clinician_migration_and_native_archive_are_one_closed_generation(monkeypatch, tmp_path, has_adrs_index):
     url = _database_url()
     schema = "cms_source_" + uuid4().hex
     dataset_id = uuid4()
@@ -202,7 +331,7 @@ async def test_clinician_migration_and_native_archive_are_one_closed_generation(
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with sessions() as session, session.begin():
-            authority = await _create_source(session, schema)
+            authority = await _create_source(session, schema, has_adrs_index=has_adrs_index)
         async with sessions() as session, session.begin():
             with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
                 await _migration(session, _CMS_REVISION, "downgrade")
@@ -339,7 +468,7 @@ async def _export_legacy_package(sessions, schema, dataset_id, url, tmp_path):
     return manifest, authority, original_bytes_by_path
 
 
-async def _restore_legacy_stage(sessions, dataset_id, url, dump_path):
+async def _restore_legacy_stage(sessions, dataset_id, url, dump_path, *, has_adrs_index=True):
     """Replace the synthetic exported stage with the current three-table restore stage."""
     stage_schema = archive.reference_family_stage_schema(dataset_id)
     async with sessions() as session, session.begin():
@@ -352,6 +481,8 @@ async def _restore_legacy_stage(sessions, dataset_id, url, dump_path):
     await _restore_native_dump(url, dump_path)
     async with sessions() as session, session.begin():
         await archive.complete_reference_family_restore(session, ownership)
+        if not has_adrs_index:
+            await session.execute(text(f"DROP INDEX {_group_address_index(stage_schema)}"))
     return ownership
 
 
@@ -366,7 +497,7 @@ async def _assert_legacy_tampering(session, ownership, manifest, schema):
         ),
         (f'ALTER TABLE "{stage_schema}".cms_doctor_group_site ADD CHECK (npi > 0)', "group schema differs"),
         (
-            f'CREATE INDEX unexpected_group_idx ON "{stage_schema}".cms_doctor_group_site (adrs_id)',
+            f'CREATE INDEX unexpected_group_idx ON "{stage_schema}".cms_doctor_group_site (adrs_id, npi)',
             "group schema differs",
         ),
         (
@@ -503,7 +634,10 @@ async def _drop_test_schemas(engine, schemas):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protected", [False, True])
-async def test_legacy_two_table_package_restores_manually_as_three_tables(monkeypatch, tmp_path, protected):
+@pytest.mark.parametrize("has_adrs_index", [False, True])
+async def test_legacy_two_table_package_restores_manually_as_three_tables(
+    monkeypatch, tmp_path, protected, has_adrs_index
+):
     """Restore an unchanged historical package manually with a verified empty third relation."""
     url = _database_url()
     schema = "cms_source_" + uuid4().hex
@@ -522,7 +656,9 @@ async def test_legacy_two_table_package_restores_manually_as_three_tables(monkey
             url,
             tmp_path,
         )
-        ownership = await _restore_legacy_stage(sessions, dataset_id, url, tmp_path / "legacy.dump")
+        ownership = await _restore_legacy_stage(
+            sessions, dataset_id, url, tmp_path / "legacy.dump", has_adrs_index=has_adrs_index
+        )
         async with sessions() as session, session.begin():
             predecessor = await _exercise_legacy_activation(
                 session,
@@ -537,4 +673,167 @@ async def test_legacy_two_table_package_restores_manually_as_three_tables(monkey
             assert archive_path.read_bytes() == original_bytes
     finally:
         await _drop_test_schemas(engine, (stage_schema, schema, predecessor))
+        await engine.dispose()
+
+
+async def _prepare_readable_archive(fixture, dataset_id):
+    """Clone and validate a complete real family before any reader starts."""
+    sessions = fixture.database.session_factory
+    async with sessions() as session, session.begin():
+        await _create_source(session, fixture.schema)
+
+    async def retain(_session, prepared):
+        assert prepared.ownership.dataset_id == dataset_id
+
+    async def metadata(session):
+        serving = await generation.capture_reference_family_serving_generation(
+            session, importer_id="cms-doctors", schema_name=fixture.schema
+        )
+        return {"serving_generation": serving.as_dict()}
+
+    prepared = await archive.prepare_reference_family_archive_source(
+        sessions,
+        importer_id="cms-doctors",
+        schema_name=fixture.schema,
+        source_metadata=None,
+        source_metadata_factory=metadata,
+        dataset_id=dataset_id,
+        on_prepared=retain,
+    )
+    async with sessions() as session, session.begin():
+        incumbent = await archive.capture_reference_family_incumbent(
+            session,
+            importer_id="cms-doctors",
+            schema_name=fixture.schema,
+        )
+        owner_oid = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
+        package_id = hashlib.sha256(archive._canonical_json(prepared.manifest.as_dict())).hexdigest()
+        validation = await archive.prepare_reference_family_activation(
+            session,
+            ownership=prepared.ownership,
+            manifest=prepared.manifest,
+            package_id=package_id,
+            profile_contract=archive.CONTRACT,
+            sealed_owner_oid=owner_oid,
+        )
+    return {
+        "ownership": prepared.ownership,
+        "manifest": prepared.manifest,
+        "expected_incumbent": incumbent,
+        "validation_receipt": validation,
+        "cutover": archive.ReferenceFamilyCutoverAuthority(
+            package_id,
+            archive.CONTRACT,
+            owner_oid,
+            owner_oid,
+            "manual",
+            prepared.manifest.source_serving_generation.as_dict(),
+        ),
+    }
+
+
+async def _activate_readable_archive(fixture, activation_by_field, is_validated):
+    """Retry ownership belongs to the caller of either archive activation API."""
+    async with fixture.database.transaction() as session:
+        if is_validated:
+            return await archive.activate_validated_reference_family_stage(session, **activation_by_field)
+        return await archive.activate_reference_family_stage(
+            session,
+            authority="manual",
+            **{name: activation_by_field[name] for name in ("ownership", "manifest", "expected_incumbent")},
+        )
+
+
+async def test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch):
+    """Prepared metadata-only adoption drains real readers without changing caller ownership."""
+    schema, dataset_id = "cms_reader_" + uuid4().hex, uuid4()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    engine = create_async_engine(_database_url())
+    fixture = SimpleNamespace(engine=engine, schema=schema,
+        database=Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False)))
+    entered, finished = asyncio.Event(), asyncio.Event()
+    observed_snapshots = []
+    tasks = []
+
+    async def read():
+        after_count = 0
+        while after_count < 3:
+            after_count += finished.is_set()
+            observed_snapshots.append(await doctors_snapshot(fixture))
+            entered.set()
+
+    try:
+        activation_by_field = await _prepare_readable_archive(fixture, dataset_id)
+        incumbent = await doctors_snapshot(fixture)
+        tasks = [asyncio.create_task(read()) for _ in range(3)]
+        await entered.wait()
+        receipt = await _activate_readable_archive(fixture, activation_by_field, True)
+        finished.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 3)
+        adopted = await doctors_snapshot(fixture)
+        assert adopted[0] == incumbent[0]
+        assert adopted[1].relation_oids == tuple(oid for _, oid in receipt.relation_oids)
+        assert adopted[1].serving_generation == incumbent[1].serving_generation
+        assert {observed[1].relation_oids for observed in observed_snapshots} == {incumbent[1].relation_oids, adopted[1].relation_oids}
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _drop_test_schemas(engine, (archive.reference_family_stage_schema(dataset_id),
+                                         archive.reference_family_predecessor_schema(dataset_id), schema))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_validated", [False, True])
+async def test_archive_activation_preserves_late_readers(monkeypatch, is_validated):
+    """Both entry points bound contention and preserve the caller's rollback and retry."""
+    schema, dataset_id = "cms_reader_" + uuid4().hex, uuid4()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    engine = create_async_engine(_database_url())
+    fixture = SimpleNamespace(
+        engine=engine,
+        schema=schema,
+        database=Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False)),
+    )
+    reader = publisher = None
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        activation_by_field = await _prepare_readable_archive(fixture, dataset_id)
+        incumbent = await doctors_snapshot(fixture)
+        reader = asyncio.create_task(doctors_snapshot(fixture, entered=entered, release=release))
+        await asyncio.wait_for(entered.wait(), 3)
+        publisher = asyncio.create_task(_activate_readable_archive(fixture, activation_by_field, is_validated))
+        pending = await pending_publisher_locks(fixture, publisher)
+        assert await doctors_snapshot(fixture) == incumbent and bool(pending) is is_validated
+        with pytest.raises(_ServingRelationLockTimeout if is_validated else DBAPIError):
+            await publisher
+        async with fixture.database.transaction() as session:
+            await archive.verify_reference_family_stage_ownership(session, activation_by_field["ownership"])
+            await archive._verify_incumbent(session, activation_by_field["expected_incumbent"])
+        assert await doctors_snapshot(fixture) == incumbent
+        release.set()
+        assert await reader == incumbent
+        receipt = await _activate_readable_archive(fixture, activation_by_field, is_validated)
+        markers, adopted = await doctors_snapshot(fixture)
+        assert markers == incumbent[0] and adopted.local_generation == incumbent[1].local_generation
+        assert adopted.serving_generation == (incumbent[1].serving_generation if is_validated else None)
+        assert adopted.relation_oids == (tuple(oid for _, oid in receipt.relation_oids) if is_validated else None)
+        assert tuple(sorted(receipt.relation_oids)) == activation_by_field["ownership"].relation_oids
+    finally:
+        release.set()
+        tasks = [task for task in (reader, publisher) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _drop_test_schemas(
+            engine,
+            (
+                archive.reference_family_stage_schema(dataset_id),
+                archive.reference_family_predecessor_schema(dataset_id),
+                schema,
+            ),
+        )
         await engine.dispose()

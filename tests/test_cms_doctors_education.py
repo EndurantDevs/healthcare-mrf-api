@@ -12,9 +12,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from db.connection import Database
 from process import cms_doctors_education as education
+from process.entity_address_cutover_contract import postgres_sqlstate
 from tests.reference_family_generation_fixture import generation_shape_check
 
 NPI = "1000000004"
@@ -99,7 +103,7 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     first_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     next_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     assert first_manifest_by_name["content_sha256"] == next_manifest_by_name["content_sha256"]
-    assert first_manifest_by_name["generation_id"] != next_manifest_by_name["generation_id"]
+    assert first_manifest_by_name["generation_id"] == next_manifest_by_name["generation_id"]
     assert first_manifest_by_name["generation_id"] != first_manifest_by_name["content_sha256"]
     assert first_manifest_by_name["schema_version"] == "cms-doctor-education/v1"
     source_row_by_field = {"NPI": NPI, "Med_sch": "Example School", "Grd_yr": "2001"}
@@ -110,7 +114,24 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     assert future["source_json"]["quality_flags"] == ["graduation_year_in_future"]
     assert not completed["source_json"].get("quality_flags")
     assert future["education_key"] == completed["education_key"]
-    assert future["generation_id"] != completed["generation_id"]
+    assert future["generation_id"] == completed["generation_id"]
+
+
+def test_manifest_generation_changes_only_with_source_identity_or_bytes(tmp_path, monkeypatch):
+    source_path = tmp_path / "national.csv"
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Example School\n")
+    monkeypatch.setattr(
+        education,
+        "datetime",
+        SimpleNamespace(utcnow=Mock(side_effect=[datetime(2026, 1, 1)] * 3)),
+    )
+    first = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    same_bytes = education.education_source_manifest(source_path, "https://example.test/second.csv")
+    assert first["generation_id"] == same_bytes["generation_id"]
+    assert first["source_url"] != same_bytes["source_url"]
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Different School\n")
+    changed = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    assert changed["generation_id"] != first["generation_id"]
 
 
 def test_education_identity_ignores_artifact_and_practice_location():
@@ -356,16 +377,9 @@ async def _assert_publication_markers(connection, schema, marker_by_table):
         assert await connection.fetchval(f"SELECT marker FROM {schema}.{table}") == marker
 
 
-def _publisher_database(connection):
-    async def rows(statement, **params):
-        compiled = statement.compile(dialect=postgresql.dialect(paramstyle="numeric_dollar"))
-        return await connection.fetch(str(compiled), *(params[name] for name in compiled.positiontup))
-
-    async def first(statement, **params):
-        result = await rows(statement, **params)
-        return dict(result[0]) if result else None
-
-    return SimpleNamespace(transaction=connection.transaction, status=connection.execute, first=first, all=rows)
+def _publisher_database(dsn):
+    engine = create_async_engine(make_url(dsn).set(drivername="postgresql+asyncpg"))
+    return Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
 
 
 async def _create_generation_fixture(connection, schema):
@@ -409,6 +423,7 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
     groups = importlib.import_module("process.cms_doctors_groups")
 
     connection = await asyncpg.connect(dsn, timeout=5)
+    database = _publisher_database(dsn)
     schema = f"cms_education_test_{uuid.uuid4().hex[:12]}"
     is_schema_created = False
     try:
@@ -418,13 +433,13 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
         is_schema_created = True
         marker_by_table = await _create_publication_fixture(connection, schema)
         generation_before = await _create_generation_fixture(connection, schema)
-        database = _publisher_database(connection)
         monkeypatch.setattr(cms_doctors, "db", database)
         monkeypatch.setattr(education, "db", database)
         monkeypatch.setattr(groups, "db", database)
         stage = SimpleNamespace(__tablename__="doctor_stage")
-        with pytest.raises(asyncpg.UndefinedTableError):
+        with pytest.raises(DBAPIError) as missing_stage:
             await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
+        assert postgres_sqlstate(missing_stage.value) == "42P01"
         await _assert_publication_markers(connection, schema, marker_by_table)
         assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
         await connection.execute(f"CREATE TABLE {schema}.cms_doctor_education_educationtests (marker text)")
@@ -436,8 +451,9 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
             f"ALTER TABLE {schema}.reference_family_result_generation ADD CONSTRAINT reject_advance "
             "CHECK (local_generation = 0)"
         )
-        with pytest.raises(asyncpg.CheckViolationError):
+        with pytest.raises(DBAPIError) as rejected_generation:
             await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
+        assert postgres_sqlstate(rejected_generation.value) == "23514"
         await _assert_publication_markers(connection, schema, marker_by_table)
         assert await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation") == generation_before
         await connection.execute(f"ALTER TABLE {schema}.reference_family_result_generation DROP CONSTRAINT reject_advance")
@@ -452,6 +468,7 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
         })
         await _assert_published_generation(connection, database, schema, generation_before)
     finally:
+        await database.disconnect()
         if is_schema_created:
             await connection.execute(f"DROP SCHEMA {schema} CASCADE")
             assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None

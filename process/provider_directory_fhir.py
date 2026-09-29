@@ -25,6 +25,7 @@ import socket
 import sqlite3
 import ssl
 import string
+import sys
 import tempfile
 import time
 import urllib.error
@@ -86,6 +87,7 @@ from process.control_lifecycle import (
     suppress_control_run_heartbeat_persistence,
 )
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
+from process.provider_directory_cms_npd_recovery import candidate_available_sql
 from process.provider_directory_source_coverage import (
     INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
     MICHIGAN_PROVIDER_DIRECTORY_BASE,
@@ -132,6 +134,18 @@ from process.provider_directory_fhir_census_binding import (
     current_version_census_contract,
     current_version_census_count_url,
     validated_current_version_census_count_map,
+)
+from process.provider_directory_address_overlay_components import (
+    ADDRESS_OVERLAY_COMPONENTS,
+    ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES,
+    ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES,
+    ADDRESS_OVERLAY_DUPLICATE_ORDER,
+    address_overlay_alias_columns,
+    address_overlay_archive_coordinate_predicate,
+    address_overlay_component_select_sql,
+    address_overlay_existing_select_sql,
+    address_overlay_formatted_columns,
+    clean_address_overlay_components as _clean_address_overlay_components,
 )
 from process.provider_directory_fhir_census_cursor import (
     CurrentVersionCensusContinuation,
@@ -345,6 +359,7 @@ from process.provider_directory_time_partition import (
     parse_utc_instant,
 )
 from process import provider_directory_profile as profile_artifact
+from process import provider_directory_profile_desired_snapshot as profile_snapshot
 from process.provider_directory_identifier_policy import (
     CMS_NPD_PSEUDO_EIN_SYSTEM,
     CMS_NPD_SOURCE_ID,
@@ -2306,6 +2321,7 @@ class EndpointDatasetCandidate:
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
     semantic_projection_as_of: str | None = None
     proof_resource_scope: tuple[str, ...] | None = None
+    source_release: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -4297,11 +4313,12 @@ def _normalized_network_reference(reference: str) -> str | None:
 
 
 def _insurance_plan_network_references(resource: dict[str, Any]) -> list[str]:
-    """Collect top-level and nested Plan-Net InsurancePlan networks."""
+    """Collect direct and nested InsurancePlan network references."""
     references = list(_references(resource.get("network")))
-    for plan_entry in resource.get("plan") or []:
-        if isinstance(plan_entry, dict):
-            references.extend(_references(plan_entry.get("network")))
+    for field in ("plan", "coverage"):
+        for entry in resource.get(field) or []:
+            if isinstance(entry, dict):
+                references.extend(_references(entry.get("network")))
     return list(dict.fromkeys(references))
 
 
@@ -8065,7 +8082,7 @@ def _parse_organization_resource(
     return ProviderDirectoryOrganization, {
         **base,
         "npi": _resource_npi(resource, source_id=base["source_id"]),
-        "tax_id": _tin(resource),
+        "tax_id": _tin(resource, source_id=base["source_id"]),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
         "name": _clean_text(resource.get("name")),
@@ -8191,9 +8208,7 @@ def _parse_healthcare_service_resource(
     }
 
 
-def _parse_organization_affiliation_resource(
-    resource: dict[str, Any], base: dict[str, Any]
-) -> tuple[type, dict[str, Any]]:
+def _parse_organization_affiliation_resource(resource: dict[str, Any], base: dict[str, Any]) -> tuple[type, dict[str, Any]]:
     period_start, period_end = _period(resource)
     return ProviderDirectoryOrganizationAffiliation, {
         **base,
@@ -8202,6 +8217,7 @@ def _parse_organization_affiliation_resource(
         "organization_ref": _first_reference(resource.get("organization")),
         "participating_organization_ref": _first_reference(resource.get("participatingOrganization")),
         "network_refs": _references(resource.get("network")),
+        "insurance_plan_refs": _references(resource.get("insurancePlan")),
         "location_refs": _references(resource.get("location")),
         "healthcare_service_refs": _references(resource.get("healthcareService")),
         "endpoint_refs": _references(resource.get("endpoint")),
@@ -8842,6 +8858,7 @@ class ProviderDirectoryPreparedProfileDelta:
     capacity_geometry_json: str
     retain_on_failed_bundle: bool = True
     resume_checkpoint: tuple[str, str] | None = None
+    from_profile_as_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -8856,10 +8873,9 @@ class ProviderDirectoryArtifactPromotionIdentity:
 class ProviderDirectoryArtifactBundle:
     """Collect serving stages and promote or clean them as one unit."""
 
-    stages: list[ProviderDirectoryPreparedArtifactStage] = field(
-        default_factory=list
-    )
+    stages: list[ProviderDirectoryPreparedArtifactStage] = field(default_factory=list)
     profile_delta: ProviderDirectoryPreparedProfileDelta | None = None
+    archive_delta: Any = None
     promoted: bool = False
 
     def add(
@@ -8876,18 +8892,16 @@ class ProviderDirectoryArtifactBundle:
     ) -> None:
         """Register the single global Profile delta in this bundle."""
         if self.profile_delta is not None:
-            raise RuntimeError(
-                "provider_directory_profile_delta_duplicate"
-            )
+            raise RuntimeError("provider_directory_profile_delta_duplicate")
         self.profile_delta = profile_delta
 
     @property
     def relation_overrides(self) -> dict[str, str]:
         """Map serving relations to their prepared dependency stages."""
-        return {
-            stage.target_relation: stage.stage_table
-            for stage in self.stages
-        }
+        overrides_by_target = {stage.target_relation: stage.stage_table for stage in self.stages}
+        if self.archive_delta is not None:
+            overrides_by_target.update(self.archive_delta.relation_overrides)
+        return overrides_by_target
 
     @property
     def target_relations(self) -> set[str]:
@@ -8904,23 +8918,27 @@ class ProviderDirectoryArtifactBundle:
 
     async def promote(self) -> int:
         """Atomically promote every registered serving stage."""
+        if self.archive_delta is not None:
+            raise RuntimeError("cms_archive_common_publication_required")
         if self.stages or self.profile_delta is not None:
             if self.profile_delta is None:
-                await _retry_provider_directory_artifact_bundle_promotion(
-                    tuple(self.stages)
-                )
+                await _retry_provider_directory_artifact_bundle_promotion(tuple(self.stages))
             else:
                 await _retry_provider_directory_artifact_bundle_promotion(
                     tuple(self.stages),
                     profile_delta=self.profile_delta,
                 )
+        return await self.mark_promoted()
+
+    async def mark_promoted(self) -> int:
+        """Consume preparation only after the owning publication has committed."""
+        if db._transaction_binding() is not None:
+            raise RuntimeError("provider_directory_artifact_bundle_commit_pending")
+        if self.archive_delta is not None and not self.archive_delta.committed:
+            raise RuntimeError("cms_archive_commit_result_missing")
         self.promoted = True
         for schema, build_id in sorted(
-            {
-                stage.resume_checkpoint
-                for stage in self.stages
-                if getattr(stage, "resume_checkpoint", None) is not None
-            }
+            {stage.resume_checkpoint for stage in self.stages if getattr(stage, "resume_checkpoint", None) is not None}
         ):
             await _delete_provider_directory_profile_build_checkpoint(
                 schema,
@@ -8934,6 +8952,8 @@ class ProviderDirectoryArtifactBundle:
             if stage.retain_on_failed_bundle and not self.promoted:
                 continue
             await _remove_provider_directory_artifact_stage(stage)
+        if self.archive_delta is not None:
+            await self.archive_delta.cleanup(sys.modules[__name__])
 
 
 @contextlib.contextmanager
@@ -9036,7 +9056,10 @@ async def _provider_directory_artifact_build_guard(
     if connection is None:
         raise ProviderDirectoryArtifactCutoverConflict(target_relation)
     try:
-        target_oid = await _provider_directory_relation_oid(schema, target_relation)
+        from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
+
+        async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+            target_oid = await _provider_directory_relation_oid(schema, target_relation)
         yield ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
     finally:
         await _release_provider_directory_artifact_build_lock(connection, build_lock_key)
@@ -9291,8 +9314,12 @@ async def _lock_provider_directory_artifact_tables(
 
 
 async def _prepare_provider_directory_artifact_stage(schema: str, stage_table: str) -> None:
-    await db.status(f"ALTER TABLE {_qt(schema, stage_table)} SET LOGGED;")
-    await _assert_provider_directory_logged_relation(schema, stage_table)
+    from process.provider_directory_cms_preparation import check_stage_logging, active_nonprofile_sql_transaction
+
+    await check_stage_logging(sys.modules[__name__], schema, stage_table)
+    async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+        await db.status(f"ALTER TABLE {_qt(schema, stage_table)} SET LOGGED;")
+        await _assert_provider_directory_logged_relation(schema, stage_table)
 
 
 async def _acquire_provider_directory_artifact_cutover_lock(
@@ -10869,7 +10896,10 @@ async def _provider_directory_profile_current_wal_bytes(
         raise RuntimeError(
             "provider_directory_profile_capacity_wal_bytes_invalid"
         )
-    return wal_bytes
+    offset_bytes = getattr(admission, "initial_wal_offset_bytes", 0)
+    if type(offset_bytes) is not int or offset_bytes < 0:
+        raise RuntimeError("provider_directory_profile_capacity_wal_offset_invalid")
+    return wal_bytes + offset_bytes
 
 
 def _checked_serialized_metadata_payload_bytes(
@@ -11416,9 +11446,12 @@ async def _profile_cutover_observation(
             "provider_directory_profile_capacity_wal_state_missing"
         )
     wal_map = _pagination_checkpoint_row_mapping(wal_state)
+    offset_bytes = getattr(admission, "initial_wal_offset_bytes", 0)
+    if type(offset_bytes) is not int or offset_bytes < 0:
+        raise RuntimeError("provider_directory_profile_capacity_wal_offset_invalid")
     return _ProfileCutoverObservation(
         wal_start_lsn=str(wal_map["wal_start_lsn"]),
-        wal_bytes=int(wal_map["wal_bytes_before"]),
+        wal_bytes=int(wal_map["wal_bytes_before"]) + offset_bytes,
         evidence_target_bytes=(
             await _provider_directory_profile_capacity_relation_bytes(
                 (refs.evidence_target,)
@@ -12012,33 +12045,20 @@ def _validate_profile_delta_serving_state(
     """Require the locked serving row to match the prepared delta base."""
     if (
         serving_state is None
-        or (serving_state.status, serving_state.operation)
-        not in {("published", "publish"), ("purged", "purge")}
-        or serving_state.generation_id
-        != profile_delta.from_generation_id
-        or serving_state.source_vector_hash
-        != profile_delta.from_source_vector_hash
-        or serving_state.source_context_vector_hash
-        != profile_delta.from_source_context_vector_hash
-        or serving_state.profile_as_of != profile_delta.profile_as_of
-        or serving_state.capacity_geometry_status
-        != profile_delta.from_capacity_geometry_status
-        or serving_state.capacity_geometry_hash
-        != profile_delta.from_capacity_geometry_hash
-        or serving_state.capacity_geometry_json
-        != profile_delta.from_capacity_geometry_json
-        or serving_state.evidence_target_oid
-        != profile_delta.evidence_target_oid
-        or serving_state.profile_target_oid
-        != profile_delta.profile_target_oid
-        or serving_state.evidence_rows
-        != profile_delta.expected_evidence_rows
-        or serving_state.profile_rows
-        != profile_delta.expected_profile_rows
+        or (serving_state.status, serving_state.operation) not in {("published", "publish"), ("purged", "purge")}
+        or serving_state.generation_id != profile_delta.from_generation_id
+        or serving_state.source_vector_hash != profile_delta.from_source_vector_hash
+        or serving_state.source_context_vector_hash != profile_delta.from_source_context_vector_hash
+        or serving_state.profile_as_of != (profile_delta.from_profile_as_of or profile_delta.profile_as_of)
+        or serving_state.capacity_geometry_status != profile_delta.from_capacity_geometry_status
+        or serving_state.capacity_geometry_hash != profile_delta.from_capacity_geometry_hash
+        or serving_state.capacity_geometry_json != profile_delta.from_capacity_geometry_json
+        or serving_state.evidence_target_oid != profile_delta.evidence_target_oid
+        or serving_state.profile_target_oid != profile_delta.profile_target_oid
+        or serving_state.evidence_rows != profile_delta.expected_evidence_rows
+        or serving_state.profile_rows != profile_delta.expected_profile_rows
     ):
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_delta_serving_generation_changed"
-        )
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_delta_serving_generation_changed")
 
 
 async def _lock_profile_delta_relations(
@@ -12393,6 +12413,7 @@ UPDATE {serving_ref}
        source_context_vector_json =
            CAST(:source_context_vector_json AS jsonb),
        executable_plan_hash = :executable_plan_hash,
+       profile_as_of = :profile_as_of,
        capacity_geometry_status = :capacity_geometry_status,
        capacity_geometry_hash = :capacity_geometry_hash,
        capacity_geometry_json = CAST(:capacity_geometry_json AS jsonb),
@@ -12410,7 +12431,7 @@ UPDATE {serving_ref}
        :from_capacity_geometry_hash
    AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
        CAST(:from_capacity_geometry_json AS jsonb)
-   AND profile_as_of = :profile_as_of
+   AND profile_as_of = :from_profile_as_of
    AND evidence_target_oid = :evidence_target_oid
    AND profile_target_oid = :profile_target_oid
    AND evidence_rows = :expected_evidence_rows
@@ -12426,11 +12447,7 @@ def _profile_delta_serving_update_values(
     """Return the serving-generation compare-and-swap parameters."""
     return {
         "control_generation": profile_delta.control_generation,
-        "status": (
-            "published"
-            if profile_delta.operation == "publish"
-            else "purged"
-        ),
+        "status": ("published" if profile_delta.operation == "publish" else "purged"),
         "operation": profile_delta.operation,
         "generation_id": profile_delta.generation_id,
         "selection_proof_id": profile_delta.selection_proof_id,
@@ -12439,17 +12456,11 @@ def _profile_delta_serving_update_values(
         "profile_strategy_version": profile_delta.profile_strategy_version,
         "source_vector_hash": profile_delta.to_source_vector_hash,
         "source_vector_json": json.dumps(
-            _provider_directory_profile_source_vector_json(
-                profile_delta.to_source_vector
-            )
+            _provider_directory_profile_source_vector_json(profile_delta.to_source_vector)
         ),
-        "source_context_vector_hash": (
-            profile_delta.to_source_context_vector_hash
-        ),
+        "source_context_vector_hash": (profile_delta.to_source_context_vector_hash),
         "source_context_vector_json": json.dumps(
-            _provider_directory_profile_source_context_vector_json(
-                profile_delta.to_source_context_vector
-            )
+            _provider_directory_profile_source_context_vector_json(profile_delta.to_source_context_vector)
         ),
         "executable_plan_hash": profile_delta.executable_plan_hash,
         "capacity_geometry_status": profile_delta.capacity_geometry_status,
@@ -12460,19 +12471,12 @@ def _profile_delta_serving_update_values(
         "profile_rows": counts_by_name["profile_rows"],
         "from_generation_id": profile_delta.from_generation_id,
         "from_source_vector_hash": profile_delta.from_source_vector_hash,
-        "from_source_context_vector_hash": (
-            profile_delta.from_source_context_vector_hash
-        ),
-        "from_capacity_geometry_status": (
-            profile_delta.from_capacity_geometry_status
-        ),
-        "from_capacity_geometry_hash": (
-            profile_delta.from_capacity_geometry_hash
-        ),
-        "from_capacity_geometry_json": (
-            profile_delta.from_capacity_geometry_json
-        ),
+        "from_source_context_vector_hash": (profile_delta.from_source_context_vector_hash),
+        "from_capacity_geometry_status": (profile_delta.from_capacity_geometry_status),
+        "from_capacity_geometry_hash": (profile_delta.from_capacity_geometry_hash),
+        "from_capacity_geometry_json": (profile_delta.from_capacity_geometry_json),
         "profile_as_of": profile_delta.profile_as_of,
+        "from_profile_as_of": profile_delta.from_profile_as_of or profile_delta.profile_as_of,
         "evidence_target_oid": profile_delta.evidence_target_oid,
         "profile_target_oid": profile_delta.profile_target_oid,
         "expected_evidence_rows": profile_delta.expected_evidence_rows,
@@ -12616,6 +12620,9 @@ async def _insert_profile_delta_receipt(
 async def _validate_profile_delta_final_wal(
     capacity_admission: _ProviderDirectoryProfileCapacityAdmission,
     capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+    *,
+    metadata_wal_start_lsn: str | None = None,
+    bulk_wal_bytes: int = 0,
 ) -> None:
     """Validate transaction WAL before admitting the commit envelope."""
     cutover_wal_bytes = int(
@@ -12626,44 +12633,36 @@ async def _validate_profile_delta_final_wal(
                        CAST(CAST(:wal_start_lsn AS text) AS pg_lsn)
                    )::bigint;
             """,
-            wal_start_lsn=capacity_forecast.wal_start_lsn,
+            wal_start_lsn=metadata_wal_start_lsn or capacity_forecast.wal_start_lsn,
         )
         or 0
     )
+    cutover_wal_bytes += bulk_wal_bytes
     projected_cutover_wal_bytes = (
         capacity_forecast.target_projection.wal_bytes
         + capacity_forecast.metadata_projection.wal_bytes
     )
-    if not 0 <= cutover_wal_bytes <= projected_cutover_wal_bytes:
+    if not 0 <= bulk_wal_bytes <= cutover_wal_bytes <= projected_cutover_wal_bytes:
         raise RuntimeError(
             "provider_directory_profile_capacity_cutover_wal_exceeded:"
             f"observed={cutover_wal_bytes}:"
             f"projected={projected_cutover_wal_bytes}"
         )
-    final_wal_bytes = await _provider_directory_profile_current_wal_bytes(
-        capacity_admission
-    )
-    maximum_wal_bytes = (
-        capacity_admission.geometry.reservation_bytes_by_storage_class["wal"]
-    )
-    commit_envelope_bytes = (
-        capacity_forecast.metadata_projection.commit_envelope_bytes
-    )
-    if final_wal_bytes + commit_envelope_bytes > maximum_wal_bytes:
-        raise RuntimeError(
-            "provider_directory_profile_capacity_final_wal_exceeded:"
-            f"observed={final_wal_bytes}:"
-            f"commit_envelope={commit_envelope_bytes}:"
-            f"maximum={maximum_wal_bytes}"
-        )
+    await _validate_profile_delta_total_wal(capacity_admission, capacity_forecast)
 
 
-async def _apply_provider_directory_profile_delta(
+async def _validate_profile_delta_total_wal(capacity_admission, capacity_forecast):
+    from process.provider_directory_artifact_bundle_preparation import validate_profile_delta_total_wal
+
+    await validate_profile_delta_total_wal(sys.modules[__name__], capacity_admission, capacity_forecast)
+
+
+async def _apply_provider_directory_profile_delta_rows(
     profile_delta: ProviderDirectoryPreparedProfileDelta,
     *,
     pending_commit_items: int,
-) -> None:
-    """Apply one source delta while readers retain their old MVCC snapshot."""
+):
+    """Apply bulk rows with reader-compatible locks, retaining final metadata for cutover."""
 
     if _provider_directory_profile_capacity_admission() is None:
         raise RuntimeError(
@@ -12701,14 +12700,47 @@ async def _apply_provider_directory_profile_delta(
                 target_bytes,
             )
         )
+    bulk_wal_bytes = int(await db.scalar(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), "
+        "CAST(CAST(:start AS text) AS pg_lsn))::bigint",
+        start=capacity_forecast.wal_start_lsn,
+    ))
+    return _AppliedProfileDeltaRows(locked_state, capacity_forecast, cutover_actual_by_field, bulk_wal_bytes)
+
+
+@dataclass(frozen=True)
+class _AppliedProfileDeltaRows:
+    locked_state: _ProfileDeltaLockedState
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast
+    cutover_actual_by_field: dict[str, Any]
+    bulk_wal_bytes: int
+
+
+async def _finish_provider_directory_profile_delta(profile_delta, applied_rows):
+    """Finalize after source promotion; count only the two Profile spans in its projection."""
+    if applied_rows is None:
+        return None
+    locked_state = applied_rows.locked_state
+    counts_by_name = locked_state.counts_by_name
+    capacity_forecast = applied_rows.capacity_forecast
+    metadata_wal_start_lsn = await _profile_delta_target_wal_start_lsn()
     await _update_profile_delta_serving_generation(profile_delta, counts_by_name, capacity_forecast)
     await _insert_profile_delta_receipt(
-        profile_delta,
-        locked_state.receipt_ref,
-        counts_by_name,
-        cutover_actual_by_field,
+        profile_delta, locked_state.receipt_ref, counts_by_name, applied_rows.cutover_actual_by_field
     )
-    await _validate_profile_delta_final_wal(capacity_admission, capacity_forecast)
+    await _validate_profile_delta_final_wal(
+        _provider_directory_profile_capacity_admission(), capacity_forecast,
+        metadata_wal_start_lsn=metadata_wal_start_lsn, bulk_wal_bytes=applied_rows.bulk_wal_bytes,
+    )
+    return capacity_forecast
+
+
+async def _apply_provider_directory_profile_delta(profile_delta, *, pending_commit_items):
+    """Retain the direct atomic delta operation for owners without intervening swaps."""
+    applied_rows = await _apply_provider_directory_profile_delta_rows(
+        profile_delta, pending_commit_items=pending_commit_items
+    )
+    return await _finish_provider_directory_profile_delta(profile_delta, applied_rows)
 
 
 async def _remove_provider_directory_profile_delta_stages(
@@ -12960,7 +12992,8 @@ async def _apply_locked_provider_directory_artifact_bundle(
     profile_delta: ProviderDirectoryPreparedProfileDelta | None,
     active_fence: ProviderDirectoryArtifactDatasetFence | None,
     cutover_timeout: asyncio.Timeout | None = None,
-) -> None:
+    before_swaps=None,
+):
     await _verify_active_profile_selection_at_cutover()
     if (
         profile_delta is not None
@@ -12985,7 +13018,18 @@ async def _apply_locked_provider_directory_artifact_bundle(
         await _assert_provider_directory_artifact_build_fence(stage)
     if profile_delta is not None:
         await _assert_provider_directory_profile_delta_identity(profile_delta)
-    await _lock_provider_directory_artifact_tables(schema, relation_names)
+    live_names = {stage.target_relation for stage in ordered_stages}
+    await _lock_provider_directory_artifact_tables(schema, tuple(name for name in relation_names if name not in live_names))
+    applied_rows = None
+    if profile_delta is not None:
+        applied_rows = await _apply_provider_directory_profile_delta_rows(
+            profile_delta,
+            pending_commit_items=len(relation_names) + (len(active_fence.datasets) if active_fence else 0),
+        )
+    if before_swaps is not None:
+        await before_swaps()
+    else:
+        await _lock_provider_directory_artifact_live_tables(schema, live_names)
     for stage in ordered_stages:
         await _install_provider_directory_prepared_stage(stage)
     for stage in ordered_stages:
@@ -12995,18 +13039,36 @@ async def _apply_locked_provider_directory_artifact_bundle(
         await _promote_provider_directory_artifact_datasets(active_fence)
     if profile_delta is None:
         return
-    await _apply_provider_directory_profile_delta(
-        profile_delta,
-        pending_commit_items=(
-            len(relation_names)
-            + (
-                len(active_fence.datasets)
-                if active_fence is not None
-                else 0
-            )
-        ),
-    )
+    capacity_forecast = await _finish_provider_directory_profile_delta(profile_delta, applied_rows)
     await _finalize_provider_directory_profile_delta_scratch(profile_delta)
+    if capacity_forecast is not None:
+        await _validate_profile_delta_total_wal(_provider_directory_profile_capacity_admission(), capacity_forecast)
+    return capacity_forecast
+
+
+async def _lock_provider_directory_artifact_live_tables(schema, relation_names):
+    from process.entity_address_cutover_contract import lock_live_serving_relations
+
+    installed_names = [name for name in sorted(relation_names)
+                       if await _provider_directory_relation_attribute(schema, name, "relkind") in {"r", "p"}]
+    await lock_live_serving_relations(db.status, schema, installed_names)
+
+
+async def _apply_prepared_artifact_bundle_in_transaction(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
+    cutover_timeout: asyncio.Timeout | None = None,
+) -> _ProviderDirectoryProfileCutoverCapacityForecast | None:
+    """Apply prepared relations without committing the owner's publication."""
+    from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
+
+    return await apply_prepared_artifact_bundle(
+        sys.modules[__name__],
+        stages,
+        profile_delta=profile_delta,
+        cutover_timeout=cutover_timeout,
+    )
 
 
 async def _promote_provider_directory_artifact_bundle_transaction(
@@ -13016,47 +13078,24 @@ async def _promote_provider_directory_artifact_bundle_transaction(
     cutover_timeout: asyncio.Timeout | None = None,
 ) -> None:
     """Publish relation swaps and an optional source delta atomically."""
-    ordered_stages = _ordered_provider_directory_artifact_bundle(stages)
-    if not ordered_stages and profile_delta is None:
+    from process.provider_directory_profile_serving_receipt import ordinary_profile_receipt_continuity
+
+    if not stages and profile_delta is None:
         return
-    schema, relation_names, lock_timeout, statement_timeout = (
-        _provider_directory_artifact_bundle_context(
-            ordered_stages,
-            profile_delta,
-        )
+    schema, _relations, lock_timeout, statement_timeout = _provider_directory_artifact_bundle_context(
+        _ordered_provider_directory_artifact_bundle(stages), profile_delta
     )
     async with db.transaction():
-        capacity_admission = await (
-            _configure_provider_directory_artifact_promotion(
-                lock_timeout,
-                statement_timeout,
-            )
-        )
-        if any(
-            stage.build_fence is not None
-            and stage.build_fence.alias_generation is not None
-            for stage in ordered_stages
+        async with ordinary_profile_receipt_continuity(
+            sys.modules[__name__], schema, profile_delta, lock_timeout, statement_timeout
         ):
-            await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
-        await _lock_provider_directory_artifact_bundle_targets(
-            ordered_stages,
-            schema,
-            profile_delta,
-        )
-        active_fence = (
-            await _reserve_provider_directory_artifact_cutover_budget(
-                profile_delta,
-                capacity_admission,
+            capacity_forecast = await _apply_prepared_artifact_bundle_in_transaction(
+                stages,
+                profile_delta=profile_delta,
+                cutover_timeout=cutover_timeout,
             )
-        )
-        await _apply_locked_provider_directory_artifact_bundle(
-            ordered_stages,
-            schema,
-            relation_names,
-            profile_delta,
-            active_fence,
-            cutover_timeout,
-        )
+        if capacity_forecast is not None:
+            await _validate_profile_delta_total_wal(_provider_directory_profile_capacity_admission(), capacity_forecast)
 
 
 async def _is_artifact_bundle_promotion_committed(
@@ -13173,6 +13212,10 @@ async def _remove_provider_directory_artifact_stage(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
     """Drop an unpromoted stage without masking the publication result."""
+    from process.provider_directory_cms_preparation import is_stage_cleanup_handled
+
+    if await is_stage_cleanup_handled(sys.modules[__name__], stage):
+        return
     stage_ref = _qt(stage.schema, stage.stage_table)
     try:
         await _provider_directory_profile_capacity_status(
@@ -13745,14 +13788,17 @@ async def backfill_provider_directory_location_coordinates(
         source_ids=source_ids,
         seen_table=seen_table,
     )
+    from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
+
     while True:
-        coordinate_batch_result = await db.first(
-            coordinate_batch_sql,
-            **query_param_dict,
-            after_source_id=after_source_id,
-            after_resource_id=after_resource_id,
-            batch_size=bounded_batch_size,
-        )
+        async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+            coordinate_batch_result = await db.first(
+                coordinate_batch_sql,
+                **query_param_dict,
+                after_source_id=after_source_id,
+                after_resource_id=after_resource_id,
+                batch_size=bounded_batch_size,
+            )
         batch_result_mapping = (
             coordinate_batch_result._mapping
             if hasattr(coordinate_batch_result, "_mapping")
@@ -14691,6 +14737,7 @@ def _artifact_candidate_universe_ctes(
                               AS full_metadata_jsonb
               ) AS candidate_publication
              WHERE {metadata} IS NOT NULL
+               AND {candidate_available_sql('dataset', _schema())}
                AND jsonb_typeof({source_ids}) = 'array'
                AND jsonb_array_length({safe_source_ids}) > 0
                AND ({safe_source_ids}) ?| CAST(:source_ids AS text[])
@@ -17403,13 +17450,8 @@ def _artifact_dataset_options_cte(
     use_eligible_candidate_ids: bool = False,
 ) -> str:
     """Select current rows and, when requested, admitted candidates."""
-    candidate_lateral, validated_candidate_clause = (
-        _artifact_candidate_option_sql(
-            dataset_ref,
-            source_ref,
-            include_validated_candidates,
-            use_eligible_candidate_ids,
-        )
+    candidate_lateral, validated_candidate_clause = _artifact_candidate_option_sql(
+        dataset_ref, source_ref, include_validated_candidates, use_eligible_candidate_ids,
     )
     endpoint_scope = _artifact_dataset_endpoint_scope_sql(
         scope_endpoint_ids=scope_endpoint_ids,
@@ -17442,7 +17484,7 @@ def _artifact_dataset_options_cte(
          FROM {dataset_ref} AS dataset
           {publication_lateral}
           {candidate_lateral}
-         WHERE {endpoint_scope}(
+         WHERE {endpoint_scope}{candidate_available_sql('dataset', _schema())} AND (
             (
                     dataset.is_current = true
                 AND dataset.status = :published_status
@@ -20679,6 +20721,7 @@ async def _artifact_scope_owner_rows(
           LEFT JOIN {import_run_ref} AS control
             ON control.run_id = consumption.run_id
          WHERE consumption.run_id = ANY(CAST(:owner_run_ids AS varchar[]))
+           AND consumption.admission_purpose = 'profile'
          ORDER BY consumption.run_id;
         """,
         owner_run_ids=list(owner_run_ids),
@@ -21518,9 +21561,14 @@ async def _execute_artifact_source_batch(
             return await _insert_artifact_source_batch(
                 batch, projection, projection_sql, insert_sql
             )
-    return await _insert_artifact_source_batch(
-        batch, projection, projection_sql, insert_sql
+    from process.provider_directory_cms_preparation import (
+        active_nonprofile_sql_transaction,
     )
+
+    async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+        return await _insert_artifact_source_batch(
+            batch, projection, projection_sql, insert_sql
+        )
 
 
 async def _analyze_artifact_scope_table(
@@ -21700,13 +21748,18 @@ async def _execute_artifact_resource_batch(
                 expected_batch,
             )
     if expected_batch is not None:
-        return await _insert_projected_artifact_resource_batch(
-            model,
-            schema,
-            insert_sql,
-            insert_params_by_name,
-            expected_batch,
+        from process.provider_directory_cms_preparation import (
+            active_nonprofile_sql_transaction,
         )
+
+        async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+            return await _insert_projected_artifact_resource_batch(
+                model,
+                schema,
+                insert_sql,
+                insert_params_by_name,
+                expected_batch,
+            )
     return _coerce_rowcount(
         await _provider_directory_profile_capacity_status(
             insert_sql,
@@ -23857,6 +23910,10 @@ async def _owned_unlogged_location_artifact_scope(
     schema: str,
 ) -> tuple[str, int] | None:
     """Return the exact current-run private Location scope, if any."""
+    from process.provider_directory_cms_preparation import _ACTIVE as nonprofile_admission
+
+    if nonprofile_admission.get() is not None:
+        return None
 
     relation_name = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
         ProviderDirectoryLocation.__tablename__
@@ -24903,13 +24960,16 @@ async def _location_key_sql_batch(
 ) -> dict[str, Any]:
     """Execute one established SQL Location-key batch."""
 
-    batch_row = await db.first(
-        sql,
-        **params_by_name,
-        after_source_id=cursor[0],
-        after_resource_id=cursor[1],
-        batch_size=batch_size,
-    )
+    from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
+
+    async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+        batch_row = await db.first(
+            sql,
+            **params_by_name,
+            after_source_id=cursor[0],
+            after_resource_id=cursor[1],
+            batch_size=batch_size,
+        )
     return (
         dict(batch_row._mapping)
         if hasattr(batch_row, "_mapping")
@@ -25043,13 +25103,15 @@ async def backfill_provider_directory_resource_id_npis(
         query_params_by_name["run_id"] = run_id
     scope_sql = "".join(f"\n               AND {clause}" for clause in scope_clauses)
     updated_counts_by_resource: dict[str, int] = {}
+    from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
     for resource_type, table_name in (
         ("Practitioner", "provider_directory_practitioner"),
         ("Organization", "provider_directory_organization"),
     ):
-        updated_counts_by_resource[resource_type] = _coerce_rowcount(
-            await db.status(
-                f"""
+        async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+            updated_counts_by_resource[resource_type] = _coerce_rowcount(
+                await db.status(
+                    f"""
                 UPDATE {_qt(schema, table_name)} AS resource
                    SET npi = resource.resource_id::bigint,
                        updated_at = now()
@@ -25058,10 +25120,10 @@ async def backfill_provider_directory_resource_id_npis(
                    AND resource.resource_id ~ '^[0-9]{{10}}$'
                    {scope_sql};
                 """,
-                **query_params_by_name,
-                resource_type=resource_type,
+                    **query_params_by_name,
+                    resource_type=resource_type,
+                )
             )
-        )
     return updated_counts_by_resource
 
 
@@ -26610,52 +26672,33 @@ async def _publish_attested_provider_directory_profile(
     execution: ProviderDirectoryProfileExecution,
 ) -> dict[str, Any]:
     """Stage and atomically publish or purge one proof-bound global Profile."""
-    catalog = _provider_directory_profile_selection_catalog()
-    await assert_registered_profile_selection_current(
-        execution.attestation,
-        catalog,
+    from process.provider_directory_cms_replay import replay_committed_cms_profile
+
+    historical = await replay_committed_cms_profile(
+        sys.modules[__name__], run_id=run_id, control_run_id=control_run_id,
+        execution=execution, metrics=metrics,
     )
-    source_ids = [pair["source_id"] for pair in execution.attestation.pairs]
-    execution_token = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(execution)
-    try:
-        fence = await _attested_profile_publication_fence(
-            run_id=run_id,
-            metrics=metrics,
-            execution=execution,
-            source_ids=source_ids,
-        )
-        _assert_profile_selection_matches_artifact_fence(execution, fence)
-        replayed_profile = (
-            await _provider_directory_profile_committed_run_replay(
-                run_id=run_id,
-                control_run_id=control_run_id,
-                execution=execution,
-                fence=fence,
-            )
-        )
-        if replayed_profile is not None:
-            published_metrics_by_name = (
-                await _provider_directory_profile_replay_publish_metrics(
-                    metrics,
-                    fence,
-                    replayed_profile,
-                )
-            )
-        else:
-            published_metrics_by_name = (
-                await _publish_attested_provider_directory_profile_build(
-                    run_id=run_id,
-                    control_run_id=control_run_id,
-                    metrics=metrics,
-                    execution=execution,
-                    fence=fence,
-                    source_ids=source_ids,
-                )
-            )
-    finally:
-        _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
-    _attach_profile_selection_result(execution, published_metrics_by_name)
-    return published_metrics_by_name
+    if historical is not None:
+        return historical
+    return await _publish_current_attested_provider_directory_profile(
+        run_id=run_id, control_run_id=control_run_id, metrics=metrics, execution=execution,
+    )
+
+
+async def _publish_current_attested_provider_directory_profile(
+    *,
+    run_id: str | None,
+    control_run_id: str | None,
+    metrics: dict[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+) -> dict[str, Any]:
+    """Validate the current selection before replaying or preparing its publication."""
+    from process.provider_directory_cms_serving import publish_current_attested_profile
+
+    return await publish_current_attested_profile(
+        sys.modules[__name__], run_id=run_id, control_run_id=control_run_id,
+        metrics=metrics, execution=execution,
+    )
 
 
 async def _bind_validated_publication_candidate(
@@ -26686,6 +26729,12 @@ async def _prepare_artifact_publication_fence(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
+    _assert_cms_npd_dedicated_candidate_promotion(fence)
+    if (
+        any(dataset.source_id == "cms-npd" for dataset in fence.datasets)
+        and is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
+    ):
+        raise RuntimeError("cms_archive_admitted_publication_required")
     fence = await _bind_validated_publication_candidate(
         fence,
         validated_publication_candidate,
@@ -26705,12 +26754,22 @@ async def _prepare_artifact_publication_fence(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
+    _assert_cms_npd_dedicated_candidate_promotion(refreshed_fence)
     refreshed_fence = await _bind_validated_publication_candidate(
         refreshed_fence,
         validated_publication_candidate,
     )
     _assert_artifact_fence_selection_unchanged(fence, refreshed_fence)
     return refreshed_fence
+
+
+def _assert_cms_npd_dedicated_candidate_promotion(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Reserve CMS candidate cutover for the retained-release verifier."""
+
+    if any(dataset.source_id == "cms-npd" for dataset in fence.promotion_datasets):
+        raise RuntimeError("cms_npd_verified_publication_required")
 
 
 _CANDIDATE_ARTIFACT_METRIC_BY_TARGET = {
@@ -26765,36 +26824,28 @@ def _candidate_artifact_deferred_relations(
 def _assert_candidate_artifact_metrics_complete(
     enabled_targets: set[str],
     publish_metrics_by_name: dict[str, Any],
+    *,
+    allow_no_profile_sources: bool = True,
 ) -> None:
     for artifact_target_name in sorted(enabled_targets - {"corroboration"}):
-        metric_name = _CANDIDATE_ARTIFACT_METRIC_BY_TARGET.get(
-            artifact_target_name
-        )
+        metric_name = _CANDIDATE_ARTIFACT_METRIC_BY_TARGET.get(artifact_target_name)
         if metric_name is None or metric_name not in publish_metrics_by_name:
-            raise RuntimeError(
-                "provider_directory_candidate_artifact_metric_missing:"
-                + artifact_target_name
-            )
-        skip_reason = _candidate_artifact_skip_reason(
-            publish_metrics_by_name[metric_name]
-        )
+            raise RuntimeError("provider_directory_candidate_artifact_metric_missing:" + artifact_target_name)
+        skip_reason = _candidate_artifact_skip_reason(publish_metrics_by_name[metric_name])
         if skip_reason is None:
             continue
         if (
             artifact_target_name == "profile"
             and skip_reason == "no_profile_enabled_sources_in_scope"
+            and allow_no_profile_sources
         ):
             continue
-        raise RuntimeError(
-            "provider_directory_candidate_artifact_skipped:"
-            f"{artifact_target_name}:{skip_reason}"
-        )
-    if "corroboration" in enabled_targets and publish_metrics_by_name.get(
-        "ptg_corroboration_view_published"
-    ) is not True:
-        raise RuntimeError(
-            "provider_directory_candidate_artifact_skipped:corroboration"
-        )
+        raise RuntimeError(f"provider_directory_candidate_artifact_skipped:{artifact_target_name}:{skip_reason}")
+    if (
+        "corroboration" in enabled_targets
+        and publish_metrics_by_name.get("ptg_corroboration_view_published") is not True
+    ):
+        raise RuntimeError("provider_directory_candidate_artifact_skipped:corroboration")
 
 
 def _assert_candidate_artifact_stage_relations_complete(
@@ -26826,7 +26877,8 @@ def _assert_candidate_artifact_bundle_complete(
     publish_artifacts_targets: set[str] | None,
 ) -> None:
     """Fail closed before a validated dataset can outpace its serving bundle."""
-    if not fence.promotion_datasets:
+    has_cms = any(dataset.source_id == "cms-npd" for dataset in fence.datasets)
+    if not fence.promotion_datasets and not has_cms:
         return
     enabled_targets = set(
         _provider_directory_dataset_artifact_targets(
@@ -26837,7 +26889,13 @@ def _assert_candidate_artifact_bundle_complete(
     _assert_candidate_artifact_metrics_complete(
         enabled_targets,
         publish_metrics_by_name,
+        allow_no_profile_sources=not has_cms,
     )
+    if has_cms and "location_archive" in enabled_targets:
+        from process.provider_directory_cms_archive import PreparedArchiveDelta
+
+        if not isinstance(artifact_bundle.archive_delta, PreparedArchiveDelta):
+            raise RuntimeError("provider_directory_candidate_archive_preparation_missing")
     _assert_candidate_artifact_stage_relations_complete(
         enabled_targets,
         publish_metrics_by_name,
@@ -26998,6 +27056,25 @@ class ProviderDirectoryArtifactPublishRequest:
         return self.source_ids
 
 
+def _prepare_artifact_bundle_from_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    request: ProviderDirectoryArtifactPublishRequest,
+    *,
+    artifact_resource_types: frozenset[str],
+    resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
+) -> Any:
+    """Keep an immutable serving bundle staged until its owner publishes it."""
+    from process.provider_directory_artifact_bundle_preparation import prepare_artifact_bundle
+
+    return prepare_artifact_bundle(
+        sys.modules[__name__],
+        fence,
+        request,
+        artifact_resource_types=artifact_resource_types,
+        resource_fence=resource_fence,
+    )
+
+
 async def _publish_artifact_bundle_from_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
     request: ProviderDirectoryArtifactPublishRequest,
@@ -27006,48 +27083,15 @@ async def _publish_artifact_bundle_from_fence(
     resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> dict[str, Any]:
     """Build one immutable serving bundle and publish it behind its fence."""
-    resource_fence = (
-        resource_fence
-        or await _provider_directory_profile_resource_scope_fence(
-            fence,
-            request.publish_artifacts_targets,
-        )
-    )
-    async with _provider_directory_artifact_dataset_scope(
-        run_id=request.run_id,
-        source_ids=request.source_ids,
-        fence=fence,
+    async with _prepare_artifact_bundle_from_fence(
+        fence,
+        request,
+        artifact_resource_types=artifact_resource_types,
         resource_fence=resource_fence,
-        metrics=request.metrics,
-        resource_types=artifact_resource_types,
-    ):
-        async with _provider_directory_artifact_bundle_scope() as artifact_bundle:
-            _attach_artifact_fence_metrics(request.metrics, fence)
-            publish_metrics = await _publish_provider_directory_artifacts(
-                replace(
-                    request,
-                    address_key_run_id=None,
-                    publish_scope_run_id=None,
-                    source_ids=[dataset.source_id for dataset in fence.datasets],
-                )
-            )
-            _assert_candidate_artifact_bundle_complete(
-                fence,
-                publish_metrics,
-                artifact_bundle,
-                publish_corroboration=request.publish_corroboration,
-                publish_artifacts_targets=request.publish_artifacts_targets,
-            )
-            promoted_stage_count = await artifact_bundle.promote()
-            await _refresh_bundle_profile_delta_metrics(
-                artifact_bundle,
-                publish_metrics,
-            )
-            return await _record_artifact_promotion_metrics(
-                fence,
-                publish_metrics,
-                promoted_stage_count,
-            )
+    ) as (artifact_bundle, publish_metrics):
+        promoted_stage_count = await artifact_bundle.promote()
+        await _refresh_bundle_profile_delta_metrics(artifact_bundle, publish_metrics)
+        return await _record_artifact_promotion_metrics(fence, publish_metrics, promoted_stage_count)
 
 
 async def _publish_selected_provider_directory_artifacts(
@@ -27780,6 +27824,7 @@ class _ProviderDirectoryProfileCapacityAdmission:
     initial_wal_lsn: str
     wal_tracker: _ProviderDirectoryProfileWalTracker
     admitted_identity: _ProviderDirectoryProfileIdentityInputs | None = None
+    initial_wal_offset_bytes: int = 0
 
 
 @dataclass
@@ -28128,6 +28173,13 @@ async def _profile_capacity_relation_row(
             "provider_directory_profile_capacity_storage_shape_missing"
         )
     relation_map = dict(_pagination_checkpoint_row_mapping(relation_row))
+    if (
+        expected_user_trigger_count == 0
+        and relation_map.get("relation_name") == "provider_directory_profile_serving_generation"
+    ):
+        from process.provider_directory_cms_receipt_guard import profile_receipt_guard_count
+
+        expected_user_trigger_count = await profile_receipt_guard_count(db, relation_map)
     has_unsafe_identity = (
         relation_map.get("relkind") != "r"
         or relation_map.get("relpersistence") != expected_persistence
@@ -28527,12 +28579,21 @@ async def _provider_directory_profile_relation_storage_fingerprint(
     attributes, indexes, constraints, triggers = (
         await _profile_capacity_relation_catalog(relation_oids)
     )
-    _assert_profile_capacity_trigger_shape(
-        triggers,
-        expected_user_trigger_count,
-        expected_immutable_trigger_error,
-        expected_single_use_receipt,
-    )
+    if (
+        expected_user_trigger_count == 0
+        and relation_map.get("relation_name") == "provider_directory_profile_serving_generation"
+        and int(relation_map.get("user_trigger_count") or 0) == 2
+    ):
+        from process.provider_directory_cms_receipt_guard import assert_profile_receipt_guards
+
+        await assert_profile_receipt_guards(db, relation_map, triggers)
+    else:
+        _assert_profile_capacity_trigger_shape(
+            triggers,
+            expected_user_trigger_count,
+            expected_immutable_trigger_error,
+            expected_single_use_receipt,
+        )
     exact_payload, structural_payload = (
         _profile_capacity_fingerprint_payloads(
             relation_map,
@@ -29031,6 +29092,8 @@ def _provider_directory_profile_capacity_consumption_identity(
     values_by_name: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
+        "admission_purpose": values_by_name.get("admission_purpose", "profile"),
+        **{
         field_name: values_by_name[field_name]
         for field_name in (
             "attestation_id",
@@ -29064,6 +29127,7 @@ def _provider_directory_profile_capacity_consumption_identity(
             "max_build_deadline",
             "recorded_at",
         )
+        },
     }
 
 
@@ -29121,6 +29185,9 @@ async def _consume_provider_directory_profile_capacity_lease(
     values_by_name: Mapping[str, Any],
 ) -> None:
     """Insert once or accept only an exact immutable replay."""
+    values_by_name = {"admission_purpose": "profile", **values_by_name}
+    if values_by_name["admission_purpose"] not in {"profile", "cms_nonprofile"}:
+        raise RuntimeError("provider_directory_capacity_admission_purpose_invalid")
     field_names = tuple(values_by_name)
     field_sql = ", ".join(_q(field_name) for field_name in field_names)
     value_sql = ", ".join(":" + field_name for field_name in field_names)
@@ -29141,7 +29208,7 @@ async def _consume_provider_directory_profile_capacity_lease(
         return
     existing_rows = await db.all(
         f"""
-        SELECT attestation_id, reservation_id, lease_digest,
+        SELECT admission_purpose, attestation_id, reservation_id, lease_digest,
                capacity_geometry_hash, executable_plan_hash,
                selection_proof_id, source_vector_hash,
                source_context_vector_hash, run_id, build_id,
@@ -29160,6 +29227,11 @@ async def _consume_provider_directory_profile_capacity_lease(
         attestation_id=values_by_name["attestation_id"],
         reservation_id=values_by_name["reservation_id"],
     )
+    _assert_profile_capacity_consumption_replay(existing_rows, values_by_name)
+
+
+def _assert_profile_capacity_consumption_replay(existing_rows, values_by_name) -> None:
+    """Reject any conflict which is not this exact immutable consumption."""
     observed_identities = [
         _provider_directory_profile_capacity_consumption_identity(
             _pagination_checkpoint_row_mapping(existing_row)
@@ -29642,6 +29714,7 @@ async def _assert_profile_capacity_run_unconsumed(
                 SELECT 1
                   FROM {consumption_ref}
                  WHERE run_id = :run_id
+                   AND admission_purpose = 'profile'
             );
             """,
             run_id=run_id,
@@ -29719,30 +29792,16 @@ def _geometry_selection_values(
     return {
         "selection_proof_id": execution.attestation.proof_id,
         "profile_input_digest": execution.attestation.profile_input_digest,
-        "profile_schema_version": (
-            execution.attestation.profile_schema_version
-        ),
-        "profile_strategy_version": (
-            execution.attestation.profile_strategy_version
-        ),
+        "profile_schema_version": (execution.attestation.profile_schema_version),
+        "profile_strategy_version": (execution.attestation.profile_strategy_version),
         "executable_plan_hash": batch_plan.fingerprint,
-        "profile_as_of": identity.serving_state.profile_as_of,
+        "profile_as_of": profile_snapshot.profile_as_of(execution, identity.serving_state),
         "current_source_vector_hash": identity.current_source_vector_hash,
         "desired_source_vector_hash": identity.desired_source_vector_hash,
-        "current_context_vector_hash": (
-            identity.current_source_context_vector_hash
-        ),
-        "desired_context_vector_hash": (
-            identity.desired_source_context_vector_hash
-        ),
-        "sql_contract_digest": (
-            _provider_directory_profile_sql_contract_digest()
-        ),
-        "control_wal_plan_input_hash": (
-            profile_capacity.profile_control_wal_plan_input_hash(
-                control_wal_plan_input
-            )
-        ),
+        "current_context_vector_hash": (identity.current_source_context_vector_hash),
+        "desired_context_vector_hash": (identity.desired_source_context_vector_hash),
+        "sql_contract_digest": (_provider_directory_profile_sql_contract_digest()),
+        "control_wal_plan_input_hash": (profile_capacity.profile_control_wal_plan_input_hash(control_wal_plan_input)),
     }
 
 
@@ -29983,10 +30042,8 @@ def _profile_admission_binding(
         executable_plan_hash=identity.batch_plan.fingerprint,
         selection_proof_id=execution.attestation.proof_id,
         source_vector_hash=identity.desired_source_vector_hash,
-        source_context_vector_hash=(
-            identity.desired_source_context_vector_hash
-        ),
-        profile_as_of=identity.serving_state.profile_as_of,
+        source_context_vector_hash=(identity.desired_source_context_vector_hash),
+        profile_as_of=profile_snapshot.profile_as_of(execution, identity.serving_state),
     )
 
 
@@ -30103,32 +30160,14 @@ def _profile_capacity_preflight_stored_receipt(
     receipt_row: Mapping[str, Any],
     lease: VerifiedDatabaseCapacityLease,
 ) -> dict[str, Any]:
-    raw_receipt = receipt_row.get("receipt_json")
-    if isinstance(raw_receipt, str):
-        raw_receipt = json.loads(raw_receipt)
-    if (
-        not isinstance(raw_receipt, Mapping)
-        or set(raw_receipt) != _PROFILE_CAPACITY_PREFLIGHT_RECEIPT_FIELDS
-    ):
+    from process.provider_directory_cms_capacity_contract import read_capacity_preflight_receipt
+
+    try:
+        return read_capacity_preflight_receipt(receipt_row, lease)
+    except (ProviderDirectoryProfileCapacityPreflightError, ValueError) as exc:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_profile_capacity_preflight_receipt_invalid"
-        )
-    receipt_by_field = dict(raw_receipt)
-    supplied_digest = receipt_by_field.pop("receipt_sha256", None)
-    expected_digest = preflight_domain_sha256(
-        CAPACITY_PREFLIGHT_CONTRACT_ID,
-        receipt_by_field,
-    )
-    receipt_by_field["receipt_sha256"] = supplied_digest
-    if (
-        supplied_digest != expected_digest
-        or supplied_digest != lease.nonce
-        or receipt_row.get("receipt_sha256") != supplied_digest
-    ):
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_capacity_preflight_receipt_invalid"
-        )
-    return receipt_by_field
+        ) from exc
 
 
 def _profile_capacity_expected_execution_identity(
@@ -30941,32 +30980,9 @@ def _profile_capacity_preflight_receipt_values(
     *,
     issued_at: datetime.datetime,
 ) -> dict[str, Any]:
-    identity = receipt["profile_execution_identity"]
-    return {
-        "receipt_sha256": receipt["receipt_sha256"],
-        "request_nonce": request.request_nonce,
-        "request_sha256": request.request_sha256,
-        CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: (
-            request.control_plane_receipt_sha256
-        ),
-        "contract_id": CAPACITY_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID,
-        "limits_contract_id": request.limits_payload["contract_id"],
-        "selection_proof_id": identity["selection_proof_id"],
-        "profile_input_digest": identity["profile_input_digest"],
-        "control_generation": identity["generation"],
-        "profile_schema_version": identity["profile_schema_version"],
-        "profile_strategy_version": identity["profile_strategy_version"],
-        "materialization_mode": identity["materialization_mode"],
-        "limits_sha256": receipt["capacity_limits_sha256"],
-        "capacity_geometry_hash": receipt["capacity_geometry_hash"],
-        "serving_preflight_sha256": (receipt["serving_generation_preflight_sha256"]),
-        "quiescence_sha256": receipt["quiescence_sha256"],
-        "receipt_json": canonical_preflight_json(receipt),
-        "issued_at": issued_at,
-        "expires_at": request.expires_at,
-        "created_at": issued_at,
-    }
+    from process.provider_directory_cms_capacity_contract import capacity_preflight_receipt_row_values
+
+    return capacity_preflight_receipt_row_values(request, receipt, issued_at=issued_at)
 
 
 async def _persist_or_replay_capacity_receipt(
@@ -31038,10 +31054,15 @@ async def _profile_capacity_preflight_fences(
 ]:
     """Resolve exact selected and changed-source fences without mutation."""
 
-    fence = await _resolve_provider_directory_artifact_datasets(
-        source_ids,
-        should_select_validated_candidates=False,
-    )
+    if getattr(execution.attestation, "desired_cms_dataset", None) is not None:
+        from process.provider_directory_cms_desired_fence import resolve_desired_fence
+
+        fence = await resolve_desired_fence(sys.modules[__name__], execution)
+    else:
+        fence = await _resolve_provider_directory_artifact_datasets(
+            source_ids,
+            should_select_validated_candidates=False,
+        )
     _assert_profile_selection_matches_artifact_fence(execution, fence)
     if execution.attestation.operation == "publish":
         await _assert_no_provider_directory_resource_id_npi_backfill_candidates(
@@ -31147,6 +31168,10 @@ async def provider_directory_profile_capacity_authority_projection(
             "provider_directory_profile_capacity_preflight_"
             "authority_projection_request_invalid"
         )
+    if request.cms_nonprofile_admission is not None:
+        from process.provider_directory_cms_preflight import capacity_authority_projection
+
+        return await capacity_authority_projection(sys.modules[__name__], request)
     execution = request.execution
     catalog = _provider_directory_profile_selection_catalog()
     source_ids = [pair["source_id"] for pair in execution.attestation.pairs]
@@ -31291,6 +31316,10 @@ async def provider_directory_profile_capacity_preflight(
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_request_invalid"
         )
+    if request.cms_nonprofile_admission is not None:
+        from process.provider_directory_cms_preflight import capacity_preflight
+
+        return await capacity_preflight(sys.modules[__name__], request)
     execution = request.execution
     catalog = _provider_directory_profile_selection_catalog()
     source_ids = [
@@ -31779,7 +31808,9 @@ async def _provider_directory_profile_capacity_status(
     """Execute one mutating statement under the admitted finite limits."""
 
     if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
-        return await db.status(statement, **params)
+        from process.provider_directory_cms_preparation import execute_nonprofile_status
+
+        return await execute_nonprofile_status(sys.modules[__name__], statement, **params)
     async with _provider_directory_profile_capacity_transaction():
         return await db.status(statement, **params)
 
@@ -32282,6 +32313,7 @@ async def _assert_terminal_profile_capacity_owners(
           LEFT JOIN {import_run_ref} AS control
             ON control.run_id = consumption.run_id
          WHERE consumption.build_id = :build_id
+           AND consumption.admission_purpose = 'profile'
            AND consumption.run_id <> :run_id
          ORDER BY consumption.run_id;
         """,
@@ -32325,6 +32357,7 @@ async def _assert_provider_directory_profile_capacity_consumption(
                run_id, build_id, profile_as_of
           FROM {consumption_ref}
          WHERE run_id = :run_id
+           AND admission_purpose = 'profile'
          ORDER BY attestation_id;
         """,
         run_id=admission.run_id,
@@ -32871,7 +32904,7 @@ async def _replay_current_consumption(
     """Resolve the requesting run's sole retained lease consumption."""
     consumption_rows = await db.all(
         f"SELECT * FROM {consumption_ref} "
-        "WHERE run_id = :run_id ORDER BY attestation_id LIMIT 2;",
+        "WHERE admission_purpose = 'profile' AND run_id = :run_id ORDER BY attestation_id LIMIT 2;",
         run_id=run_id,
     )
     if len(consumption_rows) > 1:
@@ -32924,6 +32957,7 @@ async def _replay_bound_consumption(
         SELECT *
           FROM {consumption_ref}
          WHERE run_id = :receipt_run_id
+           AND admission_purpose = 'profile'
            AND build_id = :build_id
          ORDER BY attestation_id
          LIMIT 2;
@@ -34471,40 +34505,31 @@ def _provider_directory_profile_delta_sources(
     """Return changed desired sources and sources removed from the vector."""
 
     if (
-        serving_state.profile_schema_version
-        != profile_artifact.PROFILE_SCHEMA_VERSION
-        or serving_state.profile_strategy_version
-        not in _PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES
+        serving_state.profile_schema_version != profile_artifact.PROFILE_SCHEMA_VERSION
+        or serving_state.profile_strategy_version not in _PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES
     ):
-        raise RuntimeError(
-            "provider_directory_profile_delta_strategy_incompatible"
-        )
+        raise RuntimeError("provider_directory_profile_delta_strategy_incompatible")
     current_dataset_by_source = dict(serving_state.source_vector)
     desired_dataset_by_source = dict(desired_source_vector)
-    current_context_by_source = dict(
-        serving_state.source_context_vector
-    )
+    current_context_by_source = dict(serving_state.source_context_vector)
     desired_context_by_source = dict(desired_source_context_vector)
     if set(desired_context_by_source) != set(desired_dataset_by_source):
-        raise RuntimeError(
-            "provider_directory_profile_source_context_vector_invalid"
-        )
+        raise RuntimeError("provider_directory_profile_source_context_vector_invalid")
     refresh_source_ids = {
         source_id
         for source_id, dataset_id in desired_source_vector
         if (
             current_dataset_by_source.get(source_id) != dataset_id
-            or current_context_by_source.get(source_id)
-            != desired_context_by_source[source_id]
+            or current_context_by_source.get(source_id) != desired_context_by_source[source_id]
         )
     }
-    removed_source_ids = set(current_dataset_by_source) - set(
-        desired_dataset_by_source
+    refresh_source_ids.update(
+        profile_snapshot.date_refresh_sources(
+            _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get(), serving_state, desired_source_vector
+        )
     )
-    if (
-        serving_state.profile_strategy_version
-        != profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-    ):
+    removed_source_ids = set(current_dataset_by_source) - set(desired_dataset_by_source)
+    if serving_state.profile_strategy_version != profile_artifact.PROFILE_BUILD_STRATEGY_VERSION:
         refresh_source_ids.update(
             set(desired_dataset_by_source).intersection(
                 {
@@ -34845,6 +34870,9 @@ def _is_profile_build_checkpoint_lineage_matching(
     """Return whether a checkpoint preserves this build's immutable lineage."""
     return (
         bool(checkpoint_map)
+        and profile_snapshot.is_checkpoint_date_matching(
+            _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get(), checkpoint_map, build
+        )
         and _is_checkpoint_core_lineage_matching(
             checkpoint_map,
             build,
@@ -34935,27 +34963,20 @@ def _profile_build_coordinates(
         or capacity_geometry_hash is None
         or capacity_geometry_json is None
     ):
-        raise RuntimeError(
-            "provider_directory_profile_capacity_geometry_missing"
-        )
+        raise RuntimeError("provider_directory_profile_capacity_geometry_missing")
     return _ProviderDirectoryProfileBuildCoordinates(
         build_id=build_id,
-        evidence_stage=(
-            profile_artifact.profile_evidence_stage_table_name(build_id)
-        ),
+        evidence_stage=(profile_artifact.profile_evidence_stage_table_name(build_id)),
         profile_stage=profile_artifact.profile_stage_table_name(build_id),
         affected_npi_stage=(
-            _bounded_identifier(
-                f"provider_directory_profile_affected_{build_id}"
-            )
+            _bounded_identifier(f"provider_directory_profile_affected_{build_id}")
             if identity.materialization_mode == "source_delta"
             else None
         ),
-        profile_as_of=(
-            identity.serving_state.profile_as_of
-            if identity.materialization_mode == "source_delta"
-            and identity.serving_state is not None
-            else _now().date().isoformat()
+        profile_as_of=profile_snapshot.profile_as_of(
+            _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get(),
+            identity.serving_state if identity.materialization_mode == "source_delta" else None,
+            today=_now().date().isoformat(),
         ),
         capacity_geometry_status=capacity_geometry_status,
         capacity_geometry_hash=capacity_geometry_hash,
@@ -39582,18 +39603,15 @@ def _prepared_profile_delta_source_values(
         "from_source_vector_hash": build.current_source_vector_hash,
         "to_source_vector_hash": build.desired_source_vector_hash,
         "to_source_vector": build.desired_source_vector,
-        "from_source_context_vector_hash": (
-            build.current_source_context_vector_hash
-        ),
-        "to_source_context_vector_hash": (
-            build.desired_source_context_vector_hash
-        ),
+        "from_source_context_vector_hash": (build.current_source_context_vector_hash),
+        "to_source_context_vector_hash": (build.desired_source_context_vector_hash),
         "to_source_context_vector": build.desired_source_context_vector,
         "refresh_source_ids": build.source_ids,
         "removed_source_ids": build.removed_source_ids,
         "expected_evidence_rows": serving.evidence_rows,
         "expected_profile_rows": serving.profile_rows,
         "profile_as_of": build.profile_as_of,
+        "from_profile_as_of": serving.profile_as_of,
         "from_capacity_geometry_status": serving.capacity_geometry_status,
         "from_capacity_geometry_hash": serving.capacity_geometry_hash,
         "from_capacity_geometry_json": serving.capacity_geometry_json,
@@ -40372,13 +40390,24 @@ async def _publish_provider_directory_artifacts(
         request.publish_artifacts_targets,
         "location_archive",
     ):
-        request.metrics[
-            "location_archive"
-        ] = await publish_provider_directory_location_archive(
-            run_id=request.effective_publish_scope_run_id,
-            source_ids=request.source_ids,
-            seen_table=request.seen_table,
-        )
+        from process.provider_directory_cms_preparation import _ACTIVE as nonprofile_admission
+
+        if artifact_bundle is not None and (
+            nonprofile_admission.get() is not None or 'cms-npd' in (request.source_ids or ())
+        ):
+            from process.provider_directory_cms_archive import prepare_archive_delta
+
+            if artifact_bundle.archive_delta is not None:
+                raise RuntimeError("provider_directory_candidate_archive_preparation_duplicate")
+            artifact_bundle.archive_delta, request.metrics["location_archive"] = await prepare_archive_delta(
+                sys.modules[__name__], _schema(), run_id=request.effective_publish_scope_run_id,
+                source_ids=request.source_ids, seen_table=request.seen_table,
+            )
+        else:
+            request.metrics["location_archive"] = await publish_provider_directory_location_archive(
+                run_id=request.effective_publish_scope_run_id, source_ids=request.source_ids,
+                seen_table=request.seen_table,
+            )
     else:
         request.metrics["location_archive"] = _provider_directory_publish_target_skipped()
     if is_provider_directory_publish_target_enabled(
@@ -40391,9 +40420,14 @@ async def _publish_provider_directory_artifacts(
         }
         if artifact_bundle is not None:
             address_overlay_options_by_name["defer_cutover"] = True
-        address_overlay_result = await publish_provider_directory_address_overlay(
-            **address_overlay_options_by_name,
+        archive_overrides = (
+            artifact_bundle.archive_delta.relation_overrides
+            if artifact_bundle is not None and artifact_bundle.archive_delta is not None else {}
         )
+        with _provider_directory_artifact_relation_scope(archive_overrides):
+            address_overlay_result = await publish_provider_directory_address_overlay(
+                **address_overlay_options_by_name,
+            )
         request.metrics[
             "address_overlay"
         ] = _collect_provider_directory_artifact_stage(
@@ -40610,9 +40644,11 @@ def provider_directory_location_archive_stage_sql(
     )
 
 
-def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_table: str) -> str:
+def _provider_directory_openaddresses_archive_backfill_sql(
+    schema: str, stage_table: str, *, archive_table: str | None = None,
+) -> str:
     """Build an exact-key, ambiguity-guarded OpenAddresses archive update."""
-    archive_ref = _qt(schema, "address_archive_v2")
+    archive_ref = _qt(schema, archive_table or "address_archive_v2")
     openaddresses_ref = _qt(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE)
     stage_ref = _qt(schema, stage_table)
     geo_source_type = _qt(schema, "address_archive_geo_source")
@@ -40668,6 +40704,7 @@ def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_ta
 async def _backfill_archive_openaddresses_coordinates(
     schema: str,
     stage_table: str,
+    *, archive_table: str | None = None,
 ) -> int:
     """Fill null archive coordinates for staged FHIR keys from safe OA matches."""
     if not await _is_table_present(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE):
@@ -40682,7 +40719,7 @@ async def _backfill_archive_openaddresses_coordinates(
     )
     return _coerce_rowcount(
         await db.status(
-            _provider_directory_openaddresses_archive_backfill_sql(schema, stage_table),
+        _provider_directory_openaddresses_archive_backfill_sql(schema, stage_table, archive_table=archive_table),
             coord_tolerance=coordinate_tolerance,
         )
     )
@@ -41068,6 +41105,9 @@ async def _populate_network_catalog_stage(
     await db.status(
         f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);"
     )
+    from process.provider_directory_cms_preparation import capture_nonprofile_stage
+
+    await capture_nonprofile_stage(sys.modules[__name__], schema, stage_table)
     copied_existing = await _copy_existing_network_catalog(
         stage_ref,
         target_ref,
@@ -42968,6 +43008,7 @@ async def _copy_upsert_rows(
     *,
     skip_unchanged: bool,
     transaction_session: Any | None = None,
+    ignore_conflicts: bool = False,
 ) -> int:
     """Copy upsert rows into the destination tables."""
     table = model.__table__
@@ -42977,7 +43018,7 @@ async def _copy_upsert_rows(
     quoted_stage = _q(stage_table)
     quoted_columns = ", ".join(_q(column) for column in columns)
     quoted_conflict = ", ".join(_q(column) for column in primary_keys)
-    conflict_sql = _copy_upsert_conflict_sql(
+    conflict_sql = "DO NOTHING" if ignore_conflicts else _copy_upsert_conflict_sql(
         table,
         columns,
         primary_keys,
@@ -43163,8 +43204,11 @@ def provider_directory_location_contact_backfill_sql(schema: str) -> str:
 
 async def backfill_provider_directory_location_contacts() -> dict[str, Any]:
     """Backfill provider directory location contacts for existing provider-directory rows."""
-    await _ensure_provider_directory_tables()
-    updated = _status_row_count(await db.status(provider_directory_location_contact_backfill_sql(_schema())))
+    from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
+
+    async with active_nonprofile_sql_transaction(sys.modules[__name__]):
+        await _ensure_provider_directory_tables()
+        updated = _status_row_count(await db.status(provider_directory_location_contact_backfill_sql(_schema())))
     summary_by_name = {"location_contact_rows_updated": updated}
     print(
         "PROVIDER_DIRECTORY_CONTACT_BACKFILL_DONE\t"
@@ -57191,7 +57235,7 @@ async def _completed_partition_fetch_result(
         fetch_options.deferred_materialization
         and resource_type == "PractitionerRole"
     ):
-        # ponytail: PractitionerRole only; widen after callback side effects
+        # Deferred materialization covers PractitionerRole; widen after callback side effects
         # are proven absent.
         rows_written = proof_counts.staged_candidate_count
     else:
@@ -65581,6 +65625,7 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
           FROM {dataset_ref} AS dataset
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.dataset_id <> :dataset_id
+           AND {candidate_available_sql('dataset', _schema())}
            AND ({state_filter_sql})
          ORDER BY CASE
                     WHEN dataset.status = :verification_baseline_status
@@ -66170,6 +66215,7 @@ def _endpoint_dataset_candidate_metadata(
             candidate.resource_hash_contract
         ),
         **_candidate_hash_metadata(candidate),
+        **({"source_release": candidate.source_release} if candidate.source_release is not None else {}),
     }
     if candidate.reviewed_root_policy is not None:
         metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
@@ -75893,65 +75939,18 @@ async def _assert_final_uhc_publication(
     }
 
 
-async def _publish_validated_uhc_dataset(
-    candidate: EndpointDatasetCandidate,
-) -> None:
+async def _publish_validated_uhc_dataset(candidate: EndpointDatasetCandidate) -> None:
     """Publish one proven UHC dataset without replacing global artifacts."""
 
-    fence = await _resolve_provider_directory_artifact_datasets(
-        [UHC_RETAINED_SOURCE_ID],
-        should_select_validated_candidates=True,
+    from process.provider_directory_source_local_publication import (
+        publish_validated_source_local_dataset,
     )
-    if (
-        len(fence.datasets) != 1
-        or len(fence.promotion_datasets) != 1
-        or fence.datasets[0].source_id != UHC_RETAINED_SOURCE_ID
-        or fence.datasets[0].dataset_id != candidate.dataset_id
-        or fence.datasets[0].endpoint_id != candidate.endpoint_id
-        or fence.datasets[0].evidence_run_id
-        != candidate.acquisition_root_run_id
-    ):
-        raise RuntimeError(
-            "provider_directory_uhc_source_local_fence_invalid"
-        )
-    try:
-        async with asyncio.timeout(
-            _provider_directory_artifact_transaction_timeout_seconds(fence)
-        ) as cutover_timeout:
-            async with db.transaction():
-                await db.status(
-                    "SET LOCAL lock_timeout = "
-                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
-                )
-                await db.status(
-                    "SET LOCAL statement_timeout = "
-                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
-                )
-                await _lock_artifact_cutover_fence(fence)
-                _tighten_provider_directory_artifact_cutover_timeout(
-                    cutover_timeout,
-                    fence,
-                )
-                await _promote_provider_directory_artifact_datasets(fence)
-    except Exception as promotion_error:
-        try:
-            is_cutover_committed = (
-                await _is_provider_directory_dataset_cutover_committed(fence)
-            )
-        except Exception:
-            LOGGER.warning(
-                "Source-local dataset cutover acknowledgement and committed-state "
-                "verification both failed",
-                exc_info=True,
-            )
-            is_cutover_committed = False
-        if not is_cutover_committed:
-            raise
-        LOGGER.warning(
-            "Source-local dataset cutover acknowledgement was lost after commit "
-            "(%s); verified the exact dataset and source pointers",
-            type(promotion_error).__name__,
-        )
+
+    await publish_validated_source_local_dataset(
+        sys.modules[__name__],
+        candidate,
+        UHC_RETAINED_SOURCE_ID,
+    )
 
 
 def _uhc_acquisition_progress_callback(
@@ -76530,6 +76529,14 @@ async def process_provider_directory_fhir_data(
             census_request,
         )
     )
+    if any(
+        task.get(field_name) is not None
+        for field_name in (
+            "cms_npd_rollback_vector_sha256",
+            "cms_npd_rollback_root_run_id",
+        )
+    ) and requested_source_ids != ["cms-npd"]:
+        raise ValueError("cms_npd_rollback_requires_exclusive_source_scope")
     dataset_followup_only = bool(task.get("dataset_followup_only", False))
     dataset_rehydrate_only = bool(task.get("dataset_rehydrate_only"))
     if dataset_followup_only and bool(task.get("dataset_rehydrate_only")):
@@ -76802,6 +76809,17 @@ async def process_provider_directory_fhir_data(
     if not ctx["context"].get("provider_directory_tables_ready"):
         await _ensure_provider_directory_tables()
         ctx["context"]["provider_directory_tables_ready"] = True
+    if (
+        "cms-npd" in requested_source_ids
+        and not dataset_rehydrate_only
+        and not dataset_followup_only
+        and not publish_artifacts_only
+    ):
+        if requested_source_ids != ["cms-npd"]:
+            raise ValueError("cms_npd_requires_exclusive_source_scope")
+        from process.provider_directory_cms_npd import run as run_cms_npd
+
+        return await run_cms_npd(ctx, task, run_id)
     if dataset_rehydrate_only:
         return await _run_provider_directory_dataset_rehydrate(
             ctx, task, run_id, requested_source_ids
@@ -77472,6 +77490,8 @@ class _ProviderDirectoryFhirCommandOptions:
     probe: bool = True
     import_resources: bool = False
     uhc_catalog_set_sha256: str | None = None
+    cms_npd_rollback_vector_sha256: str | None = None
+    cms_npd_rollback_root_run_id: str | None = None
     dataset_rehydrate_only: bool = False
     rehydrate_dataset_id: str | None = None
     rehydrate_acquisition_root_run_id: str | None = None
@@ -78525,45 +78545,6 @@ def provider_directory_address_overlay_insert_sql(
     )
 
 
-ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES = {
-    "organization_address": "organization",
-    "practitioner_address": "practitioner",
-    "practitioner_role": "role",
-    "organization_affiliation": "affiliation",
-}
-ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES = {
-    "organization_address": "Organization",
-    "practitioner_address": "Practitioner",
-    "practitioner_role": "PractitionerRole",
-    "organization_affiliation": "OrganizationAffiliation",
-}
-ADDRESS_OVERLAY_COMPONENTS = tuple(ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES)
-
-
-def _clean_address_overlay_components(raw_components: Any) -> tuple[str, ...]:
-    if raw_components in (None, "", ()):
-        return ADDRESS_OVERLAY_COMPONENTS
-    if isinstance(raw_components, str):
-        component_values = raw_components.split(",")
-    elif isinstance(raw_components, (bytes, bytearray, dict)) or not hasattr(raw_components, "__iter__"):
-        component_values = (raw_components,)
-    else:
-        component_values = raw_components
-    cleaned_components: list[str] = []
-    seen_components: set[str] = set()
-    for component in component_values:
-        component_text = _clean_text(component)
-        if not component_text:
-            continue
-        if component_text not in ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES:
-            raise ValueError(f"unknown Provider Directory address overlay component: {component_text}")
-        if component_text in seen_components:
-            continue
-        seen_components.add(component_text)
-        cleaned_components.append(component_text)
-    return tuple(cleaned_components or ADDRESS_OVERLAY_COMPONENTS)
-
-
 ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
     "organization_address": """
         INSERT INTO {stage_ref} ({columns})
@@ -78626,6 +78607,10 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
              WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
                AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
                AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+               AND (organization_rows.source_id <> 'cms-npd' OR (
+                    lower(addr.value->>'use') = 'work'
+                    AND lower(addr.value->>'type') IN ('physical', 'both')
+               ))
         ), org_address_keys AS MATERIALIZED (
             SELECT
                 key_parts.address_lookup_key,
@@ -78727,14 +78712,14 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                     NULLIF(TRIM(addr.value->'line'->>1), ''),
                     NULLIF(TRIM(addr.value->>'city'), ''),
                     NULLIF(TRIM(addr.value->>'state'), ''),
-                    NULLIF(TRIM(addr.value->>'postalCode'), ''),
+                    {practitioner_address_postal_code_expr},
                     {practitioner_address_country_expr}
                 )::text::varchar AS address_lookup_key,
                 NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
                 NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
                 NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
                 NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
-                NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+                {practitioner_address_postal_code_expr}::varchar AS postal_code,
                 {practitioner_address_country_expr}::varchar AS country_code,
                 practitioner_rows.telephone_number,
                 practitioner_rows.fax_number,
@@ -78745,7 +78730,11 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
              WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
                AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
-               AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+               AND {practitioner_address_postal_code_expr} IS NOT NULL
+               AND (practitioner_rows.source_id <> 'cms-npd' OR (
+                    lower(addr.value->>'use') = 'work'
+                    AND lower(addr.value->>'type') IN ('physical', 'both')
+               ))
         ), practitioner_address_keys AS MATERIALIZED (
             SELECT
                 key_parts.address_lookup_key,
@@ -78864,6 +78853,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               JOIN {practitioner_table} AS practitioner
                 ON practitioner.source_id = role.source_id
                AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
+               AND (role.source_id <> 'cms-npd' OR role.practitioner_ref ~ '^Practitioner/[A-Za-z0-9.-]{{1,64}}$')
               JOIN LATERAL (
                   SELECT direct_location_ref.value
                     FROM jsonb_array_elements_text(
@@ -78876,6 +78866,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                     ) AS service_ref(value)
                     JOIN {healthcare_service_table} AS healthcare_service
                       ON healthcare_service.source_id = role.source_id
+                     AND (role.source_id <> 'cms-npd' OR service_ref.value ~ '^HealthcareService/[A-Za-z0-9.-]{{1,64}}$')
                      AND healthcare_service.resource_id = NULLIF(
                             regexp_replace(service_ref.value, '^.*/', ''),
                             ''
@@ -78886,6 +78877,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               ) AS location_ref ON TRUE
               JOIN {location_table} AS loc
                 ON loc.source_id = role.source_id
+               AND (role.source_id <> 'cms-npd' OR location_ref.value ~ '^Location/[A-Za-z0-9.-]{{1,64}}$')
                AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
               LEFT JOIN LATERAL (
                   SELECT telecom.value->>'value' AS telephone_number
@@ -78922,6 +78914,13 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
                AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
                AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
+               AND (role.source_id <> 'cms-npd' OR (
+                    lower(COALESCE(loc.mode, '')) <> 'kind' AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(COALESCE(loc.addresses::jsonb, '[]'::jsonb)) AS physical_address(value)
+                     WHERE lower(physical_address.value->>'use') = 'work'
+                       AND lower(physical_address.value->>'type') IN ('physical', 'both')
+                    )
+               ))
                {component_scope}
           ) AS overlay_rows
          WHERE address_key IS NOT NULL;
@@ -78986,13 +78985,11 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 now() AS published_at
               FROM {affiliation_table} AS affiliation
               JOIN LATERAL (
-                  SELECT DISTINCT normalized_ref AS resource_id
-                    FROM (
-                        VALUES
-                            (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
-                            (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
-                    ) AS refs(normalized_ref)
-                   WHERE normalized_ref IS NOT NULL
+                  SELECT DISTINCT NULLIF(regexp_replace(COALESCE(refs.raw_ref, ''), '^.*/', ''), '') AS resource_id
+                    FROM (VALUES (affiliation.organization_ref),
+                                 (affiliation.participating_organization_ref)) AS refs(raw_ref)
+                   WHERE NULLIF(regexp_replace(COALESCE(refs.raw_ref, ''), '^.*/', ''), '') IS NOT NULL
+                     AND (affiliation.source_id <> 'cms-npd' OR refs.raw_ref ~ '^Organization/[A-Za-z0-9.-]{{1,64}}$')
               ) AS organization_ref ON TRUE
               JOIN {organization_table} AS organization
                 ON organization.source_id = affiliation.source_id
@@ -79028,6 +79025,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                               ) AS service_ref(value)
                               JOIN {healthcare_service_table} AS healthcare_service
                                 ON healthcare_service.source_id = affiliation.source_id
+                               AND (affiliation.source_id <> 'cms-npd' OR service_ref.value ~ '^HealthcareService/[A-Za-z0-9.-]{{1,64}}$')
                                AND healthcare_service.resource_id = NULLIF(
                                       regexp_replace(service_ref.value, '^.*/', ''),
                                       ''
@@ -79038,6 +79036,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                         ) AS location_ref
                         JOIN {location_table} AS location
                           ON location.source_id = affiliation.source_id
+                         AND (affiliation.source_id <> 'cms-npd' OR location_ref.value ~ '^Location/[A-Za-z0-9.-]{{1,64}}$')
                          AND location.resource_id = NULLIF(
                                 regexp_replace(location_ref.value, '^.*/', ''),
                                 ''
@@ -79046,6 +79045,13 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                          AND NULLIF(TRIM(location.first_line), '') IS NOT NULL
                          AND NULLIF(TRIM(location.city_name), '') IS NOT NULL
                          AND NULLIF(TRIM(location.postal_code), '') IS NOT NULL
+                         AND (affiliation.source_id <> 'cms-npd' OR (
+                              lower(COALESCE(location.mode, '')) <> 'kind' AND EXISTS (
+                              SELECT 1 FROM jsonb_array_elements(COALESCE(location.addresses::jsonb, '[]'::jsonb)) AS physical_address(value)
+                               WHERE lower(physical_address.value->>'use') = 'work'
+                                 AND lower(physical_address.value->>'type') IN ('physical', 'both')
+                              )
+                         ))
                   ), organization_addresses AS (
                       SELECT
                           ('organization-' || organization.resource_id || '-address-' ||
@@ -79073,6 +79079,10 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                        WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
                          AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
                          AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+                         AND (affiliation.source_id <> 'cms-npd' OR (
+                              lower(addr.value->>'use') = 'work'
+                              AND lower(addr.value->>'type') IN ('physical', 'both')
+                         ))
                   )
                   SELECT * FROM direct_locations
                   UNION ALL
@@ -79148,6 +79158,11 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         "practitioner_address_country_expr": _country_restore_default_us_sql(
             "addr.value->>'country'"
         ),
+        "practitioner_address_postal_code_expr": (
+            "COALESCE(CASE WHEN practitioner_rows.source_id='cms-npd' "
+            "THEN NULLIF(TRIM(addr.value->>'postal_code'), '') END, "
+            "NULLIF(TRIM(addr.value->>'postalCode'), ''))"
+        ),
         "location_country_expr": location_country_expr,
         **contact_sql_by_name,
         "location_lat_expr": _coordinate_from_location_sql(
@@ -79192,7 +79207,8 @@ def _address_overlay_component_insert_sql(
         run_id=run_id,
         source_ids=source_ids,
     )
-    return template.format(**context)
+    select_sql = address_overlay_component_select_sql(template, context)
+    return f"INSERT INTO {context['stage_ref']} ({context['columns']}) {select_sql};"
 
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES = (
@@ -79232,14 +79248,10 @@ async def _copy_existing_address_overlay(
         )
     else:
         refresh_filter = "source_id = ANY(CAST(:source_ids AS varchar[]))"
+    select_sql = address_overlay_existing_select_sql(target_ref, columns, refresh_filter)
     return _coerce_rowcount(
         await db.status(
-            f"""
-            INSERT INTO {stage_ref} ({columns})
-            SELECT {columns}
-              FROM {target_ref}
-             WHERE NOT ({refresh_filter});
-            """,
+            f"INSERT INTO {stage_ref} ({columns}) {select_sql};",
             **query_param_dict,
         )
     )
@@ -79458,14 +79470,12 @@ async def _rewrite_address_overlay_alias_rows(
     archive: str,
 ) -> tuple[int, int]:
     """Rewrite active source keys and return materialized and residual counts."""
+    assignments = ", ".join(f"{column} = {expression}" for column, expression in address_overlay_alias_columns().items())
     aliases_materialized = _coerce_rowcount(
         await db.status(
             f"""
             UPDATE {stage_ref} AS stage_row
-               SET address_key = target.address_key,
-                   premise_key = target.premise_key,
-                   lat = COALESCE(stage_row.lat, target.lat),
-                   long = COALESCE(stage_row.long, target.long)
+               SET {assignments}
               FROM {aliases} AS active
               JOIN {archive} AS target
                 ON target.address_key = active.target_address_key
@@ -79548,13 +79558,7 @@ async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: st
                SET lat = COALESCE(stage_row.lat, archive.lat),
                    long = COALESCE(stage_row.long, archive.long)
               FROM {_qt(schema, "address_archive_v2")} AS archive
-             WHERE stage_row.address_key IS NOT NULL
-               AND archive.address_key = stage_row.address_key
-               AND archive.merged_into IS NULL
-               AND archive.lat IS NOT NULL
-               AND archive.long IS NOT NULL
-               AND NOT (ABS(archive.lat) < 0.0000001 AND ABS(archive.long) < 0.0000001)
-               AND (stage_row.lat IS NULL OR stage_row.long IS NULL);
+             WHERE {address_overlay_archive_coordinate_predicate()};
             """
         )
     )
@@ -79612,38 +79616,18 @@ async def _backfill_address_overlay_stage_formatted_addresses(
         if cleaned_source_ids
         else ""
     )
+    columns_by_name = address_overlay_formatted_columns(renderer, ADDRESS_FORMAT_VERSION, ADDRESS_FORMAT_SOURCE)
+    assignments = ", ".join(f"{column} = {expression}" for column, expression in columns_by_name.items())
+    existing_columns = ", ".join(f"stage_row.{column}" for column in columns_by_name)
+    desired_columns = ", ".join(columns_by_name.values())
     return _coerce_rowcount(
         await db.status(
             f"""
             UPDATE {stage_ref} AS stage_row
-               SET formatted_address = {renderer}(
-                       stage_row.first_line,
-                       stage_row.second_line,
-                       stage_row.city_name,
-                       stage_row.state_name,
-                       stage_row.postal_code,
-                       stage_row.country_code
-                   ),
-                   formatted_address_version = {ADDRESS_FORMAT_VERSION},
-                   formatted_address_source = '{ADDRESS_FORMAT_SOURCE}'
+               SET {assignments}
              WHERE stage_row.address_key IS NOT NULL
                {source_scope}
-               AND ROW(
-                       stage_row.formatted_address,
-                       stage_row.formatted_address_version,
-                       stage_row.formatted_address_source
-                   ) IS DISTINCT FROM ROW(
-                       {renderer}(
-                           stage_row.first_line,
-                           stage_row.second_line,
-                           stage_row.city_name,
-                           stage_row.state_name,
-                           stage_row.postal_code,
-                           stage_row.country_code
-                       ),
-                       {ADDRESS_FORMAT_VERSION},
-                       '{ADDRESS_FORMAT_SOURCE}'
-                   );
+               AND ROW({existing_columns}) IS DISTINCT FROM ROW({desired_columns});
             """,
             **(
                 {"formatted_source_ids": cleaned_source_ids}
@@ -79711,11 +79695,7 @@ async def _dedupe_address_overlay_stage(
                         ctid,
                         row_number() OVER (
                             PARTITION BY source_record_id
-                            ORDER BY
-                                source_updated_at DESC NULLS LAST,
-                                published_at DESC,
-                                npi,
-                                address_key
+                            ORDER BY {ADDRESS_OVERLAY_DUPLICATE_ORDER}
                         ) AS duplicate_rank
                       FROM {stage_ref}
                      {where_sql}
@@ -79995,6 +79975,9 @@ async def _build_provider_directory_address_overlay_stage(
             f"CREATE UNLOGGED TABLE {stage_ref} "
             f"(LIKE {target_ref} INCLUDING DEFAULTS);"
         )
+        from process.provider_directory_cms_preparation import capture_nonprofile_stage
+
+        await capture_nonprofile_stage(sys.modules[__name__], schema, stage_table)
         is_stage_created = True
         stage_metrics = await _populate_address_overlay_stage(
             schema,

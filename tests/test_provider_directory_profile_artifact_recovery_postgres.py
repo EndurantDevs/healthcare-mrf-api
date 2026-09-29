@@ -49,16 +49,19 @@ async def _create_recovery_metadata_tables(fixture) -> None:
                 "provider_directory_profile_capacity_lease_consumption",
             )
         } (
-            attestation_id varchar(64) NOT NULL,
+            attestation_id varchar(64) PRIMARY KEY,
             lease_digest varchar(64) NOT NULL,
             capacity_geometry_hash varchar(64) NOT NULL,
             executable_plan_hash varchar(64) NOT NULL,
             selection_proof_id varchar(64) NOT NULL,
             source_vector_hash varchar(64) NOT NULL,
             source_context_vector_hash varchar(64) NOT NULL,
-            run_id varchar(64) PRIMARY KEY,
+            run_id varchar(64) NOT NULL,
+            admission_purpose varchar(32) NOT NULL DEFAULT 'profile'
+                CHECK (admission_purpose IN ('profile', 'cms_nonprofile')),
             build_id varchar(64) NOT NULL,
-            profile_as_of varchar(10) NOT NULL
+            profile_as_of varchar(10) NOT NULL,
+            UNIQUE (run_id, admission_purpose)
         );
         """
     )
@@ -108,13 +111,22 @@ async def _insert_owner(
         if run_id == admission.run_id
         else "pdpb_" + "c" * 32
     )
-    fields = tuple(owner_fields_by_name)
-    await fixture.database.status(
-        f"INSERT INTO {importer._unscoped_qt(fixture.schema, 'provider_directory_profile_capacity_lease_consumption')} "
-        f"({', '.join(importer._q(field) for field in fields)}) "
-        f"VALUES ({', '.join(':' + field for field in fields)});",
-        **owner_fields_by_name,
-    )
+    for purpose in ("profile", "cms_nonprofile"):
+        purpose_fields_by_name = {
+            **owner_fields_by_name,
+            "admission_purpose": purpose,
+        }
+        if purpose == "cms_nonprofile":
+            purpose_fields_by_name["attestation_id"] = (
+                "4" if run_id == admission.run_id else "5"
+            ) * 64
+        fields = tuple(purpose_fields_by_name)
+        await fixture.database.status(
+            f"INSERT INTO {importer._unscoped_qt(fixture.schema, 'provider_directory_profile_capacity_lease_consumption')} "
+            f"({', '.join(importer._q(field) for field in fields)}) "
+            f"VALUES ({', '.join(':' + field for field in fields)});",
+            **purpose_fields_by_name,
+        )
     await fixture.database.status(
         f"""
         INSERT INTO {importer._unscoped_qt(fixture.schema, "import_run")}

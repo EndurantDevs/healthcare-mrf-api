@@ -428,6 +428,10 @@ class _ShutdownRawConnection:
         self.events.append(str(statement))
         return "OK"
 
+    async def fetch(self, statement: object, _schema, names):
+        self.events.append(str(statement))
+        return [{"name": name} for name in names if not name.endswith("_old")]
+
     async def fetchval(self, statement: object, *_args):
         statement_text = str(statement)
         self.events.append(statement_text)

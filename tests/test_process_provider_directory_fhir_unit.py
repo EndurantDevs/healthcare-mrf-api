@@ -82,8 +82,10 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 56
+    assert len(command_signature.parameters) == 58
     assert "resource_scan_concurrency" in command_signature.parameters
+    assert "cms_npd_rollback_vector_sha256" in command_signature.parameters
+    assert "cms_npd_rollback_root_run_id" in command_signature.parameters
     assert "provider_directory_reviewed_root_count" not in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
@@ -16259,23 +16261,22 @@ def _assert_artifact_only_publish_result(operation_result) -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(monkeypatch):
+@pytest.mark.parametrize("source_ids", [None, ["cms-npd"]])
+async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(monkeypatch, source_ids):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     _stub_artifact_dataset_scope(monkeypatch)
+    dataset_followup = AsyncMock(return_value={"source_ids": ["cms-npd"]})
+    monkeypatch.setattr(importer, "_source_local_dataset_followup_if_current", dataset_followup)
     artifact_mock_map = {
-        "backfill_provider_directory_location_contacts": AsyncMock(
-            return_value={"location_contact_rows_updated": 0}
-        ),
+        "backfill_provider_directory_location_contacts": AsyncMock(return_value={"location_contact_rows_updated": 0}),
         "backfill_provider_directory_location_coordinates": AsyncMock(return_value=0),
         "backfill_provider_directory_resource_id_npis": AsyncMock(return_value={"Practitioner": 0, "Organization": 0}),
         "publish_provider_directory_location_address_keys": AsyncMock(return_value=0),
         "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
         "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 7}),
         "publish_provider_directory_network_catalog": AsyncMock(return_value={"rows": 8}),
-        "publish_provider_directory_address_corroboration_table": AsyncMock(
-            return_value={"rows": 9}
-        ),
+        "publish_provider_directory_address_corroboration_table": AsyncMock(return_value={"rows": 9}),
     }
     for artifact_name, artifact_mock in artifact_mock_map.items():
         monkeypatch.setattr(importer, artifact_name, artifact_mock)
@@ -16288,6 +16289,7 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
             "run_id": "run_artifact_only",
             "publish_artifacts_only": True,
             "publish_corroboration": True,
+            "source_ids": source_ids,
         },
     )
 
@@ -16295,6 +16297,11 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     assert metrics["address_overlay"] == {"rows": 7}
     assert metrics["network_catalog"] == {"rows": 8}
     assert metrics["ptg_corroboration_view_published"] is True
+    assert metrics["source_ids"] == (source_ids or [])
+    if source_ids:
+        dataset_followup.assert_awaited_once_with(source_ids=source_ids, expected_acquisition_root_run_id=None)
+    else:
+        dataset_followup.assert_not_awaited()
     for artifact_name in (
         "backfill_provider_directory_location_coordinates",
         "backfill_provider_directory_resource_id_npis",
@@ -16305,9 +16312,7 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     ):
         artifact_mock_map[artifact_name].assert_awaited_once()
         assert artifact_mock_map[artifact_name].await_args.kwargs["run_id"] is None
-    corroboration_publish = artifact_mock_map[
-        "publish_provider_directory_address_corroboration_table"
-    ]
+    corroboration_publish = artifact_mock_map["publish_provider_directory_address_corroboration_table"]
     corroboration_publish.assert_awaited_once()
     assert corroboration_publish.await_args.kwargs["refresh_network_catalog"] is False
     assert corroboration_publish.await_args.kwargs["defer_cutover"] is True

@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import Any
 
+from api.provider_directory_cms_candidate_catalog import cms_serving_candidate
 from api.provider_directory_source_outcomes import (
     enrich_provider_directory_source_catalog,
 )
@@ -18,6 +19,7 @@ from process.provider_directory_profile_selection import (
 
 _OUTCOME_ENRICHMENT_TIMEOUT_SECONDS = 5.0
 _SELECTION_PROJECTION_TIMEOUT_SECONDS = 5.0
+_CMS_CANDIDATE_TIMEOUT_SECONDS = 5.0
 
 
 async def provider_directory_control_catalog() -> dict[str, Any]:
@@ -47,4 +49,11 @@ async def provider_directory_control_catalog() -> dict[str, Any]:
             **catalog_map,
             "profile_selection_request": selection_payload,
         }
+    try:
+        async with asyncio.timeout(_CMS_CANDIDATE_TIMEOUT_SECONDS):
+            candidate = await cms_serving_candidate(static_map)
+        if candidate is not None:
+            catalog_map = {**catalog_map, "cms_serving_candidate": candidate}
+    except Exception:
+        logging.getLogger(__name__).warning("CMS candidate projection failed", exc_info=True)
     return catalog_map

@@ -191,6 +191,18 @@ async def _create_endpoint_tables(database: Database, schema: str) -> None:
     )
 
 
+async def _create_stale_candidate_table(database: Database, schema: str) -> None:
+    """Install the CMS admission table used by the census fixture."""
+    await database.status(
+        f"""
+        CREATE TABLE "{schema}".provider_directory_cms_npd_stale_candidate (
+            dataset_id varchar(96) PRIMARY KEY REFERENCES
+                "{schema}".provider_directory_endpoint_dataset(dataset_id)
+        );
+        """
+    )
+
+
 async def _create_checkpoint_table(database: Database, schema: str) -> None:
     await database.status(
         f"""
@@ -308,6 +320,7 @@ async def _create_census_tables(
     seed_dataset: bool,
 ) -> None:
     await _create_endpoint_tables(database, schema)
+    await _create_stale_candidate_table(database, schema)
     await install_subset_canonical_functions(database, schema)
     await _install_admission_seal_fixture_contract(database, schema)
     await _create_checkpoint_table(database, schema)

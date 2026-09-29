@@ -90,8 +90,10 @@ def resource_npi(resource: dict[str, Any], *, source_id: str, resource_id: str |
     return explicit_npi(resource) or npi_from_resource_id(resource_id)
 
 
-def tax_id(resource: dict[str, Any]) -> str | None:
-    """Exclude CMS pseudo-EIN identifiers from tax identity."""
+def tax_id(resource: dict[str, Any], *, source_id: str = "") -> str | None:
+    """Leave CMS tax identity empty until an EIN mapping is reviewed."""
+    if source_id == CMS_NPD_SOURCE_ID:
+        return None
     for identifier in resource.get("identifier") or []:
         if not isinstance(identifier, dict):
             continue

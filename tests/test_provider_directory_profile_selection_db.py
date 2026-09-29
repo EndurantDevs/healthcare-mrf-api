@@ -135,6 +135,7 @@ async def _create_flex_selection_tables(
         f"""
         CREATE TABLE {schema}.provider_directory_uhc_flex_practitioner_dataset (
             dataset_id varchar(96) PRIMARY KEY,
+            status varchar(32), is_current boolean,
             admission_id varchar(96),
             semantic_projection_as_of date,
             source_authority_id varchar(96),
@@ -155,6 +156,7 @@ async def _create_flex_selection_tables(
         f"""
         CREATE TABLE {schema}.provider_directory_rooted_graph_dataset (
             dataset_id varchar(96) PRIMARY KEY,
+            status varchar(32), is_current boolean,
             admission_id varchar(96),
             semantic_projection_as_of date,
             source_authority_id varchar(96),

@@ -70,6 +70,7 @@ class CMSDoctorGroupSite(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("npi",), "name": "npi"},
         {"index_elements": ("org_pac_id",), "name": "org"},
+        {"index_elements": ("adrs_id",), "name": "adrs"},
     ]
 
     row_number = Column(BigInteger, nullable=False, autoincrement=False)

@@ -35,7 +35,7 @@ def _mock_publication(monkeypatch, failure):
             calls.append(name)
             if failure == name:
                 raise RuntimeError("synthetic failure")
-            return 101 if name == "binding" else None
+            return 101 if name == "binding" else 71 if name == "sites" else None
 
         return record_call
 
@@ -45,6 +45,7 @@ def _mock_publication(monkeypatch, failure):
         ("education", "validate_education_stage"),
         ("group", "validate_group_site_stage"),
         ("binding", "bind_group_site_organizations"),
+        ("sites", "bind_cms_doctors_sites"),
         ("publish", "_publish_cms_doctors_stage"),
     ):
         monkeypatch.setattr(cms_doctors, attribute, AsyncMock(side_effect=observe(name)))
@@ -60,8 +61,9 @@ def _mock_publication(monkeypatch, failure):
 async def test_publication_binds_only_after_validation_and_before_cutover(monkeypatch):
     calls = _mock_publication(monkeypatch, None)
     metrics = await cms_doctors._publish_cms_doctors_generation(_publication_context())
-    assert calls == ["education", "group", "artifact", "binding", "cancel", "publish"]
+    assert calls == ["education", "group", "artifact", "binding", "sites", "cancel", "publish"]
     assert metrics["organization_groups"] == 101
+    assert metrics["sites"] == 71
     cms_doctors.raise_if_cancelled.assert_awaited_once_with(
         ANY,
         {"run_id": "synthetic-run"},
@@ -69,7 +71,7 @@ async def test_publication_binds_only_after_validation_and_before_cutover(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["education", "group", "artifact", "binding", "cancel"])
+@pytest.mark.parametrize("failure", ["education", "group", "artifact", "binding", "sites", "cancel"])
 async def test_validation_binding_or_cancellation_failure_prevents_publication(monkeypatch, failure):
     calls = _mock_publication(monkeypatch, failure)
     with pytest.raises(RuntimeError, match="synthetic failure"):
@@ -77,6 +79,7 @@ async def test_validation_binding_or_cancellation_failure_prevents_publication(m
     assert "publish" not in calls
     if failure in {"education", "group", "artifact"}:
         assert "binding" not in calls
+        assert "sites" not in calls
 
 
 @pytest.mark.asyncio

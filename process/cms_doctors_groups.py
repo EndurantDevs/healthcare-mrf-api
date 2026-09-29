@@ -128,7 +128,7 @@ async def swap_group_site_stage(import_date: str, schema: str) -> None:
     await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old")
     await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old")
     await db.status(f"ALTER TABLE {schema}.{stage.__tablename__} RENAME TO {table}")
-    for index_name in ("npi", "org"):
+    for index_name in ("npi", "org", "adrs"):
         await db.status(f"DROP INDEX IF EXISTS {schema}.{table}_idx_{index_name}_old")
         await db.status(
             f"ALTER INDEX IF EXISTS {schema}.{table}_idx_{index_name} RENAME TO {table}_idx_{index_name}_old"

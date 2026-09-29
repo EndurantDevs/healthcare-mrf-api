@@ -148,7 +148,7 @@ def test_delta_migration_rejects_conflicting_database_schemas(monkeypatch):
 
 
 def _assert_consumption_columns_match_model(elements) -> None:
-    """Compare migration column nullability and types with the ORM table."""
+    """Compare initial ledger columns before the later purpose migration."""
     migration_columns_by_name = {
         element.name: element
         for element in elements
@@ -160,7 +160,9 @@ def _assert_consumption_columns_match_model(elements) -> None:
             ProviderDirectoryProfileCapacityLeaseConsumption.__table__.columns
         )
     }
-    assert set(migration_columns_by_name) == set(model_columns_by_name)
+    assert set(migration_columns_by_name) == set(model_columns_by_name) - {
+        "admission_purpose"
+    }
     assert all(
         column.nullable is False
         for column in migration_columns_by_name.values()
@@ -191,10 +193,10 @@ def _assert_consumption_unique_keys(elements) -> None:
         )
 
 
-def test_capacity_consumption_migration_matches_model_and_unique_keys(
+def test_initial_capacity_consumption_migration_matches_model_and_unique_keys(
     monkeypatch,
 ):
-    """Keep the migration ledger contract aligned with its ORM model."""
+    """Keep original columns and pre-purpose uniqueness historically exact."""
     migration = _load_migration()
     recorder = _OperationsRecorder()
     monkeypatch.setattr(migration, "op", recorder)
@@ -216,6 +218,26 @@ def test_capacity_consumption_migration_matches_model_and_unique_keys(
             {"schema": "profile_test"},
         )
     ]
+
+
+def test_capacity_consumption_model_has_purpose_scoped_run_identity():
+    """Keep the later purpose contract exact without weakening global keys."""
+    table = ProviderDirectoryProfileCapacityLeaseConsumption.__table__
+    purpose = table.columns["admission_purpose"]
+    assert isinstance(purpose.type, sa.String) and purpose.type.length == 32
+    assert purpose.nullable is False
+    assert purpose.server_default.arg == "profile"
+    assert tuple(table.primary_key.columns.keys()) == ("attestation_id",)
+    assert {
+        tuple(constraint.columns.keys())
+        for constraint in table.constraints
+        if isinstance(constraint, sa.UniqueConstraint)
+    } == {("reservation_id",), ("run_id", "admission_purpose")}
+    assert {
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if constraint.name == "pd_profile_capacity_consumption_purpose_check"
+    } == {"admission_purpose IN ('profile','cms_nonprofile')"}
 
 
 @pytest.mark.parametrize(

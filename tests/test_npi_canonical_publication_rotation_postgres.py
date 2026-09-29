@@ -7,9 +7,17 @@ import asyncio
 import json
 from pathlib import Path
 from typing import NamedTuple
+from types import SimpleNamespace
 
 import asyncpg
 import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from api import provider_profile_snapshot as snapshot
+from db.connection import Database
+from tests.cms_doctors_preparation_postgres_support import pending_publisher_locks
+from process.entity_address_cutover_contract import _ServingRelationLockTimeout
 
 from process.npi_canonical_publication import (
     NpiCanonicalPublicationError,
@@ -495,4 +503,107 @@ async def test_injected_terminal_failure_rolls_back_all_six_rotations(tmp_path):
                 setup.stage_oids,
             )
         finally:
+            await connection.close()
+
+
+async def _read_npi_snapshot(fixture, *, entered=None, release=None):
+    """Observe all six canonical relations inside the real detail response snapshot."""
+    async with snapshot.provider_profile_read_snapshot(
+        fixture.database, fixture.schema, include_detail=True
+    ) as session:
+        oids = tuple(snapshot._SNAPSHOT.get()[f"{fixture.schema}.{name}"] for name in CANONICAL_TABLES)
+        counts = tuple(
+            [await session.scalar(text(f'SELECT count(*) FROM "{fixture.schema}".{name}')) for name in CANONICAL_TABLES]
+        )
+        if entered is not None:
+            entered.set()
+            await release.wait()
+        return oids, counts
+
+
+async def _publish_reader_rotation(connection, schema, setup):
+    """Run production family locks and rotations with the real atomic receipt and seal."""
+    async with connection.transaction():
+        await _lock_attempt(connection, schema)
+        await rotate_canonical_stage_tables(connection, schema, setup.stage_table_by_live)
+        return await _finalize_publication(connection, schema, setup.chain_ref, STAGE_ROW_COUNTS)
+
+
+async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path):
+    """Three unchanged reader loops must observe one complete committed six-table generation."""
+    async with npi_publication_schema() as (engine, database_url, schema, _migration):
+        fixture = SimpleNamespace(engine=engine, schema=schema,
+            database=Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False)))
+        connection = await connect(database_url)
+        entered, finished = asyncio.Event(), asyncio.Event()
+        observed_states = []
+        tasks = []
+
+        async def read():
+            after_count = 0
+            while after_count < 3:
+                after_count += finished.is_set()
+                observed_states.append(await _read_npi_snapshot(fixture))
+                entered.set()
+
+        try:
+            setup = await _prepare_rotation(connection, schema, tmp_path)
+            tasks = [asyncio.create_task(read()) for _ in range(3)]
+            await entered.wait()
+            receipt = await _publish_reader_rotation(connection, schema, setup)
+            finished.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 3)
+            assert set(observed_states) == {setup.old_state, (setup.stage_oids, STAGE_ROW_COUNTS)}
+            await _assert_committed_rotation(connection, schema, setup.old_state[0], setup.stage_oids,
+                                             tuple(setup.stage_table_by_live.values()), receipt)
+        finally:
+            for task in tasks:
+                await _drain_task(task)
+            await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_npi_rotation_preserves_late_readers(tmp_path):
+    """A rejected family prelock keeps the incumbent readable and the whole rotation retryable."""
+    async with npi_publication_schema() as (engine, database_url, schema, _migration):
+        fixture = SimpleNamespace(
+            engine=engine,
+            schema=schema,
+            database=Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False)),
+        )
+        connection = await connect(database_url)
+        entered, release = asyncio.Event(), asyncio.Event()
+        reader = publisher = None
+        try:
+            setup = await _prepare_rotation(connection, schema, tmp_path)
+            reader = asyncio.create_task(_read_npi_snapshot(fixture, entered=entered, release=release))
+            await asyncio.wait_for(entered.wait(), 3)
+            publisher = asyncio.create_task(_publish_reader_rotation(connection, schema, setup))
+            pending = await pending_publisher_locks(fixture, publisher)
+            assert await _read_npi_snapshot(fixture) == setup.old_state and pending
+            with pytest.raises(_ServingRelationLockTimeout):
+                await publisher
+            await _assert_rolled_back_rotation(
+                connection,
+                schema,
+                setup.old_state,
+                tuple(setup.stage_table_by_live.values()),
+                setup.stage_oids,
+            )
+            release.set()
+            assert await reader == setup.old_state
+            receipt = await _publish_reader_rotation(connection, schema, setup)
+            await _assert_committed_rotation(
+                connection,
+                schema,
+                setup.old_state[0],
+                setup.stage_oids,
+                tuple(setup.stage_table_by_live.values()),
+                receipt,
+            )
+            assert await _read_npi_snapshot(fixture) == (setup.stage_oids, STAGE_ROW_COUNTS)
+        finally:
+            release.set()
+            await _drain_task(reader)
+            await _drain_task(publisher)
             await connection.close()

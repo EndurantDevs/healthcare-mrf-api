@@ -6,6 +6,8 @@ import types
 from unittest.mock import AsyncMock
 
 import pytest
+
+from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
 import sanic.exceptions
 from sqlalchemy import column, table
 

@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import copy
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_evidence as evidence_api
@@ -343,16 +344,26 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
     monkeypatch,
 ):
     events = []
+    database_transaction = importer.db.transaction
+    receipt_exists = AsyncMock(return_value=False)
+    monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
+    monkeypatch.setattr(importer.db, "scalar", receipt_exists)
 
     @asynccontextmanager
     async def transaction():
         events.append("begin")
         try:
-            yield
+            async with database_transaction():
+                yield
         except RuntimeError:
             events.append("rollback")
             raise
         events.append("commit")
+
+    async def fail_publication(*_args, before_swaps=None):
+        assert before_swaps is None
+        assert importer.db._transaction_binding() is not None
+        raise RuntimeError("publication failed")
 
     stage = _artifact_stage()
     monkeypatch.setattr(importer.db, "transaction", transaction)
@@ -374,7 +385,7 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
     monkeypatch.setattr(
         importer,
         "_apply_locked_provider_directory_artifact_bundle",
-        AsyncMock(side_effect=RuntimeError("publication failed")),
+        AsyncMock(side_effect=fail_publication),
     )
 
     with pytest.raises(RuntimeError, match="publication failed"):
@@ -383,3 +394,6 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
         )
 
     assert events == ["begin", "rollback"]
+    assert importer.db._transaction_binding() is None
+    receipt_exists.assert_awaited_once()
+    assert "to_regclass(:table)" in receipt_exists.await_args.args[0]
