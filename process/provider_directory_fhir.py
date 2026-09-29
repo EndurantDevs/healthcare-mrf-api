@@ -8194,9 +8194,7 @@ def _parse_healthcare_service_resource(
     }
 
 
-def _parse_organization_affiliation_resource(
-    resource: dict[str, Any], base: dict[str, Any]
-) -> tuple[type, dict[str, Any]]:
+def _parse_organization_affiliation_resource(resource: dict[str, Any], base: dict[str, Any]) -> tuple[type, dict[str, Any]]:
     period_start, period_end = _period(resource)
     return ProviderDirectoryOrganizationAffiliation, {
         **base,
@@ -8205,6 +8203,7 @@ def _parse_organization_affiliation_resource(
         "organization_ref": _first_reference(resource.get("organization")),
         "participating_organization_ref": _first_reference(resource.get("participatingOrganization")),
         "network_refs": _references(resource.get("network")),
+        "insurance_plan_refs": _references(resource.get("insurancePlan")),
         "location_refs": _references(resource.get("location")),
         "healthcare_service_refs": _references(resource.get("healthcareService")),
         "endpoint_refs": _references(resource.get("endpoint")),
