@@ -17,6 +17,21 @@ python -m custom_import_cli status --dataset-id 5 --execution-id 17
 python -m custom_import_cli status --dataset-id 5 --generation-id 19
 ```
 
+Inspect the retained capture bound to one exact dataset and execution:
+
+```sh
+python -m custom_import_cli captures --dataset-id 5 --execution-id 17
+```
+
+This read-only command uses the retained operator evidence reader and returns
+the capture bundle ID and manifest SHA-256, plus the execution's dataset,
+definition and schema revision IDs and state. An existing execution with no
+bound capture returns `"capture":null`; a missing execution returns `not_found`.
+Mismatched or ambiguous retained evidence fails with a redacted `failed` receipt.
+It does not acquire source data or inspect replay payloads, manifest contents,
+per-stream metadata, storage paths, credentials or samples. A retained manifest
+digest alone does not establish that capture payloads are still replayable.
+
 Request cooperative cancellation; a terminal execution can return an unchanged
 receipt. This does not guarantee that an active worker has already stopped:
 
