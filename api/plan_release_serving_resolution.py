@@ -52,6 +52,13 @@ SELECT revision.serving_revision_id,
        snapshot.status AS snapshot_status,
        EXISTS (
            SELECT 1
+             FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope scope
+            WHERE scope.snapshot_id = binding.snapshot_id
+              AND scope.plan_id = binding.plan_id
+              AND scope.plan_market_type = binding.plan_market_type
+       ) AS logical_scope_present,
+       EXISTS (
+           SELECT 1
              FROM {PTG2_SCHEMA}.ptg2_snapshot_pin pin
             WHERE pin.owner_type = :pin_owner_type
               AND pin.owner_id = revision.serving_revision_id
