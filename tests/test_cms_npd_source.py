@@ -14,7 +14,11 @@ from process.cms_npd_source import (
     RESOURCE_FILES,
     CmsNpdSourceError,
     acquire_release,
+    assert_observed_release_unchanged,
+    load_retained_release,
+    observe_release,
     parse_manifest,
+    verify_release,
 )
 
 
@@ -109,6 +113,63 @@ def test_complete_release_is_sealed_and_unchanged_files_are_not_redownloaded(tmp
     assert sum(count for (filename, kind), count in calls.items() if kind == "download") == 8
 
 
+def test_observation_rechecks_all_eight_members_without_reading_retained_files():
+    manifest_by_field, payloads_by_file = _source()
+    client, calls = _client(manifest_by_field, payloads_by_file)
+    with client:
+        observed = observe_release(client=client, base_url="https://example.test/downloads")
+        assert observed.manifest.generated_at == "2026-09-24"
+        assert len(observed.probes) == len(RESOURCE_FILES)
+        assert_observed_release_unchanged(observed, client=client, base_url="https://example.test/downloads")
+    assert sum(count for (_, kind), count in calls.items() if kind == "download") == 0
+    assert all(calls[(name, "probe")] == 2 for name, _ in RESOURCE_FILES)
+
+
+def test_observation_rejects_changed_or_malformed_probe():
+    manifest_by_field, payloads_by_file = _source()
+    client, _ = _client(manifest_by_field, payloads_by_file, change_final_probe=True)
+    with client:
+        observed = observe_release(client=client, base_url="https://example.test/downloads")
+        with pytest.raises(CmsNpdSourceError, match="source_vector_changed"):
+            assert_observed_release_unchanged(observed, client=client, base_url="https://example.test/downloads")
+    malformed_by_field = dict(manifest_by_field)
+    malformed_by_field["files"] = dict(manifest_by_field["files"])
+    malformed_by_field["files"].pop("08-OrganizationAffiliation.ndjson")
+    client, _ = _client(malformed_by_field, payloads_by_file)
+    with client, pytest.raises(CmsNpdSourceError, match="manifest_files_invalid"):
+        observe_release(client=client, base_url="https://example.test/downloads")
+
+
+def test_acquisition_rejects_symlinked_artifact_child(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    try:
+        (tmp_path / "cms-npd").symlink_to(outside, target_is_directory=True)
+        manifest_by_field, payloads_by_file = _source()
+        client, _ = _client(manifest_by_field, payloads_by_file)
+        with client, pytest.raises(CmsNpdSourceError, match="artifact_path_unsafe"):
+            acquire_release(tmp_path, client=client, base_url="https://example.test/downloads")
+        assert list(outside.iterdir()) == []
+    finally:
+        outside.rmdir()
+
+
+def test_acquisition_and_publication_reject_symlinked_retained_file(tmp_path):
+    manifest_by_field, payloads_by_file = _source()
+    client, _ = _client(manifest_by_field, payloads_by_file)
+    with client:
+        release_dir, receipt = acquire_release(tmp_path, client=client, base_url="https://example.test/downloads")
+        retained_file = release_dir / "01-Organization.ndjson.zst"
+        external_file = tmp_path / "synthetic-external.zst"
+        external_file.write_bytes(retained_file.read_bytes())
+        retained_file.unlink()
+        retained_file.symlink_to(external_file)
+        with pytest.raises(CmsNpdSourceError, match="artifact_path_unsafe"):
+            acquire_release(tmp_path, client=client, base_url="https://example.test/downloads")
+        with pytest.raises(CmsNpdSourceError, match="retained_release_missing"):
+            verify_release(release_dir, receipt, client=client, base_url="https://example.test/downloads")
+
+
 def test_retained_bytes_are_checked_before_reusing_a_receipt(tmp_path):
     manifest_by_field, payloads_by_file = _source()
     client, _ = _client(manifest_by_field, payloads_by_file)
@@ -129,6 +190,57 @@ def test_reused_receipt_date_must_match_pinned_manifest(tmp_path):
         (release_dir / "receipt.json").write_text(json.dumps({**receipt, "generated_at": "2025-01-01"}))
         with pytest.raises(CmsNpdSourceError, match="receipt_invalid"):
             acquire_release(tmp_path, client=client, base_url="https://example.test/downloads")
+
+
+def test_publication_recheck_rejects_replaced_retained_bytes(tmp_path):
+    manifest_by_field, payloads_by_file = _source()
+    client, calls = _client(manifest_by_field, payloads_by_file)
+    with client:
+        release_dir, receipt = acquire_release(tmp_path, client=client, base_url="https://example.test/downloads")
+        verify_release(release_dir, receipt, client=client, base_url="https://example.test/downloads")
+        (release_dir / "01-Organization.ndjson.zst").write_bytes(b"replaced")
+        with pytest.raises(CmsNpdSourceError, match="retained_file_missing"):
+            verify_release(release_dir, receipt, client=client, base_url="https://example.test/downloads")
+    assert sum(count for (_, kind), count in calls.items() if kind == "download") == 8
+
+
+def test_selected_older_release_replays_only_its_sealed_local_bytes(tmp_path):
+    manifest_by_field, payloads_by_file = _source()
+    client, _ = _client(manifest_by_field, payloads_by_file)
+    with client:
+        directory, receipt_by_field = acquire_release(
+            tmp_path,
+            client=client,
+            base_url="https://example.test/downloads",
+        )
+    assert load_retained_release(tmp_path, receipt_by_field["vector_sha256"]) == (
+        directory,
+        receipt_by_field,
+    )
+    with pytest.raises(CmsNpdSourceError, match="rollback_vector_invalid"):
+        load_retained_release(tmp_path, "../other")
+    (directory / "06-Practitioner.ndjson.zst").write_bytes(b"replaced")
+    with pytest.raises(CmsNpdSourceError, match="retained_file_missing"):
+        load_retained_release(tmp_path, receipt_by_field["vector_sha256"])
+
+
+def test_receipt_generated_at_must_equal_sealed_manifest(tmp_path):
+    manifest_by_field, payloads_by_file = _source()
+    client, _ = _client(manifest_by_field, payloads_by_file)
+    with client:
+        directory, receipt_by_field = acquire_release(
+            tmp_path,
+            client=client,
+            base_url="https://example.test/downloads",
+        )
+        changed_receipt_by_field = {**receipt_by_field, "generated_at": "2026-09-25"}
+        with pytest.raises(CmsNpdSourceError, match="receipt_invalid"):
+            verify_release(
+                directory,
+                changed_receipt_by_field,
+                client=client,
+                base_url="https://example.test/downloads",
+            )
 
 
 def test_interrupted_download_resumes_the_pinned_bytes(tmp_path):

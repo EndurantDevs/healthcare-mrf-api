@@ -25,6 +25,7 @@ import socket
 import sqlite3
 import ssl
 import string
+import sys
 import tempfile
 import time
 import urllib.error
@@ -86,6 +87,7 @@ from process.control_lifecycle import (
     suppress_control_run_heartbeat_persistence,
 )
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
+from process.provider_directory_cms_npd_recovery import candidate_available_sql
 from process.provider_directory_source_coverage import (
     INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
     MICHIGAN_PROVIDER_DIRECTORY_BASE,
@@ -2306,6 +2308,7 @@ class EndpointDatasetCandidate:
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
     semantic_projection_as_of: str | None = None
     proof_resource_scope: tuple[str, ...] | None = None
+    source_release: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -14691,6 +14694,7 @@ def _artifact_candidate_universe_ctes(
                               AS full_metadata_jsonb
               ) AS candidate_publication
              WHERE {metadata} IS NOT NULL
+               AND {candidate_available_sql('dataset', _schema())}
                AND jsonb_typeof({source_ids}) = 'array'
                AND jsonb_array_length({safe_source_ids}) > 0
                AND ({safe_source_ids}) ?| CAST(:source_ids AS text[])
@@ -17403,13 +17407,8 @@ def _artifact_dataset_options_cte(
     use_eligible_candidate_ids: bool = False,
 ) -> str:
     """Select current rows and, when requested, admitted candidates."""
-    candidate_lateral, validated_candidate_clause = (
-        _artifact_candidate_option_sql(
-            dataset_ref,
-            source_ref,
-            include_validated_candidates,
-            use_eligible_candidate_ids,
-        )
+    candidate_lateral, validated_candidate_clause = _artifact_candidate_option_sql(
+        dataset_ref, source_ref, include_validated_candidates, use_eligible_candidate_ids,
     )
     endpoint_scope = _artifact_dataset_endpoint_scope_sql(
         scope_endpoint_ids=scope_endpoint_ids,
@@ -17442,7 +17441,7 @@ def _artifact_dataset_options_cte(
          FROM {dataset_ref} AS dataset
           {publication_lateral}
           {candidate_lateral}
-         WHERE {endpoint_scope}(
+         WHERE {endpoint_scope}{candidate_available_sql('dataset', _schema())} AND (
             (
                     dataset.is_current = true
                 AND dataset.status = :published_status
@@ -26686,6 +26685,7 @@ async def _prepare_artifact_publication_fence(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
+    _assert_cms_npd_dedicated_candidate_promotion(fence)
     fence = await _bind_validated_publication_candidate(
         fence,
         validated_publication_candidate,
@@ -26705,12 +26705,22 @@ async def _prepare_artifact_publication_fence(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
+    _assert_cms_npd_dedicated_candidate_promotion(refreshed_fence)
     refreshed_fence = await _bind_validated_publication_candidate(
         refreshed_fence,
         validated_publication_candidate,
     )
     _assert_artifact_fence_selection_unchanged(fence, refreshed_fence)
     return refreshed_fence
+
+
+def _assert_cms_npd_dedicated_candidate_promotion(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Reserve CMS candidate cutover for the retained-release verifier."""
+
+    if any(dataset.source_id == "cms-npd" for dataset in fence.promotion_datasets):
+        raise RuntimeError("cms_npd_verified_publication_required")
 
 
 _CANDIDATE_ARTIFACT_METRIC_BY_TARGET = {
@@ -65581,6 +65591,7 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
           FROM {dataset_ref} AS dataset
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.dataset_id <> :dataset_id
+           AND {candidate_available_sql('dataset', _schema())}
            AND ({state_filter_sql})
          ORDER BY CASE
                     WHEN dataset.status = :verification_baseline_status
@@ -66170,6 +66181,7 @@ def _endpoint_dataset_candidate_metadata(
             candidate.resource_hash_contract
         ),
         **_candidate_hash_metadata(candidate),
+        **({"source_release": candidate.source_release} if candidate.source_release is not None else {}),
     }
     if candidate.reviewed_root_policy is not None:
         metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
@@ -75893,65 +75905,18 @@ async def _assert_final_uhc_publication(
     }
 
 
-async def _publish_validated_uhc_dataset(
-    candidate: EndpointDatasetCandidate,
-) -> None:
+async def _publish_validated_uhc_dataset(candidate: EndpointDatasetCandidate) -> None:
     """Publish one proven UHC dataset without replacing global artifacts."""
 
-    fence = await _resolve_provider_directory_artifact_datasets(
-        [UHC_RETAINED_SOURCE_ID],
-        should_select_validated_candidates=True,
+    from process.provider_directory_source_local_publication import (
+        publish_validated_source_local_dataset,
     )
-    if (
-        len(fence.datasets) != 1
-        or len(fence.promotion_datasets) != 1
-        or fence.datasets[0].source_id != UHC_RETAINED_SOURCE_ID
-        or fence.datasets[0].dataset_id != candidate.dataset_id
-        or fence.datasets[0].endpoint_id != candidate.endpoint_id
-        or fence.datasets[0].evidence_run_id
-        != candidate.acquisition_root_run_id
-    ):
-        raise RuntimeError(
-            "provider_directory_uhc_source_local_fence_invalid"
-        )
-    try:
-        async with asyncio.timeout(
-            _provider_directory_artifact_transaction_timeout_seconds(fence)
-        ) as cutover_timeout:
-            async with db.transaction():
-                await db.status(
-                    "SET LOCAL lock_timeout = "
-                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
-                )
-                await db.status(
-                    "SET LOCAL statement_timeout = "
-                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
-                )
-                await _lock_artifact_cutover_fence(fence)
-                _tighten_provider_directory_artifact_cutover_timeout(
-                    cutover_timeout,
-                    fence,
-                )
-                await _promote_provider_directory_artifact_datasets(fence)
-    except Exception as promotion_error:
-        try:
-            is_cutover_committed = (
-                await _is_provider_directory_dataset_cutover_committed(fence)
-            )
-        except Exception:
-            LOGGER.warning(
-                "Source-local dataset cutover acknowledgement and committed-state "
-                "verification both failed",
-                exc_info=True,
-            )
-            is_cutover_committed = False
-        if not is_cutover_committed:
-            raise
-        LOGGER.warning(
-            "Source-local dataset cutover acknowledgement was lost after commit "
-            "(%s); verified the exact dataset and source pointers",
-            type(promotion_error).__name__,
-        )
+
+    await publish_validated_source_local_dataset(
+        sys.modules[__name__],
+        candidate,
+        UHC_RETAINED_SOURCE_ID,
+    )
 
 
 def _uhc_acquisition_progress_callback(
@@ -76530,6 +76495,14 @@ async def process_provider_directory_fhir_data(
             census_request,
         )
     )
+    if any(
+        task.get(field_name) is not None
+        for field_name in (
+            "cms_npd_rollback_vector_sha256",
+            "cms_npd_rollback_root_run_id",
+        )
+    ) and requested_source_ids != ["cms-npd"]:
+        raise ValueError("cms_npd_rollback_requires_exclusive_source_scope")
     dataset_followup_only = bool(task.get("dataset_followup_only", False))
     dataset_rehydrate_only = bool(task.get("dataset_rehydrate_only"))
     if dataset_followup_only and bool(task.get("dataset_rehydrate_only")):
@@ -76802,6 +76775,12 @@ async def process_provider_directory_fhir_data(
     if not ctx["context"].get("provider_directory_tables_ready"):
         await _ensure_provider_directory_tables()
         ctx["context"]["provider_directory_tables_ready"] = True
+    if "cms-npd" in requested_source_ids and not dataset_rehydrate_only and not dataset_followup_only:
+        if requested_source_ids != ["cms-npd"]:
+            raise ValueError("cms_npd_requires_exclusive_source_scope")
+        from process.provider_directory_cms_npd import run as run_cms_npd
+
+        return await run_cms_npd(ctx, task, run_id)
     if dataset_rehydrate_only:
         return await _run_provider_directory_dataset_rehydrate(
             ctx, task, run_id, requested_source_ids
@@ -77472,6 +77451,8 @@ class _ProviderDirectoryFhirCommandOptions:
     probe: bool = True
     import_resources: bool = False
     uhc_catalog_set_sha256: str | None = None
+    cms_npd_rollback_vector_sha256: str | None = None
+    cms_npd_rollback_root_run_id: str | None = None
     dataset_rehydrate_only: bool = False
     rehydrate_dataset_id: str | None = None
     rehydrate_acquisition_root_run_id: str | None = None

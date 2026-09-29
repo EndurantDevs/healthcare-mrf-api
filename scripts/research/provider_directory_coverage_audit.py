@@ -3555,7 +3555,7 @@ def _validated_maintained_source_ids(
     seen_source_ids: set[str] = set()
     for source_id_value in source_ids:
         source_id = str(source_id_value or "").strip()
-        if not PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id):
+        if source_id != "cms-npd" and not PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id):
             raise ValueError(f"invalid maintained Provider Directory source_id: {source_id!r}")
         if source_id in seen_source_ids:
             continue

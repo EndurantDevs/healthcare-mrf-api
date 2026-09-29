@@ -4281,10 +4281,10 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (39, 25, 27)
+    ) == (40, 26, 27)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 25
-    assert all(entry["profile_enabled"] for entry in runnable_items)
+    assert len(runnable_items) == 26
+    assert all(entry["profile_enabled"] == (entry["entry_id"] != "cms-npd") for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
         for entry in runnable_items

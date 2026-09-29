@@ -82,8 +82,10 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 56
+    assert len(command_signature.parameters) == 58
     assert "resource_scan_concurrency" in command_signature.parameters
+    assert "cms_npd_rollback_vector_sha256" in command_signature.parameters
+    assert "cms_npd_rollback_root_run_id" in command_signature.parameters
     assert "provider_directory_reviewed_root_count" not in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"

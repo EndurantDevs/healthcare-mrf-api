@@ -108,7 +108,8 @@ def _validate_endpoint_identity(entry_id: str, entry: dict[str, Any]) -> None:
         or not source_ids
         or len(source_ids) != len(set(source_ids))
         or not all(
-            isinstance(source_id, str) and SOURCE_ID_PATTERN.fullmatch(source_id)
+            isinstance(source_id, str)
+            and (SOURCE_ID_PATTERN.fullmatch(source_id) or (entry_id == "cms-npd" and source_id == "cms-npd"))
             for source_id in source_ids
         )
     ):

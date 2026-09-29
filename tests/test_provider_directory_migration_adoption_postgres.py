@@ -153,6 +153,7 @@ async def main():
                 "provider_directory_rooted_graph_twin_admission",
                 "provider_directory_rooted_graph_dataset",
                 "provider_directory_rooted_graph_dataset_resource",
+                "provider_directory_cms_npd_stale_candidate",
             }
             target_tables = [
                 table

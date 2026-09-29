@@ -229,7 +229,9 @@ def _validate_manifest_entry(
         not isinstance(source_ids, list)
         or not source_ids
         or not all(
-            SOURCE_ID_PATTERN.fullmatch(str(source_id)) for source_id in source_ids
+            SOURCE_ID_PATTERN.fullmatch(str(source_id))
+            or (entry_id == "cms-npd" and source_id == "cms-npd")
+            for source_id in source_ids
         )
     ):
         raise ManifestError(f"{entry_id}: source_ids must contain full pdfhir IDs")
