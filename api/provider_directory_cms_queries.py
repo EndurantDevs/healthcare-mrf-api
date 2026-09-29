@@ -159,45 +159,55 @@ async def cms_entity_rows(session, schema, query, generation, position=None):
 
 # Only explicit outgoing assertions whose target kind exists in the gateway contract.
 RELATION_FIELDS = {
-    "organizations": (("part_of_ref", "organization-part-of", "organizations", False),),
-    "sites": (("managing_organization_ref", "site-managing-organization", "organizations", False),),
+    "organizations": (("partOf", "organization-part-of", "organizations"),),
+    "sites": (
+        ("managingOrganization", "site-managing-organization", "organizations"),
+        ("partOf", "site-part-of", "sites"),
+    ),
     "plans": (
-        ("owned_by_ref", "plan-owned-by", "organizations", False),
-        ("administered_by_ref", "plan-administered-by", "organizations", False),
-        ("network_refs", "plan-network", "networks", True),
-        ("coverage_area_refs", "plan-coverage-area", "sites", True),
+        ("ownedBy", "plan-owned-by", "organizations"),
+        ("administeredBy", "plan-administered-by", "organizations"),
+        ("network", "plan-network", "networks"),
+        ("coverageArea", "plan-coverage-area", "sites"),
+        ("plan.network", "plan-network", "networks"),
+        ("plan.coverageArea", "plan-coverage-area", "sites"),
+        ("coverage.network", "plan-network", "networks"),
     ),
     "practitioner-roles": (
-        ("organization_ref", "role-organization", "organizations", False),
-        ("location_refs", "role-site", "sites", True),
-        ("network_refs", "role-network", "networks", True),
-        ("insurance_plan_refs", "role-plan", "plans", True),
+        ("organization", "role-organization", "organizations"),
+        ("location", "role-site", "sites"),
+        ("network", "role-network", "networks"),
+        ("insurancePlan", "role-plan", "plans"),
     ),
 }
 
 
-def _relationship_selects(kind):
-    selects = []
-    for ordinal, (field, relation, target_kind, is_array) in enumerate(RELATION_FIELDS[kind]):
-        extracted = f"r.payload_json::jsonb->'{field}'"
-        if is_array:
-            references = f"CASE WHEN jsonb_typeof({extracted})='array' THEN {extracted} ELSE '[]'::jsonb END"
-        else:
-            references = f"jsonb_build_array({extracted})"
-        selects.append(f"""SELECT {ordinal} * 1000000000::bigint + ref.ordinal AS position,
-            '{relation}'::text AS relationship_type, '{target_kind}'::text AS target_kind,
-            left(ref.value #>> '{{}}', 513) AS reference
-            FROM jsonb_array_elements({references}) WITH ORDINALITY ref(value, ordinal)
-            WHERE jsonb_typeof(ref.value)='string' AND ref.value #>> '{{}}' <> ''""")
-    return " UNION ALL ".join(selects)
+def _relationship_fields(kind):
+    return ", ".join(
+        f"('{field}', '{relation}', '{target_kind}')" for field, relation, target_kind in RELATION_FIELDS[kind]
+    )
 
 
 async def cms_relationship_rows(session, schema, query, generation, resource_id, position):
-    """Page explicit references in their retained order; never hydrate arbitrary JSON."""
-    statement = f"""SELECT refs.* FROM {schema}.{_RESOURCE} r
-        CROSS JOIN LATERAL ({_relationship_selects(query.kind)}) refs
-        WHERE r.dataset_id=:dataset_id AND r.resource_type=:resource_type AND r.resource_id=:resource_id
-          AND refs.position > :position ORDER BY refs.position LIMIT :page_size"""
+    """Page exact source-qualified links; preserve the admission-time resolution."""
+    statement = f"""WITH fields(reference_field, relationship_type, target_kind) AS
+        (VALUES {_relationship_fields(query.kind)}), numbered AS (
+          SELECT row_number() OVER (ORDER BY link.reference_field, link.parent_ordinal,
+                   link.reference_ordinal) AS position,
+                 fields.relationship_type, fields.target_kind,
+                 left(link.target_reference, 513) AS reference, link.resolution_status,
+                 left(link.period_start, 40) AS period_start,
+                 left(link.period_end, 40) AS period_end
+          FROM {schema}.provider_directory_cms_npd_relationship link
+          JOIN fields USING (reference_field)
+          JOIN {schema}.{_RESOURCE} r ON r.dataset_id=link.dataset_id
+            AND r.resource_type=link.resource_type AND r.resource_id=link.resource_id
+            AND r.payload_hash=link.source_payload_hash
+          WHERE link.dataset_id=:dataset_id AND link.source_id='cms-npd'
+            AND link.release_id=:release_id AND link.resource_type=:resource_type
+            AND link.resource_id=:resource_id
+        ) SELECT * FROM numbered WHERE position>:position
+        ORDER BY position LIMIT :page_size"""
     return (
         (
             await session.execute(

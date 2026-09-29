@@ -90,6 +90,10 @@ async def _create_dependencies(session):
         "CREATE TABLE provider_directory_insurance_network_plan_evidence (source_id text, release_id text, "
         "network_resource_id text, insurance_plan_resource_id text, plan_payload_sha256 text, "
         "PRIMARY KEY(source_id, release_id, network_resource_id, insurance_plan_resource_id))",
+        "CREATE TABLE provider_directory_cms_npd_relationship (dataset_id text, source_id text, release_id text, "
+        "resource_type text, resource_id text, source_payload_hash text, raw_payload_sha256 text, "
+        "reference_field text, parent_ordinal integer, reference_ordinal integer, target_reference text, "
+        "resolution_status text, period_start text, period_end text)",
     )
     for statement in statements:
         await session.execute(text(statement))
@@ -258,6 +262,61 @@ async def _seed_dependencies(session):
     )
 
 
+async def _seed_relationships(session):
+    """Give the read tests exact synthetic ledger rows rather than a JSON fallback."""
+
+    fields_by_kind = {
+        "Organization": (("part_of_ref", "partOf"),),
+        "Location": (("managing_organization_ref", "managingOrganization"), ("part_of_ref", "partOf")),
+        "InsurancePlan": (
+            ("owned_by_ref", "ownedBy"),
+            ("administered_by_ref", "administeredBy"),
+            ("network_refs", "network"),
+            ("coverage_area_refs", "coverageArea"),
+        ),
+        "PractitionerRole": (
+            ("organization_ref", "organization"),
+            ("location_refs", "location"),
+            ("network_refs", "network"),
+            ("insurance_plan_refs", "insurancePlan"),
+        ),
+    }
+    resource_rows = (
+        await session.execute(
+            text("SELECT resource_type, resource_id, payload_json FROM provider_directory_dataset_resource")
+        )
+    ).all()
+    present_resources = {(kind, resource_id) for kind, resource_id, _ in resource_rows}
+    for kind, resource_id, resource_payload in resource_rows:
+        for normalized_field, reference_field in fields_by_kind.get(kind, ()):
+            raw_refs = resource_payload.get(normalized_field)
+            if raw_refs is None:
+                continue
+            for ordinal, reference in enumerate(raw_refs if isinstance(raw_refs, list) else [raw_refs], 1):
+                target_type, _, target_id = reference.partition("/")
+                is_resolved = (
+                    target_type,
+                    target_id,
+                ) in present_resources and reference == f"{target_type}/{target_id}"
+                await session.execute(
+                    text(
+                        "INSERT INTO provider_directory_cms_npd_relationship VALUES "
+                        "('synthetic-dataset','cms-npd',:release,:kind,:resource_id,:hash,:hash,"
+                        ":field,0,:ordinal,:reference,:status,NULL,NULL)"
+                    ),
+                    {
+                        "release": _RELEASE,
+                        "kind": kind,
+                        "resource_id": resource_id,
+                        "hash": _HASH,
+                        "field": reference_field,
+                        "ordinal": ordinal,
+                        "reference": reference,
+                        "status": "resolved" if is_resolved else "unresolved",
+                    },
+                )
+
+
 @asynccontextmanager
 async def cms_database(monkeypatch, *, prepare=None, seal=True):
     """Extend the guarded disposable fixture without changing any shared database."""
@@ -273,6 +332,7 @@ async def cms_database(monkeypatch, *, prepare=None, seal=True):
             await _seed_dependencies(session)
             if prepare is not None:
                 await prepare(session)
+            await _seed_relationships(session)
             connection = await session.connection()
             migration = migration_module("20260930020000")
 

@@ -16,6 +16,7 @@ _PROOF_TABLES = (
     "provider_directory_insurance_network_source_binding",
     "provider_directory_insurance_network_plan_evidence",
     "provider_directory_resource_identity",
+    "provider_directory_cms_npd_relationship",
 )
 
 

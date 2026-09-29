@@ -83,13 +83,17 @@ async def _relationships(session, schema, key, query, generation, parent):
     relationship_rows = await reader(session, schema, query, generation, parent["resource_id"], position)
     relationship_items = []
     for relation_record in relationship_rows[: query.limit]:
-        target_id, status = await cms_target_identity(
-            session,
-            schema,
-            generation,
-            relation_record["target_kind"],
-            relation_record["reference"],
-        )
+        source_status = relation_record.get("resolution_status")
+        if source_status in {"unresolved", "ambiguous"}:
+            target_id, status = None, "conflict" if source_status == "ambiguous" else "unresolved"
+        else:
+            target_id, status = await cms_target_identity(
+                session,
+                schema,
+                generation,
+                relation_record["target_kind"],
+                relation_record["reference"],
+            )
         evidence_type = "InsurancePlan" if query.kind == "networks" else parent["resource_type"]
         evidence_id = relation_record.get("evidence_id", parent["resource_id"])
         relationship_items.append(
@@ -108,8 +112,8 @@ async def _relationships(session, schema, key, query, generation, parent):
                 "target_kind": relation_record["target_kind"],
                 "target_id": target_id,
                 "status": status,
-                "effective_start": _effective_date(parent["period_start"]),
-                "effective_end": _effective_date(parent["period_end"]),
+                "effective_start": _effective_date(relation_record.get("period_start", parent["period_start"])),
+                "effective_end": _effective_date(relation_record.get("period_end", parent["period_end"])),
                 "evidence": [_evidence(key, generation, evidence_type, evidence_id)],
             }
         )

@@ -176,8 +176,66 @@ async def test_relationship_cursors_cover_explicit_references_without_duplicates
         assert query.cursor is None
         assert len(items) == len({item["relationship_key"] for item in items}) == 4
         assert sum(item["status"] == "unresolved" for item in items) == 2
-        assert items[0]["target_id"] == ORG_ID
-        assert items[2]["target_id"] == NETWORK_ID
+        assert any(item["relationship_type"] == "plan-owned-by" and item["target_id"] == ORG_ID for item in items)
+        assert any(item["relationship_type"] == "plan-network" and item["target_id"] == NETWORK_ID for item in items)
+
+
+@pytest.mark.asyncio
+async def test_relationship_ledger_preserves_ambiguity_nested_period_and_source_scope(monkeypatch):
+    """A later binding or other source cannot turn a retained conflict into a resolved link."""
+
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE provider_directory_cms_npd_relationship SET resolution_status='ambiguous' "
+                    "WHERE resource_type='InsurancePlan' AND reference_field='network' "
+                    "AND target_reference='Organization/org-example'"
+                )
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_cms_npd_relationship VALUES "
+                    "('synthetic-dataset','cms-npd',repeat('a',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',1,1,'Organization/org-example',"
+                    "'resolved','2025-03-01',NULL)"
+                )
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_entity_source_binding VALUES "
+                    "('other-source','Organization','missing',:organization_id,NULL)"
+                ),
+                {"organization_id": ORG_ID},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_cms_npd_relationship VALUES "
+                    "('synthetic-dataset','other-source',repeat('a',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',2,1,'Organization/org-example','resolved',NULL,NULL),"
+                    "('synthetic-dataset','cms-npd',repeat('c',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',3,1,'Organization/org-example','resolved',NULL,NULL)"
+                )
+            )
+        plan_id = str(source_resource_uuid("cms-npd", "InsurancePlan", "plan-example"))
+        page = await read(sessions, cms_query("plans", "relationships", plan_id, 100))
+        networks = [
+            network_link for network_link in page["items"] if network_link["relationship_type"] == "plan-network"
+        ]
+        assert len(networks) == 3
+        assert any(
+            network_link["status"] == "conflict" and network_link["target_id"] is None for network_link in networks
+        )
+        assert any(
+            network_link["status"] == "resolved"
+            and network_link["target_id"] == NETWORK_ID
+            and network_link["effective_start"] == "2025-03-01"
+            for network_link in networks
+        )
+        assert any(
+            network_link["status"] == "unresolved" and network_link["target_id"] is None for network_link in networks
+        )
+        assert "plan-example" not in json.dumps(page)
 
 
 async def _add_plan(session, should_bind=True):

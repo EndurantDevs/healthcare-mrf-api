@@ -342,6 +342,17 @@ async def test_complete_release_publishes_with_real_database_guards(monkeypatch,
             ):
                 page = await read_cms_entities(session, DirectoryRead(kind, "cms-npd", "entities", None, None))
                 assert len(page["items"]) == expected_count
+            plan_id = str(
+                next(identity_row[2] for identity_row in resource_identities if identity_row[0] == "InsurancePlan")
+            )
+            links = await read_cms_entities(
+                session, DirectoryRead("plans", "cms-npd", "relationships", plan_id, None, 100)
+            )
+            plan_networks = [link for link in links["items"] if link["relationship_type"] == "plan-network"]
+            assert len(plan_networks) == 4
+            assert sum(link["status"] == "unresolved" for link in plan_networks) == 1
+            assert all(link["source_id"] == "cms-npd" for link in links["items"])
+            assert "network-1" not in json.dumps(links)
         await _assert_published_payload_guard(database, admission_result["dataset_id"])
         replay = await _admit(directory, receipt, "cms-test-replay")
         assert replay["dataset_id"] == admission_result["dataset_id"] and replay["replayed"] is True
