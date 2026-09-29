@@ -2021,8 +2021,8 @@ async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatc
 def test_normalize_triggered_by_bounds_database_value():
     assert control_imports._normalize_triggered_by("") == "api"
     assert (
-        control_imports._normalize_triggered_by("codex-retry-after-read-deadline-deploy")
-        == "codex-retry-after-read-deadline"
+        control_imports._normalize_triggered_by("batch-retry-after-read-deadline-deploy")
+        == "batch-retry-after-read-deadline"
     )
     assert len(control_imports._normalize_triggered_by("x" * 100)) == control_imports.MAX_TRIGGERED_BY_LENGTH
 
@@ -4281,9 +4281,9 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (39, 25, 27)
+    ) == (40, 26, 28)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 25
+    assert len(runnable_items) == 26
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
@@ -4329,6 +4329,16 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         "caresource",
         "molina",
     }
+
+
+def test_provider_directory_catalog_enables_cms_profile_source():
+    cms = next(entry for entry in provider_directory_source_catalog()["items"] if entry["entry_id"] == "cms-npd")
+
+    assert cms["source_ids"] == ["cms-npd"]
+    assert cms["resource_profile"] == "R8"
+    assert cms["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    assert cms["profile_enabled"] is True
+    assert cms["runnable"] is True
 
 
 def test_uhc_catalog_reports_supported_resources_without_enabling_import():

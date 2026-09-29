@@ -2,7 +2,6 @@
 
 import contextlib
 import importlib
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -55,11 +54,7 @@ async def test_dataset_fence_matches_current_publication(monkeypatch):
     ensure_alias = AsyncMock()
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
     monkeypatch.setattr(
-        entity_address_unified.importlib,
-        "import_module",
-        lambda _name: SimpleNamespace(
-            ensure_provider_directory_published_source_alias=ensure_alias
-        ),
+        importer, "ensure_provider_directory_published_source_alias", ensure_alias
     )
 
     await entity_address_unified._assert_current_provider_directory_dataset(
@@ -112,11 +107,7 @@ async def test_dataset_fence_repairs_exact_orphaned_alias(monkeypatch):
     ensure_alias = AsyncMock()
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
     monkeypatch.setattr(
-        entity_address_unified.importlib,
-        "import_module",
-        lambda _name: SimpleNamespace(
-            ensure_provider_directory_published_source_alias=ensure_alias
-        ),
+        importer, "ensure_provider_directory_published_source_alias", ensure_alias
     )
 
     await entity_address_unified._assert_current_provider_directory_dataset(
@@ -142,11 +133,7 @@ async def test_dataset_fence_rejects_alias_reconciliation_failure(monkeypatch):
     )
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
     monkeypatch.setattr(
-        entity_address_unified.importlib,
-        "import_module",
-        lambda _name: SimpleNamespace(
-            ensure_provider_directory_published_source_alias=ensure_alias
-        ),
+        importer, "ensure_provider_directory_published_source_alias", ensure_alias
     )
 
     with pytest.raises(RuntimeError, match="dataset fence changed"):

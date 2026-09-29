@@ -17,6 +17,7 @@ from process.provider_directory_rooted_graph_source_contract import (
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
+from tests.test_provider_directory_profile_selection_attestation import _execution
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -223,7 +224,7 @@ async def test_v4_serving_generation_uses_v6_source_delta(monkeypatch) -> None:
         AsyncMock(return_value=serving_state),
     )
     execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        object()
+        _execution()
     )
     try:
         materialization = await importer._profile_materialization_identity(

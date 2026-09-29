@@ -29,13 +29,13 @@ def source_resource_uuid(source_id, resource_type, resource_id):
 
 
 async def bind_resource_identity_batch(session, *, source_id, resource_type, resource_ids):
-    """Bind at most 100 already-validated IDs; caller commits each batch before cutover.
+    """Bind at most 1,000 already-validated IDs; caller commits each batch before cutover.
 
     This stores identity only. Admission must first reject conflicting duplicate
     resource payloads and must verify complete accepted-dataset binding coverage.
     It grants no publication authority, and replay cannot replace an existing ID.
     """
-    if not isinstance(resource_ids, list) or not resource_ids or len(resource_ids) > 100:
+    if not isinstance(resource_ids, list) or not resource_ids or len(resource_ids) > 1_000:
         raise ValueError("provider_directory_resource_identity_batch_invalid")
     identities_by_resource_id = {
         resource_id: source_resource_uuid(source_id, resource_type, resource_id) for resource_id in resource_ids

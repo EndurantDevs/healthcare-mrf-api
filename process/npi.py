@@ -28,6 +28,7 @@ from db.models import (AddressArchive, NPIAddress, NPIData,
                        NPIDataTaxonomyGroup, NPIPhoneStaffing, db)
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
+from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
 from process.ext.archive import unzip
 from process.ext.address_canon import (
     address_key_v1,
@@ -365,6 +366,34 @@ async def _archive_npi_index(
     await connection.execute(
         f"ALTER INDEX IF EXISTS {fixed_schema}.{fixed_index} "
         f"RENAME TO {archived_name};"
+    )
+
+
+async def _lock_npi_publication_relations(connection, *, schema, stage_table_by_live_table):
+    """Prelock every affected relation before rotation, preserving initial publication."""
+    names = sorted(
+        {
+            _postgres_identifier(name)
+            for live, stage in stage_table_by_live_table.items()
+            for name in (live, live + "_old", stage)
+        }
+    )
+    existing_names = await connection.fetch(
+        "SELECT name FROM unnest($2::text[]) AS relations(name) "
+        "WHERE to_regclass(format('%I.%I',$1::text,name)) IS NOT NULL ORDER BY name",
+        schema,
+        names,
+    )
+    installed_names = tuple(row["name"] for row in existing_names)
+    if not set(stage_table_by_live_table.values()).issubset(installed_names):
+        raise NPIPrerequisiteError("NPI staging table disappeared before publication")
+    private_names = tuple(name for name in installed_names if name not in stage_table_by_live_table)
+    await connection.execute(
+        "LOCK TABLE " + ", ".join(f"{_postgres_identifier(schema)}.{name}" for name in private_names)
+        + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+    )
+    await lock_live_serving_relations(
+        connection.execute, _postgres_identifier(schema), set(installed_names).intersection(stage_table_by_live_table)
     )
 
 
@@ -2628,148 +2657,154 @@ WHERE
         raise NPIPrerequisiteError("NPI import lease is missing")
     schema = _postgres_identifier(db_schema)
     publication_import_date = _canonical_publication_import_date(import_date)
-    publication_state_by_name: dict[str, object] = {}
-
-    async with (
-        suppress_control_run_heartbeat_persistence(run_id),
-        _npi_publication_transaction(
-            lease=lease,
-            schema=schema,
-            context=context,
-            publication_state_by_name=publication_state_by_name,
-        ),
-    ):
-        await lock_npi_publication_attempt(
-            lease.connection,
-            schema=schema,
-            run_id=run_id,
-            attempt_id=attempt_id,
-            attempt_started_at=attempt_started_at,
-        )
-        await raise_if_cancelled(ctx, {"run_id": run_id})
-        await _assert_npi_import_lease(context)
-
-        stage_table_by_live_table = {
-            _postgres_identifier(cls.__main_table__): _postgres_identifier(
-                staged_models_by_table[cls.__main_table__].__tablename__
-            )
-            for cls in processing_classes_array
-        }
-        await lease.connection.execute(
-            "LOCK TABLE "
-            + ", ".join(
-                f"{schema}.{stage_table}"
-                for stage_table in stage_table_by_live_table.values()
-            )
-            + " IN ACCESS EXCLUSIVE MODE"
-        )
-        await _install_npi_postseal_guards(
-            lease.connection,
-            schema=schema,
-            stage_tables=tuple(stage_table_by_live_table.values()),
-        )
-        await install_npi_result_revision_guards(
-            lease.connection,
-            schema_name=schema,
-            stage_tables=tuple(stage_table_by_live_table.values()),
-        )
-        await timed_shutdown_phase(
-            "search_taxonomy_projection_validation",
-            validate_npi_search_taxonomy_projection(
-                npi_table=stage_table_by_live_table["npi"],
-                taxonomy_table=stage_table_by_live_table["npi_taxonomy"],
-                schema=schema,
-                connection=lease.connection,
-            ),
-        )
-        stage_row_counts_by_table: dict[str, int] = {}
-        for table, stage_table in stage_table_by_live_table.items():
-            row_count = await lease.connection.fetchval(
-                f"SELECT count(*)::bigint FROM {schema}.{stage_table}"
-            )
-            if type(row_count) is not int or row_count < 0:
-                raise NPIPrerequisiteError("NPI staging census is invalid")
-            stage_row_counts_by_table[table] = row_count
-        publication_row_counts = _canonical_publication_row_counts(
-            stage_row_counts_by_table
-        )
-        published_address_count = stage_row_counts_by_table["npi_address"]
-        terminal_progress_by_name = {
-            "unit": "rows",
-            "done": published_address_count,
-            "total": published_address_count,
-            "pct": 100,
-            "message": "succeeded",
-            "phase": "npi published",
-        }
-        terminal_metrics_by_name.update(
-            {
-                "stage_rows": stage_row_counts_by_table,
-                "npi_address_rows": published_address_count,
-            }
-        )
-        await raise_if_cancelled(ctx, {"run_id": run_id})
-        await _assert_npi_import_lease(context)
-
-        for cls in processing_classes_array:
-            staged_model = staged_models_by_table[cls.__main_table__]
-            table = _postgres_identifier(staged_model.__main_table__)
-            stage_table = _postgres_identifier(staged_model.__tablename__)
-            index_definitions = tuple(
-                getattr(cls, "__my_initial_indexes__", ()) or ()
-            ) + tuple(getattr(cls, "__my_additional_indexes__", ()) or ())
-            index_suffixes = tuple(
-                index_definition.get(
-                    "name",
-                    "_".join(index_definition.get("index_elements")),
-                )
-                for index_definition in index_definitions
-            )
-
-            await timed_shutdown_phase(
-                f"publish_swap:{table}",
-                _rotate_npi_canonical_table(
+    for publication_attempt in range(1, 5):
+        publication_state_by_name: dict[str, object] = {}
+        try:
+            async with (
+                suppress_control_run_heartbeat_persistence(run_id),
+                _npi_publication_transaction(
+                    lease=lease,
+                    schema=schema,
+                    context=context,
+                    publication_state_by_name=publication_state_by_name,
+                ),
+            ):
+                await lock_npi_publication_attempt(
                     lease.connection,
                     schema=schema,
-                    live_table=table,
-                    stage_table=stage_table,
-                    index_suffixes=index_suffixes,
-                ),
-            )
-        relation_oids = await canonical_relation_oids(
-            lease.connection,
-            schema=schema,
-        )
-        publication_receipt = await insert_npi_publication_receipt(
-            lease.connection,
-            schema=schema,
-            publication_input=NpiCanonicalPublicationInput(
-                run_id,
-                attempt_id,
-                attempt_started_at,
-                evidence_receipt.chain_ref,
-                publication_import_date,
-                relation_oids,
-                publication_row_counts,
-            ),
-        )
-        await publish_local_npi_result_generation(
-            lease.connection,
-            schema_name=schema,
-            receipt=publication_receipt,
-        )
-        terminal_metrics_by_name["npi_canonical_publication"] = (
-            npi_publication_metrics(publication_receipt)
-        )
-        publication_state_by_name["progress"] = terminal_progress_by_name
-        publication_state_by_name["metrics"] = terminal_metrics_by_name
-        publication_state_by_name["commit"] = await mark_npi_publication_succeeded(
-            lease.connection,
-            schema=schema,
-            receipt=publication_receipt,
-            progress_by_name=terminal_progress_by_name,
-            metrics_by_name=terminal_metrics_by_name,
-        )
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    attempt_started_at=attempt_started_at,
+                )
+                await raise_if_cancelled(ctx, {"run_id": run_id})
+                await _assert_npi_import_lease(context)
+
+                stage_table_by_live_table = {
+                    _postgres_identifier(cls.__main_table__): _postgres_identifier(
+                        staged_models_by_table[cls.__main_table__].__tablename__
+                    )
+                    for cls in processing_classes_array
+                }
+                await lease.connection.execute(
+                    "LOCK TABLE "
+                    + ", ".join(
+                        f"{schema}.{stage_table}"
+                        for stage_table in stage_table_by_live_table.values()
+                    )
+                    + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                )
+                await _install_npi_postseal_guards(
+                    lease.connection,
+                    schema=schema,
+                    stage_tables=tuple(stage_table_by_live_table.values()),
+                )
+                await install_npi_result_revision_guards(
+                    lease.connection,
+                    schema_name=schema,
+                    stage_tables=tuple(stage_table_by_live_table.values()),
+                )
+                await timed_shutdown_phase(
+                    "search_taxonomy_projection_validation",
+                    validate_npi_search_taxonomy_projection(
+                        npi_table=stage_table_by_live_table["npi"],
+                        taxonomy_table=stage_table_by_live_table["npi_taxonomy"],
+                        schema=schema,
+                        connection=lease.connection,
+                    ),
+                )
+                stage_row_counts_by_table: dict[str, int] = {}
+                for table, stage_table in stage_table_by_live_table.items():
+                    row_count = await lease.connection.fetchval(
+                        f"SELECT count(*)::bigint FROM {schema}.{stage_table}"
+                    )
+                    stage_row_counts_by_table[table] = row_count
+                publication_row_counts = _canonical_publication_row_counts(
+                    stage_row_counts_by_table
+                )
+                published_address_count = stage_row_counts_by_table["npi_address"]
+                terminal_progress_by_name = {
+                    "unit": "rows",
+                    "done": published_address_count,
+                    "total": published_address_count,
+                    "pct": 100,
+                    "message": "succeeded",
+                    "phase": "npi published",
+                }
+                terminal_metrics_by_name.update(
+                    {
+                        "stage_rows": stage_row_counts_by_table,
+                        "npi_address_rows": published_address_count,
+                    }
+                )
+                await raise_if_cancelled(ctx, {"run_id": run_id})
+                await _assert_npi_import_lease(context)
+
+                await _lock_npi_publication_relations(
+                    lease.connection, schema=schema, stage_table_by_live_table=stage_table_by_live_table
+                )
+                for cls in processing_classes_array:
+                    staged_model = staged_models_by_table[cls.__main_table__]
+                    table = _postgres_identifier(staged_model.__main_table__)
+                    stage_table = _postgres_identifier(staged_model.__tablename__)
+                    index_definitions = tuple(
+                        getattr(cls, "__my_initial_indexes__", ()) or ()
+                    ) + tuple(getattr(cls, "__my_additional_indexes__", ()) or ())
+                    index_suffixes = tuple(
+                        index_definition.get(
+                            "name",
+                            "_".join(index_definition.get("index_elements")),
+                        )
+                        for index_definition in index_definitions
+                    )
+
+                    await timed_shutdown_phase(
+                        f"publish_swap:{table}",
+                        _rotate_npi_canonical_table(
+                            lease.connection,
+                            schema=schema,
+                            live_table=table,
+                            stage_table=stage_table,
+                            index_suffixes=index_suffixes,
+                        ),
+                    )
+                relation_oids = await canonical_relation_oids(
+                    lease.connection,
+                    schema=schema,
+                )
+                publication_receipt = await insert_npi_publication_receipt(
+                    lease.connection,
+                    schema=schema,
+                    publication_input=NpiCanonicalPublicationInput(
+                        run_id,
+                        attempt_id,
+                        attempt_started_at,
+                        evidence_receipt.chain_ref,
+                        publication_import_date,
+                        relation_oids,
+                        publication_row_counts,
+                    ),
+                )
+                await publish_local_npi_result_generation(
+                    lease.connection,
+                    schema_name=schema,
+                    receipt=publication_receipt,
+                )
+                terminal_metrics_by_name["npi_canonical_publication"] = (
+                    npi_publication_metrics(publication_receipt)
+                )
+                publication_state_by_name["progress"] = terminal_progress_by_name
+                publication_state_by_name["metrics"] = terminal_metrics_by_name
+                publication_state_by_name["commit"] = await mark_npi_publication_succeeded(
+                    lease.connection,
+                    schema=schema,
+                    receipt=publication_receipt,
+                    progress_by_name=terminal_progress_by_name,
+                    metrics_by_name=terminal_metrics_by_name,
+                )
+
+            break
+        except Exception as error:
+            await wait_for_publication_lock(error, publication_attempt)
 
     committed_result_by_name = context.get(_NPI_CONTROL_COMMITTED_RESULT_KEY)
     if type(committed_result_by_name) is not dict:

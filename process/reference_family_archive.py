@@ -1271,13 +1271,67 @@ def _is_legacy_cms_manifest(manifest: ReferenceFamilyManifest) -> bool:
 
 def _has_matching_manifest_stage_tables(manifest, tables) -> bool:
     if not _is_legacy_cms_manifest(manifest):
-        return tables == manifest.tables
+        return tables == manifest.tables or _has_compatible_cms_group_indexes(manifest, tables)
     return (
         len(tables) == 3
         and tables[:2] == manifest.tables
         and tables[2].model_name == "CMSDoctorGroupSite"
         and tables[2].table_name == "cms_doctor_group_site"
         and tables[2].row_count == 0
+    )
+
+
+def _has_compatible_cms_group_indexes(manifest, tables) -> bool:
+    """Allow only the reviewed address-index addition on an otherwise exact CMS family."""
+    if (
+        manifest.importer_id != "cms-doctors"
+        or len(manifest.tables) != 3
+        or len(tables) != 3
+        or tables[:2] != manifest.tables[:2]
+    ):
+        return False
+    expected, observed = manifest.tables[2], tables[2]
+    expected_fields, observed_fields = expected.as_dict(), observed.as_dict()
+    expected_fields.pop("schema_sha256")
+    observed_fields.pop("schema_sha256")
+    return expected_fields == observed_fields and any(
+        (expected.schema_sha256, observed.schema_sha256) == hashes for hashes in _cms_group_index_schema_hashes()
+    )
+
+
+def _has_matching_family_manifest(manifest, observed) -> bool:
+    """Keep exact manifest identity except the reviewed CMS lookup-index transition."""
+    expected_fields, observed_fields = manifest.as_dict(), observed.as_dict()
+    if _has_compatible_cms_group_indexes(manifest, observed.tables):
+        observed_fields["tables"] = expected_fields["tables"]
+        observed_fields["schema_sha256"] = expected_fields["schema_sha256"]
+    return expected_fields == observed_fields
+
+
+def _cms_group_index_schema_hashes():
+    """Pair exact old/new catalog digests, retaining each PostgreSQL constraint shape."""
+    columns = _legacy_cms_group_columns()
+    for constraints in _cms_group_constraint_orders(columns):
+        yield tuple(
+            catalog_identity._canonical_digest(
+                {
+                    "table_name": "cms_doctor_group_site",
+                    "columns": columns,
+                    "constraints": constraints,
+                    "indexes": sorted(indexes, key=_canonical_json),
+                }
+            )
+            for indexes in (_legacy_cms_group_indexes()[:3], _legacy_cms_group_indexes())
+        )
+
+
+def _cms_group_constraint_orders(columns):
+    """Retain exact catalog order under C and en_US collations without rehashing archives."""
+    not_null_constraints = _legacy_cms_group_constraints(columns, [{"contype": "n"}])
+    return (
+        _legacy_cms_group_constraints(columns, []),
+        sorted(not_null_constraints, key=lambda entry: (entry["contype"], entry["key_columns"])),
+        sorted(not_null_constraints, key=lambda entry: (entry["contype"], entry["key_columns"].strip("{}"))),
     )
 
 
@@ -1335,12 +1389,13 @@ def _legacy_cms_group_constraints(columns, constraints):
 
 
 def _legacy_cms_group_indexes():
-    """Describe the reviewed primary key and two lookup indexes."""
+    """Describe the reviewed primary key and three lookup indexes."""
     indexes = []
     for attribute, is_primary, opclass, is_collatable in (
         (1, True, "int8_ops", False),
         (2, False, "int8_ops", False),
         (4, False, "text_ops", True),
+        (5, False, "text_ops", True),
     ):
         indexes.append(
             {
@@ -1381,10 +1436,12 @@ async def _require_legacy_cms_group_schema(session, schema_name: str) -> None:
             constraint["contype"] = constraint["contype"].decode("ascii")
     expected_constraints = _legacy_cms_group_constraints(columns, constraints)
     observed_indexes = await catalog_identity._catalog_indexes(session, relation_oid)
+    known_indexes = _legacy_cms_group_indexes()
     if (
         observed_columns != columns
         or sorted(map(_canonical_json, constraints)) != sorted(map(_canonical_json, expected_constraints))
-        or sorted(map(_canonical_json, observed_indexes)) != sorted(map(_canonical_json, _legacy_cms_group_indexes()))
+        or sorted(map(_canonical_json, observed_indexes))
+        not in (sorted(map(_canonical_json, known_indexes[:3])), sorted(map(_canonical_json, known_indexes)))
     ):
         raise ReferenceFamilyArchiveError("legacy CMS synthesized group schema differs")
 
@@ -1412,7 +1469,7 @@ async def _validate_stage_manifest(
         if not _has_matching_manifest_stage_tables(validated, observed.tables):
             raise ReferenceFamilyArchiveError("reference family restored stage differs")
         await _require_legacy_cms_group_schema(session, ownership.schema_name)
-    elif observed.as_dict() != validated.as_dict():
+    elif not _has_matching_family_manifest(validated, observed):
         raise ReferenceFamilyArchiveError("reference family restored stage differs")
     return observed.tables
 
@@ -1948,12 +2005,20 @@ async def _lock_and_verify_activation(
     spec: ReferenceFamilySpec,
     ownership: ReferenceFamilyStageOwnership,
     expected_incumbent: ReferenceFamilyIncumbent,
+    *,
+    wait_for_readers: bool = False,
 ) -> None:
     async with _bounded_capture(session):
-        await _lock_family(session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE")
+        await _lock_family(session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE", nowait=True)
         incumbent_names = tuple(name for name, oid in expected_incumbent.relation_oids if oid is not None)
-        if incumbent_names:
-            await _lock_family(session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE")
+        if incumbent_names and wait_for_readers:
+            from process.entity_address_cutover_contract import lock_live_serving_relations
+
+            await lock_live_serving_relations(
+                lambda sql: session.execute(text(sql)), expected_incumbent.schema_name, incumbent_names
+            )
+        elif incumbent_names:
+            await _lock_family(session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE", nowait=True)
         await verify_reference_family_stage_ownership(session, ownership)
         await _verify_incumbent(session, expected_incumbent)
 
@@ -2135,7 +2200,7 @@ async def _activation_receipt(
         if _is_legacy_cms_manifest(manifest):
             if local_manifest.tables != tables or not _has_matching_manifest_stage_tables(manifest, tables):
                 raise ReferenceFamilyArchiveError("reference family activated receipt differs")
-        elif local_manifest.as_dict() != manifest.as_dict():
+        elif not _has_matching_family_manifest(manifest, local_manifest):
             raise ReferenceFamilyArchiveError("reference family activated receipt differs")
     return ReferenceFamilyActivationReceipt(
         spec.importer_id,
@@ -2253,16 +2318,13 @@ async def activate_validated_reference_family_stage(
     validation = validate_reference_family_validation_receipt(validation_receipt)
     _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
     spec = reference_family_spec(ownership.importer_id)
-    await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
+    await _lock_and_verify_activation(
+        session, spec, ownership, expected_incumbent, wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"}
+    )
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
     incoming_generation = _activation_source_generation(validated_manifest, cutover)
     if cutover.authority == "automatic":
-        await _require_automatic_cutover_generation(
-            session,
-            spec,
-            expected_incumbent,
-            incoming_generation,
-        )
+        await _require_automatic_cutover_generation(session, spec, expected_incumbent, incoming_generation)
     await _apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
     predecessor_schema_name, live_pairs = await _complete_validated_stage_activation(
         session,

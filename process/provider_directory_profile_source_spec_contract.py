@@ -25,8 +25,10 @@ def _is_source_id_list(source_ids: object) -> bool:
         and source_ids
         and all(
             isinstance(source_id, str)
-            and source_id.startswith("pdfhir_")
-            and len(source_id) > len("pdfhir_")
+            and (
+                source_id == "cms-npd"
+                or (source_id.startswith("pdfhir_") and len(source_id) > len("pdfhir_"))
+            )
             for source_id in source_ids
         )
     )

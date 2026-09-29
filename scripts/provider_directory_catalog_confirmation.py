@@ -137,8 +137,10 @@ def _canonical_coverage_fields(confirmation: dict[str, Any]) -> dict[str, Any]:
     return {**count_by_field, "coverage_note": coverage_note}
 
 
-def catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, Any]:
+def catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, Any] | None:
     """Validate and return the complete live-catalog confirmation."""
+    if "catalog_confirmation" in manifest and manifest["catalog_confirmation"] is None:
+        return None
     confirmation = manifest.get("catalog_confirmation")
     if (
         not isinstance(confirmation, dict)
@@ -160,6 +162,12 @@ def render_catalog_inventory_snapshot(
 ) -> list[str]:
     """Render the full-catalog snapshot separately from curated support entries."""
     confirmation = catalog_confirmation_fields(manifest)
+    if confirmation is None:
+        return [
+            "", "## Catalog Inventory Snapshot", "",
+            "Live catalog confirmation is not recorded in this public artifact. "
+            "Configured sources remain listed below; no observed inventory is claimed.",
+        ]
     support_by_entry = manifest["support_documentation"]["entry_support"]
     curated_entry_count = len(manifest["entries"]) + len(blocker_entries)
     acquisition_entry_count = sum(

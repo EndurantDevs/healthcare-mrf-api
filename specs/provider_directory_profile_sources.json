@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "release": "current-insurer-directories-v4",
-  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints enabled for unified doctor profiles, plus the official-file source when published from one eligible admitted retained semantic dataset and exactly one ready dataset-scoped enrichment generation: either complete coverage or reviewed retry-exhausted single-root coverage from the legacy Practitioner dataset or its separately acquired rooted combined successor. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Generic probe-only endpoints remain excluded.",
+  "release": "current-provider-directories-v5",
+  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints and the CMS National Provider Directory bulk FHIR source enabled for unified doctor profiles, plus the insurer official-file source when published from one eligible admitted retained semantic dataset and exactly one ready dataset-scoped enrichment generation: either complete coverage or reviewed retry-exhausted single-root coverage from the legacy Practitioner dataset or its separately acquired rooted combined successor. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Generic probe-only endpoints remain excluded.",
   "entry_ids": [
     "aetna-commercial-medicare",
     "alohr",
@@ -9,6 +9,7 @@
     "arkansas",
     "caresource",
     "cigna",
+    "cms-npd",
     "contra-costa",
     "devoted-health",
     "hap",
@@ -48,6 +49,7 @@
     }
   ],
   "source_ids": [
+    "cms-npd",
     "pdfhir_d68a896335981928bdbbb80e",
     "pdfhir_0f81c146991b27031b1ec366",
     "pdfhir_3e8f8d73e9f63b41f4f3fca5",
@@ -96,6 +98,7 @@
       "M5": {"resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
       "P1_DATASET": {"transport": "fhir_rest_exact_identifier", "resources": ["Practitioner"], "endpoint_collection_complete": false},
       "R8_DATASET": {"transport": "fhir_rest_rooted_reference_closure", "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "coverage_authority": "complete_or_reviewed_retry_exhausted_single_root", "rooted_graph_complete": true, "endpoint_collection_complete": false, "endpoint_complete": false},
+      "CMS_NPD_R4": {"transport": "cms_npd_bulk_files", "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]},
       "ALOHR_GRAPHQL_R4": {
         "transport": "graphql",
         "tenant": "alohr",
@@ -104,6 +107,7 @@
       }
     },
     "sources": [
+      {"entry_id": "cms-npd", "source_id": "cms-npd", "resource_profile": "CMS_NPD_R4"},
       {"entry_id": "aetna-commercial-medicare", "source_id": "pdfhir_d68a896335981928bdbbb80e", "resource_profile": "A7"},
       {"entry_id": "alohr", "source_id": "pdfhir_0f81c146991b27031b1ec366", "resource_profile": "ALOHR_GRAPHQL_R4"},
       {"entry_id": "amerihealth-caritas-carrier", "source_id": "pdfhir_3e8f8d73e9f63b41f4f3fca5", "resource_profile": "A6"},

@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
+
 from api.endpoint import npi as npi_module
 from tests.npi_location_hydration_support import (
     install_duplicate_detail_mocks,

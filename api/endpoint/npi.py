@@ -64,6 +64,9 @@ from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
+from api.provider_profile_snapshot import (
+    provider_profile_read_snapshot, provider_read_savepoint, snapshot_relation_available,
+)
 from api.provider_geo_sql import (
     ImportedGeoQuery,
     ImportedGeoStatements,
@@ -5526,6 +5529,8 @@ def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Option
 
 async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
     cache_key = _schema_cache_key(table_name)
+    if (is_available := snapshot_relation_available(cache_key)) is not None:
+        return is_available
     cached = _cache_get(_TABLE_EXISTS_CACHE, cache_key)
     if cached is not None:
         return bool(cached)
@@ -5682,6 +5687,8 @@ async def _is_provider_directory_profile_table_available(
     *,
     session: Any = None,
 ) -> bool:
+    if (is_available := snapshot_relation_available(table_ref)) is not None:
+        return is_available
     if table_ref in _PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN:
         return True
     relation_query_result = await _execute_stmt(
@@ -11878,13 +11885,11 @@ async def get_provider_profile(request, npi):
     except _ProviderProfileQueryError as exc:
         return response.json(exc.response_by_key, status=exc.status)
     normalized_npi = int(npi)
-    state_projection, fhir_profile_map = await asyncio.gather(
-        fetch_provider_profile_projection(normalized_npi),
-        _fetch_provider_directory_profile_map(
-            [normalized_npi],
-            include_evidence=query.include_evidence,
-        ),
-    )
+    async with provider_profile_read_snapshot(db, _runtime_db_schema()):
+        state_projection = await fetch_provider_profile_projection(normalized_npi)
+        fhir_profile_map = await _fetch_provider_directory_profile_map(
+            [normalized_npi], include_evidence=query.include_evidence,
+        )
     fhir_record_by_key = fhir_profile_map.get(normalized_npi)
     profile_by_key = _compose_requested_provider_profile(
         normalized_npi,
@@ -12372,87 +12377,6 @@ async def get_npi(request, npi):
         "address_site_key",
     )
     npi = int(npi)
-    request_session = _request_session(request)
-    profile_record: dict[str, Any] | None = None
-    if include_profile:
-        try:
-            profile_record = (
-                await _fetch_provider_directory_profile_map(
-                    [npi],
-                    include_evidence=include_evidence,
-                    session=request_session,
-                )
-            ).get(npi)
-        except Exception as exc:  # pragma: no cover - transient publication fallback
-            logger.debug(
-                "Provider Directory profile fetch failed for npi=%s: %s",
-                npi,
-                exc,
-            )
-    is_response_cache_enabled = bool(
-        not should_force_address_update
-        and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
-        and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
-    )
-    address_overlay_serving_identity: str | None = None
-    canonical_publication_identity: str | None = None
-    if is_response_cache_enabled:
-        try:
-            canonical_publication_identity = (
-                await _npi_canonical_publication_identity(
-                    session=request_session,
-                )
-            )
-            if canonical_publication_identity is None:
-                raise RuntimeError("npi_canonical_publication_identity_missing")
-            address_overlay_serving_identity = (
-                await _provider_directory_address_overlay_serving_identity(
-                    session=request_session,
-                )
-            )
-        except Exception as exc:
-            is_response_cache_enabled = False
-            logger.debug(
-                "NPI response cache identity fetch failed "
-                "for npi=%s; bypassing response cache: %s",
-                npi,
-                exc,
-            )
-    cache_key = _npi_detail_cache_key(
-        _NpiDetailCacheIdentity(
-            npi=npi,
-            view=provider_enrichment_view,
-            include_chain=include_chain_enrichment,
-            extra_info=include_extra_info,
-            sync_geocode=should_sync_geocode,
-            lookup_stored_geocode=should_lookup_stored_geocode,
-            include_sources=include_sources,
-            include_evidence=include_evidence,
-            include_profile=include_profile,
-            profile_generation=(
-                str(profile_record["profile"].get("generation_id"))
-                if profile_record and isinstance(profile_record.get("profile"), Mapping)
-                else None
-            ),
-            profile_serving_identity=(
-                str(profile_record.get("_serving_identity"))
-                if profile_record and profile_record.get("_serving_identity")
-                else None
-            ),
-            address_overlay_serving_identity=address_overlay_serving_identity,
-            canonical_publication_identity=canonical_publication_identity,
-            address_limit=address_limit,
-            address_offset=address_offset,
-            include_address_total=include_address_total,
-            address_key=address_key,
-            address_site_key=address_site_key,
-            address_grouping=address_grouping,
-        )
-    )
-    if is_response_cache_enabled:
-        cached_body = _npi_detail_response_cache_get(cache_key)
-        if cached_body is not None:
-            return response.raw(cached_body, content_type="application/json")
     db_schema = _runtime_db_schema()
     is_address_archive_cutover = _is_environment_flag_enabled(
         "HLTHPRT_ADDRESS_ARCHIVE_CUTOVER"
@@ -12945,120 +12869,221 @@ async def get_npi(request, npi):
 
         return address_by_field
 
-    detail_build_map: dict[str, Any] = {
-        # Bounded requests assemble provider identity without full address rows.
-        # A lightweight complete candidate query ranks the combined set below,
-        # then a second bounded query hydrates only the selected base rows.
-        "address_limit": 0,
-        "include_address_total": False,
-        "address_key": address_key,
-    }
-    if request_session is not None:
-        detail_build_map["session"] = request_session
-    if include_sources or include_evidence:
-        detail_build_map["include_sources"] = include_sources
-        detail_build_map["include_evidence"] = include_evidence
-    provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
-    has_provider_detail = bool(provider_detail_by_field)
-
-    if not has_provider_detail:
-        provider_detail_by_field = {"npi": npi}
-        if profile_record:
-            provider_detail_by_field["provider_directory_profile"] = (
-                profile_record["profile"]
+    async with provider_profile_read_snapshot(db, _runtime_db_schema(), include_detail=True) as request_session:
+        profile_record: dict[str, Any] | None = None
+        if include_profile:
+            try:
+                async with provider_read_savepoint(request_session):
+                    profile_record = (
+                        await _fetch_provider_directory_profile_map(
+                            [npi],
+                            include_evidence=include_evidence,
+                            session=request_session,
+                        )
+                    ).get(npi)
+            except Exception as exc:  # pragma: no cover - transient publication fallback
+                logger.debug(
+                    "Provider Directory profile fetch failed for npi=%s: %s",
+                    npi,
+                    exc,
+                )
+        is_response_cache_enabled = bool(
+            not should_force_address_update
+            and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
+            and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
+        )
+        address_overlay_serving_identity: str | None = None
+        canonical_publication_identity: str | None = None
+        if is_response_cache_enabled:
+            try:
+                async with provider_read_savepoint(request_session):
+                    canonical_publication_identity = (
+                        await _npi_canonical_publication_identity(
+                            session=request_session,
+                        )
+                    )
+                    address_overlay_serving_identity = (
+                        await _provider_directory_address_overlay_serving_identity(
+                            session=request_session,
+                        )
+                    )
+                is_response_cache_enabled = canonical_publication_identity is not None
+            except Exception as exc:
+                is_response_cache_enabled = False
+                logger.debug(
+                    "NPI response cache identity fetch failed "
+                    "for npi=%s; bypassing response cache: %s",
+                    npi,
+                    exc,
+                )
+        cache_key = _npi_detail_cache_key(
+            _NpiDetailCacheIdentity(
+                npi=npi,
+                view=provider_enrichment_view,
+                include_chain=include_chain_enrichment,
+                extra_info=include_extra_info,
+                sync_geocode=should_sync_geocode,
+                lookup_stored_geocode=should_lookup_stored_geocode,
+                include_sources=include_sources,
+                include_evidence=include_evidence,
+                include_profile=include_profile,
+                profile_generation=(
+                    str(profile_record["profile"].get("generation_id"))
+                    if profile_record and isinstance(profile_record.get("profile"), Mapping)
+                    else None
+                ),
+                profile_serving_identity=(
+                    str(profile_record.get("_serving_identity"))
+                    if profile_record and profile_record.get("_serving_identity")
+                    else None
+                ),
+                address_overlay_serving_identity=address_overlay_serving_identity,
+                canonical_publication_identity=canonical_publication_identity,
+                address_limit=address_limit,
+                address_offset=address_offset,
+                include_address_total=include_address_total,
+                address_key=address_key,
+                address_site_key=address_site_key,
+                address_grouping=address_grouping,
             )
-        if (
-            include_evidence
-            and profile_record
-            and profile_record.get("evidence") is not None
-        ):
-            provider_detail_by_field["provider_directory_profile_evidence"] = (
-                profile_record["evidence"]
-            )
+        )
+        if is_response_cache_enabled:
+            cached_body = _npi_detail_response_cache_get(cache_key)
+            if cached_body is not None:
+                return response.raw(cached_body, content_type="application/json")
+        detail_build_map: dict[str, Any] = {
+            # Bounded requests assemble provider identity without full address rows.
+            # A lightweight complete candidate query ranks the combined set below,
+            # then a second bounded query hydrates only the selected base rows.
+            "address_limit": 0,
+            "include_address_total": False,
+            "address_key": address_key,
+        }
+        if request_session is not None:
+            detail_build_map["session"] = request_session
+        if include_sources or include_evidence:
+            detail_build_map["include_sources"] = include_sources
+            detail_build_map["include_evidence"] = include_evidence
+        provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
+        has_provider_detail = bool(provider_detail_by_field)
 
-    provider_detail_by_field.pop("address_total", None)
+        if not has_provider_detail:
+            provider_detail_by_field = {"npi": npi}
+            if profile_record:
+                provider_detail_by_field["provider_directory_profile"] = (
+                    profile_record["profile"]
+                )
+            if (
+                include_evidence
+                and profile_record
+                and profile_record.get("evidence") is not None
+            ):
+                provider_detail_by_field["provider_directory_profile_evidence"] = (
+                    profile_record["evidence"]
+                )
 
-    overlay_addresses = await _fetch_provider_directory_address_overlay(
-        npi,
-        address_key=address_key,
-        address_site_key=address_site_key,
-        session=request_session,
-    )
-    initial_base_addresses = list(
-        provider_detail_by_field.get("address_list") or []
-    )
-    base_candidates = list(
-        await _fetch_npi_location_candidates(
+        provider_detail_by_field.pop("address_total", None)
+
+        overlay_addresses = await _fetch_provider_directory_address_overlay(
             npi,
             address_key=address_key,
             address_site_key=address_site_key,
             session=request_session,
         )
-    )
-    # A compatibility builder may retain direct rows despite its empty address
-    # window. Keep that evidence without replacing the complete candidate set.
-    base_candidates.extend(initial_base_addresses)
-    await _apply_location_statuses(
-        base_candidates,
-        session=request_session,
-    )
-    addresses = base_candidates + overlay_addresses
-    if address_key is not None:
-        addresses = [
-            address
-            for address in addresses
-            if isinstance(address, Mapping)
-            and str(address.get("address_key") or "").lower() == address_key
-        ]
-    if address_site_key is not None:
-        addresses = [
-            address
-            for address in addresses
-            if isinstance(address, Mapping)
-            and _is_address_site_key_match(address, address_site_key)
-        ]
-    if not include_extra_info:
-        addresses = [address for address in addresses if _is_public_street_level_address(address)]
-    addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
-    if not has_provider_detail and not profile_record and not addresses:
-        raise sanic.exceptions.NotFound
-    address_total = len(addresses)
-    selected_group_specs: list[dict[str, Any]] = []
-    if address_grouping == ADDRESS_GROUPING_PREMISE:
-        all_group_specs = _group_provider_locations_by_premise(addresses)
-        selected_group_specs = all_group_specs[
-            address_offset : address_offset + address_limit
-        ]
-        selected_candidates = [
-            member
-            for group_spec in selected_group_specs
-            for member in group_spec["members"][
-                :NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT
+        initial_base_addresses = list(
+            provider_detail_by_field.get("address_list") or []
+        )
+        base_candidates = list(
+            await _fetch_npi_location_candidates(
+                npi,
+                address_key=address_key,
+                address_site_key=address_site_key,
+                session=request_session,
+            )
+        )
+        # A compatibility builder may retain direct rows despite its empty address
+        # window. Keep that evidence without replacing the complete candidate set.
+        base_candidates.extend(initial_base_addresses)
+        await _apply_location_statuses(
+            base_candidates, session=request_session, use_request_session=True,
+        )
+        addresses = base_candidates + overlay_addresses
+        if address_key is not None:
+            addresses = [
+                address
+                for address in addresses
+                if isinstance(address, Mapping)
+                and str(address.get("address_key") or "").lower() == address_key
             ]
-        ]
-    else:
-        all_group_specs = []
-        selected_candidates = addresses
-        if address_limit is not None:
-            selected_candidates = selected_candidates[
+        if address_site_key is not None:
+            addresses = [
+                address
+                for address in addresses
+                if isinstance(address, Mapping)
+                and _is_address_site_key_match(address, address_site_key)
+            ]
+        if not include_extra_info:
+            addresses = [address for address in addresses if _is_public_street_level_address(address)]
+        addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
+        if not has_provider_detail and not profile_record and not addresses:
+            raise sanic.exceptions.NotFound
+        address_total = len(addresses)
+        selected_group_specs: list[dict[str, Any]] = []
+        if address_grouping == ADDRESS_GROUPING_PREMISE:
+            all_group_specs = _group_provider_locations_by_premise(addresses)
+            selected_group_specs = all_group_specs[
                 address_offset : address_offset + address_limit
             ]
-    addresses = await _hydrate_selected_provider_locations(
-        npi,
-        selected_candidates,
-        already_hydrated=False,
-        include_sources=include_sources,
-        include_evidence=include_evidence,
-        address_key=address_key,
-        session=request_session,
-    )
-    if addresses and (include_sources or include_evidence):
-        await _attach_selected_address_source_details(
-            addresses,
+            selected_candidates = [
+                member
+                for group_spec in selected_group_specs
+                for member in group_spec["members"][
+                    :NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT
+                ]
+            ]
+        else:
+            all_group_specs = []
+            selected_candidates = addresses
+            if address_limit is not None:
+                selected_candidates = selected_candidates[
+                    address_offset : address_offset + address_limit
+                ]
+        addresses = await _hydrate_selected_provider_locations(
+            npi,
+            selected_candidates,
+            already_hydrated=False,
             include_sources=include_sources,
-            include_role_evidence=include_evidence,
+            include_evidence=include_evidence,
+            address_key=address_key,
             session=request_session,
         )
+        if addresses and (include_sources or include_evidence):
+            await _attach_selected_address_source_details(
+                addresses,
+                include_sources=include_sources,
+                include_role_evidence=include_evidence,
+                session=request_session,
+            )
+        fetch_provider_enrichment = (
+            _fetch_provider_enrichment_summary_detail if provider_enrichment_view == "summary"
+            else _fetch_provider_enrichment_detail
+        )
+        provider_enrichment_payload: Optional[dict[str, Any]] = None
+        try:
+            async with provider_read_savepoint(request_session):
+                other_names = await _fetch_other_names(npi, session=request_session)
+                provider_enrichment_payload = await fetch_provider_enrichment(
+                    npi, include_chain=include_chain_enrichment, session=request_session,
+                )
+        except Exception as exc:  # pragma: no cover - optional legacy enrichment
+            logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
+            try:
+                async with provider_read_savepoint(request_session):
+                    other_names = await _fetch_other_names(npi, session=request_session)
+            except Exception:
+                other_names = []
+            provider_enrichment_payload = None
+    request_session = None
     update_address_tasks = [
         _update_address(address)
         for address in addresses
@@ -13142,41 +13167,6 @@ async def get_npi(request, npi):
             ),
         }
 
-    if provider_enrichment_view == "summary":
-        fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
-    else:
-        fetch_provider_enrichment = _fetch_provider_enrichment_detail
-
-    provider_enrichment_payload: Optional[dict[str, Any]] = None
-    try:
-        if request_session is not None:
-            other_names = await _fetch_other_names(npi, session=request_session)
-            provider_enrichment_payload = await fetch_provider_enrichment(
-                npi,
-                include_chain=include_chain_enrichment,
-                session=request_session,
-            )
-        else:
-            other_names_task = asyncio.create_task(_fetch_other_names(npi))
-            provider_enrichment_task = asyncio.create_task(
-                fetch_provider_enrichment(
-                    npi,
-                    include_chain=include_chain_enrichment,
-                )
-            )
-            other_names, provider_enrichment_payload = await asyncio.gather(
-                other_names_task,
-                provider_enrichment_task,
-            )
-    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
-        logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
-        if "other_names_task" in locals() and not other_names_task.done():
-            other_names_task.cancel()
-        try:
-            other_names = await _fetch_other_names(npi, session=request_session)
-        except Exception:  # pragma: no cover - defensive fallback
-            other_names = []
-        provider_enrichment_payload = None
     provider_detail_by_field["other_name_list"] = other_names
 
     existing_dba_names = [
@@ -14638,12 +14628,11 @@ async def _fetch_location_status_by_record_id(
             overlay_table_sql,
         )
         if use_request_session and session is not None:
-            query_result = await _execute_stmt(
-                status_query,
-                session=session,
-                params={"source_record_ids": normalized_record_ids},
-            )
-            return _status_map_from_result(query_result)
+            async with provider_read_savepoint(session):
+                query_result = await _execute_stmt(
+                    status_query, session=session, params={"source_record_ids": normalized_record_ids},
+                )
+                return _status_map_from_result(query_result)
         async with db.session() as status_session:
             query_result = await _execute_stmt(
                 status_query,

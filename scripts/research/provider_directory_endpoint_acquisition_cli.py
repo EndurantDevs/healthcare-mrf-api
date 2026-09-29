@@ -69,7 +69,10 @@ def _validated_observation_time(
     environment = operator_input.get("environment")
     if not isinstance(environment, str) or not ENVIRONMENT_PATTERN.fullmatch(environment):
         raise harness.ManifestError("operator input environment is invalid")
-    if environment != manifest.get("catalog_confirmation", {}).get("environment"):
+    confirmation = manifest.get("catalog_confirmation")
+    if not isinstance(confirmation, dict) or not confirmation.get("environment"):
+        raise harness.ManifestError("operator input requires a reviewed catalog confirmation")
+    if environment != confirmation["environment"]:
         raise harness.ManifestError("operator input environment does not match the manifest")
     plan_entry_by_id = {
         entry_plan["entry_id"]: entry_plan for entry_plan in operator_plan["entries"]

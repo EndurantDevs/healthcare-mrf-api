@@ -25,6 +25,7 @@ from tests.provider_directory_subset_completion_pg_support import (
 )
 from tests.tin_npi_connector_postgres_support import (
     asyncpg,
+    create_cms_stale_candidate_fixture,
     create_fence_tables,
     load_guard_migration,
     load_migration,
@@ -50,6 +51,7 @@ async def create_committed_subset_schema(monkeypatch):
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     await create_fence_tables(connection, schema)
+    await create_cms_stale_candidate_fixture(connection, schema)
     await run_migration(load_migration(), "upgrade", connection)
     await run_migration(load_guard_migration(), "upgrade", connection)
     scenario = _ScenarioView(connection, schema)

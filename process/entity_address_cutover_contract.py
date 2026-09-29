@@ -11,6 +11,28 @@ from dataclasses import dataclass
 from typing import Any
 
 
+class _ServingRelationLockTimeout(TimeoutError):
+    sqlstate = "55P03"
+
+
+async def lock_live_serving_relations(execute, schema, relation_names):
+    """Drain current readers in their lock order, with one short total wait budget.
+
+    Private stages and retired tables still require NOWAIT ownership checks. The
+    caller must roll back its whole transaction before retrying a failed lock.
+    """
+    if not relation_names:
+        return
+    quoted_schema = schema.replace('"', '""')
+    quoted_names = [name.replace('"', '""') for name in sorted(set(relation_names))]
+    qualified_names = ", ".join(f'"{quoted_schema}"."{name}"' for name in quoted_names)
+    try:
+        async with asyncio.timeout(0.1):
+            await execute(f"LOCK TABLE {qualified_names} IN ACCESS EXCLUSIVE MODE")
+    except TimeoutError as error:
+        raise _ServingRelationLockTimeout("serving_relation_lock_timeout") from error
+
+
 @dataclass(frozen=True)
 class EntityAddressCutoverCallbacks:
     """Run a local fence before cutover and a native receipt write after publish."""
@@ -143,3 +165,10 @@ def postgres_sqlstate(error: BaseException) -> str | None:
         if sqlstate:
             return str(sqlstate)
     return None
+
+
+async def wait_for_publication_lock(error: Exception, attempt: int, *, max_attempts: int = 4) -> None:
+    """Back off only after a whole failed publication transaction has rolled back."""
+    if attempt >= max_attempts or postgres_sqlstate(error) != "55P03":
+        raise error
+    await asyncio.sleep(min(25 * (2 ** (attempt - 1)), 100) / 1000)

@@ -133,10 +133,11 @@ class FhirTinNpiEvidence:
 
 @dataclass(frozen=True)
 class FhirOrganizationEvidenceResult:
-    """One non-sensitive extraction result and zero or more NPI assertions."""
+    """Tax evidence or CMS NPI-only candidates with no tax identity."""
 
     state: FhirOrganizationEvidenceState
     evidence: tuple[FhirTinNpiEvidence, ...] = ()
+    npi_candidates: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.state) is not FhirOrganizationEvidenceState:
@@ -147,6 +148,19 @@ class FhirOrganizationEvidenceResult:
             raise TinNpiConnectorError("FHIR evidence result is invalid")
         if (self.state is FhirOrganizationEvidenceState.MATCHED) != bool(self.evidence):
             raise TinNpiConnectorError("FHIR evidence result is inconsistent")
+        if (
+            type(self.npi_candidates) is not tuple
+            or self.npi_candidates != tuple(sorted(set(self.npi_candidates)))
+            or any(
+                type(npi) is not int or _normalize_npi(str(npi)) != npi
+                for npi in self.npi_candidates
+            )
+            or (
+                self.state is not FhirOrganizationEvidenceState.MISSING_EIN
+                and self.npi_candidates
+            )
+        ):
+            raise TinNpiConnectorError("FHIR NPI-only candidates are invalid")
 
 
 def _fhir_organization_identity_bytes(

@@ -707,6 +707,7 @@ async def _profile_database(monkeypatch):
     """Yield an isolated schema and remove it after the DB regression."""
     schema = f"provider_directory_profile_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.setenv("DB_SCHEMA", schema)
     database = Database()
     is_schema_created = False
     try:
@@ -1644,8 +1645,9 @@ async def test_uhc_facility_profile_preserves_membership_without_ownership(
             "WHERE npi = 1000000491;"
         )
 
-    _assert_uhc_facility_profile_rows(evidence_rows, profile_row)
-    await _assert_uhc_facility_profile_endpoint(monkeypatch, profile_row)
+        _assert_uhc_facility_profile_rows(evidence_rows, profile_row)
+        monkeypatch.setattr(npi_endpoint, "db", database)
+        await _assert_uhc_facility_profile_endpoint(monkeypatch, profile_row)
 
 
 @pytest.mark.asyncio

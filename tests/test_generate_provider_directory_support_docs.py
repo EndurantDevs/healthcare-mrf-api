@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from scripts import generate_provider_directory_support_docs as generator
+from tests.provider_directory_endpoint_acquisition_test_support import synthetic_verification_snapshot
 
 
 def test_rendered_support_matrix_represents_each_manifest_entry_once():
@@ -32,7 +33,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
     assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
-    assert "both _count=100 and _count=75 returned populated search sets" in rendered_document
+    assert "supports configured _count=100 and _count=75 searches" in rendered_document
     assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
     assert "UnitedHealthcare Official Provider Files (`uhc-provider-files`) | Acquisition-configured | None | Official files | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
@@ -41,11 +42,11 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 26 |" in rendered_document
+    assert "| Acquisition-configured | 27 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
     assert "| Probe-only | 13 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 42 |" in rendered_document
+    assert "| Total tracked | 43 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
@@ -58,8 +59,8 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Not required | 2026-08-26 | 2026-10-10 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
     assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
-    assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
+    assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |" in rendered_document
+    assert "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |" in rendered_document
     assert "scripts/update_provider_directory_verification.py" in rendered_document
     assert "## Known Not Importable" in rendered_document
     assert "Chorus Community Health Plans" in rendered_document
@@ -126,14 +127,7 @@ def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
     assert alohr_verification["access_verification"] == "not_recorded"
     assert alohr_verification["proof_state"] == "not_recorded"
     assert alohr_verification["terminal_status"] is None
-    assert alohr_verification["publication_readiness"][
-        "derived_artifact_state"
-    ] == (
-        "not_promoted"
-    )
-    assert alohr_verification["publication_readiness"]["unified_api_state"] == (
-        "not_ready"
-    )
+    assert "publication_readiness" not in alohr_verification
     assert "current_observation" not in alohr_verification
     assert "terminal_evidence" not in alohr_verification
     assert "OrganizationAffiliation" not in json.dumps(alohr_verification)
@@ -142,13 +136,15 @@ def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
 
 def test_rendered_live_proof_summarizes_resource_rows():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-    rendered_document = generator.render_markdown(manifest)
+    rendered_document = generator.render_markdown(
+        manifest, verification_snapshot=synthetic_verification_snapshot(manifest)
+    )
 
     assert "| Rows by resource |" in rendered_document
     assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
     assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Superseded (Promoted) | Superseded (Ready) |" in rendered_document
-    assert "HealthcareService: 1,108,600" in rendered_document
-    assert "Location: 280,847" in rendered_document
+    assert "HealthcareService: 3" in rendered_document
+    assert "Location: 3" in rendered_document
 
 
 @pytest.mark.parametrize(
@@ -239,7 +235,7 @@ def test_validate_manifest_rejects_external_support_without_documented_resources
         {
             "classification": "external",
             "launch_mode": "external_completed",
-            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "external_run_id": "run_11111111111111111111111111111111",
             "resource_profile": "NONE",
             "resources": [],
         }
@@ -270,7 +266,7 @@ def test_validate_manifest_rejects_external_method_mismatch():
         {
             "classification": "external",
             "launch_mode": "external_completed",
-            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "external_run_id": "run_11111111111111111111111111111111",
             "resource_profile": "NONE",
             "resources": [],
         }

@@ -51,3 +51,7 @@ def test_provider_directory_adoption_migrations_compile_offline_sql():
         '"mrf"."import_run_active_idempotency_idx"'
     )
     assert migration_sql.index(composite_create) < migration_sql.index(legacy_drop)
+    coverage_guard = "cms_npd_coverage_v1_current_requires_staged_upgrade"
+    coverage_column = 'ALTER TABLE "mrf".provider_directory_cms_serving_coverage ADD COLUMN proof_version'
+    assert coverage_guard in migration_sql
+    assert migration_sql.index(coverage_guard) < migration_sql.index(coverage_column)

@@ -81,6 +81,10 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         ");"
     )
     await database.status(
+        f"CREATE TABLE {schema}.provider_directory_cms_npd_stale_candidate "
+        "(dataset_id varchar(96) PRIMARY KEY);"
+    )
+    await database.status(
         f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
         "dataset_id varchar(96) NOT NULL, "
         "resource_type varchar(64) NOT NULL, "

@@ -26,6 +26,7 @@ __all__ = (
     "ProviderDirectoryEntitySourceBinding",
     "ProviderDirectoryEntityReleaseEvidence",
     "ProviderDirectoryCMSDoctorsGroupBinding",
+    "ProviderDirectoryCMSDoctorsSiteBinding",
 )
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
@@ -135,6 +136,30 @@ class ProviderDirectoryCMSDoctorsGroupBinding(Base):
     organization_id = Column(
         UUID(as_uuid=True),
         ForeignKey(f"{_SCHEMA}.provider_directory_organization_identity.organization_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class ProviderDirectoryCMSDoctorsSiteBinding(Base):
+    """Exact CMS Doctors adrs_id binding, separate from FHIR Locations."""
+
+    __tablename__ = "provider_directory_cms_doctors_site_binding"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("adrs_id"),
+        UniqueConstraint("site_id"),
+        CheckConstraint(
+            "adrs_id <> '' AND adrs_id = btrim(adrs_id)",
+            name="provider_directory_cms_doctors_site_address_check",
+        ),
+        {"schema": _SCHEMA, "extend_existing": True},
+    )
+
+    adrs_id = Column(String(256), nullable=False)
+    site_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{_SCHEMA}.provider_directory_site_identity.site_id", ondelete="RESTRICT"),
         nullable=False,
     )
     created_at = Column(TIMESTAMP(timezone=True), nullable=False)

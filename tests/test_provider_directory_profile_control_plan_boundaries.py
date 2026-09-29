@@ -15,12 +15,6 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from .test_provider_directory_profile_selection_attestation import _execution
-from .test_provider_directory_profile_capacity import _geometry_payload
-from .test_provider_directory_profile_control_capacity import (
-    _bound_control_wal_projection,
-    _control_wal_plan_input,
-)
 from .provider_directory_profile_execution_test_support import (
     _capacity_consumption_row,
     _capacity_geometry_identity,
@@ -28,6 +22,12 @@ from .provider_directory_profile_execution_test_support import (
     _published_dataset_state,
     _wal_tracker_admission,
 )
+from .test_provider_directory_profile_capacity import _geometry_payload
+from .test_provider_directory_profile_control_capacity import (
+    _bound_control_wal_projection,
+    _control_wal_plan_input,
+)
+from .test_provider_directory_profile_selection_attestation import _execution
 
 importer = importlib.import_module("process.provider_directory_fhir")
 capacity = importlib.import_module("process.provider_directory_profile_capacity")
@@ -350,10 +350,11 @@ def _patch_profile_cutover_noops(monkeypatch):
         "_assert_provider_directory_profile_delta_identity",
         "_lock_provider_directory_artifact_tables",
         "_promote_provider_directory_artifact_datasets",
-        "_apply_provider_directory_profile_delta",
+        "_apply_provider_directory_profile_delta_rows",
         "_finalize_provider_directory_profile_delta_scratch",
     ):
         monkeypatch.setattr(importer, dependency_name, AsyncMock())
+    monkeypatch.setattr(importer, "_finish_provider_directory_profile_delta", AsyncMock(return_value=None))
     monkeypatch.setattr(
         importer,
         "_resolve_provider_directory_profile_delta_replay",
@@ -394,6 +395,8 @@ def _patch_profile_cutover_retry_dependencies(
 
     _patch_profile_cutover_noops(monkeypatch)
     monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace())
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_capacity_admission",
@@ -427,11 +430,15 @@ async def _run_profile_cutover_lock_retries(
     fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
         fence
     )
+    profile_delta = SimpleNamespace(schema="mrf")
     try:
         await importer._retry_provider_directory_artifact_bundle_promotion(
             (),
-            profile_delta=SimpleNamespace(schema="mrf"),
+            profile_delta=profile_delta,
         )
+        apply_rows = importer._apply_provider_directory_profile_delta_rows
+        apply_rows.assert_awaited_once_with(profile_delta, pending_commit_items=0)
+        importer._finish_provider_directory_profile_delta.assert_awaited_once_with(profile_delta, apply_rows.return_value)
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(
             fence_token
