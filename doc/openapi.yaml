@@ -60,6 +60,80 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReadinessResponse'
+  /provider-directory/entities/{kind}:
+    parameters:
+      - $ref: '#/components/parameters/DirectoryKind'
+    get:
+      operationId: listProviderDirectoryEntities
+      summary: List source-bound provider directory entities
+      description: Upstream read for the authenticated gateway. Cursors are opaque and bound to the selected source generation.
+      parameters:
+        - $ref: '#/components/parameters/DirectorySourceId'
+        - $ref: '#/components/parameters/DirectoryGenerationId'
+        - $ref: '#/components/parameters/DirectoryLimit'
+        - $ref: '#/components/parameters/DirectoryCursor'
+      responses:
+        '200':
+          description: One page from the accepted source generation.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DirectoryEntityPage'
+        '400': {$ref: '#/components/responses/DirectoryBadRequest'}
+        '404': {$ref: '#/components/responses/DirectoryNotFound'}
+        '409': {$ref: '#/components/responses/DirectoryStale'}
+        '503': {$ref: '#/components/responses/DirectoryUnavailable'}
+  /provider-directory/entities/{kind}/{entity_id}:
+    parameters:
+      - $ref: '#/components/parameters/DirectoryKind'
+      - $ref: '#/components/parameters/DirectoryEntityId'
+    get:
+      operationId: getProviderDirectoryEntity
+      summary: Read one source-bound provider directory entity
+      parameters:
+        - $ref: '#/components/parameters/DirectorySourceId'
+        - $ref: '#/components/parameters/DirectoryGenerationId'
+      responses:
+        '200':
+          description: The exact entity in the accepted source generation.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DirectoryEntityDetail'
+        '400': {$ref: '#/components/responses/DirectoryBadRequest'}
+        '404': {$ref: '#/components/responses/DirectoryNotFound'}
+        '409': {$ref: '#/components/responses/DirectoryStale'}
+        '503': {$ref: '#/components/responses/DirectoryUnavailable'}
+  /provider-directory/entities/{kind}/{entity_id}/relationships:
+    parameters:
+      - $ref: '#/components/parameters/DirectoryKind'
+      - $ref: '#/components/parameters/DirectoryEntityId'
+    get:
+      operationId: listProviderDirectoryEntityRelationships
+      summary: List explicit source relationships for one entity
+      description: Unresolved references retain a null target ID; no ownership is inferred.
+      parameters:
+        - $ref: '#/components/parameters/DirectorySourceId'
+        - $ref: '#/components/parameters/DirectoryGenerationId'
+        - $ref: '#/components/parameters/DirectoryLimit'
+        - $ref: '#/components/parameters/DirectoryCursor'
+      responses:
+        '200':
+          description: One page of explicit relationships from the accepted source generation.
+          headers:
+            Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DirectoryRelationshipPage'
+        '400': {$ref: '#/components/responses/DirectoryBadRequest'}
+        '404': {$ref: '#/components/responses/DirectoryNotFound'}
+        '409': {$ref: '#/components/responses/DirectoryStale'}
+        '503': {$ref: '#/components/responses/DirectoryUnavailable'}
   /coverage/statistics:
     get:
       operationId: getCoverageStatistics
@@ -6979,6 +7053,11 @@ paths:
                 $ref: '#/components/schemas/ClinicalCrosswalkListResponse'
 components:
   headers:
+    DirectoryCacheControl:
+      description: Source-bound responses must not be stored.
+      schema:
+        type: string
+        enum: ['private, no-store']
     BillingSearchCacheControl:
       description: |
         Present on exact billing-search responses, which are private and must
@@ -6998,6 +7077,54 @@ components:
         type: string
         enum: ['private, no-store']
   parameters:
+    DirectoryKind:
+      name: kind
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [organizations, sites, payers, plans, networks, medical-groups, practitioner-roles]
+    DirectoryEntityId:
+      name: entity_id
+      in: path
+      required: true
+      description: UUID for all kinds except payer, which uses its existing opaque ID.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    DirectorySourceId:
+      name: source_id
+      in: query
+      required: true
+      description: cms-doctors for medical-groups; cms-npd for the other kinds.
+      schema:
+        type: string
+        pattern: '^[a-z0-9_-]{1,64}$'
+    DirectoryGenerationId:
+      name: generation_id
+      in: query
+      description: Opaque generation returned by the preceding page.
+      schema:
+        type: string
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]+$'
+    DirectoryLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    DirectoryCursor:
+      name: cursor
+      in: query
+      description: Opaque cursor; requires the matching generation_id and limit.
+      schema:
+        type: string
+        maxLength: 512
+        pattern: '^[A-Za-z0-9_-]+$'
     CustomImportProviderReadContext:
       name: X-HealthPorta-Extension-Read-Context
       in: header
@@ -7110,6 +7237,34 @@ components:
         minLength: 1
         maxLength: 512
   responses:
+    DirectoryBadRequest:
+      description: Invalid source selector or bounded read request.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DirectoryReadError'}
+    DirectoryNotFound:
+      description: Entity or kind was not found.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DirectoryReadError'}
+    DirectoryStale:
+      description: Generation or cursor is stale; restart pagination.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DirectoryReadError'}
+    DirectoryUnavailable:
+      description: Source generation cannot be served safely.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/DirectoryCacheControl'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DirectoryReadError'}
     CustomImportProviderInvalidRequest:
       description: The signed provider request or cursor violates the bounded read contract.
       headers:
@@ -7174,6 +7329,78 @@ components:
           schema:
             $ref: '#/components/schemas/FHIRFormularyServingUnavailableResponse'
   schemas:
+    DirectoryReadError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+    DirectoryEvidence:
+      type: object
+      required: [source_id, resource_type, record_key, release_id, observed_at]
+      properties:
+        source_id: {type: string}
+        resource_type: {type: string}
+        record_key: {type: string}
+        release_id: {type: string}
+        observed_at: {type: string, format: date-time}
+    DirectoryEntity:
+      type: object
+      required: [id, kind, source_id, display_name, status, effective_start, effective_end, evidence]
+      properties:
+        id: {type: string}
+        kind: {type: string}
+        source_id: {type: string}
+        display_name: {type: string, nullable: true}
+        status: {type: string, enum: [active, inactive, conflict, unknown]}
+        effective_start: {type: string, format: date, nullable: true}
+        effective_end: {type: string, format: date, nullable: true}
+        evidence:
+          type: array
+          items: {$ref: '#/components/schemas/DirectoryEvidence'}
+    DirectoryRelationship:
+      type: object
+      required: [relationship_key, relationship_type, source_id, target_kind, target_id, status, effective_start, effective_end, evidence]
+      properties:
+        relationship_key: {type: string}
+        relationship_type: {type: string}
+        source_id: {type: string}
+        target_kind: {type: string}
+        target_id: {type: string, nullable: true}
+        status: {type: string, enum: [resolved, unresolved, conflict]}
+        effective_start: {type: string, format: date, nullable: true}
+        effective_end: {type: string, format: date, nullable: true}
+        evidence:
+          type: array
+          items: {$ref: '#/components/schemas/DirectoryEvidence'}
+    DirectoryEntityPage:
+      type: object
+      required: [generation_id, items, next_cursor]
+      properties:
+        generation_id: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/DirectoryEntity'}
+        next_cursor: {type: string, nullable: true}
+    DirectoryEntityDetail:
+      type: object
+      required: [generation_id, item]
+      properties:
+        generation_id: {type: string}
+        item: {$ref: '#/components/schemas/DirectoryEntity'}
+    DirectoryRelationshipPage:
+      type: object
+      required: [generation_id, items, next_cursor]
+      properties:
+        generation_id: {type: string}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/DirectoryRelationship'}
+        next_cursor: {type: string, nullable: true}
     Error:
       type: object
       properties:

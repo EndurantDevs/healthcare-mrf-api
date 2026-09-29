@@ -123,6 +123,8 @@ async def main():
                 "provider_directory_site_identity",
                 "provider_directory_entity_source_binding",
                 "provider_directory_entity_release_evidence",
+                "provider_directory_cms_serving_coverage",
+                "provider_directory_resource_identity",
                 "provider_directory_cms_doctors_group_binding",
                 "provider_directory_insurance_network_identity",
                 "provider_directory_insurance_network_source_binding",
@@ -221,6 +223,20 @@ def _run_alembic(environment: dict[str, str], *arguments: str) -> None:
         env=environment,
         check=True,
     )
+
+
+def _seed_runtime_schema(environment: dict[str, str], target_revision: str) -> None:
+    """Build one disposable adoption schema at the requested revision."""
+
+    _run_alembic(environment, "stamp", BASELINE_REVISION)
+    _run_alembic(environment, "upgrade", RUNTIME_SEED_REVISION)
+    subprocess.run(
+        [sys.executable, "-c", RUNTIME_SCHEMA_SEED],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+    )
+    _run_alembic(environment, "upgrade", target_revision)
 
 
 async def _connect(url):
@@ -399,18 +415,11 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
 
     asyncio.run(reset_adoption_schema())
     try:
-        _run_alembic(environment, "stamp", BASELINE_REVISION)
-        _run_alembic(environment, "upgrade", RUNTIME_SEED_REVISION)
-        subprocess.run(
-            [sys.executable, "-c", RUNTIME_SCHEMA_SEED],
-            cwd=ROOT,
-            env=environment,
-            check=True,
-        )
-        _run_alembic(environment, "upgrade", "head")
+        _seed_runtime_schema(environment, "head")
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
 
-        _run_alembic(environment, "downgrade", PRE_REPAIR_REVISION)
+        asyncio.run(reset_adoption_schema())
+        _seed_runtime_schema(environment, PRE_REPAIR_REVISION)
 
         async def install_legacy_index() -> None:
             connection = await _connect(url)
