@@ -8068,7 +8068,7 @@ def _parse_organization_resource(
     return ProviderDirectoryOrganization, {
         **base,
         "npi": _resource_npi(resource, source_id=base["source_id"]),
-        "tax_id": _tin(resource),
+        "tax_id": _tin(resource, source_id=base["source_id"]),
         "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
         "identifiers": _normalized_identifiers(resource.get("identifier")),
         "name": _clean_text(resource.get("name")),

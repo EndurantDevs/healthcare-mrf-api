@@ -876,6 +876,20 @@ async def _publish_covered_candidate(fhir, candidate, identity, directory, recei
     return state
 
 
+async def _tax_candidate_followup_status(fhir: Any, directory: Path, candidate: Any, identity: dict[str, Any]):
+    """Keep optional tax-candidate work outside the core publication result."""
+    try:
+        return await importlib.import_module("process.cms_npd_tax_candidate_followup").cms_npd_tax_candidate_followup(
+            fhir,
+            release_directory=directory,
+            dataset_id=candidate.dataset_id,
+            vector_sha256=identity["vector_sha256"],
+            generated_at=identity["generated_at"],
+        )
+    except Exception:
+        return {"status": "failed", "retryable": True, "retry_via": "same_byte_import"}
+
+
 async def _run_acquired(
     ctx: dict[str, Any],
     task: dict[str, Any],
@@ -914,6 +928,13 @@ async def _run_acquired(
     )
     if dataset_followup is None:
         raise RuntimeError("cms_npd_dataset_followup_missing")
+    # Finish the publication run so its required address follow-up can be dispatched.
+    # Optional tax evidence is produced on the next same-byte replay.
+    tax_candidate_status_by_field = (
+        await _tax_candidate_followup_status(fhir, directory, candidate, identity)
+        if candidate.already_published or task.get("cms_npd_rollback_vector_sha256")
+        else {"status": "pending", "retryable": True, "retry_via": "same_byte_import"}
+    )
     return {
         "source_id": SOURCE_ID,
         "dataset_id": candidate.dataset_id,
@@ -922,6 +943,7 @@ async def _run_acquired(
         "status": "published",
         "replayed": candidate.already_published,
         "dataset_followup": dataset_followup,
+        "tax_candidates": tax_candidate_status_by_field,
     }
 
 

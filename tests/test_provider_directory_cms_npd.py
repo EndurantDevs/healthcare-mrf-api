@@ -186,6 +186,11 @@ async def test_unchanged_run_skips_acquisition_and_preserves_required_followup(m
     recheck = Mock()
     monkeypatch.setattr(cms.source, "assert_observed_release_unchanged", recheck)
     monkeypatch.setattr(cms, "_current_observed_publication", AsyncMock(return_value=state_by_field))
+    monkeypatch.setattr(
+        cms,
+        "_completed_tax_candidate_status",
+        AsyncMock(return_value={"status": "complete", "retryable": False}),
+    )
     acquire = Mock(side_effect=AssertionError("unchanged release must not be acquired"))
     monkeypatch.setattr(cms.source, "acquire_release", acquire)
     monkeypatch.setattr(cms, "_run_acquired", AsyncMock(side_effect=AssertionError("no DB rebuild")))
@@ -213,6 +218,11 @@ async def test_unchanged_run_fails_closed_when_final_probe_changes(monkeypatch):
     monkeypatch.setattr(cms.source, "observe_release", Mock(return_value=_observation()))
     monkeypatch.setattr(
         cms, "_current_observed_publication", AsyncMock(return_value={"acquisition_root_run_id": "root"})
+    )
+    monkeypatch.setattr(
+        cms,
+        "_completed_tax_candidate_status",
+        AsyncMock(return_value={"status": "complete", "retryable": False}),
     )
     monkeypatch.setattr(
         cms.source,
@@ -910,11 +920,8 @@ async def test_replaced_release_after_validation_never_reaches_cutover(monkeypat
     dispose.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeypatch, tmp_path: Path):
-    """Reopen retained bytes without consulting the upstream CMS endpoint."""
-    receipt_by_field = _receipt()
-    identity = cms.release_identity(receipt_by_field)
+def _stub_rollback_publication(monkeypatch, identity):
+    """Provide a published candidate while keeping upstream verification observable."""
     candidate = SimpleNamespace(
         dataset_id="rollback-dataset",
         acquisition_root_run_id="run-synthetic",
@@ -949,6 +956,44 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
     monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", AsyncMock())
     coverage = importlib.import_module("process.provider_directory_cms_serving_coverage")
     monkeypatch.setattr(coverage, "validate_cms_candidate_coverage", AsyncMock())
+    tax_followup = AsyncMock(return_value={"status": "complete", "retryable": False})
+    monkeypatch.setattr(
+        importlib.import_module("process.cms_npd_tax_candidate_followup"),
+        "cms_npd_tax_candidate_followup",
+        tax_followup,
+    )
+    return candidate_factory, local_rechecks, upstream_verify, tax_followup
+
+
+@pytest.mark.asyncio
+async def test_new_publication_defers_optional_tax_until_same_byte_replay(monkeypatch, tmp_path: Path):
+    receipt_by_field = _receipt()
+    identity = cms.release_identity(receipt_by_field)
+    _, _, _, tax_followup = _stub_rollback_publication(monkeypatch, identity)
+
+    async def run_preflight(*_args, **kwargs):
+        await kwargs["before_cutover"](object())
+
+    monkeypatch.setattr(cms, "publish_validated_source_local_dataset", AsyncMock(side_effect=run_preflight))
+    result = await cms._run_acquired(
+        {"context": {}},
+        {"import_resources": True, "full_refresh": True},
+        "run-synthetic",
+        tmp_path,
+        receipt_by_field,
+        None,
+    )
+    assert result["dataset_followup"] == {"status": "required"}
+    assert result["tax_candidates"] == {"status": "pending", "retryable": True, "retry_via": "same_byte_import"}
+    tax_followup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeypatch, tmp_path: Path):
+    """Reopen retained bytes without consulting the upstream CMS endpoint."""
+    receipt_by_field = _receipt()
+    identity = cms.release_identity(receipt_by_field)
+    candidate_factory, local_rechecks, upstream_verify, tax_followup = _stub_rollback_publication(monkeypatch, identity)
 
     async def run_preflight(*_args, **kwargs):
         await kwargs["before_cutover"](object())
@@ -969,6 +1014,8 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
     assert candidate_key.startswith("cms-npd-rollback:")
     assert len(local_rechecks) == 3
     assert admission_summary["dataset_id"] == "rollback-dataset"
+    assert admission_summary["tax_candidates"] == {"status": "complete", "retryable": False}
+    tax_followup.assert_awaited_once()
     publisher.assert_awaited_once()
     upstream_verify.assert_not_awaited()
 
