@@ -19,3 +19,4 @@ from db.models.hospital_price_header import *
 from db.models.hospital_price_facts import *
 from db.models.custom_import import *
 from db.models.facility_address_contribution import *
+from db.models.provider_directory_insurance_network_identity import *

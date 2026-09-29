@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import asyncpg
@@ -21,12 +21,9 @@ from tests.provider_directory_subset_abandonment_adoption_support import (
     assert_abandonment_object_shapes,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 OPT_IN_DSN_ENV = "HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN"
-DISPOSABLE_DATABASE_PATTERN = re.compile(
-    r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$"
-)
+DISPOSABLE_DATABASE_PATTERN = re.compile(r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$")
 BASELINE_REVISION = "20260610143000_address_checksums_bigint"
 RUNTIME_SEED_REVISION = "20260709110000_provider_directory_overlay_coordinates"
 PRE_REPAIR_REVISION = "20260714120000_ptg2_v3_schema_gc_consistency"
@@ -126,6 +123,9 @@ async def main():
                 "provider_directory_entity_source_binding",
                 "provider_directory_entity_release_evidence",
                 "provider_directory_cms_doctors_group_binding",
+                "provider_directory_insurance_network_identity",
+                "provider_directory_insurance_network_source_binding",
+                "provider_directory_insurance_network_plan_evidence",
                 "provider_directory_profile_build_checkpoint",
                 "provider_directory_profile_capacity_lease_consumption",
                 "provider_directory_profile_capacity_preflight_receipt",
@@ -186,9 +186,7 @@ def _database_url():
         pytest.fail(f"{OPT_IN_DSN_ENV} must use PostgreSQL")
     database_name = str(url.database or "")
     if not DISPOSABLE_DATABASE_PATTERN.fullmatch(database_name):
-        pytest.fail(
-            f"refusing non-disposable PostgreSQL database {database_name!r}"
-        )
+        pytest.fail(f"refusing non-disposable PostgreSQL database {database_name!r}")
     if not url.host or not url.username:
         pytest.fail(f"{OPT_IN_DSN_ENV} must include an explicit host and user")
     return url
@@ -339,33 +337,16 @@ async def _activation_object_shape_records(
 def _assert_activation_function_shapes(function_records) -> None:
     """Require the three hardened activation functions."""
 
-    assert {
-        function_record["proname"] for function_record in function_records
-    } == (
-        _EXPECTED_ACTIVATION_FUNCTIONS
-    )
-    assert all(
-        function_record["prosecdef"] is True
-        for function_record in function_records
-    )
-    assert all(
-        function_record["proconfig"] == ["search_path=pg_catalog"]
-        for function_record in function_records
-    )
+    assert {function_record["proname"] for function_record in function_records} == (_EXPECTED_ACTIVATION_FUNCTIONS)
+    assert all(function_record["prosecdef"] is True for function_record in function_records)
+    assert all(function_record["proconfig"] == ["search_path=pg_catalog"] for function_record in function_records)
 
 
 def _assert_activation_trigger_shapes(trigger_records) -> None:
     """Require the four activation triggers to remain ENABLE ALWAYS."""
 
-    assert {
-        trigger_record["tgname"] for trigger_record in trigger_records
-    } == (
-        _EXPECTED_ACTIVATION_TRIGGERS
-    )
-    assert all(
-        trigger_record["tgenabled"] == "A"
-        for trigger_record in trigger_records
-    )
+    assert {trigger_record["tgname"] for trigger_record in trigger_records} == (_EXPECTED_ACTIVATION_TRIGGERS)
+    assert all(trigger_record["tgenabled"] == "A" for trigger_record in trigger_records)
 
 
 async def _assert_activation_object_shapes(
@@ -431,9 +412,7 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         async def install_legacy_index() -> None:
             connection = await _connect(url)
             try:
-                await connection.execute(
-                    f'DROP INDEX "{ADOPTION_SCHEMA}"."{ACTIVE_INDEX}"'
-                )
+                await connection.execute(f'DROP INDEX "{ADOPTION_SCHEMA}"."{ACTIVE_INDEX}"')
                 await connection.execute(
                     f'CREATE INDEX "{ACTIVE_INDEX}" '
                     f'ON "{ADOPTION_SCHEMA}"."{PLAN_TABLE}" '
