@@ -4,15 +4,15 @@ from sanic import response
 from sanic.blueprints import Blueprint
 from sanic.exceptions import SanicException
 
-from api.control import blueprint as control_blueprint, control_error
+from api.control import blueprint as control_blueprint
+from api.control import control_error
 from api.control_execution_evidence import blueprint as execution_evidence_blueprint
-from api.metrics import blueprint as metrics_blueprint
+from api.endpoint.clinical import blueprint as v1_clinical
+from api.endpoint.codes import blueprint as v1_codes
+from api.endpoint.coverage import blueprint as v1_coverage
+from api.endpoint.extension_reads import blueprint as v1_custom_import
 from api.endpoint.formulary import blueprint as v1_formulary
 from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
-from api.endpoint.coverage import blueprint as v1_coverage
-from api.endpoint.codes import blueprint as v1_codes
-from api.endpoint.clinical import blueprint as v1_clinical
-from api.endpoint.extension_reads import blueprint as v1_custom_import
 from api.endpoint.geo import blueprint as v1_geo
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
 from api.endpoint.hospital_prices import blueprint as v1_hospital_prices
@@ -20,18 +20,20 @@ from api.endpoint.importer import blueprint as v1_import
 from api.endpoint.issuer import blueprint as v1_issuer
 from api.endpoint.npi import blueprint as v1_npi
 from api.endpoint.nucc import blueprint as v1_nucc
-from api.endpoint.plan import blueprint as v1_plan
-from api.endpoint.pricing import blueprint as v1_pricing
 from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
+from api.endpoint.plan import blueprint as v1_plan
+from api.endpoint.pricing import blueprint as v1_pricing
+from api.endpoint.provider_directory_entities import blueprint as v1_provider_directory_entities
 from api.endpoint.reports import blueprint as v1_reports
 from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
+from api.metrics import blueprint as metrics_blueprint
+from api.provider_directory_profile_capacity_preflight import (
+    register_profile_capacity_preflight_route,
+)
 from api.ptg2_capacity_evidence import (
     CapacityEvidenceError,
     guard_isolated_capacity_process_request,
-)
-from api.provider_directory_profile_capacity_preflight import (
-    register_profile_capacity_preflight_route,
 )
 from api.runtime_identity import add_runtime_identity_headers
 from api.server_timing import register_server_timing
@@ -88,6 +90,7 @@ def init_api(api):
             v1_partd_formulary,
             v1_pharmacy_license,
             v1_reports,
+            v1_provider_directory_entities,
             v1_site_intelligence,
         ],
         version_prefix="/api/v",
