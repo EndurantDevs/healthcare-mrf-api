@@ -16,6 +16,7 @@ from api import plan_pricing_projection_v3 as projection
 from api import plan_pricing_projection_v3_code as rate_profiles
 from api import plan_pricing_projection_v3_work as work_admission
 from api import plan_pricing_projection_v4_occurrence as rate_occurrences
+from api import plan_pricing_projection_v4_provider as provider_children
 from api import ptg2_serving as serving
 from api.plan_pricing_projection_source import BindingProjection
 from api.plan_pricing_projection_v3_types import _BuildState
@@ -185,6 +186,63 @@ async def _durable_projection_counts(connection, schema: str):
             )
         )
     return tuple(counts)
+
+
+@pytest.mark.asyncio
+async def test_v4_provider_children_copy_nonempty_states_with_string_identity(monkeypatch, migrated_v3_database):
+    """Persist native provider children without conflicting projection-ID bind types."""
+    database = migrated_v3_database
+    projection_id = "a" * 64
+    state_fragment = b'{"provider":{"state":"mi"}}'
+    async with database.engine.begin() as connection:
+        monkeypatch.setattr(projection_contract, "SCHEMA", database.schema)
+        await _insert_candidate(connection, database.schema, projection_id)
+        await connection.execute(
+            text(
+                f'CREATE TABLE "{database.schema}".plan_pricing_provider_state ('
+                "projection_id varchar(64) NOT NULL, state varchar(2) NOT NULL, npi bigint NOT NULL, "
+                "provider_fragment bytea NOT NULL, PRIMARY KEY (projection_id,state,npi))"
+            )
+        )
+        await projection._create_stage_tables(connection)
+        await connection.execute(
+            text(
+                "INSERT INTO plan_pricing_provider_member_stage (binding_ordinal,provider_set_key,npi) "
+                "VALUES (0,7,1000000001)"
+            )
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO plan_pricing_provider_cell_stage (projection_id,geo_cell,npi,entity_type_code,"
+                "taxonomy_codes,fragment,state_fragment) VALUES (:projection_id,'10001',:npi,1,"
+                "ARRAY[]::varchar[],:fragment,:state_fragment)"
+            ),
+            [
+                {"projection_id": identity, "npi": npi, "fragment": b"{}", "state_fragment": fragment}
+                for identity, npi, fragment in (
+                    (projection_id, 1000000001, state_fragment),
+                    (projection_id, 1000000002, None),
+                    (projection_id, 1000000003, b'{"provider":{"state":"invalid"}}'),
+                    ("b" * 64, 1000000004, state_fragment),
+                )
+            ],
+        )
+        await provider_children.persist_provider_projection(connection, projection_id)
+        copied_states = (
+            await connection.execute(
+                text(
+                    f'SELECT projection_id,state,npi,provider_fragment FROM "{database.schema}".plan_pricing_provider_state'
+                )
+            )
+        ).all()
+        assert copied_states == [(projection_id, "MI", 1000000001, state_fragment)]
+        assert (
+            await connection.scalar(text(f'SELECT COUNT(*) FROM "{database.schema}".plan_pricing_provider_membership'))
+            == 1
+        )
+        assert (
+            await connection.scalar(text(f'SELECT COUNT(*) FROM "{database.schema}".plan_pricing_provider_cell')) == 3
+        )
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from db.connection import Database
 from process import cms_doctors_education as education
 from process.entity_address_cutover_contract import postgres_sqlstate
-from tests.reference_family_generation_fixture import generation_shape_check
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards_from_dsn
 
 NPI = "1000000004"
 SOURCE_URL = "https://example.test/cms-national.csv"
@@ -382,17 +382,18 @@ def _publisher_database(dsn):
     return Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
 
 
-async def _create_generation_fixture(connection, schema):
+async def _create_generation_fixture(connection, schema, dsn):
     await connection.execute(
         f"CREATE TABLE {schema}.reference_family_result_generation ("
         "importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL, local_generation bigint NOT NULL, "
         "origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[], "
-        f"CHECK ({generation_shape_check()}))"
+        f"CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))"
     )
     await connection.execute(
         f"INSERT INTO {schema}.reference_family_result_generation "
         "(importer_id, local_lineage_id, local_generation) VALUES ('cms-doctors', $1, 0)", uuid.uuid4(),
     )
+    await install_source_generation_guards_from_dsn(dsn, schema)
     return await connection.fetchrow(f"SELECT * FROM {schema}.reference_family_result_generation")
 
 
@@ -432,7 +433,7 @@ async def test_native_postgres_publication_rolls_back_both_tables_on_education_f
         await connection.execute(f"CREATE SCHEMA {schema}")
         is_schema_created = True
         marker_by_table = await _create_publication_fixture(connection, schema)
-        generation_before = await _create_generation_fixture(connection, schema)
+        generation_before = await _create_generation_fixture(connection, schema, dsn)
         monkeypatch.setattr(cms_doctors, "db", database)
         monkeypatch.setattr(education, "db", database)
         monkeypatch.setattr(groups, "db", database)

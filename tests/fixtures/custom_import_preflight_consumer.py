@@ -181,45 +181,50 @@ def _binding_document(definition):
 
 
 assert importlib.util.find_spec("process") is None
-sys.meta_path.insert(0, BlockedImports())
+_native_source = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
+if _native_source is None:
+    sys.meta_path.insert(0, BlockedImports())
+else:
+    sys.path.insert(0, str(_native_source))
+    importlib.import_module("process.custom_import.definition")
 sys.path.insert(0, str(_TARGET_DIRECTORY))
 
 _MODULE_NAMES = (
-    "process.custom_import._source_text",
-    "process.custom_import.definition",
-    "process.custom_import.family",
-    "process.custom_import.capture_limits",
-    "process.custom_import.snowflake",
-    "process.custom_import.snowflake_bundle",
-    "process.custom_import.snowflake_binding",
-    "process.custom_import.snowflake_preflight",
-    "process.custom_import.snowflake_preflight_schema",
+    "custom_import_preflight._source_text",
+    "custom_import_preflight.definition",
+    "custom_import_preflight.family",
+    "custom_import_preflight.capture_limits",
+    "custom_import_preflight.snowflake",
+    "custom_import_preflight.snowflake_bundle",
+    "custom_import_preflight.snowflake_binding",
+    "custom_import_preflight.snowflake_preflight",
+    "custom_import_preflight.snowflake_preflight_schema",
 )
 _modules = tuple(importlib.import_module(name) for name in _MODULE_NAMES)
 assert all(pathlib.Path(module.__file__).resolve().is_relative_to(_TARGET_DIRECTORY) for module in _modules)
 assert all(
     pathlib.Path(module.__file__).resolve().is_relative_to(_TARGET_DIRECTORY)
     for name, module in sys.modules.items()
-    if name == "process" or name.startswith("process.")
+    if name == "custom_import_preflight" or name.startswith("custom_import_preflight.")
 )
 
-from process.custom_import.definition import CustomImportDefinition
-from process.custom_import.snowflake import SnowflakeConnectorError
-from process.custom_import.snowflake_binding import (
+from custom_import_preflight.definition import CustomImportDefinition
+from custom_import_preflight.snowflake import SnowflakeConnectorError
+from custom_import_preflight.snowflake_binding import (
     SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
     SOURCE_BINDING_CONTRACT,
     SnowflakeSourceBinding,
 )
-from process.custom_import.snowflake_bundle import (
+from custom_import_preflight.snowflake_bundle import (
     SnowflakeBundleAcquisitionConnector,
     SnowflakeBundleError,
     SnowflakeBundleStatementBuilder,
 )
-from process.custom_import.snowflake_preflight import (
+from custom_import_preflight.snowflake_preflight import (
     SnowflakePreflightLimits,
     preflight_snowflake_bundle,
 )
-from process.custom_import.snowflake_preflight_schema import validate_preflight_result_schema
+from custom_import_preflight.snowflake_preflight_schema import validate_preflight_result_schema
 
 _definition = CustomImportDefinition.from_mapping(_definition_document())
 _binding = SnowflakeSourceBinding.from_mapping(_binding_document(_definition))
@@ -261,3 +266,37 @@ else:
     raise AssertionError("acquisition without the capture runtime was accepted")
 assert _credentials.calls == 0
 assert _bundle_adapter.calls == 0
+
+
+if _native_source is not None:
+    from dataclasses import asdict
+
+    from process.custom_import.definition import CustomImportDefinition as NativeDefinition
+    from process.custom_import.snowflake_binding import SnowflakeSourceBinding as NativeBinding
+    from process.custom_import.snowflake_bundle import SnowflakeBundleStatementBuilder as NativeBuilder
+
+    native_definition = NativeDefinition.from_mapping(_definition_document())
+    native_binding = NativeBinding.from_mapping(_binding_document(native_definition))
+    assert NativeDefinition is not CustomImportDefinition
+    assert asdict(native_definition) == asdict(_definition)
+    assert asdict(native_binding) == asdict(_binding)
+    native_relations, native_bindings = native_binding.bundle_components(native_definition)
+    native_request = NativeBuilder(approved_relations=native_relations).prepare_request(
+        native_definition, bindings=native_bindings
+    )
+    assert asdict(native_request) == asdict(_request)
+    for module_name in (
+        "process.reference_family_archive",
+        "process.entity_address_snapshot_source",
+        "process.entity_address_snapshot_destination",
+        "process.ptg_parts.result_archive_receive_binding",
+        "process.ptg_parts.result_archive_candidate_validation",
+    ):
+        native_module = importlib.import_module(module_name)
+        assert pathlib.Path(native_module.__file__).resolve().is_relative_to(_native_source)
+    assert all(
+        pathlib.Path(origin).resolve().is_relative_to(_native_source)
+        for name, module in tuple(sys.modules.items())
+        if name == "process" or name.startswith("process.")
+        for origin in ([module.__file__] if module.__file__ else module.__path__)
+    )

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from db.models import ImportLog
 from process import initial
 from process.reference_family_archive import reference_family_spec
 
@@ -64,7 +65,9 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
     monkeypatch.setattr(initial, "publish_local_reference_family_generation", generation_writer)
 
     spec = reference_family_spec("mrf")
-    assert initial._MRF_PUBLICATION_MODELS == spec.model_types[:-1]
+    assert ImportLog in initial._MRF_PUBLICATION_MODELS
+    assert ImportLog not in spec.model_types
+    assert tuple(model for model in initial._MRF_PUBLICATION_MODELS if model is not ImportLog) == spec.model_types[:-1]
     assert spec.model_types[-1].__tablename__ == "plan_search_summary"
     await initial._publish_mrf_table_generation("synthetic-generation", "mrf_test")
 

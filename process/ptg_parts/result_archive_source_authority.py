@@ -28,6 +28,7 @@ from process.ptg_parts.ptg2_lifecycle_lock import (
 )
 
 PTG_RESULT_ARCHIVE_SOURCE_AUTHORITY_CONTRACT = "healthporta.ptg-result-archive-source-authority.v1"
+PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT = "ptg_published_result_source_authority.v1"
 PTG_RESULT_ARCHIVE_SOURCE_PIN_OWNER_TYPE = "ptg-result-archive-source"
 _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SNAPSHOT_STATUSES = frozenset({"validated", "published"})
@@ -326,6 +327,13 @@ async def _insert_or_verify_pin(session: Any, *, schema: str, authority: PtgResu
 def validate_ptg_result_archive_source_authority(authority_by_field: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the closed serializable source-publication callback payload."""
 
+    if (
+        isinstance(authority_by_field, Mapping)
+        and authority_by_field.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT
+    ):
+        from process.ptg_parts.result_archive_published_authority import validate_ptg_published_result_source_authority
+
+        return validate_ptg_published_result_source_authority(authority_by_field)
     if not isinstance(authority_by_field, Mapping) or set(authority_by_field) != {
         "contract",
         "operation_id",
@@ -385,6 +393,21 @@ async def prepare_ptg_result_archive_source_authority(
     schema = _quote_ident(schema_name)
     operation_id = _operation_id(operation_id)
     snapshot_id = _required_text(snapshot_id, "snapshot identity", 96)
+    binding_result = await session.execute(
+        text(
+            f"SELECT EXISTS (SELECT 1 FROM {schema}.ptg2_snapshot AS snapshot "
+            f"JOIN {schema}.ptg2_frozen_source_file_binding AS frozen "
+            "ON frozen.internal_run_id = snapshot.import_run_id "
+            "WHERE snapshot.snapshot_id = :snapshot_id)"
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    if not binding_result.scalar_one():
+        from process.ptg_parts.result_archive_published_authority import prepare_ptg_published_result_source_authority
+
+        return await prepare_ptg_published_result_source_authority(
+            session, schema_name=schema_name, operation_id=operation_id, snapshot_id=snapshot_id
+        )
     await _acquire_operation_lock(session, operation_id)
     source_key = await _source_key_for_snapshot(session, schema=schema, snapshot_id=snapshot_id)
     await acquire_ptg2_source_lifecycle_lock(session, source_key=source_key)
@@ -404,6 +427,10 @@ async def commit_ptg_result_archive_source_authority(
     """Create or verify the exact retention pin for a durable prepared receipt."""
 
     _require_transaction(session)
+    if isinstance(authority, Mapping) and authority.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        from process.ptg_parts.result_archive_published_authority import commit_ptg_published_result_source_authority
+
+        return await commit_ptg_published_result_source_authority(session, schema_name=schema_name, authority=authority)
     authority_by_field = validate_ptg_result_archive_source_authority(authority)
     expected = PtgResultArchiveSourceAuthority(
         operation_id=authority_by_field["operation_id"],
@@ -457,6 +484,14 @@ async def revalidate_ptg_result_archive_source_authority(
     """Recheck the source receipt and owned pin before a trusted next phase."""
 
     _require_transaction(session)
+    if isinstance(authority, Mapping) and authority.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        from process.ptg_parts.result_archive_published_authority import (
+            revalidate_ptg_published_result_source_authority,
+        )
+
+        return await revalidate_ptg_published_result_source_authority(
+            session, schema_name=schema_name, authority=authority
+        )
     authority_by_field = validate_ptg_result_archive_source_authority(authority)
     expected = PtgResultArchiveSourceAuthority(
         operation_id=authority_by_field["operation_id"],
@@ -519,6 +554,10 @@ async def lock_ptg_result_archive_for_clone(
     """
 
     _require_transaction(session)
+    if isinstance(authority, Mapping) and authority.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        from process.ptg_parts.result_archive_published_authority import lock_ptg_published_result_for_clone
+
+        return await lock_ptg_published_result_for_clone(session, schema_name=schema_name, authority=authority)
     authority_by_field = validate_ptg_result_archive_source_authority(authority)
     expected = PtgResultArchiveSourceAuthority(
         operation_id=authority_by_field["operation_id"],
@@ -565,17 +604,34 @@ async def _release_authority_pin(
 ) -> str:
     """Delete one exact pin or acknowledge only its already-absent replay."""
 
-    _require_transaction(session)
     validated_authority = _authority_from_receipt(authority_by_field)
+    return await _release_validated_authority_pin(
+        session,
+        schema_name=schema_name,
+        authority=validated_authority,
+        acknowledge_absent=acknowledge_absent,
+    )
+
+
+async def _release_validated_authority_pin(
+    session: Any,
+    *,
+    schema_name: str,
+    authority: Any,
+    acknowledge_absent: bool,
+) -> str:
+    """Release the exact shared pin shape after contract-specific validation."""
+
+    _require_transaction(session)
     schema = _quote_ident(schema_name)
-    await _acquire_operation_lock(session, validated_authority.operation_id)
+    await _acquire_operation_lock(session, authority.operation_id)
     try:
-        stored_pin_rows = await _pin_rows(session, schema=schema, authority=validated_authority)
+        stored_pin_rows = await _pin_rows(session, schema=schema, authority=authority)
     except Exception as exc:
         if not is_retryable_lifecycle_database_error(exc):
             raise
         raise PTG2LifecycleLockDeferred("result archive source authority release is busy; retry") from exc
-    expected_pin_rows = [{"snapshot_id": validated_authority.snapshot_id, "reason": validated_authority.pin_reason}]
+    expected_pin_rows = [{"snapshot_id": authority.snapshot_id, "reason": authority.pin_reason}]
     if not stored_pin_rows:
         if acknowledge_absent:
             return "already_released"
@@ -595,9 +651,9 @@ async def _release_authority_pin(
         ),
         {
             "owner_type": PTG_RESULT_ARCHIVE_SOURCE_PIN_OWNER_TYPE,
-            "owner_id": validated_authority.owner_id,
-            "snapshot_id": validated_authority.snapshot_id,
-            "reason": validated_authority.pin_reason,
+            "owner_id": authority.owner_id,
+            "snapshot_id": authority.snapshot_id,
+            "reason": authority.pin_reason,
         },
     )
     if len(deletion_result.all()) != 1:
@@ -620,6 +676,12 @@ async def release_ptg_result_archive_source_authority(
     exposes deletion by operation id alone.
     """
 
+    if isinstance(authority, Mapping) and authority.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        from process.ptg_parts.result_archive_published_authority import release_ptg_published_result_source_authority
+
+        return await release_ptg_published_result_source_authority(
+            session, schema_name=schema_name, authority=authority
+        )
     outcome = await _release_authority_pin(
         session,
         schema_name=schema_name,
@@ -644,6 +706,12 @@ async def reconcile_ptg_archive_source_release(
     idempotent acknowledgment after an uncertain source commit.
     """
 
+    if isinstance(authority, Mapping) and authority.get("contract") == PTG_PUBLISHED_RESULT_SOURCE_AUTHORITY_CONTRACT:
+        from process.ptg_parts.result_archive_published_authority import reconcile_ptg_published_result_source_release
+
+        return await reconcile_ptg_published_result_source_release(
+            session, schema_name=schema_name, authority=authority
+        )
     return await _release_authority_pin(
         session,
         schema_name=schema_name,

@@ -26,6 +26,7 @@ from process import reference_family_archive as archive
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout
 from process import reference_family_result_generation as generation
 from tests.cms_doctors_preparation_postgres_support import doctors_snapshot, pending_publisher_locks
+from tests.reference_family_generation_fixture import install_source_generation_guards
 
 _CMS_REVISION = "20260920100000_cms_doctors_result_generation"
 _GROUP_REVISION = "20260929000000_cms_doctor_group_site"
@@ -116,6 +117,7 @@ async def _create_source(session, schema, *, has_adrs_index=True):
         await session.execute(
             text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
         )
+    await install_source_generation_guards(await session.connection(), schema)
     await session.execute(
         text(
             f"INSERT INTO \"{schema}\".doctor_clinician_address (npi, address_checksum, city) VALUES (1000000004, 1, 'Example')"

@@ -14,6 +14,7 @@ from db.connection import Database
 from process import geo_census_import
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
+from tests.reference_family_generation_fixture import install_source_generation_guards
 from tests.test_reference_family_archive_postgres import _create_live_family, _database_url, _manifest
 from tests.test_reference_family_result_generation_postgres import (
     _CENSUS_MIGRATION_PATH,
@@ -214,6 +215,7 @@ async def _create_census_import_schema(engine, schema):
         metadata = MetaData(schema=schema)
         models.GeoZipCensusProfile.__table__.to_metadata(metadata, schema=schema)
         await connection.run_sync(metadata.create_all)
+        await install_source_generation_guards(connection, schema)
         await connection.execute(
             text(f"INSERT INTO \"{schema}\".geo_zip_census_profile (zip_code,total_population) VALUES ('10001',1)")
         )

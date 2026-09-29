@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
 
@@ -35,7 +35,7 @@ from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
     ReferenceFamilyServingGeneration,
-    current_reference_family_relation_oids,
+    capture_reference_family_serving_generation,
     publish_adopted_reference_family_generation,
     read_reference_family_result_generation_authority,
     require_reference_family_automatic_generation_order,
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT = "reference-replacement-family.postgres.v1"
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
+GUARDED_SOURCE_CAPTURE_CONTRACT = "reference-family.guarded-source-capture.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
 _STAGE_PREFIX = "reference_family_archive_"
@@ -117,6 +118,7 @@ class ReferenceFamilyManifest:
     auxiliary: Mapping[str, Any] | None = None
     publication_authority: str = "manual-only"
     source_serving_generation: ReferenceFamilyServingGeneration | None = None
+    source_capture_contract: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the strict portable archive manifest."""
@@ -137,6 +139,9 @@ class ReferenceFamilyManifest:
         }
         if self.publication_authority == "tracked-generation":
             manifest_by_field["source_serving_generation"] = self.source_serving_generation.as_dict()
+        if self.source_capture_contract is not None:
+            manifest_by_field["source_capture_contract"] = self.source_capture_contract
+            _validate_source_capture_contract(manifest_by_field)
         if self.dependencies:
             manifest_by_field["dependencies"] = dict(self.dependencies)
         if self.importer_id == "mrf":
@@ -267,7 +272,6 @@ _SPECS = {
                 models.PlanDrugRaw,
                 models.PlanDrugStats,
                 models.PlanDrugTierStats,
-                models.ImportLog,
                 models.PlanNPIRaw,
                 models.PlanNetworkTierRaw,
                 models.MRFAddress,
@@ -807,6 +811,17 @@ def _manifest_family_spec(manifest_value) -> ReferenceFamilySpec:
     return spec
 
 
+def _validate_source_capture_contract(manifest_value: Mapping[str, Any]) -> None:
+    """Recognize guarded non-Label capture without upgrading legacy provenance."""
+
+    if (
+        manifest_value["source_capture_contract"] != GUARDED_SOURCE_CAPTURE_CONTRACT
+        or manifest_value.get("publication_authority") != "tracked-generation"
+        or manifest_value.get("importer_id") == "label"
+    ):
+        raise ReferenceFamilyArchiveError("reference family source capture contract is invalid")
+
+
 def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamilyManifest:
     """Validate the portable closed-family receipt without granting authority."""
 
@@ -828,6 +843,9 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         expected_fields.add("auxiliary")
     if authority == "tracked-generation":
         expected_fields.add("source_serving_generation")
+    if "source_capture_contract" in manifest_value:
+        expected_fields.add("source_capture_contract")
+        _validate_source_capture_contract(manifest_value)
     if set(manifest_value) - {"dependencies"} != expected_fields:
         raise ReferenceFamilyArchiveError("reference family manifest is invalid")
     if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation"}:
@@ -860,6 +878,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         auxiliary,
         authority,
         source_serving_generation,
+        manifest_value.get("source_capture_contract"),
     )
 
 
@@ -1004,25 +1023,7 @@ async def _capture_reference_family_source(
         publication = None
         if importer_id == "mrf":
             publication = await require_completed_publication(session, schema)
-        source_serving_generation = None
-        if await _has_source_generation_authority(session, spec, schema):
-            generation_authority = await read_reference_family_result_generation_authority(
-                session,
-                importer_id=importer_id,
-                schema_name=schema,
-            )
-            current_generation_oids = await current_reference_family_relation_oids(
-                session,
-                importer_id=importer_id,
-                schema_name=schema,
-            )
-            if generation_authority.serving_generation is None:
-                if importer_id == "label" or generation_authority.relation_oids is not None:
-                    raise ReferenceFamilyArchiveError("reference family source generation is incomplete")
-            elif generation_authority.relation_oids != current_generation_oids:
-                raise ReferenceFamilyArchiveError("reference family source generation is drifted")
-            else:
-                source_serving_generation = generation_authority.serving_generation
+        source_serving_generation = await _source_serving_generation(session, spec, schema)
         if importer_id == "facility-anchors":
             from process.facility_address_contribution_merge import validate_observations
 
@@ -1038,10 +1039,31 @@ async def _capture_reference_family_source(
             publication=publication,
             source_serving_generation=source_serving_generation,
         )
+        if source_serving_generation is not None and spec.importer_id != "label":
+            manifest = replace(manifest, source_capture_contract=GUARDED_SOURCE_CAPTURE_CONTRACT)
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
         if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
             raise ReferenceFamilyArchiveError("reference family source snapshot is invalid")
     return ReferenceFamilySourceCapture(manifest, schema, snapshot)
+
+
+async def _source_serving_generation(session, spec, schema):
+    """Keep legacy exports generationless and reject untracked claimed origins."""
+    if not await _has_source_generation_authority(session, spec, schema):
+        return None
+    authority = await read_reference_family_result_generation_authority(
+        session, importer_id=spec.importer_id, schema_name=schema
+    )
+    if authority.serving_generation is None:
+        if spec.importer_id == "label" or authority.relation_oids is not None:
+            raise ReferenceFamilyArchiveError("reference family source generation is incomplete")
+        return None
+    try:
+        return await capture_reference_family_serving_generation(
+            session, importer_id=spec.importer_id, schema_name=schema
+        )
+    except RuntimeError as error:
+        raise ReferenceFamilyArchiveError("reference family source generation is unavailable or drifted") from error
 
 
 async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, stage_schema: str) -> None:
@@ -1465,6 +1487,7 @@ async def _validate_stage_manifest(
         auxiliary=validated.auxiliary,
         source_serving_generation=validated.source_serving_generation,
     )
+    observed = replace(observed, source_capture_contract=validated.source_capture_contract)
     if _is_legacy_cms_manifest(validated):
         if not _has_matching_manifest_stage_tables(validated, observed.tables):
             raise ReferenceFamilyArchiveError("reference family restored stage differs")
@@ -2197,6 +2220,7 @@ async def _activation_receipt(
             dependencies=manifest.dependencies,
             source_serving_generation=manifest.source_serving_generation,
         )
+        local_manifest = replace(local_manifest, source_capture_contract=manifest.source_capture_contract)
         if _is_legacy_cms_manifest(manifest):
             if local_manifest.tables != tables or not _has_matching_manifest_stage_tables(manifest, tables):
                 raise ReferenceFamilyArchiveError("reference family activated receipt differs")
@@ -2292,6 +2316,19 @@ async def _complete_validated_stage_activation(
     return predecessor_schema_name, live_pairs
 
 
+def _require_cutover_authority(ownership, expected_incumbent, cutover) -> None:
+    """Reject malformed activation scope before inspecting or locking a stage."""
+
+    if not isinstance(cutover, ReferenceFamilyCutoverAuthority):
+        raise ReferenceFamilyArchiveError("reference family cutover authority is invalid")
+    if cutover.authority not in {"manual", "automatic"}:
+        raise ReferenceFamilyArchiveError("reference family activation authority is unsupported")
+    if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
+        expected_incumbent, ReferenceFamilyIncumbent
+    ):
+        raise ReferenceFamilyArchiveError("reference family activation ownership is invalid")
+
+
 async def activate_validated_reference_family_stage(
     session: Any,
     *,
@@ -2305,15 +2342,7 @@ async def activate_validated_reference_family_stage(
     """CAS-rotate one publisher-validated immutable stage without recounting."""
 
     _require_transaction(session)
-    if not isinstance(cutover, ReferenceFamilyCutoverAuthority):
-        raise ReferenceFamilyArchiveError("reference family cutover authority is invalid")
-    if cutover.authority not in {"manual", "automatic"}:
-        raise ReferenceFamilyArchiveError("reference family activation authority is unsupported")
-    if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
-        expected_incumbent,
-        ReferenceFamilyIncumbent,
-    ):
-        raise ReferenceFamilyArchiveError("reference family activation ownership is invalid")
+    _require_cutover_authority(ownership, expected_incumbent, cutover)
     validated_manifest = validate_reference_family_manifest(manifest)
     validation = validate_reference_family_validation_receipt(validation_receipt)
     _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
@@ -2338,6 +2367,10 @@ async def activate_validated_reference_family_stage(
         importer_id=spec.importer_id,
         schema_name=expected_incumbent.schema_name,
         source_generation=incoming_generation,
+        source_revision_tracked=(
+            incoming_generation is not None
+            and validated_manifest.source_capture_contract == GUARDED_SOURCE_CAPTURE_CONTRACT
+        ),
     )
     _require_published_generation_binding(spec, live_pairs, incoming_generation, published_authority)
     return ReferenceFamilyActivationReceipt(
@@ -2378,6 +2411,12 @@ def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, 
 
     if _is_legacy_cms_manifest(manifest) and cutover.authority != "manual":
         raise ReferenceFamilyArchiveError("legacy CMS archive requires manual activation")
+    if (
+        cutover.authority == "automatic"
+        and manifest.importer_id != "label"
+        and manifest.source_capture_contract != GUARDED_SOURCE_CAPTURE_CONTRACT
+    ):
+        raise ReferenceFamilyArchiveError("reference family automatic activation requires guarded source capture")
     manifest_sha256 = hashlib.sha256(_canonical_json(manifest.as_dict())).hexdigest()
     if (
         manifest.importer_id != ownership.importer_id
@@ -2398,6 +2437,8 @@ def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, 
 def _activation_source_generation(manifest, cutover):
     """Keep a legacy two-relation generation as provenance, never current-family authority."""
     incoming_generation = _cutover_source_generation(cutover)
+    if incoming_generation != manifest.source_serving_generation:
+        raise ReferenceFamilyArchiveError("reference family source generation differs from captured manifest")
     return None if _is_legacy_cms_manifest(manifest) else incoming_generation
 
 
@@ -2453,6 +2494,12 @@ async def _require_automatic_cutover_generation(session, spec, expected_incumben
         return
     if current_authority.relation_oids != generation_incumbent_oids:
         raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
+    if spec.importer_id != "label":
+        from process.reference_source_generation import require_reference_revision_tracking
+
+        await require_reference_revision_tracking(
+            session, importer_id=spec.importer_id, schema_name=expected_incumbent.schema_name
+        )
     try:
         require_reference_family_automatic_generation_order(incoming_generation, current_authority.serving_generation)
     except ValueError as error:

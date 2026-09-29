@@ -32,7 +32,6 @@ def test_closed_relation_families_are_ordered_and_distinct():
             "plan_drug_raw",
             "plan_drug_stats",
             "plan_drug_tier_stats",
-            "log",
             "plan_npi_raw",
             "plan_networktier",
             "mrf_address",
@@ -173,6 +172,38 @@ def test_serving_generation_rejects_malformed_identity(value):
         generation.validate_reference_family_serving_generation(value)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracked", [True, None, 0, "true"])
+async def test_adopted_revision_tracking_requires_explicit_valid_capture(tracked):
+    with pytest.raises(ValueError, match="adopted revision tracking is invalid"):
+        await generation.publish_adopted_reference_family_generation(
+            object(),
+            importer_id="places-zcta",
+            schema_name="mrf",
+            source_generation=None,
+            source_revision_tracked=tracked,
+        )
+
+
+@pytest.mark.asyncio
+async def test_label_adoption_preserves_native_generation_authority(monkeypatch):
+    database, native_authority = object(), object()
+    source = _serving("c8f27af1-56ba-4cda-82d8-0fc67650918f", 8)
+    adopt = AsyncMock(return_value=native_authority)
+    monkeypatch.setattr(generation, "_adopt_label_generation", adopt)
+    install = AsyncMock(side_effect=AssertionError("Label uses its native authority"))
+    monkeypatch.setattr("process.reference_source_generation.install_reference_revision_guards", install)
+
+    assert (
+        await generation.publish_adopted_reference_family_generation(
+            database, importer_id="label", schema_name="mrf", source_generation=source
+        )
+        is native_authority
+    )
+    adopt.assert_awaited_once_with(database, "mrf", source)
+    install.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -229,6 +260,7 @@ async def test_relation_oid_read_rejects_malformed_rows(rows):
 
 @pytest.mark.asyncio
 async def test_generation_publication_rejects_missing_or_changed_authority(monkeypatch):
+    monkeypatch.setattr("process.reference_source_generation.install_reference_revision_guards", AsyncMock())
     current = generation.ReferenceFamilyResultGenerationAuthority(
         "places-zcta",
         "c8f27af1-56ba-4cda-82d8-0fc67650918f",
@@ -274,6 +306,7 @@ async def test_generation_publication_rejects_missing_or_changed_authority(monke
 
 @pytest.mark.asyncio
 async def test_generation_reads_and_publication_guards(monkeypatch):
+    monkeypatch.setattr("process.reference_source_generation.install_reference_revision_guards", AsyncMock())
     with pytest.raises(ValueError, match="schema is invalid"):
         generation._schema_name("bad-name")
 
