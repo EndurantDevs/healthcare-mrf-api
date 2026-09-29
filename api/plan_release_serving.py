@@ -91,6 +91,7 @@ class PlanReleaseSnapshotBinding:
     plan_market_type: str
     role: str
     required: bool
+    logical_scope_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,7 @@ def _plan_release_binding_from_row(
         ).strip().lower(),
         role=role,
         required=bool(release_row.get("required")),
+        logical_scope_present=release_row.get("logical_scope_present") is True,
     )
 
 
