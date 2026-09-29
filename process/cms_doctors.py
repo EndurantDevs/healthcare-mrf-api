@@ -32,6 +32,7 @@ from process.cms_doctors_groups import (
     swap_group_site_stage,
     validate_group_site_stage,
 )
+from process.cms_doctors_organizations import bind_group_site_organizations
 from process.cms_doctors_rows import doctor_address_row
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
@@ -518,8 +519,9 @@ async def _publish_cms_doctors_generation(ctx):
     education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
         import_date, db_schema, context,
     )
+    organization_groups = await bind_group_site_organizations(ctx, import_date, db_schema, group_receipt)
     address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
-    await raise_if_cancelled(ctx, {})
+    await raise_if_cancelled(ctx, {"run_id": run_id})
     await _publish_cms_doctors_stage(stage_cls, db_schema, import_date)
     context.pop("education_stage_owned", None)
     context.pop("group_site_stage_owned", None)
@@ -531,6 +533,7 @@ async def _publish_cms_doctors_generation(ctx):
         "rows": stage_rows,
         "education": education_manifest,
         "group_site": group_receipt,
+        "organization_groups": organization_groups,
         **({"artifact": context["artifact"]} if context.get("artifact") else {}),
         **({"address_resolve": address_stats.__dict__} if address_stats else {}),
     }
