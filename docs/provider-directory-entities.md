@@ -37,8 +37,9 @@ they are not seek tokens. No offset scan or whole-result in-memory sort is used.
 
 Medical-group names are source assertions. Conflicting names produce a null
 name and conflict status; activity and effective dates remain unknown. Explicit
-group-site assertions have unresolved targets until an accepted site identity
-link exists. Evidence exposes keyed record references, opaque releases and
+group-site assertions resolve to stable CMS Doctors site IDs through exact
+source address-ID bindings; a missing binding makes the read unavailable.
+Evidence exposes keyed record references, opaque releases and
 observation timestamps; raw source identifiers and payloads are excluded.
 
 Each response uses a read-only repeatable-read transaction, 2-second per-statement

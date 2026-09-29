@@ -373,6 +373,7 @@ def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
         },
         "group_site": {"source_rows": 4},
         "organization_groups": 2,
+        "sites": 3,
         "artifact": _ARTIFACT_RECEIPT,
         "address_resolve": address_stats.__dict__,
     }
@@ -429,6 +430,7 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
     verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
     monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
@@ -439,7 +441,6 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
-    assert terminal_result["address_resolve"] == address_stats.__dict__
     verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     _assert_cms_publish_metrics(marked, terminal_result, address_stats)
 
@@ -462,6 +463,7 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
     verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
     monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
@@ -486,6 +488,7 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
                       "content_sha256": _ARTIFACT_DIGEST},
         "group_site": {"source_rows": 10000},
         "organization_groups": 2,
+        "sites": 3,
         "artifact": _ARTIFACT_RECEIPT,
     }
 

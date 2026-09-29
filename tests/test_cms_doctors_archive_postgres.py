@@ -81,6 +81,9 @@ async def _create_source(session, schema):
     await _migration(session, _CMS_REVISION, "upgrade")
     await _migration(session, _GROUP_REVISION, "upgrade")
     await session.execute(
+        text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
+    )
+    await session.execute(
         text(
             f"INSERT INTO \"{schema}\".doctor_clinician_address (npi, address_checksum, city) VALUES (1000000004, 1, 'Example')"
         )

@@ -12,7 +12,14 @@ from sqlalchemy import text
 from api import provider_directory_medical_groups as serving
 from api.endpoint import provider_directory_entities as endpoint
 from api.provider_directory_entities_contract import DirectoryReadError
-from tests.provider_directory_entities_postgres_support import GROUP_A, GROUP_B, directory_database
+from tests.provider_directory_entities_postgres_support import (
+    GROUP_A,
+    GROUP_B,
+    SITE_A,
+    SITE_B,
+    SITE_D,
+    directory_database,
+)
 from tests.test_provider_directory_entities import directory_query
 
 
@@ -53,7 +60,7 @@ async def test_accepted_groups_page_by_stable_uuid_without_candidate_or_source_l
 
 
 @pytest.mark.asyncio
-async def test_detail_and_relationships_preserve_explicit_unresolved_assertions(monkeypatch):
+async def test_detail_and_relationships_resolve_exact_source_site_bindings(monkeypatch):
     async with directory_database(monkeypatch) as sessions:
         detail_query = directory_query("source_id=cms-doctors", shape="entity", entity_id=GROUP_A)
         detail = await _read(sessions, detail_query)
@@ -68,9 +75,11 @@ async def test_detail_and_relationships_preserve_explicit_unresolved_assertions(
         assert len(items) == 3
         assert len({item["relationship_key"] for item in items}) == 3
         assert first["items"] == sorted(first["items"], key=lambda item: item["relationship_key"])
+        assert {item["target_id"] for item in items} == {SITE_A, SITE_B, SITE_D}
+        assert "synthetic-address" not in json.dumps(items)
         for item in items:
-            assert item["target_kind"] == "sites" and item["target_id"] is None
-            assert item["status"] == "unresolved" and item["relationship_type"] == "group-site"
+            assert item["target_kind"] == "sites" and item["target_id"] is not None
+            assert item["status"] == "resolved" and item["relationship_type"] == "group-site"
             assert item["effective_start"] is None and item["effective_end"] is None
 
 
@@ -95,6 +104,7 @@ async def test_missing_group_is_not_found_even_if_candidate_binding_exists(monke
         "UPDATE reference_family_result_generation SET relation_oids = relation_oids[1:2]",
         "UPDATE reference_family_result_generation SET relation_oids[3] = 1",
         "DELETE FROM provider_directory_cms_doctors_group_binding WHERE org_pac_id = 'synthetic-pac-beta'",
+        "DELETE FROM provider_directory_cms_doctors_site_binding WHERE adrs_id = 'synthetic-address-beta'",
     ],
 )
 async def test_unaccepted_or_incompletely_bound_source_never_returns_partial_page(monkeypatch, mutation):

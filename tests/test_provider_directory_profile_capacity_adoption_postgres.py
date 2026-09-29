@@ -247,7 +247,7 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     _configure_database(monkeypatch, dsn)
     monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
     expected_heads = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
-    assert expected_heads == {"20260930050000_cms_npd_relationship"}
+    assert expected_heads == {"20260930060000_cms_doctors_site_binding"}
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)
         await _upgrade_disposable_schema_to_head(dsn, schema)

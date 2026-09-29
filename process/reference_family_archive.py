@@ -1335,12 +1335,13 @@ def _legacy_cms_group_constraints(columns, constraints):
 
 
 def _legacy_cms_group_indexes():
-    """Describe the reviewed primary key and two lookup indexes."""
+    """Describe the reviewed primary key and three lookup indexes."""
     indexes = []
     for attribute, is_primary, opclass, is_collatable in (
         (1, True, "int8_ops", False),
         (2, False, "int8_ops", False),
         (4, False, "text_ops", True),
+        (5, False, "text_ops", True),
     ):
         indexes.append(
             {

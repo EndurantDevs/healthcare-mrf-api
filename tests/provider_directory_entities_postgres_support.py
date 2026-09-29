@@ -16,6 +16,10 @@ from api.provider_directory_entities_contract import CURSOR_KEY_ENV
 _DSN_ENV = "HLTHPRT_DIRECTORY_ENTITIES_TEST_DSN"
 GROUP_A = "00000000-0000-0000-0000-000000000001"
 GROUP_B = "00000000-0000-0000-0000-000000000002"
+SITE_A = "00000000-0000-0000-0000-000000001001"
+SITE_B = "00000000-0000-0000-0000-000000001002"
+SITE_C = "00000000-0000-0000-0000-000000001003"
+SITE_D = "00000000-0000-0000-0000-000000001004"
 
 
 def _database_url():
@@ -42,6 +46,8 @@ async def _create_tables(session):
         "CREATE INDEX ON cms_doctor_group_site (org_pac_id)",
         "CREATE TABLE provider_directory_cms_doctors_group_binding (org_pac_id varchar(64) PRIMARY KEY, "
         "organization_id uuid NOT NULL UNIQUE)",
+        "CREATE TABLE provider_directory_cms_doctors_site_binding (adrs_id varchar(256) PRIMARY KEY, "
+        "site_id uuid NOT NULL UNIQUE)",
         "CREATE TABLE reference_family_result_generation (importer_id text PRIMARY KEY, local_lineage_id uuid, "
         "local_generation bigint, origin_lineage_id uuid, origin_generation bigint, "
         "published_at timestamptz, relation_oids bigint[])",
@@ -61,6 +67,14 @@ async def _create_tables(session):
 
 
 async def _seed_groups(session):
+    await session.execute(
+        text("""
+        INSERT INTO provider_directory_cms_doctors_site_binding VALUES
+        ('synthetic-address-alpha', :first), ('synthetic-address-beta', :second),
+        ('synthetic-address-gamma', :third), ('synthetic-address-delta', :fourth)
+    """),
+        {"first": SITE_A, "second": SITE_B, "third": SITE_C, "fourth": SITE_D},
+    )
     await session.execute(
         text("""
         INSERT INTO provider_directory_cms_doctors_group_binding VALUES

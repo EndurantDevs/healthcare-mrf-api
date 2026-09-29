@@ -20,6 +20,7 @@ from api.provider_directory_entities_contract import (
 _SOURCE = "cms-doctors"
 _TABLES = ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
 _BINDING = "provider_directory_cms_doctors_group_binding"
+_SITE_BINDING = "provider_directory_cms_doctors_site_binding"
 
 
 def _schema_name():
@@ -41,7 +42,7 @@ def _generation_key(key, authority, relation_oids):
             raise ValueError
         if list(authority["relation_oids"]) != relation_oids[:3]:
             raise ValueError
-        if len(set(relation_oids)) != 4 or any(type(value) is not int or value <= 0 for value in relation_oids):
+        if len(set(relation_oids)) != 5 or any(type(value) is not int or value <= 0 for value in relation_oids):
             raise ValueError
     except KeyError, TypeError, ValueError, AttributeError:
         raise DirectoryReadError(503) from None
@@ -50,7 +51,7 @@ def _generation_key(key, authority, relation_oids):
 
 async def _accepted_generation(session, schema, key):
     """Fence relation replacement before observing the source ledger and table OIDs."""
-    qualified_tables = [f'{schema}."{name}"' for name in (*_TABLES, _BINDING)]
+    qualified_tables = [f'{schema}."{name}"' for name in (*_TABLES, _BINDING, _SITE_BINDING)]
     await session.execute(text(f"LOCK TABLE {', '.join(qualified_tables)} IN ACCESS SHARE MODE"))
     authority = (
         (
@@ -115,13 +116,15 @@ def _entity(key, row):
 
 
 def _relationship(key, row):
+    if row["site_id"] is None:
+        raise DirectoryReadError(503)
     return {
         "relationship_key": opaque_directory_key(key, "rel_", _SOURCE, row["generation_id"], row["row_number"]),
         "relationship_type": "group-site",
         "source_id": _SOURCE,
         "target_kind": "sites",
-        "target_id": None,
-        "status": "unresolved",
+        "target_id": str(row["site_id"]),
+        "status": "resolved",
         "effective_start": None,
         "effective_end": None,
         "evidence": _evidence(key, row),
@@ -160,9 +163,10 @@ async def _entity_rows(session, schema, query, position):
 async def _relationship_rows(session, schema, query, position):
     result = await session.execute(
         text(f"""
-        SELECT g.row_number, g.generation_id, g.observed_at
+        SELECT g.row_number, g.generation_id, g.observed_at, s.site_id
         FROM {schema}.cms_doctor_group_site g
         JOIN {schema}.{_BINDING} b ON b.org_pac_id = g.org_pac_id
+        LEFT JOIN {schema}.{_SITE_BINDING} s ON s.adrs_id = g.adrs_id
         WHERE b.organization_id = CAST(:entity_id AS uuid)
           AND g.row_number > :position AND nullif(btrim(g.adrs_id), '') IS NOT NULL
         ORDER BY g.row_number LIMIT :page_size
@@ -235,7 +239,9 @@ async def _require_complete_bindings(session, schema):
         SELECT EXISTS (
             SELECT 1 FROM {schema}.cms_doctor_group_site g
             LEFT JOIN {schema}.{_BINDING} b ON b.org_pac_id = g.org_pac_id
-            WHERE nullif(btrim(g.org_pac_id), '') IS NOT NULL AND b.organization_id IS NULL
+            LEFT JOIN {schema}.{_SITE_BINDING} s ON s.adrs_id = g.adrs_id
+            WHERE (nullif(btrim(g.org_pac_id), '') IS NOT NULL AND b.organization_id IS NULL)
+               OR (nullif(btrim(g.adrs_id), '') IS NOT NULL AND s.site_id IS NULL)
         )
     """)
         )

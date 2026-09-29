@@ -99,7 +99,7 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     first_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     next_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     assert first_manifest_by_name["content_sha256"] == next_manifest_by_name["content_sha256"]
-    assert first_manifest_by_name["generation_id"] != next_manifest_by_name["generation_id"]
+    assert first_manifest_by_name["generation_id"] == next_manifest_by_name["generation_id"]
     assert first_manifest_by_name["generation_id"] != first_manifest_by_name["content_sha256"]
     assert first_manifest_by_name["schema_version"] == "cms-doctor-education/v1"
     source_row_by_field = {"NPI": NPI, "Med_sch": "Example School", "Grd_yr": "2001"}
@@ -110,7 +110,24 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     assert future["source_json"]["quality_flags"] == ["graduation_year_in_future"]
     assert not completed["source_json"].get("quality_flags")
     assert future["education_key"] == completed["education_key"]
-    assert future["generation_id"] != completed["generation_id"]
+    assert future["generation_id"] == completed["generation_id"]
+
+
+def test_manifest_generation_changes_only_with_source_identity_or_bytes(tmp_path, monkeypatch):
+    source_path = tmp_path / "national.csv"
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Example School\n")
+    monkeypatch.setattr(
+        education,
+        "datetime",
+        SimpleNamespace(utcnow=Mock(side_effect=[datetime(2026, 1, 1)] * 3)),
+    )
+    first = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    same_bytes = education.education_source_manifest(source_path, "https://example.test/second.csv")
+    assert first["generation_id"] == same_bytes["generation_id"]
+    assert first["source_url"] != same_bytes["source_url"]
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Different School\n")
+    changed = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    assert changed["generation_id"] != first["generation_id"]
 
 
 def test_education_identity_ignores_artifact_and_practice_location():
