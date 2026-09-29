@@ -28,6 +28,7 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "pricing",
     "partd_formulary",
     "pharmacy_license",
+    "provider_directory_entities",
     "reports",
     "site_intelligence",
 }

@@ -31,6 +31,12 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # The shared directory request parser validates these outside the route AST.
+    ("get", "/provider-directory/entities/{kind}"): {"source_id", "generation_id", "limit", "cursor"},
+    ("get", "/provider-directory/entities/{kind}/{entity_id}"): {"source_id", "generation_id"},
+    ("get", "/provider-directory/entities/{kind}/{entity_id}/relationships"): {
+        "source_id", "generation_id", "limit", "cursor",
+    },
     ("get", "/hospital-prices/facilities"): {
         "cursor",
         "include_metadata",
