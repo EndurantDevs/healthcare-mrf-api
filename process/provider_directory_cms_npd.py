@@ -24,6 +24,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from db.models import ProviderDirectoryCMSNPDResourceWitness
 from process import cms_npd_source as source
 from process import provider_directory_cms_npd_recovery as recovery
+from process import provider_directory_cms_npd_relationship as relationships
 from process.provider_directory_source_local_publication import (
     publish_validated_source_local_dataset,
 )
@@ -34,7 +35,7 @@ RESOURCE_SET = frozenset(RESOURCE_TYPES)
 ADAPTER_CONTRACT = "cms-npd-bulk-fhir-v1"
 BATCH_SIZE = 1_000
 BATCH_MAX_DECODED_BYTES = 8 * 1024 * 1024
-IDENTITY_BATCH_SIZE = 100
+IDENTITY_BATCH_SIZE = 1_000
 _LOCAL_ORGANIZATION_REF = re.compile(r"Organization/([A-Za-z0-9.-]{1,64})\Z")
 
 
@@ -376,9 +377,11 @@ async def _reacquire_unwitnessed_candidate(
 
     if not (selected_candidate.already_validated or selected_candidate.already_published):
         return selected_candidate
-    if not sum(file_by_field["distinct_count"] for file_by_field in identity["files"].values()):
-        return selected_candidate
-    if await _has_raw_witnesses(fhir, selected_candidate.dataset_id):
+    has_rows = bool(sum(file_by_field["distinct_count"] for file_by_field in identity["files"].values()))
+    if (not has_rows or await _has_raw_witnesses(fhir, selected_candidate.dataset_id)) and (
+        await relationships.completed_receipt_count(fhir, selected_candidate.dataset_id, identity["vector_sha256"])
+        is not None
+    ):
         return selected_candidate
     # An older sealed candidate cannot be edited. Reacquire into a stable new
     # candidate while a published predecessor remains the current authority.
@@ -625,21 +628,23 @@ async def _write_identity_batch(
     """Persist only exact, source-scoped identities and direct network evidence."""
     if resource_type in {"Organization", "Location"}:
         async with fhir.db.session() as session:
-            await entity_writer.bind_entity_batch(
-                session,
-                source_id=SOURCE_ID,
-                release_id=identity["vector_sha256"],
-                resources=resources,
-            )
+            for offset in range(0, len(resources), 100):
+                await entity_writer.bind_entity_batch(
+                    session,
+                    source_id=SOURCE_ID,
+                    release_id=identity["vector_sha256"],
+                    resources=resources[offset : offset + 100],
+                )
         return
 
     async with fhir.db.session() as session:
-        await resource_writer.bind_resource_identity_batch(
-            session,
-            source_id=SOURCE_ID,
-            resource_type=resource_type,
-            resource_ids=[resource["id"] for resource in resources],
-        )
+        for offset in range(0, len(resources), 100):
+            await resource_writer.bind_resource_identity_batch(
+                session,
+                source_id=SOURCE_ID,
+                resource_type=resource_type,
+                resource_ids=[resource["id"] for resource in resources[offset : offset + 100]],
+            )
     if resource_type == "PractitionerRole":
         return
 
@@ -899,6 +904,7 @@ async def _run_acquired(
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
     await _assert_witness_counts(fhir, candidate, identity)
     await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
+    await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
     await _validate_candidate(fhir, candidate, identity, counts_by_type)
     state = await _publish_covered_candidate(fhir, candidate, identity, directory, receipt_by_field, client, ctx, task)
@@ -955,6 +961,8 @@ async def _current_observed_publication(observed: source.ObservedRelease) -> dic
     if sum(file["distinct_count"] for file in release["files"].values()) and not await _has_raw_witnesses(
         fhir, state["dataset_id"]
     ):
+        return None
+    if await relationships.completed_receipt_count(fhir, state["dataset_id"], observed.vector_sha256) is None:
         return None
     return state
 

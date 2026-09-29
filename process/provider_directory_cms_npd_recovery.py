@@ -178,6 +178,11 @@ async def _clear_failed_rows(fhir: Any, candidate: Any, identity: dict[str, Any]
             )
             if parent is None or not await is_disposed(fhir, candidate.dataset_id):
                 raise RuntimeError("cms_npd_stale_cleanup_parent_changed")
+            await fhir.db.status(
+                f"DELETE FROM {_table(fhir, 'provider_directory_cms_npd_relationship_receipt')} "
+                "WHERE dataset_id=:dataset_id",
+                dataset_id=candidate.dataset_id,
+            )
             deleted = await fhir.db.status(
                 f"DELETE FROM {_table(fhir, 'provider_directory_dataset_resource')} "
                 "WHERE ctid IN (SELECT ctid FROM "

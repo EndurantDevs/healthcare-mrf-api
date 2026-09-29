@@ -148,6 +148,7 @@ async def test_current_observation_requires_exact_covered_publication(monkeypatc
     monkeypatch.setattr(fhir.db, "session", session)
     has_witnesses = AsyncMock(return_value=True)
     monkeypatch.setattr(fhir.db, "scalar", has_witnesses)
+    monkeypatch.setattr(cms.relationships, "completed_receipt_count", AsyncMock(return_value=0))
     monkeypatch.setattr(fhir, "_schema", lambda: "synthetic")
     monkeypatch.setattr(fhir, "_endpoint_dataset_state", AsyncMock(return_value=state_by_field))
     accepted = importlib.import_module("api.provider_directory_cms_generation")
@@ -602,6 +603,33 @@ async def test_identity_batches_bind_only_explicit_same_source_networks():
     assert set(fake_fhir.db.all.await_args.kwargs["resource_ids"]) == {"network-1", "unresolved"}
 
 
+@pytest.mark.asyncio
+async def test_identity_batch_keeps_writer_limit_inside_one_transaction():
+    sessions = []
+    sizes = []
+
+    @asynccontextmanager
+    async def session():
+        sessions.append(object())
+        yield sessions[-1]
+
+    async def bind(_session, **kwargs):
+        sizes.append(len(kwargs["resources"]))
+
+    resources = [{"resourceType": "Organization", "id": f"org-{index}"} for index in range(101)]
+    await cms._write_identity_batch(
+        SimpleNamespace(db=SimpleNamespace(session=session)),
+        SimpleNamespace(bind_entity_batch=bind),
+        None,
+        None,
+        "Organization",
+        resources,
+        cms.release_identity(_receipt()),
+    )
+    assert sizes == [100, 1]
+    assert len(sessions) == 1
+
+
 def test_parsed_plan_preserves_unresolved_network_reference():
     _, plan_row_by_field = cms._parse_batch_row(
         fhir,
@@ -784,6 +812,7 @@ async def test_retained_verification_failure_never_reaches_validation(
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
     monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
+    monkeypatch.setattr(cms.relationships, "materialize", AsyncMock())
     finalizer = AsyncMock(return_value={"validated": True})
     publisher = AsyncMock()
     monkeypatch.setattr(fhir, "_finalize_endpoint_dataset_candidate", finalizer)
@@ -844,6 +873,7 @@ async def test_replaced_release_after_validation_never_reaches_cutover(monkeypat
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
     monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
+    monkeypatch.setattr(cms.relationships, "materialize", AsyncMock())
     finalizer = AsyncMock(return_value={"validated": True})
 
     async def run_preflight(*_args, **kwargs):
@@ -899,6 +929,7 @@ async def test_rollback_replays_fresh_candidate_without_upstream_recheck(monkeyp
     monkeypatch.setattr(cms, "_assert_counts", AsyncMock(return_value={name: 1 for _, name in RESOURCE_FILES}))
     monkeypatch.setattr(cms, "_assert_witness_counts", AsyncMock())
     monkeypatch.setattr(cms, "_materialize_identity_evidence", AsyncMock())
+    monkeypatch.setattr(cms.relationships, "materialize", AsyncMock())
     local_rechecks = []
     monkeypatch.setattr(cms.source, "verify_retained_release", lambda *_args: local_rechecks.append(True))
     upstream_verify = AsyncMock()

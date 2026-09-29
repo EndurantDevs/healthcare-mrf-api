@@ -98,6 +98,7 @@ MIGRATION_PREFIXES = (
     "20260930020000",
     "20260930030000",
     "20260930040000",
+    "20260930050000",
 )
 
 
@@ -211,6 +212,13 @@ def _plan_fixture():
     return {
         "id": "plan-1",
         "network": [{"reference": "Organization/network-1"}, {"reference": "Organization/unresolved"}],
+        "plan": [
+            {
+                "network": [{"reference": "Organization/network-1"}],
+                "coverageArea": [{"reference": "Location/site-1"}],
+            }
+        ],
+        "coverage": [{"network": [{"reference": "Organization/network-1"}]}],
         "ownedBy": {
             "reference": "Organization/insurer-1",
             "identifier": {"system": "https://example.test/organization", "value": "insurer-source-1"},
@@ -224,22 +232,40 @@ def _plan_fixture():
     }
 
 
-def retained_release(root, *, revision="first", empty_resource_type=None):
-    """Acquire and seal eight compressed files through the real source validator."""
-    resources_by_type = {
+def _resource_rows(revision):
+    """Build the eight synthetic FHIR resource sets for a release."""
+    return {
         "Organization": [
             {
                 "id": "network-1",
                 "name": "Example Network " + revision,
                 "identifier": [{"system": "urn:cms:npd:pseudo-ein", "value": "00-0000000"}],
+                "endpoint": [{"reference": "Endpoint/endpoint-1"}],
             },
             {"id": "insurer-1", "name": "Example Insurer"},
         ],
         "Location": [_site_fixture()],
-        "Endpoint": [{"id": "endpoint-1", "status": "active", "address": "https://example.test/fhir"}],
+        "Endpoint": [
+            {
+                "id": "endpoint-1",
+                "status": "active",
+                "address": "https://example.test/fhir",
+                "managingOrganization": {"reference": "Organization/insurer-1"},
+            }
+        ],
         "HealthcareService": [{"id": "service-1", "providedBy": {"reference": "Organization/network-1"}}],
         "InsurancePlan": [_plan_fixture()],
-        "Practitioner": [{"id": "1234567893"}],
+        "Practitioner": [
+            {
+                "id": "1234567893",
+                "qualification": [
+                    {
+                        "issuer": {"reference": "Organization/insurer-1"},
+                        "period": {"start": "2025-01-01"},
+                    }
+                ],
+            }
+        ],
         "PractitionerRole": [
             {
                 "id": "role-1",
@@ -256,6 +282,13 @@ def retained_release(root, *, revision="first", empty_resource_type=None):
             }
         ],
     }
+
+
+def retained_release(root, *, revision="first", empty_resource_type=None, include_missing_network=True):
+    """Acquire and seal eight compressed files through the real source validator."""
+    resources_by_type = _resource_rows(revision)
+    if not include_missing_network:
+        resources_by_type["InsurancePlan"][0]["network"] = [{"reference": "Organization/network-1"}]
     if empty_resource_type is not None:
         assert empty_resource_type in resources_by_type
         resources_by_type[empty_resource_type] = []

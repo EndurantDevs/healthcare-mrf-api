@@ -16,6 +16,7 @@ from api.provider_directory_cms_entities import read_cms_entities
 from api.provider_directory_entities_contract import CURSOR_KEY_ENV, DirectoryRead
 from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_npd_recovery as recovery
+from process import provider_directory_cms_npd_relationship as relationships
 from process import provider_directory_cms_serving_coverage as coverage
 from tests.cms_npd_admission_postgres_support import (
     admission_database,
@@ -155,6 +156,60 @@ async def _assert_source_facts(database, admission_result, receipt):
     )
     assert coverage[0] == receipt["vector_sha256"]
 
+    await _assert_relationship_facts(database, admission_result["dataset_id"])
+
+
+async def _assert_relationship_facts(database, dataset_id):
+    """Check all eight source types and exact resolution outcomes."""
+    edges = await database.all(
+        "SELECT resource_type, reference_field, target_reference, target_resource_id, resolution_status "
+        "FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id "
+        "ORDER BY resource_type, resource_id, reference_field, reference_ordinal",
+        dataset_id=dataset_id,
+    )
+    assert len(edges) == 19
+    assert {relationship[0] for relationship in edges} == {
+        "Organization",
+        "Location",
+        "Endpoint",
+        "HealthcareService",
+        "InsurancePlan",
+        "Practitioner",
+        "PractitionerRole",
+        "OrganizationAffiliation",
+    }
+    assert {relationship[1] for relationship in edges} >= {
+        "plan.network",
+        "plan.coverageArea",
+        "coverage.network",
+        "qualification.issuer",
+    }
+    issuer_period = await database.scalar(
+        "SELECT period_start FROM mrf.provider_directory_cms_npd_relationship "
+        "WHERE dataset_id=:dataset_id AND reference_field='qualification.issuer'",
+        dataset_id=dataset_id,
+    )
+    assert issuer_period == "2025-01-01"
+    assert {
+        (relationship[2], relationship[3], relationship[4])
+        for relationship in edges
+        if relationship[2] == "Organization/unresolved"
+    } == {("Organization/unresolved", "unresolved", "unresolved")}
+    assert {
+        (relationship[0], relationship[1], relationship[2], relationship[4])
+        for relationship in edges
+        if relationship[4] == "unresolved"
+    } == {
+        ("InsurancePlan", "network", "Organization/unresolved", "unresolved"),
+        ("Location", "partOf", "Location/parent-site", "unresolved"),
+        ("Location", "endpoint", None, "unresolved"),
+    }
+    assert all(
+        relationship[4] == "resolved"
+        for relationship in edges
+        if relationship[2] not in {"Organization/unresolved", "Location/parent-site", None}
+    )
+
 
 async def _assert_published_payload_guard(database, dataset_id):
     with pytest.raises(DBAPIError, match="cms_npd_published_resource_immutable"):
@@ -168,6 +223,35 @@ async def _assert_published_payload_guard(database, dataset_id):
             "SET raw_payload_json='{}'::jsonb WHERE dataset_id=:dataset_id",
             dataset_id=dataset_id,
         )
+    with pytest.raises(DBAPIError, match="cms_npd_published_relationship_immutable"):
+        await database.status(
+            "UPDATE mrf.provider_directory_cms_npd_relationship "
+            "SET resolution_status='unresolved' WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+    with pytest.raises(DBAPIError, match="cms_npd_relationship_receipt_immutable"):
+        await database.status(
+            "UPDATE mrf.provider_directory_cms_npd_relationship_receipt "
+            "SET relationship_count=0 WHERE dataset_id=:dataset_id",
+            dataset_id=dataset_id,
+        )
+    with pytest.raises(DBAPIError, match="cms_npd_published_relationship_immutable"):
+        await database.status(
+            "INSERT INTO mrf.provider_directory_cms_npd_relationship "
+            "(dataset_id, source_id, release_id, resource_type, resource_id, "
+            "source_payload_hash, raw_payload_sha256, reference_field, "
+            "parent_ordinal, reference_ordinal, target_type, target_reference, "
+            "target_resource_id, resolution_status, period_start, period_end) "
+            "SELECT dataset_id, source_id, release_id, resource_type, resource_id, "
+            "source_payload_hash, raw_payload_sha256, reference_field, "
+            "parent_ordinal, reference_ordinal + 100, target_type, target_reference, "
+            "target_resource_id, resolution_status, period_start, period_end "
+            "FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id LIMIT 1",
+            dataset_id=dataset_id,
+        )
+    with pytest.raises(DBAPIError, match="cms_npd_relationship_truncate_forbidden"):
+        await database.status("TRUNCATE mrf.provider_directory_cms_npd_relationship")
 
 
 async def _assert_generic_publication_blocked():
@@ -262,24 +346,96 @@ async def test_complete_release_publishes_with_real_database_guards(monkeypatch,
         replay = await _admit(directory, receipt, "cms-test-replay")
         assert replay["dataset_id"] == admission_result["dataset_id"] and replay["replayed"] is True
         await _assert_source_facts(database, replay, receipt)
-        next_directory, next_receipt = retained_release(cms_artifact_root, revision="second")
-        replacement = await _admit(next_directory, next_receipt, "cms-test-second")
-        assert replacement["dataset_id"] != admission_result["dataset_id"]
-        assert (await fhir._endpoint_dataset_state(admission_result["dataset_id"]))["status"] == "superseded"
-        await _assert_current(database, replacement["dataset_id"])
-        restored = await _admit(
-            directory,
-            receipt,
-            "cms-test-restore",
-            {
-                "cms_npd_rollback_vector_sha256": receipt["vector_sha256"],
-            },
+        await _assert_release_replacement(
+            database, cms_artifact_root, directory, receipt, admission_result, bindings, resource_identities
         )
-        assert restored["dataset_id"] not in {admission_result["dataset_id"], replacement["dataset_id"]}
-        await _assert_current(database, restored["dataset_id"])
-        await _assert_source_facts(database, restored, receipt)
-        assert await _bindings(database) == bindings
-        assert await _resource_identities(database) == resource_identities
+
+
+async def _assert_release_replacement(
+    database, artifact_root, directory, receipt, first_admission, bindings, identities
+):
+    """A replacement withdraws an edge; replay of retained bytes restores it."""
+    next_directory, next_receipt = retained_release(artifact_root, revision="second", include_missing_network=False)
+    replacement = await _admit(next_directory, next_receipt, "cms-test-second")
+    assert replacement["dataset_id"] != first_admission["dataset_id"]
+    assert (await fhir._endpoint_dataset_state(first_admission["dataset_id"]))["status"] == "superseded"
+    await _assert_current(database, replacement["dataset_id"])
+    assert (
+        await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id AND target_reference='Organization/unresolved'",
+            dataset_id=replacement["dataset_id"],
+        )
+        == 0
+    )
+    assert (
+        await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id AND target_reference='Organization/unresolved'",
+            dataset_id=first_admission["dataset_id"],
+        )
+        == 1
+    )
+    restored = await _admit(
+        directory,
+        receipt,
+        "cms-test-restore",
+        {"cms_npd_rollback_vector_sha256": receipt["vector_sha256"]},
+    )
+    assert restored["dataset_id"] not in {first_admission["dataset_id"], replacement["dataset_id"]}
+    await _assert_current(database, restored["dataset_id"])
+    await _assert_source_facts(database, restored, receipt)
+    assert await _bindings(database) == bindings
+    assert await _resource_identities(database) == identities
+
+
+@pytest.mark.asyncio
+async def test_relationship_alias_is_ambiguous_without_merging_entities(monkeypatch, cms_artifact_root):
+    """Two exact CMS resource IDs sharing one stable ID cannot silently resolve a link."""
+
+    directory, receipt = retained_release(cms_artifact_root)
+    identity = cms.release_identity(receipt)
+    async with admission_database(monkeypatch) as database:
+        endpoint_id = await cms._register_source(fhir)
+        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-test-ambiguous", identity, {})
+        for name, resource_type in cms.source.RESOURCE_FILES:
+            await cms._stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, {}, {})
+        await cms._materialize_identity_evidence(fhir, directory, candidate, identity, {}, {})
+        alias_payload_map = {"resourceType": "Organization", "id": "network-alias", "name": "Alias"}
+        model, normalized = cms._parse_batch_row(fhir, alias_payload_map, candidate)
+        await cms._persist_source_batch(fhir, model, [normalized], [alias_payload_map], candidate, "Organization")
+        await database.status(
+            "INSERT INTO mrf.provider_directory_entity_source_binding "
+            "(source_id,resource_type,resource_id,organization_id,site_id,created_at) "
+            "SELECT source_id,resource_type,'network-alias',organization_id,NULL,now() "
+            "FROM mrf.provider_directory_entity_source_binding "
+            "WHERE source_id='cms-npd' AND resource_type='Organization' AND resource_id='network-1'"
+        )
+        await relationships.materialize(fhir, candidate, identity["vector_sha256"])
+        statuses = await database.all(
+            "SELECT target_reference,resolution_status FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id AND resource_type='InsurancePlan' ORDER BY reference_field,reference_ordinal",
+            dataset_id=candidate.dataset_id,
+        )
+        assert ("Organization/network-1", "ambiguous") in [tuple(status) for status in statuses]
+        assert ("Organization/unresolved", "unresolved") in [tuple(status) for status in statuses]
+        assert ("Organization/insurer-1", "resolved") in [tuple(status) for status in statuses]
+
+
+@pytest.mark.asyncio
+async def test_relationship_pages_are_byte_bounded_and_receipted(monkeypatch, cms_artifact_root):
+    directory, receipt = retained_release(cms_artifact_root)
+    monkeypatch.setattr(relationships, "_BATCH_SIZE", 3)
+    monkeypatch.setattr(relationships, "_BATCH_BYTES", 1)
+    async with admission_database(monkeypatch) as database:
+        admitted = await _admit(directory, receipt, "cms-small-pages")
+        assert await relationships.completed_receipt_count(
+            fhir, admitted["dataset_id"], receipt["vector_sha256"]
+        ) == await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id",
+            dataset_id=admitted["dataset_id"],
+        )
+        await _assert_source_facts(database, admitted, receipt)
 
 
 @pytest.mark.asyncio
@@ -448,6 +604,48 @@ async def test_daily_check_upgrades_current_release_without_witnesses(monkeypatc
         acquired.assert_called_once()
         assert upgraded["dataset_id"] != legacy["dataset_id"]
         assert upgraded["cms_npd_check"]["outcome"] == "acquisition_required"
+        await _assert_current(database, upgraded["dataset_id"])
+        await _assert_source_facts(database, upgraded, receipt)
+
+
+@pytest.mark.asyncio
+async def test_daily_check_upgrades_witnessed_release_without_relationship_receipt(monkeypatch, cms_artifact_root):
+    directory, receipt = retained_release(cms_artifact_root)
+    with release_probe_client(directory) as client:
+        observed = cms.source.observe_release(client=client)
+    async with admission_database(monkeypatch) as database:
+        with monkeypatch.context() as witness_era:
+            witness_era.setattr(cms.relationships, "materialize", AsyncMock())
+            legacy = await _admit(directory, receipt, "cms-witness-era")
+        assert (
+            await cms.relationships.completed_receipt_count(fhir, legacy["dataset_id"], receipt["vector_sha256"])
+            is None
+        )
+        assert (
+            await database.scalar(
+                "SELECT count(*) FROM mrf.provider_directory_cms_npd_resource_witness WHERE dataset_id=:dataset_id",
+                dataset_id=legacy["dataset_id"],
+            )
+            == legacy["resource_count"]
+        )
+        acquired = Mock(return_value=(directory, receipt))
+
+        async def verify_retained(path, release_receipt, _client):
+            await asyncio.to_thread(cms.source.verify_retained_release, path, release_receipt)
+
+        with monkeypatch.context() as daily:
+            daily.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
+            daily.setattr(cms.source, "observe_release", lambda **_kwargs: observed)
+            daily.setattr(cms.source, "acquire_release", acquired)
+            daily.setattr(cms, "_verify_release", verify_retained)
+            upgraded = await cms.run({"context": {}}, {"import_resources": True, "full_refresh": True}, "cms-rel")
+        acquired.assert_called_once()
+        assert upgraded["dataset_id"] != legacy["dataset_id"]
+        assert upgraded["cms_npd_check"]["outcome"] == "acquisition_required"
+        assert (
+            await cms.relationships.completed_receipt_count(fhir, upgraded["dataset_id"], receipt["vector_sha256"])
+            is not None
+        )
         await _assert_current(database, upgraded["dataset_id"])
         await _assert_source_facts(database, upgraded, receipt)
 
