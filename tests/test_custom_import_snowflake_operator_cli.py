@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 from contextlib import asynccontextmanager
@@ -138,6 +139,58 @@ class _Database:
         session = object()
         self.sessions.append(session)
         yield session
+
+
+class _NoisyOperatorDatabase(_Database):
+    """Emit synthetic output during one receipt-only operator lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        failure_stage: str | None,
+        failure_type: type[BaseException] | None,
+        disconnect_failure: bool,
+    ) -> None:
+        super().__init__()
+        self.engine = SimpleNamespace(echo=True)
+        self.failure_stage = failure_stage
+        self.failure_type = failure_type
+        self.disconnect_failure = disconnect_failure
+        self.observed_echoes: list[bool] = []
+        self.output_logger = logging.getLogger("tests.snowflake_operator_execute_output")
+        self.output_handler = logging.StreamHandler(sys.stderr)
+        self.added_output_handler = logging.StreamHandler(sys.stderr)
+        self.output_logger.addHandler(self.output_handler)
+        self.has_added_output_handler = False
+
+    def _emit_noise(self, stage: str) -> None:
+        print(f"synthetic {stage} stdout")
+        print(f"synthetic {stage} stderr", file=sys.stderr)
+        if not self.has_added_output_handler:
+            self.output_logger.addHandler(self.added_output_handler)
+            self.has_added_output_handler = True
+        self.output_logger.warning("synthetic %s logging", stage)
+        if self.failure_stage == stage:
+            if self.failure_type is None:
+                raise AssertionError("synthetic failure is missing")
+            raise self.failure_type("synthetic primary failure")
+
+    async def connect(self) -> None:
+        self.connected += 1
+        self._emit_noise("connect")
+
+    async def disconnect(self) -> None:
+        self.disconnected += 1
+        self._emit_noise("disconnect")
+        if self.disconnect_failure:
+            raise RuntimeError("synthetic cleanup failure")
+
+    def close(self) -> None:
+        self.output_logger.removeHandler(self.output_handler)
+        if self.added_output_handler in self.output_logger.handlers:
+            self.output_logger.removeHandler(self.added_output_handler)
+        self.output_handler.close()
+        self.added_output_handler.close()
 
 
 class _ResumeSession:
@@ -299,6 +352,72 @@ async def test_operator_composes_only_retained_configuration_and_generated_sql(m
     assert 'FROM "SYNTHETIC"."PUBLIC"."ROOT_SNAPSHOTS"' in captured_by_key["statement"].sql
     assert "SELECT" in captured_by_key["statement"].sql
     assert "DROP" not in captured_by_key["statement"].sql
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failure", "disconnect_failure", "expected_exit", "error_code"),
+    (
+        (None, None, False, 0, None),
+        ("connect", RuntimeError, True, 1, "failed"),
+        ("run", KeyboardInterrupt, True, 130, "canceled"),
+        (None, None, True, 1, "failed"),
+    ),
+)
+def test_operator_cli_suppresses_noisy_execute_lifecycle_output(
+    monkeypatch, capsys, failure_stage, failure, disconnect_failure, expected_exit, error_code
+):
+    """Emit only a safe receipt across execute and disconnect outcomes."""
+
+    database = _NoisyOperatorDatabase(
+        failure_stage=failure_stage, failure_type=failure, disconnect_failure=disconnect_failure
+    )
+    loaded = _loaded_binding()
+
+    async def load(session, **identifiers):
+        assert session is database.sessions[0]
+        assert identifiers == {
+            "definition_revision_id": loaded.definition_revision_id,
+            "source_binding_revision_id": loaded.source_binding_revision_id,
+        }
+        database.observed_echoes.append(database.engine.echo)
+        database._emit_noise("load")
+        return loaded
+
+    async def run(_session_factory, _connector, _request):
+        database.observed_echoes.append(database.engine.echo)
+        database._emit_noise("run")
+        return CandidateRunResult(status="sealed_unpublished", execution_id=41)
+
+    execute_operation = operator_cli._run_retained_snowflake_binding
+
+    async def execute(**arguments):
+        return await execute_operation(**arguments, database=database)
+
+    monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", load)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", _CredentialProvider)
+    monkeypatch.setattr(operator_cli, "SnowflakePythonConnectorAdapter", _Adapter)
+    monkeypatch.setattr(operator_cli, "run_snowflake_bundle_candidate", run)
+    monkeypatch.setattr(operator_cli, "_run_retained_snowflake_binding", execute)
+
+    try:
+        exit_code = operator_cli.run_command(
+            "execute --definition-revision-id 32 --source-binding-revision-id 34 "
+            "--idempotency-key synthetic-run".split()
+        )
+        captured_output = capsys.readouterr()
+        assert exit_code == expected_exit
+        if error_code is None:
+            assert captured_output.err == ""
+            assert captured_output.out == '{"execution_id":41,"status":"sealed_unpublished"}\n'
+        else:
+            assert captured_output.out == ""
+            assert captured_output.err == f'{{"code":"{error_code}","status":"error"}}\n'
+            assert "synthetic" not in captured_output.err
+        assert database.observed_echoes == ([] if failure_stage == "connect" else [False, False])
+        assert database.connected == database.disconnected == 1 and database.engine.echo is True
+        assert database.added_output_handler not in database.output_logger.handlers
+    finally:
+        database.close()
 
 
 def test_operator_cli_runs_the_retained_revision_command(monkeypatch, capsys):
@@ -977,6 +1096,61 @@ async def test_registration_reads_back_the_committed_receipt_before_output(monke
     ]
     assert database.connected == database.disconnected == 1
     assert database.sessions == [database.resume_session, database.resume_session]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failure", "disconnect_failure", "expected_exit", "error_code", "expected_echoes"),
+    (
+        (None, None, False, 0, None, [False, False]),
+        ("connect", RuntimeError, True, 1, "failed", []),
+        ("register", DefinitionRegistrationError, True, 1, "invalid_registration", [False]),
+        ("readback", KeyboardInterrupt, True, 130, "canceled", [False, False]),
+        (None, None, True, 1, "failed", [False, False]),
+    ),
+)
+def test_operator_cli_suppresses_noisy_registration_lifecycle_output(
+    monkeypatch, capsys, failure_stage, failure, disconnect_failure, expected_exit, error_code, expected_echoes
+):
+    database = _NoisyOperatorDatabase(
+        failure_stage=failure_stage, failure_type=failure, disconnect_failure=disconnect_failure
+    )
+    loaded = _loaded_binding()
+    registration = _binding_receipt(loaded)
+    expected_receipt = operator_cli._registration_receipt(registration, loaded.definition, loaded.binding)
+    monkeypatch.setattr(database, "session", _resume_database(loaded).session)
+
+    async def register(_session, **_arguments):
+        database.observed_echoes.append(database.engine.echo)
+        database._emit_noise("register")
+        return registration
+
+    async def committed(_session, **_arguments):
+        database.observed_echoes.append(database.engine.echo)
+        database._emit_noise("readback")
+        return expected_receipt
+
+    registration_operation = operator_cli._register_snowflake_binding
+
+    async def register_command(**arguments):
+        return await registration_operation(**arguments, database=database)
+
+    monkeypatch.setattr(operator_cli, "register_snowflake_source_binding", register)
+    monkeypatch.setattr(operator_cli, "_committed_registration_receipt", committed)
+    monkeypatch.setattr(operator_cli, "_register_snowflake_binding", register_command)
+    try:
+        assert operator_cli.run_command(["register"], stream=_registration_stream()) == expected_exit
+        captured_output = capsys.readouterr()
+        if error_code is None:
+            assert captured_output.err == ""
+            assert captured_output.out == expected_receipt + "\n"
+        else:
+            assert captured_output.out == ""
+            assert captured_output.err == f'{{"code":"{error_code}","status":"error"}}\n'
+        assert database.observed_echoes == expected_echoes
+        assert database.connected == database.disconnected == 1 and database.engine.echo is True
+        assert database.added_output_handler not in database.output_logger.handlers
+    finally:
+        database.close()
 
 
 def test_registration_command_emits_only_the_safe_receipt(monkeypatch, capsys):

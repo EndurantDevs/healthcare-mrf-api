@@ -281,6 +281,106 @@ async def test_cancel_before_reservation_retains_an_exact_request_tombstone():
 
 
 @pytest.mark.asyncio
+async def test_bound_cancellation_retains_tombstone_before_worker_reservation():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-stopped-request",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-stopped-request").digest(),
+    }
+
+    with pytest.raises(lifecycle.ExecutionNotFound):
+        await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert not session.executions
+
+    canceled = await lifecycle.request_bound_execution_cancellation(
+        session, **request_dict, terminal_reason="operator_request"
+    )
+    replay = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert canceled.state == stopped.state == replay.state == "canceled"
+    assert canceled.changed is True and stopped.changed is False and replay.created is False
+    assert canceled.execution_id == stopped.execution_id == replay.execution_id
+    assert session.executions[canceled.execution_id].source_binding_revision_id == 44
+    assert session.executions[canceled.execution_id].terminal_reason == "operator_request"
+    assert await lifecycle.claim_execution(session, execution_id=canceled.execution_id, token=_WORKER) is None
+    assert (await lifecycle.request_bound_execution_cancellation(session, **request_dict)).changed is False
+
+    for changed in (
+        {"source_binding_revision_id": 45},
+        {"request_identity_sha256": hashlib.sha256(b"different-request").digest()},
+    ):
+        with pytest.raises(lifecycle.IdempotencyConflict):
+            await lifecycle.request_bound_execution_cancellation(session, **{**request_dict, **changed})
+    assert session.executions[canceled.execution_id].state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_stopped_bound_request_expires_a_previously_claimed_lease():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-claimed-request",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-claimed-request").digest(),
+    }
+    reserved = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    grant = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER)
+    assert grant is not None
+
+    with pytest.raises(lifecycle.ExecutionLifecycleError, match="request bound cancellation"):
+        await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    requested = await lifecycle.request_bound_execution_cancellation(session, **request_dict)
+    lease = session.leases[reserved.execution_id]
+    assert requested.state == "canceling" and requested.changed is True
+    assert lease.expires_at is not None and lease.expires_at > session.now
+    assert (await lifecycle.request_bound_execution_cancellation(session, **request_dict)).changed is False
+
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert stopped.state == "canceled" and stopped.changed is True
+    assert stopped.execution_id == reserved.execution_id
+    assert lease.fence == grant.fence and lease.expires_at == session.now
+    assert (
+        await lifecycle.finish_execution(
+            session,
+            execution_id=reserved.execution_id,
+            fence=grant.fence,
+            token=_WORKER,
+            terminal_state="completed",
+        )
+    ).state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_bound_cancellation_preserves_a_prior_completed_outcome():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-terminal-before-cancel",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-terminal-before-cancel").digest(),
+    }
+    reserved = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    grant = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER)
+    assert grant is not None
+    completed = await lifecycle.finish_execution(
+        session, execution_id=reserved.execution_id, fence=grant.fence, token=_WORKER, terminal_state="completed"
+    )
+
+    requested = await lifecycle.request_bound_execution_cancellation(session, **request_dict)
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert completed.state == requested.state == stopped.state == "completed"
+    assert requested.changed is False and stopped.changed is False
+
+
+@pytest.mark.asyncio
 async def test_lookup_rejects_dirty_sessions_before_refreshing_execution():
     session = _SyntheticSession()
     identity = hashlib.sha256(b"synthetic-pending-lookup").digest()

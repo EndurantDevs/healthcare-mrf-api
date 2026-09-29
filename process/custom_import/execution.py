@@ -773,6 +773,102 @@ async def cancel_execution_request(
     )
 
 
+async def request_bound_execution_cancellation(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    source_binding_revision_id: int,
+    idempotency_key: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+    terminal_reason: str | None = None,
+) -> ExecutionTransition:
+    """Fence one exact bound request before stopping its external worker.
+
+    A new request is retained as a canceled row.  A claimed execution stays
+    canceling until its worker finishes or a caller proves that it has stopped.
+    """
+
+    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
+    binding_id = _positive_id(source_binding_revision_id, "source_binding_revision_id")
+    identity = _request_identity_sha256(request_identity_sha256)
+    if identity is None:
+        raise ValueError("request_identity_sha256 is required")
+    submission = await reserve_execution(
+        session,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        source_binding_revision_id=binding_id,
+        idempotency_key=idempotency_key,
+        mechanism="local",
+        request_identity_sha256=identity,
+    )
+    return await request_cancellation(
+        session,
+        execution_id=submission.execution_id,
+        terminal_reason=terminal_reason,
+    )
+
+
+async def finalize_stopped_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    source_binding_revision_id: int,
+    idempotency_key: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+) -> ExecutionTransition:
+    """Terminalize a pre-canceled exact request after its worker is stopped.
+
+    The caller must establish that no worker for this request can continue or
+    start before committing this transaction.  A prior cancellation request
+    must have fenced delayed reservations.  Existing terminal outcomes remain
+    unchanged, and this operation never creates an execution.
+    """
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    request = _validated_execution_request(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        source_binding_revision_id=source_binding_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism="local",
+        request_identity_sha256=request_identity_sha256,
+        capture_bundle_id=None,
+    )
+    if request.request_identity_sha256 is None:
+        raise ValueError("request_identity_sha256 is required")
+    await _lock_dataset(session, request.dataset_id)
+    execution = await _locked_submission_execution(session, request, None)
+    if execution is None:
+        raise ExecutionNotFound("exact bound execution request does not exist")
+    if not _has_matching_execution_identity(execution, request):
+        raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
+    state = _validate_execution_state(execution)
+    lease = await _lock_lease(session, execution.execution_id)
+    _validate_lease(lease)
+    if state in TERMINAL_STATES:
+        return ExecutionTransition(execution_id=execution.execution_id, state=state, changed=False)
+    if state != "canceling":
+        raise ExecutionLifecycleError("request bound cancellation before worker-stop finality")
+
+    now = await _database_now(session)
+    await _apply_terminal_transition(
+        session,
+        execution_id=execution.execution_id,
+        terminal_state="canceled",
+        terminal_reason="worker_stopped",
+        now=now,
+    )
+    return ExecutionTransition(execution_id=execution.execution_id, state="canceled", changed=True)
+
+
 async def _submit_execution(
     session: AsyncSession,
     request: _ExecutionRequest,
@@ -1247,10 +1343,12 @@ __all__ = (
     "claim_execution",
     "create_execution",
     "finish_execution",
+    "finalize_stopped_execution_request",
     "heartbeat_execution",
     "lease_token_sha256",
     "lookup_execution_request",
     "request_cancellation",
+    "request_bound_execution_cancellation",
     "require_separate_publication_transaction",
     "reserve_execution",
     "resume_execution",

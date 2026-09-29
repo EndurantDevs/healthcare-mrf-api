@@ -119,9 +119,15 @@ credentials and does not print or log preview rows.
 bounded query and its selected root-key scope. They are not warehouse
 cardinality, import cardinality, query-credit, or cost estimates.
 
-The limits bound selected root keys, rows per child stream, client-side encoded
-result bytes, and elapsed cursor work. The adapter receives the execution
-timeout and owns resource cleanup. `LIMIT` limits returned rows, not warehouse
-scan work; grouping and joins can still scan an approved relation. A
-client-side byte cap also cannot prevent a driver from allocating one oversized
-source cell before the core sees it.
+The limits bound selected root keys, rows per child stream, a conservative
+whole-result wire allowance, client-side encoded result bytes, and elapsed
+cursor work. The generated query sizes every selected metadata, key, and data
+cell before returning it, including the `R + 1` and `C + 1` sentinels and a
+fixed schema allowance. When that allowance exceeds the byte limit, it returns
+one empty byte-limit sentinel; the core returns an unavailable result with no
+sample and unknown observations. The adapter receives the execution timeout and
+owns resource cleanup. `LIMIT` limits returned rows, not warehouse scan work;
+grouping and joins can still scan an approved relation. The allowance is
+conservative rather than a driver-allocation guarantee: a wide, mostly-null
+schema can therefore be unavailable before returning a sample. The client-side
+cap remains a second guard.

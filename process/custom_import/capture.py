@@ -35,6 +35,7 @@ from process.custom_import._source_text import (
     validate_snapshot_token,
     validate_source_label,
 )
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
 from process.custom_import.parquet_pages import (
     ParquetPageError,
@@ -42,7 +43,6 @@ from process.custom_import.parquet_pages import (
     validate_page_layout,
 )
 
-_DEFAULT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_PARQUET_FOOTER_BYTES = 1024 * 1024
 _MAX_PARQUET_ROW_GROUPS = 4_096
 _MAX_PARQUET_THRIFT_CONTAINER_ITEMS = 64 * 1024
@@ -64,40 +64,6 @@ Scalar = str | int | Decimal | bool | None
 
 class CaptureError(ValueError):
     """A source payload is malformed, exceeds limits, or fails replay checks."""
-
-
-@dataclass(frozen=True)
-class CaptureLimits:
-    """Resource limits applied before custom-import source data is admitted.
-
-    The per-record byte limit applies to raw delimited and JSON record bytes
-    (including escapes) and to the cumulative scalar content of XML records.
-    XML parser safety also applies fixed internal ceilings to unfinished markup
-    and the document-wide expanded-name vocabulary.
-    """
-
-    maximum_compressed_bytes: int = 64 * 1024 * 1024
-    maximum_decoded_bytes: int = 256 * 1024 * 1024
-    maximum_record_bytes: int = 1024 * 1024
-    maximum_records: int = 1_000_000
-    maximum_fields_per_record: int = 1_024
-    read_chunk_bytes: int = _DEFAULT_READ_CHUNK_BYTES
-
-    def __post_init__(self) -> None:
-        """Reject nonsensical or internally inconsistent resource limits."""
-
-        for name, value in (
-            ("maximum_compressed_bytes", self.maximum_compressed_bytes),
-            ("maximum_decoded_bytes", self.maximum_decoded_bytes),
-            ("maximum_record_bytes", self.maximum_record_bytes),
-            ("maximum_records", self.maximum_records),
-            ("maximum_fields_per_record", self.maximum_fields_per_record),
-            ("read_chunk_bytes", self.read_chunk_bytes),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.maximum_decoded_bytes < self.maximum_record_bytes:
-            raise ValueError("maximum_decoded_bytes must cover one complete record")
 
 
 _DEFAULT_CAPTURE_LIMITS = CaptureLimits()
