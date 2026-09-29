@@ -11,10 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api import provider_directory_sources
 from process import provider_directory_profile as profile
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -3167,9 +3167,7 @@ async def test_candidate_fence_failure_skips_reset(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_candidate_bundle_restores_budget_before_table_lock(
-    monkeypatch,
-):
+async def test_candidate_bundle_restores_budget_before_table_lock(monkeypatch):
     """Wire the candidate fence budget ahead of the live bundle lock."""
     events = []
 
@@ -3183,6 +3181,8 @@ async def test_candidate_bundle_restores_budget_before_table_lock(
         events.append("lock-tables")
 
     stage = _artifact_stage()
+    relation_attribute = AsyncMock(return_value="r")
+    monkeypatch.setattr(importer, "_provider_directory_relation_attribute", relation_attribute)
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_promotion_dataset(),),
         should_select_validated_candidates=True,
@@ -3222,6 +3222,9 @@ async def test_candidate_bundle_restores_budget_before_table_lock(
     assert fence_budget < events.index("verify-fence")
     assert events.index("verify-fence") < retained_budget
     assert retained_budget < events.index("lock-tables")
+    relation_attribute.assert_awaited_once_with(stage.schema, stage.target_relation, "relkind")
+    live_lock = f'LOCK TABLE "{stage.schema}"."{stage.target_relation}" IN ACCESS EXCLUSIVE MODE'
+    assert events.index("lock-tables") < events.index(live_lock)
 
 
 @pytest.mark.asyncio
@@ -3509,6 +3512,8 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock())
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
+    monkeypatch.setattr(importer.db, "_transaction_binding", lambda: SimpleNamespace())
+    monkeypatch.setattr(importer, "_provider_directory_relation_attribute", AsyncMock(return_value="r"))
     helper_names = (
         "_acquire_provider_directory_artifact_cutover_lock",
         "_lock_and_verify_artifact_dataset_fence",
@@ -3540,6 +3545,7 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     helpers_by_name[
         "_promote_provider_directory_artifact_datasets"
     ].assert_awaited_once_with(fence)
+    importer.db.status.assert_any_await('LOCK TABLE "mrf"."target-a", "mrf"."target-b" IN ACCESS EXCLUSIVE MODE')
     await importer._promote_provider_directory_artifact_bundle_transaction(())
 
 
@@ -4086,17 +4092,15 @@ async def test_profile_unbounded_and_completed_batch_paths(monkeypatch):
 @pytest.mark.asyncio
 async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     """Exercise active dataset fencing and the ordinary bundle branch."""
-    @contextlib.asynccontextmanager
-    async def transaction():
-        yield
-
     stage = _artifact_stage()
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_promotion_dataset(),)
     )
-    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
     monkeypatch.setattr(importer.db, "status", AsyncMock())
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=True))
+    scalar_query = AsyncMock(return_value=False)
+    monkeypatch.setattr(importer.db, "scalar", scalar_query)
+    monkeypatch.setattr(importer, "_provider_directory_relation_attribute", AsyncMock(return_value="r"))
     helper_names = (
         "_acquire_provider_directory_artifact_cutover_lock",
         "_lock_and_verify_artifact_dataset_fence",
@@ -4131,6 +4135,14 @@ async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     await importer._promote_provider_directory_artifact_bundle_transaction(
         (stage,)
     )
+    assert importer.db._transaction_binding() is None
+    assert "to_regclass(:table)" in scalar_query.await_args.args[0]
+    importer._provider_directory_relation_attribute.assert_awaited_once_with(stage.schema, stage.target_relation, "relkind")
+    importer.db.status.assert_any_await(f'LOCK TABLE "{stage.schema}"."{stage.target_relation}" IN ACCESS EXCLUSIVE MODE')
+    assert helpers_by_name["_install_provider_directory_prepared_stage"].await_count == 2
+    assert helpers_by_name["_finish_provider_directory_prepared_stage"].await_count == 2
+    helpers_by_name["_lock_and_verify_artifact_dataset_fence"].assert_awaited_once()
+    helpers_by_name["_promote_provider_directory_artifact_datasets"].assert_awaited_once()
 
 
 @pytest.mark.asyncio

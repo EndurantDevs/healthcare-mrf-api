@@ -75,15 +75,16 @@ def _write_observations(tmp_path, observation_payload_by_kind):
     return path_by_label
 
 
-def test_all_27_maintained_sources_can_produce_ready_rows_and_table():
+def test_all_28_maintained_sources_can_produce_ready_rows_and_table():
     report = _report(_observation_payload_by_kind())
 
-    assert report["maintained_source_count"] == 27
+    assert report["maintained_source_count"] == 28
     assert report["ready"] is True
-    assert len(report["sources"]) == 27
+    assert len(report["sources"]) == 28
+    assert next(row for row in report["sources"] if row["entry_id"] == "cms-npd")["source_id"] == "cms-npd"
     assert {row["status"] for row in report["sources"]} == {"ready"}
     table = gates.format_table(report)
-    assert table.count("\n") == 28
+    assert table.count("\n") == 29
     assert "aetna-commercial-medicare" in table
     assert "current_terminal_acquisition" not in table
 

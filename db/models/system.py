@@ -2700,8 +2700,12 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
             name="pd_profile_capacity_consumption_reservation_key",
         ),
         UniqueConstraint(
-            "run_id",
-            name="pd_profile_capacity_consumption_run_key",
+            "run_id", "admission_purpose",
+            name="pd_profile_capacity_consumption_run_purpose_key",
+        ),
+        CheckConstraint(
+            "admission_purpose IN ('profile','cms_nonprofile')",
+            name="pd_profile_capacity_consumption_purpose_check",
         ),
         CheckConstraint(
             "attestation_id ~ '^[0-9a-f]{64}$' "
@@ -2770,6 +2774,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     source_vector_hash = Column(String(64), nullable=False)
     source_context_vector_hash = Column(String(64), nullable=False)
     run_id = Column(String(64), nullable=False)
+    admission_purpose = Column(String(32), nullable=False, server_default="profile")
     build_id = Column(String(64), nullable=False)
     profile_as_of = Column(String(10), nullable=False)
     contract_id = Column(String(64), nullable=False)

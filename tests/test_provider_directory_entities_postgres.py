@@ -11,8 +11,15 @@ from sqlalchemy import text
 
 from api import provider_directory_medical_groups as serving
 from api.endpoint import provider_directory_entities as endpoint
-from api.provider_directory_entities_contract import DirectoryReadError
-from tests.provider_directory_entities_postgres_support import GROUP_A, GROUP_B, directory_database
+from api.provider_directory_entities_contract import DirectoryReadError, parse_directory_read
+from tests.provider_directory_entities_postgres_support import (
+    GROUP_A,
+    GROUP_B,
+    SITE_A,
+    SITE_B,
+    SITE_D,
+    directory_database,
+)
 from tests.test_provider_directory_entities import directory_query
 
 
@@ -53,7 +60,7 @@ async def test_accepted_groups_page_by_stable_uuid_without_candidate_or_source_l
 
 
 @pytest.mark.asyncio
-async def test_detail_and_relationships_preserve_explicit_unresolved_assertions(monkeypatch):
+async def test_detail_and_relationships_resolve_exact_source_site_bindings(monkeypatch):
     async with directory_database(monkeypatch) as sessions:
         detail_query = directory_query("source_id=cms-doctors", shape="entity", entity_id=GROUP_A)
         detail = await _read(sessions, detail_query)
@@ -64,14 +71,39 @@ async def test_detail_and_relationships_preserve_explicit_unresolved_assertions(
             sessions, replace(query, generation_id=first["generation_id"], cursor=first["next_cursor"])
         )
         assert second["next_cursor"] is None
-        items = first["items"] + second["items"]
-        assert len(items) == 3
-        assert len({item["relationship_key"] for item in items}) == 3
-        assert first["items"] == sorted(first["items"], key=lambda item: item["relationship_key"])
-        for item in items:
-            assert item["target_kind"] == "sites" and item["target_id"] is None
-            assert item["status"] == "unresolved" and item["relationship_type"] == "group-site"
-            assert item["effective_start"] is None and item["effective_end"] is None
+        relationship_items = first["items"] + second["items"]
+        assert len(relationship_items) == 3
+        assert len({relationship["relationship_key"] for relationship in relationship_items}) == 3
+        assert first["items"] == sorted(first["items"], key=lambda relationship: relationship["relationship_key"])
+        assert {relationship["target_id"] for relationship in relationship_items} == {SITE_A, SITE_B, SITE_D}
+        assert "synthetic-address" not in json.dumps(relationship_items)
+        for relationship in relationship_items:
+            assert relationship["target_kind"] == "sites" and relationship["target_id"] is not None
+            assert relationship["status"] == "resolved" and relationship["relationship_type"] == "group-site"
+            assert relationship["effective_start"] is None and relationship["effective_end"] is None
+            assert relationship["provider_npi"] == "1234567893"
+            assert relationship["provider_profile_path"] == "/api/v1/providers/1234567893/profile"
+            site = await _read(sessions, serving_query("sites", relationship["target_id"]))
+            assert site["item"]["id"] == relationship["target_id"]
+            assert site["item"]["kind"] == "sites"
+            assert site["item"]["source_id"] == "cms-doctors"
+            assert site["item"]["evidence"][0]["resource_type"] == "CMSDoctorsSite"
+        async with sessions() as session:
+            request = SimpleNamespace(query_string="source_id=cms-doctors", ctx=SimpleNamespace(sa_session=session))
+            routed = await endpoint.entity_detail(request, "sites", SITE_A)
+            assert routed.status == 200
+            assert json.loads(routed.body)["item"]["id"] == SITE_A
+        site_links = await _read(
+            sessions, parse_directory_read("sites", SITE_A, "relationships", "source_id=cms-doctors")
+        )
+        assert len(site_links["items"]) == 1
+        assert site_links["items"][0]["target_id"] == GROUP_A
+        assert site_links["items"][0]["relationship_type"] == "site-group"
+        assert site_links["items"][0]["provider_npi"] == "1234567893"
+
+
+def serving_query(kind, entity_id):
+    return parse_directory_read(kind, entity_id, "entity", "source_id=cms-doctors")
 
 
 @pytest.mark.asyncio
@@ -95,6 +127,7 @@ async def test_missing_group_is_not_found_even_if_candidate_binding_exists(monke
         "UPDATE reference_family_result_generation SET relation_oids = relation_oids[1:2]",
         "UPDATE reference_family_result_generation SET relation_oids[3] = 1",
         "DELETE FROM provider_directory_cms_doctors_group_binding WHERE org_pac_id = 'synthetic-pac-beta'",
+        "DELETE FROM provider_directory_cms_doctors_site_binding WHERE adrs_id = 'synthetic-address-beta'",
     ],
 )
 async def test_unaccepted_or_incompletely_bound_source_never_returns_partial_page(monkeypatch, mutation):

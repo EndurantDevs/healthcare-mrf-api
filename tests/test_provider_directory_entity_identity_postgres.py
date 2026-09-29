@@ -244,12 +244,13 @@ async def _exercise_batched_cms_doctors_groups(fhir_organization_id, suffix):
 
 async def _exercise_batched_identity_cases(source_id):
     organizations = [
-        {"resourceType": "Organization", "id": f"org-{index}", "name": f"Example Group {index}"} for index in range(100)
+        {"resourceType": "Organization", "id": f"org-{index}", "name": f"Example Group {index}"}
+        for index in range(1_000)
     ]
     start = time.perf_counter()
     first_ids = await _observe_batch(source_id, "release-one", organizations)
     first_seconds = time.perf_counter() - start
-    assert len(set(first_ids)) == 100
+    assert len(set(first_ids)) == 1_000
     replay_ids, concurrent_ids = await asyncio.gather(
         _observe_batch(source_id, "release-one", organizations),
         _observe_batch(source_id, "release-one", organizations),
@@ -273,8 +274,8 @@ async def _exercise_batched_identity_cases(source_id):
                 )
             )
         ).all()
-    assert len(evidence_rows) == 100
-    print(f"synthetic_organization_batch_100_rows_per_second={100 / first_seconds:.1f}")
+    assert len(evidence_rows) == 1_000
+    print(f"synthetic_organization_batch_1000_rows_per_second={1_000 / first_seconds:.1f}")
 
 
 @pytest.mark.asyncio

@@ -173,6 +173,15 @@ async def create_fence_tables(connection, schema: str) -> None:
     await _create_ptg_manifest_table(connection, schema)
 
 
+async def create_cms_stale_candidate_fixture(connection, schema: str) -> None:
+    """Provide the shared publication query's disposition relation in reduced schemas."""
+
+    await connection.execute(
+        f'CREATE TABLE "{schema}".provider_directory_cms_npd_stale_candidate '
+        '(dataset_id varchar(96) PRIMARY KEY)'
+    )
+
+
 async def _create_directory_catalog_tables(connection, schema: str) -> None:
     quoted_schema = f'"{schema}"'
     await connection.execute(
@@ -482,3 +491,4 @@ class TransactionalSchema:
             self.schema,
         )
         assert guard_binding_after == guard_binding_before
+        await create_cms_stale_candidate_fixture(self.connection, self.schema)

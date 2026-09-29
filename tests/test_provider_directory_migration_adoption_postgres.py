@@ -123,9 +123,12 @@ async def main():
                 "provider_directory_site_identity",
                 "provider_directory_entity_source_binding",
                 "provider_directory_entity_release_evidence",
+                "provider_directory_entity_redirect_decision",
+                "provider_directory_entity_redirect",
                 "provider_directory_cms_serving_coverage",
                 "provider_directory_resource_identity",
                 "provider_directory_cms_doctors_group_binding",
+                "provider_directory_cms_doctors_site_binding",
                 "provider_directory_insurance_network_identity",
                 "provider_directory_insurance_network_source_binding",
                 "provider_directory_insurance_network_plan_evidence",
@@ -153,6 +156,8 @@ async def main():
                 "provider_directory_rooted_graph_twin_admission",
                 "provider_directory_rooted_graph_dataset",
                 "provider_directory_rooted_graph_dataset_resource",
+                "provider_directory_cms_npd_stale_candidate",
+                "provider_directory_cms_npd_resource_witness",
             }
             target_tables = [
                 table

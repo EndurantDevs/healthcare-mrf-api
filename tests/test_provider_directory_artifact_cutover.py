@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from contextlib import asynccontextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -378,6 +380,38 @@ async def test_artifact_build_guard_serializes_complete_build_cycle(monkeypatch)
     assert sum("pg_try_advisory_lock" in event for event in engine.events) == 4
     assert sum("pg_advisory_unlock" in event for event in engine.events) == 1
     assert engine.locked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_artifact_build_guard_closes_lookup_transaction_before_build(monkeypatch, failure):
+    preparation = importlib.import_module("process.provider_directory_cms_preparation")
+    engine = _AdvisoryEngine()
+    monkeypatch.setattr(importer.db, "engine", engine)
+    transaction_state = SimpleNamespace(is_active=False)
+
+    @asynccontextmanager
+    async def transaction(fhir):
+        assert fhir is importer and not transaction_state.is_active
+        transaction_state.is_active = True
+        try:
+            yield
+        finally:
+            transaction_state.is_active = False
+
+    async def relation_oid(*args):
+        assert transaction_state.is_active and engine.locked
+        return 42
+
+    monkeypatch.setattr(preparation, "active_nonprofile_sql_transaction", transaction)
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", relation_oid)
+    with pytest.raises(RuntimeError, match="synthetic build failure") if failure else nullcontext():
+        async with importer._provider_directory_artifact_build_guard("mrf", "address_overlay") as fence:
+            assert fence.target_oid == 42 and not transaction_state.is_active and engine.locked
+            if failure:
+                raise RuntimeError("synthetic build failure")
+    assert not transaction_state.is_active and not engine.locked
+    assert sum("pg_advisory_unlock" in event for event in engine.events) == 1
 
 
 @pytest.mark.asyncio

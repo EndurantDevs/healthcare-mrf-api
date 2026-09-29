@@ -108,7 +108,8 @@ def _validate_endpoint_identity(entry_id: str, entry: dict[str, Any]) -> None:
         or not source_ids
         or len(source_ids) != len(set(source_ids))
         or not all(
-            isinstance(source_id, str) and SOURCE_ID_PATTERN.fullmatch(source_id)
+            isinstance(source_id, str)
+            and (SOURCE_ID_PATTERN.fullmatch(source_id) or (entry_id == "cms-npd" and source_id == "cms-npd"))
             for source_id in source_ids
         )
     ):
@@ -257,17 +258,18 @@ def _review_expiration_messages(
     """Return expiration messages for catalog and source reviews."""
     freshness_policy = validate_freshness_policy(manifest)
     catalog_confirmation = manifest["catalog_confirmation"]
-    catalog_date = parse_timestamp_date(
-        catalog_confirmation["checked_at"], "catalog_confirmation.checked_at"
-    )
-    catalog_due = catalog_date + dt.timedelta(
-        days=freshness_policy["catalog_confirmation_max_age_days"]
-    )
     expiration_messages = []
-    if evaluation_date > catalog_due:
-        expiration_messages.append(
-            f"catalog confirmation expired {catalog_due.isoformat()}"
+    if catalog_confirmation is not None:
+        catalog_date = parse_timestamp_date(
+            catalog_confirmation["checked_at"], "catalog_confirmation.checked_at"
         )
+        catalog_due = catalog_date + dt.timedelta(
+            days=freshness_policy["catalog_confirmation_max_age_days"]
+        )
+        if evaluation_date > catalog_due:
+            expiration_messages.append(
+                f"catalog confirmation expired {catalog_due.isoformat()}"
+            )
     support_records_by_entry = manifest["support_documentation"]["entry_support"]
     source_reviews = [
         (entry["entry_id"], support_records_by_entry[entry["entry_id"]]["reviewed_at"])

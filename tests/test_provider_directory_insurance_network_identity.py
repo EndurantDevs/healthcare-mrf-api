@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import hashlib
 import importlib.util
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -18,7 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from db.models import ProviderDirectoryInsuranceNetworkPlanEvidence
 from process.provider_directory_insurance_network_identity import (
     _plan_network_refs,
+    record_insurance_network_organization,
     record_insurance_network_plan,
+    has_source_declared_network_role,
 )
 
 
@@ -36,7 +40,17 @@ def _plan(*, name="A plan", network="Organization/network-1"):
 def test_network_refs_include_nested_plan_networks_without_guessing():
     plan = _plan()
     plan["plan"] = [{"network": [{"reference": "Organization/network-2"}]}]
-    assert _plan_network_refs(plan) == ["Organization/network-1", "Organization/network-2"]
+    plan["coverage"] = [{"network": [{"reference": "Organization/network-3"}]}]
+    assert _plan_network_refs(plan) == [
+        "Organization/network-1", "Organization/network-2", "Organization/network-3"
+    ]
+
+
+def test_only_explicit_organization_type_declares_network_role():
+    assert has_source_declared_network_role({"type": [{"text": "ntwk"}]})
+    assert has_source_declared_network_role({"type": [{"coding": [{"code": "ntwk"}]}]})
+    assert not has_source_declared_network_role({"name": "Network", "type": [{"text": "ins"}]})
+    assert not has_source_declared_network_role({"type": {"text": "ntwk"}})
 
 
 async def _migrate(connection, upgrade, revision="20260929020000_provider_directory_insurance_network_identity"):
@@ -105,8 +119,8 @@ def _test_database_url():
 @pytest.mark.parametrize(
     "database_url",
     (
-        "postgresql+asyncpg://nick@127.0.0.1:5432/shared_test",
-        "postgresql+asyncpg://nick@example.test:5432/cms_network_test_" + "a" * 32,
+        "postgresql+asyncpg://test_user@127.0.0.1:5432/shared_test",
+        "postgresql+asyncpg://test_user@example.test:5432/cms_network_test_" + "a" * 32,
     ),
 )
 def test_network_postgres_proof_rejects_non_disposable_database(monkeypatch, database_url):
@@ -118,7 +132,7 @@ def test_network_postgres_proof_rejects_non_disposable_database(monkeypatch, dat
 @pytest.mark.parametrize("setting", ("HLTHPRT_DB_SCHEMA", "DB_SCHEMA"))
 def test_network_postgres_proof_rejects_other_schema(monkeypatch, setting):
     monkeypatch.setenv(
-        "CMS_NETWORK_TEST_DATABASE", "postgresql+asyncpg://nick@127.0.0.1:5432/cms_network_test_" + "a" * 32
+        "CMS_NETWORK_TEST_DATABASE", "postgresql+asyncpg://test_user@127.0.0.1:5432/cms_network_test_" + "a" * 32
     )
     monkeypatch.setenv(setting, "other")
     with pytest.raises(pytest.fail.Exception, match="require the mrf schema"):
@@ -180,6 +194,39 @@ async def test_network_identity_is_source_scoped_and_release_evidence_is_immutab
             assert all(entry.administered_by_ref == "Organization/administrator-1" for entry in evidence_rows)
             assert all(entry.network_refs == ["Organization/network-1"] for entry in evidence_rows)
         await _assert_network_failures(engine)
+
+
+@pytest.mark.asyncio
+async def test_source_declared_network_reuses_id_when_plan_arrives():
+    organization_map = {"resourceType": "Organization", "id": "network-2", "type": [{"text": "ntwk"}]}
+    payload_json = json.dumps(organization_map, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    async with _network_test_engine() as engine:
+        async with AsyncSession(engine) as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE mrf.provider_directory_entity_release_evidence "
+                    "SET payload_json=CAST(:payload AS jsonb), payload_sha256=:sha "
+                    "WHERE source_id='source-a' AND resource_id='network-2'"
+                ),
+                {"payload": payload_json, "sha": hashlib.sha256(payload_json.encode()).hexdigest()},
+            )
+            network_id = await record_insurance_network_organization(
+                session, source_id="source-a", release_id="release-1", organization=organization_map
+            )
+            assert network_id == await record_insurance_network_organization(
+                session, source_id="source-a", release_id="release-1", organization=organization_map
+            )
+            assert network_id == await record_insurance_network_plan(
+                session,
+                source_id="source-a",
+                release_id="release-1",
+                network_resource_id="network-2",
+                plan=_plan(network="Organization/network-2"),
+            )
+            assert (
+                await session.scalar(text("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity"))
+                == 1
+            )
 
 
 async def _assert_network_failures(engine):

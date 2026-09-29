@@ -292,7 +292,9 @@ def test_alias_generation_lock_precedes_every_materialization_fence():
         provider_directory._promote_provider_directory_artifact_stage_transaction
     )
     bundled_cutover = inspect.getsource(
-        provider_directory._promote_provider_directory_artifact_bundle_transaction
+        importlib.import_module(
+            "process.provider_directory_artifact_bundle_preparation"
+        ).apply_prepared_artifact_bundle
     )
     resolver = inspect.getsource(address_canon._validated_active_alias_state)
     entity_cutover = inspect.getsource(entity_address._run_entity_address_cutover)
@@ -301,8 +303,8 @@ def test_alias_generation_lock_precedes_every_materialization_fence():
         "_assert_provider_directory_artifact_build_fence"
     )
     assert bundled_cutover.index("alias_advisory_xact_lock_sql") < bundled_cutover.index(
-        "_apply_locked_provider_directory_artifact_bundle"
-    )
+        "_lock_provider_directory_artifact_bundle_targets"
+    ) < bundled_cutover.index("_apply_locked_provider_directory_artifact_bundle")
     assert resolver.index("alias_advisory_xact_lock_sql") < resolver.index(
         "active_alias_generation_sql"
     )

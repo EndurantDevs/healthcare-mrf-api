@@ -60,7 +60,7 @@ async def test_batch_rejects_oversize_mixed_types_and_conflicting_duplicates_bef
     organization_by_field = {"resourceType": "Organization", "id": "org-1", "name": "One"}
     with pytest.raises(ValueError, match="batch_invalid"):
         await bind_entity_batch(
-            None, source_id="cms-directory", release_id="release-one", resources=[organization_by_field] * 101
+            None, source_id="cms-directory", release_id="release-one", resources=[organization_by_field] * 1_001
         )
     with pytest.raises(ValueError, match="resource_type_mixed"):
         await bind_entity_batch(

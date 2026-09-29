@@ -42,6 +42,18 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20260930010000_provider_directory_resource_identity",
     "20260930020000_cms_npd_serving_coverage",
     "20260930030000_custom_import_registration_authority",
+    "20260930030000_cms_npd_stale_candidate",
+    "20260930040000_cms_npd_resource_witness",
+    "20260930050000_cms_npd_relationship",
+    "20260930060000_cms_doctors_site_binding",
+    "20260930070000_provider_directory_entity_redirect",
+    "20260930080000_cms_npd_coverage_version",
+    "20260930090000_cms_npd_candidate_coverage",
+    "20260930100000_cms_npd_serving_receipt",
+    "20260930110000_cms_npd_nonprofile_capacity",
+    "20260930120000_cms_native_input_revision",
+    "20260930130000_cms_doctors_prepared_seal",
+    "20260930140000_cms_capacity_preflight_receipt",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -75,7 +87,10 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
     source_binding_revision = "20260923030000_custom_import_source_binding"
     doctors_revision = "20260929000000_cms_doctor_group_site"
-    assert script.get_heads() == ["20260930030000_custom_import_registration_authority"]
+    assert script.get_heads() == ["20260930140000_cms_capacity_preflight_receipt"]
+    assert script.get_revision("20260930080000_cms_npd_coverage_version").down_revision == (
+        "20260930070000_provider_directory_entity_redirect"
+    )
     assert (
         script.get_revision("20260929020000_provider_directory_insurance_network_identity").down_revision
         == "20260929010000_provider_directory_entity_identity"
@@ -430,3 +445,17 @@ async def test_source_capture_requires_exactly_one_metadata_input() -> None:
             schema_name="mrf",
             source_metadata=None,
         )
+
+
+def test_cms_candidate_coverage_appends_to_serving_coverage():
+    """Keep candidate sealing on the existing linear migration chain."""
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    assert script.get_revision("20260930030000_cms_npd_stale_candidate").down_revision == (
+        "20260930030000_custom_import_registration_authority"
+    )
+    assert script.get_revision("20260930090000_cms_npd_candidate_coverage").down_revision == (
+        "20260930080000_cms_npd_coverage_version"
+    )
+    assert script.get_revision("20260930100000_cms_npd_serving_receipt").down_revision == (
+        "20260930090000_cms_npd_candidate_coverage"
+    )

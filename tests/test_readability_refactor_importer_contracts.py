@@ -18,9 +18,10 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, create_autospec
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 cms_doctors = importlib.import_module("process.cms_doctors")
 doctor_rows = importlib.import_module("process.cms_doctors_rows")
@@ -365,6 +366,7 @@ async def test_cms_publish_fails_closed_below_minimum_and_skips_empty_worker(mon
 
 
 def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
+    assert cms_doctors.db._transaction_binding() is None
     expected_metrics_by_name = {
         "rows": 4,
         "education": {
@@ -373,6 +375,7 @@ def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
         },
         "group_site": {"source_rows": 4},
         "organization_groups": 2,
+        "sites": 3,
         "artifact": _ARTIFACT_RECEIPT,
         "address_resolve": address_stats.__dict__,
     }
@@ -381,11 +384,35 @@ def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
     assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
 
 
+def _assert_cms_publication_transaction(*_args):
+    binding = cms_doctors.db._transaction_binding()
+    assert binding is not None
+    assert binding.session.in_transaction()
+
+
+@pytest.fixture
+def cms_publication_session(monkeypatch):
+    """Keep the real session transaction while supplying the unit-only SQL results."""
+    session = async_sessionmaker()()
+    inventory = Mock()
+
+    def execute_statement(_statement, params=None):
+        _assert_cms_publication_transaction()
+        if params is not None:
+            inventory.scalars.return_value.all.return_value = params["names"]
+        return inventory
+
+    execute = AsyncMock(side_effect=execute_statement)
+    monkeypatch.setattr(session, "execute", execute)
+    monkeypatch.setattr(cms_doctors.db, "session_factory", lambda: session)
+    return execute
+
+
 @pytest.mark.asyncio
-async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypatch):
+async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypatch, cms_publication_session):
     """A valid stage atomically replaces the live generation and retains metrics."""
 
-    status = AsyncMock()
+    status = AsyncMock(side_effect=_assert_cms_publication_transaction)
     worker_context_by_key = {
         "import_date": "run", "context": {
             "run": 1, "education": {
@@ -418,7 +445,6 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=4))
     monkeypatch.setattr(cms_doctors.db, "status", status)
-    monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: True)
     monkeypatch.setattr(cms_doctors, "stamp_address_keys", AsyncMock())
     monkeypatch.setattr(cms_doctors, "resolve_into_archive", AsyncMock(return_value=address_stats))
@@ -429,6 +455,7 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
     verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
     monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
@@ -439,29 +466,29 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
-    assert terminal_result["address_resolve"] == address_stats.__dict__
+    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
     verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     _assert_cms_publish_metrics(marked, terminal_result, address_stats)
 
 
 @pytest.mark.asyncio
-async def test_cms_publish_production_stage_without_address_feature_still_swaps(monkeypatch):
+async def test_cms_publish_production_stage_without_address_feature_still_swaps(monkeypatch, cms_publication_session):
     """Address enrichment is optional, but production row admission remains mandatory."""
 
-    status = AsyncMock()
+    status = AsyncMock(side_effect=_assert_cms_publication_transaction)
     marked = AsyncMock()
     stage = SimpleNamespace(__tablename__="doctor_stage")
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=cms_doctors.DEFAULT_MIN_ROWS))
     monkeypatch.setattr(cms_doctors.db, "status", status)
-    monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: False)
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
     verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
     monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
@@ -479,6 +506,8 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
             "control_run_id": "control", "start": "start",
         }}
     )
+    assert cms_doctors.db._transaction_binding() is None
+    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
     verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     assert marked.await_args.kwargs["metrics"] == {
         "rows": cms_doctors.DEFAULT_MIN_ROWS,
@@ -486,6 +515,7 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
                       "content_sha256": _ARTIFACT_DIGEST},
         "group_site": {"source_rows": 10000},
         "organization_groups": 2,
+        "sites": 3,
         "artifact": _ARTIFACT_RECEIPT,
     }
 

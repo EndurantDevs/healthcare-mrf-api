@@ -7,7 +7,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from process import provider_directory_profile as profile_artifact
-from process.provider_directory_profile_selection_contract import _clean_text
+from process.provider_directory_profile_selection_contract import (
+    PROFILE_SELECTION_LINEAGE_AUTHORITY, ProviderDirectoryProfileSelectionDrift,
+    ProviderDirectoryProfileSelectionError, _clean_text, _validated_pair,
+)
 from process.provider_directory_profile_uhc_flex import (
     is_uhc_flex_dataset_row_ready,
     is_uhc_flex_dataset_variant_matching,
@@ -189,3 +192,33 @@ __all__ = (
     "_metadata_source_ids",
     "_source_selection_indexes",
 )
+
+
+def _cms_dataset_pair(dataset_row: Mapping[str, Any], *, allow_desired: bool = False) -> dict[str, Any]:
+    """Read a real CMS publication state and reject incomplete source parents."""
+    pair_map = {"source_id": "cms-npd", "endpoint_id": dataset_row.get("endpoint_id"),
+        "dataset_id": dataset_row.get("dataset_id"), "dataset_hash": dataset_row.get("dataset_hash"),
+        "acquisition_root_run_id": dataset_row.get("acquisition_root_run_id"),
+        "publication_status": dataset_row.get("status"), "is_current": dataset_row.get("is_current"),
+        "lineage_authority": PROFILE_SELECTION_LINEAGE_AUTHORITY}
+    try:
+        pair_map = _validated_pair(pair_map, allow_desired=allow_desired)
+    except ProviderDirectoryProfileSelectionError as exc:
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_desired_cms_changed") from exc
+    metadata = dataset_row.get("publication_metadata_json")
+    resource_count = dataset_row.get("resource_count")
+    if (not isinstance(metadata, Mapping) or metadata.get("source_ids") != ["cms-npd"]
+        or dataset_row.get("validated_at") is None or dataset_row.get("superseded_at") is not None
+        or not isinstance(resource_count, int) or isinstance(resource_count, bool) or resource_count < 1
+        or (pair_map["publication_status"] == "validated" and dataset_row.get("published_at") is not None)
+        or (pair_map["publication_status"] == "published" and dataset_row.get("published_at") is None)):
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_desired_cms_changed")
+    return pair_map
+
+
+def _cms_incumbent_pair(dataset_rows: list[Mapping[str, Any]], endpoint_id: str) -> dict[str, Any] | None:
+    """Require the actual endpoint incumbent, including malformed-parent rejection."""
+    current_rows = [row for row in dataset_rows if row.get("endpoint_id") == endpoint_id]
+    if len(current_rows) > 1:
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_incumbent_ambiguous")
+    return _cms_dataset_pair(current_rows[0]) if current_rows else None

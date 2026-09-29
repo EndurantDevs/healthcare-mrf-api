@@ -1427,6 +1427,8 @@ def provider_enrichment(test: bool):
     "--uhc-catalog-set-sha256",
     help="Require this exact current catalog when importing the UHC source.",
 )
+@click.option("--cms-npd-rollback-vector-sha256", help="Replay one previously published retained CMS release vector.")
+@click.option("--cms-npd-rollback-root-run-id", help="Stable root run id when retrying the same CMS rollback.")
 @click.option("--dataset-rehydrate-only", is_flag=True, help="Rebuild typed rows from one retained current dataset without network calls.")
 @click.option("--rehydrate-dataset-id", help="Exact current immutable dataset id to rehydrate.")
 @click.option("--rehydrate-acquisition-root-run-id", help="Exact acquisition root run id recorded by the dataset.")

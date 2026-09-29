@@ -220,6 +220,7 @@ async def test_current_selection_request_uses_repeatable_unlocked_snapshot(
     computed_selection = SimpleNamespace(
         request_projection=tuple(selection_payload["datasets"]),
         identity_payload={
+            "contract_id": selection.PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
             "catalog_digest": selection_payload["catalog_digest"],
             "selection_fingerprint": selection_payload["selection_fingerprint"],
         },

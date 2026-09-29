@@ -7,7 +7,8 @@ and metering. Each request requires `source_id`; list and relationship requests
 accept `limit` (1–100, default 25), `generation_id`, and `cursor`. Detail requests
 accept only `source_id` and `generation_id`.
 
-The CMS Doctors scope is `kind=medical-groups` and `source_id=cms-doctors`.
+The CMS Doctors scope is `source_id=cms-doctors` with `kind=medical-groups`
+or `kind=sites`.
 The CMS directory scope is described below. Other sources return
 serving-unavailable. These routes do not use global readiness as evidence
 of source publication.
@@ -37,8 +38,12 @@ they are not seek tokens. No offset scan or whole-result in-memory sort is used.
 
 Medical-group names are source assertions. Conflicting names produce a null
 name and conflict status; activity and effective dates remain unknown. Explicit
-group-site assertions have unresolved targets until an accepted site identity
-link exists. Evidence exposes keyed record references, opaque releases and
+group-site assertions resolve to stable CMS Doctors site IDs through exact
+source address-ID bindings; a missing binding makes the read unavailable.
+Site detail and site-to-group relationships use the same accepted generation.
+Each group-site assertion also carries its source-row NPI and a path to the
+existing provider-profile route; the profile route may have no reviewed profile.
+Evidence exposes keyed record references, opaque releases and
 observation timestamps; raw source identifiers and payloads are excluded.
 
 Each response uses a read-only repeatable-read transaction, 2-second per-statement
@@ -65,9 +70,10 @@ Generation keys bind the endpoint, dataset, acquisition root, content hash,
 release vector and publication time. A rollback publication invalidates cursors.
 
 Organizations and sites use durable entity bindings and exact release evidence.
-Networks additionally require an explicit InsurancePlan network reference to the
-same source Organization and matching retained plan evidence. Network evidence
-always includes an InsurancePlan witness. Names, activity and date-only effective
+Networks require either an explicit source Organization network type or an
+InsurancePlan network reference to the same source Organization. A plan-linked
+network includes matching retained plan evidence; a source-declared network may
+have only Organization evidence and is not thereby an insurer. Names, activity and date-only effective
 periods are allowlisted; arbitrary resource JSON, identifiers, tax values and
 contact details are never returned.
 
@@ -94,14 +100,24 @@ backfill. Missing identity coverage returns 503.
 
 Direct relationships expose only explicit source assertions: organization
 part-of, site managing organization, plan owner/administrator/network/coverage
-area, and role organization/site/network/plan. Network-to-plan relationships use
+area, and role practitioner/organization/site/network/plan. Network-to-plan relationships use
 the exact plan witnesses. Only relative references resolving inside the same
 accepted source are linked. External, missing and unbound network-role
 references remain unresolved; a missing required durable binding fails closed.
 No shared names, numeric IDs, tax values or addresses infer a relationship.
-Practitioner, Endpoint and HealthcareService targets have no entity kind in this
-contract and are not converted into another kind. Reverse affiliation expansion,
-clinician/profile enrichment and search integration are outside this slice.
+PractitionerRole-to-Practitioner links resolve to the existing provider-profile
+route only when the accepted Practitioner has a matching, explicit NPI in its
+same-release raw witness. Missing or conflicting evidence remains unresolved.
+`providers` is a relationship target only; it is not a new entity read kind.
+Endpoint and HealthcareService targets have no entity kind in this contract.
+CMS Doctors group-site rows retain their exact NPI profile link; broader clinician/profile enrichment,
+reverse affiliation expansion and search integration are outside this slice.
+
+Reviewed same-source organization and site identity corrections return an
+explicit old-ID-to-canonical-ID response on detail and relationship routes.
+The canonical ID must be present in the current publication. Each review changes
+the generation, invalidating old cursors; unreviewed matching names and addresses
+never redirect or merge facts.
 
 ## Reviewed existing payers
 
@@ -123,6 +139,9 @@ The gateway's opaque payer-ID contract must be integrated before activation.
 
 ## Bounds and activation dependencies
 
+CMS intake requires `HLTHPRT_DB_POOL_MAX_SIZE` of at least two, even if
+`HLTHPRT_DB_POOL_MIN_SIZE` is larger, to reserve separate guard and staging connections.
+
 CMS reads have a two-second budget for the entire database read, in addition to
 the statement, lock and work-memory limits above. Entities seek indexed UUIDs
 (or binary-ordered existing payer IDs). Direct references seek their retained
@@ -132,27 +151,27 @@ seek positions are encrypted. Missing schema dependencies return sanitized 503s.
 
 CMS directory reads require an exact row in
 `provider_directory_cms_serving_coverage` for the selected published dataset,
-release vector, dataset hash and publication time. Without it, every CMS entity
-kind returns 503. `build_cms_coverage` performs the existing five-kind binding
-checks and reverse plan/network witness check once after publication, outside
-the bounded cutover transaction. A per-release lock serializes network witness
-writes while it builds the receipt; unrelated source writes can continue. A new
-publication has no matching receipt and remains unavailable until its own proof
-is built. Database guards keep published CMS
-resource rows and CMS binding/evidence/network witness facts immutable; plan and
-role identities already have their own immutability guard. The builder must run
-after all identity and evidence backfill, and before enabling serving for that
-generation. The acquisition/admission caller does not yet invoke it automatically.
+release vector, dataset hash, publication time and current proof version.
+Earlier plan-only receipts cannot authorize reads that now include source-declared
+network Organizations. A same-byte replay binds newly recognized network roles
+from immutable release facts and rebuilds coverage before serving them. Without
+a current receipt, every CMS entity kind returns 503. Initial admission checks
+five-kind bindings and reverse plan/network witnesses before source-local
+publication, then seals the receipt with the pointer. Replay performs the check
+outside publication. A per-release lock serializes network witness writes;
+unrelated source writes can continue. Database guards keep published CMS resource
+rows and CMS binding/evidence/network witness facts immutable; plan and role
+identities have their own immutability guard.
 
 The receipt makes completeness a primary-key lookup per request. Payer review
 counts and aggregation, page seeks, and per-target relationship resolution still
 need representative full-scale measurements against the two-second request
-budget. The receipt builder itself scans the release and may take longer; run it
-away from the short publication cutover.
+budget. The coverage check scans the release and may take longer than the
+intended publication cutover; measure this on the full release before activation.
 
-The focused PostgreSQL fixtures exercise the real admission digest SQL and new
-identity migration with synthetic dependency tables. They do not prove a full
-CMS acquisition, the integrated migration chain, or production-scale latency.
-Integrate the organization, network, admission and reviewed payer dependencies,
-wire the identity binder and post-publication coverage builder, and run a
-combined accepted-publication read proof before activation.
+The PostgreSQL admission fixture runs the integrated migration dependency slice,
+eight synthetic retained files, publication, replay, coverage and API reads.
+It does not establish full-release acquisition time, storage capacity or API
+latency under a live import. Measure those on the retained CMS release with an
+incumbent generation and representative concurrent API traffic before DEV
+activation.

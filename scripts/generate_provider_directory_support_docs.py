@@ -248,14 +248,13 @@ def validate_verification_snapshot(
     return entries
 def _support_document_header(manifest: dict[str, Any]) -> list[str]:
     report_path = manifest["support_documentation"]["runtime_status_report"]
-    confirmation_by_field = _catalog_confirmation_fields(manifest)
     policy = validate_freshness_policy(manifest)
     return [
         "# Provider Directory Endpoint Support",
         "",
         "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Credential-safe operator results are written locally or on dev to `" + report_path + "`, or to a selected `--output` path with `--verification-report`; the report is not tracked.",
         "",
-        "The live catalog and curated support matrix are distinct: the catalog inventory covers every source in `" + confirmation_by_field["relation"] + "`, while this maintained matrix tracks only sources with curated support records. The tracked verification snapshot remains the authority for terminal per-endpoint live status.",
+        "The live catalog and curated support matrix are distinct: a recorded catalog inventory covers observed sources, while this maintained matrix tracks sources with curated support records. Missing operational evidence is displayed as not recorded and establishes no live status.",
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",

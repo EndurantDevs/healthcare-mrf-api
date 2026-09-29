@@ -21,7 +21,7 @@ _HEADERS = {"Cache-Control": "private, no-store"}
 async def _read(request, kind, entity_id, shape):
     try:
         query = parse_directory_read(kind, entity_id, shape, request.query_string)
-        reader = read_medical_groups if kind == "medical-groups" else read_cms_entities
+        reader = read_medical_groups if query.source_id == "cms-doctors" else read_cms_entities
         payload = await reader(request.ctx.sa_session, query)
         return response.json(payload, headers=_HEADERS)
     except DirectoryReadError as error:

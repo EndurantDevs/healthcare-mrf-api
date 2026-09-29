@@ -33,9 +33,12 @@ from process.cms_doctors_groups import (
     validate_group_site_stage,
 )
 from process.cms_doctors_organizations import bind_group_site_organizations
+from process.cms_doctors_sites import bind_cms_doctors_sites
 from process.cms_doctors_rows import doctor_address_row
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
+from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
+from process.reference_family_archive import _lock_family
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.redis_config import build_redis_settings
@@ -66,13 +69,13 @@ CMS_DOCTORS_ADDRESS_FIELDS = {
 
 
 def _stage_index_name(stage_table: str, index_name: str) -> str:
-    return f"{stage_table}_idx_{index_name}"
+    return _archived_identifier(f"{stage_table}_idx_{index_name}", suffix="")
 
 
 async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
     if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
         await db.status(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {stage_cls.__tablename__}_idx_primary "
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {_stage_index_name(stage_cls.__tablename__, 'primary')} "
             f"ON {db_schema}.{stage_cls.__tablename__} "
             f"({', '.join(stage_cls.__my_index_elements__)});"
         )
@@ -402,43 +405,74 @@ async def _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema: str):
     return address_stats
 
 
-async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str) -> None:
-    async with db.transaction():
-        table = DoctorClinicianAddress.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
+async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
+    """Keep ordinary publication on the same three-table transactional apply path."""
+    max_attempts = 1 if db._transaction_binding() is not None else 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with db.transaction():
+                return await _apply_cms_doctors_stage(stage_cls, db_schema, import_date)
+        except Exception as error:
+            await wait_for_publication_lock(error, attempt, max_attempts=max_attempts)
 
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-        )
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
-        )
 
-        if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
-            for index in stage_cls.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
-                old_live_name = f"{table}_idx_{index_name}"
-                archived_live_name = _archived_identifier(old_live_name)
-                await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                    f"RENAME TO {archived_live_name};"
-                )
-                await db.status(
-                    f"ALTER INDEX IF EXISTS "
-                    f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
-                    f"RENAME TO {old_live_name};"
-                )
-        await swap_education_stage(import_date, db_schema)
-        await swap_group_site_stage(import_date, db_schema)
-        await publish_local_reference_family_generation(db, importer_id="cms-doctors", schema_name=db_schema)
+async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_date):
+    """Drain readers briefly, retaining immediate private-stage ownership checks."""
+    models = (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite)
+    optional_names = tuple(name for model in models for name in (model.__main_table__, model.__main_table__ + "_old"))
+    existing_names = (
+        (
+            await session.execute(
+                db.text(
+                    "SELECT name FROM unnest(CAST(:names AS text[])) AS relations(name) "
+                    "WHERE to_regclass(format('%I.%I',CAST(:schema AS text),name)) IS NOT NULL"
+                ),
+                {"schema": db_schema, "names": list(optional_names)},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    stages = (stage_cls.__tablename__, *(make_class(model, import_date).__tablename__ for model in models[1:]))
+    await _lock_family(session, db_schema, tuple(sorted(stages)), "ACCESS EXCLUSIVE", nowait=True)
+    live_names = {model.__main_table__ for model in models}
+    await lock_live_serving_relations(db.status, db_schema, live_names.intersection(existing_names))
+    retired_names = tuple(sorted(set(existing_names) - live_names))
+    if retired_names:
+        await _lock_family(session, db_schema, retired_names, "ACCESS EXCLUSIVE", nowait=True)
+
+
+async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str):
+    """Swap every Doctors relation and advance authority without committing the owner."""
+    if db._transaction_binding() is None:
+        raise RuntimeError("cms_doctors_publication_requires_transaction")
+    await _lock_cms_doctors_publication(db._transaction_binding().session, stage_cls, db_schema, import_date)
+    table = DoctorClinicianAddress.__main_table__
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+    await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+    await db.status(f"ALTER TABLE {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
+    archived = _archived_identifier(f"{table}_idx_primary")
+    await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+    await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
+    await db.status(
+        f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, 'primary')} "
+        f"RENAME TO {table}_idx_primary;"
+    )
+    for index in getattr(stage_cls, "__my_additional_indexes__", ()):
+        index_name = index.get("name", "_".join(index.get("index_elements")))
+        old_live_name = f"{table}_idx_{index_name}"
+        archived_live_name = _archived_identifier(old_live_name)
+        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};"
+        )
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
+            f"RENAME TO {old_live_name};"
+        )
+    await swap_education_stage(import_date, db_schema)
+    await swap_group_site_stage(import_date, db_schema)
+    return await publish_local_reference_family_generation(db, importer_id="cms-doctors", schema_name=db_schema)
 
 
 async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> dict:
@@ -480,6 +514,32 @@ async def _validate_cms_doctors_publication_sources(import_date, db_schema, cont
     return education_manifest, group_receipt
 
 
+async def _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows):
+    """Complete source, stable identity, and address preparation before any serving swap."""
+    context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    if stage_rows < DEFAULT_MIN_ROWS:
+        raise RuntimeError(
+            f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
+        )
+    education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
+        ctx["import_date"], db_schema, context,
+    )
+    organization_groups = await bind_group_site_organizations(ctx, ctx["import_date"], db_schema, group_receipt)
+    sites = await bind_cms_doctors_sites(ctx, ctx["import_date"], db_schema, group_receipt)
+    address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
+    await raise_if_cancelled(ctx, {"run_id": run_id})
+    return {
+        "rows": stage_rows,
+        "education": education_manifest,
+        "group_site": group_receipt,
+        "organization_groups": organization_groups,
+        "sites": sites,
+        **({"artifact": context["artifact"]} if context.get("artifact") else {}),
+        **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+    }
+
+
 def _cms_doctors_terminal_progress(stage_rows):
     """Describe the completed publication for the control run."""
     return {
@@ -511,17 +571,7 @@ async def _publish_cms_doctors_generation(ctx):
     if context.get("test_mode"):
         logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
         return await _finish_cms_doctors_test_run(ctx, db_schema, stage_rows)
-    elif stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(
-            f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
-        )
-
-    education_manifest, group_receipt = await _validate_cms_doctors_publication_sources(
-        import_date, db_schema, context,
-    )
-    organization_groups = await bind_group_site_organizations(ctx, import_date, db_schema, group_receipt)
-    address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
-    await raise_if_cancelled(ctx, {"run_id": run_id})
+    terminal_metrics_by_name = await _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows)
     await _publish_cms_doctors_stage(stage_cls, db_schema, import_date)
     context.pop("education_stage_owned", None)
     context.pop("group_site_stage_owned", None)
@@ -529,14 +579,6 @@ async def _publish_cms_doctors_generation(ctx):
     logger.info("CMS Doctors publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
     terminal_progress_by_name = _cms_doctors_terminal_progress(stage_rows)
-    terminal_metrics_by_name = {
-        "rows": stage_rows,
-        "education": education_manifest,
-        "group_site": group_receipt,
-        "organization_groups": organization_groups,
-        **({"artifact": context["artifact"]} if context.get("artifact") else {}),
-        **({"address_resolve": address_stats.__dict__} if address_stats else {}),
-    }
     await mark_control_run(
         run_id,
         status="succeeded",

@@ -30,11 +30,12 @@ def _identity(value: str, limit: int) -> str:
 
 
 def _plan_network_refs(plan: Mapping[str, Any]) -> list[str]:
-    """Keep only explicit FHIR references, including nested plan networks."""
+    """Keep only explicit FHIR network references."""
     items = [plan.get("network")]
-    for entry in plan.get("plan") or []:
-        if isinstance(entry, Mapping):
-            items.append(entry.get("network"))
+    for field in ("plan", "coverage"):
+        for entry in plan.get(field) or []:
+            if isinstance(entry, Mapping):
+                items.append(entry.get("network"))
     refs: list[str] = []
     for item in items:
         for reference in item if isinstance(item, list) else [item]:
@@ -46,6 +47,20 @@ def _plan_network_refs(plan: Mapping[str, Any]) -> list[str]:
 def _payer_ref(plan: Mapping[str, Any], key: str) -> str | None:
     value = plan.get(key)
     return value.get("reference") if isinstance(value, Mapping) and isinstance(value.get("reference"), str) else None
+
+
+def has_source_declared_network_role(organization: Mapping[str, Any]) -> bool:
+    """Accept only an explicit FHIR Organization type, including CMS text-only types."""
+    types = organization.get("type")
+    return isinstance(types, list) and any(
+        isinstance(entry, Mapping)
+        and (
+            entry.get("text") == "ntwk"
+            or isinstance(entry.get("coding"), list)
+            and any(isinstance(coding, Mapping) and coding.get("code") == "ntwk" for coding in entry["coding"])
+        )
+        for entry in types
+    )
 
 
 async def _bind_network(session: AsyncSession, source_id: str, network_resource_id: str, observed_at: datetime) -> UUID:
@@ -111,11 +126,11 @@ async def _existing_plan_networks(session: AsyncSession, evidence_values: dict[s
 
 
 async def _require_release_evidence(
-    session: AsyncSession, source_id: str, network_resource_id: str, release_id: str
+    session: AsyncSession, source_id: str, network_resource_id: str, release_id: str, payload_sha256: str | None = None
 ) -> None:
     evidence = ProviderDirectoryEntityReleaseEvidence.__table__
-    resource_id = await session.scalar(
-        select(evidence.c.resource_id)
+    observed_hash = await session.scalar(
+        select(evidence.c.payload_sha256)
         .where(
             evidence.c.source_id == source_id,
             evidence.c.resource_type == "Organization",
@@ -124,8 +139,26 @@ async def _require_release_evidence(
         )
         .with_for_update(read=True, key_share=True)
     )
-    if resource_id is None:
+    if observed_hash is None or payload_sha256 is not None and observed_hash != payload_sha256:
         raise ValueError("provider_directory_insurance_network_release_evidence_missing")
+
+
+async def record_insurance_network_organization(
+    session: AsyncSession, *, source_id: str, release_id: str, organization: Mapping[str, Any]
+) -> UUID:
+    """Bind a source-declared network Organization without requiring a plan."""
+    source_id = _identity(source_id, 64)
+    release_id = _identity(release_id, 256)
+    if not isinstance(organization, Mapping) or organization.get("resourceType") != "Organization":
+        raise ValueError("provider_directory_insurance_network_organization_invalid")
+    network_resource_id = _identity(organization.get("id"), 256)
+    if not _FHIR_ID.fullmatch(network_resource_id) or not has_source_declared_network_role(organization):
+        raise ValueError("provider_directory_insurance_network_role_missing")
+    payload_text = json.dumps(organization, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    await _require_release_evidence(
+        session, source_id, network_resource_id, release_id, hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    )
+    return await _bind_network(session, source_id, network_resource_id, datetime.now(timezone.utc))
 
 
 async def record_insurance_network_plan(

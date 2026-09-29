@@ -130,7 +130,7 @@ def test_pseudo_ein_never_becomes_tax_id():
         ],
     }
     _, row = importer.parse_fhir_resource("cms-npd", organization_by_field)
-    assert row["tax_id"] == "12-3456789"
+    assert row["tax_id"] is None
     assert [identifier["value"] for identifier in row["identifiers"]] == [
         PSEUDO_EIN,
         "12-3456789",
@@ -139,6 +139,37 @@ def test_pseudo_ein_never_becomes_tax_id():
     organization_by_field["identifier"] = organization_by_field["identifier"][:1]
     _, other_source_row = importer.parse_fhir_resource("source-a", organization_by_field)
     assert other_source_row["tax_id"] is None
+
+
+def test_pseudo_namespace_is_not_tax_even_for_ein_shaped_value():
+    resource_by_field = {
+        "resourceType": "Organization",
+        "id": "organization-a",
+        "identifier": [
+            {
+                "system": importer.CMS_NPD_PSEUDO_EIN_SYSTEM,
+                "type": {"text": "EIN"},
+                "value": "01-2345678",
+            }
+        ],
+    }
+    _, organization_row = importer.parse_fhir_resource("cms-npd", resource_by_field)
+    assert organization_row["tax_id"] is None
+    assert organization_row["identifiers"][0]["value"] == "01-2345678"
+
+
+@pytest.mark.parametrize("value", (PSEUDO_EIN, "12345678", "１２３４５６７８９", "12-3456789"))
+def test_cms_unreviewed_tax_identifier_remains_source_evidence(value):
+    resource_by_field = {
+        "resourceType": "Organization",
+        "id": "organization-a",
+        "identifier": [{"system": "https://example.test/ein", "value": value}],
+    }
+    _, cms_row = importer.parse_fhir_resource("cms-npd", resource_by_field)
+    _, legacy_row = importer.parse_fhir_resource("source-a", resource_by_field)
+    assert cms_row["tax_id"] is None
+    assert legacy_row["tax_id"] == value
+    assert cms_row["identifiers"][0]["value"] == value
 
 
 @pytest.mark.asyncio

@@ -154,7 +154,7 @@ async def test_clone_capacity_observation_is_inert_when_disabled(monkeypatch):
         (importer._run_profile_evidence_window, "evidence", ("batch_start", "batch_end")),
         (importer._populate_affected_npi_stage, "affected_npi", ("wave",)),
         (importer._populate_provider_directory_profile_compact_stage, "compact", ("batch_start", "batch_end")),
-        (importer._apply_provider_directory_profile_delta, "target", ("wave",)),
+        (importer._apply_provider_directory_profile_delta_rows, "target", ("wave",)),
     ),
 )
 def test_clone_capacity_observes_only_existing_write_waves(

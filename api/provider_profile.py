@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import re
 from typing import Any, Iterable, Mapping
@@ -74,10 +73,9 @@ async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
 
 async def fetch_provider_profile_projection(npi: int) -> dict[str, Any] | None:
     """Load independently published state and CMS facts without replacing either."""
-    state_projection, cms_projection, additional_state_projections = await asyncio.gather(
-        fetch_state_profile_projection(npi), fetch_cms_education_projection(npi),
-        fetch_additional_state_profile_projections(npi),
-    )
+    state_projection = await fetch_state_profile_projection(npi)
+    cms_projection = await fetch_cms_education_projection(npi)
+    additional_state_projections = await fetch_additional_state_profile_projections(npi)
     projection = merge_cms_education_projection(npi, state_projection, cms_projection)
     for state_projection in additional_state_projections:
         projection = merge_state_profile_projection(npi, projection, state_projection)

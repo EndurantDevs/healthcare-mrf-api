@@ -54,6 +54,7 @@ async def test_receipt_storage_oid_drift_blocks_atomic_consume(monkeypatch):
     }
     lease = types.SimpleNamespace(
         nonce=receipt_by_field["receipt_sha256"],
+        signing_preflight_guard={"healthcare_receipt": receipt_by_field},
         expires_at=EXPIRES_AT,
         observed_at=ISSUED_AT,
         issued_at=ISSUED_AT,

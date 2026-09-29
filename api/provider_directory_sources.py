@@ -28,6 +28,7 @@ DEFAULT_MANIFEST = (
     ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 )
 RUNNABLE_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
+PROFILE_OPT_IN_SOURCES = frozenset({"cms-npd"})
 PUBLIC_ENTRY_FIELDS = (
     "entry_id",
     "display_name",
@@ -175,7 +176,10 @@ def provider_directory_source_catalog(
         profile_source_ids,
     )
 
-    if runnable_source_ids | nonrunnable_profile_source_ids != profile_source_ids:
+    required_profile_source_ids = (
+        runnable_source_ids - PROFILE_OPT_IN_SOURCES
+    ) | nonrunnable_profile_source_ids
+    if required_profile_source_ids != profile_source_ids - PROFILE_OPT_IN_SOURCES:
         raise RuntimeError("provider_directory_profile_source_catalog_drift")
     return {
         "schema_version": 1,

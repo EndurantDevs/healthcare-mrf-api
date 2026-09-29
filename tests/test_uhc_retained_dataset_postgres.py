@@ -1704,6 +1704,7 @@ async def test_native_invalid_facility_is_private_through_profile_api(
     assert not profile.is_valid_npi(_NATIVE_INVALID_FACILITY_NPI)
     async with _dataset_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
+        monkeypatch.setattr(npi_endpoint, "db", database)
         stage = await _build_native_quarantine_stage(
             database,
             schema,

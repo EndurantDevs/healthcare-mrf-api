@@ -19,8 +19,10 @@ import uuid
 from contextlib import asynccontextmanager
 
 import pytest
+from asyncpg import LockNotAvailableError
 
 from process.nppes_public_evidence_import import NPPES_RIGHTS_PROOF_SHA256
+from process.entity_address_cutover_contract import _ServingRelationLockTimeout
 
 from tests.test_process_npi_unit import (
     ROOT,
@@ -384,11 +386,15 @@ async def test_publication_transaction_reconciles_only_an_exact_commit(
             state_by_name["second_body_entered"] = True
 
 @pytest.mark.asyncio
-async def test_shutdown_handles_rotation(monkeypatch, npi_module):
+@pytest.mark.parametrize(
+    "failure_count,error_type",
+    [(0, LockNotAvailableError), (1, LockNotAvailableError), (4, LockNotAvailableError), (1, RuntimeError),
+     (1, _ServingRelationLockTimeout), (4, _ServingRelationLockTimeout)],
+)
+async def test_shutdown_handles_rotation(monkeypatch, npi_module, failure_count, error_type):
     """Seal stage census, table rotation, receipt, and terminal state together."""
     stage_count_by_table = {
-        f"{table_name}_20251108": ordinal
-        for ordinal, table_name in enumerate(npi_module.NPI_CANONICAL_TABLES, 1)
+        f"{table_name}_20251108": ordinal for ordinal, table_name in enumerate(npi_module.NPI_CANONICAL_TABLES, 1)
     }
     raw_connection = _ShutdownRawConnection(stage_count_by_table)
     publication_receipt = _install_shutdown_success_collaborators(
@@ -396,6 +402,16 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         npi_module,
         raw_connection,
     )
+    original_lock = npi_module._lock_npi_publication_relations
+    attempts = []
+
+    async def contended_lock(*args, **kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= failure_count:
+            raise error_type("synthetic publication failure")
+        await original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(npi_module, "_lock_npi_publication_relations", contended_lock)
     lease = npi_module._NpiImportLease(object(), raw_connection, 731)
     shutdown_context_map = {
         "context": {
@@ -408,37 +424,28 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         },
         "import_date": "20251108",
     }
+    if failure_count == 4 or error_type is RuntimeError:
+        with pytest.raises(error_type, match="synthetic publication failure"):
+            await npi_module.shutdown(shutdown_context_map)
+        assert len(attempts) == failure_count
+        assert raw_connection.events.count("transaction:rollback") == failure_count
+        npi_module.mark_npi_publication_succeeded.assert_not_awaited()
+        return
     shutdown_result_by_name = await npi_module.shutdown(shutdown_context_map)
+    assert raw_connection.events.count("transaction:begin") == failure_count + 1
+    assert raw_connection.events.count("transaction:rollback") == failure_count
 
     _assert_npi_generation_published(
         npi_module,
         raw_connection,
         publication_receipt,
+        shutdown_context_map,
     )
     npi_module.mark_npi_publication_succeeded.assert_awaited_once()
     npi_module.raise_if_cancelled.assert_awaited()
-    first_swap = next(
-        index for index, event in enumerate(raw_connection.events)
-        if "DROP TABLE IF EXISTS testschema.npi_old" in event
+    assert (
+        shutdown_result_by_name["npi_canonical_publication"]["publication_ref"] == publication_receipt.publication_ref
     )
-    final_count = max(
-        index for index, event in enumerate(raw_connection.events)
-        if "count(*)::bigint" in event
-    )
-    stage_lock = next(
-        index for index, event in enumerate(raw_connection.events)
-        if event.startswith("LOCK TABLE ")
-    )
-    projection_validation = next(index for index, event in enumerate(raw_connection.events) if "search_taxonomy_codes" in event and "FULL OUTER JOIN" in event)
-    assert stage_lock < projection_validation < final_count < first_swap
-    assert raw_connection.events[-1] == "transaction:commit"
-    assert shutdown_context_map["context"][npi_module._NPI_CONTROL_TERMINAL_COMMITTED_KEY] is True
-    assert shutdown_context_map["context"][
-        npi_module._NPI_CONTROL_COMMITTED_FINISHED_AT_KEY
-    ] == "2026-08-09T02:03:04.000000+00:00"
-    assert shutdown_result_by_name["npi_canonical_publication"][
-        "publication_ref"
-    ] == publication_receipt.publication_ref
     npi_module._release_npi_import_lease.assert_awaited_once_with(
         shutdown_context_map["context"],
         suppress_errors=True,
@@ -449,9 +456,27 @@ def _assert_npi_generation_published(
     npi_module,
     raw_connection,
     publication_receipt,
+    shutdown_context_map,
 ) -> None:
     """Assert shutdown records and publishes its canonical result generation."""
 
+    first_swap = next(
+        index for index, event in enumerate(raw_connection.events) if "DROP TABLE IF EXISTS testschema.npi_old" in event
+    )
+    final_count = max(index for index, event in enumerate(raw_connection.events) if "count(*)::bigint" in event)
+    stage_lock = next(index for index, event in enumerate(raw_connection.events) if event.startswith("LOCK TABLE "))
+    projection_validation = next(
+        index
+        for index, event in enumerate(raw_connection.events)
+        if "search_taxonomy_codes" in event and "FULL OUTER JOIN" in event
+    )
+    assert stage_lock < projection_validation < final_count < first_swap
+    assert raw_connection.events[-1] == "transaction:commit"
+    assert shutdown_context_map["context"][npi_module._NPI_CONTROL_TERMINAL_COMMITTED_KEY] is True
+    assert (
+        shutdown_context_map["context"][npi_module._NPI_CONTROL_COMMITTED_FINISHED_AT_KEY]
+        == "2026-08-09T02:03:04.000000+00:00"
+    )
     receipt_mock = npi_module.insert_npi_publication_receipt
     publication_input = receipt_mock.await_args.kwargs["publication_input"]
     assert publication_input.row_counts == (1, 2, 3, 4, 5, 6)

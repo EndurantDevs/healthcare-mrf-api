@@ -117,6 +117,7 @@ class ProviderDirectoryProfileCapacityPreflightRequest:
     expires_at: datetime.datetime
     request_payload: dict[str, Any]
     request_sha256: str
+    cms_nonprofile_admission: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,7 @@ class ProfileCapacityAuthorityProjectionRequest:
     limits_sha256: str
     request_payload: dict[str, Any]
     request_sha256: str
+    cms_nonprofile_admission: dict[str, Any] | None = None
 
 
 def canonical_preflight_json(value: Any) -> str:
@@ -296,6 +298,25 @@ def validated_capacity_preflight_request(
 ) -> ProviderDirectoryProfileCapacityPreflightRequest:
     """Validate the exact authenticated signing-preflight request schema."""
 
+    from process.provider_directory_cms_capacity_contract import (
+        CMS_PREFLIGHT_REQUEST_CONTRACT,
+        validated_cms_preflight_request,
+    )
+
+    if (
+        isinstance(raw_request, Mapping)
+        and raw_request.get("contract_id") == CMS_PREFLIGHT_REQUEST_CONTRACT
+    ):
+        return validated_cms_preflight_request(raw_request)
+
+    return _validated_profile_capacity_preflight_request(raw_request)
+
+
+def _validated_profile_capacity_preflight_request(
+    raw_request: Any,
+) -> ProviderDirectoryProfileCapacityPreflightRequest:
+    """Validate the unchanged closed Profile-only signing request."""
+
     request_map = dict(
         _exact_mapping(
             raw_request,
@@ -353,6 +374,17 @@ def validated_capacity_authority_projection_request(
 ) -> ProfileCapacityAuthorityProjectionRequest:
     """Validate one closed, receipt-free authority projection request."""
 
+    from process.provider_directory_cms_capacity_contract import (
+        CMS_PROJECTION_REQUEST_CONTRACT,
+        validated_cms_preflight_request,
+    )
+
+    if (
+        isinstance(raw_request, Mapping)
+        and raw_request.get("contract_id") == CMS_PROJECTION_REQUEST_CONTRACT
+    ):
+        return validated_cms_preflight_request(raw_request, projection=True)
+
     request_map = dict(
         _exact_mapping(
             raw_request,
@@ -365,8 +397,7 @@ def validated_capacity_authority_projection_request(
         != CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID
     ):
         raise ProviderDirectoryProfileCapacityPreflightError(
-            "provider_directory_profile_capacity_preflight_"
-            "authority_projection_request_contract_invalid"
+            "provider_directory_profile_capacity_preflight_authority_projection_request_contract_invalid"
         )
     execution, execution_payload = _validated_execution_payload(
         request_map["profile_execution"]
@@ -381,8 +412,7 @@ def validated_capacity_authority_projection_request(
     }
     if request_map != normalized_by_field:
         raise ProviderDirectoryProfileCapacityPreflightError(
-            "provider_directory_profile_capacity_preflight_"
-            "authority_projection_request_not_canonical"
+            "provider_directory_profile_capacity_preflight_authority_projection_request_not_canonical"
         )
     return ProfileCapacityAuthorityProjectionRequest(
         execution=execution,

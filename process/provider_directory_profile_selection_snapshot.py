@@ -17,6 +17,10 @@ from db.models import (
 from process import provider_directory_profile as profile_artifact
 from process.provider_directory_profile_selection_contract import (
     PROFILE_EXECUTION_CONTRACT_ID,
+    PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+    ProviderDirectoryProfileSelectionDrift,
+    _validated_desired_selection,
+    desired_selection_fingerprint,
     PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
     PROFILE_SELECTION_LINEAGE_AUTHORITY,
     _GLOBAL_PROFILE_PARAMS,
@@ -27,6 +31,8 @@ from process.provider_directory_profile_selection_contract import (
 )
 from process.provider_directory_profile_selection_dataset import (
     _assert_dataset_variant_registry_coordinates,
+    _cms_dataset_pair,
+    _cms_incumbent_pair,
     _dataset_selection_by_group,
     _metadata_source_ids,
     _source_selection_indexes,
@@ -184,6 +190,7 @@ def _selection_records_for_group(
     source_group: tuple[str, ...],
     dataset_row: Mapping[str, Any],
     source_by_id: Mapping[str, Mapping[str, Any]],
+    desired_cms_dataset: Mapping[str, Any] | None = None,
 ) -> _SelectionRecords:
     endpoint_id = _required_text(dataset_row, "endpoint_id", limit=128)
     dataset_id = _required_text(dataset_row, "dataset_id", limit=128)
@@ -211,6 +218,8 @@ def _selection_records_for_group(
             dataset_hash,
             root_run_id,
         )
+        if desired_cms_dataset is not None and source_id == "cms-npd":
+            pair_map = dict(desired_cms_dataset)
         group_records.pairs.append(pair_map)
         group_records.request_projection.append(
             {"source_id": source_id, "dataset_id": dataset_id}
@@ -303,6 +312,7 @@ def _selection_records(
     source_groups: tuple[tuple[str, ...], ...],
     dataset_by_group: Mapping[tuple[str, ...], Mapping[str, Any]],
     source_by_id: Mapping[str, Mapping[str, Any]],
+    desired_cms_dataset: Mapping[str, Any] | None = None,
 ) -> _SelectionRecords:
     all_records = _SelectionRecords([], [], [], [])
     for source_group in source_groups:
@@ -313,6 +323,7 @@ def _selection_records(
             source_group,
             dataset_row,
             source_by_id,
+            desired_cms_dataset,
         )
         all_records.pairs.extend(group_records.pairs)
         all_records.profile_inputs.extend(group_records.profile_inputs)
@@ -464,3 +475,64 @@ async def _compute_current_selection(
             exact_readiness=exact_readiness,
         ),
     )
+
+
+def _computed_desired_selection_from_rows(
+    catalog_map: Mapping[str, Any], *, node_id: str,
+    source_rows: list[Mapping[str, Any]], dataset_rows: list[Mapping[str, Any]],
+    desired_dataset_row: Mapping[str, Any], desired_selection: Mapping[str, Any],
+) -> _ComputedProfileSelection:
+    """Replace only CMS in the full current vector using an exact desired tuple."""
+    desired_selection = _validated_desired_selection(desired_selection)
+    desired = desired_selection["desired_cms_dataset"]
+    incumbent = _cms_incumbent_pair(dataset_rows, desired["endpoint_id"])
+    if incumbent != desired_selection["expected_cms_incumbent"]:
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_incumbent_changed")
+    if _cms_dataset_pair(desired_dataset_row, allow_desired=True) != desired:
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_desired_cms_changed")
+    source_groups = _catalog_source_groups(catalog_map)
+    if ("cms-npd",) not in source_groups:
+        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_not_enabled")
+    source_by_id, source_ids_by_endpoint = _source_selection_indexes(source_rows)
+    _assert_dataset_variant_registry_coordinates(source_by_id)
+    dataset_by_group = _dataset_selection_by_group(dataset_rows, source_groups,
+        source_ids_by_endpoint, _dataset_scoped_variant_source_groups())
+    dataset_by_group[("cms-npd",)] = desired_dataset_row
+    selection_records = _selection_records(source_groups, dataset_by_group, source_by_id, desired)
+    identity = _selection_identity(str(catalog_map["catalog_digest"]), node_id, selection_records)
+    identity.update({"contract_id": PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+                     **desired_selection,
+                     "selection_fingerprint": desired_selection_fingerprint(node_id,
+                        str(catalog_map["catalog_digest"]), selection_records.request_projection, desired_selection),
+                     "profile_input_digest": stable_hash({"current_input_digest": identity["profile_input_digest"],
+                        **desired_selection}, domain="provider_directory_profile_input.v2")})
+    return _ComputedProfileSelection(tuple(selection_records.request_projection), identity)
+
+
+async def _compute_desired_selection(
+    catalog_map: Mapping[str, Any], *, node_id: str, lock_selection: bool,
+    desired_selection: Mapping[str, Any], exact_readiness: bool = True,
+) -> _ComputedProfileSelection:
+    if lock_selection:
+        await _lock_profile_selection_tables()
+    desired = desired_selection["desired_cms_dataset"]
+    row = await db.first(
+        f"SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
+        "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
+        f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE dataset_id=:dataset_id;",
+        dataset_id=desired["dataset_id"],
+    )
+    current_rows = await _selection_dataset_rows(exact_readiness=exact_readiness)
+    incumbent_rows = await db.all(
+        "SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
+        "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
+        f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE endpoint_id=:endpoint_id AND is_current=true;",
+        endpoint_id=desired["endpoint_id"],
+    )
+    current_rows = [current_row for current_row in current_rows
+                    if current_row.get("endpoint_id") != desired["endpoint_id"]]
+    current_rows.extend(_row_mapping(incumbent_row) for incumbent_row in incumbent_rows)
+    return _computed_desired_selection_from_rows(catalog_map, node_id=node_id,
+        source_rows=await _selection_source_rows(),
+        dataset_rows=current_rows,
+        desired_dataset_row=_row_mapping(row), desired_selection=desired_selection)

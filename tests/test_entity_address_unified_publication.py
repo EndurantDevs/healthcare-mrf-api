@@ -83,6 +83,8 @@ class _RecordingDB:
 
     async def scalar(self, statement, **_params):
         self.events.append(statement)
+        if "to_regclass(:relation) IS NOT NULL" in statement:
+            return False
         if "relpersistence" in statement:
             return self.persistence_values.pop(0)
         if "address_numeric_grid_alias_v1" in statement:

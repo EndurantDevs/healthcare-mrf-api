@@ -116,6 +116,66 @@ async def test_candidate_only_alias_does_not_hide_current_entity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reviewed_old_id_returns_canonical_redirect_and_invalidates_generation(monkeypatch):
+    old_id = "00000000-0000-0000-0000-000000000099"
+    async with cms_database(monkeypatch) as sessions:
+        before = await read(sessions, cms_query())
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect_decision VALUES "
+                     "('00000000-0000-0000-0000-000000000077', 'cms-npd')")
+            )
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect VALUES "
+                     "('cms-npd', 'Organization', :old_id, :canonical_id)"),
+                {"old_id": old_id, "canonical_id": ORG_ID},
+            )
+        stale = replace(cms_query("organizations", "entity", old_id), generation_id=before["generation_id"])
+        with pytest.raises(DirectoryReadError) as caught:
+            await read(sessions, stale)
+        assert caught.value.status == 409
+        detail = await read(sessions, cms_query("organizations", "entity", old_id))
+        relations = await read(sessions, cms_query("organizations", "relationships", old_id))
+        assert detail == relations == {
+            "generation_id": detail["generation_id"],
+            "redirect": {
+                "source_id": "cms-npd",
+                "kind": "organizations",
+                "requested_id": old_id,
+                "canonical_id": ORG_ID,
+            },
+        }
+        assert detail["generation_id"] != before["generation_id"]
+        invalid_cursor = replace(
+            cms_query("organizations", "relationships", old_id),
+            generation_id=detail["generation_id"], cursor="invalid",
+        )
+        with pytest.raises(DirectoryReadError) as caught:
+            await read(sessions, invalid_cursor)
+        assert caught.value.status == 409
+        assert (await read(sessions, cms_query("organizations", "entity", ORG_ID)))["item"]["id"] == ORG_ID
+
+
+@pytest.mark.asyncio
+async def test_reviewed_redirect_does_not_resolve_to_unpublished_target(monkeypatch):
+    unpublished_id = "00000000-0000-0000-0000-000000000099"
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect_decision VALUES "
+                     "('00000000-0000-0000-0000-000000000078', 'cms-npd')")
+            )
+            await session.execute(
+                text("INSERT INTO provider_directory_entity_redirect VALUES "
+                     "('cms-npd', 'Organization', :old_id, :canonical_id)"),
+                {"old_id": ORG_ID, "canonical_id": unpublished_id},
+            )
+        with pytest.raises(DirectoryReadError) as caught:
+            await read(sessions, cms_query("organizations", "entity", ORG_ID))
+        assert caught.value.status == 503
+
+
+@pytest.mark.asyncio
 async def test_two_accepted_aliases_cannot_seal_one_entity(monkeypatch):
     from process.provider_directory_cms_serving_coverage import build_cms_coverage
 
@@ -142,7 +202,8 @@ async def test_two_accepted_aliases_cannot_seal_one_entity(monkeypatch):
         )
         await session.execute(
             text(
-                "INSERT INTO provider_directory_entity_release_evidence VALUES "
+                "INSERT INTO provider_directory_entity_release_evidence "
+                "(source_id, resource_type, resource_id, release_id, payload_sha256) VALUES "
                 "('cms-npd', 'Organization', 'accepted-alias', repeat('a',64), repeat('b',64))"
             )
         )
@@ -176,8 +237,66 @@ async def test_relationship_cursors_cover_explicit_references_without_duplicates
         assert query.cursor is None
         assert len(items) == len({item["relationship_key"] for item in items}) == 4
         assert sum(item["status"] == "unresolved" for item in items) == 2
-        assert items[0]["target_id"] == ORG_ID
-        assert items[2]["target_id"] == NETWORK_ID
+        assert any(item["relationship_type"] == "plan-owned-by" and item["target_id"] == ORG_ID for item in items)
+        assert any(item["relationship_type"] == "plan-network" and item["target_id"] == NETWORK_ID for item in items)
+
+
+@pytest.mark.asyncio
+async def test_relationship_ledger_preserves_ambiguity_nested_period_and_source_scope(monkeypatch):
+    """A later binding or other source cannot turn a retained conflict into a resolved link."""
+
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "UPDATE provider_directory_cms_npd_relationship SET resolution_status='ambiguous' "
+                    "WHERE resource_type='InsurancePlan' AND reference_field='network' "
+                    "AND target_reference='Organization/org-example'"
+                )
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_cms_npd_relationship VALUES "
+                    "('synthetic-dataset','cms-npd',repeat('a',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',1,1,'Organization/org-example',"
+                    "'resolved','2025-03-01',NULL)"
+                )
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_entity_source_binding VALUES "
+                    "('other-source','Organization','missing',:organization_id,NULL)"
+                ),
+                {"organization_id": ORG_ID},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_cms_npd_relationship VALUES "
+                    "('synthetic-dataset','other-source',repeat('a',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',2,1,'Organization/org-example','resolved',NULL,NULL),"
+                    "('synthetic-dataset','cms-npd',repeat('c',64),'InsurancePlan','plan-example',"
+                    "repeat('b',64),repeat('b',64),'plan.network',3,1,'Organization/org-example','resolved',NULL,NULL)"
+                )
+            )
+        plan_id = str(source_resource_uuid("cms-npd", "InsurancePlan", "plan-example"))
+        page = await read(sessions, cms_query("plans", "relationships", plan_id, 100))
+        networks = [
+            network_link for network_link in page["items"] if network_link["relationship_type"] == "plan-network"
+        ]
+        assert len(networks) == 3
+        assert any(
+            network_link["status"] == "conflict" and network_link["target_id"] is None for network_link in networks
+        )
+        assert any(
+            network_link["status"] == "resolved"
+            and network_link["target_id"] == NETWORK_ID
+            and network_link["effective_start"] == "2025-03-01"
+            for network_link in networks
+        )
+        assert any(
+            network_link["status"] == "unresolved" and network_link["target_id"] is None for network_link in networks
+        )
+        assert "plan-example" not in json.dumps(page)
 
 
 async def _add_plan(session, should_bind=True):
@@ -346,6 +465,124 @@ async def test_missing_network_witness_does_not_silently_omit_network(monkeypatc
         async with sessions() as session:
             await build_cms_coverage(session)
         assert len((await read(sessions, cms_query("networks")))["items"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("network_type", ([{"text": "ntwk"}], [{"coding": [{"code": "ntwk"}]}]))
+async def test_source_declared_network_without_plan_witness_is_served(monkeypatch, network_type):
+    async def prepare(session):
+        await session.execute(text("DELETE FROM provider_directory_insurance_network_plan_evidence"))
+        await session.execute(
+            text(
+                "UPDATE provider_directory_dataset_resource SET payload_json="
+                "jsonb_set(payload_json::jsonb, '{network_refs}', '[]'::jsonb) "
+                "WHERE resource_type='InsurancePlan'"
+            )
+        )
+        await session.execute(
+            text(
+                "UPDATE provider_directory_entity_release_evidence SET payload_json=CAST(:payload AS jsonb) "
+                "WHERE resource_type='Organization' AND resource_id='org-example'"
+            ),
+            {"payload": json.dumps({"resourceType": "Organization", "id": "org-example", "type": network_type})},
+        )
+
+    async with cms_database(monkeypatch, prepare=prepare) as sessions:
+        page = await read(sessions, cms_query("networks"))
+        assert [item["id"] for item in page["items"]] == [NETWORK_ID]
+        network = page["items"][0]
+        assert {entry["resource_type"] for entry in network["evidence"]} == {"Organization"}
+        assert (await read(sessions, cms_query("networks", "entity", NETWORK_ID)))["item"] == network
+        assert (await read(sessions, cms_query("networks", "relationships", NETWORK_ID)))["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_source_declared_network_without_binding_fails_coverage(monkeypatch):
+    async def prepare(session):
+        await session.execute(text("DELETE FROM provider_directory_insurance_network_plan_evidence"))
+        await session.execute(text("DELETE FROM provider_directory_insurance_network_source_binding"))
+        await session.execute(
+            text(
+                "UPDATE provider_directory_dataset_resource SET payload_json="
+                "jsonb_set(payload_json::jsonb, '{network_refs}', '[]'::jsonb) "
+                "WHERE resource_type='InsurancePlan'"
+            )
+        )
+        await session.execute(
+            text(
+                "UPDATE provider_directory_entity_release_evidence SET payload_json="
+                '\'{"type":[{"text":"ntwk"}]}\'::jsonb WHERE resource_type=\'Organization\''
+            )
+        )
+
+    async with cms_database(monkeypatch, prepare=prepare, seal=False) as sessions:
+        from process.provider_directory_cms_serving_coverage import build_cms_coverage
+
+        async with sessions() as session:
+            with pytest.raises(DirectoryReadError) as caught:
+                await build_cms_coverage(session)
+        assert caught.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_old_plan_only_coverage_cannot_approve_a_new_network_role(monkeypatch):
+    from process.provider_directory_cms_serving_coverage import build_cms_coverage
+
+    async def prepare(session):
+        await session.execute(text("DELETE FROM provider_directory_insurance_network_plan_evidence"))
+        await session.execute(text("DELETE FROM provider_directory_insurance_network_source_binding"))
+        await session.execute(text(
+            "UPDATE provider_directory_dataset_resource SET payload_json="
+            "jsonb_set(payload_json::jsonb, '{network_refs}', '[]'::jsonb) "
+            "WHERE resource_type='InsurancePlan'"
+        ))
+        await session.execute(text(
+            "UPDATE provider_directory_entity_release_evidence SET payload_json="
+            "'{\"type\":[{\"text\":\"ntwk\"}]}'::jsonb WHERE resource_type='Organization'"
+        ))
+
+    async with cms_database(monkeypatch, prepare=prepare, seal=False) as sessions:
+        # Model a receipt retained from before the new-writer constraint existed.
+        async with sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    "ALTER TABLE provider_directory_cms_serving_coverage "
+                    "DROP CONSTRAINT cms_npd_coverage_new_receipt_v2_check"
+                )
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO provider_directory_cms_serving_coverage "
+                    "(dataset_id, release_id, dataset_hash, published_at, created_at) "
+                    "SELECT dataset_id, :release_id, dataset_hash, published_at, now() "
+                    "FROM provider_directory_endpoint_dataset WHERE dataset_id='synthetic-dataset'"
+                ),
+                {"release_id": publication_summary()["source_release"]["vector_sha256"]},
+            )
+            await session.execute(
+                text(
+                    "ALTER TABLE provider_directory_cms_serving_coverage "
+                    "ADD CONSTRAINT cms_npd_coverage_new_receipt_v2_check CHECK (proof_version=2) NOT VALID"
+                )
+            )
+        with pytest.raises(DirectoryReadError) as caught:
+            await read(sessions, cms_query("networks"))
+        assert caught.value.status == 503
+        async with sessions() as session:
+            with pytest.raises(DirectoryReadError) as caught:
+                await build_cms_coverage(session)
+        assert caught.value.status == 503
+        await change(sessions,
+            "INSERT INTO provider_directory_insurance_network_source_binding VALUES "
+            "('cms-npd','Organization','org-example','" + NETWORK_ID + "')")
+        async with sessions() as session:
+            await build_cms_coverage(session)
+        assert [network_item["id"] for network_item in (await read(sessions, cms_query("networks")))["items"]] == [NETWORK_ID]
+        async with sessions() as session:
+            versions = (await session.execute(text(
+                "SELECT proof_version FROM provider_directory_cms_serving_coverage ORDER BY proof_version"
+            ))).scalars().all()
+        assert versions == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -539,6 +776,27 @@ async def test_identity_binder_replays_and_rolls_back_without_reassignment(monke
                 sessions,
                 "UPDATE provider_directory_resource_identity SET entity_id='00000000-0000-0000-0000-000000000099'",
             )
+
+
+@pytest.mark.asyncio
+async def test_resource_identity_binder_accepts_one_thousand_ids(monkeypatch):
+    resource_ids = [f"role-{index}" for index in range(1_000)]
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as session, session.begin():
+            first = await bind_resource_identity_batch(
+                session, source_id="cms-npd", resource_type="PractitionerRole", resource_ids=resource_ids
+            )
+        async with sessions() as session, session.begin():
+            assert (
+                await bind_resource_identity_batch(
+                    session, source_id="cms-npd", resource_type="PractitionerRole", resource_ids=resource_ids
+                )
+                == first
+            )
+    with pytest.raises(ValueError, match="batch_invalid"):
+        await bind_resource_identity_batch(
+            None, source_id="cms-npd", resource_type="PractitionerRole", resource_ids=resource_ids + ["extra"]
+        )
 
 
 def test_uuid_identity_is_exact_source_type_scoped_and_stable():

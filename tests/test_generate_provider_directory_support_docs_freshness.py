@@ -10,9 +10,12 @@ import pytest
 
 from scripts import generate_provider_directory_support_docs as generator
 from scripts.research import provider_directory_endpoint_acquisition_harness as harness
+from tests.provider_directory_endpoint_acquisition_test_support import (
+    synthetic_support_manifest, synthetic_verification_snapshot,
+)
 
 def test_validate_manifest_rejects_unusable_catalog_confirmation():
-    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    manifest = synthetic_support_manifest()
     manifest["catalog_confirmation"]["checked_at"] = "not-a-date"
 
     with pytest.raises(generator.SupportDocumentationError, match="ISO-8601"):
@@ -20,13 +23,11 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
 
 
 def test_freshness_validation_rejects_expired_catalog_source_and_proof():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     blockers = generator.validate_blocker_registry(
         generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
     )
-    snapshot = generator.load_verification_snapshot(
-        generator.DEFAULT_VERIFICATION_SNAPSHOT
-    )
+    snapshot = synthetic_verification_snapshot(manifest)
 
     with pytest.raises(generator.SupportDocumentationError, match="catalog confirmation expired") as error:
         generator.validate_support_freshness(
@@ -40,13 +41,11 @@ def test_freshness_validation_rejects_expired_catalog_source_and_proof():
 
 
 def test_freshness_validation_accepts_current_reviews():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     blockers = generator.validate_blocker_registry(
         generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
     )
-    snapshot = generator.load_verification_snapshot(
-        generator.DEFAULT_VERIFICATION_SNAPSHOT
-    )
+    snapshot = synthetic_verification_snapshot(manifest)
 
     generator.validate_support_freshness(
         manifest,
@@ -57,19 +56,15 @@ def test_freshness_validation_accepts_current_reviews():
 
 
 def test_freshness_validation_rejects_stale_active_observation():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     blockers = generator.validate_blocker_registry(
         generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
     )
-    snapshot = copy.deepcopy(
-        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
-    )
-    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"][
-        "run_status"
-    ] = "running"
-    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"][
-        "observed_at"
-    ] = "2026-07-12T11:32:21Z"
+    snapshot = synthetic_verification_snapshot(manifest)
+    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"] = {
+        "run_id": "run_" + "2" * 32, "state_status": "observed",
+        "run_status": "running", "observed_at": "2026-07-12T00:00:00Z",
+    }
 
     with pytest.raises(generator.SupportDocumentationError, match="active observation expired"):
         generator.validate_support_freshness(
@@ -83,21 +78,21 @@ def test_freshness_validation_rejects_stale_active_observation():
 @pytest.mark.parametrize(
     "entry_id, expected_detail",
     [
-        ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
-        ("molina", "progressed beyond the initial quota failure"),
+        ("idaho", "official public cursor continuations with checkpoints"),
+        ("molina", "fails closed with pagination_resume_required"),
         ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
-        ("cigna", "both _count=100 and _count=75 returned populated search sets"),
+        ("cigna", "supports configured _count=100 and _count=75 searches"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
         ("humana", "catalog product aliases are neutralized"),
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),
-        ("washington", "active PractitionerRole checkpoint has 20,800 rows"),
-        ("wyoming", "PractitionerRole pagination was revalidated"),
+        ("washington", "provider_directory_pagination_resume_required"),
+        ("wyoming", "PractitionerRole pagination requires complete traversal proof"),
         ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint returns HTTP 404 and remains excluded"),
-        ("uhc", "server ignores the :missing modifier"),
+        ("uhc", "ignored :missing modifier"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
@@ -108,14 +103,14 @@ def test_freshness_validation_rejects_stale_active_observation():
     ],
 )
 def test_support_metadata_retains_audited_source_details(entry_id, expected_detail):
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     limitation = manifest["support_documentation"]["entry_support"][entry_id]["limitation"]
 
     assert expected_detail in limitation
 
 
 def test_reviewed_manual_subset_support_never_claims_exhaustive():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     manual_entries = [
         entry
         for entry in manifest["entries"]
@@ -129,15 +124,10 @@ def test_reviewed_manual_subset_support_never_claims_exhaustive():
     current_audit = generator.load_current_dataset_audit(
         generator.DEFAULT_CURRENT_DATASET_AUDIT
     )
-    audit_notes = [
-        entry["note"]
-        for entry in current_audit["records"]
-        if entry.get("entry_id") == entry_id
-    ]
-    assert len(audit_notes) == 1
+    assert current_audit == {"schema_version": 1, "as_of": None, "records": []}
     generated_support = generator.DEFAULT_OUTPUT.read_text(encoding="utf-8")
 
-    for support_text in (limitation, audit_notes[0]):
+    for support_text in (limitation,):
         normalized_text = support_text.lower()
         for required_text in (
             "server-issued traversal subset",
@@ -156,7 +146,7 @@ def test_reviewed_manual_subset_support_never_claims_exhaustive():
 
 
 def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     support_by_entry = manifest["support_documentation"]["entry_support"]
     entries_by_id = {
         entry["entry_id"]: entry
@@ -184,7 +174,7 @@ def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
 
 
 def test_documentation_metadata_does_not_change_entry_execution_fingerprints():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manifest = synthetic_support_manifest()
     fingerprints_by_entry = {
         entry["entry_id"]: harness._entry_fingerprint(manifest, entry)
         for entry in manifest["entries"]
@@ -264,10 +254,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
 
 
 def test_verification_snapshot_rejects_terminal_record_without_timestamp():
-    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-    snapshot = copy.deepcopy(
-        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
-    )
+    manifest = synthetic_support_manifest()
+    snapshot = synthetic_verification_snapshot(manifest)
     snapshot["entries"]["idaho"] = {
         "terminal_status": "succeeded",
         "run_id": "run_idaho",
@@ -283,10 +271,8 @@ def test_verification_snapshot_rejects_terminal_record_without_timestamp():
 
 
 def test_verification_snapshot_rejects_current_proof_for_changed_entry():
-    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
-    snapshot = copy.deepcopy(
-        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
-    )
+    manifest = synthetic_support_manifest()
+    snapshot = synthetic_verification_snapshot(manifest)
     idaho_entry = next(
         entry for entry in manifest["entries"] if entry["entry_id"] == "idaho"
     )

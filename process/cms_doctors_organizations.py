@@ -13,8 +13,10 @@ from process.provider_directory_entity_identity import bind_cms_doctors_group_ba
 GROUP_BINDING_BATCH_SIZE = 100
 
 
-async def _lock_group_stage(session, stage_table, expected_oid=None):
+async def _lock_group_stage(session, stage_table, expected_oid=None, *, identifier_column="org_pac_id"):
     """Fence each short read against stage replacement and lossy identifier collation."""
+    if identifier_column not in {"org_pac_id", "adrs_id"}:
+        raise ValueError("cms_group_site_binding_column_invalid")
     qualified_name = postgresql.dialect().identifier_preparer.format_table(stage_table)
     await session.execute(text(f"LOCK TABLE {qualified_name} IN SHARE MODE"))
     stage_identity = (
@@ -23,10 +25,10 @@ async def _lock_group_stage(session, stage_table, expected_oid=None):
                 "SELECT attribute.attrelid::bigint, collation_info.collisdeterministic "
                 "FROM pg_catalog.pg_attribute AS attribute "
                 "JOIN pg_catalog.pg_collation AS collation_info ON collation_info.oid=attribute.attcollation "
-                "WHERE attribute.attrelid=to_regclass(:stage) AND attribute.attname='org_pac_id' "
+                "WHERE attribute.attrelid=to_regclass(:stage) AND attribute.attname=:identifier_column "
                 "AND NOT attribute.attisdropped"
             ),
-            {"stage": qualified_name},
+            {"stage": qualified_name, "identifier_column": identifier_column},
         )
     ).one()
     if not stage_identity[1] or (expected_oid is not None and stage_identity[0] != expected_oid):

@@ -67,6 +67,13 @@ class FileProbe:
     compressed_bytes: int
 
 
+@dataclass(frozen=True)
+class ObservedRelease:
+    manifest: Manifest
+    probes: tuple[FileProbe, ...]
+    vector_sha256: str
+
+
 def _is_positive_size(value: Any) -> bool:
     return type(value) is int and 0 < value <= 2**63 - 1
 
@@ -390,6 +397,35 @@ def _assert_vector_unchanged(
         raise CmsNpdSourceError("cms_npd_source_vector_changed")
 
 
+def observe_release(*, client: httpx.Client, base_url: str = DOWNLOADS_URL) -> ObservedRelease:
+    """Read the complete upstream vector without touching retained artifacts."""
+
+    manifest = _manifest(client, base_url)
+    probes = tuple(_probe(client, base_url, item) for item in manifest.files)
+    vector_by_field = {
+        "manifest_sha256": manifest.sha256,
+        "files": {
+            item.name: {"etag": probe.etag, "compressed_bytes": probe.compressed_bytes}
+            for item, probe in zip(manifest.files, probes, strict=True)
+        },
+    }
+    vector_sha256 = hashlib.sha256(json.dumps(vector_by_field, sort_keys=True).encode()).hexdigest()
+    return ObservedRelease(manifest, probes, vector_sha256)
+
+
+def assert_observed_release_unchanged(
+    observed: ObservedRelease, *, client: httpx.Client, base_url: str = DOWNLOADS_URL
+) -> None:
+    """Recheck every member after deciding whether the publication is current."""
+
+    _assert_vector_unchanged(
+        client,
+        base_url,
+        observed.manifest,
+        dict(zip((item.name for item in observed.manifest.files), observed.probes, strict=True)),
+    )
+
+
 def acquire_release(
     root: Path,
     *,
@@ -400,8 +436,110 @@ def acquire_release(
 
     if not root.is_dir():
         raise CmsNpdSourceError("cms_npd_artifact_root_missing")
-    manifest = _manifest(client, base_url)
-    probes_by_name = {file_spec.name: _probe(client, base_url, file_spec) for file_spec in manifest.files}
+    observed = observe_release(client=client, base_url=base_url)
+    manifest = observed.manifest
+    probes_by_name = dict(zip((item.name for item in manifest.files), observed.probes, strict=True))
+    vector_sha256 = observed.vector_sha256
+    directory = _acquisition_directory(root, vector_sha256)
+    with _release_lock(directory):
+        return _acquire_pinned_release(client, base_url, directory, manifest, probes_by_name, vector_sha256)
+
+
+def _acquisition_directory(root: Path, vector_sha256: str) -> Path:
+    """Keep every acquisition child literal and inside the configured root."""
+
+    if root.is_symlink():
+        raise CmsNpdSourceError("cms_npd_artifact_path_unsafe")
+    root_path = root.resolve()
+    directory = root
+    for component in ("cms-npd", "releases", vector_sha256):
+        directory = directory / component
+        if directory.is_symlink():
+            raise CmsNpdSourceError("cms_npd_artifact_path_unsafe")
+        try:
+            directory.mkdir(exist_ok=True)
+        except OSError as error:
+            raise CmsNpdSourceError("cms_npd_artifact_path_unsafe") from error
+        if directory.is_symlink() or not directory.is_dir() or not directory.resolve().is_relative_to(root_path):
+            raise CmsNpdSourceError("cms_npd_artifact_path_unsafe")
+    return directory
+
+
+def verify_release(
+    directory: Path,
+    receipt_by_field: dict[str, Any],
+    *,
+    client: httpx.Client,
+    base_url: str = DOWNLOADS_URL,
+) -> None:
+    """Recheck the exact retained bytes and upstream vector before publication."""
+
+    if directory != retained_release_directory(directory.parents[2], directory.name):
+        raise CmsNpdSourceError("cms_npd_retained_release_missing")
+    verify_retained_release(directory, receipt_by_field)
+    observed = observe_release(client=client, base_url=base_url)
+    if (
+        directory.name != observed.vector_sha256
+        or _file_sha256(directory / "manifest.json") != observed.manifest.sha256
+    ):
+        raise CmsNpdSourceError("cms_npd_source_vector_changed")
+    assert_observed_release_unchanged(observed, client=client, base_url=base_url)
+
+
+def retained_release_directory(root: Path, vector_sha256: str) -> Path:
+    """Resolve only one existing, literal release under the durable root."""
+
+    if _SHA256.fullmatch(vector_sha256) is None:
+        raise CmsNpdSourceError("cms_npd_rollback_vector_invalid")
+    base = root / "cms-npd" / "releases"
+    directory = base / vector_sha256
+    if (
+        (root / "cms-npd").is_symlink()
+        or base.is_symlink()
+        or directory.is_symlink()
+        or not directory.is_dir()
+        or not directory.resolve().is_relative_to(root.resolve())
+    ):
+        raise CmsNpdSourceError("cms_npd_retained_release_missing")
+    return directory
+
+
+def verify_retained_release(directory: Path, receipt_by_field: dict[str, Any]) -> None:
+    """Recheck sealed local bytes without requiring today's upstream vector."""
+
+    manifest_path = directory / "manifest.json"
+    receipt_path = directory / "receipt.json"
+    if (
+        manifest_path.is_symlink()
+        or receipt_path.is_symlink()
+        or not manifest_path.is_file()
+        or not receipt_path.is_file()
+        or manifest_path.stat().st_size > MAX_MANIFEST_BYTES
+        or receipt_path.stat().st_size > MAX_MANIFEST_BYTES
+        or any((directory / f"{name}.zst").is_symlink() for name, _ in RESOURCE_FILES)
+    ):
+        raise CmsNpdSourceError("cms_npd_retained_release_missing")
+    try:
+        manifest = parse_manifest(manifest_path.read_bytes())
+        stored_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CmsNpdSourceError("cms_npd_retained_release_invalid") from error
+    if not isinstance(stored_receipt, dict) or stored_receipt != receipt_by_field:
+        raise CmsNpdSourceError("cms_npd_receipt_invalid")
+    files = stored_receipt.get("files")
+    if not isinstance(files, dict) or set(files) != {name for name, _ in RESOURCE_FILES}:
+        raise CmsNpdSourceError("cms_npd_receipt_invalid")
+    probes_by_name = {}
+    for file_spec in manifest.files:
+        entry = files[file_spec.name]
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("etag"), str)
+            or not entry["etag"].startswith('"')
+            or not entry["etag"].endswith('"')
+        ):
+            raise CmsNpdSourceError("cms_npd_receipt_invalid")
+        probes_by_name[file_spec.name] = FileProbe(entry["etag"], file_spec.compressed_bytes)
     vector_by_field = {
         "manifest_sha256": manifest.sha256,
         "files": {
@@ -410,10 +548,26 @@ def acquire_release(
         },
     }
     vector_sha256 = hashlib.sha256(json.dumps(vector_by_field, sort_keys=True).encode()).hexdigest()
-    directory = root / "cms-npd" / "releases" / vector_sha256
-    directory.mkdir(parents=True, exist_ok=True)
-    with _release_lock(directory):
-        return _acquire_pinned_release(client, base_url, directory, manifest, probes_by_name, vector_sha256)
+    if directory.name != vector_sha256 or stored_receipt.get("generated_at") != manifest.generated_at:
+        raise CmsNpdSourceError("cms_npd_source_vector_changed")
+    _assert_retained_receipt(directory, receipt_by_field, manifest, probes_by_name, vector_sha256)
+
+
+def load_retained_release(root: Path, vector_sha256: str) -> tuple[Path, dict[str, Any]]:
+    """Load a selected older vector only after its complete local seal verifies."""
+
+    directory = retained_release_directory(root, vector_sha256)
+    receipt_path = directory / "receipt.json"
+    if not receipt_path.is_file() or receipt_path.is_symlink() or receipt_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise CmsNpdSourceError("cms_npd_receipt_invalid")
+    try:
+        receipt_by_field = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CmsNpdSourceError("cms_npd_receipt_invalid") from error
+    if not isinstance(receipt_by_field, dict):
+        raise CmsNpdSourceError("cms_npd_receipt_invalid")
+    verify_retained_release(directory, receipt_by_field)
+    return directory, receipt_by_field
 
 
 def _assert_retained_receipt(
@@ -465,12 +619,19 @@ def _acquire_pinned_release(
     """Seal or verify the pinned vector while holding its writer lock."""
 
     manifest_path = directory / "manifest.json"
+    receipt_path = directory / "receipt.json"
+    paths = (manifest_path, receipt_path) + tuple(
+        directory / f"{file_spec.name}{suffix}"
+        for file_spec in manifest.files
+        for suffix in (".zst", ".part", ".resume.json")
+    )
+    if any(path.is_symlink() for path in paths):
+        raise CmsNpdSourceError("cms_npd_artifact_path_unsafe")
     if manifest_path.exists():
         if _file_sha256(manifest_path) != manifest.sha256:
             raise CmsNpdSourceError("cms_npd_retained_manifest_invalid")
     else:
         _atomic_bytes(manifest_path, manifest.raw)
-    receipt_path = directory / "receipt.json"
     if receipt_path.exists():
         try:
             receipt_by_field = json.loads(receipt_path.read_text(encoding="utf-8"))

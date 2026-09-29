@@ -5,13 +5,12 @@ import copy
 import pytest
 
 from scripts import generate_provider_directory_support_docs as generator
+from tests.provider_directory_endpoint_acquisition_test_support import synthetic_verification_snapshot
 
 
 def test_rendered_live_proof_keeps_artifact_and_api_readiness_separate():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-    snapshot = copy.deepcopy(
-        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
-    )
+    snapshot = synthetic_verification_snapshot(manifest)
     snapshot["entries"]["idaho"]["publication_readiness"] = {
         "dataset_id": "pdds_fc4faaf27524be41f181cc4ccfa81bf5911d9a534c0114b0ecbe6a114685b94f",
         "derived_artifact_state": "promoted",
@@ -78,11 +77,15 @@ def test_verification_snapshot_rejects_incomplete_current_observation(missing_fi
     snapshot = copy.deepcopy(
         generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
     )
-    observation = snapshot["entries"]["aetna-commercial-medicare"][
-        "current_observation"
-    ]
+    observation_by_field = {
+        "state_status": "observed",
+        "run_status": "running",
+        "observed_at": "2026-08-26T00:00:00Z",
+    }
+    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"] = observation_by_field
+    generator.validate_verification_snapshot(snapshot, manifest)
     for field_name in missing_fields:
-        observation.pop(field_name)
+        observation_by_field.pop(field_name)
 
     with pytest.raises(
         generator.SupportDocumentationError,

@@ -35,8 +35,9 @@ def test_uhc_reference_helpers_cover_multi_value_and_state_only_rows():
                 {"network": [{"reference": "Organization/n2"}]},
                 {"network": [{"reference": "Organization/n3"}]},
             ],
+            "coverage": [{"network": [{"reference": "Organization/n4"}]}],
         }
-    ) == ["Organization/n1", "Organization/n2", "Organization/n3"]
+    ) == ["Organization/n1", "Organization/n2", "Organization/n3", "Organization/n4"]
     assert fhir._uhc_location_partition_predicate_error(
         _source(),
         "Location",
