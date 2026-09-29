@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -126,6 +127,8 @@ async def main():
                 "provider_directory_insurance_network_identity",
                 "provider_directory_insurance_network_source_binding",
                 "provider_directory_insurance_network_plan_evidence",
+                "provider_directory_mrf_payer_review_decision",
+                "provider_directory_mrf_payer_binding",
                 "provider_directory_profile_build_checkpoint",
                 "provider_directory_profile_capacity_lease_consumption",
                 "provider_directory_profile_capacity_preflight_receipt",
@@ -153,7 +156,7 @@ async def main():
                 table
                 for table in Base.metadata.sorted_tables
                 if (
-                    table.name == "import_run"
+                    table.name in {"import_run", "mrf_payer"}
                     or table.name.startswith("provider_directory_")
                 )
                 and table.name not in future_strict_tables
@@ -426,3 +429,37 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
     finally:
         asyncio.run(drop_adoption_schema())
+
+
+def test_reviewed_cms_payer_contract_in_database_lane(monkeypatch):
+    """Run reviewed payer transitions in an isolated local database."""
+
+    from tests.test_provider_directory_mrf_payer_binding import (
+        test_concurrent_reviews_cannot_bind_two_payers_to_one_organization,
+        test_reviewed_payer_binding_replay_conflict_closure_and_source_isolation,
+    )
+
+    url = _database_url()
+    database_name = f"cms_payer_binding_test_{uuid4().hex}"
+    payer_url = url.set(drivername="postgresql+asyncpg", database=database_name)
+
+    async def run_contract() -> None:
+        admin = await asyncpg.connect(
+            host=url.host,
+            port=url.port or 5432,
+            user=url.username,
+            password=url.password,
+            database="postgres",
+        )
+        try:
+            await admin.execute(f'CREATE DATABASE "{database_name}"')
+            try:
+                monkeypatch.setenv("CMS_PAYER_BINDING_TEST_DATABASE", payer_url.render_as_string(hide_password=False))
+                await test_reviewed_payer_binding_replay_conflict_closure_and_source_isolation()
+                await test_concurrent_reviews_cannot_bind_two_payers_to_one_organization()
+            finally:
+                await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+        finally:
+            await admin.close()
+
+    asyncio.run(run_contract())
