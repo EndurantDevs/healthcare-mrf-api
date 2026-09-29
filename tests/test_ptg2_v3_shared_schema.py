@@ -151,9 +151,7 @@ def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260929020000_provider_directory_insurance_network_identity"
-    ]
+    assert ScriptDirectory.from_config(config).get_heads() == ["20260929030000_provider_directory_mrf_payer_binding"]
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():
