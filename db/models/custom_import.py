@@ -60,6 +60,7 @@ __all__ = (
     "CustomImportNoChangeSeal",
     "CustomImportPack",
     "CustomImportPublicationEvent",
+    "CustomImportRegistrationAuthority",
     "CustomImportRejection",
     "CustomImportRootRecord",
     "CustomImportRootRevision",
@@ -158,6 +159,41 @@ class CustomImportDataset(_CustomImportModel):
     dataset_id = Column(BigInteger, primary_key=True, autoincrement=True)
     dataset_key = Column(String(63), nullable=False)
     created_at = _timestamp_column()
+
+
+class CustomImportRegistrationAuthority(_CustomImportModel):
+    """One immutable registration capability with retained revoke/result evidence."""
+
+    __tablename__ = "custom_import_registration_authority"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint("authority_id", name="custom_import_reg_authority_pkey"),
+        CheckConstraint(
+            "authority_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'",
+            name="custom_import_reg_authority_id_check",
+        ),
+        CheckConstraint(
+            "((input_sha256 IS NOT NULL AND token_sha256 IS NOT NULL AND expires_at IS NOT NULL AND "
+            + _sha256_check("input_sha256")
+            + " AND "
+            + _sha256_check("token_sha256")
+            + ") OR (input_sha256 IS NULL AND token_sha256 IS NULL AND expires_at IS NULL AND "
+            "revoked_at IS NOT NULL AND result_receipt IS NULL))",
+            name="custom_import_reg_authority_pins_check",
+        ),
+        CheckConstraint(
+            "result_receipt IS NULL OR (input_sha256 IS NOT NULL AND octet_length(result_receipt) BETWEEN 2 AND 4096)",
+            name="custom_import_reg_authority_result_check",
+        ),
+    )
+
+    authority_id = Column(String(128), primary_key=True)
+    input_sha256 = Column(LargeBinary(32))
+    token_sha256 = Column(LargeBinary(32))
+    expires_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("clock_timestamp()"))
+    revoked_at = Column(TIMESTAMP(timezone=True))
+    result_receipt = Column(Text)
 
 
 class CustomImportSchemaRevision(_CustomImportModel):

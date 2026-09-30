@@ -21,7 +21,11 @@ from db.models.custom_import import (
 )
 from process.custom_import.definition import CustomImportDefinition, load_json_definition
 import process.custom_import.definition_store as definition_store
-from process.custom_import.definition_store import DefinitionRegistrationError, register_definition
+from process.custom_import.definition_store import (
+    DefinitionRegistrationConflict,
+    DefinitionRegistrationError,
+    register_definition,
+)
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
 _IDENTITY_FIELDS = {
@@ -170,10 +174,56 @@ async def test_registration_replays_exact_content_and_rejects_drift_before_persi
     key_drift["schema"]["root"]["fields"][1]["id"] = "provider_name"
     key_drift["aliases"]["providers"]["Provider Name"] = "provider_name"
     key_drift["query"]["root_fields"][1] = "provider_name"
-    with pytest.raises(DefinitionRegistrationError, match="transition is invalid"):
+    with pytest.raises(DefinitionRegistrationConflict, match="transition is invalid"):
         await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(key_drift))
 
     assert _table_counts(session) == expected_counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("canonical", "schema_reference", "schema_canonical"))
+async def test_existing_registration_rejects_corrupt_replay_identity_as_persisted_error(corruption):
+    session = _SyntheticSession()
+    definition = _definition()
+    await register_definition(session, "synthetic_store", definition)
+    definition_row = session._models_by_table[CustomImportDefinitionRevision.__tablename__][0]
+    schema_row = session._models_by_table[CustomImportSchemaRevision.__tablename__][0]
+    if corruption == "canonical":
+        definition_row.canonical_definition = "not-json"
+    elif corruption == "schema_reference":
+        definition_row.schema_revision_id = -1
+    else:
+        schema_row.canonical_schema = "not-json"
+
+    with pytest.raises(DefinitionRegistrationError) as caught:
+        await register_definition(session, "synthetic_store", definition)
+    assert type(caught.value) is DefinitionRegistrationError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ("definition_digest", "schema_digest"))
+async def test_existing_registration_validates_digest_candidates_before_conflict(conflict):
+    session = _SyntheticSession()
+    definition = _definition()
+    await register_definition(session, "synthetic_store", definition)
+    revised = _raw_definition()
+    revised["revision"] = {"definition": 2, "schema": 2}
+    if conflict == "schema_digest":
+        revised["refresh_mode"] = "snapshot"
+    competing = CustomImportDefinition.from_mapping(revised)
+
+    with pytest.raises(DefinitionRegistrationConflict):
+        await register_definition(session, "synthetic_store", competing)
+
+    definition_row = session._models_by_table[CustomImportDefinitionRevision.__tablename__][0]
+    schema_row = session._models_by_table[CustomImportSchemaRevision.__tablename__][0]
+    if conflict == "definition_digest":
+        definition_row.canonical_definition = "not-json"
+    else:
+        schema_row.canonical_schema = "not-json"
+    with pytest.raises(DefinitionRegistrationError) as caught:
+        await register_definition(session, "synthetic_store", competing)
+    assert type(caught.value) is DefinitionRegistrationError
 
 
 @pytest.mark.asyncio
@@ -212,6 +262,72 @@ async def test_registration_rejects_drift_in_a_reused_schema_graph():
         await register_definition(session, "synthetic_store", _revised_definition(first_definition))
 
     assert _table_counts(session) == (1, 1, 5, 2, 5, 1, 2, 5, 1)
+
+
+@pytest.mark.asyncio
+async def test_reused_schema_corrupt_field_slot_ledger_is_not_a_content_conflict():
+    session = _SyntheticSession()
+    first_definition = _definition()
+    await register_definition(session, "synthetic_store", first_definition)
+    field_slot = session._models_by_table["custom_import_field_slot"][0]
+    field_slot.field_id = "wrong_field"
+
+    with pytest.raises(DefinitionRegistrationError, match="persisted schema graph") as caught:
+        await register_definition(session, "synthetic_store", _revised_definition(first_definition))
+    assert type(caught.value) is DefinitionRegistrationError
+    assert _table_counts(session) == (1, 1, 5, 1, 5, 1, 2, 5, 1)
+
+
+@pytest.mark.asyncio
+async def test_new_schema_corrupt_field_slot_ledger_is_not_a_content_conflict():
+    session = _SyntheticSession()
+    first_definition = _definition()
+    await register_definition(session, "synthetic_store", first_definition)
+    field_slot = session._models_by_table["custom_import_field_slot"][1]
+    field_slot.field_id = "wrong_field"
+    revised = _raw_definition()
+    revised["revision"] = {"definition": 2, "schema": 2}
+    revised["schema"]["root"]["fields"][1]["nullable"] = True
+
+    with pytest.raises(DefinitionRegistrationError, match="persisted field slot") as caught:
+        await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(revised))
+    assert type(caught.value) is DefinitionRegistrationError
+    assert _table_counts(session) == (1, 1, 5, 1, 5, 1, 2, 5, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corrupt_ledger", (False, True))
+async def test_retired_field_slot_preserves_conflict_only_for_valid_history(corrupt_ledger):
+    session = _SyntheticSession()
+    await register_definition(session, "synthetic_store", _definition())
+    added = _raw_definition()
+    added["revision"] = {"definition": 2, "schema": 2}
+    added["schema"]["root"]["fields"].append(
+        {"id": "retired_field", "slot": 6, "type": "string", "nullable": True}
+    )
+    await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(added))
+    removed = copy.deepcopy(added)
+    removed["revision"] = {"definition": 3, "schema": 3}
+    removed["schema"]["root"]["fields"].pop()
+    removed["schema"]["root"]["fields"][1]["nullable"] = True
+    await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(removed))
+
+    replacement = copy.deepcopy(removed)
+    replacement["revision"] = {"definition": 4, "schema": 4}
+    replacement["schema"]["root"]["fields"].append(
+        {"id": "replacement_field", "slot": 6, "type": "string", "nullable": True}
+    )
+    if corrupt_ledger:
+        retired_slot = next(
+            slot_row for slot_row in session._models_by_table["custom_import_field_slot"] if slot_row.field_slot == 6
+        )
+        retired_slot.field_id = "wrong_field"
+    before = _table_counts(session)
+    expected_error = DefinitionRegistrationError if corrupt_ledger else DefinitionRegistrationConflict
+    with pytest.raises(expected_error) as caught:
+        await register_definition(session, "synthetic_store", CustomImportDefinition.from_mapping(replacement))
+    assert type(caught.value) is expected_error
+    assert _table_counts(session) == before
 
 
 @pytest.mark.asyncio
