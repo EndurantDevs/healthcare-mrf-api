@@ -41,6 +41,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20260929030000_provider_directory_mrf_payer_binding",
     "20260930010000_provider_directory_resource_identity",
     "20260930020000_cms_npd_serving_coverage",
+    "20260930030000_custom_import_registration_authority",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -74,7 +75,7 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
     source_binding_revision = "20260923030000_custom_import_source_binding"
     doctors_revision = "20260929000000_cms_doctor_group_site"
-    assert script.get_heads() == ["20260930020000_cms_npd_serving_coverage"]
+    assert script.get_heads() == ["20260930030000_custom_import_registration_authority"]
     assert (
         script.get_revision("20260929020000_provider_directory_insurance_network_identity").down_revision
         == "20260929010000_provider_directory_entity_identity"
