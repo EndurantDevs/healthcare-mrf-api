@@ -45,7 +45,12 @@ from process.custom_import.runner_registry import (
 )
 from process.custom_import.runner_types import CandidateRunnerError, CandidateRunRequest
 
-__all__ = ("DefinitionRegistrationError", "RegisteredDefinition", "register_definition")
+__all__ = (
+    "DefinitionRegistrationConflict",
+    "DefinitionRegistrationError",
+    "RegisteredDefinition",
+    "register_definition",
+)
 
 
 _DATASET_KEY = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
@@ -53,6 +58,10 @@ _DATASET_KEY = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 class DefinitionRegistrationError(ValueError):
     """A definition cannot be safely registered as an immutable revision."""
+
+
+class DefinitionRegistrationConflict(DefinitionRegistrationError):
+    """A requested definition conflicts with an existing immutable identity."""
 
 
 @dataclass(frozen=True)
@@ -234,7 +243,7 @@ def _validate_transition(
     try:
         CustomImportDefinition.from_json(definition.canonical, previous=previous_definition)
     except (DefinitionError, TypeError, ValueError) as exc:
-        raise DefinitionRegistrationError("definition revision transition is invalid") from exc
+        raise DefinitionRegistrationConflict("definition revision transition is invalid") from exc
 
 
 def _new_field_slots(
@@ -248,10 +257,67 @@ def _new_field_slots(
         bound_field_id = field_by_slot.get(field.field_slot)
         bound_slot = slot_by_field.get(field.field_id)
         if bound_field_id not in {None, field.field_id} or bound_slot not in {None, field.field_slot}:
-            raise DefinitionRegistrationError("stable field slot identity is already bound differently")
+            raise DefinitionRegistrationConflict("stable field slot identity is already bound differently")
         if bound_field_id is None:
             new_fields.append(field)
     return tuple(new_fields)
+
+
+async def _validate_affected_field_slot_history(
+    session: AsyncSession,
+    state: _LockedDefinitionState,
+    fields: tuple[Field, ...],
+) -> None:
+    """Check requested slot identities against their persisted canonical history."""
+
+    requested_by_slot = {field.field_slot: field.field_id for field in fields}
+    requested_by_id = {field.field_id: field.field_slot for field in fields}
+    affected_slots = {
+        ledger_row.field_slot
+        for ledger_row in state.field_slot_rows
+        if (
+            ledger_row.field_slot in requested_by_slot
+            and requested_by_slot[ledger_row.field_slot] != ledger_row.field_id
+        )
+        or (ledger_row.field_id in requested_by_id and requested_by_id[ledger_row.field_id] != ledger_row.field_slot)
+    }
+    if not affected_slots:
+        return
+    with _no_autoflush(session):
+        historical_rows = (
+            await session.scalars(
+                select(CustomImportField).where(
+                    CustomImportField.dataset_id == state.dataset.dataset_id,
+                    CustomImportField.field_slot.in_(affected_slots),
+                )
+            )
+        ).all()
+    relevant_rows = tuple(field_row for field_row in historical_rows if field_row.field_slot in affected_slots)
+    ledger_by_slot = {ledger_row.field_slot: ledger_row for ledger_row in state.field_slot_rows}
+    schema_by_id = {schema_row.schema_revision_id: schema_row for schema_row in state.schema_rows}
+    definition_by_schema = {
+        definition_row.schema_revision_id: definition_row for definition_row in state.definition_rows
+    }
+    for field_row in relevant_rows:
+        ledger_row = ledger_by_slot.get(field_row.field_slot)
+        schema_row = schema_by_id.get(field_row.schema_revision_id)
+        definition_row = definition_by_schema.get(field_row.schema_revision_id)
+        if ledger_row is None or ledger_row.field_id != field_row.field_name or schema_row is None or definition_row is None:
+            raise DefinitionRegistrationError("persisted field slot identity is invalid")
+        stored_definition = _persisted_definition(definition_row, schema_row)
+        stored_field = next(
+            (field for field in stored_definition.fields if field.field_slot == field_row.field_slot),
+            None,
+        )
+        if stored_field is None or stored_field.field_id != field_row.field_name:
+            raise DefinitionRegistrationError("persisted field slot identity is invalid")
+    historical_bindings = {(field_row.field_slot, field_row.field_name) for field_row in relevant_rows}
+    if any(
+        (ledger_row.field_slot, ledger_row.field_id) not in historical_bindings
+        for ledger_row in state.field_slot_rows
+        if ledger_row.field_slot in affected_slots
+    ):
+        raise DefinitionRegistrationError("persisted field slot identity is invalid")
 
 
 def _collection_slot_by_name(definition: CustomImportDefinition) -> dict[str, int]:
@@ -437,10 +503,43 @@ async def _persist_aliases_and_profiles(
         await session.flush()
 
 
+def _validate_registration_candidates(
+    state: _LockedDefinitionState,
+    definitions: Iterable[CustomImportDefinitionRevision | None],
+    schemas: Iterable[CustomImportSchemaRevision | None],
+) -> None:
+    """Reject corrupt stored candidate identities before classifying conflicts."""
+
+    schema_by_id = {schema_row.schema_revision_id: schema_row for schema_row in state.schema_rows}
+    for stored_definition in definitions:
+        if stored_definition is None:
+            continue
+        actual_schema = schema_by_id.get(stored_definition.schema_revision_id)
+        if actual_schema is None:
+            raise DefinitionRegistrationError("persisted definition schema is unavailable")
+        _persisted_definition(stored_definition, actual_schema)
+    for stored_schema in schemas:
+        if stored_schema is None:
+            continue
+        referenced_definition = next(
+            (
+                definition_row
+                for definition_row in state.definition_rows
+                if definition_row.schema_revision_id == stored_schema.schema_revision_id
+            ),
+            None,
+        )
+        if referenced_definition is None:
+            raise DefinitionRegistrationError("persisted definition schema is unavailable")
+        _persisted_definition(referenced_definition, stored_schema)
+
+
 def _existing_registration(
     state: _LockedDefinitionState,
     definition: CustomImportDefinition,
 ) -> tuple[RegisteredDefinition | None, CustomImportSchemaRevision | None]:
+    """Return an exact replay or reused schema only after stored identities are valid."""
+
     definition_by_revision = _row_by_revision(
         state.definition_rows,
         definition.definition_revision,
@@ -459,11 +558,16 @@ def _existing_registration(
         bytes.fromhex(definition.schema_digest),
         "schema",
     )
+    _validate_registration_candidates(
+        state,
+        (definition_by_revision, definition_by_digest),
+        (schema_by_revision, schema_by_digest),
+    )
     if definition_by_revision is not None:
         if schema_by_revision is None or not _is_matching_schema(schema_by_revision, definition):
-            raise DefinitionRegistrationError("definition revision is bound to a different schema")
+            raise DefinitionRegistrationConflict("definition revision is bound to a different schema")
         if not _is_matching_definition(definition_by_revision, definition, schema_by_revision.schema_revision_id):
-            raise DefinitionRegistrationError("definition revision is already bound to different content")
+            raise DefinitionRegistrationConflict("definition revision is already bound to different content")
         return (
             RegisteredDefinition(
                 dataset_id=state.dataset.dataset_id,
@@ -474,13 +578,13 @@ def _existing_registration(
             schema_by_revision,
         )
     if definition_by_digest is not None:
-        raise DefinitionRegistrationError("definition content is already bound to another revision")
+        raise DefinitionRegistrationConflict("definition content is already bound to another revision")
     if schema_by_revision is not None:
         if not _is_matching_schema(schema_by_revision, definition):
-            raise DefinitionRegistrationError("schema revision is already bound to different content")
+            raise DefinitionRegistrationConflict("schema revision is already bound to different content")
         return None, schema_by_revision
     if schema_by_digest is not None:
-        raise DefinitionRegistrationError("schema content is already bound to another revision")
+        raise DefinitionRegistrationConflict("schema content is already bound to another revision")
     return None, None
 
 
@@ -580,9 +684,10 @@ async def register_definition(
         return replay
 
     _validate_transition(canonical_definition, state.definition_rows, state.schema_rows)
-    new_field_slots = _new_field_slots(canonical_definition.fields, state.field_slot_rows)
     collection_slot_by_name = _collection_slot_by_name(canonical_definition)
     if schema_row is None:
+        await _validate_affected_field_slot_history(session, state, canonical_definition.fields)
+        new_field_slots = _new_field_slots(canonical_definition.fields, state.field_slot_rows)
         schema_row = await _persist_schema(
             session,
             state.dataset.dataset_id,
