@@ -32,6 +32,7 @@ from process.custom_import.definition import CustomImportDefinition, canonical_j
 from process.custom_import.definition_store import DefinitionRegistrationError, _normalized_dataset_key
 from process.custom_import.execution import IdempotencyConflict, lookup_execution_request
 from process.custom_import.family import RootFamily
+from process.custom_import.registration_authority_operator import register_authority
 from process.custom_import.runner import CandidateRunResult
 from process.custom_import.runner_registry import database_now
 from process.custom_import.snowflake import FixedLocalKeyPairCredentialProvider
@@ -141,6 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = _RedactedArgumentParser(allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=_RedactedArgumentParser)
     commands.add_parser("register", allow_abbrev=False, help="read one canonical registration envelope from stdin")
+    commands.add_parser("register-authority", allow_abbrev=False, help="register stdin with a fixed mounted capability")
     for command in ("execute", "resume"):
         operation = commands.add_parser(command, allow_abbrev=False)
         operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
@@ -924,6 +926,14 @@ async def _run_resumed_snowflake_binding(
                     raise
 
 
+def _run_authority_registration(*, stream: Any | None = None) -> str:
+    """Parse and send scoped registration while preserving receipt-only output."""
+
+    with _receipt_only_database_output(None):
+        dataset_key, definition, binding = _registration_from_stdin(stream)
+        return asyncio.run(register_authority(dataset_key, definition, binding))
+
+
 def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = None) -> int:
     """Register or run a retained binding while emitting only compact safe receipts."""
 
@@ -934,8 +944,12 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
     except SnowflakePreflightError:
         parser.error("invalid")
     try:
-        if parsed.command == "register":
-            rendered = asyncio.run(_register_snowflake_binding(stream=stream))
+        if parsed.command in {"register", "register-authority"}:
+            rendered = (
+                _run_authority_registration(stream=stream)
+                if parsed.command == "register-authority"
+                else asyncio.run(_register_snowflake_binding(stream=stream))
+            )
         elif parsed.command == "execute":
             candidate_result = asyncio.run(
                 _run_retained_snowflake_binding(
@@ -962,7 +976,11 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
         print(_error_json("canceled"), file=sys.stderr)
         return 130
     except DefinitionRegistrationError, SnowflakeSourceBindingError:
-        code = "invalid_registration" if parsed.command == "register" else "source_binding_unavailable"
+        code = (
+            "invalid_registration"
+            if parsed.command in {"register", "register-authority"}
+            else "source_binding_unavailable"
+        )
         print(_error_json(code), file=sys.stderr)
         return 1
     except _ResumeUnavailableError:
