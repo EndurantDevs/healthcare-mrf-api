@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_serving_receipt as receipts
 from tests.cms_npd_admission_postgres_support import _database_url
+from tests.reference_family_generation_fixture import install_source_generation_guards
 
 _MIGRATIONS = Path(__file__).resolve().parents[1] / "alembic" / "versions"
 _PIN = {
@@ -29,7 +30,7 @@ _PIN = {
 
 
 def _migration(prefix):
-    path = next(_MIGRATIONS.glob(prefix + "*.py"))
+    (path,) = _MIGRATIONS.glob(prefix + "*.py")
     spec = importlib.util.spec_from_file_location("receipt_" + prefix, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -39,6 +40,12 @@ def _migration(prefix):
 def _apply(connection, prefix, function="upgrade"):
     with Operations.context(MigrationContext.configure(connection)):
         getattr(_migration(prefix), function)()
+
+
+def test_fixture_migration_rejects_ambiguous_prefix():
+    """A shared timestamp cannot silently select the wrong migration."""
+    with pytest.raises(ValueError, match="too many values"):
+        _migration("20260914120000")
 
 
 async def _create_scalar_tables(connection, schema):
@@ -70,7 +77,8 @@ async def _create_native_tables(connection, schema):
     await connection.execute(
         text(f"""CREATE TABLE {schema}.reference_family_result_generation (
         importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL,local_generation bigint NOT NULL,
-        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],CHECK ({shape}))""")
+        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],
+        CONSTRAINT reference_family_result_generation_shape_check CHECK ({shape}))""")
     )
     await connection.execute(
         text(
@@ -79,6 +87,7 @@ async def _create_native_tables(connection, schema):
         ),
         {"lineage": uuid4()},
     )
+    await install_source_generation_guards(connection, schema)
 
 
 def _create_profile_table(connection, schema):

@@ -220,7 +220,9 @@ async def test_legacy_publication_without_cms_keeps_native_authority(monkeypatch
         ctx = await stage_family(fixture.database, fixture.schema)
         incumbent = await authority(fixture)
         for model in preparation._models():
-            await native._create_stage_indexes(native.make_class(model, ctx["import_date"]), fixture.schema)
+            stage = native.make_class(model, ctx["import_date"])
+            await native._create_stage_indexes(stage, fixture.schema)
+            await fixture.database.status(f'ALTER TABLE "{fixture.schema}"."{stage.__tablename__}" SET LOGGED')
         result = await native._publish_cms_doctors_stage(
             native.make_class(native.DoctorClinicianAddress, ctx["import_date"]), fixture.schema, ctx["import_date"]
         )
@@ -237,7 +239,9 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
         incumbent = await authority(fixture)
         stages = await stage_oids(fixture, ctx)
         for model in preparation._models():
-            await native._create_stage_indexes(native.make_class(model, ctx["import_date"]), fixture.schema)
+            stage = native.make_class(model, ctx["import_date"])
+            await native._create_stage_indexes(stage, fixture.schema)
+            await fixture.database.status(f'ALTER TABLE "{fixture.schema}"."{stage.__tablename__}" SET LOGGED')
         transaction_ids = []
         original_apply = native._apply_cms_doctors_stage
 
