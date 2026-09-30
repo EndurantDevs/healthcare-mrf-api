@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass, replace
+from decimal import Decimal
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +52,8 @@ from process.custom_import.read_core import (
     RootDetailRequest,
     SearchRequest,
 )
+from process.custom_import.runner import run_candidate
+from tests import test_custom_import_runner_postgres as runner_fixture
 from tests.custom_import_postgres_support import (
     FamilyMaterial,
     FamilyMaterialSpec,
@@ -364,26 +369,38 @@ def _publication_graph(seed: _ReadIdentity) -> PublicationGraph:
     )
 
 
-async def _add_selected_scalars(session, graph: PublicationGraph, family: FamilyMaterial) -> None:
-    """Persist one root value and an explicit-null metric on the selected child."""
+async def _add_selected_scalars(
+    session,
+    graph: PublicationGraph,
+    family: FamilyMaterial,
+    *,
+    selected_amount: Decimal | None = None,
+    sibling_amount: Decimal | None = None,
+) -> None:
+    """Persist one root value and selected-child metrics before sealing."""
 
     selected_child_revision_id = family.child_revision_ids[1]
+    session.add(
+        CustomImportRootScalar(
+            root_revision_id=family.root_revision_id,
+            dataset_id=graph.dataset_id,
+            schema_revision_id=graph.schema_revision_id,
+            root_record_id=family.root_record_id,
+            field_slot=3,
+            field_collection_slot=0,
+            projection_slot=3,
+            field_type="string",
+            value_state="value",
+            string_value="synthetic-root",
+        )
+    )
+    amounts = ((selected_child_revision_id, selected_amount),)
+    if sibling_amount is not None:
+        amounts += ((family.child_revision_ids[0], sibling_amount),)
     session.add_all(
         (
-            CustomImportRootScalar(
-                root_revision_id=family.root_revision_id,
-                dataset_id=graph.dataset_id,
-                schema_revision_id=graph.schema_revision_id,
-                root_record_id=family.root_record_id,
-                field_slot=3,
-                field_collection_slot=0,
-                projection_slot=3,
-                field_type="string",
-                value_state="value",
-                string_value="synthetic-root",
-            ),
             CustomImportChildScalar(
-                child_revision_id=selected_child_revision_id,
+                child_revision_id=child_revision_id,
                 dataset_id=graph.dataset_id,
                 schema_revision_id=graph.schema_revision_id,
                 root_record_id=family.root_record_id,
@@ -392,17 +409,24 @@ async def _add_selected_scalars(session, graph: PublicationGraph, family: Family
                 field_collection_slot=1,
                 projection_slot=4,
                 field_type="decimal",
-                value_state="null",
-            ),
+                value_state="null" if amount is None else "value",
+                decimal_value=amount,
+            )
+            for child_revision_id, amount in amounts
         )
     )
     await session.flush()
 
 
 async def _add_selected_winners(
-    session, graph: PublicationGraph, attempt: GenerationAttempt, family: FamilyMaterial
+    session,
+    graph: PublicationGraph,
+    attempt: GenerationAttempt,
+    family: FamilyMaterial,
+    *,
+    include_sibling: bool = False,
 ) -> None:
-    """Create two deterministic winner rows for exact-count page coverage."""
+    """Create two selected rows, optionally preceded by a different context child."""
 
     selected_child_revision_id = family.child_revision_ids[1]
     session.add_all(
@@ -416,9 +440,9 @@ async def _add_selected_winners(
             family_revision_id=family.family_revision_id,
             context_collection_slot=1,
             context_key_sha256=digest(f"read-core-context:{ordinal}"),
-            context_child_revision_id=selected_child_revision_id,
+            context_child_revision_id=family.child_revision_ids[0] if ordinal == 0 else selected_child_revision_id,
         )
-        for ordinal in (1, 2)
+        for ordinal in ((0, 1, 2) if include_sibling else (1, 2))
     )
     await session.flush()
 
@@ -649,6 +673,150 @@ async def test_read_core_uses_one_selected_child_and_exact_family_membership():
         await _assert_selected_child_filtering(session, service, authorization, fixture)
         await _assert_metric_states(session, service, authorization, fixture)
         await _assert_exact_family_detail(session, service, authorization, fixture, first_page)
+
+
+@pytest.mark.asyncio
+async def test_read_core_filters_the_selected_child_before_count_and_pagination(monkeypatch):
+    """A high sibling metric cannot replace the selected low child after filtering."""
+
+    monkeypatch.setattr(
+        "tests.test_custom_import_read_core_postgres._add_selected_scalars",
+        partial(_add_selected_scalars, selected_amount=Decimal("4"), sibling_amount=Decimal("10")),
+    )
+    monkeypatch.setattr(
+        "tests.test_custom_import_read_core_postgres._add_selected_winners",
+        partial(_add_selected_winners, include_sibling=True),
+    )
+    async with transaction_session() as session, session.begin():
+        fixture = await _seed_read_fixture(session)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        rejected = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("synthetic_alpha", "eq", "low-1"), ReadFilter("amount", "gt", "5")),
+                page_size=1,
+            ),
+        )
+        assert rejected.total == 0
+        assert rejected.items == ()
+        assert rejected.next_cursor is None
+
+        unfiltered = await service.search(
+            session, authorization=authorization, request=SearchRequest(target=fixture.target, page_size=1)
+        )
+        assert unfiltered.total == 3
+        assert unfiltered.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[0]
+        accepted = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(target=fixture.target, filters=(ReadFilter("amount", "lt", "5"),), page_size=1),
+        )
+        assert accepted.total == 2
+        assert len(accepted.items) == 1
+        assert accepted.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[1]
+        assert accepted.next_cursor is not None
+        next_page = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("amount", "lt", "5"),),
+                page_size=1,
+                cursor=accepted.next_cursor,
+            ),
+        )
+        assert next_page.total == 2
+        assert len(next_page.items) == 1
+        assert next_page.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[1]
+        assert next_page.next_cursor is None
+        assert next_page.items[0].winner != accepted.items[0].winner
+
+
+def _ranked_family_definition() -> CustomImportDefinition:
+    document = json.loads(runner_fixture._decimal_root_key_definition().canonical)
+    document["schema"]["root"]["fields"][-1]["projection_slot"] = 5
+    document["query"]["root_fields"].append("rank")
+    document["selection_profiles"][0]["selection"] = [{"field": "rank", "direction": "desc", "nulls": "last"}]
+    return CustomImportDefinition.from_mapping(document)
+
+
+async def _run_ranked_families(case, amount_state: str) -> PinnedReadTarget:
+    seed = await runner_fixture._seed_case(case, "ranked", _ranked_family_definition())
+    execution_id, token = await runner_fixture._new_execution(case, seed, "ranked")
+    npi = "1234567893"
+    roots = [runner_fixture._root_with_rank(npi, name, rank) for name, rank in (("Older", 1), ("Latest", 2))]
+    child_rows = [
+        runner_fixture._rate_with_rank(npi, code, Decimal(amount), rank)
+        for code, amount, rank in (("A", "10", 1), ("B", "20", 1), ("A", "4", 2), ("B", "8", 2))
+    ]
+    if amount_state == "null":
+        child_rows[2]["amount"] = None
+    elif amount_state == "missing":
+        del child_rows[2]["amount"]
+    run_result = await run_candidate(
+        case.sessions, runner_fixture._request(seed, execution_id, token, roots, child_rows)
+    )
+    assert run_result.status == "activated"
+    assert run_result.generation_id is not None
+    assert run_result.accepted_family_count == 2
+    assert run_result.rejection_count == 0
+    assert run_result.seal is not None and run_result.seal.family_count == 2
+    return PinnedReadTarget(
+        dataset_id=seed.dataset_id,
+        generation_id=run_result.generation_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        profile_id="default",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("amount_state", ("value", "null", "missing"))
+async def test_ranked_family_never_falls_back_after_metric_filtering(amount_state):
+    """Ranking, persistence and reads keep the latest family even when its metric fails."""
+
+    async with isolated_publication_case() as case:
+        pinned_target = await _run_ranked_families(case, amount_state)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-ranked-read")
+        async with case.sessions() as session:
+            rejected = await service.search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(
+                    target=pinned_target,
+                    filters=(ReadFilter("service_code", "eq", "A"), ReadFilter("amount", "gt", "5")),
+                    page_size=1,
+                ),
+            )
+            assert (rejected.total, rejected.items, rejected.next_cursor) == (0, (), None)
+            selected = await service.search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(target=pinned_target, filters=(ReadFilter("service_code", "eq", "A"),)),
+            )
+            assert selected.total == len(selected.items) == 1
+            selected_item = selected.items[0]
+            assert (
+                next(field.value for field in selected_item.root_fields if field.field_id == "display_name") == "Latest"
+            )
+            assert (
+                next(field.state for field in selected_item.context_fields if field.field_id == "amount")
+                == amount_state
+            )
+            detail = await service.root_detail(
+                session, authorization=authorization, target=pinned_target, winner=selected_item.winner
+            )
+            amounts_by_code = {
+                next(field.value for field in child.fields if field.field_id == "service_code"): next(
+                    field.value for field in child.fields if field.field_id == "amount"
+                )
+                for child in detail.children
+            }
+            assert amounts_by_code == {"A": Decimal("4") if amount_state == "value" else None, "B": Decimal("8")}
 
 
 @pytest.mark.asyncio
