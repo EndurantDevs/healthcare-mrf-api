@@ -6,7 +6,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 from process.ptg_parts.canonical import (
     _canonicalize_for_json,
@@ -25,6 +26,65 @@ from process.ptg_parts.toc_entries import (
     _toc_body_source_type,
     flat_toc_catalog_entries,
 )
+
+
+def validated_in_network_urls(params: Mapping[str, Any]) -> list[str] | None:
+    """Validate an explicit complete ordinary URL set without truncation."""
+
+    urls = params.get("in_network_urls")
+    if urls is None:
+        return None
+    if not isinstance(urls, (list, tuple)) or not 2 <= len(urls) <= 100:
+        raise ValueError("in_network_urls requires 2 to 100 distinct rate URLs")
+    if any(
+        params.get(key) not in (None, [], ())
+        for key in (
+            "in_network_url",
+            "allowed_url",
+            "toc_url",
+            "toc_urls",
+            "toc_list",
+            "file_url_contains",
+            "provider_ref_url",
+            "direct_source_index_url",
+            "direct_rate_file_intent",
+            "direct_rate_file_intent_sha256",
+            "frozen_rate_file_set_contract",
+            "frozen_rate_files",
+            "frozen_rate_file_set_sha256",
+            "frozen_rate_file_count",
+        )
+    ) or any(key.startswith("ordinary_cutover_") for key in params):
+        raise ValueError("in_network_urls cannot mix direct or protected selectors")
+    max_files = params.get("max_files")
+    if max_files is not None and (type(max_files) is not int or max_files != len(urls)):
+        raise ValueError("in_network_urls cannot truncate the selected rate set")
+    for url in urls:
+        if (
+            not isinstance(url, str)
+            or url != url.strip()
+            or len(url.encode("utf-8")) > 4096
+            or any(ord(character) < 32 or ord(character) == 127 for character in url)
+        ):
+            raise ValueError("in_network_urls contains an invalid rate URL")
+        normalized_url = normalize_tic_source_url(url)
+        parsed = urlsplit(normalized_url)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or any(character.isspace() for character in parsed.hostname)
+            or parsed.username is not None
+            or normalized_url != normalized_url.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in normalized_url)
+        ):
+            raise ValueError("in_network_urls contains an invalid rate URL")
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("in_network_urls contains an invalid rate URL") from exc
+    if len({_ptg_job_identity({"type": "in_network", "url": url}) for url in urls}) != len(urls):
+        raise ValueError("in_network_urls contains duplicate rate URLs")
+    return list(urls)
 
 
 def _normalize_filter_values(values: list[str] | None) -> list[str]:
