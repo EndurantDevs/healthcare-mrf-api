@@ -118,6 +118,7 @@ from process.ptg_parts.canonical import (
     _canonicalize_for_json,
     canonical_json_dumps,
     canonicalize_url,
+    default_ptg2_import_id,
     hash_prefix,
     normalize_date,
     normalize_import_month,
@@ -443,6 +444,7 @@ from process.ptg_parts.source_files import (
     _maybe_unzip,
 )
 from process.ptg_parts.source_jobs import (
+    validated_in_network_urls,
     _dedupe_preserve,
     _dedupe_ptg_jobs,
     _dedupe_rows_by,
@@ -4677,6 +4679,8 @@ def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, 
     content_option_by_name = {
         key: option_by_name.get(key) for key in _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS
     }
+    if option_by_name.get("in_network_urls"):
+        content_option_by_name["in_network_urls"] = option_by_name["in_network_urls"]
     if isinstance(
         option_by_name.get(FROZEN_RATE_FILE_BINDING_OPTION),
         Mapping,
@@ -7492,6 +7496,7 @@ async def _main_with_artifact_lease(
     toc_urls: list[str] | None = None,
     toc_list: str | None = None,
     in_network_url: str | None = None,
+    in_network_urls: list[str] | None = None,
     allowed_url: str | None = None,
     source_file_import_id: str | None = None,
     frozen_rate_file_set_contract: str | None = None,
@@ -7521,6 +7526,7 @@ async def _main_with_artifact_lease(
     """
     PTG2 entry point for the Transparency in Coverage importer.
     """
+    in_network_urls = validated_in_network_urls(locals())
     import_started_monotonic = _ptg2_monotonic()
     import_month_value = normalize_import_month(import_month)
     source_key_val = _normalize_source_key(
@@ -7612,15 +7618,18 @@ async def _main_with_artifact_lease(
                 arch_variant=shared_storage_generation,
             )
             if normalized_frozen_set_digest is not None
-            else _default_ptg2_import_id(
+            else default_ptg2_import_id(
                 import_month_value,
                 source_key_val,
-                toc_urls=toc_urls,
-                toc_list=toc_list,
-                in_network_url=in_network_url,
-                allowed_url=allowed_url,
-                provider_ref_url=provider_ref_url,
-                arch_variant=shared_storage_generation,
+                {
+                    "toc_urls": toc_urls,
+                    "toc_list": toc_list,
+                    "in_network_url": in_network_url,
+                    "in_network_urls": in_network_urls,
+                    "allowed_url": allowed_url,
+                    "provider_ref_url": provider_ref_url,
+                    "arch_variant": shared_storage_generation,
+                },
             )
         )
     )
@@ -7649,6 +7658,7 @@ async def _main_with_artifact_lease(
         "toc_urls": toc_urls or [],
         "toc_list": toc_list,
         "in_network_url": in_network_url,
+        **({"in_network_urls": in_network_urls} if in_network_urls else {}),
         "allowed_url": allowed_url,
         "source_file_import_id": (
             frozen_binding_by_name.get("source_file_import_id")
@@ -8132,14 +8142,14 @@ async def _main_with_artifact_lease(
                 continue
             jobs.extend(toc_jobs)
 
-        if in_network_url:
+        for direct_in_network_url in in_network_urls or ([in_network_url] if in_network_url else []):
             direct_in_network_plans = _direct_dispatch_plan_info(
                 plan_ids,
                 plan_market_types,
             )
             jobs.append(
                 _direct_in_network_job(
-                    in_network_url,
+                    direct_in_network_url,
                     plan_info=direct_in_network_plans,
                     source_network_names=source_network_name_values,
                     private_intent_sha256=(
@@ -9550,6 +9560,7 @@ async def run_ptg_command(
     toc_urls: list[str] | None = None,
     toc_list: str | None = None,
     in_network_url: str | None = None,
+    in_network_urls: list[str] | None = None,
     allowed_url: str | None = None,
     source_file_import_id: str | None = None,
     frozen_rate_file_set_contract: str | None = None,
@@ -9617,37 +9628,9 @@ def _default_ptg2_import_id(
     provider_ref_url: str | None = None,
     arch_variant: str | None = None,
 ) -> str:
-    month_id = import_month_value.strftime("%Y%m%d")
-    if not source_key_val:
-        return month_id
-    source_inputs_by_name = {
-        "source_key": source_key_val,
-        "toc_urls": toc_urls or [],
-        "toc_list": toc_list or "",
-        "in_network_url": in_network_url or "",
-        "allowed_url": allowed_url or "",
-        "provider_ref_url": provider_ref_url or "",
-        "arch_variant": arch_variant or "",
-    }
-    if not any(
-        source_inputs_by_name[key]
-        for key in (
-            "toc_urls",
-            "toc_list",
-            "in_network_url",
-            "allowed_url",
-            "provider_ref_url",
-        )
-    ):
-        return month_id
-    fingerprint = hash_prefix(
-        semantic_hash(
-            {"import_month": month_id, **source_inputs_by_name},
-            domain="ptg2_import_identity",
-        ),
-        16,
-    )
-    return f"{month_id}_{fingerprint}"
+    """Preserve the legacy scalar selector import identity interface."""
+
+    return default_ptg2_import_id(import_month_value, source_key_val, locals())
 
 
 def _frozen_ptg2_import_id(

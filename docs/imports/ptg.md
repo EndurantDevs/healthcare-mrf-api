@@ -78,6 +78,13 @@ python main.py start ptg \
 is rejected. A direct `--in-network-url <URL>` is supported when the job still
 provides enough metadata to establish one logical plan scope.
 
+For a complete direct set, repeat `--in-network-urls <URL>` for each of 2 to
+100 distinct rate files, with the same explicit plan scope. The control API
+accepts the corresponding `in_network_urls` list. This selector cannot mix with
+TOC, scalar, allowed-amount, provider-reference, or protected file selectors.
+If `--max-files` is supplied, it must equal the list size. Every selected member
+must succeed; a failed member prevents publication of a partial set.
+
 Useful diagnostic options include `--test`, `--max-files`, and `--max-items`.
 They are for bounded fixtures and investigations, not release publication.
 Release evidence must cover the complete selected source without truncation.
