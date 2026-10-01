@@ -12,7 +12,7 @@ import re
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from dateutil.parser import parse as parse_date
@@ -371,3 +371,45 @@ def normalize_import_month(value: str | datetime.date | None) -> datetime.date:
         raise ValueError("import month cannot be blank")
     parsed = datetime.date.fromisoformat(normalized)
     return datetime.date(parsed.year, parsed.month, 1)
+
+
+def default_ptg2_import_id(
+    import_month_value: datetime.date,
+    source_key_val: str | None,
+    source_inputs: Mapping[str, Any],
+) -> str:
+    """Bind an ordinary import identity to its complete source selectors."""
+
+    month_id = import_month_value.strftime("%Y%m%d")
+    if not source_key_val:
+        return month_id
+    source_inputs_by_name = {
+        "source_key": source_key_val,
+        "toc_urls": source_inputs.get("toc_urls") or [],
+        "toc_list": source_inputs.get("toc_list") or "",
+        "in_network_url": source_inputs.get("in_network_url") or "",
+        **({"in_network_urls": source_inputs["in_network_urls"]} if source_inputs.get("in_network_urls") else {}),
+        "allowed_url": source_inputs.get("allowed_url") or "",
+        "provider_ref_url": source_inputs.get("provider_ref_url") or "",
+        "arch_variant": source_inputs.get("arch_variant") or "",
+    }
+    if not any(
+        source_inputs_by_name.get(key)
+        for key in (
+            "toc_urls",
+            "toc_list",
+            "in_network_url",
+            "in_network_urls",
+            "allowed_url",
+            "provider_ref_url",
+        )
+    ):
+        return month_id
+    fingerprint = hash_prefix(
+        semantic_hash(
+            {"import_month": month_id, **source_inputs_by_name},
+            domain="ptg2_import_identity",
+        ),
+        16,
+    )
+    return f"{month_id}_{fingerprint}"

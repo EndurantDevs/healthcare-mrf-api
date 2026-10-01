@@ -1113,6 +1113,7 @@ def npi():
 @click.option("--toc-url", multiple=True, help="URL of a table-of-contents file to seed jobs (repeatable).")
 @click.option("--toc-list", type=click.Path(exists=True), help="Path to file containing TOC URLs (newline or JSON list).")
 @click.option("--in-network-url", help="URL of a single in-network rates file.")
+@click.option("--in-network-urls", multiple=True, help="Complete explicit in-network rate URL set (repeatable; no truncation).")
 @click.option("--allowed-url", help="URL of a single allowed-amounts file.")
 @click.option("--provider-ref-url", help="URL of a provider-reference file.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
@@ -1168,6 +1169,8 @@ def ptg(**options):
         ("plan_market_type", "plan_market_types"),
     ):
         options[target_name] = list(options.pop(source_name))
+    if "in_network_urls" in options:
+        options["in_network_urls"] = list(options["in_network_urls"] or ()) or None
     options["plan_name_contains"] = list(options["plan_name_contains"])
     options["file_url_contains"] = list(options["file_url_contains"])
     _run(initiate_ptg(**options))
