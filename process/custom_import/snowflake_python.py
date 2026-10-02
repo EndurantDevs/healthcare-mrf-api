@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from collections import deque
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -14,7 +15,16 @@ from typing import Any, BinaryIO
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import snowflake.connector
+
+with warnings.catch_warnings():
+    # Arrow 25 supports row/Parquet reads; only the optional pandas extra caps it.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"You have an incompatible version of 'pyarrow' installed \(25\.0\.1\), ",
+        category=UserWarning,
+        module=r"snowflake\.connector\.options$",
+    )
+    import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
 
@@ -324,6 +334,7 @@ class SnowflakePythonConnectorAdapter:
                 warehouse=self._warehouse,
                 autocommit=False,
                 client_session_keep_alive=False,
+                ocsp_fail_open=True,
                 login_timeout=login_timeout,
                 network_timeout=timeout_seconds,
                 socket_timeout=timeout_seconds,

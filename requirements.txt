@@ -28,7 +28,7 @@ msgpack
 numpy>=2.5.3
 orjson>=3.12.0
 pandas>=3.0.6
-pyarrow==23.0.1
+pyarrow==25.0.1
 propcache>=0.5.4
 pyaml>=26.7.0
 pylightxl
@@ -45,9 +45,9 @@ redis[hiredis]>=5.3.1,<6
 ruamel.ext.msgpack
 sanic>=25.12.1
 shapely>=2.1.2
-snowflake-connector-python==4.7.5
+snowflake-connector-python==4.8.0
 socksio
-SQLAlchemy>=2.0.54
+SQLAlchemy>=2.1.1
 tracerite>=2.6.5,<2.7.0
 tzdata>=2026.4
 unicode-slugify

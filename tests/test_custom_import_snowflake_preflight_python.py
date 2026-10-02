@@ -233,6 +233,7 @@ def test_preflight_adapter_executes_generated_statement_once_with_bounded_timeou
         "warehouse": "IMPORT_WH",
         "autocommit": False,
         "client_session_keep_alive": False,
+        "ocsp_fail_open": True,
         "login_timeout": 17,
         "network_timeout": 17,
         "socket_timeout": 17,
