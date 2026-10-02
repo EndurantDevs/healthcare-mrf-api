@@ -181,6 +181,7 @@ def _execution_evidence_row(*, generation: bool = True, current_generation_id: i
         "capture_definition_revision_id": 5,
         "capture_schema_revision_id": 7,
         "capture_manifest_sha256": _DIGEST,
+        "capture_state": "sealed",
         **_execution_evidence_generation_values(generation),
         "current_generation_id": current_generation_id,
         "current_definition_revision_id": 5 if current_generation_id is not None else None,
@@ -250,6 +251,7 @@ def _without_optional_evidence_row():
         "capture_definition_revision_id",
         "capture_schema_revision_id",
         "capture_manifest_sha256",
+        "capture_state",
     ):
         row[field] = None
     return row
@@ -459,6 +461,14 @@ async def test_execution_evidence_distinguishes_absent_optional_binding_and_capt
     assert evidence.source_binding_sha256 is None
     assert evidence.capture_manifest_sha256 is None
     assert evidence.generation is None
+
+
+@pytest.mark.asyncio
+async def test_execution_evidence_rejects_a_pending_capture():
+    row = _execution_evidence_row()
+    row["capture_state"] = "pending"
+    with pytest.raises(OperatorInvariantError):
+        await inspect_execution_evidence(_Session(row), dataset_id=3, execution_id=17)
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from process.custom_import.definition import (
     canonical_json,
     load_json_definition,
 )
+from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import (
     MAX_APPROVED_RELATIONS,
     MAX_SELECTED_COLUMNS,
@@ -34,13 +35,20 @@ from process.custom_import.snowflake_bundle import (
 __all__ = (
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
     "SOURCE_BINDING_CONTRACT",
+    "SOURCE_BINDING_CONTRACTS",
+    "SOURCE_BINDING_V2_CONTRACT",
     "SnowflakeSourceBinding",
     "SnowflakeSourceBindingError",
 )
 
 
 SOURCE_BINDING_CONTRACT = "custom-import/source-binding/v1"
+SOURCE_BINDING_V2_CONTRACT = "custom-import/source-binding/v2"
+SOURCE_BINDING_CONTRACTS = frozenset({SOURCE_BINDING_CONTRACT, SOURCE_BINDING_V2_CONTRACT})
 SNOWFLAKE_SOURCE_BINDING_CONNECTOR = "snowflake_bundle"
+_BINDING_KEYS = frozenset(
+    {"connector", "contract", "definition_sha256", "role", "schema_sha256", "source_object", "streams", "warehouse"}
+)
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$", flags=re.ASCII)
 _FIELD_ID = re.compile(r"^[a-z][a-z0-9_]{0,62}$", flags=re.ASCII)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", flags=re.ASCII)
@@ -160,6 +168,8 @@ class _StreamBinding:
             raise SnowflakeSourceBindingError("source binding stream columns are invalid")
         field_ids = tuple(column.field_id for column in self.columns)
         column_identifiers = tuple(column.column_identifier for column in self.columns)
+        if self.snapshot.relation == self.relation:
+            column_identifiers += (self.snapshot.column_identifier,)
         if len(field_ids) != len(set(field_ids)) or len(column_identifiers) != len(set(column_identifiers)):
             raise SnowflakeSourceBindingError("source binding stream columns are not unique")
         object.__setattr__(self, "stream_id", stream_id)
@@ -198,6 +208,26 @@ def _stream_binding(stream_mapping: object) -> _StreamBinding:
     )
 
 
+def _processing_policy(document: Mapping[str, Any]) -> ProcessingPolicy | None:
+    if document["contract"] == SOURCE_BINDING_CONTRACT:
+        return None
+    try:
+        return ProcessingPolicy.from_mapping(document["processing_policy"])
+    except ValueError as exc:
+        raise SnowflakeSourceBindingError("source binding processing policy is invalid") from exc
+
+
+def _validated_processing_policy(policy: object) -> ProcessingPolicy | None:
+    if policy is None:
+        return None
+    if not isinstance(policy, ProcessingPolicy):
+        raise SnowflakeSourceBindingError("source binding processing policy is invalid")
+    try:
+        return ProcessingPolicy.from_mapping(policy.to_mapping())
+    except ValueError as exc:
+        raise SnowflakeSourceBindingError("source binding processing policy is invalid") from exc
+
+
 @dataclass(frozen=True)
 class SnowflakeSourceBinding:
     """One immutable connector configuration without credentials or executable input."""
@@ -208,6 +238,7 @@ class SnowflakeSourceBinding:
     role: str
     warehouse: str
     streams: tuple[_StreamBinding, ...]
+    processing_policy: ProcessingPolicy | None = None
     canonical: str = field(init=False)
     digest: str = field(init=False)
 
@@ -231,13 +262,20 @@ class SnowflakeSourceBinding:
         object.__setattr__(self, "schema_sha256", schema_sha256)
         object.__setattr__(self, "role", role)
         object.__setattr__(self, "warehouse", warehouse)
+        object.__setattr__(self, "processing_policy", _validated_processing_policy(self.processing_policy))
         canonical = canonical_json(self._document())
         object.__setattr__(self, "canonical", canonical)
         object.__setattr__(
             self,
             "digest",
-            hashlib.sha256(f"{SOURCE_BINDING_CONTRACT}:".encode("ascii") + canonical.encode("utf-8")).hexdigest(),
+            hashlib.sha256(f"{self.contract}:".encode("ascii") + canonical.encode("utf-8")).hexdigest(),
         )
+
+    @property
+    def contract(self) -> str:
+        """Select the version from the validated retained declaration."""
+
+        return SOURCE_BINDING_CONTRACT if self.processing_policy is None else SOURCE_BINDING_V2_CONTRACT
 
     @classmethod
     def from_json(cls, serialized: str | bytes) -> SnowflakeSourceBinding:
@@ -252,23 +290,14 @@ class SnowflakeSourceBinding:
     def from_mapping(cls, mapping: Mapping[str, Any]) -> SnowflakeSourceBinding:
         """Validate one decoded source-binding document."""
 
-        document = _exact_mapping(
-            mapping,
-            frozenset(
-                {
-                    "connector",
-                    "contract",
-                    "definition_sha256",
-                    "role",
-                    "schema_sha256",
-                    "source_object",
-                    "streams",
-                    "warehouse",
-                }
-            ),
-        )
+        if not isinstance(mapping, Mapping):
+            raise SnowflakeSourceBindingError("source binding object shape is invalid")
+        contract = mapping.get("contract")
+        keys = _BINDING_KEYS | {"processing_policy"} if contract == SOURCE_BINDING_V2_CONTRACT else _BINDING_KEYS
+        document = _exact_mapping(mapping, keys)
         if (
-            document["contract"] != SOURCE_BINDING_CONTRACT
+            not isinstance(contract, str)
+            or contract not in SOURCE_BINDING_CONTRACTS
             or document["connector"] != SNOWFLAKE_SOURCE_BINDING_CONNECTOR
         ):
             raise SnowflakeSourceBindingError("source binding contract is unsupported")
@@ -286,12 +315,13 @@ class SnowflakeSourceBinding:
             role=_identifier(document["role"]),
             warehouse=_identifier(document["warehouse"]),
             streams=tuple(_stream_binding(raw_stream) for raw_stream in raw_streams),
+            processing_policy=_processing_policy(document),
         )
 
     def _document(self) -> dict[str, object]:
-        return {
+        document_by_field = {
             "connector": SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
-            "contract": SOURCE_BINDING_CONTRACT,
+            "contract": self.contract,
             "definition_sha256": self.definition_sha256,
             "role": self.role,
             "schema_sha256": self.schema_sha256,
@@ -317,6 +347,9 @@ class SnowflakeSourceBinding:
             ],
             "warehouse": self.warehouse,
         }
+        if self.processing_policy is not None:
+            document_by_field["processing_policy"] = self.processing_policy.to_mapping()
+        return document_by_field
 
     def bundle_components(
         self,
@@ -338,7 +371,9 @@ class SnowflakeSourceBinding:
             for source_stream in definition.source_streams
         )
         try:
-            SnowflakeBundleRequest(definition=definition, bindings=bundle_bindings)
+            SnowflakeBundleRequest(
+                definition=definition, bindings=bundle_bindings, processing_policy=self.processing_policy
+            )
             approved_relations = tuple(
                 SnowflakeApprovedRelation(
                     relation=relation_by_key[key],
@@ -432,9 +467,4 @@ def _register_approved_column(
     existing = columns_by_field.get(column.field_id)
     if existing is not None and existing != column:
         raise SnowflakeSourceBindingError("source binding field mapping is inconsistent")
-    if any(
-        existing_column.column_identifier == column.column_identifier and existing_column.field_id != column.field_id
-        for existing_column in columns_by_field.values()
-    ):
-        raise SnowflakeSourceBindingError("source binding physical column mapping is inconsistent")
     columns_by_field[column.field_id] = column

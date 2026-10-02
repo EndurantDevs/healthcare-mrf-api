@@ -13,6 +13,7 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import Database
 from tests.provider_directory_entities_postgres_support import _database_url
+from tests.reference_family_generation_fixture import generation_shape_check, install_source_generation_guards
 
 TABLES = (
     *snapshot._DOCTORS_TABLES,
@@ -60,13 +61,15 @@ async def create_families(database, schema):
             await database.status(f'INSERT INTO "{schema}".{table}{suffix} VALUES (:marker)', marker=marker)
     await database.status(f'''CREATE TABLE "{schema}".reference_family_result_generation (
         importer_id text PRIMARY KEY, local_lineage_id uuid, local_generation bigint,
-        origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[])''')
+        origin_lineage_id uuid, origin_generation bigint, published_at timestamptz, relation_oids bigint[],
+        CONSTRAINT reference_family_result_generation_shape_check CHECK ({generation_shape_check()}))''')
     await database.status(
         f'''INSERT INTO "{schema}".reference_family_result_generation
         (importer_id,local_lineage_id,local_generation) VALUES ('cms-doctors',:lineage,0)''',
         lineage=uuid4(),
     )
     async with database.transaction() as session:
+        await install_source_generation_guards(await session.connection(), schema)
         await snapshot.reference_generation.publish_local_reference_family_generation(
             session,
             importer_id="cms-doctors",

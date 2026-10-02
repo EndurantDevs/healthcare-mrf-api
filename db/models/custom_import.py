@@ -37,9 +37,16 @@ from db.connection import Base
 from db.json_mixin import JSONOutputMixin
 
 __all__ = (
+    "CustomImportBuildAttempt",
+    "CustomImportBuildStream",
+    "CustomImportBuildOccurrence",
+    "CustomImportBuildFamily",
+    "CustomImportBuildCandidateContext",
+    "CustomImportBuildVerification",
     "CustomImportCapture",
     "CustomImportCaptureBundle",
     "CustomImportCaptureParquetPart",
+    "CustomImportCaptureUsage",
     "CustomImportChildCollection",
     "CustomImportChildRevision",
     "CustomImportChildScalar",
@@ -102,6 +109,10 @@ def _timestamp_column():
 
 def _sha256_check(column: str) -> str:
     return f"octet_length({column}) = 32"
+
+
+def _capture_counter(name: str):
+    return Column(BigInteger, CheckConstraint(f"{name} >= 0"), nullable=False, server_default=text("0"))
 
 
 def _scalar_check(name: str, *, root: bool = False) -> CheckConstraint:
@@ -528,7 +539,7 @@ class CustomImportSourceBindingRevision(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "binding_contract = 'custom-import/source-binding/v1' AND "
+            "binding_contract IN ('custom-import/source-binding/v1', 'custom-import/source-binding/v2') AND "
             "connector_kind = 'snowflake_bundle' AND revision_number > 0 AND "
             + _sha256_check("definition_sha256")
             + " AND "
@@ -805,7 +816,7 @@ class CustomImportLease(_CustomImportModel):
 
 
 class CustomImportCaptureBundle(_CustomImportModel):
-    """Sealed common source snapshot for every stream in one candidate."""
+    """Legacy sealed snapshot or a fenced segmented capture in progress."""
 
     __tablename__ = "custom_import_capture_bundle"
     __main_table__ = __tablename__
@@ -842,6 +853,40 @@ class CustomImportCaptureBundle(_CustomImportModel):
             "schema_revision_id",
             "snapshot_token_sha256",
         ),
+        UniqueConstraint("producing_execution_id", "producing_fence", name="custom_import_capture_bundle_attempt_key"),
+        ForeignKeyConstraint(
+            ["producing_execution_id", "dataset_id", "definition_revision_id", "schema_revision_id"],
+            [
+                _reference("custom_import_execution", column)
+                for column in ("execution_id", "dataset_id", "definition_revision_id", "schema_revision_id")
+            ],
+            name="custom_import_capture_bundle_producer_fkey",
+        ),
+        CheckConstraint(
+            "(capture_state = 'pending' AND canonical_manifest IS NULL AND manifest_sha256 IS NULL AND sealed_at IS NULL) OR "
+            "(capture_state = 'sealed' AND canonical_manifest IS NOT NULL AND manifest_sha256 IS NOT NULL AND sealed_at IS NOT NULL)",
+            name="custom_import_capture_bundle_final_shape_check",
+        ),
+        CheckConstraint(
+            "(payload_contract IS NULL AND capture_state = 'sealed' AND producing_execution_id IS NULL AND "
+            "producing_fence IS NULL AND producing_token_sha256 IS NULL AND request_identity_sha256 IS NULL AND "
+            "source_binding_revision_id IS NULL AND source_binding_sha256 IS NULL AND source_request_sha256 IS NULL AND "
+            "statement_sha256 IS NULL AND canonical_policy IS NULL AND policy_sha256 IS NULL AND "
+            "acquisition_started_at IS NULL AND acquisition_deadline_at IS NULL) OR "
+            "(payload_contract IS NOT NULL AND payload_contract = 'custom-import/parquet-parts/v2' AND capture_state IN ('pending','sealed') AND "
+            "producing_execution_id IS NOT NULL AND producing_fence IS NOT NULL AND producing_fence > 0 AND "
+            "producing_token_sha256 IS NOT NULL AND octet_length(producing_token_sha256) = 32 AND "
+            "request_identity_sha256 IS NOT NULL AND octet_length(request_identity_sha256) = 32 AND "
+            "source_request_sha256 IS NOT NULL AND octet_length(source_request_sha256) = 32 AND "
+            "statement_sha256 IS NOT NULL AND octet_length(statement_sha256) = 32 AND "
+            "policy_sha256 IS NOT NULL AND octet_length(policy_sha256) = 32 AND "
+            "canonical_policy IS NOT NULL AND octet_length(canonical_policy) BETWEEN 2 AND 16384 AND "
+            "acquisition_started_at IS NOT NULL AND acquisition_deadline_at IS NOT NULL AND "
+            "acquisition_deadline_at > acquisition_started_at AND "
+            "((source_binding_revision_id IS NULL AND source_binding_sha256 IS NULL) OR "
+            "(source_binding_revision_id IS NOT NULL AND source_binding_sha256 IS NOT NULL AND octet_length(source_binding_sha256) = 32)))",
+            name="custom_import_capture_bundle_lifecycle_check",
+        ),
     )
 
     capture_bundle_id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -850,14 +895,34 @@ class CustomImportCaptureBundle(_CustomImportModel):
     schema_revision_id = Column(BigInteger, nullable=False)
     snapshot_token = Column(Text, nullable=False)
     snapshot_token_sha256 = Column(LargeBinary(32), nullable=False)
-    canonical_manifest = Column(Text, nullable=False)
-    manifest_sha256 = Column(LargeBinary(32), nullable=False)
+    canonical_manifest = Column(Text)
+    manifest_sha256 = Column(LargeBinary(32))
     stream_count = Column(SmallInteger, nullable=False)
-    sealed_at = _timestamp_column()
+    sealed_at = Column(TIMESTAMP(timezone=True), server_default=text("transaction_timestamp()"))
+    payload_contract = Column(String(63))
+    capture_state = Column(String(16), nullable=False, server_default=text("'sealed'"))
+    producing_execution_id = Column(BigInteger)
+    producing_fence = Column(BigInteger)
+    producing_token_sha256 = Column(LargeBinary(32))
+    request_identity_sha256 = Column(LargeBinary(32))
+    source_binding_revision_id = Column(BigInteger)
+    source_binding_sha256 = Column(LargeBinary(32))
+    source_request_sha256 = Column(LargeBinary(32))
+    statement_sha256 = Column(LargeBinary(32))
+    canonical_policy = Column(Text)
+    policy_sha256 = Column(LargeBinary(32))
+    acquisition_started_at = Column(TIMESTAMP(timezone=True))
+    acquisition_deadline_at = Column(TIMESTAMP(timezone=True))
+    committed_part_count = _capture_counter("committed_part_count")
+    committed_byte_count = _capture_counter("committed_byte_count")
+    committed_decoded_byte_count = _capture_counter("committed_decoded_byte_count")
+    committed_arrow_byte_count = _capture_counter("committed_arrow_byte_count")
+    committed_record_count = _capture_counter("committed_record_count")
+    committed_manifest_byte_count = _capture_counter("committed_manifest_byte_count")
 
 
 class CustomImportCapture(_CustomImportModel):
-    """One immutable stream capture belonging to a sealed capture bundle."""
+    """One stream header, immutable after its capture is sealed."""
 
     __tablename__ = "custom_import_capture"
     __main_table__ = __tablename__
@@ -906,13 +971,25 @@ class CustomImportCapture(_CustomImportModel):
             name="custom_import_capture_shape_check",
         ),
         CheckConstraint(
-            "(payload_contract IS NULL AND payload_part_count IS NULL AND payload_set_sha256 IS NULL) OR "
+            "(payload_contract IS NULL AND payload_part_count IS NULL AND payload_set_sha256 IS NULL "
+            "AND capture_state = 'sealed' AND eof_at IS NULL AND manifest_set_sha256 IS NULL) OR "
             "(payload_contract IS NOT NULL AND payload_contract = 'custom-import/parquet-parts/v1' AND "
+            "capture_state = 'sealed' AND eof_at IS NULL AND manifest_set_sha256 IS NULL AND "
             "byte_count BETWEEN 1 AND 67108864 AND payload_part_count IS NOT NULL AND "
             "payload_part_count BETWEEN 1 AND 4096 AND payload_set_sha256 IS NOT NULL AND "
             + _sha256_check("payload_set_sha256")
-            + ")",
+            + ") OR (payload_contract IS NOT NULL AND payload_contract = 'custom-import/parquet-parts/v2' AND "
+            "((capture_state = 'pending' AND payload_part_count IS NULL AND payload_set_sha256 IS NULL AND manifest_set_sha256 IS NULL) OR "
+            "(capture_state = 'sealed' AND payload_part_count BETWEEN 1 AND 131072 AND payload_part_count IS NOT NULL AND "
+            "payload_set_sha256 IS NOT NULL AND octet_length(payload_set_sha256) = 32 AND "
+            "manifest_set_sha256 IS NOT NULL AND octet_length(manifest_set_sha256) = 32 AND eof_at IS NOT NULL)))",
             name="custom_import_capture_payload_shape_check",
+        ),
+        CheckConstraint(
+            "(capture_state = 'pending' AND content_sha256 IS NULL AND byte_count IS NULL AND canonical_manifest IS NULL "
+            "AND manifest_sha256 IS NULL AND sealed_at IS NULL) OR (capture_state = 'sealed' AND content_sha256 IS NOT NULL "
+            "AND byte_count IS NOT NULL AND canonical_manifest IS NOT NULL AND manifest_sha256 IS NOT NULL AND sealed_at IS NOT NULL)",
+            name="custom_import_capture_stream_final_shape_check",
         ),
     )
 
@@ -921,14 +998,23 @@ class CustomImportCapture(_CustomImportModel):
     definition_revision_id = Column(BigInteger, nullable=False)
     schema_revision_id = Column(BigInteger, nullable=False)
     stream_slot = Column(SmallInteger, primary_key=True)
-    content_sha256 = Column(LargeBinary(32), nullable=False)
-    byte_count = Column(BigInteger, nullable=False)
-    canonical_manifest = Column(Text, nullable=False)
-    manifest_sha256 = Column(LargeBinary(32), nullable=False)
+    content_sha256 = Column(LargeBinary(32))
+    byte_count = Column(BigInteger)
+    canonical_manifest = Column(Text)
+    manifest_sha256 = Column(LargeBinary(32))
     payload_contract = Column(String(63))
     payload_part_count = Column(Integer)
     payload_set_sha256 = Column(LargeBinary(32))
-    sealed_at = _timestamp_column()
+    sealed_at = Column(TIMESTAMP(timezone=True), server_default=text("transaction_timestamp()"))
+    capture_state = Column(String(16), nullable=False, server_default=text("'sealed'"))
+    eof_at = Column(TIMESTAMP(timezone=True))
+    manifest_set_sha256 = Column(LargeBinary(32))
+    committed_part_count = _capture_counter("committed_part_count")
+    committed_byte_count = _capture_counter("committed_byte_count")
+    committed_decoded_byte_count = _capture_counter("committed_decoded_byte_count")
+    committed_arrow_byte_count = _capture_counter("committed_arrow_byte_count")
+    committed_record_count = _capture_counter("committed_record_count")
+    committed_manifest_byte_count = _capture_counter("committed_manifest_byte_count")
 
 
 class CustomImportCaptureParquetPart(_CustomImportModel):
@@ -953,11 +1039,22 @@ class CustomImportCaptureParquetPart(_CustomImportModel):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "part_ordinal BETWEEN 1 AND 4096 AND byte_count BETWEEN 1 AND 67108864 AND "
+            "part_ordinal BETWEEN 1 AND 131072 AND byte_count BETWEEN 1 AND 67108864 AND "
             "octet_length(payload) = byte_count AND "
             + _sha256_check("payload_sha256")
             + " AND payload_sha256 = pg_catalog.sha256(payload)",
             name="custom_import_capture_parquet_part_shape_check",
+        ),
+        CheckConstraint(
+            "(canonical_capture_manifest IS NULL AND capture_manifest_sha256 IS NULL AND decoded_byte_count IS NULL "
+            "AND arrow_byte_count IS NULL AND record_count IS NULL) OR "
+            "(canonical_capture_manifest IS NOT NULL AND capture_manifest_sha256 IS NOT NULL AND "
+            "octet_length(canonical_capture_manifest) BETWEEN 2 AND 2097152 AND "
+            "capture_manifest_sha256 = pg_catalog.sha256(convert_to(canonical_capture_manifest, 'UTF8')) AND "
+            "decoded_byte_count IS NOT NULL AND decoded_byte_count BETWEEN 1 AND 268435456 AND "
+            "arrow_byte_count IS NOT NULL AND arrow_byte_count BETWEEN 0 AND 268435456 AND "
+            "record_count IS NOT NULL AND record_count BETWEEN 0 AND 1000000)",
+            name="custom_import_capture_parquet_manifest_shape_check",
         ),
     )
 
@@ -968,6 +1065,21 @@ class CustomImportCaptureParquetPart(_CustomImportModel):
     payload = Column(LargeBinary, nullable=False)
     payload_sha256 = Column(LargeBinary(32), nullable=False)
     sealed_at = _timestamp_column()
+    canonical_capture_manifest = Column(Text)
+    capture_manifest_sha256 = Column(LargeBinary(32))
+    decoded_byte_count = Column(BigInteger)
+    arrow_byte_count = Column(BigInteger)
+    record_count = Column(BigInteger)
+
+
+class CustomImportCaptureUsage(_CustomImportModel):
+    """Logical retained payload and per-part manifest bytes, including abandoned captures."""
+
+    __tablename__ = "custom_import_capture_usage"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(CheckConstraint("retained_bytes >= 0", name="custom_import_capture_usage_shape_check"))
+    dataset_id = Column(BigInteger, ForeignKey(_reference("custom_import_dataset", "dataset_id")), primary_key=True)
+    retained_bytes = Column(BigInteger, nullable=False)
 
 
 class CustomImportPack(_CustomImportModel):
@@ -2252,3 +2364,439 @@ Index(
     unique=True,
     postgresql_where=text("finality_contract = 'custom-import-finality/v1' AND event_kind = 'no_change'"),
 )
+
+
+class CustomImportBuildAttempt(_CustomImportModel):
+    """One fenced, monotonically frozen bounded family build."""
+
+    __tablename__ = "custom_import_build_attempt"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        UniqueConstraint("execution_id", "producing_fence", name="custom_import_build_attempt_key"),
+        UniqueConstraint("generation_id", name="custom_import_build_generation_key"),
+        ForeignKeyConstraint(
+            ["execution_id", "dataset_id", "definition_revision_id", "schema_revision_id", "capture_bundle_id"],
+            [
+                _reference("custom_import_execution", key)
+                for key in (
+                    "execution_id",
+                    "dataset_id",
+                    "definition_revision_id",
+                    "schema_revision_id",
+                    "capture_bundle_id",
+                )
+            ],
+            ondelete="RESTRICT",
+            name="custom_import_build_execution_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["base_generation_id", "dataset_id"],
+            [
+                _reference("custom_import_generation", "generation_id"),
+                _reference("custom_import_generation", "dataset_id"),
+            ],
+            ondelete="RESTRICT",
+            name="custom_import_build_base_fkey",
+        ),
+        CheckConstraint(
+            "build_contract = 'custom-import/build/v1' AND producing_fence > 0 AND "
+            "octet_length(producing_token_sha256) = 32 AND "
+            "(request_identity_sha256 IS NULL OR octet_length(request_identity_sha256) = 32) AND "
+            "refresh_mode IN ('upsert','snapshot') AND page_row_limit BETWEEN 1 AND 256 AND "
+            "page_byte_limit BETWEEN 1 AND 268435456 AND statement_timeout_ms > 0 AND "
+            "((base_generation_id IS NULL AND base_pointer_version = 0) OR "
+            "(base_generation_id IS NOT NULL AND base_pointer_version > 0)) AND "
+            "plan_stage IN ('base','source','complete')",
+            name="custom_import_build_attempt_shape",
+        ),
+        CheckConstraint(
+            "((phase = 'source' AND source_frozen_at IS NULL AND graph_frozen_at IS NULL "
+            "AND output_frozen_at IS NULL AND generation_id IS NULL AND verified_at IS NULL) OR "
+            "(phase IN ('admission','graph','rejected') AND source_frozen_at IS NOT NULL "
+            "AND graph_frozen_at IS NULL AND output_frozen_at IS NULL AND generation_id IS NULL "
+            "AND verified_at IS NULL) OR "
+            "(phase = 'output' AND source_frozen_at IS NOT NULL AND graph_frozen_at IS NOT NULL "
+            "AND output_frozen_at IS NULL AND generation_id IS NOT NULL AND verified_at IS NULL) OR "
+            "(phase IN ('verifying','verified') AND source_frozen_at IS NOT NULL AND graph_frozen_at IS NOT NULL "
+            "AND output_frozen_at IS NOT NULL AND generation_id IS NOT NULL "
+            "AND ((phase = 'verifying' AND verified_at IS NULL) OR (phase = 'verified' AND verified_at IS NOT NULL))))",
+            name="custom_import_build_attempt_phase",
+        ),
+        CheckConstraint(
+            "(output_after_profile_slot IS NULL AND output_after_entity_binding_id IS NULL "
+            "AND output_after_context_key_sha256 IS NULL) OR "
+            "(output_after_profile_slot IS NOT NULL AND output_after_entity_binding_id IS NOT NULL "
+            "AND output_after_context_key_sha256 IS NOT NULL AND octet_length(output_after_context_key_sha256) = 32)",
+            name="custom_import_build_output_cursor",
+        ),
+        Index("custom_import_build_definition_idx", "definition_revision_id"),
+        Index("custom_import_build_schema_idx", "schema_revision_id"),
+    )
+
+    build_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    build_contract = Column(String(63), nullable=False, server_default=text("'custom-import/build/v1'"))
+    dataset_id = Column(BigInteger, nullable=False)
+    definition_revision_id = Column(BigInteger, nullable=False)
+    schema_revision_id = Column(BigInteger, nullable=False)
+    execution_id = Column(BigInteger, nullable=False)
+    capture_bundle_id = Column(BigInteger, nullable=False)
+    producing_fence = Column(BigInteger, nullable=False)
+    producing_token_sha256 = Column(LargeBinary(32), nullable=False)
+    request_identity_sha256 = Column(LargeBinary(32))
+    base_generation_id = Column(BigInteger)
+    base_pointer_version = Column(BigInteger, nullable=False)
+    refresh_mode = Column(String(16), nullable=False)
+    complete_scope = Column(Boolean, nullable=False)
+    phase = Column(String(16), nullable=False, server_default=text("'source'"))
+    generation_id = Column(BigInteger, ForeignKey(_reference("custom_import_generation", "generation_id")))
+    page_row_limit = Column(Integer, nullable=False)
+    page_byte_limit = Column(BigInteger, nullable=False)
+    statement_timeout_ms = Column(Integer, nullable=False)
+    build_deadline_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    admission_after_occurrence_id = _capture_counter("admission_after_occurrence_id")
+    plan_stage = Column(String(8), nullable=False, server_default=text("'base'"))
+    plan_page_sequence = _capture_counter("plan_page_sequence")
+    plan_after_base_root_record_id = _capture_counter("plan_after_base_root_record_id")
+    plan_after_source_root_record_id = _capture_counter("plan_after_source_root_record_id")
+    plan_complete_at = Column(TIMESTAMP(timezone=True))
+    output_after_profile_slot = Column(SmallInteger)
+    output_after_entity_binding_id = Column(BigInteger)
+    output_after_context_key_sha256 = Column(LargeBinary(32))
+    source_occurrence_count = _capture_counter("source_occurrence_count")
+    candidate_error_count = _capture_counter("candidate_error_count")
+    selected_family_count = _capture_counter("selected_family_count")
+    completed_family_count = _capture_counter("completed_family_count")
+    candidate_context_count = _capture_counter("candidate_context_count")
+    generation_family_count = _capture_counter("generation_family_count")
+    winner_count = _capture_counter("winner_count")
+    next_rejection_ordinal = _capture_counter("next_rejection_ordinal")
+    source_frozen_at = Column(TIMESTAMP(timezone=True))
+    graph_frozen_at = Column(TIMESTAMP(timezone=True))
+    output_frozen_at = Column(TIMESTAMP(timezone=True))
+    verified_at = Column(TIMESTAMP(timezone=True))
+    created_at = _timestamp_column()
+
+
+class CustomImportBuildStream(_CustomImportModel):
+    """Protected source replay cursor and current-attempt pack allocator."""
+
+    __tablename__ = "custom_import_build_stream"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        CheckConstraint(
+            "stream_slot > 0 AND next_part_ordinal > 0 AND next_part_row_ordinal >= 0 AND "
+            "next_source_ordinal >= 0 AND next_pack_ordinal >= 0",
+            name="custom_import_build_stream_shape",
+        )
+    )
+
+    build_id = Column(BigInteger, ForeignKey(_reference("custom_import_build_attempt", "build_id")), primary_key=True)
+    stream_slot = Column(SmallInteger, primary_key=True)
+    next_part_ordinal = Column(Integer, nullable=False, server_default=text("1"))
+    next_part_row_ordinal = _capture_counter("next_part_row_ordinal")
+    next_source_ordinal = _capture_counter("next_source_ordinal")
+    next_pack_ordinal = Column(Integer, nullable=False, server_default=text("0"))
+    replay_verified_at = Column(TIMESTAMP(timezone=True))
+
+
+class CustomImportBuildOccurrence(_CustomImportModel):
+    """Position/equality evidence referring to existing revisions or rejections."""
+
+    __tablename__ = "custom_import_build_occurrence"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        ForeignKeyConstraint(
+            ["build_id", "stream_slot"],
+            [
+                _reference("custom_import_build_stream", "build_id"),
+                _reference("custom_import_build_stream", "stream_slot"),
+            ],
+            name="custom_import_build_occurrence_stream_fkey",
+        ),
+        CheckConstraint(
+            "((origin = 'source' AND source_part_ordinal IS NOT NULL AND source_part_ordinal > 0 "
+            "AND part_row_ordinal IS NOT NULL AND part_row_ordinal >= 0 AND source_ordinal IS NOT NULL "
+            "AND source_ordinal >= 0 AND base_family_revision_id IS NULL AND base_root_revision_id IS NULL "
+            "AND base_child_revision_id IS NULL) OR "
+            "(origin = 'retained' AND source_part_ordinal IS NULL AND part_row_ordinal IS NULL "
+            "AND source_ordinal IS NULL AND base_family_revision_id IS NOT NULL "
+            "AND num_nonnulls(base_root_revision_id,base_child_revision_id) = 1 "
+            "AND raw_parent_key_canonical IS NULL AND raw_parent_key_sha256 IS NULL "
+            "AND rejection_id IS NULL AND resolved_rejection_id IS NULL)) AND "
+            "((record_kind = 'root' AND collection_slot = 0 AND child_revision_id IS NULL "
+            "AND child_key_sha256 IS NULL AND base_child_revision_id IS NULL) OR "
+            "(record_kind = 'child' AND collection_slot > 0 AND root_revision_id IS NULL "
+            "AND base_root_revision_id IS NULL)) AND "
+            "num_nonnulls(root_revision_id,child_revision_id,rejection_id) = 1 AND "
+            "((raw_parent_key_canonical IS NULL AND raw_parent_key_sha256 IS NULL) OR "
+            "(raw_parent_key_canonical IS NOT NULL AND raw_parent_key_sha256 IS NOT NULL "
+            "AND octet_length(raw_parent_key_sha256) = 32)) AND "
+            "((child_revision_id IS NULL AND child_key_sha256 IS NULL) OR "
+            "(child_revision_id IS NOT NULL AND child_key_sha256 IS NOT NULL AND octet_length(child_key_sha256) = 32))",
+            name="custom_import_build_occurrence_shape",
+        ),
+        Index(
+            "custom_import_build_source_position_key",
+            "build_id",
+            "stream_slot",
+            "source_part_ordinal",
+            "part_row_ordinal",
+            unique=True,
+            postgresql_where=text("origin = 'source'"),
+        ),
+        Index(
+            "custom_import_build_source_ordinal_key",
+            "build_id",
+            "stream_slot",
+            "source_ordinal",
+            unique=True,
+            postgresql_where=text("origin = 'source'"),
+        ),
+        Index(
+            "custom_import_build_copy_root_key",
+            "build_id",
+            "base_family_revision_id",
+            unique=True,
+            postgresql_where=text("base_root_revision_id IS NOT NULL"),
+        ),
+        Index(
+            "custom_import_build_copy_child_key",
+            "build_id",
+            "base_family_revision_id",
+            "base_child_revision_id",
+            unique=True,
+            postgresql_where=text("base_child_revision_id IS NOT NULL"),
+        ),
+        Index(
+            "custom_import_build_raw_parent_idx", "build_id", "record_kind", "raw_parent_key_sha256", "occurrence_id"
+        ),
+        Index(
+            "custom_import_build_typed_root_idx", "build_id", "origin", "record_kind", "root_record_id", "occurrence_id"
+        ),
+        Index(
+            "custom_import_build_source_child_idx",
+            "build_id",
+            "raw_parent_key_sha256",
+            "collection_slot",
+            "child_key_sha256",
+            "occurrence_id",
+            postgresql_where=text("origin = 'source'"),
+        ),
+        Index(
+            "custom_import_build_graph_child_idx",
+            "build_id",
+            "origin",
+            "root_record_id",
+            "collection_slot",
+            "child_key_sha256",
+            "child_revision_id",
+            postgresql_where=text("child_revision_id IS NOT NULL"),
+        ),
+        Index("custom_import_build_occurrence_pack_idx", "pack_id", "occurrence_id"),
+        Index("custom_import_build_occurrence_page_idx", "build_id", "origin", "occurrence_id"),
+    )
+
+    occurrence_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    build_id = Column(BigInteger, nullable=False)
+    stream_slot = Column(SmallInteger, nullable=False)
+    pack_id = Column(BigInteger, ForeignKey(_reference("custom_import_pack", "pack_id")), nullable=False)
+    origin = Column(String(8), nullable=False)
+    source_part_ordinal = Column(Integer)
+    part_row_ordinal = Column(BigInteger)
+    source_ordinal = Column(BigInteger)
+    base_family_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_family_revision", "family_revision_id"))
+    )
+    base_root_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_root_revision", "root_revision_id"))
+    )
+    base_child_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_child_revision", "child_revision_id"))
+    )
+    record_kind = Column(String(8), nullable=False)
+    collection_slot = Column(SmallInteger, nullable=False)
+    raw_parent_key_canonical = Column(Text)
+    raw_parent_key_sha256 = Column(LargeBinary(32))
+    root_record_id = Column(BigInteger, ForeignKey(_reference("custom_import_root_record", "root_record_id")))
+    child_key_sha256 = Column(LargeBinary(32))
+    root_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_root_revision", "root_revision_id")), unique=True
+    )
+    child_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_child_revision", "child_revision_id")), unique=True
+    )
+    rejection_id = Column(BigInteger, ForeignKey(_reference("custom_import_rejection", "rejection_id")))
+    resolved_rejection_id = Column(BigInteger, ForeignKey(_reference("custom_import_rejection", "rejection_id")))
+
+
+class CustomImportBuildFamily(_CustomImportModel):
+    """SQL-selected source or retained family and its bounded build cursor."""
+
+    __tablename__ = "custom_import_build_family"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        UniqueConstraint("build_id", "family_revision_id", name="custom_import_build_family_output_key"),
+        CheckConstraint(
+            "((selection_kind = 'source' AND source_root_occurrence_id IS NOT NULL AND base_family_revision_id IS NULL) "
+            "OR (selection_kind = 'retained' AND source_root_occurrence_id IS NULL AND base_family_revision_id IS NOT NULL)) "
+            "AND (complete_at IS NULL OR family_revision_id IS NOT NULL) AND "
+            "((last_child_collection_slot IS NULL AND last_child_key_sha256 IS NULL AND last_input_child_revision_id IS NULL) "
+            "OR (last_child_collection_slot IS NOT NULL AND last_input_child_revision_id IS NOT NULL AND "
+            "((selection_kind = 'source' AND last_child_key_sha256 IS NOT NULL AND octet_length(last_child_key_sha256)=32) "
+            "OR (selection_kind = 'retained' AND last_child_key_sha256 IS NULL))))",
+            name="custom_import_build_family_shape",
+        ),
+        Index(
+            "custom_import_build_family_pending_idx",
+            "build_id",
+            "root_record_id",
+            postgresql_where=text("complete_at IS NULL"),
+        ),
+        Index("custom_import_build_family_hash_idx", "build_id", "root_key_sha256", "root_record_id"),
+        CheckConstraint("octet_length(root_key_sha256) = 32", name="custom_import_build_family_hash_shape"),
+    )
+
+    build_id = Column(BigInteger, ForeignKey(_reference("custom_import_build_attempt", "build_id")), primary_key=True)
+    root_record_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_root_record", "root_record_id")), primary_key=True
+    )
+    root_key_sha256 = Column(LargeBinary(32), nullable=False)
+    selection_kind = Column(String(8), nullable=False)
+    source_root_occurrence_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_build_occurrence", "occurrence_id"))
+    )
+    base_family_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_family_revision", "family_revision_id"))
+    )
+    family_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_family_revision", "family_revision_id"))
+    )
+    last_child_collection_slot = Column(SmallInteger)
+    last_child_key_sha256 = Column(LargeBinary(32))
+    last_input_child_revision_id = Column(BigInteger)
+    attached_child_count = _capture_counter("attached_child_count")
+    complete_at = Column(TIMESTAMP(timezone=True))
+
+
+class CustomImportBuildCandidateContext(_CustomImportModel):
+    """All immutable selection candidates, including eventual losers."""
+
+    __tablename__ = "custom_import_build_candidate_context"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        ForeignKeyConstraint(
+            ["build_id", "family_revision_id"],
+            [
+                _reference("custom_import_build_family", "build_id"),
+                _reference("custom_import_build_family", "family_revision_id"),
+            ],
+            name="custom_import_build_context_family_fkey",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        UniqueConstraint(
+            "build_id",
+            "profile_slot",
+            "family_revision_id",
+            "context_child_revision_id",
+            name="custom_import_build_context_candidate_key",
+            postgresql_nulls_not_distinct=True,
+        ),
+        CheckConstraint(
+            "profile_slot > 0 AND octet_length(canonical_context_key) BETWEEN 1 AND 8192 AND "
+            "octet_length(context_key_sha256) = 32 AND "
+            "((context_collection_slot = 0 AND context_child_revision_id IS NULL) OR "
+            "(context_collection_slot > 0 AND context_child_revision_id IS NOT NULL))",
+            name="custom_import_build_context_shape",
+        ),
+        Index(
+            "custom_import_build_context_order_idx",
+            "build_id",
+            "profile_slot",
+            "entity_binding_id",
+            "context_key_sha256",
+            "candidate_context_id",
+        ),
+    )
+
+    candidate_context_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    build_id = Column(BigInteger, nullable=False)
+    profile_slot = Column(SmallInteger, nullable=False)
+    entity_binding_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_entity_binding", "entity_binding_id")), nullable=False
+    )
+    family_revision_id = Column(BigInteger, nullable=False)
+    context_collection_slot = Column(SmallInteger, nullable=False)
+    context_child_revision_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_child_revision", "child_revision_id"))
+    )
+    canonical_context_key = Column(Text, nullable=False)
+    context_key_sha256 = Column(LargeBinary(32), nullable=False)
+
+
+class CustomImportBuildVerification(_CustomImportModel):
+    """SQL-derived structural scan progress; immutable when complete."""
+
+    __tablename__ = "custom_import_build_verification"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        CheckConstraint(
+            "verification_contract = 'custom-import/build-structure/v1' AND "
+            "((verification_state = 'scanning' AND scan_stage IN "
+            "('capture','profiles','families','root_scalars','child_scalars','winners') AND verified_at IS NULL) OR "
+            "(verification_state = 'complete' AND scan_stage = 'complete' AND verified_at IS NOT NULL)) AND "
+            "((current_family_revision_id IS NULL AND current_family_expected_child_count IS NULL "
+            "AND current_family_seen_child_count IS NULL) OR "
+            "(current_family_revision_id IS NOT NULL AND current_family_expected_child_count IS NOT NULL "
+            "AND current_family_seen_child_count IS NOT NULL AND current_family_expected_child_count >= 0 "
+            "AND current_family_seen_child_count >= 0))",
+            name="custom_import_build_verification_shape",
+        ),
+        CheckConstraint(
+            "num_nonnulls(after_child_collection_slot,after_child_revision_id) IN (0,2) AND "
+            "num_nonnulls(after_root_scalar_revision_id,after_root_scalar_field_slot) IN (0,2) AND "
+            "num_nonnulls(after_child_scalar_revision_id,after_child_scalar_field_slot) IN (0,2) AND "
+            "(num_nonnulls(after_winner_profile_slot,after_winner_entity_binding_id,after_winner_context_key_sha256)=0 OR "
+            "(num_nonnulls(after_winner_profile_slot,after_winner_entity_binding_id,after_winner_context_key_sha256)=3 "
+            "AND octet_length(after_winner_context_key_sha256)=32))",
+            name="custom_import_build_verification_cursors",
+        ),
+    )
+
+    build_id = Column(BigInteger, ForeignKey(_reference("custom_import_build_attempt", "build_id")), primary_key=True)
+    generation_id = Column(
+        BigInteger, ForeignKey(_reference("custom_import_generation", "generation_id")), nullable=False, unique=True
+    )
+    verification_contract = Column(
+        String(63), nullable=False, server_default=text("'custom-import/build-structure/v1'")
+    )
+    verification_state = Column(String(16), nullable=False, server_default=text("'scanning'"))
+    scan_stage = Column(String(16), nullable=False, server_default=text("'capture'"))
+    page_sequence = _capture_counter("page_sequence")
+    after_capture_stream_slot = Column(SmallInteger)
+    after_profile_slot = Column(SmallInteger)
+    after_root_record_id = Column(BigInteger)
+    current_family_revision_id = Column(BigInteger)
+    current_family_expected_child_count = Column(BigInteger)
+    current_family_seen_child_count = Column(BigInteger)
+    after_child_collection_slot = Column(SmallInteger)
+    after_child_revision_id = Column(BigInteger)
+    after_root_scalar_revision_id = Column(BigInteger)
+    after_root_scalar_field_slot = Column(SmallInteger)
+    after_child_scalar_revision_id = Column(BigInteger)
+    after_child_scalar_field_slot = Column(SmallInteger)
+    after_winner_profile_slot = Column(SmallInteger)
+    after_winner_entity_binding_id = Column(BigInteger)
+    after_winner_context_key_sha256 = Column(LargeBinary(32))
+    root_count = _capture_counter("root_count")
+    family_count = _capture_counter("family_count")
+    generation_family_count = _capture_counter("generation_family_count")
+    family_child_count = _capture_counter("family_child_count")
+    winner_count = _capture_counter("winner_count")
+    profile_count = _capture_counter("profile_count")
+    root_scalar_count = _capture_counter("root_scalar_count")
+    child_scalar_count = _capture_counter("child_scalar_count")
+    source_frozen_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    graph_frozen_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    output_frozen_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    verified_at = Column(TIMESTAMP(timezone=True))

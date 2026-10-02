@@ -24,6 +24,7 @@ from process.custom_import.publication import activate_generation, record_no_cha
 from tests import test_custom_import_snowflake_operator_cli as registration_cli_tests
 from tests.custom_import_postgres_support import (
     digest,
+    install_segmented_capture_migration,
     isolated_publication_case,
     lease_digest,
     seed_publication_graph,
@@ -250,6 +251,7 @@ async def _seed_legacy_current_generation(case):
             generation_id,
         )
         await connection.run_sync(_upgrade_finality_schema, case.schema_name)
+        await connection.run_sync(install_segmented_capture_migration, case.schema_name)
     return identity[0], generation_id
 
 
@@ -371,7 +373,7 @@ async def test_execution_evidence_selects_second_candidate_from_one_execution():
 async def test_operator_inspection_retains_unsealed_legacy_current_and_superseded_states():
     """Inspect legacy generations before and after their current pointer is removed."""
 
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(is_segmented_capture_enabled=False) as case:
         dataset_id, generation_id = await _seed_legacy_current_generation(case)
         async with case.sessions() as session:
             async with session.begin():

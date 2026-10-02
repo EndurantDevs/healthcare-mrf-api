@@ -47,6 +47,60 @@ def test_effective_output_revision_document_omits_only_source_position(revision,
     }
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    (
+        (
+            custom_import_models.CustomImportCaptureBundle(
+                canonical_manifest='{"source":"synthetic"}', manifest_sha256=b"m" * 32, stream_count=2
+            ),
+            {"canonical_manifest": '{"source":"synthetic"}', "manifest_sha256": (b"m" * 32).hex(), "stream_count": 2},
+        ),
+        (
+            custom_import_models.CustomImportCapture(
+                stream_slot=1,
+                content_sha256=b"c" * 32,
+                byte_count=17,
+                canonical_manifest='{"stream":"synthetic"}',
+                manifest_sha256=b"m" * 32,
+                payload_contract="custom-import/parquet-parts/v1",
+                payload_part_count=1,
+                payload_set_sha256=b"p" * 32,
+            ),
+            {
+                "stream_slot": 1,
+                "content_sha256": (b"c" * 32).hex(),
+                "byte_count": 17,
+                "canonical_manifest": '{"stream":"synthetic"}',
+                "manifest_sha256": (b"m" * 32).hex(),
+                "payload_contract": "custom-import/parquet-parts/v1",
+                "payload_part_count": 1,
+                "payload_set_sha256": (b"p" * 32).hex(),
+            },
+        ),
+    ),
+    ids=("bundle", "stream"),
+)
+def test_capture_materialization_projection_preserves_retained_v1_bytes(model, expected, monkeypatch):
+    """Ignore added lifecycle columns without omitting any retained capture evidence."""
+
+    assert _materialization_document(model) == expected
+    monkeypatch.setattr(
+        type(model),
+        "__table__",
+        SimpleNamespace(columns=(*model.__table__.columns, SimpleNamespace(name="capture_lifecycle"))),
+    )
+    model.capture_lifecycle = "synthetic-new-lifecycle"
+    assert _materialization_document(model) == expected
+    old_digest = publication._new_digest("generation-materialization/v1")
+    new_digest = publication._new_digest("generation-materialization/v1")
+    publication._add_digest_record(old_digest, "capture", expected)
+    publication._add_digest_record(new_digest, "capture", _materialization_document(model))
+    assert new_digest.digest() == old_digest.digest()
+    model.manifest_sha256 = b"x" * 32
+    assert _materialization_document(model) != expected
+
+
 def test_publication_event_is_canonical_and_domain_separated():
     canonical_event, digest = _event_document(
         _PublicationEventDetails(
@@ -351,6 +405,49 @@ def test_expected_pointer_and_scalar_materialization_validation():
         publication._json_value(dt.datetime(2026, 9, 17))
     with pytest.raises(PublicationConflict, match="unsupported scalar"):
         publication._json_value(object())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_state", ("pending", None))
+async def test_capture_identity_loader_rejects_unsealed_bundle(capture_state):
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state=capture_state)
+    with pytest.raises(PublicationConflict, match="not sealed"):
+        await publication._capture_bundle_for_identity(
+            _ExecuteSession(_Result(bundle)),
+            capture_bundle_id=1,
+            dataset_id=2,
+            definition_revision_id=3,
+            schema_revision_id=4,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload_contract", (None, "custom-import/parquet-parts/v2"))
+async def test_capture_identity_loader_accepts_sealed_contracts(payload_contract):
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state="sealed", payload_contract=payload_contract)
+    assert (
+        await publication._capture_bundle_for_identity(
+            _ExecuteSession(_Result(bundle)),
+            capture_bundle_id=1,
+            dataset_id=2,
+            definition_revision_id=3,
+            schema_revision_id=4,
+        )
+        is bundle
+    )
+
+
+@pytest.mark.asyncio
+async def test_generation_identity_rejects_pending_capture_before_hashing():
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state="pending")
+    generation = SimpleNamespace(capture_bundle_id=1, dataset_id=2, definition_revision_id=3, schema_revision_id=4)
+    session = _ExecuteSession(_Result(bundle))
+    session.get = AsyncMock(return_value=SimpleNamespace(dataset_id=2))
+    digest = publication._new_digest("test-domain")
+    original_digest = digest.digest()
+    with pytest.raises(PublicationConflict, match="not sealed"):
+        await publication._add_generation_identity_material(session, digest, generation)
+    assert digest.digest() == original_digest
 
 
 @pytest.mark.asyncio

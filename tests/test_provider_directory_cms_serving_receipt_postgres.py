@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_serving_receipt as receipts
 from tests.cms_npd_admission_postgres_support import _database_url
+from tests.reference_family_generation_fixture import install_source_generation_guards
 
 _MIGRATIONS = Path(__file__).resolve().parents[1] / "alembic" / "versions"
 _PIN = {
@@ -70,7 +71,8 @@ async def _create_native_tables(connection, schema):
     await connection.execute(
         text(f"""CREATE TABLE {schema}.reference_family_result_generation (
         importer_id text PRIMARY KEY, local_lineage_id uuid NOT NULL,local_generation bigint NOT NULL,
-        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],CHECK ({shape}))""")
+        origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],
+        CONSTRAINT reference_family_result_generation_shape_check CHECK ({shape}))""")
     )
     await connection.execute(
         text(
@@ -100,6 +102,7 @@ async def _database(monkeypatch, *, install_receipt=True):
             await _create_scalar_tables(connection, schema)
             await connection.run_sync(lambda sync: _create_profile_table(sync, schema))
             await _create_native_tables(connection, schema)
+            await install_source_generation_guards(connection, schema)
             if install_receipt:
                 await connection.run_sync(lambda sync: _apply(sync, "20260930100000"))
         yield engine, schema

@@ -621,7 +621,7 @@ async def _register_bundle_captures(
         return None
 
 
-async def _validate_bound_source_identity(session, request, prepared_statement):
+async def _validate_bound_source_identity(session, request, prepared_statement, processing_policy=None):
     """Match a prepared source query to its retained immutable binding."""
 
     try:
@@ -638,6 +638,8 @@ async def _validate_bound_source_identity(session, request, prepared_statement):
         or loaded.definition != request.definition
         or not hmac.compare_digest(loaded.source_binding_sha256, request.source_binding_sha256)
         or loaded.bundle_bindings != request.bundle_request.bindings
+        or request.bundle_request.processing_policy != processing_policy
+        or getattr(loaded.binding, "processing_policy", None) != processing_policy
     ):
         raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
     approved_by_relation = {relation.relation.parts: relation for relation in loaded.approved_relations}
@@ -669,9 +671,13 @@ async def _reserve_bundle_execution(
     request: SnowflakeBundleCandidateRequest,
     prepared_statement: SnowflakeBundleStatement,
     request_identity_sha256: bytes,
+    *,
+    processing_policy=None,
 ) -> tuple[ExecutionSubmission, LeaseGrant | None]:
     """Validate, reserve, and claim the current owner before source contact."""
 
+    if request.bundle_request.processing_policy != processing_policy:
+        raise SnowflakeCandidateError("Snowflake request processing policy does not match the selected runner")
     validation_request = _bundle_candidate_run_request(
         request,
         1,
@@ -684,7 +690,7 @@ async def _reserve_bundle_execution(
         except CandidateRunnerError as exc:
             raise SnowflakeCandidateError("Snowflake registered definition does not match the bundle") from exc
         if request.source_binding_revision_id is not None:
-            await _validate_bound_source_identity(session, request, prepared_statement)
+            await _validate_bound_source_identity(session, request, prepared_statement, processing_policy)
         submission = await reserve_execution(
             session,
             dataset_id=request.dataset_id,

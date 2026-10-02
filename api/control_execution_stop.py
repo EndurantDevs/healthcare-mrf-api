@@ -19,7 +19,6 @@ from process.custom_import.execution import (
     request_bound_execution_cancellation,
 )
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
-from process.custom_import.snowflake_candidate import bundle_request_identity_sha256
 from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
 
 blueprint = Blueprint("control_execution_stop", url_prefix="/control/v1")
@@ -69,6 +68,8 @@ def _no_source_access(*_args, **_kwargs):
 
 
 async def _retained_identity(session, dataset_id, definition_revision_id, source_binding_revision_id):
+    from process.custom_import.snowflake_segmented_runner import configured_request_identity
+
     loaded = await load_snowflake_source_binding(
         session,
         definition_revision_id=definition_revision_id,
@@ -82,10 +83,17 @@ async def _retained_identity(session, dataset_id, definition_revision_id, source
         credential_provider=no_source,
         adapter=no_source,
     )
-    bundle_request = connector.prepare_request(loaded.definition, bindings=loaded.bundle_bindings)
+    bundle_request = connector.prepare_request(
+        loaded.definition,
+        bindings=loaded.bundle_bindings,
+        processing_policy=getattr(loaded.binding, "processing_policy", None),
+    )
     statement = connector.build_statement(bundle_request)
-    digest = bundle_request_identity_sha256(
-        bundle_request, statement, source_binding_sha256=loaded.source_binding_sha256
+    digest = configured_request_identity(
+        bundle_request,
+        statement,
+        source_binding_sha256=loaded.source_binding_sha256,
+        processing_policy=getattr(loaded.binding, "processing_policy", None),
     )
     return loaded.schema_revision_id, digest
 

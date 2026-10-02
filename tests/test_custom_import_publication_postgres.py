@@ -3502,7 +3502,7 @@ async def _seed_finality_duplicate_legacy_events(case) -> None:
 async def test_finality_downgrade_restores_legacy_rejection_code_shape():
     """A valid legacy rejection survives upgrade and a later downgrade."""
 
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(is_segmented_capture_enabled=False) as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(_downgrade_finality_schema, case.schema_name)
             identity = await _finality_insert_minimal_identity(
@@ -3575,7 +3575,7 @@ async def _finality_upgraded_duplicate_event_receipt(case) -> tuple[int | None, 
 async def test_upgrade_retains_populated_legacy_duplicate_publication_events():
     """Feature-on indexes exclude, rather than silently deleting, legacy event duplicates."""
 
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(is_segmented_capture_enabled=False) as case:
         await _seed_finality_duplicate_legacy_events(case)
         retained_count, event_index = await _finality_upgraded_duplicate_event_receipt(case)
 

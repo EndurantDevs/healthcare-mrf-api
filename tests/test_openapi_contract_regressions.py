@@ -3,15 +3,43 @@
 import ast
 import re
 
-import yaml
-
-from tests.openapi_route_contract_support import HIDDEN_RUNTIME_ALIASES
+from tests import openapi_route_contract_support as openapi_support
+from tests.openapi_route_contract_support import HIDDEN_RUNTIME_ALIASES, load_openapi_document
 from tests.test_openapi_spec import (
     ENDPOINT_DIR,
     OPENAPI_PATH,
     _collect_query_params,
     _collect_spec_routes,
 )
+
+
+def test_openapi_parse_reuse_keeps_mutations_and_file_changes_independent(tmp_path, monkeypatch):
+    document_path = tmp_path / "openapi.yaml"
+    original_text = "paths:\n  /example:\n    get:\n      summary: original\n"
+    document_path.write_text(original_text, encoding="utf-8")
+    parsed_texts = []
+    parse = openapi_support.yaml.safe_load
+
+    def track_parse(text):
+        parsed_texts.append(text)
+        return parse(text)
+
+    monkeypatch.setattr(openapi_support.yaml, "safe_load", track_parse)
+    openapi_support._parse_openapi_document.cache_clear()
+    try:
+        first = load_openapi_document(document_path)
+        first["paths"]["/example"]["get"]["summary"] = "mutated"
+        second = load_openapi_document(document_path)
+        assert second["paths"]["/example"]["get"]["summary"] == "original"
+        assert parsed_texts == [original_text]
+
+        changed_text = original_text.replace("original", "changed")
+        document_path.write_text(changed_text, encoding="utf-8")
+        current = load_openapi_document(document_path)
+        assert current["paths"]["/example"]["get"]["summary"] == "changed"
+        assert parsed_texts == [original_text, changed_text]
+    finally:
+        openapi_support._parse_openapi_document.cache_clear()
 
 
 def test_query_param_collector_includes_list_and_pagination_helpers():
@@ -59,7 +87,7 @@ def test_openapi_operation_ids_are_present_and_unique():
 def test_doctor_search_contract_documents_cards_and_filter_defaults():
     """Keep doctor-search cards and filters aligned with the runtime contract."""
 
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     schemas = spec["components"]["schemas"]
     npi_all = spec["paths"]["/npi/all"]["get"]
     npi_near = spec["paths"]["/npi/near/"]["get"]
@@ -115,7 +143,7 @@ def test_doctor_search_contract_documents_cards_and_filter_defaults():
 
 
 def test_provider_specialty_filter_primary_only_defaults_to_true():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     group_plan_parameters = spec["paths"]["/pricing/group-plan-providers"]["get"][
         "parameters"
     ]

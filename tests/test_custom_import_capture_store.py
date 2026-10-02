@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -276,39 +278,6 @@ def test_durable_replay_rejects_incomplete_or_drifted_payload_rows():
         capture_store._complete_payload_metadata_by_slot({1: unavailable})
     with pytest.raises(CaptureBundleConflict, match="mixed payload"):
         capture_store._complete_payload_metadata_by_slot({1: unavailable, 2: valid_metadata})
-
-    bundle = SimpleNamespace(snapshot_token=receipt.source_snapshot_token)
-    stored_capture = SimpleNamespace(
-        byte_count=1,
-        content_sha256=bytes.fromhex(receipt.content_sha256),
-        canonical_manifest=receipt.canonical_manifest,
-        manifest_sha256=bytes.fromhex(receipt.manifest_sha256),
-    )
-    valid_part = SimpleNamespace(
-        part_ordinal=1,
-        payload=b"x",
-        byte_count=1,
-        payload_sha256=hashlib.sha256(b"x").digest(),
-    )
-    arguments = (bundle, (("records", 1),), {1: stored_capture})
-    with pytest.raises(CaptureBundleConflict, match="incomplete part count"):
-        capture_store._replayable_captures_from_rows(
-            *arguments,
-            {1: (2, capture_store._payload_set_sha256((b"x", b"y")))},
-            {1: [valid_part]},
-        )
-    with pytest.raises(CaptureBundleConflict, match="payload part has drifted"):
-        capture_store._replayable_captures_from_rows(
-            *arguments,
-            {1: (1, capture_store._payload_set_sha256((b"x",)))},
-            {1: [SimpleNamespace(**(vars(valid_part) | {"part_ordinal": 2}))]},
-        )
-    with pytest.raises(CaptureBundleConflict, match="set digest has drifted"):
-        capture_store._replayable_captures_from_rows(
-            *arguments,
-            {1: (1, b"z" * 32)},
-            {1: [valid_part]},
-        )
 
 
 class _MissingDatasetSession:
@@ -585,8 +554,6 @@ async def test_durable_loader_and_idempotency_reject_partial_persisted_state(mon
         await capture_store._load_replayable_captures_by_slot(
             _RowsSession(rows=(drifted_capture,)), 9, identity, streams
         )
-    with pytest.raises(CaptureBundleConflict, match="missing or extra payload parts"):
-        await capture_store._load_replayable_parts_by_slot(_RowsSession(), 9, streams)
 
     snapshots: tuple[object, ...] = ()
     is_matching_payload: bool | None = True
@@ -638,70 +605,20 @@ async def test_durable_store_rejects_missing_insert_identity_and_final_bundle_dr
             _NoIdentifierInsertSession(), prepared, {"records": replayable}
         )
 
-    async def loaded_streams(_session, _identity):
-        return streams
-
-    async def validated_streams(_session, _identity, _streams):
-        return None
-
-    async def loaded_bundle(_session, _capture_bundle_id, _identity):
-        bundle = capture_store._new_capture_bundle(prepared)
-        bundle.capture_bundle_id = 9
-        bundle.manifest_sha256 = b"x" * 32
-        return bundle
-
-    async def loaded_captures(_session, _capture_bundle_id, _identity, _streams):
-        return {1: object()}
-
-    async def loaded_parts(_session, _capture_bundle_id, _streams):
-        return {1: [object()]}
-
-    monkeypatch.setattr(capture_store, "_validated_streams", loaded_streams)
-    monkeypatch.setattr(capture_store, "_validated_replayable_parquet_streams", validated_streams)
-    monkeypatch.setattr(capture_store, "_load_replayable_bundle_model", loaded_bundle)
-    monkeypatch.setattr(capture_store, "_load_replayable_captures_by_slot", loaded_captures)
-    monkeypatch.setattr(capture_store, "_complete_payload_metadata_by_slot", lambda _captures: {1: (1, b"x" * 32)})
-    monkeypatch.setattr(capture_store, "_load_replayable_parts_by_slot", loaded_parts)
-    monkeypatch.setattr(
-        capture_store,
-        "_replayable_captures_from_rows",
-        lambda _bundle, _streams, _captures, _metadata, _parts: ((replayable,), {"records": replayable.receipt}),
-    )
+    case = _part_read_case(monkeypatch)
+    case.bundle.manifest_sha256 = b"x" * 32
     with pytest.raises(CaptureBundleConflict, match="identity has drifted"):
-        await capture_store.load_replayable_parquet_bundle(
-            _RowsSession(),
-            capture_bundle_id=9,
-            dataset_id=1,
-            definition_revision_id=2,
-            schema_revision_id=3,
-        )
+        await capture_store.load_replayable_parquet_bundle(case.session, **_PART_IDS)
+    assert case.session.rows is None
 
 
-def test_durable_store_wraps_nonconflict_payload_decoding_errors():
-    receipt = _build_receipt(byte_count=1, content_sha256=_digest("payload"))
-    capture = SimpleNamespace(
-        byte_count=1,
-        content_sha256=object(),
-        canonical_manifest=receipt.canonical_manifest,
-        manifest_sha256=bytes.fromhex(receipt.manifest_sha256),
-    )
+@pytest.mark.asyncio
+async def test_durable_store_wraps_nonconflict_payload_decoding_errors(monkeypatch):
+    case = _part_read_case(monkeypatch)
+    case.captures_by_slot[1].content_sha256 = object()
     with pytest.raises(CaptureBundleConflict, match="payload is invalid"):
-        capture_store._replayable_captures_from_rows(
-            SimpleNamespace(snapshot_token=receipt.source_snapshot_token),
-            (("records", 1),),
-            {1: capture},
-            {1: (1, capture_store._payload_set_sha256((b"x",)))},
-            {
-                1: [
-                    SimpleNamespace(
-                        part_ordinal=1,
-                        payload=b"x",
-                        byte_count=1,
-                        payload_sha256=hashlib.sha256(b"x").digest(),
-                    )
-                ]
-            },
-        )
+        await capture_store.load_replayable_parquet_bundle(case.session, **_PART_IDS)
+    assert case.session.rows is None
 
 
 @pytest.mark.asyncio
@@ -746,3 +663,286 @@ async def test_snapshot_lookup_uses_digest_then_retains_exact_token_comparison()
     where_clause = str(session.statement.whereclause)
     assert "snapshot_token_sha256" in where_clause
     assert "snapshot_token =" in where_clause
+
+
+_PART_IDS = {"capture_bundle_id": 9, "dataset_id": 1, "definition_revision_id": 2, "schema_revision_id": 3}
+
+
+class _PartRows:
+    def __init__(self, source):
+        self.source = iter(source)
+        self.read_count = self.close_count = 0
+        self.pause = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.read_count += 1
+        if self.pause is not None:
+            self.pause.set()
+            await asyncio.Event().wait()
+        row = next(self.source, None)
+        if row is None:
+            raise StopAsyncIteration
+        return row
+
+    async def close(self):
+        self.close_count += 1
+
+
+class _PartReadSession:
+    def __init__(self, source):
+        self.source = source
+        self.rows = self.statement = None
+        self.autoflush_suppressed = False
+        self.new = [object()]
+
+    @property
+    @contextmanager
+    def no_autoflush(self):
+        self.autoflush_suppressed = True
+        try:
+            yield
+        finally:
+            self.autoflush_suppressed = False
+
+    async def stream(self, statement):
+        assert self.autoflush_suppressed
+        self.statement = statement
+        self.rows = _PartRows(self.source)
+        return self.rows
+
+    async def close(self):
+        raise AssertionError("borrowed session must stay open")
+
+    async def commit(self):
+        raise AssertionError("borrowed transaction must not be committed")
+
+    async def rollback(self):
+        raise AssertionError("borrowed transaction recovery belongs to the caller")
+
+
+def _part_read_case(monkeypatch):
+    captures = (
+        _build_replayable_capture(parts=(b"first", b"second")),
+        ReplayableParquetCapture(
+            receipt=_build_receipt(stream_id="details", byte_count=5),
+            parts=(b"third",),
+        ),
+    )
+    streams = (("records", 1), ("details", 2))
+    identity = capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3)
+    prepared = capture_store._prepare_capture_bundle(
+        identity, streams, {capture.receipt.stream_id: capture.receipt for capture in captures}
+    )
+    bundle = capture_store._new_capture_bundle(prepared)
+    bundle.capture_bundle_id = 9
+    captures_by_slot = {
+        slot: _stored_replayable_capture(capture, stream_slot=slot) for slot, capture in enumerate(captures, start=1)
+    }
+    source_parts = [
+        (9, slot, ordinal, len(part_payload), part_payload, hashlib.sha256(part_payload).digest())
+        for slot, capture in enumerate(captures, start=1)
+        for ordinal, part_payload in enumerate(capture.parts, start=1)
+    ]
+    session = _PartReadSession(source_parts)
+
+    async def loaded_streams(borrowed, _identity):
+        assert borrowed.autoflush_suppressed
+        return streams
+
+    async def validated_streams(borrowed, _identity, _streams):
+        assert borrowed.autoflush_suppressed
+
+    async def loaded_bundle(borrowed, _bundle_id, _identity):
+        assert borrowed.autoflush_suppressed
+        return bundle
+
+    async def loaded_captures(borrowed, _bundle_id, _identity, _streams):
+        assert borrowed.autoflush_suppressed
+        return captures_by_slot
+
+    monkeypatch.setattr(capture_store, "_validated_streams", loaded_streams)
+    monkeypatch.setattr(capture_store, "_validated_replayable_parquet_streams", validated_streams)
+    monkeypatch.setattr(capture_store, "_load_replayable_bundle_model", loaded_bundle)
+    monkeypatch.setattr(capture_store, "_load_replayable_captures_by_slot", loaded_captures)
+    return SimpleNamespace(
+        session=session, source=source_parts, captures=captures, captures_by_slot=captures_by_slot, bundle=bundle
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_pull_preserves_eager_round_trip(monkeypatch):
+    case = _part_read_case(monkeypatch)
+    async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS) as parts:
+        assert case.session.rows.read_count == 0
+        first = await anext(parts)
+        assert first == (case.captures[0].receipt, 1, b"first")
+        assert case.session.rows.read_count == 1
+        remaining_parts = [part async for part in parts]
+        assert tuple(part[2] for part in remaining_parts) == (b"second", b"third")
+        assert case.session.rows.read_count == 4
+    assert case.session.rows.close_count == 1
+    assert not case.session.autoflush_suppressed
+    assert len(case.session.new) == 1
+    query = case.session.statement
+    assert len(query.selected_columns) == 6
+    assert query.get_execution_options()["yield_per"] == 1
+    assert str(query.whereclause).count("=") == 1
+    assert "capture_bundle_id" in str(query.whereclause)
+    assert tuple(str(column) for column in query._order_by_clauses) == (
+        "custom_import_capture_parquet_part.stream_slot",
+        "custom_import_capture_parquet_part.part_ordinal",
+    )
+    loaded = await capture_store.load_replayable_parquet_bundle(case.session, **_PART_IDS)
+    assert loaded == case.captures
+    assert case.session.rows.read_count == 4
+    assert case.session.rows.close_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "missing",
+        "extra",
+        "reordered",
+        "foreign",
+        "unknown_stream",
+        "empty",
+        "length",
+        "sha",
+        "set_digest",
+        "byte_total",
+        "bool_ordinal",
+        "bool_slot",
+        "bool_length",
+    ),
+)
+async def test_incremental_and_eager_parts_reject_complete_payload_drift(monkeypatch, damage):
+    case = _part_read_case(monkeypatch)
+    match damage:
+        case "missing":
+            case.source.pop()
+        case "extra":
+            case.source.insert(2, (9, 1, 3, 5, b"extra", hashlib.sha256(b"extra").digest()))
+        case "reordered":
+            case.source[:2] = case.source[1::-1]
+        case "set_digest":
+            case.captures_by_slot[2].payload_set_sha256 = b"x" * 32
+        case "byte_total":
+            case.captures_by_slot[2].byte_count += 1
+            receipt = replace(case.captures[1].receipt, byte_count=6)
+            prepared = capture_store._prepare_capture_bundle(
+                capture_store._identity(dataset_id=1, definition_revision_id=2, schema_revision_id=3),
+                (("records", 1), ("details", 2)),
+                {"records": case.captures[0].receipt, "details": receipt},
+            )
+            rebuilt = capture_store._new_capture_bundle(prepared)
+            case.bundle.canonical_manifest = rebuilt.canonical_manifest
+            case.bundle.manifest_sha256 = rebuilt.manifest_sha256
+        case _:
+            row_fields = list(case.source[1])
+            changes_by_damage = {
+                "foreign": (0, 99),
+                "unknown_stream": (1, 99),
+                "empty": (4, b""),
+                "length": (3, 1),
+                "sha": (5, b"x" * 32),
+                "bool_ordinal": (2, True),
+                "bool_slot": (1, True),
+                "bool_length": (3, True),
+            }
+            index, corrupted_value = changes_by_damage[damage]
+            row_fields[index] = corrupted_value
+            case.source[1] = tuple(row_fields)
+    with pytest.raises(CaptureBundleConflict):
+        async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS) as parts:
+            received_parts = [part async for part in parts]
+            pytest.fail(f"corrupt capture returned {len(received_parts)} parts")
+    assert case.session.rows.close_count == 1
+    with pytest.raises(CaptureBundleConflict):
+        await capture_store.load_replayable_parquet_bundle(case.session, **_PART_IDS)
+    assert case.session.rows.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_declared_last_part_does_not_establish_integrity_without_actual_eof(monkeypatch):
+    case = _part_read_case(monkeypatch)
+    case.source.append((9, 99, 1, 5, b"extra", hashlib.sha256(b"extra").digest()))
+    async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS) as parts:
+        for _ in range(3):
+            await anext(parts)
+        with pytest.raises(CaptureBundleConflict, match="missing or extra"):
+            await anext(parts)
+    assert case.session.rows.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_receipts_and_payload_metadata_are_frozen_before_first_yield(monkeypatch):
+    case = _part_read_case(monkeypatch)
+    async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS) as parts:
+        await anext(parts)
+        case.captures_by_slot[2].byte_count = 0
+        case.captures_by_slot[2].payload_part_count = 99
+        case.captures_by_slot[2].payload_set_sha256 = b"x" * 32
+        remaining_parts = [part async for part in parts]
+    assert remaining_parts[-1] == (case.captures[1].receipt, 1, b"third")
+    assert case.session.rows.close_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ("break", "error", "cancel"))
+async def test_incremental_context_closes_owned_resources_and_preserves_borrowed_session(monkeypatch, exit_kind):
+    case = _part_read_case(monkeypatch)
+    observed_iterators = []
+
+    async def consume():
+        async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS) as parts:
+            observed_iterators.append(parts)
+            if exit_kind == "cancel":
+                case.session.rows.pause = asyncio.Event()
+            await anext(parts)
+            if exit_kind == "error":
+                raise RuntimeError("synthetic consumer failure")
+
+    if exit_kind == "cancel":
+        task = asyncio.create_task(consume())
+        while case.session.rows is None or case.session.rows.pause is None:
+            await asyncio.sleep(0)
+        await case.session.rows.pause.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif exit_kind == "error":
+        with pytest.raises(RuntimeError, match="consumer failure"):
+            await consume()
+    else:
+        await consume()
+    assert case.session.rows.close_count == 1
+    with pytest.raises(StopAsyncIteration):
+        await anext(observed_iterators[0])
+    assert len(case.session.new) == 1
+    assert not case.session.autoflush_suppressed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ("unavailable", "mixed", "parts_cap", "bytes_cap"))
+async def test_incremental_metadata_rejects_incomplete_or_over_budget_bundles_before_opening_result(
+    monkeypatch, damage
+):
+    case = _part_read_case(monkeypatch)
+    if damage in {"unavailable", "mixed"}:
+        for slot in (1, 2) if damage == "unavailable" else (2,):
+            capture = case.captures_by_slot[slot]
+            capture.payload_contract = capture.payload_part_count = capture.payload_set_sha256 = None
+    elif damage == "parts_cap":
+        monkeypatch.setattr(capture_store, "_MAX_PARQUET_PARTS_PER_BUNDLE", 2)
+    else:
+        monkeypatch.setattr(capture_store, "_MAX_PARQUET_BYTES_PER_BUNDLE", 1)
+    error_type = CapturePayloadUnavailable if damage == "unavailable" else CaptureStoreError
+    with pytest.raises(error_type):
+        async with capture_store.open_replayable_parquet_parts(case.session, **_PART_IDS):
+            raise AssertionError("invalid metadata must not yield an iterator")
+    assert case.session.rows is None

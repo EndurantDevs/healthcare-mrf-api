@@ -7,7 +7,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,7 @@ from db.models.custom_import import (
     CustomImportSourceStream,
 )
 from process.custom_import._source_text import _SourceTextValidationError, validate_snapshot_token
+from process.custom_import.capture import CaptureManifest, SealedCapture
 from process.custom_import.definition import (
     CONTRACT_VERSION,
     MAX_CHILD_COLLECTIONS,
@@ -40,7 +42,10 @@ __all__ = (
     "CaptureStoreError",
     "CaptureStoreTransactionRequired",
     "ReplayableParquetCapture",
+    "SegmentedParquetPart",
     "load_replayable_parquet_bundle",
+    "open_replayable_parquet_parts",
+    "open_segmented_parquet_parts",
     "register_capture_bundle",
     "register_replayable_parquet_bundle",
 )
@@ -133,6 +138,27 @@ class CaptureBundleRegistration:
     capture_bundle_id: int
     stream_slots: tuple[int, ...]
     created: bool
+
+
+@dataclass(frozen=True)
+class SegmentedParquetPart:
+    """One verified retained part and connector-asserted replay accounting."""
+
+    receipt: CaptureReceipt
+    ordinal: int
+    capture: SealedCapture = field(repr=False)
+    record_count: int
+    arrow_byte_count: int
+
+
+@dataclass(frozen=True)
+class _VerifiedParquetPart:
+    receipt: CaptureReceipt
+    ordinal: int
+    payload: bytes = field(repr=False)
+    capture_manifest: CaptureManifest | None = None
+    record_count: int | None = None
+    arrow_byte_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -290,10 +316,16 @@ def _payload_set_sha256(parts: tuple[bytes, ...]) -> bytes:
 
     digest = hashlib.sha256(_PARQUET_PART_SET_DOMAIN)
     for ordinal, part in enumerate(parts, start=1):
-        digest.update(ordinal.to_bytes(4, byteorder="big", signed=False))
-        digest.update(len(part).to_bytes(8, byteorder="big", signed=False))
-        digest.update(hashlib.sha256(part).digest())
+        _add_payload_part_digest(digest, ordinal, len(part), hashlib.sha256(part).digest())
     return digest.digest()
+
+
+def _add_payload_part_digest(digest: Any, ordinal: int, byte_count: int, payload_sha256: bytes) -> None:
+    """Preserve the ordered payload-set framing for eager and incremental reads."""
+
+    digest.update(ordinal.to_bytes(4, byteorder="big", signed=False))
+    digest.update(byte_count.to_bytes(8, byteorder="big", signed=False))
+    digest.update(payload_sha256)
 
 
 def _validate_replayable_parquet_captures(value: object) -> tuple[ReplayableParquetCapture, ...]:
@@ -654,6 +686,7 @@ async def _snapshot_bundles(
             CustomImportCaptureBundle.schema_revision_id == identity.schema_revision_id,
             CustomImportCaptureBundle.snapshot_token_sha256 == prepared.snapshot_token_sha256,
             CustomImportCaptureBundle.snapshot_token == prepared.snapshot_token,
+            CustomImportCaptureBundle.capture_state == "sealed",
         )
         .with_for_update()
     )
@@ -881,10 +914,11 @@ async def _load_replayable_bundle_model(
                 CustomImportCaptureBundle.dataset_id == identity.dataset_id,
                 CustomImportCaptureBundle.definition_revision_id == identity.definition_revision_id,
                 CustomImportCaptureBundle.schema_revision_id == identity.schema_revision_id,
+                CustomImportCaptureBundle.capture_state == "sealed",
             )
         )
     ).scalar_one_or_none()
-    if bundle is None:
+    if bundle is None or bundle.capture_state != "sealed":
         raise CaptureBundleConflict("capture bundle does not match the durable replay identity")
     return bundle
 
@@ -899,7 +933,10 @@ async def _load_replayable_captures_by_slot(
         (
             await session.execute(
                 select(CustomImportCapture)
-                .where(CustomImportCapture.capture_bundle_id == capture_bundle_id)
+                .where(
+                    CustomImportCapture.capture_bundle_id == capture_bundle_id,
+                    CustomImportCapture.capture_state == "sealed",
+                )
                 .order_by(CustomImportCapture.stream_slot)
             )
         )
@@ -933,81 +970,279 @@ def _complete_payload_metadata_by_slot(
     return payload_metadata_by_slot
 
 
-async def _load_replayable_parts_by_slot(
-    session: AsyncSession,
+async def _iter_replayable_parquet_parts(
+    part_rows: Any,
     capture_bundle_id: int,
-    streams: tuple[tuple[str, int], ...],
-) -> dict[int, list[CustomImportCaptureParquetPart]]:
-    part_rows = tuple(
-        (
-            await session.execute(
-                select(CustomImportCaptureParquetPart)
-                .where(CustomImportCaptureParquetPart.capture_bundle_id == capture_bundle_id)
-                .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
+    receipts_by_slot: Mapping[int, CaptureReceipt],
+    metadata_by_slot: Mapping[int, tuple[int, bytes]],
+    accounting_by_slot: Mapping[int, Any] | None = None,
+) -> AsyncIterator[_VerifiedParquetPart]:
+    """Validate each part locally; validate complete coverage only at exhaustion."""
+
+    counts = dict.fromkeys(receipts_by_slot, 0)
+    byte_counts = dict.fromkeys(receipts_by_slot, 0)
+    digests_by_slot = {slot: hashlib.sha256(_PARQUET_PART_SET_DOMAIN) for slot in receipts_by_slot}
+    previous_slot = 0
+    async for part_row in part_rows:
+        stored_bundle_id, slot, ordinal, byte_count, stored_payload, stored_digest = part_row[:6]
+        if (
+            isinstance(stored_bundle_id, bool)
+            or not isinstance(stored_bundle_id, int)
+            or stored_bundle_id != capture_bundle_id
+            or isinstance(slot, bool)
+            or not isinstance(slot, int)
+            or slot not in receipts_by_slot
+        ):
+            raise CaptureBundleConflict("durable capture bundle has missing or extra payload parts")
+        part_payload = _stored_bytes(stored_payload)
+        payload_digest = _stored_bytes(stored_digest)
+        if (
+            slot < previous_slot
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal != counts[slot] + 1
+            or ordinal > metadata_by_slot[slot][0]
+            or part_payload is None
+            or not 1 <= len(part_payload) <= _MAX_PARQUET_PART_BYTES
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count != len(part_payload)
+            or payload_digest is None
+            or len(payload_digest) != 32
+            or hashlib.sha256(part_payload).digest() != payload_digest
+        ):
+            raise CaptureBundleConflict("durable capture payload part has drifted")
+        previous_slot = slot
+        counts[slot] += 1
+        byte_counts[slot] += byte_count
+        if byte_counts[slot] > receipts_by_slot[slot].byte_count:
+            raise CaptureBundleConflict("durable capture bundle payload is invalid")
+        _add_payload_part_digest(digests_by_slot[slot], ordinal, byte_count, payload_digest)
+        manifest = record_count = arrow_byte_count = None
+        if accounting_by_slot is not None:
+            manifest, record_count, arrow_byte_count = accounting_by_slot[slot].add(
+                receipts_by_slot[slot], ordinal, part_payload, part_row[6:]
+            )
+        yield _VerifiedParquetPart(
+            receipts_by_slot[slot], ordinal, part_payload, manifest, record_count, arrow_byte_count
+        )
+
+    _verify_complete_part_totals(
+        receipts_by_slot, metadata_by_slot, counts, byte_counts, digests_by_slot, accounting_by_slot
+    )
+
+
+def _verify_complete_part_totals(
+    receipts_by_slot, metadata_by_slot, counts, byte_counts, digests_by_slot, accounting_by_slot
+):
+    for slot, receipt in receipts_by_slot.items():
+        expected_count, expected_digest = metadata_by_slot[slot]
+        if counts[slot] != expected_count:
+            raise CaptureBundleConflict("durable capture bundle has an incomplete part count")
+        if byte_counts[slot] != receipt.byte_count:
+            raise CaptureBundleConflict("durable capture bundle payload is invalid")
+        if digests_by_slot[slot].digest() != expected_digest:
+            raise CaptureBundleConflict("durable capture payload set digest has drifted")
+        if accounting_by_slot is not None:
+            accounting_by_slot[slot].finish()
+
+
+async def _load_parquet_part_metadata(
+    session: AsyncSession,
+    identity: _CaptureIdentity,
+    capture_bundle_id: int,
+) -> tuple[dict[int, CaptureReceipt], dict[int, tuple[int, bytes]], Mapping[int, Any] | None]:
+    """Freeze and validate complete immutable headers before part iteration."""
+
+    streams = await _validated_streams(session, identity)
+    await _validated_replayable_parquet_streams(session, identity, streams)
+    bundle = await _load_replayable_bundle_model(session, capture_bundle_id, identity)
+    captures_by_slot = await _load_replayable_captures_by_slot(session, capture_bundle_id, identity, streams)
+    if bundle.payload_contract == "custom-import/parquet-parts/v2":
+        from process.custom_import.capture_pending import _load_segmented_replay_metadata
+
+        try:
+            return _load_segmented_replay_metadata(bundle, streams, captures_by_slot)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise CaptureBundleConflict("segmented capture sealed metadata is invalid") from exc
+    stored_metadata = _complete_payload_metadata_by_slot(captures_by_slot)
+    try:
+        receipts = _validate_receipts(
+            tuple(
+                CaptureReceipt(
+                    stream_id=stream_id,
+                    source_snapshot_token=bundle.snapshot_token,
+                    byte_count=captures_by_slot[slot].byte_count,
+                    content_sha256=bytes(captures_by_slot[slot].content_sha256).hex(),
+                    canonical_manifest=captures_by_slot[slot].canonical_manifest,
+                    manifest_sha256=bytes(captures_by_slot[slot].manifest_sha256).hex(),
+                )
+                for stream_id, slot in streams
             )
         )
-        .scalars()
-        .all()
-    )
-    parts_by_slot: dict[int, list[CustomImportCaptureParquetPart]] = {}
-    for part in part_rows:
-        parts_by_slot.setdefault(part.stream_slot, []).append(part)
-    if set(parts_by_slot) != {stream_slot for _, stream_slot in streams}:
-        raise CaptureBundleConflict("durable capture bundle has missing or extra payload parts")
-    return parts_by_slot
-
-
-def _replayable_captures_from_rows(
-    bundle: CustomImportCaptureBundle,
-    streams: tuple[tuple[str, int], ...],
-    captures_by_slot: Mapping[int, CustomImportCapture],
-    payload_metadata_by_slot: Mapping[int, tuple[int, bytes] | None],
-    parts_by_slot: Mapping[int, list[CustomImportCaptureParquetPart]],
-) -> tuple[tuple[ReplayableParquetCapture, ...], dict[str, CaptureReceipt]]:
-    replayable_captures: list[ReplayableParquetCapture] = []
-    receipts_by_stream: dict[str, CaptureReceipt] = {}
-    try:
-        for stream_id, stream_slot in streams:
-            capture = captures_by_slot[stream_slot]
-            metadata = payload_metadata_by_slot[stream_slot]
-            assert metadata is not None
-            part_count, expected_set_sha256 = metadata
-            persisted_parts = parts_by_slot[stream_slot]
-            if len(persisted_parts) != part_count:
-                raise CaptureBundleConflict("durable capture bundle has an incomplete part count")
-            part_payloads: list[bytes] = []
-            for ordinal, part in enumerate(persisted_parts, start=1):
-                stored_payload = _stored_bytes(part.payload)
-                stored_digest = _stored_bytes(part.payload_sha256)
-                if (
-                    part.part_ordinal != ordinal
-                    or stored_payload is None
-                    or part.byte_count != len(stored_payload)
-                    or stored_digest is None
-                    or len(stored_digest) != 32
-                    or hashlib.sha256(stored_payload).digest() != stored_digest
-                ):
-                    raise CaptureBundleConflict("durable capture payload part has drifted")
-                part_payloads.append(stored_payload)
-            payload_parts = tuple(part_payloads)
-            if _payload_set_sha256(payload_parts) != expected_set_sha256:
-                raise CaptureBundleConflict("durable capture payload set digest has drifted")
-            receipt = CaptureReceipt(
-                stream_id=stream_id,
-                source_snapshot_token=bundle.snapshot_token,
-                byte_count=capture.byte_count,
-                content_sha256=bytes(capture.content_sha256).hex(),
-                canonical_manifest=capture.canonical_manifest,
-                manifest_sha256=bytes(capture.manifest_sha256).hex(),
-            )
-            replayable = ReplayableParquetCapture(receipt=receipt, parts=payload_parts)
-            receipts_by_stream[stream_id] = receipt
-            replayable_captures.append(replayable)
     except (AttributeError, TypeError, ValueError, CaptureStoreError) as exc:
-        if isinstance(exc, CaptureBundleConflict):
-            raise
         raise CaptureBundleConflict("durable capture bundle payload is invalid") from exc
-    return tuple(replayable_captures), receipts_by_stream
+    # Freeze immutable values before yielding; never retain mutable ORM rows
+    # as authority for a later part or its completion checks.
+    receipts_by_slot = {slot: receipt for (_, slot), receipt in zip(streams, receipts, strict=True)}
+    metadata_by_slot = {slot: (metadata[0], bytes(metadata[1])) for slot, metadata in stored_metadata.items()}
+    if (
+        sum(metadata[0] for metadata in metadata_by_slot.values()) > _MAX_PARQUET_PARTS_PER_BUNDLE
+        or sum(receipt.byte_count for receipt in receipts) > _MAX_PARQUET_BYTES_PER_BUNDLE
+    ):
+        raise CaptureStoreError("replayable Parquet captures exceed the aggregate durable payload limit")
+    prepared = _prepare_capture_bundle(identity, streams, {receipt.stream_id: receipt for receipt in receipts})
+    if not _is_matching_bundle(bundle, prepared):
+        raise CaptureBundleConflict("durable capture bundle identity has drifted")
+    return receipts_by_slot, metadata_by_slot, None
+
+
+@asynccontextmanager
+async def _open_verified_parquet_parts(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+) -> AsyncIterator[AsyncIterator[_VerifiedParquetPart]]:
+    """Borrow a session and yield locally validated ordered durable parts.
+
+    The consumer must exhaust the iterator to establish complete store-level
+    payload integrity. A yielded receipt is retained connector metadata, not
+    proof that its complete capture or bundle has been verified. This function
+    does not perform connector-specific acquisition validation or publication.
+
+    The context owns and closes its iterator and SQL result on exhaustion,
+    early exit, error, or cancellation. It never closes, commits, or rolls back
+    the caller's session. Do not use or commit that session concurrently; after
+    driver cancellation, transaction recovery remains the caller's responsibility.
+    """
+
+    identity = _identity(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+    )
+    capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
+    with session.no_autoflush:
+        receipts_by_slot, metadata_by_slot, accounting_by_slot = await _load_parquet_part_metadata(
+            session, identity, capture_bundle_id
+        )
+        part_rows = await session.stream(_part_statement(capture_bundle_id, accounting_by_slot))
+    parts = _iter_replayable_parquet_parts(
+        part_rows, capture_bundle_id, receipts_by_slot, metadata_by_slot, accounting_by_slot
+    )
+    try:
+        yield parts
+    finally:
+        try:
+            await parts.aclose()
+        finally:
+            await part_rows.close()
+
+
+def _part_statement(capture_bundle_id, accounting_by_slot):
+    columns = [
+        CustomImportCaptureParquetPart.capture_bundle_id,
+        CustomImportCaptureParquetPart.stream_slot,
+        CustomImportCaptureParquetPart.part_ordinal,
+        CustomImportCaptureParquetPart.byte_count,
+        CustomImportCaptureParquetPart.payload,
+        CustomImportCaptureParquetPart.payload_sha256,
+    ]
+    if accounting_by_slot is not None:
+        columns.extend(
+            (
+                CustomImportCaptureParquetPart.canonical_capture_manifest,
+                CustomImportCaptureParquetPart.capture_manifest_sha256,
+                CustomImportCaptureParquetPart.decoded_byte_count,
+                CustomImportCaptureParquetPart.arrow_byte_count,
+                CustomImportCaptureParquetPart.record_count,
+            )
+        )
+    return (
+        select(*columns)
+        .where(CustomImportCaptureParquetPart.capture_bundle_id == capture_bundle_id)
+        .order_by(CustomImportCaptureParquetPart.stream_slot, CustomImportCaptureParquetPart.part_ordinal)
+        .execution_options(yield_per=1)
+    )
+
+
+@asynccontextmanager
+async def open_replayable_parquet_parts(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+) -> AsyncIterator[AsyncIterator[tuple[CaptureReceipt, int, bytes]]]:
+    """Yield validated ordered parts; actual iterator EOF establishes completeness.
+
+    The context closes its iterator/result on every exit and borrows the caller's
+    transaction. It does not decode source records or establish publication.
+    """
+
+    async with _open_verified_parquet_parts(
+        session,
+        capture_bundle_id=capture_bundle_id,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+    ) as verified:
+        parts = _legacy_part_tuples(verified)
+        try:
+            yield parts
+        finally:
+            await parts.aclose()
+
+
+async def _legacy_part_tuples(verified):
+    async for part in verified:
+        yield part.receipt, part.ordinal, part.payload
+
+
+@asynccontextmanager
+async def open_segmented_parquet_parts(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+) -> AsyncIterator[AsyncIterator[SegmentedParquetPart]]:
+    """Yield sealed v2 parts with complete retained manifests and asserted metrics.
+
+    Complete store integrity requires iterator EOF. Actual decoded records and
+    whole-part Arrow accounting remain the replay consumer's responsibility.
+    """
+
+    async with _open_verified_parquet_parts(
+        session,
+        capture_bundle_id=capture_bundle_id,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+    ) as verified:
+        parts = _segmented_parts(verified)
+        try:
+            yield parts
+        finally:
+            await parts.aclose()
+
+
+async def _segmented_parts(verified):
+    async for part in verified:
+        if part.capture_manifest is None or part.record_count is None or part.arrow_byte_count is None:
+            raise CapturePayloadUnavailable("segmented replay requires a sealed v2 capture")
+        yield SegmentedParquetPart(
+            part.receipt,
+            part.ordinal,
+            SealedCapture(part.payload, part.capture_manifest),
+            part.record_count,
+            part.arrow_byte_count,
+        )
 
 
 async def load_replayable_parquet_bundle(
@@ -1018,28 +1253,26 @@ async def load_replayable_parquet_bundle(
     definition_revision_id: int,
     schema_revision_id: int,
 ) -> tuple[ReplayableParquetCapture, ...]:
-    """Load one exact durable bundle as in-memory parts, never a filesystem locator."""
+    """Load an exact complete durable bundle through the incremental verifier."""
 
-    identity = _identity(
+    receipts_by_stream: dict[str, CaptureReceipt] = {}
+    parts_by_stream: dict[str, list[bytes]] = {}
+    async with _open_verified_parquet_parts(
+        session,
+        capture_bundle_id=capture_bundle_id,
         dataset_id=dataset_id,
         definition_revision_id=definition_revision_id,
         schema_revision_id=schema_revision_id,
+    ) as parts:
+        async for part in parts:
+            if part.capture_manifest is not None:
+                raise CaptureStoreError("segmented captures require incremental replay")
+            receipt = part.receipt
+            receipts_by_stream[receipt.stream_id] = receipt
+            parts_by_stream.setdefault(receipt.stream_id, []).append(part.payload)
+    return _validate_replayable_parquet_captures(
+        tuple(
+            ReplayableParquetCapture(receipt=receipt, parts=tuple(parts_by_stream[stream_id]))
+            for stream_id, receipt in receipts_by_stream.items()
+        )
     )
-    capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
-    streams = await _validated_streams(session, identity)
-    await _validated_replayable_parquet_streams(session, identity, streams)
-    bundle = await _load_replayable_bundle_model(session, capture_bundle_id, identity)
-    captures_by_slot = await _load_replayable_captures_by_slot(session, capture_bundle_id, identity, streams)
-    payload_metadata_by_slot = _complete_payload_metadata_by_slot(captures_by_slot)
-    parts_by_slot = await _load_replayable_parts_by_slot(session, capture_bundle_id, streams)
-    replayable_captures, receipts_by_stream = _replayable_captures_from_rows(
-        bundle,
-        streams,
-        captures_by_slot,
-        payload_metadata_by_slot,
-        parts_by_slot,
-    )
-    prepared = _prepare_capture_bundle(identity, streams, receipts_by_stream)
-    if not _is_matching_bundle(bundle, prepared):
-        raise CaptureBundleConflict("durable capture bundle identity has drifted")
-    return _validate_replayable_parquet_captures(replayable_captures)
