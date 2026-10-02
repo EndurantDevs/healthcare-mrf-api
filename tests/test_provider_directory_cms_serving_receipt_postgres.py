@@ -30,7 +30,7 @@ _PIN = {
 
 
 def _migration(prefix):
-    path = next(_MIGRATIONS.glob(prefix + "*.py"))
+    (path,) = _MIGRATIONS.glob(prefix + "*.py")
     spec = importlib.util.spec_from_file_location("receipt_" + prefix, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -40,6 +40,12 @@ def _migration(prefix):
 def _apply(connection, prefix, function="upgrade"):
     with Operations.context(MigrationContext.configure(connection)):
         getattr(_migration(prefix), function)()
+
+
+def test_fixture_migration_rejects_ambiguous_prefix():
+    """A shared timestamp cannot silently select the wrong migration."""
+    with pytest.raises(ValueError, match="too many values"):
+        _migration("20260914120000")
 
 
 async def _create_scalar_tables(connection, schema):

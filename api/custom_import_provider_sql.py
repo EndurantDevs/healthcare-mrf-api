@@ -9,7 +9,8 @@ from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import bindparam
-from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.engine import BindTyping
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import BindParameter
 from sqlalchemy.sql.selectable import Select
@@ -65,8 +66,11 @@ def compile_npi_entity_relation(statement: Select) -> CompiledNpiEntityRelation:
         {},
         _replace_bind_parameter,
     )
+    # Apply driver casts only after the typed fragment is composed into native SQL.
+    dialect = PGDialect(paramstyle="named")
+    dialect.bind_typing = BindTyping.NONE
     compiled = rewritten.compile(
-        dialect=postgresql.dialect(paramstyle="named"),
+        dialect=dialect,
         compile_kwargs={"render_postcompile": True},
     )
     expanded = compiled.construct_expanded_state()
