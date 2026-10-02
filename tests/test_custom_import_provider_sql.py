@@ -112,6 +112,16 @@ def test_compiler_preserves_bool_numeric_uuid_date_and_json_types():
     assert isinstance(relation.typed_binds[3].type, Date)
     assert isinstance(relation.typed_binds[4].type, JSON)
 
+    native_statement = text(relation.sql).bindparams(*relation.typed_binds)
+    native_compiled = native_statement.compile(dialect=postgresql.asyncpg.dialect())
+
+    assert native_compiled.params == dict(relation.values)
+    assert set(native_compiled.positiontup) == set(relation.values)
+    assert "::UUID" in str(native_compiled)
+    assert "::JSON" in str(native_compiled)
+    for parameter in relation.typed_binds:
+        assert native_compiled.binds[parameter.key].type is parameter.type
+
 
 def test_merge_native_params_rejects_collisions_without_mutating_inputs():
     relation = compile_npi_entity_relation(select(_SAMPLE.c.id).where(_SAMPLE.c.id == bindparam("id", 3)))

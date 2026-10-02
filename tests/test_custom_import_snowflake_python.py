@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from asyncio import CancelledError
@@ -20,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from snowflake.connector.auth.keypair import AuthByKeyPair
 
 import process.custom_import.snowflake_python as snowflake_python
+from process.custom_import.capture import capture_stream, iter_records, verify_capture
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.snowflake import (
     SnowflakeConnectorError,
@@ -208,7 +210,7 @@ def _parquet_tables(result) -> list[dict[str, list[object]]]:
 
 def test_connector_import_accepts_the_project_pyarrow_version():
     completed = subprocess.run(
-        [sys.executable, "-W", "error::UserWarning", "-c", "import snowflake.connector"],
+        [sys.executable, "-W", "error::UserWarning", "-c", "import process.custom_import.snowflake_python"],
         capture_output=True,
         check=False,
         text=True,
@@ -216,6 +218,79 @@ def test_connector_import_accepts_the_project_pyarrow_version():
     )
 
     assert completed.returncode == 0, completed.stderr
+
+    unrelated = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::UserWarning",
+            "-c",
+            "import process.custom_import.snowflake_python; import warnings; warnings.warn('unrelated', UserWarning)",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert unrelated.returncode != 0
+    assert "UserWarning: unrelated" in unrelated.stderr
+
+
+@pytest.mark.parametrize(
+    "result_rows",
+    (
+        (
+            ("1003000126", True, 7, Decimal("123456789012345678.123456789012")),
+            ("1234567893", False, -7, Decimal("-12.500000000000")),
+            ("1999999999", None, None, None),
+        ),
+        (),
+    ),
+    ids=("scalar-null-values", "empty-schema"),
+)
+def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows):
+    """Real encoder and sealed replay preserve scalar types, nulls and cleanup."""
+
+    result_schema = (
+        SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),
+        SnowflakeResultColumn(field_id="active", source_type="BOOLEAN", nullable=True),
+        SnowflakeResultColumn(field_id="count", source_type="FIXED(18,0)", nullable=True),
+        SnowflakeResultColumn(field_id="amount", source_type="FIXED(38,12)", nullable=True),
+    )
+    stream = _definition().source_streams[0]
+    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(result_rows, result_schema)
+    with reader:
+        captured = capture_stream(reader, stream, source_snapshot_token="synthetic-snapshot")
+        assert not reader.closed
+    assert reader.closed
+    assert captured.payload
+    assert captured.manifest.compressed_bytes == captured.manifest.decoded_bytes == len(captured.payload)
+    assert (
+        captured.manifest.compressed_sha256
+        == captured.manifest.decoded_sha256
+        == hashlib.sha256(captured.payload).hexdigest()
+    )
+    assert captured.manifest.source_snapshot_token == "synthetic-snapshot"
+    verify_capture(captured, stream)
+    captured_records = list(iter_records(captured, stream))
+    assert [captured_record.ordinal for captured_record in captured_records] == list(range(1, len(result_rows) + 1))
+    assert [dict(captured_record.values) for captured_record in captured_records] == [
+        dict(zip((column.field_id for column in result_schema), result_row, strict=True)) for result_row in result_rows
+    ]
+    for captured_record, result_row in zip(captured_records, result_rows, strict=True):
+        assert [type(scalar_value) for scalar_value in captured_record.values.values()] == [
+            type(scalar_value) for scalar_value in result_row
+        ]
+        if result_row[3] is not None:
+            assert captured_record.values["amount"].as_tuple() == result_row[3].as_tuple()
+    with BytesIO(captured.payload) as replay_source, pq.ParquetFile(replay_source) as parquet_file:
+        replayed = parquet_file.read()
+        assert replayed.num_rows == len(result_rows)
+        assert replayed.column_names == [column.field_id for column in result_schema]
+        assert replayed.schema.types == [snowflake_python._arrow_type(column) for column in result_schema]
+        assert [field.nullable for field in replayed.schema] == [column.nullable for column in result_schema]
+        assert replayed.nbytes == arrow_bytes
+    assert replay_source.closed and parquet_file.closed
 
 
 def test_key_pair_authentication_signs_a_verifiable_token():
@@ -266,6 +341,7 @@ def test_adapter_fetches_one_generated_bundle_with_fixed_connection_policy(monke
         "warehouse": "IMPORT_WH",
         "autocommit": False,
         "client_session_keep_alive": False,
+        "ocsp_fail_open": True,
         "login_timeout": 30,
         "network_timeout": 120,
         "socket_timeout": 120,
@@ -702,6 +778,10 @@ def test_bundle_transport_rejects_invalid_stream_ownership_and_result_rows():
         ("bad", "result row"),
         ((1,), "result row"),
         ((0, 1, "root_source", None, "npi", None), "data row"),
+        ((1, True, "root_source", None, "npi", None), "stream ordinal"),
+        ((1, 2, "root_source", None, "npi", None), "stream ordinal"),
+        ((1, 1, "wrong", None, "npi", None), "stream identity"),
+        ((1, 1, "root_source", "unexpected-snapshot", "npi", None), "stream identity"),
     ):
         with pytest.raises(SnowflakeConnectorError, match=message):
             owner._split_row(result_row, 0)
