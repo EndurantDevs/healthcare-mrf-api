@@ -765,7 +765,6 @@ def test_manifest_and_capture_policy_boundaries_fail_closed(monkeypatch):
 def test_approved_relation_and_credential_value_contracts_reject_invalid_shapes():
     first = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="provider_npi")
     duplicate_field = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="other_npi")
-    duplicate_column = snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="provider_npi")
     relation = snowflake.SnowflakeRelation(database="raw_data", schema="public", name="providers")
 
     invalid_relations = (
@@ -773,7 +772,6 @@ def test_approved_relation_and_credential_value_contracts_reject_invalid_shapes(
         (relation, ()),
         (relation, (object(),)),
         (relation, (first, duplicate_field)),
-        (relation, (first, duplicate_column)),
     )
     for invalid_relation, columns in invalid_relations:
         with pytest.raises(snowflake.SnowflakeConnectorError):
@@ -795,6 +793,26 @@ def test_approved_relation_and_credential_value_contracts_reject_invalid_shapes(
         credential_by_field.update(changes)
         with pytest.raises(snowflake.SnowflakeCredentialError):
             snowflake.SnowflakeKeyPairCredentials(**credential_by_field)
+
+
+def test_shared_column_aliases_require_separate_reads():
+    original = _approved_relation()
+    shared = replace(
+        original,
+        columns=(original.columns[0], snowflake.SnowflakeDeclaredColumn("display_name", "provider_npi")),
+    )
+    connector = snowflake.SnowflakeAcquisitionConnector(
+        approved_relations=(shared,),
+        credential_provider=SimpleNamespace(load_key_pair=lambda: None),
+        adapter=SimpleNamespace(fetch_parquet=lambda *_args: None),
+    )
+    for field_id in ("npi", "display_name"):
+        request = connector.prepare_request(_definition(), relation=shared.relation, selected_field_ids=(field_id,))
+        assert connector.build_statement(request).sql == (
+            f'SELECT "PROVIDER_NPI" AS "{field_id}" FROM "RAW_DATA"."PUBLIC"."PROVIDERS"'
+        )
+    with pytest.raises(snowflake.SnowflakeConnectorError, match="read request column identifiers must be unique"):
+        connector.prepare_request(_definition(), relation=shared.relation, selected_field_ids=("npi", "display_name"))
 
 
 def test_fixed_provider_rejects_malformed_documents_and_descriptor_failures(tmp_path, monkeypatch):
@@ -896,6 +914,7 @@ def test_read_statement_result_and_manifest_types_fail_closed():
     relation = _approved_relation().relation
     column = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="provider_npi")
     duplicate = snowflake.SnowflakeDeclaredColumn(field_id="npi", column_identifier="other_npi")
+    duplicate_column = snowflake.SnowflakeDeclaredColumn(field_id="display_name", column_identifier="provider_npi")
     digest = _manifest_digest("digest")
 
     invalid_requests = (
@@ -903,6 +922,7 @@ def test_read_statement_result_and_manifest_types_fail_closed():
         {"relation": relation, "selected_columns": ()},
         {"relation": relation, "selected_columns": (object(),)},
         {"relation": relation, "selected_columns": (column, duplicate)},
+        {"relation": relation, "selected_columns": (column, duplicate_column)},
     )
     for changes in invalid_requests:
         with pytest.raises(snowflake.SnowflakeConnectorError):

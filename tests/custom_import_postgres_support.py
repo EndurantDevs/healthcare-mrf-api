@@ -72,6 +72,7 @@ _EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
     _ROOT / "alembic" / "versions" / "20260922010000_custom_import_execution_request_identity.py"
 )
 _SOURCE_BINDING_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260923030000_custom_import_source_binding.py"
+_SEGMENTED_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261002000000_custom_import_segmented_capture.py"
 
 
 def digest(label: str) -> bytes:
@@ -110,7 +111,7 @@ def _migration(path: Path, module_name: str):
     return module
 
 
-def _install_custom_import_migrations(sync_connection, schema_name: str) -> None:
+def _install_custom_import_migrations(sync_connection, schema_name: str, is_segmented_capture_enabled: bool) -> None:
     """Install the exact custom-import DDL needed by the focused PostgreSQL proofs."""
 
     for path, module_name in (
@@ -124,6 +125,17 @@ def _install_custom_import_migrations(sync_connection, schema_name: str) -> None
         migration._schema = lambda: schema_name
         migration.op = Operations(MigrationContext.configure(sync_connection))
         migration.upgrade()
+    if is_segmented_capture_enabled:
+        install_segmented_capture_migration(sync_connection, schema_name)
+
+
+def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
+    """Install segmented capture once, after any historical finality reconstruction."""
+
+    migration = _migration(_SEGMENTED_CAPTURE_MIGRATION_PATH, "custom_import_segmented_capture_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.upgrade()
 
 
 @asynccontextmanager
@@ -160,7 +172,9 @@ def _quoted_publication_schema(schema_name: str) -> str:
 
 
 @asynccontextmanager
-async def isolated_publication_case() -> AsyncIterator[IsolatedPublicationCase]:
+async def isolated_publication_case(
+    *, is_segmented_capture_enabled: bool = True
+) -> AsyncIterator[IsolatedPublicationCase]:
     """Create an exact disposable schema for committed multi-session races."""
 
     raw_engine = create_async_engine(_database_url(), pool_pre_ping=True)
@@ -174,7 +188,7 @@ async def isolated_publication_case() -> AsyncIterator[IsolatedPublicationCase]:
             await connection.execute(text(f"CREATE SCHEMA {quoted_schema}"))
         is_schema_created = True
         async with raw_engine.begin() as connection:
-            await connection.run_sync(_install_custom_import_migrations, schema_name)
+            await connection.run_sync(_install_custom_import_migrations, schema_name, is_segmented_capture_enabled)
         yield IsolatedPublicationCase(
             engine=engine,
             sessions=sessions,
@@ -1183,6 +1197,7 @@ __all__ = (
     "attach_generation_family",
     "digest",
     "execution_state",
+    "install_segmented_capture_migration",
     "isolated_publication_case",
     "lease_digest",
     "seed_publication_graph",

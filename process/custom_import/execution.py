@@ -31,7 +31,12 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.custom_import import CustomImportDataset, CustomImportExecution, CustomImportLease
+from db.models.custom_import import (
+    CustomImportCaptureBundle,
+    CustomImportDataset,
+    CustomImportExecution,
+    CustomImportLease,
+)
 
 DEFAULT_LEASE_SECONDS = 300
 MAX_LEASE_SECONDS = 3_600
@@ -880,6 +885,14 @@ async def _submit_execution(
     # The INSERT itself can wait on a competing idempotency row.  Serialize it
     # beneath the dataset lock so no execution/lease lock precedes that parent.
     await _lock_dataset(session, request.dataset_id)
+    if request.capture_bundle_id is not None:
+        await _require_sealed_capture_bundle(
+            session,
+            capture_bundle_id=request.capture_bundle_id,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+        )
     inserted_execution_id = await _insert_execution(session, request)
     is_created = inserted_execution_id is not None
     execution = await _locked_submission_execution(session, request, inserted_execution_id)
@@ -893,6 +906,31 @@ async def _submit_execution(
         raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
     await _ensure_lease(session, execution.execution_id)
     return _submission_result(execution, is_created=is_created)
+
+
+async def _require_sealed_capture_bundle(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+) -> None:
+    bundle = (
+        await session.execute(
+            select(CustomImportCaptureBundle)
+            .where(
+                CustomImportCaptureBundle.capture_bundle_id == capture_bundle_id,
+                CustomImportCaptureBundle.dataset_id == dataset_id,
+                CustomImportCaptureBundle.definition_revision_id == definition_revision_id,
+                CustomImportCaptureBundle.schema_revision_id == schema_revision_id,
+                CustomImportCaptureBundle.capture_state == "sealed",
+            )
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if bundle is None or bundle.capture_state != "sealed":
+        raise ExecutionInvariantError("execution capture must be an exact sealed bundle")
 
 
 async def _lock_current_capture_binding(
@@ -994,6 +1032,13 @@ async def bind_execution_capture_bundle(
     if binding_context is None:
         return None
     execution, state, now = binding_context
+    await _require_sealed_capture_bundle(
+        session,
+        capture_bundle_id=capture_bundle_id,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+    )
     return await _bind_locked_capture_bundle(
         session,
         execution=execution,

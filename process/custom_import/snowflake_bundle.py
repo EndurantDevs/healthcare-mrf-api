@@ -15,6 +15,7 @@ from process.custom_import._source_text import _SourceTextValidationError, valid
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CONTRACT_VERSION, CustomImportDefinition, Field, SourceStream
 from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
+from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import (
     DEFAULT_CAPTURE_LIMITS,
     MAX_APPROVED_RELATIONS,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from process.custom_import.capture_store import ReplayableParquetCapture
 
 BUNDLE_CONNECTOR_CONTRACT = "custom-import/snowflake-bundle-acquisition/v1"
+BUNDLE_V2_CONNECTOR_CONTRACT = "custom-import/snowflake-bundle-acquisition/v2"
 PARQUET_COMPRESSION = "zstd"
 DEFAULT_PARTITION_ROWS = 1_024
 MAX_PARTITION_ROWS = 1_000_000
@@ -91,7 +93,9 @@ def _snapshot_token(value: object) -> str:
         raise SnowflakeBundleError("source snapshot token is invalid") from exc
 
 
-def _canonical_identity(domain: str, document: dict[str, Any]) -> tuple[str, str]:
+def _canonical_identity(
+    domain: str, document: dict[str, Any], *, contract: str = BUNDLE_CONNECTOR_CONTRACT
+) -> tuple[str, str]:
     try:
         canonical = json.dumps(
             document,
@@ -105,9 +109,7 @@ def _canonical_identity(domain: str, document: dict[str, Any]) -> tuple[str, str
         raise SnowflakeBundleError("bundle identity cannot be canonically serialized") from exc
     if len(encoded) > MAX_MANIFEST_CANONICAL_BYTES:
         raise SnowflakeBundleError("bundle identity exceeds the canonical byte limit")
-    digest = hashlib.sha256(
-        f"{CONTRACT_VERSION}\x00{BUNDLE_CONNECTOR_CONTRACT}\x00{domain}\x00".encode("ascii") + encoded
-    ).hexdigest()
+    digest = hashlib.sha256(f"{CONTRACT_VERSION}\x00{contract}\x00{domain}\x00".encode("ascii") + encoded).hexdigest()
     return canonical, digest
 
 
@@ -395,6 +397,7 @@ class SnowflakeBundleRequest:
     bindings: tuple[SnowflakeBundleBinding, ...]
     encoding: SnowflakeBundleEncoding = DEFAULT_BUNDLE_ENCODING
     capture_limits: CaptureLimits = field(default=DEFAULT_CAPTURE_LIMITS, repr=False)
+    processing_policy: ProcessingPolicy | None = field(default=None, repr=False)
     canonical_request: str = field(init=False, repr=False)
     request_sha256: str = field(init=False)
 
@@ -409,6 +412,14 @@ class SnowflakeBundleRequest:
         if not isinstance(self.encoding, SnowflakeBundleEncoding):
             raise SnowflakeBundleError("bundle encoding must use the declared encoding type")
         capture_limits = _capture_limits(self.capture_limits)
+        if self.processing_policy is not None:
+            if not isinstance(self.processing_policy, ProcessingPolicy):
+                raise SnowflakeBundleError("bundle processing policy must use the declared policy type")
+            try:
+                policy = ProcessingPolicy.from_mapping(self.processing_policy.to_mapping())
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise SnowflakeBundleError("bundle processing policy is invalid") from exc
+            object.__setattr__(self, "processing_policy", policy)
 
         streams_by_id = {stream.stream_id: stream for stream in self.definition.source_streams}
         bindings_by_stream = {binding.stream_id: binding for binding in self.bindings}
@@ -435,16 +446,24 @@ class SnowflakeBundleRequest:
                 for binding in bindings
             ],
             "capture_limits": _capture_limits_document(capture_limits),
-            "contract": BUNDLE_CONNECTOR_CONTRACT,
+            "contract": self.contract,
             "definition_sha256": self.definition.digest,
             "encoding": self.encoding.as_identity_document(),
             "schema_sha256": self.definition.schema_digest,
         }
-        canonical, digest = _canonical_identity("request", request_identity_by_key)
+        if self.processing_policy is not None:
+            request_identity_by_key["processing_policy"] = self.processing_policy.to_mapping()
+        canonical, digest = _canonical_identity("request", request_identity_by_key, contract=self.contract)
         object.__setattr__(self, "bindings", bindings)
         object.__setattr__(self, "capture_limits", capture_limits)
         object.__setattr__(self, "canonical_request", canonical)
         object.__setattr__(self, "request_sha256", digest)
+
+    @property
+    def contract(self) -> str:
+        """Keep the legacy wire identity unless a complete policy explicitly selects v2."""
+
+        return BUNDLE_CONNECTOR_CONTRACT if self.processing_policy is None else BUNDLE_V2_CONNECTOR_CONTRACT
 
 
 def _normalized_bundle_bindings(
@@ -502,6 +521,7 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
                 parquet_compression=request.encoding.parquet_compression,
             ),
             capture_limits=request.capture_limits,
+            processing_policy=request.processing_policy,
         )
     except (AttributeError, TypeError) as exc:
         raise SnowflakeBundleError("bundle request seal is invalid") from exc
@@ -513,6 +533,22 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
 def _stream_field_ids(definition: CustomImportDefinition, stream: SourceStream) -> tuple[str, ...]:
     fields = tuple(field for field in definition.fields if field.collection == stream.child_collection)
     return tuple(field.field_id for field in sorted(fields, key=lambda field: field.field_slot))
+
+
+def _validate_stream_column_uniqueness(
+    binding: SnowflakeBundleBinding,
+    selected_columns: tuple[SnowflakeDeclaredColumn, ...],
+    snapshot_column: SnowflakeDeclaredColumn | None,
+) -> None:
+    column_identifiers = tuple(column.column_identifier for column in selected_columns)
+    if (
+        snapshot_column is not None
+        and binding.source_snapshot_token_relation == binding.relation
+        and snapshot_column.field_id not in binding.selected_field_ids
+    ):
+        column_identifiers += (snapshot_column.column_identifier,)
+    if len(column_identifiers) != len(set(column_identifiers)):
+        raise SnowflakeBundleError("bundle statement column identifiers must be unique within each stream")
 
 
 @dataclass(frozen=True)
@@ -527,6 +563,8 @@ class SnowflakeBundleStatement:
     statement_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
+        """Validate stream-local mappings before generating the fixed bundle SQL."""
+
         if not isinstance(self.request, SnowflakeBundleRequest):
             raise SnowflakeBundleError("bundle statement requires a declared bundle request")
         if not isinstance(self.selected_columns_by_stream, tuple) or len(self.selected_columns_by_stream) != len(
@@ -562,6 +600,8 @@ class SnowflakeBundleStatement:
                     raise SnowflakeBundleError(
                         "bundle statement snapshot column does not match semantic token metadata"
                     )
+            if self.request.processing_policy is not None:
+                _validate_stream_column_uniqueness(binding, selected_columns, snapshot_column)
 
         sql = _bundle_sql(
             self.request,
@@ -569,11 +609,11 @@ class SnowflakeBundleStatement:
             self.source_snapshot_token_columns_by_stream,
         )
         statement_identity_by_key = {
-            "contract": BUNDLE_CONNECTOR_CONTRACT,
+            "contract": self.request.contract,
             "request_sha256": self.request.request_sha256,
             "sql": sql,
         }
-        canonical, digest = _canonical_identity("statement", statement_identity_by_key)
+        canonical, digest = _canonical_identity("statement", statement_identity_by_key, contract=self.request.contract)
         object.__setattr__(self, "sql", sql)
         object.__setattr__(self, "canonical_statement", canonical)
         object.__setattr__(self, "statement_sha256", digest)
@@ -603,6 +643,62 @@ def _validated_bundle_statement(statement: object) -> SnowflakeBundleStatement:
     return rebuilt
 
 
+def _snapshot_token_expression(
+    relation: SnowflakeRelation | None,
+    column: SnowflakeDeclaredColumn | None,
+    *,
+    processing_policy: ProcessingPolicy | None = None,
+) -> str:
+    """Retain legacy scalar SQL; explicit policies encode native scalar identities.
+
+    Type tags keep text distinct from typed values. Explicit temporal formats
+    retain nanoseconds without session formatting; unsupported types fail closed.
+    The outer SELECT must not deduplicate converted values or discard nulls.
+    """
+
+    if column is None:
+        return "CAST(NULL AS TEXT)"
+    if processing_policy is None:
+        return f"(SELECT {_quoted_identifier(column.column_identifier)} FROM {relation.quoted_sql})"
+    native_variant = 'TO_VARIANT("__ci_snapshot_native")'
+    timestamp_format = "'UUUU-MM-DD\"T\"HH24:MI:SS.FF9'"
+    expressions_by_type = {
+        "VARCHAR": f"'VARCHAR:' || NULLIF(AS_VARCHAR({native_variant}), '')",
+        "INTEGER": f"'NUMBER:' || TO_JSON({native_variant})",
+        "DECIMAL": f"'NUMBER:' || TO_JSON({native_variant})",
+        "BOOLEAN": f"'BOOLEAN:' || TO_JSON({native_variant})",
+        "DATE": f"'DATE:' || TO_CHAR(AS_DATE({native_variant}), 'UUUU-MM-DD')",
+        "TIME": f"'TIME:' || TO_CHAR(AS_TIME({native_variant}), 'HH24:MI:SS.FF9')",
+        "TIMESTAMP_NTZ": f"'TIMESTAMP_NTZ:' || TO_CHAR(AS_TIMESTAMP_NTZ({native_variant}), {timestamp_format})",
+        **{
+            kind: f"'{kind}:' || TO_CHAR(CONVERT_TIMEZONE('UTC', AS_{kind}({native_variant})), {timestamp_format})"
+            for kind in ("TIMESTAMP_LTZ", "TIMESTAMP_TZ")
+        },
+    }
+    cases = " ".join(f"WHEN '{kind}' THEN {expression}" for kind, expression in expressions_by_type.items())
+    return (
+        f"(SELECT CASE TYPEOF({native_variant}) {cases} ELSE NULL END FROM "
+        f'(SELECT DISTINCT {_quoted_identifier(column.column_identifier)} AS "__ci_snapshot_native" '
+        f'FROM {relation.quoted_sql}) AS "__ci_snapshot_values")'
+    )
+
+
+def _bundle_source_field_ids(
+    request: SnowflakeBundleRequest,
+    selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
+) -> dict[str, str]:
+    """Preserve legacy stream columns; explicit policies share physical scalar reads."""
+
+    if request.processing_policy is None:
+        return {column.field_id: column.field_id for columns in selected_columns_by_stream for column in columns}
+    fields_by_source = {}
+    return {
+        column.field_id: fields_by_source.setdefault((binding.relation, column.column_identifier), column.field_id)
+        for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True)
+        for column in columns
+    }
+
+
 def _bundle_sql_branches(
     request: SnowflakeBundleRequest,
     fields: tuple[Field, ...],
@@ -610,6 +706,13 @@ def _bundle_sql_branches(
     source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...],
 ) -> tuple[list[str], list[str]]:
     metadata_branches, data_branches = [], []
+    source_fields = _bundle_source_field_ids(request, selected_columns_by_stream)
+    columns_by_source = {}
+    for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True):
+        source_key = binding.stream_id if request.processing_policy is None else binding.relation
+        columns_by_source.setdefault(source_key, {}).update(
+            (column.field_id, column) for column in columns if source_fields[column.field_id] == column.field_id
+        )
     for ordinal, (binding, selected_columns, snapshot_column) in enumerate(
         zip(
             request.bindings,
@@ -619,14 +722,8 @@ def _bundle_sql_branches(
         ),
         start=1,
     ):
-        selected_by_field = {column.field_id: column for column in selected_columns}
-        snapshot_token_expression = (
-            "CAST(NULL AS TEXT)"
-            if snapshot_column is None
-            else (
-                f"(SELECT {_quoted_identifier(snapshot_column.column_identifier)} "
-                f"FROM {binding.source_snapshot_token_relation.quoted_sql})"
-            )
+        snapshot_token_expression = _snapshot_token_expression(
+            binding.source_snapshot_token_relation, snapshot_column, processing_policy=request.processing_policy
         )
         metadata_values = [
             f"{_METADATA_ROW_KIND} AS {_quoted_identifier(_BUNDLE_ROW_KIND_COLUMN)}",
@@ -636,6 +733,10 @@ def _bundle_sql_branches(
             *(f"NULL AS {_quoted_identifier(field.field_id)}" for field in fields),
         ]
         metadata_branches.append(f"SELECT {', '.join(metadata_values)}")
+        source_key = binding.stream_id if request.processing_policy is None else binding.relation
+        selected_by_field = columns_by_source.pop(source_key, None)
+        if selected_by_field is None:
+            continue
         data_values = [
             f"{_DATA_ROW_KIND} AS {_quoted_identifier(_BUNDLE_ROW_KIND_COLUMN)}",
             f"{ordinal} AS {_quoted_identifier(_STREAM_ORDINAL_COLUMN)}",
@@ -660,7 +761,7 @@ def _bundle_sql(
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
     source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...],
 ) -> str:
-    """Render the fixed metadata-and-data union for one approved bundle."""
+    """Preserve legacy stream reads; an explicit policy reads each relation once."""
 
     fields = tuple(sorted(request.definition.fields, key=lambda field: field.field_slot))
     output_columns = (
@@ -995,6 +1096,7 @@ class SnowflakeBundleStatementBuilder:
         *,
         bindings: tuple[SnowflakeBundleBinding, ...],
         encoding: SnowflakeBundleEncoding = DEFAULT_BUNDLE_ENCODING,
+        processing_policy: ProcessingPolicy | None = None,
     ) -> SnowflakeBundleRequest:
         """Validate definition-owned stream configuration before generating SQL."""
 
@@ -1003,6 +1105,7 @@ class SnowflakeBundleStatementBuilder:
             bindings=bindings,
             encoding=encoding,
             capture_limits=self._capture_limits,
+            processing_policy=processing_policy,
         )
 
     def build_statement(self, request: SnowflakeBundleRequest) -> SnowflakeBundleStatement:

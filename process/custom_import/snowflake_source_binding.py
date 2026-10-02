@@ -22,6 +22,8 @@ from process.custom_import.snowflake import SnowflakeApprovedRelation, Snowflake
 from process.custom_import.snowflake_binding import (
     SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
     SOURCE_BINDING_CONTRACT,
+    SOURCE_BINDING_CONTRACTS,
+    SOURCE_BINDING_V2_CONTRACT,
     SnowflakeSourceBinding,
     SnowflakeSourceBindingError,
 )
@@ -31,6 +33,8 @@ __all__ = (
     "LoadedSnowflakeSourceBinding",
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
     "SOURCE_BINDING_CONTRACT",
+    "SOURCE_BINDING_CONTRACTS",
+    "SOURCE_BINDING_V2_CONTRACT",
     "SnowflakeSourceBinding",
     "SnowflakeSourceBindingError",
     "SnowflakeSourceBindingReceipt",
@@ -99,7 +103,7 @@ def _loaded_snowflake_source_binding(
         source_binding_revision_id = _positive_id(binding_row.source_binding_revision_id)
         _positive_id(binding_row.revision_number)
         if (
-            binding_row.binding_contract != SOURCE_BINDING_CONTRACT
+            binding_row.binding_contract not in SOURCE_BINDING_CONTRACTS
             or binding_row.connector_kind != SNOWFLAKE_SOURCE_BINDING_CONNECTOR
             or definition_row.dataset_id != dataset_id
             or definition_row.definition_revision_id != definition_revision_id
@@ -112,7 +116,8 @@ def _loaded_snowflake_source_binding(
         binding = SnowflakeSourceBinding.from_json(binding_row.canonical_binding)
         binding_sha256 = bytes.fromhex(binding.digest)
         if (
-            binding_row.canonical_binding != binding.canonical
+            binding_row.binding_contract != binding.contract
+            or binding_row.canonical_binding != binding.canonical
             or not _has_matching_digest(binding_row.binding_sha256, binding_sha256)
             or not _has_matching_digest(binding_row.definition_sha256, bytes.fromhex(binding.definition_sha256))
             or not _has_matching_digest(binding_row.schema_sha256, bytes.fromhex(binding.schema_sha256))
@@ -333,7 +338,7 @@ async def register_snowflake_source_binding(
             definition_revision_id=definition_registration.definition_revision_id,
             schema_revision_id=definition_registration.schema_revision_id,
             revision_number=_next_binding_revision(binding_revisions),
-            binding_contract=SOURCE_BINDING_CONTRACT,
+            binding_contract=canonical_binding.contract,
             connector_kind=SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
             definition_sha256=bytes.fromhex(canonical_binding.definition_sha256),
             schema_sha256=bytes.fromhex(canonical_binding.schema_sha256),

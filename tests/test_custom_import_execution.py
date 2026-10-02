@@ -67,6 +67,7 @@ class _SyntheticSession:
         self.executions: dict[int, SimpleNamespace] = {}
         self.execution_by_request: dict[tuple[int, str], SimpleNamespace] = {}
         self.leases: dict[int, SimpleNamespace] = {}
+        self.capture_state = "sealed"
         self.statements: list[Any] = []
         self._next_execution_id = 1
 
@@ -146,6 +147,8 @@ class _SyntheticSession:
             return _Result(self.execution_by_request.get((where["definition_revision_id"], where["idempotency_key"])))
         if table_name == "custom_import_lease":
             return _Result(self.leases.get(where["execution_id"]))
+        if table_name == "custom_import_capture_bundle":
+            return _Result(SimpleNamespace(capture_state=self.capture_state))
         raise AssertionError(f"unexpected select table: {table_name}")
 
     def _update(self, statement: Any) -> _Result:
@@ -501,6 +504,45 @@ async def test_reservation_replays_its_bound_execution():
         created=False,
         capture_bundle_id=44,
     )
+
+
+@pytest.mark.asyncio
+async def test_pending_capture_cannot_be_submitted_or_bound():
+    session = _SyntheticSession()
+    session.capture_state = "pending"
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="sealed"):
+        await lifecycle.create_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-pending-capture",
+            mechanism="local",
+            capture_bundle_id=44,
+        )
+    assert session.executions == {}
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-pending-reservation",
+        mechanism="local",
+    )
+    lease = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER_A)
+    assert lease is not None
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="sealed"):
+        await lifecycle.bind_execution_capture_bundle(
+            session,
+            execution_id=reserved.execution_id,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            capture_bundle_id=44,
+            fence=lease.fence,
+            token=_WORKER_A,
+        )
+    assert session.executions[reserved.execution_id].capture_bundle_id is None
 
 
 @pytest.mark.asyncio

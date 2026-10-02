@@ -650,11 +650,29 @@ _MATERIALIZATION_VOLATILE_COLUMNS = frozenset(
         "updated_at",
     }
 )
+_CAPTURE_MATERIALIZATION_COLUMNS = {
+    CustomImportCaptureBundle: ("canonical_manifest", "manifest_sha256", "stream_count"),
+    CustomImportCapture: (
+        "stream_slot",
+        "content_sha256",
+        "byte_count",
+        "canonical_manifest",
+        "manifest_sha256",
+        "payload_contract",
+        "payload_part_count",
+        "payload_set_sha256",
+    ),
+}
 
 
 def _materialization_document(model: Any) -> dict[str, Any]:
     """Encode retained semantic content without database allocation artifacts."""
 
+    # Capture lifecycle columns must not silently change retained v1 digests.
+    # New capture evidence belongs in its explicitly versioned manifest.
+    columns = _CAPTURE_MATERIALIZATION_COLUMNS.get(type(model))
+    if columns is not None:
+        return {name: _json_value(getattr(model, name)) for name in columns}
     return _model_document(
         model,
         omit=_MATERIALIZATION_IDENTITY_COLUMNS | _MATERIALIZATION_VOLATILE_COLUMNS,
@@ -737,7 +755,7 @@ async def _capture_bundle_for_identity(
     definition_revision_id: int,
     schema_revision_id: int,
 ) -> CustomImportCaptureBundle:
-    """Load the bundle only when it has the execution's immutable identity."""
+    """Load a sealed bundle matching the execution's immutable identity."""
 
     bundle = (
         await session.execute(
@@ -751,6 +769,8 @@ async def _capture_bundle_for_identity(
     ).scalar_one_or_none()
     if bundle is None:
         raise PublicationConflict("capture bundle does not match immutable execution identity")
+    if bundle.capture_state != "sealed":
+        raise PublicationConflict("capture bundle is not sealed")
     return bundle
 
 
@@ -921,15 +941,20 @@ async def _add_generation_identity_material(
 
     definition = await session.get(CustomImportDefinitionRevision, generation.definition_revision_id)
     schema_revision = await session.get(CustomImportSchemaRevision, generation.schema_revision_id)
-    capture_bundle = await session.get(CustomImportCaptureBundle, generation.capture_bundle_id)
     if (
         definition is None
         or schema_revision is None
-        or capture_bundle is None
         or definition.dataset_id != generation.dataset_id
         or schema_revision.dataset_id != generation.dataset_id
     ):
         raise PublicationConflict("generation definition or schema identity is missing")
+    capture_bundle = await _capture_bundle_for_identity(
+        session,
+        capture_bundle_id=generation.capture_bundle_id,
+        dataset_id=generation.dataset_id,
+        definition_revision_id=generation.definition_revision_id,
+        schema_revision_id=generation.schema_revision_id,
+    )
     _add_digest_record(digest, "generation", _materialization_document(generation))
     _add_digest_record(digest, "definition", _materialization_document(definition))
     _add_digest_record(digest, "schema", _materialization_document(schema_revision))

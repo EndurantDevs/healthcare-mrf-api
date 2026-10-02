@@ -4,16 +4,17 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import subprocess
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
-import datetime as dt
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import func, select
@@ -30,8 +31,10 @@ from db.models.custom_import import (
 from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition
 from process.custom_import.definition_store import DefinitionRegistrationError
 from process.custom_import.execution import ExecutionSubmission
+from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.runner import CandidateRunResult
 from tests.custom_import_postgres_support import isolated_publication_case
+from tests.test_custom_import_processing_policy import _policy_document
 
 
 def _definition() -> CustomImportDefinition:
@@ -120,6 +123,12 @@ def _binding_receipt(
         ),
         created=created,
     )
+
+
+def _configured_loaded_binding():
+    loaded = _loaded_binding()
+    binding = replace(loaded.binding, processing_policy=ProcessingPolicy.from_mapping(_policy_document()))
+    return replace(loaded, binding=binding, source_binding_sha256=bytes.fromhex(binding.digest))
 
 
 class _Database:
@@ -352,6 +361,53 @@ async def test_operator_composes_only_retained_configuration_and_generated_sql(m
     assert 'FROM "SYNTHETIC"."PUBLIC"."ROOT_SNAPSHOTS"' in captured_by_key["statement"].sql
     assert "SELECT" in captured_by_key["statement"].sql
     assert "DROP" not in captured_by_key["statement"].sql
+
+
+@pytest.mark.parametrize("operation", ("execute", "resume"))
+@pytest.mark.parametrize("configured", (False, True))
+async def test_operator_dispatches_only_the_retained_processing_policy(monkeypatch, operation, configured):
+    loaded = _configured_loaded_binding() if configured else _loaded_binding()
+    database = _resume_database(loaded)
+    _install_resume_preflight(monkeypatch, database, loaded)
+    expected = CandidateRunResult(status="sealed_unpublished", execution_id=40)
+    legacy_runner, segmented_runner = AsyncMock(return_value=expected), AsyncMock(return_value=expected)
+    forbidden = Mock(side_effect=AssertionError("resume must not construct source or credential access"))
+    monkeypatch.setattr(operator_cli, "run_snowflake_bundle_candidate", legacy_runner)
+    monkeypatch.setattr(operator_cli, "run_segmented_snowflake_candidate", segmented_runner)
+    monkeypatch.setattr(
+        operator_cli,
+        "FixedLocalKeyPairCredentialProvider",
+        _CredentialProvider if operation == "execute" else forbidden,
+    )
+    monkeypatch.setattr(
+        operator_cli, "SnowflakePythonConnectorAdapter", _Adapter if operation == "execute" else forbidden
+    )
+    operations_by_name = {
+        "execute": operator_cli._run_retained_snowflake_binding,
+        "resume": operator_cli._run_resumed_snowflake_binding,
+    }
+    assert (
+        await operations_by_name[operation](
+            definition_revision_id=loaded.definition_revision_id,
+            source_binding_revision_id=loaded.source_binding_revision_id,
+            idempotency_key="synthetic-resume",
+            database=database,
+        )
+        == expected
+    )
+    selected, unselected = (segmented_runner, legacy_runner) if configured else (legacy_runner, segmented_runner)
+    selected.assert_awaited_once()
+    unselected.assert_not_awaited()
+    session_factory, connector, request = selected.await_args.args
+    assert session_factory == database.session
+    assert request.definition == loaded.definition and request.source_binding_sha256 == loaded.source_binding_sha256
+    assert request.source_binding_revision_id == loaded.source_binding_revision_id
+    assert selected.await_args.kwargs == ({"processing_policy": loaded.binding.processing_policy} if configured else {})
+    assert request.bundle_request.processing_policy == loaded.binding.processing_policy
+    assert connector.build_statement(request.bundle_request).request == request.bundle_request
+    if operation == "resume":
+        forbidden.assert_not_called()
+    assert database.connected == database.disconnected == 1
 
 
 @pytest.mark.parametrize(
@@ -706,7 +762,7 @@ async def test_resume_replays_only_the_exact_bound_capture_without_source_access
     assert request.idempotency_key == "synthetic-resume"
     assert captured_by_key["statement"].request == request.bundle_request
     assert database.resume_lookup_arguments["source_binding_revision_id"] == loaded.source_binding_revision_id
-    assert database.resume_lookup_arguments["request_identity_sha256"] == operator_cli.bundle_request_identity_sha256(
+    assert database.resume_lookup_arguments["request_identity_sha256"] == operator_cli.configured_request_identity(
         request.bundle_request,
         captured_by_key["statement"],
         source_binding_sha256=loaded.source_binding_sha256,
@@ -723,6 +779,12 @@ def test_resume_connector_refuses_source_acquisition():
 
     with pytest.raises(AssertionError, match="resume must not acquire a source"):
         connector.acquire(bundle_request)
+    with pytest.raises(AssertionError, match="resume must not acquire a source"):
+        connector._credential_provider.load_key_pair()
+    with pytest.raises(AssertionError, match="resume must not acquire a source"):
+        connector._adapter.fetch_bundle(object())
+    with pytest.raises(AssertionError, match="resume must not acquire a source"):
+        connector._adapter.open_bundle_landing(object())
 
 
 @pytest.mark.asyncio
