@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from copy import deepcopy
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
-import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,7 @@ import pytest
 from process.custom_import import snowflake_preflight
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import MAX_SCALAR_INTEGER, MIN_SCALAR_INTEGER, FamilyRejection
+from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import SnowflakeApprovedRelation, SnowflakeConnectorError, SnowflakeDeclaredColumn
 from process.custom_import.snowflake_bundle import (
     DEFAULT_BUNDLE_ENCODING,
@@ -22,6 +25,7 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleBinding,
     SnowflakeBundleRequest,
     SnowflakeBundleStatementBuilder,
+    _snapshot_token_expression,
 )
 from process.custom_import.snowflake_preflight import (
     SnowflakePreflightError,
@@ -33,12 +37,13 @@ from process.custom_import.snowflake_preflight import (
     SnowflakePreflightValidation,
     preflight_snowflake_bundle,
 )
+from process.custom_import.snowflake_preflight_schema import validate_preflight_result_schema
 from process.custom_import.snowflake_source_binding import (
     SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
     SOURCE_BINDING_CONTRACT,
     SnowflakeSourceBinding,
 )
-from process.custom_import.snowflake_preflight_schema import validate_preflight_result_schema
+from tests.test_custom_import_processing_policy import _policy_document
 
 _TOKEN = "synthetic-snapshot"
 
@@ -176,8 +181,10 @@ class _Adapter:
 class _TokenDroppingConnector(SnowflakeBundleAcquisitionConnector):
     """Synthetic connector that attempts to replace a configured token relation."""
 
-    def prepare_request(self, definition, *, bindings, encoding=DEFAULT_BUNDLE_ENCODING):
-        request = super().prepare_request(definition, bindings=bindings, encoding=encoding)
+    def prepare_request(self, definition, *, bindings, encoding=DEFAULT_BUNDLE_ENCODING, processing_policy=None):
+        request = super().prepare_request(
+            definition, bindings=bindings, encoding=encoding, processing_policy=processing_policy
+        )
         return SnowflakeBundleRequest(
             definition=request.definition,
             bindings=tuple(
@@ -192,11 +199,12 @@ class _TokenDroppingConnector(SnowflakeBundleAcquisitionConnector):
             ),
             encoding=request.encoding,
             capture_limits=request.capture_limits,
+            processing_policy=request.processing_policy,
         )
 
 
 class _InvalidRequestConnector(SnowflakeBundleAcquisitionConnector):
-    def prepare_request(self, definition, *, bindings, encoding=DEFAULT_BUNDLE_ENCODING):
+    def prepare_request(self, definition, *, bindings, encoding=DEFAULT_BUNDLE_ENCODING, processing_policy=None):
         return object()
 
 
@@ -317,7 +325,9 @@ def _connector(
 def _bundle_statement(definition, binding):
     connector = _connector(definition, binding)
     approved_relations, bundle_bindings = binding.bundle_components(definition)
-    request = connector.prepare_request(definition, bindings=bundle_bindings)
+    request = connector.prepare_request(
+        definition, bindings=bundle_bindings, processing_policy=binding.processing_policy
+    )
     return connector.build_statement(request), request, approved_relations
 
 
@@ -333,6 +343,164 @@ def test_statement_builder_matches_acquisition_connector_sql():
 
     assert builder_request == connector_request
     assert builder.build_statement(builder_request) == connector.build_statement(connector_request)
+
+
+def _shared_relation_binding():
+    definition_document = deepcopy(_DEFINITION_DOCUMENT)
+    for stream_id, aliases in definition_document["aliases"].items():
+        prefix = stream_id.removesuffix("_source").upper()
+        aliases["NPI"] = aliases.pop(f"{prefix}_NPI")
+        aliases["EDITION"] = aliases.pop(f"{prefix}_EDITION")
+    definition = CustomImportDefinition.from_mapping(definition_document)
+    binding_document = json.loads(_binding(definition).canonical)
+    for stream in binding_document["streams"]:
+        stream["relation"] = ["synthetic", "public", "family_records"]
+        stream["source_snapshot_token_relation"] = ["synthetic", "public", "snapshot_tokens"]
+        stream["source_snapshot_token_column_identifier"] = "SNAPSHOT_TOKEN"
+        for column in stream["columns"]:
+            suffix = column["column_identifier"].split("_", 1)[-1]
+            if suffix in {"NPI", "EDITION"}:
+                column["column_identifier"] = suffix
+    return definition, SnowflakeSourceBinding.from_mapping(binding_document)
+
+
+def test_shared_columns_preserve_stream_scopes():
+    """Keep preview stream scopes while bundle data projects each physical column once."""
+
+    definition, binding = _shared_relation_binding()
+    binding = replace(binding, processing_policy=ProcessingPolicy.from_mapping(_policy_document()))
+    bundle, _request, approved_relations = _bundle_statement(definition, binding)
+    adapter = _Adapter(_complete_rows)
+
+    preflight_result = preflight_snowflake_bundle(
+        definition,
+        binding,
+        SnowflakeBundleStatementBuilder(approved_relations=approved_relations),
+        adapter,
+        limits=SnowflakePreflightLimits(maximum_root_keys=1, maximum_child_rows=2),
+    )
+
+    assert len(approved_relations) == 2
+    assert preflight_result.status == "complete"
+    assert preflight_result.rejection_diagnostics == ()
+    family = preflight_result.sample.families[0]
+    assert family.root["npi"] == family.children["details"][0]["detail_npi"]
+    assert family.root["npi"] == family.children["notes"][0]["note_npi"]
+    preview, _timeout = adapter.calls[0]
+    for ordinal, field_id in enumerate(("npi", "detail_npi", "note_npi"), start=1):
+        assert any(
+            column.field_id == field_id and column.column_identifier == "NPI"
+            for column in bundle.selected_columns_by_stream[ordinal - 1]
+        )
+        assert f'"__ci_preflight_source_{ordinal}"."NPI" AS "{field_id}"' in preview.sql
+        assert f'"__ci_preflight_source_{ordinal}"."NPI" = "__ci_preflight_selected_keys"."npi"' in preview.sql
+    assert bundle.sql.count('"NPI" AS ') == 1
+    assert bundle.sql.count('"EDITION" AS ') == 1
+    assert bundle.sql.count('FROM "SYNTHETIC"."PUBLIC"."FAMILY_RECORDS"') == 1
+    assert bundle.sql.count('SELECT DISTINCT "SNAPSHOT_TOKEN" AS "__ci_snapshot_native"') == 3
+    assert adapter.cursor.closed
+
+
+@pytest.mark.parametrize(
+    ("token_values", "expected_rows"),
+    (
+        (("edition-a",) * 3, (("VARCHAR:edition-a",),)),
+        ((42, 42), (("NUMBER:42",),)),
+        ((), ()),
+        ((None, None), ((None,),)),
+        (("first", "second"), (("VARCHAR:first",), ("VARCHAR:second",))),
+        (("first", None), (("VARCHAR:first",), (None,))),
+        ((None, ""), ((None,), (None,))),
+        ((42, "42"), (("NUMBER:42",), ("VARCHAR:42",))),
+        (("NUMBER:42",), (("VARCHAR:NUMBER:42",),)),
+        ((1.25,), ((None,),)),
+    ),
+    ids=("repeated", "integer", "missing", "null", "multiple", "mixed-null", "empty-null", "typed", "tagged", "float"),
+)
+def test_token_subqueries_preserve_distinct_states_before_scalar_validation(token_values, expected_rows):
+    """Deduplicate source observations without hiding nulls or conflicting values."""
+
+    assert _sqlite_snapshot_tokens(token_values) == expected_rows
+
+
+def _sqlite_snapshot_tokens(token_values, *, native_type=None):
+    """Execute generated cardinality/CASE syntax with synthetic Snowflake scalar functions."""
+
+    definition = _definition()
+    binding = replace(_binding(definition), processing_policy=ProcessingPolicy.from_mapping(_policy_document()))
+    bundle, _request, _relations = _bundle_statement(definition, binding)
+    preview = SnowflakePreflightStatement(bundle, SnowflakePreflightLimits())
+    token_query = _snapshot_token_expression(
+        bundle.request.bindings[0].source_snapshot_token_relation,
+        bundle.source_snapshot_token_columns_by_stream[0],
+        processing_policy=binding.processing_policy,
+    )
+    assert token_query in bundle.sql and token_query in preview.sql
+    assert 'SELECT DISTINCT "ROOT_TOKEN" AS "__ci_snapshot_native"' in token_query
+    assert token_query.count("DISTINCT") == 1
+
+    with sqlite3.connect(":memory:") as connection:
+        connection.create_function(
+            "TYPEOF", 1, lambda value: native_type or {str: "VARCHAR", int: "INTEGER", float: "DOUBLE"}.get(type(value))
+        )
+        for function in (
+            "TO_VARIANT",
+            "AS_VARCHAR",
+            "AS_DATE",
+            "AS_TIME",
+            "AS_TIMESTAMP_NTZ",
+            "AS_TIMESTAMP_LTZ",
+            "AS_TIMESTAMP_TZ",
+        ):
+            connection.create_function(function, 1, lambda value: value)
+        connection.create_function("TO_JSON", 1, lambda value: None if value is None else json.dumps(value))
+        connection.create_function("TO_CHAR", 2, _synthetic_temporal_text)
+        connection.create_function("CONVERT_TIMEZONE", 2, lambda zone, value: value if zone == "UTC" else None)
+        connection.execute('CREATE TABLE "ROOT_TOKENS" ("ROOT_TOKEN")')
+        connection.executemany('INSERT INTO "ROOT_TOKENS" VALUES (?)', ((token,) for token in token_values))
+        local_query = token_query[1:-1].replace('"SYNTHETIC"."PUBLIC"."ROOT_TOKENS"', '"ROOT_TOKENS"')
+        return tuple(connection.execute(local_query))
+
+
+def _synthetic_temporal_text(temporal_scalar, format_string):
+    """Model signed years and nanoseconds outside Python datetime's supported range."""
+
+    assert format_string in ('UUUU-MM-DD"T"HH24:MI:SS.FF9', "HH24:MI:SS.FF9", "UUUU-MM-DD")
+    if isinstance(temporal_scalar, str):
+        date_text = f"{temporal_scalar}-01-01"
+        return date_text if format_string == "UUUU-MM-DD" else f"{date_text}T12:00:00.123456789"
+    prefix = "2025-01-01T12:00:00" if format_string.startswith("UUUU") else "12:00:00"
+    return f"{prefix}.{temporal_scalar:09d}"
+
+
+@pytest.mark.parametrize("native_type", ("TIME", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"))
+@pytest.mark.parametrize("nanoseconds", ((123100000, 123200000), (123456781, 123456789)))
+def test_temporal_token_identity_preserves_native_nanoseconds(native_type, nanoseconds):
+    token_rows = _sqlite_snapshot_tokens((*nanoseconds, nanoseconds[0]), native_type=native_type)
+    prefix = "12:00:00" if native_type == "TIME" else "2025-01-01T12:00:00"
+
+    assert token_rows == tuple((f"{native_type}:{prefix}.{value:09d}",) for value in nanoseconds)
+    assert token_rows[0] != token_rows[1]
+
+
+@pytest.mark.parametrize("native_type", ("DATE", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"))
+def test_temporal_token_identity_preserves_signed_iso_years(native_type):
+    token_rows = _sqlite_snapshot_tokens(("-0001", "0001"), native_type=native_type)
+    suffix = "" if native_type == "DATE" else "T12:00:00.123456789"
+
+    assert token_rows == tuple((f"{native_type}:{year}-01-01{suffix}",) for year in ("-0001", "0001"))
+    assert token_rows[0] != token_rows[1]
+
+
+def test_token_normalization_explicitly_handles_zones_and_rejects_unsupported_types():
+    definition = _definition()
+    binding = replace(_binding(definition), processing_policy=ProcessingPolicy.from_mapping(_policy_document()))
+    bundle, _request, _relations = _bundle_statement(definition, binding)
+    for kind in ("TIMESTAMP_LTZ", "TIMESTAMP_TZ"):
+        assert f"CONVERT_TIMEZONE('UTC', AS_{kind}(" in bundle.sql
+    assert "CONVERT_TIMEZONE('UTC', AS_TIMESTAMP_NTZ(" not in bundle.sql
+    for kind in ("DOUBLE", "ARRAY", "OBJECT", "BINARY", "NULL_VALUE"):
+        assert _sqlite_snapshot_tokens(("unsupported",), native_type=kind) == ((None,),)
 
 
 def test_preflight_accepts_statement_builder_by_connector_keyword():
@@ -722,14 +890,35 @@ def test_preflight_discards_the_sample_when_a_child_stream_reaches_its_sentinel(
     assert result.observations[1].observed_rows == 2
 
 
-def test_preflight_discards_inconsistent_snapshot_tokens_without_returning_rows():
+@pytest.mark.parametrize("detail_token", ("other-snapshot", None, ""))
+def test_preflight_discards_inconsistent_snapshot_tokens_without_returning_rows(detail_token):
     result, _adapter = _run(
-        lambda statement: [*_metadata_rows(statement, detail_token="other-snapshot"), *_complete_rows(statement)[3:]]
+        lambda statement: [*_metadata_rows(statement, detail_token=detail_token), *_complete_rows(statement)[3:]]
     )
 
     assert result.status == "unavailable"
     assert result.unavailable_reason == "snapshot_invalid"
     assert result.sample is None
+
+
+def test_preflight_rejects_snapshot_tokens_differing_only_in_nanoseconds():
+    token_rows = _sqlite_snapshot_tokens((123456781, 123456789), native_type="TIMESTAMP_NTZ")
+
+    def rows(statement):
+        return [
+            *(
+                _row(statement, 0, stream_ordinal=ordinal, stream_id=stream_id, token=token_rows[ordinal % 2][0])
+                for ordinal, stream_id in enumerate(("root_source", "detail_source", "note_source"), start=1)
+            ),
+            *_complete_rows(statement)[3:],
+        ]
+
+    preflight_result, adapter = _run(rows)
+
+    assert preflight_result.status == "unavailable"
+    assert preflight_result.unavailable_reason == "snapshot_invalid"
+    assert preflight_result.sample is None
+    assert adapter.cursor.closed
 
 
 def test_preflight_discards_a_duplicate_selected_root_key_before_family_admission():

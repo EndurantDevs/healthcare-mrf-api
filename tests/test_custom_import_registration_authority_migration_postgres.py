@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import asynccontextmanager
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -85,10 +86,23 @@ async def _denied(case, statement, message, *, replication_role="origin"):
     """Require a guard error and a rollback rather than silently accepting DML."""
 
     with pytest.raises(DBAPIError, match=message) as caught:
-        async with case.engine.begin() as connection:
+        async with case.engine.connect() as connection:
             await connection.execute(text(f"SET LOCAL session_replication_role = '{replication_role}'"))
             await connection.execute(text(statement))
     assert caught.value.orig.sqlstate == "P0001"
+
+
+async def _assert_invalid_authority_row(case, overrides, constraint, sqlstate):
+    """Reject one input without retaining writes for the following input."""
+
+    with pytest.raises(DBAPIError) as caught:
+        async with case.engine.connect() as connection:
+            await _insert(connection, _table(case), **overrides)
+    assert caught.value.orig.sqlstate == sqlstate
+    if sqlstate != "22001":
+        assert constraint in str(caught.value)
+    async with case.engine.connect() as connection:
+        assert await connection.scalar(text(f"SELECT count(*) FROM {_table(case)}")) == 0
 
 
 @pytest.mark.asyncio
@@ -187,9 +201,9 @@ async def test_migration_revokes_public_table_and_function_privileges(monkeypatc
             assert function["prosecdef"] is False
 
 
-@pytest.mark.parametrize(
-    ("overrides", "constraint", "sqlstate"),
-    [
+@pytest.mark.asyncio
+async def test_migration_rejects_invalid_authority_rows(monkeypatch, subtests):
+    invalid_rows = [
         ({"authority_id": None}, "authority_id", "23502"),
         ({"authority_id": ""}, "id_check", "23514"),
         ({"authority_id": "-synthetic"}, "id_check", "23514"),
@@ -216,19 +230,11 @@ async def test_migration_revokes_public_table_and_function_privileges(monkeypatc
             "pins_check",
             "23514",
         ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_migration_rejects_invalid_authority_rows(monkeypatch, overrides, constraint, sqlstate):
+    ]
     async with _authority_case(monkeypatch) as (case, _):
-        with pytest.raises(DBAPIError) as caught:
-            async with case.engine.begin() as connection:
-                await _insert(connection, _table(case), **overrides)
-        assert caught.value.orig.sqlstate == sqlstate
-        if sqlstate != "22001":
-            assert constraint in str(caught.value)
-        async with case.engine.connect() as connection:
-            assert await connection.scalar(text(f"SELECT count(*) FROM {_table(case)}")) == 0
+        for overrides, constraint, sqlstate in invalid_rows:
+            with subtests.test(overrides=overrides):
+                await _assert_invalid_authority_row(case, overrides, constraint, sqlstate)
 
 
 @pytest.mark.asyncio
@@ -258,9 +264,9 @@ async def test_migration_accepts_tombstone_and_byte_bounded_retained_result(monk
         assert caught.value.orig.sqlstate == "23505"
 
 
-@pytest.mark.parametrize(
-    "assignment",
-    [
+@pytest.mark.asyncio
+async def test_migration_forbids_pin_changes_and_removal(monkeypatch, subtests):
+    assignments = [
         "authority_id = 'synthetic_changed'",
         "input_sha256 = decode(repeat('ab', 32), 'hex')",
         "token_sha256 = decode(repeat('ab', 32), 'hex')",
@@ -269,16 +275,15 @@ async def test_migration_accepts_tombstone_and_byte_bounded_retained_result(monk
         "input_sha256 = NULL",
         "token_sha256 = NULL",
         "expires_at = NULL",
-    ],
-)
-@pytest.mark.asyncio
-async def test_migration_forbids_pin_changes_and_removal(monkeypatch, assignment):
+    ]
     async with _authority_case(monkeypatch) as (case, _):
         async with case.engine.begin() as connection:
             await _insert(connection, _table(case))
         original = await _row(case)
-        await _denied(case, f"UPDATE {_table(case)} SET {assignment}", "authority_immutable")
-        assert await _row(case) == original
+        for assignment in assignments:
+            with subtests.test(assignment=assignment):
+                await _denied(case, f"UPDATE {_table(case)} SET {assignment}", "authority_immutable")
+                assert await _row(case) == original
 
 
 @pytest.mark.asyncio
@@ -330,21 +335,21 @@ async def test_revoke_and_result_are_once_only_and_history_coexists(monkeypatch,
             assert await _row(case) == retained
 
 
-@pytest.mark.parametrize("replication_role", ["origin", "replica"])
-@pytest.mark.parametrize("operation", ["DELETE FROM", "TRUNCATE", "UPDATE"])
 @pytest.mark.asyncio
-async def test_always_guards_reject_destructive_dml_in_replica_mode(monkeypatch, replication_role, operation):
+async def test_always_guards_reject_destructive_dml_in_replica_mode(monkeypatch, subtests):
     async with _authority_case(monkeypatch) as (case, _):
         async with case.engine.begin() as connection:
             await _insert(connection, _table(case))
         original = await _row(case)
-        statement = f"{operation} {_table(case)}"
-        message = "authority_retained"
-        if operation == "UPDATE":
-            statement += " SET expires_at = expires_at + interval '1 second'"
-            message = "authority_immutable"
-        await _denied(case, statement, message, replication_role=replication_role)
-        assert await _row(case) == original
+        for operation, replication_role in product(("DELETE FROM", "TRUNCATE", "UPDATE"), ("origin", "replica")):
+            with subtests.test(operation=operation, replication_role=replication_role):
+                statement = f"{operation} {_table(case)}"
+                message = "authority_retained"
+                if operation == "UPDATE":
+                    statement += " SET expires_at = expires_at + interval '1 second'"
+                    message = "authority_immutable"
+                await _denied(case, statement, message, replication_role=replication_role)
+                assert await _row(case) == original
 
 
 @pytest.mark.parametrize("kind", ["mint", "tombstone", "result"])

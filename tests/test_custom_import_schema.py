@@ -192,7 +192,7 @@ def test_durable_capture_models_bind_only_immutable_bounded_parquet_parts():
         for constraint in CustomImportCaptureParquetPart.__table__.constraints
         if constraint.name == "custom_import_capture_parquet_part_shape_check"
     )
-    assert "part_ordinal BETWEEN 1 AND 4096" in str(part_shape.sqltext)
+    assert "part_ordinal BETWEEN 1 AND 131072" in str(part_shape.sqltext)
     assert "octet_length(payload) = byte_count" in str(part_shape.sqltext)
     assert "pg_catalog.sha256(payload)" in str(part_shape.sqltext)
     capture_foreign_key = next(

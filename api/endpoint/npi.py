@@ -12881,7 +12881,7 @@ async def get_npi(request, npi):
                             session=request_session,
                         )
                     ).get(npi)
-            except Exception as exc:  # pragma: no cover - transient publication fallback
+            except Exception as exc:
                 logger.debug(
                     "Provider Directory profile fetch failed for npi=%s: %s",
                     npi,
@@ -13075,7 +13075,7 @@ async def get_npi(request, npi):
                 provider_enrichment_payload = await fetch_provider_enrichment(
                     npi, include_chain=include_chain_enrichment, session=request_session,
                 )
-        except Exception as exc:  # pragma: no cover - optional legacy enrichment
+        except Exception as exc:
             logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
             try:
                 async with provider_read_savepoint(request_session):

@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,8 +20,18 @@ from db.models.custom_import import CustomImportExecution
 from process.custom_import import execution as lifecycle
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
 from process.custom_import.snowflake_candidate import bundle_request_identity_sha256
+from process.custom_import.snowflake_capture import segmented_bundle_request_identity_sha256
 from tests.custom_import_postgres_support import isolated_publication_case
-from tests.test_custom_import_snowflake_operator_cli import _Database, _loaded_binding, _registration_stream
+from tests.test_custom_import_snowflake_operator_cli import (
+    _Adapter,
+    _configured_loaded_binding,
+    _CredentialProvider,
+    _Database,
+    _install_resume_preflight,
+    _loaded_binding,
+    _registration_stream,
+    _resume_database,
+)
 
 
 def _request(*, bearer="synthetic-stop-token", document=None):
@@ -53,6 +66,32 @@ class _Session:
 def _payload(reply):
     assert reply.headers["Cache-Control"] == "no-store"
     return json.loads(reply.body)
+
+
+def test_stop_route_import_does_not_load_the_source_runtime():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from process.ptg_parts.ptg2_tax_identity_source_publication_parser import (
+    parse_tax_identity_source_publication,
+)
+from api import control_execution_stop
+assert callable(parse_tax_identity_source_publication)
+assert callable(control_execution_stop._retained_identity)
+assert "process.custom_import.snowflake_segmented_runner" not in sys.modules
+assert "snowflake.connector" not in sys.modules
+""",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.asyncio
@@ -126,6 +165,69 @@ async def test_stop_reconstructs_the_worker_request_digest_without_source_access
         await stop._retained_identity(
             object(), loaded.dataset_id + 1, loaded.definition_revision_id, loaded.source_binding_revision_id
         )
+
+
+@pytest.mark.parametrize("configured", (False, True))
+async def test_execute_resume_and_stop_share_the_exact_retained_policy_identity(monkeypatch, configured):
+    """Keep retained v1/v2 identity coherent across dispatch, replay, and stop."""
+    loaded = _configured_loaded_binding() if configured else _loaded_binding()
+    database = _resume_database(loaded)
+    _install_resume_preflight(monkeypatch, database, loaded)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", _CredentialProvider)
+    monkeypatch.setattr(operator_cli, "SnowflakePythonConnectorAdapter", _Adapter)
+    calls = []
+
+    async def run(_sessions, connector, request, **keywords):
+        assert keywords == ({"processing_policy": loaded.binding.processing_policy} if configured else {})
+        calls.append((connector.build_statement(request.bundle_request), request))
+        return operator_cli.CandidateRunResult(status="sealed_unpublished", execution_id=40)
+
+    monkeypatch.setattr(
+        operator_cli, "run_segmented_snowflake_candidate" if configured else "run_snowflake_bundle_candidate", run
+    )
+    for operation in (operator_cli._run_retained_snowflake_binding, operator_cli._run_resumed_snowflake_binding):
+        await operation(
+            definition_revision_id=loaded.definition_revision_id,
+            source_binding_revision_id=loaded.source_binding_revision_id,
+            idempotency_key="synthetic-resume",
+            database=database,
+        )
+    (statement, candidate), (resume_statement, resumed) = calls
+    assert candidate.bundle_request == resumed.bundle_request and statement == resume_statement
+    assert candidate.bundle_request.processing_policy == loaded.binding.processing_policy
+    assert candidate.source_binding_sha256 == resumed.source_binding_sha256 == loaded.source_binding_sha256
+    legacy = bundle_request_identity_sha256(
+        candidate.bundle_request, statement, source_binding_sha256=loaded.source_binding_sha256
+    )
+    expected = legacy
+    if configured:
+        expected = segmented_bundle_request_identity_sha256(
+            candidate.bundle_request,
+            statement,
+            loaded.binding.processing_policy.capture,
+            source_binding_sha256=loaded.source_binding_sha256,
+        )
+    assert (expected != legacy) is configured
+    monkeypatch.setenv(stop._TOKEN_ENV, "synthetic-stop-token")
+    monkeypatch.setattr(stop, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    transition = AsyncMock(return_value=SimpleNamespace(execution_id=40, state="canceled"))
+    monkeypatch.setattr(stop, "request_bound_execution_cancellation", transition)
+    reply = await stop.serve_execution_stop(
+        _request(
+            document={
+                "dataset_id": loaded.dataset_id,
+                "definition_revision_id": loaded.definition_revision_id,
+                "source_binding_revision_id": loaded.source_binding_revision_id,
+                "idempotency_key": "synthetic-resume",
+            }
+        ),
+        _Session(),
+        finalize=False,
+    )
+    assert reply.status == 200 and _payload(reply) == {"execution_id": 40, "state": "canceled"}
+    transition.assert_awaited_once()
+    assert transition.await_args.kwargs["request_identity_sha256"] == expected
+    assert database.resume_lookup_arguments["request_identity_sha256"] == expected
 
 
 @pytest.mark.asyncio

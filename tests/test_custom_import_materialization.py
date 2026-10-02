@@ -8,6 +8,8 @@ import copy
 import hashlib
 import itertools
 import json
+import weakref
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -37,6 +39,7 @@ from process.custom_import.materialization import (
     ValidatedWinnerCandidateStream,
     WinnerCandidate,
     WinnerMaterializationError,
+    iter_ordered_profile_winners,
     materialize_winners,
     persist_selection_profiles,
     project_child_scalars,
@@ -1114,6 +1117,302 @@ def test_candidate_validation_rejects_invalid_identity_scope_and_values(definiti
         candidates=_validated_candidates((root,)),
     )
     assert empty.winners == ()
+
+
+def _ordered_candidates(definition, candidates, profile_slot=1):
+    scopes = materialization_module._profile_scopes(definition, {"rates": 7})
+    contract = materialization_module._winner_candidate_contract(definition, scopes)
+    profile = definition.selection_profiles[profile_slot - 1]
+
+    def key(candidate):
+        normalized = materialization_module._normalize_winner_candidate(candidate, contract)
+        canonical, digest = materialization_module._context_key(profile, normalized, contract.fields_by_id)
+        return candidate.entity_binding_id, digest, canonical
+
+    return sorted(candidates, key=key)
+
+
+def _ordered_winners(definition, candidates, *, profile_slot=1):
+    return iter_ordered_profile_winners(
+        definition,
+        generation=_generation(),
+        profile_slot=profile_slot,
+        candidates=_validated_candidates(candidates),
+        child_collection_slots={"rates": 7},
+    )
+
+
+def test_ordered_winners_match_eager_null_missing_and_decimal_contexts():
+    definition = _context_definition()
+    numeric = _child_candidate(
+        family_revision_id=503,
+        child_revision_id=603,
+        semantic_suffix="decimal",
+        service_code="A",
+        amount="1.00",
+    )
+    numeric_alias = replace(numeric, values_by_field={"service_code": "A", "amount": Decimal("1.0")})
+    candidates = (
+        *_missing_and_null_candidates(),
+        numeric,
+        numeric_alias,
+        replace(numeric, entity_binding_id=42),
+    )
+    eager = materialize_winners(
+        definition,
+        generation=_generation(),
+        candidates=_validated_candidates(candidates),
+        child_collection_slots={"rates": 7},
+    )
+    assert tuple(_ordered_winners(definition, _ordered_candidates(definition, candidates))) == eager.winners
+    assert len(eager.winners) == 4
+
+
+@pytest.mark.parametrize("nulls", ("first", "last"))
+def test_ordered_winners_share_nullable_selection_order(nulls):
+    definition = _amount_selection_definition(nulls)
+    candidates = _missing_and_null_candidates()
+    numeric = replace(
+        candidates[0],
+        family_sha256=b"\x00" * 32,
+        values_by_field={"service_code": "A", "amount": "2.50"},
+    )
+    candidates = (*candidates, numeric)
+    eager = materialize_winners(
+        definition,
+        generation=_generation(),
+        candidates=_validated_candidates(candidates),
+        child_collection_slots={"rates": 7},
+    )
+    assert tuple(_ordered_winners(definition, candidates)) == eager.winners
+
+
+@pytest.mark.parametrize("order", itertools.permutations((0, 1, 2)))
+@pytest.mark.parametrize("is_better", (False, True))
+@pytest.mark.parametrize("is_physical", (False, True))
+def test_ordered_winner_tie_conflicts_match_eager_after_later_candidates(definition, order, is_better, is_physical):
+    first = _child_candidate(
+        family_revision_id=801,
+        child_revision_id=901,
+        semantic_suffix="same",
+        service_code="A",
+    )
+    conflicting = (
+        replace(first, family_revision_id=803, context_child_revision_id=903)
+        if is_physical
+        else replace(first, values_by_field={**first.values_by_field, "display_name": "other"})
+    )
+    other = replace(
+        first,
+        family_revision_id=802,
+        context_child_revision_id=902,
+        family_sha256=(b"\x00" if is_better else b"\xff") * 32,
+    )
+    candidates = tuple((first, conflicting, other)[index] for index in order)
+    if is_better:
+        eager = materialize_winners(
+            definition,
+            generation=_generation(),
+            candidates=_validated_candidates(candidates),
+            child_collection_slots={"rates": 7},
+        )
+        assert tuple(_ordered_winners(definition, candidates)) == eager.winners
+        assert eager.winners[0].family_revision_id == 802
+    else:
+        message = "conflicting physical identity" if is_physical else "conflicting typed values"
+        with pytest.raises(WinnerMaterializationError, match=message):
+            materialize_winners(
+                definition,
+                generation=_generation(),
+                candidates=_validated_candidates(candidates),
+                child_collection_slots={"rates": 7},
+            )
+        with pytest.raises(WinnerMaterializationError, match=message):
+            tuple(_ordered_winners(definition, candidates))
+
+
+@pytest.mark.parametrize("is_reversed", (False, True))
+def test_ordered_winners_reject_adjacent_digest_collision_before_yield(monkeypatch, is_reversed):
+    def collision(_profile, candidate, _fields):
+        return f'{{"candidate":{candidate.candidate.family_revision_id}}}', b"x" * 32
+
+    monkeypatch.setattr(materialization_module, "_context_key", collision)
+    candidates = _missing_and_null_candidates()
+    winners = _ordered_winners(_context_definition(), reversed(candidates) if is_reversed else candidates)
+    with pytest.raises(WinnerMaterializationError, match="digest collision"):
+        next(winners)
+
+
+def test_ordered_winners_reject_out_of_order_contexts_before_yield(definition):
+    first = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="first",
+        service_code="A",
+    )
+    candidates = _ordered_candidates(definition, (first, replace(first, values_by_field={"service_code": "B"})))
+    with pytest.raises(WinnerMaterializationError, match="entity/context order"):
+        next(_ordered_winners(definition, reversed(candidates)))
+
+
+def test_ordered_winners_require_actual_exhaustion_for_late_failures(definition):
+    first = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="first",
+        service_code="A",
+    )
+    winners = _ordered_winners(
+        definition,
+        (
+            first,
+            replace(first, entity_binding_id=42),
+            replace(first, entity_binding_id=40),
+        ),
+    )
+    assert next(winners).entity_binding_id == 41
+    with pytest.raises(WinnerMaterializationError, match="entity/context order"):
+        next(winners)
+
+
+@pytest.mark.parametrize("profile_slot", (True, False, None, "1", 0, -1, 2))
+def test_ordered_winners_validate_profile_slot_before_consuming(definition, profile_slot):
+    stream = _validated_candidates(())
+    winners = iter_ordered_profile_winners(
+        definition,
+        generation=_generation(),
+        profile_slot=profile_slot,
+        candidates=stream,
+    )
+    with pytest.raises(WinnerMaterializationError, match="profile slot"):
+        next(winners)
+    assert stream._is_consumed is False
+
+
+def test_ordered_winners_preserve_trusted_generation_and_single_use(definition):
+    stream = _validated_candidates(())
+    with pytest.raises(WinnerMaterializationError, match="generation does not match"):
+        tuple(
+            iter_ordered_profile_winners(
+                definition,
+                generation=replace(_generation(), generation_id=102),
+                profile_slot=1,
+                candidates=stream,
+            )
+        )
+    assert (
+        tuple(
+            iter_ordered_profile_winners(
+                definition,
+                generation=_generation(),
+                profile_slot=1,
+                candidates=stream,
+                child_collection_slots={"rates": 7},
+            )
+        )
+        == ()
+    )
+    with pytest.raises(WinnerMaterializationError, match="already consumed"):
+        tuple(
+            iter_ordered_profile_winners(
+                definition,
+                generation=_generation(),
+                profile_slot=1,
+                candidates=stream,
+                child_collection_slots={"rates": 7},
+            )
+        )
+
+
+def test_ordered_winners_skip_other_valid_scopes_but_validate_their_data(definition):
+    child = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="child",
+        service_code="A",
+    )
+    root = replace(
+        child,
+        context_collection_slot=0,
+        context_child_revision_id=None,
+        context_child_key_sha256=None,
+        values_by_field={"npi": "1234567893"},
+    )
+    assert tuple(_ordered_winners(definition, (root, child))) == tuple(_ordered_winners(definition, (child,)))
+    with pytest.raises(WinnerMaterializationError, match="non-query field"):
+        tuple(
+            _ordered_winners(
+                definition,
+                (replace(root, values_by_field={"service_code": "A"}), child),
+            )
+        )
+
+
+def test_ordered_winners_select_one_declared_profile_and_preserve_root_scope():
+    document = _raw_definition()
+    document["selection_profiles"].insert(
+        0,
+        {
+            "id": "root_name",
+            "selection": [{"field": "display_name", "direction": "asc", "nulls": "last"}],
+            "context_dimensions": [],
+        },
+    )
+    definition = CustomImportDefinition.from_mapping(document)
+    child = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="child",
+        service_code="A",
+    )
+    root = replace(
+        child,
+        context_collection_slot=0,
+        context_child_revision_id=None,
+        context_child_key_sha256=None,
+        values_by_field={"display_name": "Alpha"},
+    )
+    candidates = (root, child)
+    eager = materialize_winners(
+        definition,
+        generation=_generation(),
+        candidates=_validated_candidates(candidates),
+        child_collection_slots={"rates": 7},
+    )
+    for profile_slot in (1, 2):
+        assert tuple(_ordered_winners(definition, candidates, profile_slot=profile_slot)) == tuple(
+            winner for winner in eager.winners if winner.profile_slot == profile_slot
+        )
+
+
+def test_ordered_winners_keep_bounded_state_in_one_large_lazy_group(definition):
+    template = _child_candidate(
+        family_revision_id=301,
+        child_revision_id=401,
+        semantic_suffix="group",
+        service_code="A",
+    )
+    recent = deque(maxlen=8)
+    consumed_counts = [0]
+
+    def candidates():
+        for index in range(5000):
+            candidate = replace(
+                template,
+                family_revision_id=index + 1000,
+                family_sha256=index.to_bytes(32, "big"),
+            )
+            recent.append(weakref.ref(candidate))
+            assert sum(reference() is not None for reference in recent) <= 3
+            consumed_counts[0] += 1
+            yield candidate
+
+    winners = _ordered_winners(definition, candidates())
+    assert consumed_counts[0] == 0
+    assert next(winners).family_revision_id == 1000
+    assert consumed_counts[0] == 5000
+    with pytest.raises(StopIteration):
+        next(winners)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,23 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Route visibility and query-parser exceptions for OpenAPI parity tests."""
 
+from copy import deepcopy
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+
+@lru_cache(maxsize=1)
+def _parse_openapi_document(text: str) -> dict:
+    return yaml.safe_load(text)
+
+
+def load_openapi_document(path: Path) -> dict:
+    """Reuse parsing for current file contents while keeping callers independent."""
+    return deepcopy(_parse_openapi_document(path.read_text(encoding="utf-8")))
+
+
 HIDDEN_RUNTIME_ALIASES = {
     # Control-authenticated candidate validation is intentionally excluded
     # from the public OpenAPI contract.

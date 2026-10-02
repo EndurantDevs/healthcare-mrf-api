@@ -4,12 +4,11 @@ import ast
 import re
 from pathlib import Path
 
-import yaml
-
 from tests.openapi_route_contract_support import (
     HIDDEN_RUNTIME_ALIASES,
     ROUTE_QUERY_PARAM_ADDITIONS,
     ROUTE_QUERY_PARAM_REMOVALS,
+    load_openapi_document,
 )
 
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
@@ -176,7 +175,7 @@ def _collect_query_params(node: ast.AST) -> set[str]:
 
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
     """Collect route parameters from the checked-in OpenAPI document."""
-    document = yaml.safe_load(OPENAPI_PATH.read_text())
+    document = load_openapi_document(OPENAPI_PATH)
 
     def resolve_parameter(parameter_by_field: dict) -> dict:
         resolved = parameter_by_field
@@ -247,7 +246,7 @@ def test_openapi_routes_match_code():
 
 
 def test_custom_import_extension_read_openapi_contract():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/extensions/custom-import/search"]["post"]
     header_names = {parameter["name"] for parameter in operation["parameters"]}
 
@@ -276,7 +275,7 @@ def test_custom_import_extension_read_openapi_contract():
 
 
 def test_custom_import_extension_detail_openapi_contract():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/extensions/custom-import/detail"]["post"]
     request_schema = spec["components"]["schemas"]["CustomImportDetailRequest"]
     entity_schema = spec["components"]["schemas"]["CustomImportDetailEntity"]
@@ -313,7 +312,7 @@ def test_custom_import_extension_detail_openapi_contract():
 
 def test_pricing_procedure_scope_refusals_match_shared_handler():
     """Document every structured 422 emitted by both procedure-search paths."""
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     scope_ref_by_key = {"$ref": "#/components/schemas/PlanPricingScopeRefusal"}
     paths = spec["paths"]
     canonical = paths["/pricing/providers/search-by-procedure"]["get"]["responses"]["422"]
@@ -323,7 +322,7 @@ def test_pricing_procedure_scope_refusals_match_shared_handler():
 
 
 def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     schemas = spec["components"]["schemas"]
     pagination_properties = schemas["PaginationMeta"]["properties"]
 
@@ -359,7 +358,7 @@ def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
 def test_openapi_exposes_strict_v3_allowed_amount_fallback():
     """Document allowed fallback routing and response states."""
 
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     for path in (
         "/pricing/providers/search-by-procedure",
         "/pricing/providers/by-procedure",
@@ -412,7 +411,7 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
 def test_provider_routes_share_canonical_provider_sex_parameter():
     """Keep one provider-sex parameter name and value contract across APIs."""
 
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     for path in (
         "/npi/all",
         "/npi/near/",
@@ -434,7 +433,7 @@ def test_provider_routes_share_canonical_provider_sex_parameter():
 def test_openapi_documents_allowed_unverified_location_suppression():
     """Document allowed fallback output suppression without changing filtering."""
 
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     for path in (
         "/pricing/providers/search-by-procedure",
         "/pricing/providers/by-procedure",
@@ -459,7 +458,7 @@ def test_openapi_documents_allowed_unverified_location_suppression():
 
 
 def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     npi_parameters = spec["paths"]["/npi/id/{npi}"]["get"]["parameters"]
     parameters_by_name = {parameter["name"]: parameter for parameter in npi_parameters}
     schemas = spec["components"]["schemas"]
@@ -481,7 +480,7 @@ def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
 
 
 def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/npi/id/{npi}/profile"]["get"]
     parameters_by_name = {
         parameter["name"]: parameter
@@ -542,7 +541,7 @@ def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
 
 
 def test_npi_near_documents_exact_cursor_page_identity():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/npi/near/"]["get"]
     parameter_names = {parameter["name"] for parameter in operation["parameters"]}
 

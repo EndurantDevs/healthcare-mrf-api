@@ -41,6 +41,7 @@ from process.custom_import.capture_store import (
     CaptureStoreError,
     ReplayableParquetCapture,
     load_replayable_parquet_bundle,
+    open_replayable_parquet_parts,
     register_capture_bundle,
     register_replayable_parquet_bundle,
 )
@@ -498,6 +499,90 @@ async def test_replayable_parquet_round_trip_preserves_schema_bearing_zero_row_p
     expected_schema = pa.schema((pa.field("ordinal", pa.int64()), pa.field("stream_id", pa.string())))
     assert all(pq.read_table(BytesIO(capture.parts[0])).num_rows == 0 for capture in loaded)
     assert all(pq.read_table(BytesIO(capture.parts[0])).schema == expected_schema for capture in loaded)
+
+
+async def test_incremental_parts_preserve_pending_work_and_close_the_native_result(monkeypatch):
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        registered = await _register_replayable_bundle(case, seed, captures)
+        async with AsyncSession(case.engine, expire_on_commit=False, autoflush=True) as session:
+            pending = CustomImportCaptureParquetPart()
+            session.add(pending)
+            sql_results = []
+            original_stream = session.stream
+
+            async def observe_stream(statement):
+                result = await original_stream(statement)
+                sql_results.append(result)
+                return result
+
+            monkeypatch.setattr(session, "stream", observe_stream)
+            async with open_replayable_parquet_parts(
+                session,
+                capture_bundle_id=registered.capture_bundle_id,
+                dataset_id=seed.dataset_id,
+                definition_revision_id=seed.definition_revision_id,
+                schema_revision_id=seed.schema_revision_id,
+            ) as parts:
+                loaded_parts = [part async for part in parts]
+            expected_parts = [
+                (capture.receipt, ordinal, part_payload)
+                for capture in captures
+                for ordinal, part_payload in enumerate(capture.parts, start=1)
+            ]
+            assert loaded_parts == expected_parts
+            assert pending in session.new
+            assert sql_results[0].closed
+            assert session.in_transaction()
+            with session.no_autoflush:
+                assert await session.scalar(select(1)) == 1
+            await session.rollback()
+
+
+@pytest.mark.parametrize("cancel", (False, True))
+async def test_incremental_parts_close_native_cursor_after_early_exit(monkeypatch, cancel):
+    async with isolated_publication_case() as case:
+        seed = await _seed_parquet_case(case)
+        captures = _build_replayable_capture_set()
+        registered = await _register_replayable_bundle(case, seed, captures)
+        async with case.sessions() as session:
+            sql_results = []
+            original_stream = session.stream
+            paused = asyncio.Event()
+
+            async def observe_stream(statement):
+                result = await original_stream(statement)
+                sql_results.append(result)
+                return result
+
+            monkeypatch.setattr(session, "stream", observe_stream)
+
+            async def consume():
+                async with open_replayable_parquet_parts(
+                    session,
+                    capture_bundle_id=registered.capture_bundle_id,
+                    dataset_id=seed.dataset_id,
+                    definition_revision_id=seed.definition_revision_id,
+                    schema_revision_id=seed.schema_revision_id,
+                ) as parts:
+                    first = await anext(parts)
+                    assert first == (captures[0].receipt, 1, captures[0].parts[0])
+                    if cancel:
+                        paused.set()
+                        await asyncio.Event().wait()
+
+            if cancel:
+                task = asyncio.create_task(consume())
+                await paused.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await consume()
+            assert sql_results[0].closed
+            assert session.in_transaction()
+            assert await session.scalar(select(1)) == 1
 
 
 async def test_durable_registration_refuses_metadata_only_and_payload_drift():

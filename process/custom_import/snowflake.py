@@ -313,7 +313,7 @@ class SnowflakeDeclaredColumn:
 
 @dataclass(frozen=True)
 class SnowflakeApprovedRelation:
-    """A finite relation allowlist entry and its complete selectable column set."""
+    """A finite relation allowlist whose unique fields may share physical columns."""
 
     relation: SnowflakeRelation
     columns: tuple[SnowflakeDeclaredColumn, ...]
@@ -326,11 +326,8 @@ class SnowflakeApprovedRelation:
         if not all(isinstance(column, SnowflakeDeclaredColumn) for column in self.columns):
             raise SnowflakeConnectorError("approved relation columns must use declared column values")
         field_ids = tuple(column.field_id for column in self.columns)
-        column_identifiers = tuple(column.column_identifier for column in self.columns)
         if len(field_ids) != len(set(field_ids)):
             raise SnowflakeConnectorError("approved relation field ids must be unique")
-        if len(column_identifiers) != len(set(column_identifiers)):
-            raise SnowflakeConnectorError("approved relation column identifiers must be unique")
 
     def column_for(self, field_id: str) -> SnowflakeDeclaredColumn | None:
         """Return the one configured physical-column mapping for a field id."""
@@ -668,6 +665,9 @@ class SnowflakeReadRequest:
         field_ids = tuple(column.field_id for column in self.selected_columns)
         if len(field_ids) != len(set(field_ids)):
             raise SnowflakeConnectorError("read request field ids must be unique")
+        column_identifiers = tuple(column.column_identifier for column in self.selected_columns)
+        if len(column_identifiers) != len(set(column_identifiers)):
+            raise SnowflakeConnectorError("read request column identifiers must be unique")
         definition_sha256 = _sha256(self.definition_sha256, "definition digest")
         schema_sha256 = _sha256(self.schema_sha256, "schema digest")
         request_document_by_key = {

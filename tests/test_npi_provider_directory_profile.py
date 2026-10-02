@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import types
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -371,3 +372,86 @@ async def test_npi_detail_with_base_provider_keeps_normal_response(monkeypatch):
     assert response_payload["provider_directory_profile"] == (
         profile_payload_by_kind["profile"]
     )
+
+
+def _query_failure_loader(query_label, query_result, read_session, events, failures):
+    """Record bound reads and raise selected synthetic query failures."""
+    async def read(*_args, session=None, **_kwargs):
+        assert session is read_session
+        events.append(query_label)
+        if query_label in failures:
+            raise RuntimeError("synthetic query failure")
+        return query_result
+
+    return AsyncMock(side_effect=read)
+
+
+def _install_bound_read_snapshot(monkeypatch, events):
+    """Bind route reads to a session that records savepoint exit outcomes."""
+    read_session = types.SimpleNamespace()
+
+    @asynccontextmanager
+    async def savepoint():
+        try:
+            yield
+        except RuntimeError:
+            events.append("rollback")
+            raise
+        else:
+            events.append("release")
+
+    read_session.begin_nested = savepoint
+
+    @asynccontextmanager
+    async def snapshot(_database, _schema, *, include_detail=False):
+        assert include_detail
+        yield read_session
+
+    monkeypatch.setattr(npi_module, "provider_profile_read_snapshot", snapshot)
+    return read_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_names_unavailable", [False, True])
+async def test_npi_detail_optional_query_failures_release_savepoints(
+    monkeypatch, other_names_unavailable,
+):
+    """Serve base details after optional query rollback, retaining name fallback."""
+    provider_npi = 1000000001
+    _patch_npi_detail_dependencies(monkeypatch, None, provider_npi=provider_npi)
+    events = []
+    read_session = _install_bound_read_snapshot(monkeypatch, events)
+    names = [{
+        "other_provider_identifier": "Example Clinic",
+        "other_provider_identifier_type_code": "3",
+    }]
+    failures = {"profile", "enrichment"}
+    if other_names_unavailable:
+        failures.add("names")
+
+    for function_name, query_label, query_result in (
+        ("_fetch_provider_directory_profile_map", "profile", {}),
+        ("_build_npi_details", "base", npi_module._build_npi_details.return_value),
+        ("_fetch_other_names", "names", names),
+        ("_fetch_provider_enrichment_detail", "enrichment", None),
+    ):
+        query_loader = _query_failure_loader(query_label, query_result, read_session, events, failures)
+        monkeypatch.setattr(npi_module, function_name, query_loader)
+    request = types.SimpleNamespace(
+        args={"sync_geocode": "0", "lookup_stored_geocode": "0"},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+
+    response = await npi_module.get_npi(request, str(provider_npi))
+    response_payload = json.loads(response.body)
+
+    assert response.status == 200 and response_payload["npi"] == provider_npi
+    assert "provider_directory_profile" not in response_payload
+    assert response_payload["other_name_list"] == ([] if other_names_unavailable else names)
+    assert response_payload["do_business_as"] == ([] if other_names_unavailable else ["Example Clinic"])
+    assert response_payload["provider_enrichment"]["summary"] is None
+    assert all(not enrollment_rows for enrollment_rows in response_payload["provider_enrichment"]["enrollments"].values())
+    assert events == ["profile", "rollback", "base", "names", *(
+        ["rollback", "names", "rollback"] if other_names_unavailable
+        else ["enrichment", "rollback", "names", "release"]
+    )]

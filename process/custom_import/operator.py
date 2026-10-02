@@ -114,6 +114,7 @@ _EXECUTION_EVIDENCE_COLUMNS = (
     CustomImportCaptureBundle.definition_revision_id.label("capture_definition_revision_id"),
     CustomImportCaptureBundle.schema_revision_id.label("capture_schema_revision_id"),
     CustomImportCaptureBundle.manifest_sha256.label("capture_manifest_sha256"),
+    CustomImportCaptureBundle.capture_state.label("capture_state"),
     CustomImportGeneration.generation_id.label("evidence_generation_id"),
     CustomImportGeneration.dataset_id.label("generation_dataset_id"),
     CustomImportGeneration.definition_revision_id.label("generation_definition_revision_id"),
@@ -801,6 +802,7 @@ def _evidence_capture(evidence_snapshot, execution: ExecutionEvidenceExecution) 
                 "capture_definition_revision_id",
                 "capture_schema_revision_id",
                 "capture_manifest_sha256",
+                "capture_state",
             )
         ):
             raise OperatorInvariantError("custom import operator evidence is invalid")
@@ -810,6 +812,7 @@ def _evidence_capture(evidence_snapshot, execution: ExecutionEvidenceExecution) 
         or not _is_stored_id(evidence_snapshot["capture_dataset_id"], execution.dataset_id)
         or not _is_stored_id(evidence_snapshot["capture_definition_revision_id"], execution.definition_revision_id)
         or not _is_stored_id(evidence_snapshot["capture_schema_revision_id"], execution.schema_revision_id)
+        or evidence_snapshot["capture_state"] != "sealed"
     ):
         raise OperatorInvariantError("custom import operator evidence is invalid")
     return _digest(evidence_snapshot["capture_manifest_sha256"])

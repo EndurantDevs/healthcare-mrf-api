@@ -8,10 +8,10 @@ import datetime as dt
 import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
-from process.custom_import.definition import CustomImportDefinition, Field, canonical_json
+from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition, Field, canonical_json
 from process.custom_import.family import RootFamily, normalize_source_decimal
 from process.custom_import.runner_types import CandidateRunnerError, StoredCandidateFamily
 
@@ -86,6 +86,23 @@ def candidate_hash(
 ) -> bytes:
     """Fingerprint one worker attempt without claiming output authority."""
 
+    return candidate_hash_ordered(
+        execution_id=execution_id,
+        fence=fence,
+        base_generation_id=base_generation_id,
+        root_key_hashes=sorted(root_key_hashes),
+    )
+
+
+def candidate_hash_ordered(
+    *,
+    execution_id: int,
+    fence: int,
+    base_generation_id: int | None,
+    root_key_hashes: Iterable[bytes],
+) -> bytes:
+    """Hash one pass of nondecreasing root digests, retaining duplicates."""
+
     # Keep the v1 canonical document bytes without building its potentially
     # large ``root_keys`` array.  This preserves persisted hash compatibility
     # while avoiding the definition JSON validator's aggregate-array cap.
@@ -97,10 +114,15 @@ def candidate_hash(
     _digest_text_fragment(digest, ',"fence":')
     _digest_text_fragment(digest, str(fence))
     _digest_text_fragment(digest, ',"root_keys":[')
-    for ordinal, root_key_hash_value in enumerate(sorted(root_key_hashes)):
+    previous_hash = None
+    for ordinal, root_key_hash_value in enumerate(root_key_hashes):
+        _validate_hash_value(root_key_hash_value, "ordered root key")
+        if previous_hash is not None and root_key_hash_value < previous_hash:
+            raise CandidateRunnerError("root key hashes are not ordered")
         if ordinal:
             _digest_text_fragment(digest, ",")
         _digest_json_string(digest, root_key_hash_value.hex())
+        previous_hash = root_key_hash_value
     _digest_text_fragment(digest, "]}")
     return digest.digest()
 
@@ -108,29 +130,91 @@ def candidate_hash(
 def new_family_hash(definition: CustomImportDefinition, family: RootFamily) -> bytes:
     """Hash one accepted root family and its exact typed child payloads."""
 
+    return _family_hash_from_documents(
+        definition,
+        family.root,
+        {
+            collection: _sorted_child_documents(definition, collection, children)
+            for collection, children in family.children.items()
+        },
+    )
+
+
+def _sorted_child_documents(
+    definition: CustomImportDefinition,
+    collection: str,
+    children: Iterable[Mapping[str, Any]],
+) -> Iterator[tuple[bytes, str, str]]:
+    """Materialize only the eager API's current collection before hashing it."""
+
+    collection_fields = fields_by_collection(definition)[collection]
+    yield from sorted(
+        (
+            child_key_hash(definition, collection, child_values),
+            child_key_document(definition, collection, child_values),
+            record_payload(collection_fields, child_values),
+        )
+        for child_values in children
+    )
+
+
+def new_family_hash_ordered(
+    definition: CustomImportDefinition,
+    root_values: Mapping[str, Any],
+    child_documents_by_collection: Mapping[str, Iterable[tuple[bytes, str, str]]],
+) -> bytes:
+    """Hash accepted records ordered by (key digest, key text, payload text)."""
+
+    return _family_hash_from_documents(
+        definition,
+        root_values,
+        {
+            collection: _validated_child_documents(definition, collection, documents)
+            for collection, documents in child_documents_by_collection.items()
+        },
+    )
+
+
+def _validated_child_documents(
+    definition: CustomImportDefinition,
+    collection: str,
+    child_documents: Iterable[tuple[bytes, str, str]],
+) -> Iterator[tuple[bytes, str, str]]:
+    """Validate raw ordered fragments without narrowing the eager input domain."""
+
+    collection_fields = fields_by_collection(definition)[collection]
+    for child_document in child_documents:
+        _validate_child_document(definition, collection, collection_fields, child_document)
+        yield child_document
+
+
+def _family_hash_from_documents(
+    definition: CustomImportDefinition,
+    root_values: Mapping[str, Any],
+    child_documents_by_collection: Mapping[str, Iterable[tuple[bytes, str, str]]],
+) -> bytes:
+    """Emit the v1 digest from canonical eager records or validated raw fragments."""
+
+    if set(child_documents_by_collection) != {collection.name for collection in definition.child_collections}:
+        raise CandidateRunnerError("family collections do not match the definition")
+
     # This is the same canonical JSON sequence previously passed to
     # ``canonical_json``.  Stream it into the digest so a valid large family
     # does not need one aggregate children document in memory or at the
     # definition parser's array limit.
     digest = _incremental_digest("family")
     _digest_text_fragment(digest, '{"children":{')
-    collection_fields = fields_by_collection(definition)
-    for collection_ordinal, collection_name in enumerate(
-        sorted(collection.name for collection in definition.child_collections)
-    ):
+    collection_names = sorted(collection.name for collection in definition.child_collections)
+    for collection_ordinal, collection_name in enumerate(collection_names):
         if collection_ordinal:
             _digest_text_fragment(digest, ",")
         _digest_json_string(digest, collection_name)
         _digest_text_fragment(digest, ":[")
-        child_documents = sorted(
-            (
-                child_key_hash(definition, collection_name, child_values),
-                child_key_document(definition, collection_name, child_values),
-                record_payload(collection_fields[collection_name], child_values),
-            )
-            for child_values in family.children[collection_name]
-        )
-        for child_ordinal, (_key_hash, child_key, child_payload_document) in enumerate(child_documents):
+        previous_document = None
+        for child_ordinal, child_document in enumerate(child_documents_by_collection[collection_name]):
+            if previous_document is not None and child_document < previous_document:
+                raise CandidateRunnerError("child documents are not ordered")
+            _key_hash, child_key, child_payload_document = child_document
             if child_ordinal:
                 _digest_text_fragment(digest, ",")
             _digest_text_fragment(digest, '{"key":')
@@ -138,13 +222,59 @@ def new_family_hash(definition: CustomImportDefinition, family: RootFamily) -> b
             _digest_text_fragment(digest, ',"payload":')
             _digest_json_string(digest, child_payload_document)
             _digest_text_fragment(digest, "}")
+            previous_document = child_document
         _digest_text_fragment(digest, "]")
     _digest_text_fragment(digest, '},"contract":"custom-import-family/v1","root_key":')
-    _digest_json_string(digest, root_key_document(definition, family.root))
+    _digest_json_string(digest, root_key_document(definition, root_values))
     _digest_text_fragment(digest, ',"root_payload":')
-    _digest_json_string(digest, record_payload(definition.root_fields, family.root))
+    _digest_json_string(digest, record_payload(definition.root_fields, root_values))
     _digest_text_fragment(digest, "}")
     return digest.digest()
+
+
+def _validate_hash_value(hash_value: object, label: str) -> None:
+    """Require the existing SHA-256 binary representation."""
+
+    if not isinstance(hash_value, bytes) or len(hash_value) != 32:
+        raise CandidateRunnerError(f"{label} digest is malformed")
+
+
+def _validate_canonical_text(canonical_document: object) -> None:
+    """Bound a supplied fragment before decoding it with the existing codec."""
+
+    if not isinstance(canonical_document, str) or len(canonical_document) > MAX_DEFINITION_BYTES:
+        raise CandidateRunnerError("child canonical document exceeds the text limit")
+    try:
+        if len(canonical_document.encode("utf-8")) > MAX_DEFINITION_BYTES:
+            raise CandidateRunnerError("child canonical document exceeds the text limit")
+    except UnicodeEncodeError as exc:
+        raise CandidateRunnerError("candidate canonical value is not UTF-8") from exc
+
+
+def _validate_child_document(
+    definition: CustomImportDefinition,
+    collection: str,
+    fields: Sequence[Field],
+    child_document: object,
+) -> None:
+    """Reject malformed or incoherent ordered fragments without retaining them."""
+
+    if not isinstance(child_document, tuple) or len(child_document) != 3:
+        raise CandidateRunnerError("child document is malformed")
+    key_hash, child_key, child_payload = child_document
+    _validate_hash_value(key_hash, "ordered child key")
+    _validate_canonical_text(child_key)
+    _validate_canonical_text(child_payload)
+    try:
+        child_values = payload_values(fields, child_payload, label="ordered child payload")
+    except RecursionError as exc:
+        raise CandidateRunnerError("ordered child payload exceeds structural limits") from exc
+    if record_payload(fields, child_values) != child_payload:
+        raise CandidateRunnerError("ordered child payload is not canonical")
+    if child_key_document(definition, collection, child_values) != child_key:
+        raise CandidateRunnerError("ordered child key does not match the payload")
+    if child_key_hash(definition, collection, child_values) != key_hash:
+        raise CandidateRunnerError("ordered child key digest does not match the payload")
 
 
 def _incremental_digest(domain: str) -> hashlib._Hash:

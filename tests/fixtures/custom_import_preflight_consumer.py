@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import pathlib
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 _BLOCKED_MODULES = {"arq", "db", "pyarrow", "snowflake", "sqlalchemy"}
@@ -180,6 +181,27 @@ def _binding_document(definition):
     }
 
 
+def _processing_policy():
+    budget_by_name = {
+        "maximum_parts": 2,
+        "maximum_compressed_bytes": 2048,
+        "maximum_decoded_bytes": 8192,
+        "maximum_arrow_bytes": 8192,
+        "maximum_records": 16,
+        "maximum_manifest_bytes": 4096,
+    }
+    capture = SegmentedCapturePolicy(
+        part_limits=CaptureLimits(1024, 4096, 1024, 8, 8, 1024),
+        stream_budget=budget_by_name,
+        bundle_budget=budget_by_name,
+        maximum_part_arrow_bytes=4096,
+        maximum_part_manifest_bytes=2048,
+        maximum_dataset_retained_bytes=8192,
+        acquisition_deadline_seconds=60,
+    )
+    return ProcessingPolicy(capture, 30, BuildPolicy(2, 4096, 1000, 60, 300))
+
+
 assert importlib.util.find_spec("process") is None
 _native_source = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 if _native_source is None:
@@ -194,6 +216,8 @@ _MODULE_NAMES = (
     "custom_import_preflight.definition",
     "custom_import_preflight.family",
     "custom_import_preflight.capture_limits",
+    "custom_import_preflight.segmented_capture_policy",
+    "custom_import_preflight.processing_policy",
     "custom_import_preflight.snowflake",
     "custom_import_preflight.snowflake_bundle",
     "custom_import_preflight.snowflake_binding",
@@ -208,7 +232,10 @@ assert all(
     if name == "custom_import_preflight" or name.startswith("custom_import_preflight.")
 )
 
+from custom_import_preflight.capture_limits import CaptureLimits
 from custom_import_preflight.definition import CustomImportDefinition
+from custom_import_preflight.processing_policy import BuildPolicy, ProcessingPolicy
+from custom_import_preflight.segmented_capture_policy import SegmentedCapturePolicy
 from custom_import_preflight.snowflake import SnowflakeConnectorError
 from custom_import_preflight.snowflake_binding import (
     SNOWFLAKE_SOURCE_BINDING_CONNECTOR,
@@ -241,6 +268,17 @@ _result = preflight_snowflake_bundle(
 )
 assert _result.status == "complete"
 assert _adapter.cursor.closed
+
+_configured_binding = replace(_binding, processing_policy=_processing_policy())
+_configured_request = _builder.prepare_request(
+    _definition, bindings=_bundle_bindings, processing_policy=_configured_binding.processing_policy
+)
+assert _configured_request.request_sha256 != _request.request_sha256
+assert _builder.build_statement(_configured_request).sql == _builder.build_statement(_request).sql
+_configured_adapter = Adapter()
+assert preflight_snowflake_bundle(_definition, _configured_binding, _builder, _configured_adapter).status == "complete"
+assert _configured_adapter.statement.bundle_statement.request == _configured_request
+assert _configured_adapter.cursor.closed
 
 _invalid_metadata = list(_metadata(_adapter.statement))
 _invalid_metadata[-1] = SimpleNamespace(name="label", type_name=None, type_code=True)
@@ -285,6 +323,12 @@ if _native_source is not None:
         native_definition, bindings=native_bindings
     )
     assert asdict(native_request) == asdict(_request)
+    native_configured_binding = NativeBinding.from_json(_configured_binding.canonical)
+    native_configured_request = NativeBuilder(approved_relations=native_relations).prepare_request(
+        native_definition, bindings=native_bindings, processing_policy=native_configured_binding.processing_policy
+    )
+    assert native_configured_request.canonical_request == _configured_request.canonical_request
+    assert native_configured_request.request_sha256 == _configured_request.request_sha256
     for module_name in (
         "process.reference_family_archive",
         "process.entity_address_snapshot_source",

@@ -75,7 +75,7 @@ async def _install_detail_tables(connection, schema, monkeypatch, create_scalars
         "20260808220000",
         "20260809020000",
         "20260808230000",
-        "20260914120000",
+        "20260914120000_npi_result_generation",
     ):
         await connection.run_sync(lambda sync, prefix=prefix: receipt_fixture._apply(sync, prefix))
 

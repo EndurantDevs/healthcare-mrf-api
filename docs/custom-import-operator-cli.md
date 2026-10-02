@@ -55,6 +55,52 @@ expired database lease. Queued, terminal, live-lease, unbound, and mismatched
 executions fail with a redacted receipt. A `canceling` execution is only
 acknowledged as canceled. The command never automatically retries.
 
+## Bounded segmented Snowflake execution
+
+An immutable `custom-import/source-binding/v2` binding opts into segmented
+capture and bounded family builds. It retains the existing binding fields and
+requires a complete `processing_policy` object. A v1 binding keeps its existing
+execution path and identity; it does not inherit current operator settings.
+
+| Policy member | Required declaration |
+| --- | --- |
+| `capture` | `custom-import/segmented-capture-policy/v1`: per-part limits, per-stream and whole-bundle budgets, decoded Arrow and manifest bounds, retained-storage limit, acquisition deadline |
+| `driver_timeout_seconds` | Positive integer, at most 120 seconds per driver operation |
+| `build` | `page_row_limit`, `page_byte_limit`, `statement_timeout_ms`, `lease_seconds`, `build_deadline_seconds` |
+
+All limits are explicit positive integers; unknown, missing, incoherent, or
+over-ceiling values fail validation. Build pages admit at most 256 records and
+256 MiB. Declaration ceilings are not recommended sizing or throughput claims.
+Changing any retained limit requires a new binding revision, not a retry of an
+old request with different settings. The complete capture-policy fields and
+validation are defined in
+[`segmented_capture_policy.py`](../process/custom_import/segmented_capture_policy.py).
+
+Use the existing revision-based command and fixed local credential provider:
+
+```sh
+python -m custom_import_snowflake_operator execute \
+  --definition-revision-id 12 --source-binding-revision-id 14 \
+  --idempotency-key synthetic-segmented-run
+```
+
+Acquisition seals only after every stream reaches verified EOF with matching
+snapshot evidence. Source replay, global duplicate detection, family replacement,
+winner materialization and final sealing continue under the same execution claim.
+An invalid child still rejects its whole root family. Engine activation uses the
+original current-pointer compare-and-swap; a conflict retains a sealed but
+unpublished candidate. Identical effective output records `no_change` only while
+the original base and pointer version remain current.
+
+The build deadline is the capture's database `sealed_at` plus the retained build
+duration. Resume uses the same capture and deadline, without accessing source
+credentials or fetching source rows. An expired deadline cannot be extended by
+retrying. Run acquisition in a supervised worker process: driver timeouts and
+cooperative cancellation alone cannot guarantee hard termination of a blocked
+driver. No policy declaration grants database or source authorization.
+
+## Explicit publication and rollback
+
 Activate an initial generation only while the current pointer is absent:
 
 ```sh

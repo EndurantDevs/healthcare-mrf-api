@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from io import BytesIO
 from typing import Any, BinaryIO
@@ -16,9 +18,13 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
 
+from process.custom_import.capture import SealedCapture, _decoded_record, capture_stream, iter_records
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
 from process.custom_import.snowflake import (
+    MAX_RESULT_BYTES,
     MAX_RESULT_PARTITION_BYTES,
+    MAX_RESULT_PARTITIONS,
     SnowflakeConnectorError,
     SnowflakeCredentialError,
     SnowflakeCredentialProvider,
@@ -34,19 +40,26 @@ from process.custom_import.snowflake_bundle import (
     _SOURCE_SNAPSHOT_TOKEN_COLUMN,
     _STREAM_ID_COLUMN,
     _STREAM_ORDINAL_COLUMN,
-    _query_identity_snapshot_token,
+    MAX_BUNDLE_CAPTURE_BYTES,
+    MAX_BUNDLE_PARTITIONS,
+    MAX_STREAM_CAPTURE_BYTES,
     SnowflakeBundleResult,
     SnowflakeBundleStatement,
     SnowflakeBundleStreamMetadata,
     SnowflakeBundleStreamResult,
+    _bundle_source_field_ids,
+    _capture_limits,
+    _query_identity_snapshot_token,
 )
 from process.custom_import.snowflake_preflight import SnowflakePreflightStatement
 from process.custom_import.snowflake_preflight_schema import (
     _fixed_type_parts,
     _is_integral_fixed,
     _metadata_integer,
-    _source_type as _preflight_source_type,
     validate_preflight_result_schema,
+)
+from process.custom_import.snowflake_preflight_schema import (
+    _source_type as _preflight_source_type,
 )
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
@@ -57,6 +70,72 @@ _NETWORK_TIMEOUT_SECONDS = 120
 _STATEMENT_TIMEOUT_SECONDS = 120
 _MIN_INT64 = -(2**63)
 _MAX_INT64 = 2**63 - 1
+
+
+@dataclass(frozen=True)
+class SnowflakeLandingPart:
+    """One bounded projection, provisional until every source EOF is observed."""
+
+    stream_id: str
+    ordinal: int
+    capture: SealedCapture
+    record_count: int
+    arrow_byte_count: int
+
+
+@dataclass(frozen=True)
+class SnowflakeLandingEOF:
+    """One stream's compact completion evidence after actual cursor exhaustion."""
+
+    stream_id: str
+    part_count: int
+    record_count: int
+
+
+class SnowflakeBundleLandingResult:
+    """Own one landing cursor; open, advance and close on its affinity thread."""
+
+    def __init__(
+        self,
+        *,
+        owner: _SnowflakeBundlePartitionSources,
+        query_id: str,
+        source_snapshot_token: str,
+        metadata: tuple[SnowflakeBundleStreamMetadata, ...],
+        schemas: tuple[tuple[SnowflakeResultColumn, ...], ...],
+    ) -> None:
+        self.query_id = query_id
+        self.source_snapshot_token = source_snapshot_token
+        self.metadata = metadata
+        self.schemas = schemas
+        self._owner = owner
+        self._iterator: Iterator[SnowflakeLandingPart | SnowflakeLandingEOF] | None = None
+        self._closed = False
+
+    def consume_events(self) -> Iterator[SnowflakeLandingPart | SnowflakeLandingEOF]:
+        """Transfer the single-use iterator, retaining no yielded event history."""
+
+        if self._closed or self._iterator is not None:
+            raise SnowflakeConnectorError("Snowflake landing events were already consumed or closed")
+        self._iterator = self._owner.landing_events(self.source_snapshot_token)
+        return self._iterator
+
+    def close(self) -> None:
+        """Close a suspended iterator and its cursor even before first advance."""
+
+        if self._closed:
+            return
+        self._closed = True
+        _close_resources(self._iterator, self._owner)
+
+    def __enter__(self) -> SnowflakeBundleLandingResult:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            _best_effort_close(self)
 
 
 class SnowflakePythonConnectorAdapter:
@@ -163,6 +242,62 @@ class SnowflakePythonConnectorAdapter:
         except Exception as exc:
             _best_effort_close(cursor, connection)
             raise SnowflakeConnectorError("Snowflake bundle read failed") from exc
+        except BaseException:
+            _best_effort_close(cursor, connection)
+            raise
+
+    def open_bundle_landing(
+        self,
+        statement: SnowflakeBundleStatement,
+        credentials: SnowflakeKeyPairCredentials,
+        *,
+        part_limits: CaptureLimits,
+        maximum_part_arrow_bytes: int,
+        timeout_seconds: int,
+    ) -> SnowflakeBundleLandingResult:
+        """Open one generated SELECT with explicit, separately admitted part limits."""
+
+        if not isinstance(statement, SnowflakeBundleStatement):
+            raise SnowflakeConnectorError("runtime adapter requires a generated Snowflake bundle statement")
+        if not isinstance(credentials, SnowflakeKeyPairCredentials):
+            raise SnowflakeCredentialError("runtime adapter requires key-pair credentials")
+        _validate_landing_limits(part_limits, maximum_part_arrow_bytes)
+        if any(
+            len(columns) > part_limits.maximum_fields_per_record for columns in statement.selected_columns_by_stream
+        ):
+            raise SnowflakeConnectorError("Snowflake landing projection exceeds the field limit")
+        timeout_seconds = _execution_timeout(timeout_seconds)
+        connection = cursor = None
+        try:
+            connection, cursor = self._connect(credentials, timeout_seconds=timeout_seconds)
+            cursor.execute(statement.sql)
+            query_id = getattr(cursor, "sfqid", None)
+            if not isinstance(query_id, str) or not query_id.strip():
+                raise SnowflakeConnectorError("Snowflake did not return a statement identity")
+            schemas = _bundle_result_schemas(statement, cursor.description)
+            metadata, token, pending_row = _bundle_stream_metadata(statement, cursor, query_id=query_id)
+            owner = _SnowflakeBundlePartitionSources(
+                connection=connection,
+                cursor=cursor,
+                statement=statement,
+                schemas=schemas,
+                pending_row=pending_row,
+                landing_limits=part_limits,
+                maximum_part_arrow_bytes=maximum_part_arrow_bytes,
+            )
+            return SnowflakeBundleLandingResult(
+                owner=owner,
+                query_id=query_id,
+                source_snapshot_token=token,
+                metadata=metadata,
+                schemas=schemas,
+            )
+        except SnowflakeConnectorError:
+            _best_effort_close(cursor, connection)
+            raise
+        except Exception as exc:
+            _best_effort_close(cursor, connection)
+            raise SnowflakeConnectorError("Snowflake bundle landing read failed") from exc
         except BaseException:
             _best_effort_close(cursor, connection)
             raise
@@ -435,8 +570,16 @@ def _bundle_result_schemas(
         )
         for field, metadata in zip(fields, description[4:], strict=True)
     }
+    source_fields = _bundle_source_field_ids(statement.request, statement.selected_columns_by_stream)
     return tuple(
-        tuple(columns_by_field[column.field_id] for column in selected_columns)
+        tuple(
+            SnowflakeResultColumn(
+                field_id=column.field_id,
+                source_type=columns_by_field[source_fields[column.field_id]].source_type,
+                nullable=columns_by_field[source_fields[column.field_id]].nullable,
+            )
+            for column in selected_columns
+        )
         for selected_columns in statement.selected_columns_by_stream
     )
 
@@ -508,6 +651,8 @@ class _SnowflakeBundlePartitionSources:
         statement: SnowflakeBundleStatement,
         schemas: tuple[tuple[SnowflakeResultColumn, ...], ...],
         pending_row: Sequence[object] | None,
+        landing_limits: CaptureLimits | None = None,
+        maximum_part_arrow_bytes: int = MAX_RESULT_PARTITION_BYTES,
     ) -> None:
         self._connection = connection
         self._cursor = cursor
@@ -515,14 +660,22 @@ class _SnowflakeBundlePartitionSources:
         self._stream_ids = tuple(binding.stream_id for binding in statement.request.bindings)
         fields = tuple(sorted(statement.request.definition.fields, key=lambda field: field.field_slot))
         output_index_by_field = {field.field_id: index for index, field in enumerate(fields, start=4)}
+        source_fields = _bundle_source_field_ids(statement.request, statement.selected_columns_by_stream)
         self._field_indexes_by_stream = tuple(
-            tuple(output_index_by_field[column.field_id] for column in selected_columns)
+            tuple(output_index_by_field[source_fields[column.field_id]] for column in selected_columns)
             for selected_columns in statement.selected_columns_by_stream
         )
+        self._landing_limits = landing_limits
+        self._maximum_part_arrow_bytes = min(maximum_part_arrow_bytes, MAX_RESULT_PARTITION_BYTES)
+        self._streams = {stream.stream_id: stream for stream in statement.request.definition.source_streams}
+        self._configure_shared_sources(statement)
         self._partition_rows = statement.request.encoding.partition_rows
+        if landing_limits is not None:
+            self._partition_rows = min(self._partition_rows, landing_limits.maximum_records)
         self._expected_row_length = len(fields) + 4
         self._next_stream_index = 0
         self._pending_row = pending_row
+        self._source_exhausted = False
         self._closed_stream_indexes: set[int] = set()
         self._closed = False
         self._stream_sources = tuple(
@@ -534,15 +687,98 @@ class _SnowflakeBundlePartitionSources:
 
         return self._stream_sources[stream_index]
 
-    def next_partition_rows(self, stream_index: int) -> tuple[list[Sequence[object]], bool]:
-        """Return the next deterministic partition for one configured stream."""
+    def _configure_shared_sources(self, statement: SnowflakeBundleStatement) -> None:
+        """Keep bounded later-stream Parquet partitions from each relation's sole read."""
 
+        streams_by_source = {}
+        for index, binding in enumerate(statement.request.bindings):
+            source_key = binding.stream_id if statement.request.processing_policy is None else binding.relation
+            streams_by_source.setdefault(source_key, []).append(index)
+        self._streams_by_source = {indexes[0]: tuple(indexes) for indexes in streams_by_source.values()}
+        self._source_field_indexes = {}
+        self._source_schemas = {}
+        self._projection_indexes = {}
+        self._shared_partitions: dict[int, deque[BinaryIO]] = {}
+        for source_index, stream_indexes in self._streams_by_source.items():
+            columns_by_index = {}
+            for stream_index in stream_indexes:
+                for index, column in zip(
+                    self._field_indexes_by_stream[stream_index], self._schemas[stream_index], strict=True
+                ):
+                    columns_by_index.setdefault(index, column)
+                if stream_index != source_index and self._landing_limits is None:
+                    self._shared_partitions[stream_index] = deque()
+            indexes = tuple(columns_by_index)
+            self._source_field_indexes[source_index] = indexes
+            self._source_schemas[source_index] = tuple(columns_by_index.values())
+            for stream_index in stream_indexes:
+                self._projection_indexes[stream_index] = tuple(
+                    indexes.index(index) for index in self._field_indexes_by_stream[stream_index]
+                )
+        self._stream_byte_limit = min(
+            MAX_STREAM_CAPTURE_BYTES, statement.request.capture_limits.maximum_compressed_bytes
+        )
+        self._generated_bytes_by_stream = [0] * len(self._stream_ids)
+        self._generated_partitions_by_stream = [0] * len(self._stream_ids)
+        self._generated_bytes = self._generated_partitions = 0
+
+    def next_partition(self, stream_index: int) -> tuple[BinaryIO | None, bool]:
+        """Fan out one captured batch, or transfer a previously retained partition."""
+
+        self._check_stream_order(stream_index)
+        if stream_index in self._shared_partitions:
+            partitions = self._shared_partitions[stream_index]
+            return (partitions.popleft() if partitions else None), not partitions
+        rows, is_complete = self.next_partition_rows(stream_index)
+        if not rows:
+            return None, is_complete
+        reader = self._projected_partition(rows, stream_index)
+        try:
+            for shared_index in self._streams_by_source[stream_index][1:]:
+                self._shared_partitions[shared_index].append(self._projected_partition(rows, shared_index))
+        except BaseException:
+            _best_effort_close(reader)
+            raise
+        return reader, is_complete
+
+    def _projected_partition(self, rows: Sequence[Sequence[object]], stream_index: int) -> BinaryIO:
+        indexes = self._projection_indexes[stream_index]
+        return self.partition_reader([tuple(row[index] for index in indexes) for row in rows], stream_index)
+
+    def partition_reader(self, rows: Sequence[Sequence[object]], stream_index: int) -> BinaryIO:
+        """Bound all generated partitions before later-stream bytes can be retained."""
+
+        reader = _parquet_reader(rows, self._schemas[stream_index])
+        if not self._shared_partitions:
+            return reader
+        size = reader.getbuffer().nbytes
+        if (
+            self._generated_bytes + size > MAX_BUNDLE_CAPTURE_BYTES
+            or self._generated_bytes_by_stream[stream_index] + size > self._stream_byte_limit
+            or self._generated_partitions >= MAX_BUNDLE_PARTITIONS
+            or self._generated_partitions_by_stream[stream_index] >= MAX_RESULT_PARTITIONS
+        ):
+            reader.close()
+            raise SnowflakeConnectorError("Snowflake shared capture exceeds the bundle byte or partition limit")
+        self._generated_bytes += size
+        self._generated_bytes_by_stream[stream_index] += size
+        self._generated_partitions += 1
+        self._generated_partitions_by_stream[stream_index] += 1
+        return reader
+
+    def _check_stream_order(self, stream_index: int) -> None:
         if self._closed:
             raise SnowflakeConnectorError("Snowflake bundle result is closed")
         if stream_index != self._next_stream_index:
             raise SnowflakeConnectorError("Snowflake bundle streams must be consumed in configured order")
+
+    def next_partition_rows(self, stream_index: int) -> tuple[list[Sequence[object]], bool]:
+        """Return the next deterministic partition for one configured stream."""
+
+        self._check_stream_order(stream_index)
         partition_rows: list[Sequence[object]] = []
         variable_bytes = 0
+        projection_bytes_by_stream = {}
         expected_ordinal = stream_index + 1
         while len(partition_rows) < self._partition_rows:
             result_row = self._pending_row
@@ -551,6 +787,7 @@ class _SnowflakeBundlePartitionSources:
             else:
                 self._pending_row = None
             if result_row is None:
+                self._source_exhausted = True
                 return partition_rows, True
             ordinal, selected_values = self._split_row(result_row, stream_index)
             if ordinal > expected_ordinal:
@@ -558,10 +795,15 @@ class _SnowflakeBundlePartitionSources:
                 return partition_rows, True
             if ordinal < expected_ordinal:
                 raise SnowflakeConnectorError("Snowflake bundle result rows are not ordered by stream")
-            schema = self._schemas[stream_index]
+            schema = self._source_schemas[stream_index]
             row_variable_bytes = _result_row_variable_bytes(selected_values, schema)
+            has_exceeded_projection = False
+            if self._landing_limits is not None:
+                has_exceeded_projection = self._has_exceeded_landing_projection(
+                    selected_values, stream_index, len(partition_rows) + 1, projection_bytes_by_stream
+                )
             decoded_bytes = variable_bytes + row_variable_bytes + _fixed_batch_bytes(schema, len(partition_rows) + 1)
-            if decoded_bytes > MAX_RESULT_PARTITION_BYTES:
+            if decoded_bytes > MAX_RESULT_PARTITION_BYTES or has_exceeded_projection:
                 if not partition_rows:
                     raise SnowflakeConnectorError("Snowflake bundle result batch exceeds the decoded-byte limit")
                 self._pending_row = result_row
@@ -569,6 +811,114 @@ class _SnowflakeBundlePartitionSources:
             partition_rows.append(selected_values)
             variable_bytes += row_variable_bytes
         return partition_rows, False
+
+    def _has_exceeded_landing_projection(
+        self, row: Sequence[object], source_index: int, row_count: int, variable_bytes_by_stream: dict[int, int]
+    ) -> bool:
+        """Validate records and preflight each projection independently of union bytes."""
+
+        has_exceeded_limit = False
+        for stream_index in self._streams_by_source[source_index]:
+            values_by_field = {
+                column.field_id: row[index]
+                for column, index in zip(
+                    self._schemas[stream_index], self._projection_indexes[stream_index], strict=True
+                )
+            }
+            _decoded_record(1, values_by_field, self._landing_limits)
+            schema = self._schemas[stream_index]
+            variable_bytes_by_stream[stream_index] = variable_bytes_by_stream.get(stream_index, 0) + (
+                _result_row_variable_bytes(tuple(values_by_field.values()), schema)
+            )
+            if (
+                variable_bytes_by_stream[stream_index] + _fixed_batch_bytes(schema, row_count)
+                > self._maximum_part_arrow_bytes
+            ):
+                has_exceeded_limit = True
+        return has_exceeded_limit
+
+    def landing_events(self, source_snapshot_token: str) -> Iterator[SnowflakeLandingPart | SnowflakeLandingEOF]:
+        """Fan out each bounded batch before fetching another; EOF follows cursor EOF."""
+
+        part_counts = [0] * len(self._stream_ids)
+        record_counts = [0] * len(self._stream_ids)
+        has_primary_failure = False
+        try:
+            for source_index, stream_indexes in self._streams_by_source.items():
+                self._next_stream_index = source_index
+                for part in self._landing_source_parts(source_index, stream_indexes, source_snapshot_token):
+                    stream_index = self._stream_ids.index(part.stream_id)
+                    part_counts[stream_index] = part.ordinal
+                    record_counts[stream_index] += part.record_count
+                    yield part
+                    part = None
+            if not self._source_exhausted or self._pending_row is not None:
+                raise SnowflakeConnectorError("Snowflake landing did not exhaust the source cursor")
+            for index, stream_id in enumerate(self._stream_ids):
+                yield SnowflakeLandingEOF(stream_id, part_counts[index], record_counts[index])
+        except SnowflakeConnectorError:
+            has_primary_failure = True
+            raise
+        except Exception as exc:
+            has_primary_failure = True
+            raise SnowflakeConnectorError("Snowflake bundle landing fetch failed") from exc
+        except GeneratorExit:
+            # Explicit close has no body failure to preserve; cleanup must report.
+            raise
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if has_primary_failure:
+                _best_effort_close(self)
+            else:
+                self.close()
+
+    def _landing_source_parts(
+        self, source_index: int, stream_indexes: tuple[int, ...], source_snapshot_token: str
+    ) -> Iterator[SnowflakeLandingPart]:
+        """Release every projection of one source batch before fetching another."""
+
+        ordinal = 0
+        while True:
+            rows, is_complete = self.next_partition_rows(source_index)
+            if rows or not ordinal:
+                ordinal += 1
+                for stream_index in stream_indexes:
+                    yield self._landing_part(rows, stream_index, ordinal, source_snapshot_token)
+            rows = None
+            if is_complete:
+                return
+
+    def _landing_part(
+        self, rows: Sequence[Sequence[object]], stream_index: int, ordinal: int, token: str
+    ) -> SnowflakeLandingPart:
+        """Seal and release the sole encoded reader before exposing one event."""
+
+        indexes = self._projection_indexes[stream_index]
+        projected_rows = [tuple(row[index] for index in indexes) for row in rows]
+        reader, arrow_bytes = _parquet_reader_with_metrics(
+            projected_rows,
+            self._schemas[stream_index],
+            maximum_arrow_bytes=self._maximum_part_arrow_bytes,
+        )
+        has_primary_failure = False
+        try:
+            stream_id = self._stream_ids[stream_index]
+            stream = self._streams[stream_id]
+            capture = capture_stream(reader, stream, source_snapshot_token=token, limits=self._landing_limits)
+            record_count = sum(1 for _record in iter_records(capture, stream, limits=self._landing_limits))
+            if record_count != len(rows):
+                raise SnowflakeConnectorError("Snowflake landing record count does not match the source batch")
+            return SnowflakeLandingPart(stream_id, ordinal, capture, record_count, arrow_bytes)
+        except BaseException:
+            has_primary_failure = True
+            raise
+        finally:
+            if has_primary_failure:
+                _best_effort_close(reader)
+            else:
+                reader.close()
 
     def finish_stream(self, stream_index: int) -> None:
         """Advance only after this stream's final partition has been yielded."""
@@ -593,7 +943,12 @@ class _SnowflakeBundlePartitionSources:
         cursor, connection = self._cursor, self._connection
         self._cursor = None
         self._connection = None
-        _close_resources(cursor, connection)
+        if self._landing_limits is not None:
+            self._pending_row = None
+        readers = [reader for partitions in self._shared_partitions.values() for reader in partitions]
+        for partitions in self._shared_partitions.values():
+            partitions.clear()
+        _close_resources(*readers, cursor, connection)
 
     def _split_row(self, result_row: object, stream_index: int) -> tuple[int, Sequence[object]]:
         if isinstance(result_row, (str, bytes, bytearray, memoryview)) or not isinstance(result_row, Sequence):
@@ -605,9 +960,11 @@ class _SnowflakeBundlePartitionSources:
         ordinal = result_row[1]
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or not 1 <= ordinal <= len(self._stream_ids):
             raise SnowflakeConnectorError("Snowflake bundle stream ordinal is invalid")
+        if ordinal - 1 not in self._streams_by_source:
+            raise SnowflakeConnectorError("Snowflake bundle data repeats a shared source relation")
         if result_row[2] != self._stream_ids[ordinal - 1] or result_row[3] is not None:
             raise SnowflakeConnectorError("Snowflake bundle stream identity is invalid")
-        return ordinal, tuple(result_row[index] for index in self._field_indexes_by_stream[stream_index])
+        return ordinal, tuple(result_row[index] for index in self._source_field_indexes[stream_index])
 
 
 class _SnowflakeBundleStreamPartitionSources:
@@ -627,13 +984,13 @@ class _SnowflakeBundleStreamPartitionSources:
         has_primary_failure = False
         try:
             while True:
-                partition_rows, is_complete = self._owner.next_partition_rows(self._stream_index)
-                if partition_rows:
+                reader, is_complete = self._owner.next_partition(self._stream_index)
+                if reader is not None:
                     has_emitted_partition = True
-                    yield _parquet_reader(partition_rows, self._owner._schemas[self._stream_index])
+                    yield reader
                 if is_complete:
                     if not has_emitted_partition:
-                        yield _parquet_reader((), self._owner._schemas[self._stream_index])
+                        yield self._owner.partition_reader((), self._stream_index)
                     self._owner.finish_stream(self._stream_index)
                     return
         except SnowflakeConnectorError:
@@ -726,8 +1083,21 @@ def _parquet_reader(
     result_rows: Sequence[Sequence[object]],
     result_schema: tuple[SnowflakeResultColumn, ...],
 ) -> BytesIO:
+    reader, _arrow_bytes = _parquet_reader_with_metrics(result_rows, result_schema)
+    return reader
+
+
+def _parquet_reader_with_metrics(
+    result_rows: Sequence[Sequence[object]],
+    result_schema: tuple[SnowflakeResultColumn, ...],
+    *,
+    maximum_arrow_bytes: int = MAX_RESULT_PARTITION_BYTES,
+) -> tuple[BytesIO, int]:
+    """Encode with the existing codec and report actual Arrow, not encoded bytes."""
+
     _validate_result_rows(result_rows, result_schema)
     result_columns = tuple(zip(*result_rows, strict=True)) if result_rows else ((),) * len(result_schema)
+    destination = None
     try:
         table = pa.Table.from_arrays(
             [
@@ -745,19 +1115,39 @@ def _parquet_reader(
                 ]
             ),
         )
-        if table.nbytes > MAX_RESULT_PARTITION_BYTES:
+        if table.nbytes > min(maximum_arrow_bytes, MAX_RESULT_PARTITION_BYTES):
             raise SnowflakeConnectorError("Snowflake result batch exceeds the decoded-byte limit")
         destination = BytesIO()
         pq.write_table(table, destination, compression="zstd")
     except SnowflakeConnectorError:
+        _best_effort_close(destination)
         raise
     except (pa.ArrowException, OverflowError, TypeError, ValueError) as exc:
+        _best_effort_close(destination)
         raise SnowflakeConnectorError("Snowflake result cannot be encoded as Parquet") from exc
+    except BaseException:
+        _best_effort_close(destination)
+        raise
     if destination.tell() > MAX_RESULT_PARTITION_BYTES:
         destination.close()
         raise SnowflakeConnectorError("Snowflake Parquet partition exceeds the byte limit")
     destination.seek(0)
-    return destination
+    return destination, table.nbytes
+
+
+def _validate_landing_limits(part_limits: CaptureLimits, maximum_arrow_bytes: int) -> None:
+    """Validate the separate trusted limits before opening a source connection."""
+
+    try:
+        _capture_limits(part_limits)
+    except ValueError as exc:
+        raise SnowflakeConnectorError("Snowflake landing part limits are invalid") from exc
+    if (
+        isinstance(maximum_arrow_bytes, bool)
+        or not isinstance(maximum_arrow_bytes, int)
+        or not 1 <= maximum_arrow_bytes <= MAX_RESULT_BYTES
+    ):
+        raise SnowflakeConnectorError("Snowflake landing Arrow limit is invalid")
 
 
 def _validate_result_rows(

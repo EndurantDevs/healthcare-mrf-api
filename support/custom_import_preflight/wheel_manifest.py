@@ -11,6 +11,8 @@ CANONICAL_MODULES = (
     "process/custom_import/definition.py",
     "process/custom_import/family.py",
     "process/custom_import/capture_limits.py",
+    "process/custom_import/segmented_capture_policy.py",
+    "process/custom_import/processing_policy.py",
     "process/custom_import/snowflake.py",
     "process/custom_import/snowflake_bundle.py",
     "process/custom_import/snowflake_binding.py",

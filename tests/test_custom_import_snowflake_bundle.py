@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -23,6 +24,7 @@ import process.custom_import.snowflake_candidate as snowflake_candidate
 from process.custom_import.capture import CaptureLimits, iter_records
 from process.custom_import.capture_store import CaptureReceipt, ReplayableParquetCapture
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import (
     SnowflakeApprovedRelation,
     SnowflakeConnectorError,
@@ -53,6 +55,7 @@ from process.custom_import.snowflake_candidate import (
     run_snowflake_bundle_candidate,
 )
 from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter
+from tests.test_custom_import_processing_policy import _policy_document
 
 _PRIVATE_KEY = b"-----BEGIN PRIVATE KEY-----\nsynthetic-key\n-----END PRIVATE KEY-----"
 _SNAPSHOT = "synthetic-release-20260922"
@@ -694,6 +697,58 @@ def test_bundle_statement_contracts_reject_drift():
             callback()
 
 
+@pytest.mark.parametrize(
+    ("duplicates_snapshot", "legacy_hashes"),
+    (
+        (
+            False,
+            (
+                "c44af17bcbab72c43ddfa2435eb001c4b88ad44977ef7c05b548cfcb206d16e1",
+                "f3bf26ce2433ea0284fb9c8485aa7c725f16ed3786520a038a4b1012e7bc9fef",
+                "248defd976cd42b328156906f79fb8384ecd0600d1e067e56f2f828a2067a996",
+            ),
+        ),
+        (
+            True,
+            (
+                "a4f00935975a8ce007aa0b9638742d2643204af7f7983412f53a694f999e1e7c",
+                "2f51db8d64318263986ed1718e006658905870c65ac2086e3ed3b9cc40befdd3",
+                "85e2aba911bf168de56bba2e36e7798dd3cc08ba612f8323df8c797d04c18000",
+            ),
+        ),
+    ),
+)
+def test_bundle_preserves_legacy_duplicate_physical_columns_and_rejects_v2(duplicates_snapshot, legacy_hashes):
+    snapshot, root, detail = _relations()
+    bindings = _bindings()
+    if duplicates_snapshot:
+        root = replace(root, columns=(*root.columns, SnowflakeDeclaredColumn("semantic_snapshot", "root_npi")))
+        bindings = tuple(
+            replace(binding, source_snapshot_token_relation=root.relation)
+            if binding.stream_id == "root_source"
+            else binding
+            for binding in bindings
+        )
+    else:
+        root = replace(
+            root,
+            columns=(root.columns[0], SnowflakeDeclaredColumn("score", "root_npi"), root.columns[2]),
+        )
+    builder = snowflake_bundle.SnowflakeBundleStatementBuilder(approved_relations=(snapshot, root, detail))
+    request = builder.prepare_request(_definition(), bindings=bindings)
+    statement = builder.build_statement(request)
+    assert (
+        hashlib.sha256(statement.sql.encode()).hexdigest(),
+        request.request_sha256,
+        statement.statement_sha256,
+    ) == legacy_hashes
+    policy_request = builder.prepare_request(
+        _definition(), bindings=bindings, processing_policy=ProcessingPolicy.from_mapping(_policy_document())
+    )
+    with pytest.raises(SnowflakeBundleError, match="column identifiers must be unique within each stream"):
+        builder.build_statement(policy_request)
+
+
 def test_bundle_acquisition_contracts_reject_drift():
     connector = _connector(_Adapter(lambda: _result(query_id="query-contract")[0]))
     request = connector.prepare_request(_definition(), bindings=_bindings())
@@ -1081,7 +1136,7 @@ def test_bundle_generates_one_safe_statement_with_fixed_order_and_encoding_input
     )
     assert 'FROM "SYNTHETIC"."PUBLIC"."ROOTS"' in statement.sql
     assert 'FROM "SYNTHETIC"."PUBLIC"."DETAILS"' in statement.sql
-    assert '(SELECT "SNAPSHOT_TOKEN" FROM "SYNTHETIC"."PUBLIC"."SNAPSHOTS")' in statement.sql
+    assert statement.sql.count('(SELECT "SNAPSHOT_TOKEN" FROM "SYNTHETIC"."PUBLIC"."SNAPSHOTS")') == 2
     assert '"ROOT_NPI" AS "npi"' in statement.sql
     assert '"DETAIL_AMOUNT" AS "amount"' in statement.sql
     assert "UNION ALL" in statement.sql
@@ -1301,8 +1356,14 @@ def test_bundle_preserves_exact_scalar_values_without_sql_text_coercion():
         "detail_id": "synthetic-detail",
         "amount": Decimal("12.500000000000"),
     }
-    assert "TO_VARCHAR" not in acquisition.statement.sql
-    assert "TO_JSON" not in acquisition.statement.sql
+    statement = acquisition.statement
+    _metadata, data_branches = snowflake_bundle._bundle_sql_branches(
+        statement.request,
+        tuple(sorted(statement.request.definition.fields, key=lambda field: field.field_slot)),
+        statement.selected_columns_by_stream,
+        statement.source_snapshot_token_columns_by_stream,
+    )
+    assert all("TO_VARCHAR" not in branch and "TO_JSON" not in branch for branch in data_branches)
 
 
 def test_bundle_replays_fixed38_integer_as_bounded_python_int():

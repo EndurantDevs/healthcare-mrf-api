@@ -68,6 +68,7 @@ __all__ = (
     "WinnerCandidate",
     "WinnerMaterialization",
     "WinnerMaterializationError",
+    "iter_ordered_profile_winners",
     "materialize_winners",
     "persist_scalar_projections",
     "persist_selection_profiles",
@@ -551,6 +552,67 @@ def _select_winners(
         )
     _raise_selected_winner_tie_conflicts(selected_winner_by_context)
     return selected_winner_by_context
+
+
+def iter_ordered_profile_winners(
+    definition: CustomImportDefinition,
+    *,
+    generation: GenerationIdentity,
+    profile_slot: int,
+    candidates: ValidatedWinnerCandidateStream,
+    child_collection_slots: Mapping[str, int] | None = None,
+) -> Iterator[MaterializedWinner]:
+    """Reduce one trusted profile ordered by entity, context digest, and text.
+
+    Skip other valid scopes. Winners are provisional until actual exhaustion;
+    later validation failures must prevent sealing the unpublished generation.
+    """
+
+    _validated_definition(definition)
+    if not isinstance(generation, GenerationIdentity):
+        raise WinnerMaterializationError("generation identity is malformed")
+    if not isinstance(candidates, ValidatedWinnerCandidateStream):
+        raise WinnerMaterializationError("winner candidates require a validated generation stream")
+    if candidates.generation != generation:
+        raise WinnerMaterializationError("winner candidate stream generation does not match materialization")
+    if type(profile_slot) is not int or not 1 <= profile_slot <= len(definition.selection_profiles):
+        raise WinnerMaterializationError("winner profile slot is outside the materialization profile range")
+    profile_scopes = _profile_scopes(definition, child_collection_slots)
+    candidate_contract = _winner_candidate_contract(definition, profile_scopes)
+    profile = definition.selection_profiles[profile_slot - 1]
+    scope = profile_scopes[profile_slot - 1]
+    selected: _SelectedWinner | None = None
+    previous_key = None
+    for raw_candidate in candidates.consume():
+        candidate = _normalize_winner_candidate(raw_candidate, candidate_contract)
+        if candidate.candidate.context_collection_slot != scope.collection_slot:
+            continue
+        _validate_selection_values(profile, candidate, candidate_contract.fields_by_id)
+        canonical_context_key, context_key_sha256 = _context_key(profile, candidate, candidate_contract.fields_by_id)
+        key = (candidate.candidate.entity_binding_id, context_key_sha256, canonical_context_key)
+        if selected is not None:
+            assert previous_key is not None
+            if key[:2] == previous_key[:2] and key[2] != previous_key[2]:
+                raise WinnerMaterializationError("winner context digest collision has different canonical context")
+            if key < previous_key:
+                raise WinnerMaterializationError("winner candidates are not in entity/context order")
+            if key != previous_key:
+                _raise_selected_winner_tie_conflicts({(profile_slot, previous_key[0], previous_key[2]): selected})
+                yield _winner_from_selection(generation, selected)
+                selected = None
+        selected = _reduce_selected_winner(
+            selected,
+            profile,
+            profile_slot,
+            candidate,
+            candidate_contract.fields_by_id,
+            canonical_context_key,
+            context_key_sha256,
+        )
+        previous_key = key
+    if selected is not None:
+        _raise_selected_winner_tie_conflicts({(profile_slot, key[0], key[2]): selected})
+        yield _winner_from_selection(generation, selected)
 
 
 def _materialized_winners(
@@ -1065,7 +1127,26 @@ def _replace_winner_when_better(
     context_key_sha256: bytes,
 ) -> None:
     winner_context = (profile_slot, candidate.candidate.entity_binding_id, canonical_context_key)
-    selected_winner = selected_winner_by_context.get(winner_context)
+    selected_winner_by_context[winner_context] = _reduce_selected_winner(
+        selected_winner_by_context.get(winner_context),
+        profile,
+        profile_slot,
+        candidate,
+        fields_by_id,
+        canonical_context_key,
+        context_key_sha256,
+    )
+
+
+def _reduce_selected_winner(
+    selected_winner: _SelectedWinner | None,
+    profile: SelectionProfile,
+    profile_slot: int,
+    candidate: _NormalizedWinnerCandidate,
+    fields_by_id: Mapping[str, Field],
+    canonical_context_key: str,
+    context_key_sha256: bytes,
+) -> _SelectedWinner:
     if selected_winner is not None:
         comparison = _compare_candidates(
             profile,
@@ -1075,7 +1156,7 @@ def _replace_winner_when_better(
         )
         if comparison == 0:
             physical_conflict, typed_conflict = _winner_tie_conflicts(selected_winner.candidate, candidate)
-            selected_winner_by_context[winner_context] = _SelectedWinner(
+            return _SelectedWinner(
                 profile_id=selected_winner.profile_id,
                 profile_slot=selected_winner.profile_slot,
                 canonical_context_key=selected_winner.canonical_context_key,
@@ -1084,10 +1165,9 @@ def _replace_winner_when_better(
                 has_physical_tie_conflict=selected_winner.has_physical_tie_conflict or physical_conflict,
                 has_typed_tie_conflict=selected_winner.has_typed_tie_conflict or typed_conflict,
             )
-            return
         if comparison > 0:
-            return
-    selected_winner_by_context[winner_context] = _SelectedWinner(
+            return selected_winner
+    return _SelectedWinner(
         profile_id=profile.profile_id,
         profile_slot=profile_slot,
         canonical_context_key=canonical_context_key,

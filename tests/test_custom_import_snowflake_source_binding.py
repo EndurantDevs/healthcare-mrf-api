@@ -9,14 +9,18 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 
-import process.custom_import.snowflake_candidate as snowflake_candidate
 import process.custom_import.snowflake_binding as binding_contract
+import process.custom_import.snowflake_candidate as snowflake_candidate
 import process.custom_import.snowflake_source_binding as source_binding
 from db.models.custom_import import CustomImportExecution, CustomImportSourceBindingRevision
 from process.custom_import.definition import CustomImportDefinition
@@ -27,9 +31,12 @@ from process.custom_import.execution import (
     request_cancellation,
     reserve_execution,
 )
+from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
+from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
 from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest, SnowflakeCandidateError
-from tests.custom_import_postgres_support import isolated_publication_case, transaction_session
+from tests.custom_import_postgres_support import _migration, isolated_publication_case, transaction_session
+from tests.test_custom_import_segmented_capture_policy import _document as _capture_policy_document
 
 
 def _definition() -> CustomImportDefinition:
@@ -170,9 +177,10 @@ def _loaded_rows(definition: CustomImportDefinition, binding: source_binding.Sno
     return binding_row, definition_row, schema_row
 
 
-def test_binding_derives_complete_approved_relations_and_generated_bundle_identity():
+@pytest.mark.parametrize("configured", (False, True))
+def test_binding_derives_complete_approved_relations_and_generated_bundle_identity(configured):
     definition = _definition()
-    binding = _binding(definition)
+    binding = _v2_binding(definition) if configured else _binding(definition)
 
     approved_relations, bindings = binding.bundle_components(definition)
     connector = SnowflakeBundleAcquisitionConnector(
@@ -180,7 +188,9 @@ def test_binding_derives_complete_approved_relations_and_generated_bundle_identi
         credential_provider=SimpleNamespace(load_key_pair=lambda: None),
         adapter=SimpleNamespace(fetch_bundle=lambda *_args: None),
     )
-    statement = connector.build_statement(connector.prepare_request(definition, bindings=bindings))
+    statement = connector.build_statement(
+        connector.prepare_request(definition, bindings=bindings, processing_policy=binding.processing_policy)
+    )
 
     replayed = source_binding.SnowflakeSourceBinding.from_json(binding.canonical)
     assert binding.canonical == replayed.canonical
@@ -203,8 +213,9 @@ def test_binding_derives_complete_approved_relations_and_generated_bundle_identi
     assert 'FROM "SYNTHETIC"."PUBLIC"."DETAIL_RECORDS"' in statement.sql
     assert 'FROM "SYNTHETIC"."PUBLIC"."ROOT_SNAPSHOTS"' in statement.sql
     assert 'FROM "SYNTHETIC"."PUBLIC"."DETAIL_SNAPSHOTS"' in statement.sql
-    assert 'SELECT "ROOT_SNAPSHOT_TOKEN"' in statement.sql
-    assert 'SELECT "DETAIL_SNAPSHOT_TOKEN"' in statement.sql
+    for token in ("ROOT_SNAPSHOT_TOKEN", "DETAIL_SNAPSHOT_TOKEN"):
+        expression = f'SELECT DISTINCT "{token}" AS "__ci_snapshot_native"' if configured else f'SELECT "{token}" FROM'
+        assert expression in statement.sql
     assert "DROP" not in statement.sql
 
 
@@ -248,11 +259,19 @@ def test_binding_rejects_unknown_keys_paths_and_incomplete_field_mapping():
     with pytest.raises(source_binding.SnowflakeSourceBindingError, match="selector"):
         source_binding.SnowflakeSourceBinding.from_json(json.dumps(document)).bundle_components(definition)
 
+
+@pytest.mark.parametrize("duplicates_snapshot", (False, True))
+def test_stream_columns_remain_unique(duplicates_snapshot):
+    definition = _definition()
     document = _binding_document(definition)
-    document["streams"][1]["source_snapshot_token_relation"] = document["streams"][0]["source_snapshot_token_relation"]
-    document["streams"][1]["source_snapshot_token_column_identifier"] = "root_snapshot_token"
-    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="physical column mapping"):
-        source_binding.SnowflakeSourceBinding.from_json(json.dumps(document)).bundle_components(definition)
+    stream = document["streams"][0]
+    if duplicates_snapshot:
+        stream["source_snapshot_token_relation"] = stream["relation"]
+        stream["source_snapshot_token_column_identifier"] = "root_npi"
+    else:
+        stream["columns"][1]["column_identifier"] = "root_npi"
+    with pytest.raises(source_binding.SnowflakeSourceBindingError, match="stream columns are not unique"):
+        source_binding.SnowflakeSourceBinding.from_mapping(document)
 
 
 def test_shared_relation_rejects_conflicting_field_mapping():
@@ -260,12 +279,16 @@ def test_shared_relation_rejects_conflicting_field_mapping():
     columns_by_relation = {}
     relation_by_key = {}
     binding_contract._register_approved_column(
-        columns_by_relation, relation_by_key, relation,
+        columns_by_relation,
+        relation_by_key,
+        relation,
         binding_contract.SnowflakeDeclaredColumn("npi", "first_npi"),
     )
     with pytest.raises(source_binding.SnowflakeSourceBindingError, match="field mapping is inconsistent"):
         binding_contract._register_approved_column(
-            columns_by_relation, relation_by_key, relation,
+            columns_by_relation,
+            relation_by_key,
+            relation,
             binding_contract.SnowflakeDeclaredColumn("npi", "second_npi"),
         )
 
@@ -848,3 +871,81 @@ async def test_source_binding_receipt_requires_exact_readback_identity(monkeypat
         loader.return_value = replace(loaded, **{field: wrong_value})
         with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="readback"):
             await readback()
+
+
+def _processing_policy_migration(connection, schema_name):
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/20261002020000_custom_import_processing_policy.py"
+    migration = _migration(path, "source_processing_policy_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(connection))
+    return migration
+
+
+def _v2_binding(definition):
+    policy = ProcessingPolicy(
+        capture=SegmentedCapturePolicy.from_mapping(_capture_policy_document()),
+        driver_timeout_seconds=30,
+        build=BuildPolicy(2, 4096, 1000, 60, 300),
+    )
+    return replace(_binding(definition), processing_policy=policy)
+
+
+async def _register_and_load_policy_binding(case, binding):
+    async with case.sessions() as session, session.begin():
+        receipt = await source_binding.register_snowflake_source_binding(
+            session, dataset_key="synthetic_processing_policy", definition=_definition(), binding=binding
+        )
+        loaded = await source_binding.load_snowflake_source_binding(
+            session,
+            definition_revision_id=receipt.definition_revision_id,
+            source_binding_revision_id=receipt.source_binding_revision_id,
+        )
+    return receipt, loaded
+
+
+async def test_v2_native_registration_preserves_immutable_policy_choices():
+    async with isolated_publication_case() as case:
+        legacy = _binding(_definition())
+        first, before = await _register_and_load_policy_binding(case, legacy)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).upgrade())
+        v2 = _v2_binding(_definition())
+        second, retained = await _register_and_load_policy_binding(case, v2)
+        replay, reloaded = await _register_and_load_policy_binding(case, v2)
+        changed = replace(v2, processing_policy=replace(v2.processing_policy, driver_timeout_seconds=31))
+        third, changed_loaded = await _register_and_load_policy_binding(case, changed)
+        assert first.revision_number == 1
+        assert before.binding.canonical == legacy.canonical
+        assert second.revision_number == 2 and second.created is True
+        assert replay == replace(second, created=False)
+        assert retained == reloaded
+        assert retained.binding == v2
+        assert retained.binding.processing_policy.driver_timeout_seconds == 30
+        assert third.revision_number == 3 and third.created is True
+        assert changed_loaded.binding.processing_policy.driver_timeout_seconds == 31
+        async with case.sessions() as session:
+            old = await source_binding.load_snowflake_source_binding(
+                session,
+                definition_revision_id=first.definition_revision_id,
+                source_binding_revision_id=first.source_binding_revision_id,
+            )
+            assert old == before
+        with pytest.raises(DBAPIError, match="processing_policy_retention_required"):
+            async with case.engine.begin() as connection:
+                await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).downgrade())
+        _, still_retained = await _register_and_load_policy_binding(case, v2)
+        assert still_retained == retained
+
+
+async def test_binding_allowlist_downgrade_preserves_legacy_and_rejects_v2():
+    async with isolated_publication_case() as case:
+        legacy = _binding(_definition())
+        first, original = await _register_and_load_policy_binding(case, legacy)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).upgrade())
+            await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).downgrade())
+        replay, retained = await _register_and_load_policy_binding(case, legacy)
+        assert replay == replace(first, created=False)
+        assert retained == original
+        with pytest.raises(DBAPIError, match="source_binding_revision_shape_check"):
+            await _register_and_load_policy_binding(case, _v2_binding(_definition()))

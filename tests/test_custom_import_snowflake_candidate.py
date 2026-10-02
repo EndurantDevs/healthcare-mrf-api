@@ -610,8 +610,13 @@ def test_bridge_rejects_invalid_capture_structure(defect):
         definition,
         ("npi", "display_name"),
         () if defect == "no_partitions" else (pa.table({"npi": ["1234567893"], "display_name": ["One"]}),),
-        column_identifiers=("NPI", "NPI") if defect == "duplicate_column" else None,
     )
+    if defect == "duplicate_column":
+        object.__setattr__(
+            acquisition.statement.request,
+            "selected_columns",
+            tuple(snowflake.SnowflakeDeclaredColumn(field_id, "NPI") for field_id in ("npi", "display_name")),
+        )
 
     with pytest.raises(SnowflakeCandidateError):
         _prepare_candidate(_request(definition, acquisition))

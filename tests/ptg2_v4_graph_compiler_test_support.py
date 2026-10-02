@@ -356,7 +356,7 @@ def scanner_binary() -> Path:
     target_root = Path(os.getenv("CARGO_TARGET_DIR", scanner_root / "target"))
     if not target_root.is_absolute():
         target_root = root / target_root
-    if not os.environ.get("PREPUSH_RUST_BINARIES"):
+    if not (os.environ.get("PREPUSH_RUST_BINARIES") or os.environ.get("CI_RUST_BINARIES")):
         subprocess.run(
             [
                 "cargo",

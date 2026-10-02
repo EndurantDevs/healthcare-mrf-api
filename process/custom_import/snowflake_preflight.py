@@ -32,16 +32,17 @@ from process.custom_import.snowflake import (
     SnowflakeConnectorError,
     SnowflakeDeclaredColumn,
 )
+from process.custom_import.snowflake_binding import SnowflakeSourceBinding, SnowflakeSourceBindingError
 from process.custom_import.snowflake_bundle import (
     SnowflakeBundleBinding,
     SnowflakeBundleError,
     SnowflakeBundleRequest,
-    SnowflakeBundleStatementBuilder,
     SnowflakeBundleStatement,
+    SnowflakeBundleStatementBuilder,
     _query_identity_snapshot_token,
+    _snapshot_token_expression,
     _validated_bundle_statement,
 )
-from process.custom_import.snowflake_binding import SnowflakeSourceBinding, SnowflakeSourceBindingError
 
 DEFAULT_MAX_ROOT_KEYS = 32
 DEFAULT_MAX_CHILD_ROWS = 256
@@ -346,7 +347,9 @@ def _prepare_preflight(
         approved_relations, bundle_bindings = binding.bundle_components(definition)
         if not isinstance(builder, SnowflakeBundleStatementBuilder):
             raise TypeError
-        request = builder.prepare_request(definition, bindings=bundle_bindings)
+        request = builder.prepare_request(
+            definition, bindings=bundle_bindings, processing_policy=binding.processing_policy
+        )
         if not isinstance(request, SnowflakeBundleRequest):
             raise TypeError
         expected_request = SnowflakeBundleRequest(
@@ -354,6 +357,7 @@ def _prepare_preflight(
             bindings=bundle_bindings,
             encoding=request.encoding,
             capture_limits=request.capture_limits,
+            processing_policy=binding.processing_policy,
         )
         bundle_statement = builder.build_statement(request)
         if not isinstance(bundle_statement, SnowflakeBundleStatement):
@@ -580,10 +584,8 @@ def _metadata_branch(
 ) -> str:
     binding = statement.request.bindings[ordinal - 1]
     snapshot_column = statement.source_snapshot_token_columns_by_stream[ordinal - 1]
-    token = (
-        "CAST(NULL AS TEXT)"
-        if snapshot_column is None
-        else f"(SELECT {_quoted(snapshot_column.column_identifier)} FROM {binding.source_snapshot_token_relation.quoted_sql})"
+    token = _snapshot_token_expression(
+        binding.source_snapshot_token_relation, snapshot_column, processing_policy=statement.request.processing_policy
     )
     return _select_branch(
         kind=_METADATA_KIND,

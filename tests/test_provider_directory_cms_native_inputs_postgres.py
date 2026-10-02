@@ -34,7 +34,7 @@ _DATASET_INPUTS = {
 async def _seed_authorities(database, schema):
     """Use real NPI migration and valid synthetic native publication pointers."""
     async with database.engine.begin() as connection:
-        await connection.run_sync(lambda sync: _apply(sync, "20260914120000"))
+        await connection.run_sync(lambda sync: _apply(sync, "20260914120000_npi_result_generation"))
         await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
     await database.status(f'''CREATE TABLE "{schema}".reference_family_result_generation (
         importer_id text PRIMARY KEY,local_lineage_id uuid,local_generation bigint,

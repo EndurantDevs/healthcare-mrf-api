@@ -39,7 +39,6 @@ from process.custom_import.snowflake import FixedLocalKeyPairCredentialProvider
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
 from process.custom_import.snowflake_candidate import (
     SnowflakeBundleCandidateRequest,
-    bundle_request_identity_sha256,
     run_snowflake_bundle_candidate,
 )
 from process.custom_import.snowflake_preflight import (
@@ -56,6 +55,10 @@ from process.custom_import.snowflake_preflight import (
     preflight_snowflake_bundle,
 )
 from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter, SnowflakePythonPreflightAdapter
+from process.custom_import.snowflake_segmented_runner import (
+    configured_request_identity,
+    run_segmented_snowflake_candidate,
+)
 from process.custom_import.snowflake_source_binding import (
     SnowflakeSourceBinding,
     SnowflakeSourceBindingError,
@@ -721,7 +724,11 @@ async def _run_retained_snowflake_binding(
                     credential_provider=credential_provider,
                     adapter=adapter,
                 )
-                bundle_request = connector.prepare_request(loaded.definition, bindings=loaded.bundle_bindings)
+                bundle_request = connector.prepare_request(
+                    loaded.definition,
+                    bindings=loaded.bundle_bindings,
+                    processing_policy=getattr(loaded.binding, "processing_policy", None),
+                )
                 request = SnowflakeBundleCandidateRequest(
                     dataset_id=loaded.dataset_id,
                     definition_revision_id=loaded.definition_revision_id,
@@ -733,7 +740,9 @@ async def _run_retained_snowflake_binding(
                     source_binding_revision_id=loaded.source_binding_revision_id,
                     source_binding_sha256=loaded.source_binding_sha256,
                 )
-                return await run_snowflake_bundle_candidate(database.session, connector, request)
+                return await _run_configured_candidate(
+                    database.session, connector, request, getattr(loaded.binding, "processing_policy", None)
+                )
         except BaseException:
             has_primary_failure = True
             raise
@@ -751,13 +760,25 @@ def _resume_source_access_forbidden(*_args: object, **_kwargs: object) -> None:
     raise AssertionError("resume must not acquire a source")
 
 
+async def _run_configured_candidate(session_factory, connector, request, processing_policy):
+    """Choose only the runner selected by the retained immutable binding."""
+
+    if processing_policy is None:
+        return await run_snowflake_bundle_candidate(session_factory, connector, request)
+    return await run_segmented_snowflake_candidate(
+        session_factory, connector, request, processing_policy=processing_policy
+    )
+
+
 def _resume_connector(loaded: Any) -> SnowflakeBundleAcquisitionConnector:
     """Build statements from the retained allowlist without credential access."""
 
     return SnowflakeBundleAcquisitionConnector(
         approved_relations=loaded.approved_relations,
         credential_provider=SimpleNamespace(load_key_pair=_resume_source_access_forbidden),
-        adapter=SimpleNamespace(fetch_bundle=_resume_source_access_forbidden),
+        adapter=SimpleNamespace(
+            fetch_bundle=_resume_source_access_forbidden, open_bundle_landing=_resume_source_access_forbidden
+        ),
     )
 
 
@@ -805,7 +826,7 @@ async def _resumable_snowflake_candidate(
     definition_revision_id: int,
     source_binding_revision_id: int,
     idempotency_key: str,
-) -> tuple[SnowflakeBundleAcquisitionConnector, SnowflakeBundleCandidateRequest]:
+):
     """Load an exact retained request whose capture can be replayed."""
 
     loaded_binding = await load_snowflake_source_binding(
@@ -814,13 +835,15 @@ async def _resumable_snowflake_candidate(
         source_binding_revision_id=source_binding_revision_id,
     )
     bundle_connector = _resume_connector(loaded_binding)
+    processing_policy = getattr(loaded_binding.binding, "processing_policy", None)
     bundle_request = bundle_connector.prepare_request(
-        loaded_binding.definition, bindings=loaded_binding.bundle_bindings
+        loaded_binding.definition, bindings=loaded_binding.bundle_bindings, processing_policy=processing_policy
     )
-    request_identity_sha256 = bundle_request_identity_sha256(
+    request_identity_sha256 = configured_request_identity(
         bundle_request,
         bundle_connector.build_statement(bundle_request),
         source_binding_sha256=loaded_binding.source_binding_sha256,
+        processing_policy=processing_policy,
     )
     await _require_exact_resumable_execution(
         session,
@@ -828,7 +851,7 @@ async def _resumable_snowflake_candidate(
         idempotency_key=idempotency_key,
         request_identity_sha256=request_identity_sha256,
     )
-    return bundle_connector, SnowflakeBundleCandidateRequest(
+    candidate_request = SnowflakeBundleCandidateRequest(
         dataset_id=loaded_binding.dataset_id,
         definition_revision_id=loaded_binding.definition_revision_id,
         schema_revision_id=loaded_binding.schema_revision_id,
@@ -839,6 +862,7 @@ async def _resumable_snowflake_candidate(
         source_binding_revision_id=loaded_binding.source_binding_revision_id,
         source_binding_sha256=loaded_binding.source_binding_sha256,
     )
+    return bundle_connector, candidate_request, processing_policy
 
 
 async def _require_exact_resumable_execution(
@@ -899,16 +923,17 @@ async def _run_resumed_snowflake_binding(
             previous_echo = getattr(engine, "echo", _MISSING)
             _set_engine_echo(database, False)
             async with database.session() as session, session.begin():
-                bundle_connector, candidate_request = await _resumable_snowflake_candidate(
+                bundle_connector, candidate_request, processing_policy = await _resumable_snowflake_candidate(
                     session,
                     definition_revision_id=definition_revision_id,
                     source_binding_revision_id=source_binding_revision_id,
                     idempotency_key=idempotency_key,
                 )
-            candidate_result = await run_snowflake_bundle_candidate(
+            candidate_result = await _run_configured_candidate(
                 database.session,
                 bundle_connector,
                 candidate_request,
+                processing_policy,
             )
             if candidate_result.status == "not_claimed":
                 raise _ResumeUnavailableError("execution lease is unavailable")

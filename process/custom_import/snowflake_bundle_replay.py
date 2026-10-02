@@ -162,6 +162,7 @@ def _rebuilt_bundle_statement(
             supplied_request.encoding.parquet_compression,
         ),
         capture_limits=supplied_request.capture_limits,
+        processing_policy=supplied_request.processing_policy,
     )
     statement = SnowflakeBundleStatement(
         request=request,
