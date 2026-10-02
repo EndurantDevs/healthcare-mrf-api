@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import types
 from copy import deepcopy
 from dataclasses import replace
@@ -183,7 +184,7 @@ def test_scalar_contracts_reject_noncanonical_values(validator, value):
         replace(_source(), network_name_digests=("e" * 64, "e" * 64)),
         replace(
             _source(),
-            network_name_digests=tuple(f"{index:064x}" for index in range(65)),
+            network_name_digests=("f" * 64, "e" * 64),
         ),
     ],
 )
@@ -194,6 +195,102 @@ def test_plan_rejects_noncanonical_network_digest_sets(challenge):
             source_challenges=(challenge,),
             persisted_occurrences=(_persisted(),),
         )
+
+
+@pytest.mark.parametrize("network_count", [65, 1024, 31000])
+def test_plan_and_parser_preserve_large_complete_network_sets(network_count):
+    network_digests = tuple(f"{index:064x}" for index in range(network_count))
+    plan = contract.build_partitioned_candidate_audit_plan(
+        binding=_binding(),
+        source_challenges=(replace(_source(), network_name_digests=network_digests),),
+        persisted_occurrences=(_persisted(),),
+    )
+    request = plan.requests[0]
+
+    assert request.source_challenges[0].network_name_digests == network_digests
+    assert contract.parse_partitioned_candidate_audit_request(request.payload) == request
+
+
+def test_byte_partitioning_preserves_whole_challenges_and_exact_once_ordinals():
+    networks = tuple(f"{index:064x}" for index in range(16000))
+    sources = tuple(
+        replace(_source(npi=1_234_567_890 + index), network_name_digests=networks)
+        for index in range(2)
+    )
+    plan = contract.build_partitioned_candidate_audit_plan(
+        binding=_binding(2, 1), source_challenges=sources, persisted_occurrences=(_persisted(),)
+    )
+    reordered_plan = contract.build_partitioned_candidate_audit_plan(
+        binding=_binding(2, 1), source_challenges=tuple(reversed(sources)), persisted_occurrences=(_persisted(),)
+    )
+
+    assert plan == reordered_plan
+    assert len(plan.requests) == 2
+    assert [challenge.network_name_digests for request in plan.requests for challenge in request.source_challenges] == [
+        networks, networks
+    ]
+    assert sorted(
+        audit_item.ordinal
+        for request in plan.requests
+        for audit_item in (*request.source_challenges, *request.persisted_occurrences)
+    ) == [0, 1, 2]
+    assert all(contract.parse_partitioned_candidate_audit_request(request.payload) == request for request in plan.requests)
+
+
+def test_network_count_cannot_exceed_the_wire_byte_ceiling():
+    network_count = audit_types.PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS + 1
+    challenge = replace(
+        _source(), network_name_digests=tuple(f"{index:064x}" for index in range(network_count))
+    )
+
+    with pytest.raises(ValueError, match="network_digests"):
+        request_contract._validated_source_challenge(challenge)
+
+
+def test_request_byte_boundary_is_identical_in_planner_and_parser(monkeypatch):
+    payload = _plan().requests[0].payload
+    serialized_bytes = len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    monkeypatch.setattr(
+        request_contract, "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES", serialized_bytes
+    )
+    assert _plan().requests[0].payload == payload
+    assert contract.parse_partitioned_candidate_audit_request(payload).payload == payload
+
+    monkeypatch.setattr(
+        request_contract, "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES", serialized_bytes - 1
+    )
+    assert len(_plan().requests) == 2
+    with pytest.raises(ValueError, match="request_too_large"):
+        contract.parse_partitioned_candidate_audit_request(payload)
+
+
+def test_unsplittable_item_exceeds_request_bytes(monkeypatch):
+    monkeypatch.setattr(request_contract, "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES", 1)
+
+    with pytest.raises(ValueError, match="request_too_large"):
+        _plan()
+
+
+def test_request_byte_limit_counts_compact_utf8_not_ascii_escapes(monkeypatch):
+    plan = contract.build_partitioned_candidate_audit_plan(
+        binding=replace(_binding(), plan_id="é" * 512),
+        source_challenges=(_source(),), persisted_occurrences=(_persisted(),),
+    )
+    payload = plan.requests[0].payload
+    compact_bytes = len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    assert len(json.dumps(payload).encode("ascii")) > compact_bytes
+    monkeypatch.setattr(request_contract, "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES", compact_bytes)
+
+    assert contract.parse_partitioned_candidate_audit_request(payload) == plan.requests[0]
+
+
+@pytest.mark.parametrize("invalid_value", [{"a" * 64}, "\ud800"])
+def test_parser_rejects_non_json_request_fields(invalid_value):
+    payload = _plan().requests[0].payload
+    payload["source_challenges"][0]["network_name_digests"] = invalid_value
+
+    with pytest.raises(ValueError, match="request_fields_invalid"):
+        contract.parse_partitioned_candidate_audit_request(payload)
 
 
 @pytest.mark.parametrize("occurrence_id", ["not-bytes", b"short"])
