@@ -152,7 +152,7 @@ class SyntheticSession(_Session):
                 [
                     (
                         SimpleNamespace(entity_binding_id=index + 1, context_key_sha256=bytes([index + 1]) * 32),
-                        SimpleNamespace(root_record_id=index + 1, family_revision_id=101 + index),
+                        SimpleNamespace(root_record_id=index + 1, family_revision_id=101 + index, child_count=1),
                         SimpleNamespace(root_revision_id=201 + index),
                         SimpleNamespace(child_revision_id=301 + index),
                         npi,
@@ -161,6 +161,8 @@ class SyntheticSession(_Session):
                     if npi in requested_npis
                 ]
             )
+        if column_names == ("CustomImportFamilyChild", "CustomImportChildRevision"):
+            return self._family_membership_rows(statement)
         if column_names == ("CustomImportRootScalar",):
             requested_ids = statement.compile().params["root_revision_id_1"]
             return _result(
@@ -201,6 +203,20 @@ class SyntheticSession(_Session):
                 ]
             )
         raise AssertionError(f"unexpected synthetic query columns: {column_names}")
+
+    def _family_membership_rows(self, statement):
+        """Keep synthetic full-family rows inside the exact requested page."""
+        requested_families = statement.compile().params["param_1"]
+        return _result(
+            [
+                (
+                    SimpleNamespace(family_revision_id=101 + index, collection_slot=1),
+                    SimpleNamespace(child_revision_id=301 + index),
+                )
+                for index, _npi in enumerate(_NPIS)
+                if (101 + index, index + 1) in requested_families
+            ]
+        )
 
     def _publication_event_row(self):
         details = publication._PublicationEventDetails(
