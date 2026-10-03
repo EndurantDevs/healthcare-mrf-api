@@ -316,6 +316,29 @@ async def test_bound_request_cannot_invent_statement_mode(monkeypatch, reverse_s
     await candidate._validate_bound_source_identity(None, request, builder.build_statement(bundle))
 
 
+@pytest.mark.asyncio
+async def test_bound_source_rejects_missing_retained_stream(monkeypatch):
+    binding, builder, bundle = _statement_binding()
+    request = candidate.SnowflakeBundleCandidateRequest(
+        1,
+        2,
+        3,
+        bundle.definition,
+        bundle,
+        "synthetic",
+        b"owner",
+        source_binding_revision_id=4,
+        source_binding_sha256=bytes.fromhex(binding.digest),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "load_snowflake_source_binding",
+        AsyncMock(return_value=SimpleNamespace(bundle_bindings=bundle.bindings[:-1])),
+    )
+    with pytest.raises(candidate.SnowflakeCandidateError, match="binding identity"):
+        await candidate._validate_bound_source_identity(None, request, builder.build_statement(bundle))
+
+
 @pytest.mark.parametrize("corruption", ["missing", "duplicate", "reversed", "source_token"])
 def test_invalid_metadata_never_seals(monkeypatch, corruption):
     connector, request, _, cursor, connection = _runtime(monkeypatch, snapshot_token_mode=_MODE)
