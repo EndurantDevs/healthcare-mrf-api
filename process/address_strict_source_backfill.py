@@ -230,7 +230,6 @@ class _StrictSourceBackfillRunner:
         _, _, execution.generation = await _alias_state(
             session,
             schema=execution.schema,
-            lock=True,
         )
 
     async def _validate_reviewed_shadow(self, session: Any) -> None:

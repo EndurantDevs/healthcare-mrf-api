@@ -67,7 +67,7 @@ async def test_alias_state_rejects_missing_or_unknown_contracts(
     session.execute = AsyncMock(return_value=_query_result(first=state_record))
 
     with pytest.raises(RuntimeError, match=error_message):
-        await alias_store._alias_state(session, schema="mrf", lock=True)
+        await alias_store._alias_state(session, schema="mrf")
 
 
 @pytest.mark.asyncio

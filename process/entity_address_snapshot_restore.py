@@ -346,9 +346,10 @@ async def _move_owned_relations(
             )
         )
         primary_name = entity_address_unified._stage_index_name(stage_table_name, "primary")
-        await session.execute(
-            text(f"ALTER INDEX {_quoted(owner.schema_name)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}")
-        )
+        if primary_index != primary_name:
+            await session.execute(
+                text(f"ALTER INDEX {_quoted(owner.schema_name)}.{_quoted(primary_index)} RENAME TO {_quoted(primary_name)}")
+            )
         for sequence_name in sequence_names:
             await session.execute(
                 text(
@@ -376,8 +377,8 @@ async def _verify_moved_stage_oids(
     await _verify_stored_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
 
 
-async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
-    """Drop the source namespace only after every owned table left it unchanged."""
+async def _require_empty_owned_schema(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
+    """Require the original source namespace to be unchanged and empty."""
 
     current_oid = await session.scalar(
         text("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = :schema_name"),
@@ -391,7 +392,37 @@ async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStag
     )
     if int(remaining or 0) != 0:
         raise EntityAddressSnapshotRestoreError("entity-address restore ownership namespace is not empty")
+
+
+async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
+    await _require_empty_owned_schema(session, owner)
     await session.execute(text(f"DROP SCHEMA {_quoted(owner.schema_name)}"))
+
+
+async def _return_owned_relations(session, *, owner, db_schema, stage_names) -> None:
+    """Return prepared heaps to the same private namespace without replacing OIDs."""
+    await _require_empty_owned_schema(session, owner)
+    stage_oids = tuple(sorted((stage_names[name], oid) for name, oid in owner.relation_oids))
+    await _verify_moved_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
+    evidence_name = entity_address_unified.EntityAddressEvidence.__tablename__
+    for table_name, relation_oid in owner.relation_oids:
+        stage_name = stage_names[table_name]
+        sequences = await _owned_sequence_names(session, relation_oid)
+        expected = (stage_name + "_evidence_id_seq",) if table_name == evidence_name else ()
+        if sequences != expected:
+            raise EntityAddressSnapshotRestoreError("entity-address restore sequence ownership changed")
+        await session.execute(text(
+            f"ALTER TABLE {_quoted(db_schema)}.{_quoted(stage_name)} SET SCHEMA {_quoted(owner.schema_name)}"
+        ))
+        await session.execute(text(
+            f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(stage_name)} RENAME TO {_quoted(table_name)}"
+        ))
+        for sequence_name in sequences:
+            await session.execute(text(
+                f"ALTER SEQUENCE {_quoted(owner.schema_name)}.{_quoted(sequence_name)} "
+                f"RENAME TO {_quoted(table_name + '_evidence_id_seq')}"
+            ))
+    await verify_entity_address_archive_stage_ownership(session, owner=owner)
 
 
 async def finalize_entity_address_archive_restore(

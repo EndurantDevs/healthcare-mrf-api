@@ -472,6 +472,17 @@ async def _capture_receipt(sessions, schema_name: str, timezone: str):
             return await receipt.capture_entity_address_archive_receipt(session, schema_name=schema_name)
 
 
+@pytest.mark.asyncio
+async def test_migrated_head_sealed_activation_preserves_cms_guards(monkeypatch):
+    """Run in the existing archive shard or an explicitly opted-in local role database."""
+    from tests.entity_address_migrated_preparation_support import migrated_head_sealed_activation
+
+    if not os.getenv("HLTHPRT_ALIAS_GUARD_TEST_DSN"):
+        dsn, _environment = _native_test_connection()
+        monkeypatch.setenv("HLTHPRT_ALIAS_GUARD_TEST_DSN", dsn)
+    await migrated_head_sealed_activation(monkeypatch)
+
+
 def _dump_stage_capture(capture, *, dataset_id, stage_schema: str, dump_path: Path, pg_dump: str, environment) -> None:
     """Write the clone-only native archive covered by the stage snapshot pin."""
 

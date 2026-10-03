@@ -116,7 +116,7 @@ def _require_caller_transaction(session: Any) -> None:
         raise EntityAddressSnapshotAliasError("entity-address alias receipt requires a caller transaction")
 
 
-async def _lock_alias_relations(session: Any, schema_name: str) -> None:
+async def _lock_alias_relations(session: Any, schema_name: str, *, provisional: bool = False) -> None:
     """Follow writer ordering, then freeze the two relations through capture."""
 
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
@@ -124,7 +124,8 @@ async def _lock_alias_relations(session: Any, schema_name: str) -> None:
         f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in (_STATE_TABLE, _ALIAS_TABLE)
     )
     try:
-        await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
+        mode = "ACCESS SHARE" if provisional else "SHARE"
+        await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE"))
     except SQLAlchemyError as error:
         raise EntityAddressSnapshotAliasError("entity-address alias receipt relations are unavailable") from error
 
@@ -349,9 +350,20 @@ async def capture_entity_address_alias_semantic_receipt(
 ) -> EntityAddressAliasSemanticReceipt:
     """Capture worker-side active alias semantics under the native writer lock."""
 
+    return await _capture_alias_semantic_receipt(session, schema_name=schema_name)
+
+
+async def _capture_alias_semantic_receipt(session, *, schema_name, provisional=False):
+    """A provisional capture is only input to later protected full validation."""
+
+    from process import entity_address_alias_guard
+
     schema = _schema_name(schema_name)
     _require_caller_transaction(session)
-    await _lock_alias_relations(session, schema)
+    if provisional:
+        await _lock_alias_relations(session, schema, provisional=True)
+    else:
+        await entity_address_alias_guard.lock_entity_address_alias_capture(session, schema=schema)
     await _require_relation_shape(
         session,
         schema_name=schema,
