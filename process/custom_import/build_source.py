@@ -830,6 +830,8 @@ async def _drain_cleanup(cleanup, primary: BaseException | None) -> BaseExceptio
         except asyncio.CancelledError as exc:
             if primary is None:
                 primary = exc
+            else:
+                primary._custom_import_retry_blocked = True
         except BaseException:
             break
     try:
@@ -838,6 +840,7 @@ async def _drain_cleanup(cleanup, primary: BaseException | None) -> BaseExceptio
         if primary is None:
             primary = exc
         elif primary is not exc:
+            primary._custom_import_retry_blocked = True
             primary.add_note(f"source replay cleanup also failed: {type(exc).__name__}")
             primary.__cause__ = exc
     return primary

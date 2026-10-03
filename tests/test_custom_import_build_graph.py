@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import (
     CustomImportBuildCandidateContext,
@@ -29,6 +30,7 @@ from db.models.custom_import import (
     CustomImportRootRevision,
 )
 from process.custom_import import build_graph as graph
+from process.custom_import import build_source as staging
 from process.custom_import.build_source import SourceBuildRequest
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import assemble_root_families
@@ -158,6 +160,255 @@ def test_read_pages_fetch_only_admitted_keys_and_resume(monkeypatch):
     assert "octet_length" in str(queries[0])
     assert list(queries[1].params.values()) == [[(1,)]]
     assert any(value == 1 for value in queries[2].params.values())
+
+
+def test_one_read_page_stops_at_the_metadata_byte_boundary(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)]])
+    root = CustomImportRootRevision
+    assert list(
+        graph._read_rows(
+            session,
+            _request(page_byte_limit=5),
+            7,
+            select(root),
+            (root.root_revision_id,),
+            (root,),
+            bounds=graph._ReadPage(single_page=True),
+        )
+    ) == [("first",)]
+    assert session.execute.call_count == 2
+
+
+def test_child_batch_limit_reserves_all_scalar_and_context_rows():
+    request = _request(page_row_limit=256)
+    registry = _registry(request.definition)
+    plan = CustomImportBuildFamily(selection_kind="source")
+    child_values_by_field = dict(rate_npi="1234567893", service_code="A100", amount=Decimal("12.50"))
+    child = _revision(request.definition, "rates", child_values_by_field)
+    family = CustomImportFamilyRevision(
+        family_revision_id=7, entity_binding_id=8, root_record_id=9, root_revision_id=10, family_sha256=b"f" * 32
+    )
+    projections = graph._child_models(request, registry, 6, family, _root(), child, child_values_by_field, "rates")
+    assert graph._child_page_limit(request, registry, plan) == 256 // (len(projections) + 2)
+    plan.selection_kind = "retained"
+    assert graph._child_page_limit(request, registry, plan) == 1
+
+
+@pytest.mark.parametrize("driver", ["asyncpg", "psycopg"])
+@pytest.mark.parametrize(
+    "message,sqlstate,expected",
+    [
+        ("custom_import_build_page_too_large", "P0001", True),
+        ("custom_import_build_page_too_large", "57014", False),
+        ("custom_import_build_page_too_large", None, False),
+        ("custom_import_build_structure_mismatch", "P0001", False),
+        ("prefix custom_import_build_page_too_large", "P0001", False),
+        (None, "P0001", False),
+    ],
+)
+def test_child_batch_retries_only_the_exact_database_bound(driver, message, sqlstate, expected):
+    driver_error = RuntimeError(message)
+    driver_error.sqlstate = sqlstate
+    if driver == "asyncpg":
+        driver_error.__cause__ = RuntimeError(message)
+        driver_error.__cause__.message = message
+    else:
+        driver_error.diag = SimpleNamespace(message_primary=message)
+    assert graph._is_child_page_bound_error(DBAPIError(None, None, driver_error)) is expected
+    assert not graph._is_child_page_bound_error(CandidateRunnerError("build child payload digest differs"))
+
+
+@pytest.mark.parametrize(
+    "child_count,message,retry",
+    [
+        (4, "record projection fanout exceeds the admitted row page", True),
+        (4, "record projection fanout exceeds the admitted byte page", True),
+        (1, "record projection fanout exceeds the admitted row page", False),
+        (4, "build child payload digest differs", False),
+        (4, "prefix record projection fanout exceeds the admitted row page", False),
+    ],
+)
+async def test_child_batch_retry_preserves_the_cursor_and_exact_failure(monkeypatch, child_count, message, retry):
+    request = _request()
+    family_input = SimpleNamespace(plan=CustomImportBuildFamily(selection_kind="source"))
+    current = SimpleNamespace(attached_child_count=0, complete_at=None)
+    finished = SimpleNamespace(complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC))
+    child_revisions = [object() for _ in range(child_count)]
+    reads = Mock(side_effect=[(current, child_revisions), (current, child_revisions[:2]), (finished, [])])
+    failure = CandidateRunnerError(message)
+    append = AsyncMock(side_effect=[failure, None])
+    heartbeat = AsyncMock()
+    session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda callback: callback(None)))
+    monkeypatch.setattr(graph, "_session", lambda _factory: nullcontext(session))
+    monkeypatch.setattr(graph, "_child_page_limit", Mock(return_value=4))
+    monkeypatch.setattr(graph, "_next_children", reads)
+    monkeypatch.setattr(graph, "_append_child_batch", append)
+    monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+    if retry:
+        await graph._append_children(None, request, None, family_input)
+        assert [call.args[-1] for call in reads.call_args_list] == [4, 2, 2]
+        assert all(call.args[-2] is current for call in append.await_args_list)
+        assert [len(call.args[-1]) for call in append.await_args_list] == [4, 2]
+        heartbeat.assert_awaited_once_with(None, request)
+    else:
+        with pytest.raises(CandidateRunnerError) as caught:
+            await graph._append_children(None, request, None, family_input)
+        assert caught.value is failure
+        assert reads.call_count == append.await_count == 1
+        heartbeat.assert_not_awaited()
+
+
+def _retry_page_error(database_error):
+    """Build an admitted page-limit error, retaining a normal driver cause chain."""
+    if not database_error:
+        return CandidateRunnerError("record projection fanout exceeds the admitted row page")
+    driver_error = RuntimeError("custom_import_build_page_too_large")
+    driver_error.sqlstate = "P0001"
+    driver_error.__cause__ = RuntimeError("custom_import_build_page_too_large")
+    driver_error.__cause__.message = "custom_import_build_page_too_large"
+    primary = DBAPIError(None, None, driver_error)
+    primary.__cause__ = driver_error
+    return primary
+
+
+def _owned_cleanup(cleanup_stage, cancelled):
+    """Control one real page-owned exit without replacing its cleanup machinery."""
+    cleanup = SimpleNamespace(
+        error=RuntimeError("synthetic cleanup failure"), entered=asyncio.Event(), release=asyncio.Event()
+    )
+
+    async def exit_owned(*_args):
+        if cancelled:
+            cleanup.entered.set()
+            await cleanup.release.wait()
+        else:
+            raise cleanup.error
+
+    cleanup.transaction_exit = AsyncMock(side_effect=exit_owned if cleanup_stage == "transaction" else None)
+    cleanup.session_exit = AsyncMock(side_effect=exit_owned if cleanup_stage == "session" else None)
+    cleanup.factory = _session_contexts(cleanup.transaction_exit, cleanup.session_exit)
+    return cleanup
+
+
+@pytest.mark.parametrize(
+    "cleanup_stage,cancelled",
+    [(None, False), ("transaction", False), ("session", False), ("transaction", True), ("session", True)],
+)
+@pytest.mark.parametrize("database_error", [False, True])
+async def test_child_batch_retry_requires_uninterrupted_owned_cleanup(
+    monkeypatch, cleanup_stage, cancelled, database_error
+):
+    """Only clean, uninterrupted page exits permit a smaller retry."""
+    primary = _retry_page_error(database_error)
+    original_cause = primary.__cause__
+    cleanup = _owned_cleanup(cleanup_stage, cancelled)
+    request = _request()
+    family_input = SimpleNamespace(plan=CustomImportBuildFamily(build_id=7, selection_kind="source"))
+    current = SimpleNamespace(attached_child_count=0, complete_at=None)
+    finished = SimpleNamespace(complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC))
+    child_revisions = [object() for _ in range(4)]
+    reads = Mock(side_effect=[(current, child_revisions), (current, child_revisions[:2]), (finished, [])])
+    read_session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda callback: callback(None)))
+
+    async def append_page(_factory, _request, _registry, _family_input, _current, batch):
+        if len(batch) == 4:
+            async with graph._page_session(cleanup.factory, request, 7):
+                raise primary
+
+    append = AsyncMock(side_effect=append_page)
+    heartbeat = AsyncMock()
+    monkeypatch.setattr(staging, "_lock_page", AsyncMock())
+    monkeypatch.setattr(graph, "_session", lambda _factory: nullcontext(read_session))
+    monkeypatch.setattr(graph, "_child_page_limit", Mock(return_value=4))
+    monkeypatch.setattr(graph, "_next_children", reads)
+    monkeypatch.setattr(graph, "_append_child_batch", append)
+    monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+    if cleanup_stage is not None:
+        task = asyncio.create_task(graph._append_children(cleanup.factory, request, None, family_input))
+        if cancelled:
+            await cleanup.entered.wait()
+            task.cancel("secondary cancellation")
+            await asyncio.sleep(0)
+            task.cancel("repeated cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            cleanup.release.set()
+        with pytest.raises(type(primary)) as caught:
+            await task
+        assert caught.value is primary
+        assert primary.__cause__ is (original_cause if cancelled else cleanup.error)
+        assert reads.call_count == append.await_count == 1
+        heartbeat.assert_not_awaited()
+    else:
+        await graph._append_children(cleanup.factory, request, None, family_input)
+        assert [call.args[-1] for call in reads.call_args_list] == [4, 2, 2]
+        assert append.await_count == 2
+        assert primary.__cause__ is original_cause
+        heartbeat.assert_awaited_once_with(cleanup.factory, request)
+    cleanup.transaction_exit.assert_awaited_once()
+    cleanup.session_exit.assert_awaited_once()
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_child_batch_skips_progress_changed_after_the_read(monkeypatch, completed):
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8)
+    progress = SimpleNamespace(attached_child_count=0 if completed else 1, complete_at=object() if completed else None)
+    session = SimpleNamespace(get=AsyncMock(return_value=progress))
+    prepare = AsyncMock()
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", prepare)
+    await graph._append_child_batch(
+        None, _request(), None, SimpleNamespace(plan=plan), SimpleNamespace(attached_child_count=0), [object()]
+    )
+    session.get.assert_awaited_once_with(CustomImportBuildFamily, (7, 8), with_for_update=True)
+    prepare.assert_awaited_once_with(session)
+
+
+@pytest.mark.parametrize("completed,has_child", [(True, False), (False, False), (False, True)])
+def test_child_page_preserves_completion_and_admitted_children(monkeypatch, completed, has_child):
+    request = _request()
+    current = CustomImportBuildFamily(
+        build_id=7,
+        root_record_id=8,
+        selection_kind="source",
+        complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC) if completed else None,
+    )
+    family_input = SimpleNamespace(plan=current, root=CustomImportRootRevision(), record=CustomImportRootRecord())
+    child = object()
+    reads = Mock(side_effect=lambda *_args, **_kwargs: ((child,) for _ in range(int(has_child))))
+    monkeypatch.setattr(graph, "_one_row", Mock(return_value=(current,)))
+    monkeypatch.setattr(graph, "_read_rows", reads)
+    assert graph._next_children(None, request, _registry(request.definition), family_input, 3) == (
+        current,
+        [child] if has_child else [],
+    )
+    if completed:
+        reads.assert_not_called()
+    else:
+        assert reads.call_count == len(request.definition.child_collections)
+        assert all(call.kwargs["bounds"].row_limit == 3 for call in reads.call_args_list)
+        assert all(call.kwargs["bounds"].single_page for call in reads.call_args_list)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_exhausted_child_input_requires_sql_completion(monkeypatch, completed):
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8, selection_kind="source")
+    progress = SimpleNamespace(attached_child_count=0, complete_at=None, family_revision_id=9)
+    family = SimpleNamespace(family_revision_id=9)
+    session = SimpleNamespace(get=AsyncMock(side_effect=[progress, family]), add_all=Mock())
+    commit = AsyncMock(return_value=SimpleNamespace(complete=completed))
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(graph, "_flush_page", AsyncMock())
+    monkeypatch.setattr(graph, "_commit_family", commit)
+    operation = graph._append_child_batch(None, _request(), None, SimpleNamespace(plan=plan), progress, [])
+    if completed:
+        await operation
+    else:
+        with pytest.raises(CandidateRunnerError, match="family input ended before SQL completion"):
+            await operation
+    commit.assert_awaited_once_with(session, 7, 8, 9)
+    assert not any(list(call.args[0]) for call in session.add_all.call_args_list)
 
 
 def test_oversize_metadata_prevents_payload_query(monkeypatch):
