@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from process.ptg_parts.ptg2_partitioned_candidate_audit_request_contract import (
+    _validate_request_size,
     _validated_binding,
     _validated_persisted_occurrence,
     _validated_source_challenge,
@@ -220,6 +221,7 @@ def parse_partitioned_candidate_audit_request(
         != PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
     ):
         raise ValueError("partitioned_audit_request_contract_invalid")
+    _validate_request_size(raw_request)
     raw_challenges = raw_request.get("source_challenges")
     raw_occurrences = raw_request.get("persisted_occurrences")
     if not isinstance(raw_challenges, list) or not isinstance(
