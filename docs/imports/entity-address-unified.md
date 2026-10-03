@@ -83,6 +83,22 @@ renaming anything and retries with short bounded backoff. The local
 `lock_timeout` is a final guard for DDL locks after the fail-fast relation-lock
 step; it is intentionally separate from the bulk-import lock timeout.
 
+### Protected archive activation and CMS history
+
+Protected archive activation recognizes the exact migrated
+`cms_serving_address_transition()` and `cms_serving_no_truncate()` guards.
+Their function ownership must exclude ordinary role membership; installations
+with ordinary-owned functions require explicit provisioning to the existing
+protected owner before activation. Activation changes no function ownership or
+privileges and never disables a guard.
+
+The CMS receipt relation is locked and must remain empty through commit. A
+populated `provider_directory_cms_serving_receipt` history refuses standalone
+archive activation because it requires coordinated composite publication.
+This path does not provide that populated-history integration. Unknown or
+altered guards, unsupported receipt catalogs, and concurrent receipt writers
+also refuse without publishing the candidate.
+
 ## Key Environment Variables
 
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BATCH_SIZE`

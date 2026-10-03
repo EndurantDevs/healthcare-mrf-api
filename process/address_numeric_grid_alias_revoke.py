@@ -75,7 +75,7 @@ async def _lock_active_alias(
     await session.execute(text(f"SET LOCAL lock_timeout = '{timeout}';"))
     await session.execute(text(f"SET LOCAL statement_timeout = '{timeout}';"))
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
-    await _alias_state(session, schema=schema, lock=True)
+    await _alias_state(session, schema=schema)
     active_alias = (
         await session.execute(
             text(
@@ -240,7 +240,6 @@ async def _execute_revoke(context: _RevokeContext) -> NumericGridAliasRevokeResu
         _, _, generation = await _alias_state(
             session,
             schema=context.schema,
-            lock=False,
         )
         await _seal_revoke_run(
             session,
