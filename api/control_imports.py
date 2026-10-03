@@ -3358,6 +3358,15 @@ async def create_import_run(
         if isinstance(request_payload_map.get("params"), dict)
         else {}
     )
+    if importer != "provider-directory-fhir" and any(
+        name in raw_params_by_name
+        for name in (
+            "cms_npd_retained_operation",
+            "cms_npd_retained_vector_sha256",
+            "cms_npd_retained_receipt_sha256",
+        )
+    ):
+        raise ValueError("cms_npd_retained_requires_provider_directory_importer")
     effective_params_by_name = (
         apply_provider_directory_refresh_preset(raw_params_by_name)
         if importer == "provider-directory-fhir"

@@ -82,10 +82,13 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 58
+    assert len(command_signature.parameters) == 61
     assert "resource_scan_concurrency" in command_signature.parameters
     assert "cms_npd_rollback_vector_sha256" in command_signature.parameters
     assert "cms_npd_rollback_root_run_id" in command_signature.parameters
+    assert "cms_npd_retained_operation" in command_signature.parameters
+    assert "cms_npd_retained_vector_sha256" in command_signature.parameters
+    assert "cms_npd_retained_receipt_sha256" in command_signature.parameters
     assert "provider_directory_reviewed_root_count" not in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
@@ -10074,6 +10077,7 @@ def _location_parse_fixture() -> dict[str, Any]:
         "resourceType": "Location",
         "id": "loc-1",
         "name": "Example Clinic",
+        "physicalType": {"coding": [{"system": "urn:example:location-type", "code": "bu", "display": "Building"}]},
         "telecom": [{"system": "phone", "value": "312-555-0100"}],
         "address": {
             "line": ["100 Main St", "Suite 2"],
@@ -10236,6 +10240,54 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
 
     _assert_plan_and_practitioner_parse((plan_result, practitioner_result))
     _assert_location_role_and_endpoint_parse((location_result, role_result, endpoint_result))
+
+
+def test_parse_organization_retains_mixed_source_types_in_dataset():
+    """Retain concurrent coded, text-only, and unknown organization roles."""
+    resource_by_field = {
+        "resourceType": "Organization",
+        "id": "mixed-role-organization",
+        "type": [
+            {"coding": [{"system": "urn:example:organization-role", "code": "grp", "display": "Medical group"}]},
+            {"text": "ntwk"},
+            {"text": "unknown-source-role"},
+        ],
+    }
+    model, row = importer.parse_fhir_resource("cms-npd", resource_by_field)
+    assert model is ProviderDirectoryOrganization
+    retained = importer._endpoint_dataset_resource_rows(
+        model, [row], dataset_id="dataset-example", resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT
+    )
+    expected_types = [
+        {"system": "urn:example:organization-role", "code": "grp", "display": "Medical group"},
+        {"text": "ntwk"},
+        {"text": "unknown-source-role"},
+    ]
+    assert row["type_codes"] == expected_types
+    assert retained[0]["payload_json"]["type_codes"] == expected_types
+
+
+@pytest.mark.parametrize(
+    "mode,address_use,address_type",
+    [("instance", "work", "physical"), ("instance", "billing", "postal"), ("kind", "work", "physical")],
+)
+def test_parse_location_retains_site_semantics_in_dataset(mode, address_use, address_type):
+    """Retain the facts distinguishing physical, mailing, and abstract sites."""
+    resource = _location_parse_fixture()
+    resource["mode"] = mode
+    resource["address"].update(use=address_use, type=address_type)
+    model, row = importer.parse_fhir_resource("cms-npd", resource)
+    assert model is ProviderDirectoryLocation
+    retained = importer._endpoint_dataset_resource_rows(
+        model, [row], dataset_id="dataset-example", resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT
+    )
+    for payload in (row, retained[0]["payload_json"]):
+        assert payload["mode"] == mode
+        assert payload["addresses"][0]["use"] == address_use
+        assert payload["addresses"][0]["type"] == address_type
+        assert payload["physical_type_codes"] == [
+            {"system": "urn:example:location-type", "code": "bu", "display": "Building"}
+        ]
 
 
 @pytest.mark.parametrize(
@@ -33808,7 +33860,10 @@ async def test_profile_bucket_and_promoted_stage_cleanup(monkeypatch):
         "profile_role_bucket_count"
     ] == 2
 
-    stages = (Mock(resume_checkpoint=None), Mock(resume_checkpoint=None))
+    stages = (
+        Mock(resume_checkpoint=None, profile_initial_build=None),
+        Mock(resume_checkpoint=None, profile_initial_build=None),
+    )
     monkeypatch.setattr(
         importer,
         "_retry_provider_directory_artifact_bundle_promotion",

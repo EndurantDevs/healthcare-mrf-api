@@ -10,10 +10,12 @@ import pytest
 from process import provider_directory_capacity_reservation_snapshot as snapshot
 from process import provider_directory_cms_capacity_contract as cms_contract
 from process import provider_directory_profile_capacity_preflight_contract as preflight
+from process import provider_directory_profile_failed_cleanup as cleanup
 from process.provider_directory_profile_capacity_attestation_contract import CapacityLeaseConsumptionBinding
 from process.provider_directory_profile_capacity_consumption import capacity_lease_consumption_values
 from tests.provider_directory_cms_capacity_test_support import cms_guard, sign_guard
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope, _verify
+from tests.test_provider_directory_profile_failed_cleanup import authorization_fixture
 
 RUN_ID = "run_" + "a" * 32
 
@@ -79,10 +81,50 @@ def _run(envelope, *, status="running", run_id=RUN_ID):
     }
 
 
-def _project(*, consumptions=(), runs=(), preflights=(), stages=(), observed_at=VALIDATION_TIME):
+def _project(*, consumptions=(), runs=(), preflights=(), stages=(), cleanup_claims=(), observed_at=VALIDATION_TIME):
     return snapshot.reservation_projection(
-        _metadata(observed_at=observed_at), list(consumptions), list(runs), list(preflights), list(stages)
+        _metadata(observed_at=observed_at), list(consumptions), list(runs), list(preflights), list(stages),
+        list(cleanup_claims),
     )
+
+
+def _cleanup_claim():
+    envelope, _trust, _key = authorization_fixture(VALIDATION_TIME)
+    body = envelope["authorization"]
+    return {
+        **{name: body[name] for name in ("operation_id", "reservation_id", "nonce")},
+        **{name: body["checkpoint"][name] for name in ("build_id", "owner_run_id")},
+        "checkpoint_preimage_sha256": body["checkpoint"]["preimage_sha256"],
+        "authorization_sha256": cleanup.digest(envelope),
+        "authorization_json": cleanup.canonical(body),
+        "signature": envelope["signature"],
+        "claimed_at": cleanup.timestamp(body["issued_at"]),
+        "expires_at": cleanup.timestamp(body["expires_at"]),
+        "max_operation_deadline": cleanup.timestamp(body["max_operation_deadline"]),
+    }, envelope
+
+
+@pytest.mark.parametrize("offset_microseconds,expected_count", [(-1, 1), (0, 0), (1, 0)])
+def test_cleanup_snapshot_excludes_only_signed_expiry(offset_microseconds, expected_count):
+    claim, envelope = _cleanup_claim()
+    before = deepcopy(claim)
+    observed_at = claim["expires_at"] + datetime.timedelta(microseconds=offset_microseconds)
+    assert claim["max_operation_deadline"] < observed_at
+    result = _project(cleanup_claims=[claim], observed_at=observed_at)
+    assert len(result["failed_profile_cleanup_claims"]) == expected_count
+    if expected_count:
+        assert result["failed_profile_cleanup_claims"][0]["envelope"] == envelope
+    assert claim == before
+    assert result["release_proof_available"] is False
+
+
+@pytest.mark.parametrize("field", ["expires_at", "authorization_sha256"])
+def test_cleanup_snapshot_refuses_corrupt_expired_claim(field):
+    claim, _envelope = _cleanup_claim()
+    observed_at = claim["expires_at"] + datetime.timedelta(seconds=1)
+    claim[field] = observed_at if field == "expires_at" else "0" * 64
+    with pytest.raises(RuntimeError, match="claim_corrupt"):
+        _project(cleanup_claims=[claim], observed_at=observed_at)
 
 
 def test_consumption_and_pending_run_share_one_original_reservation(monkeypatch):

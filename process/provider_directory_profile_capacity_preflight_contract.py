@@ -298,6 +298,11 @@ def validated_capacity_preflight_request(
 ) -> ProviderDirectoryProfileCapacityPreflightRequest:
     """Validate the exact authenticated signing-preflight request schema."""
 
+    from process.provider_directory_profile_initial_contract import REQUEST_CONTRACT
+
+    if isinstance(raw_request, Mapping) and raw_request.get("contract_id") == REQUEST_CONTRACT:
+        return _validated_initial_request(raw_request, projection=False)
+
     from process.provider_directory_cms_capacity_contract import (
         CMS_PREFLIGHT_REQUEST_CONTRACT,
         validated_cms_preflight_request,
@@ -374,6 +379,11 @@ def validated_capacity_authority_projection_request(
 ) -> ProfileCapacityAuthorityProjectionRequest:
     """Validate one closed, receipt-free authority projection request."""
 
+    from process.provider_directory_profile_initial_contract import PROJECTION_REQUEST_CONTRACT
+
+    if isinstance(raw_request, Mapping) and raw_request.get("contract_id") == PROJECTION_REQUEST_CONTRACT:
+        return _validated_initial_request(raw_request, projection=True)
+
     from process.provider_directory_cms_capacity_contract import (
         CMS_PROJECTION_REQUEST_CONTRACT,
         validated_cms_preflight_request,
@@ -385,6 +395,11 @@ def validated_capacity_authority_projection_request(
     ):
         return validated_cms_preflight_request(raw_request, projection=True)
 
+    return _validated_profile_projection_request(raw_request)
+
+
+def _validated_profile_projection_request(raw_request):
+    """Validate the ordinary Profile authority wire without variant dispatch."""
     request_map = dict(
         _exact_mapping(
             raw_request,
@@ -447,6 +462,25 @@ def assert_preflight_expiry(
         )
 
 
+def _validated_initial_request(raw_request: Mapping[str, Any], *, projection: bool):
+    """Reuse closed selection/limit validation without changing the old wire shape."""
+    from process.provider_directory_profile_initial_contract import MATERIALIZATION
+
+    if raw_request.get("profile_materialization") != MATERIALIZATION:
+        raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_initial_mode_invalid")
+    ordinary_by_field = dict(raw_request)
+    ordinary_by_field.pop("profile_materialization")
+    ordinary_by_field["contract_id"] = (CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID
+                               if projection else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
+    request = (validated_capacity_authority_projection_request(ordinary_by_field) if projection
+               else _validated_profile_capacity_preflight_request(ordinary_by_field))
+    if request.execution.attestation.operation != "publish" or request.execution.attestation.desired_profile_as_of is None:
+        raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_initial_explicit_date_required")
+    payload = dict(raw_request)
+    return dataclasses.replace(request, request_payload=payload,
+                               request_sha256=preflight_domain_sha256(payload["contract_id"], payload))
+
+
 def profile_execution_identity_payload(
     request: (
         ProviderDirectoryProfileCapacityPreflightRequest
@@ -454,6 +488,8 @@ def profile_execution_identity_payload(
     ),
 ) -> dict[str, Any]:
     """Return the exact v6/source-delta identity exposed to the signer."""
+
+    from process.provider_directory_profile_initial_contract import initial_profile_for_request
 
     attestation = request.execution.attestation
     return {
@@ -466,7 +502,7 @@ def profile_execution_identity_payload(
         "operation": attestation.operation,
         "profile_schema_version": attestation.profile_schema_version,
         "profile_strategy_version": attestation.profile_strategy_version,
-        "materialization_mode": "source_delta",
+        "materialization_mode": "full_swap" if initial_profile_for_request(request) else "source_delta",
     }
 
 

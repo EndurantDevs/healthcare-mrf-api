@@ -175,3 +175,30 @@ It does not establish full-release acquisition time, storage capacity or API
 latency under a live import. Measure those on the retained CMS release with an
 incumbent generation and representative concurrent API traffic before DEV
 activation.
+
+Profile geometry v5 distinguishes the original whole-delta physical projection
+from `healthporta.provider-directory-profile-bounded-admission.v2`. The bounded
+contract keeps the complete typed source projection and signed data, WAL and temp
+caps. Each finite mutation window reserves its modeled growth and WAL before
+writing. After every worker or statement finishes, an observed conservative WAL
+interval replaces that window's estimate. The next admission includes all
+outstanding windows, metadata, commits, aborts and cleanup. Scratch data covers
+every relation in its capacity class; target growth uses the original locked
+target sizes.
+
+These estimates support admission and overrun detection; they do not guarantee
+that every PostgreSQL write stays below its estimate or that a release finishes
+within its caps. An observation failure, cancellation or overrun retains the
+window's charges and stops further relation writes. Rollback does not release
+WAL charges or reset the admission LSN. Target replacement uses stable key windows
+inside the existing atomic transaction and locks, so readers continue to see the
+incumbent generation until commit.
+
+The new cutover forecast and actual contracts are v2 with separate hash domains;
+v1 receipts retain their original exact validation. Committed v2 receipts replay
+without scratch. A process restart cannot reconstruct an unresolved window from
+the existing consumption record and therefore refuses another lease for the
+same build. Recovery requires exact failed-stage disposal and a newly registered
+selection authority/control generation, followed by a fresh preflight and signed
+lease. Existing source and context hashes still bind the retained bytes; a caller
+cannot create a fresh build by changing a run ID alone.

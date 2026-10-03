@@ -85,7 +85,8 @@ async def _assert_seal_guards(database, proof):
 async def test_candidate_coverage_is_unpublished_immutable_and_replayable(monkeypatch, cms_artifact_root, published):
     """A full fixture seals once, preserves the current pointer, and rejects changed identities."""
     _include_candidate_migration(monkeypatch)
-    async with support.admission_database(monkeypatch) as database:
+    migration_prefixes = support.LEGACY_MIGRATION_PREFIXES if published else support.MIGRATION_PREFIXES
+    async with support.admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
         candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
         if published:
             await publish_validated_source_local_dataset(

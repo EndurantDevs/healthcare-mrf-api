@@ -31,6 +31,8 @@ from process.provider_directory_profile_capacity_types import (
 def project_profile_scratch_capacity(
     geometry: ProviderDirectoryProfileCapacityGeometry,
     scratch_input: ProviderDirectoryProfileScratchInput,
+    *,
+    enforce_caps: bool = True,
 ) -> ProviderDirectoryProfileScratchProjection:
     """Project one scratch wave before PostgreSQL can emit data or WAL."""
 
@@ -54,11 +56,12 @@ def project_profile_scratch_capacity(
         scratch_input,
         inserted_toast_chunks_upper,
     )
-    _assert_scratch_projection_caps(
-        relation_cap,
-        growth_bytes=growth_bytes,
-        wal_bytes=wal_bytes,
-    )
+    if enforce_caps or not verified_geometry.bounded_admission:
+        _assert_scratch_projection_caps(
+            relation_cap,
+            growth_bytes=growth_bytes,
+            wal_bytes=wal_bytes,
+        )
     return ProviderDirectoryProfileScratchProjection(
         relation_name=scratch_input.relation_name,
         inserted_rows=scratch_input.inserted_rows,
@@ -343,13 +346,18 @@ def project_profile_delta_metadata_capacity(
     """Bound final serving/receipt writes and the commit envelope."""
 
     verified_geometry = revalidate_capacity_geometry(geometry)
+    from process.provider_directory_profile_initial_contract import InitialCapacityGeometry
+
+    expected_relations = ("serving_generation", "initial_receipt") if isinstance(
+        verified_geometry, InitialCapacityGeometry
+    ) else ("build_checkpoint", "serving_generation", "delta_receipt")
     if (
         not isinstance(mutations, tuple)
         or tuple(
             metadata_mutation.relation_name
             for metadata_mutation in mutations
         )
-        != ("build_checkpoint", "serving_generation", "delta_receipt")
+        != expected_relations
         or not isinstance(pending_commit_items, int)
         or isinstance(pending_commit_items, bool)
         or pending_commit_items < 0

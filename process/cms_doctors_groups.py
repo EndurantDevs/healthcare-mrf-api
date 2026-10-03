@@ -38,7 +38,7 @@ def doctor_group_site_row(source_row: dict, row_number: int, manifest: dict) -> 
     address = doctor_address_row(source_row, observed_at)
     raw_fields_by_name = {
         key: fields_by_name.get(key)
-        for key in ("npi", "ind_enrl_id", "org_pac_id", "adrs_id", "facility name", "num_org_mem")
+        for key in ("npi", "ind_enrl_id", "org_pac_id", "adrs_id", "facility name", "num_org_mem", "cred")
     }
     return {
         "row_number": row_number,
@@ -51,9 +51,7 @@ def doctor_group_site_row(source_row: dict, row_number: int, manifest: dict) -> 
         "address_checksum": address["address_checksum"] if address else None,
         "generation_id": manifest["generation_id"],
         "source_json": {
-            "source_key": manifest["source_key"],
-            "dataset_id": manifest["dataset_id"],
-            "content_sha256": manifest["content_sha256"],
+            **manifest,
             "row_number": row_number,
             "raw_fields": raw_fields_by_name,
         },

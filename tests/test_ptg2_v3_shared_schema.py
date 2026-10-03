@@ -151,7 +151,7 @@ def test_repository_has_single_alembic_head():
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["20261003000000_address_alias_generation_guard"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["20261001110000_profile_initial_publication"]
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

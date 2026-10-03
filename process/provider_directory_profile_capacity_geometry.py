@@ -24,6 +24,7 @@ from process.provider_directory_profile_capacity_geometry_contract import (
     _validated_single_relation_cap,
 )
 from process.provider_directory_profile_capacity_types import (
+    BOUNDED_ADMISSION_CONTRACT_ID,
     CAPACITY_GEOMETRY_CONTRACT_ID,
     METADATA_DATA_UPPER_BOUND_BYTES,
     METADATA_WAL_UPPER_BOUND_BYTES,
@@ -183,7 +184,14 @@ def _validated_scalar_geometry(
 
 
 def _validate_scalar_identity(geometry_map: Mapping[str, Any]) -> None:
+    from process.provider_directory_profile_initial_contract import GEOMETRY_CONTRACT
+
     for name in _HASH_FIELDS:
+        if (geometry_map.get("contract_id") == GEOMETRY_CONTRACT
+            and name in {"current_source_vector_hash", "current_context_vector_hash"}):
+            if geometry_map.get(name) is not None:
+                raise _error("initial_current_vector_not_absent")
+            continue
         _exact_hash(geometry_map, name)
     _database_system_identifier(geometry_map)
     _profile_as_of(geometry_map)
@@ -197,7 +205,7 @@ def _validate_scalar_identity(geometry_map: Mapping[str, Any]) -> None:
         _exact_text(geometry_map, name, maximum_length=32)
     if (
         geometry_map.get("physical_projection_contract_id")
-        != PHYSICAL_PROJECTION_CONTRACT_ID
+        not in {PHYSICAL_PROJECTION_CONTRACT_ID, BOUNDED_ADMISSION_CONTRACT_ID}
     ):
         raise _error("physical_projection_contract_invalid")
 
@@ -302,11 +310,22 @@ def validated_capacity_geometry(
     geometry_map: Mapping[str, Any],
 ) -> ProviderDirectoryProfileCapacityGeometry:
     """Validate exact executable geometry and return its immutable form."""
-    _exact_fields(geometry_map, _GEOMETRY_FIELDS, name="geometry")
-    if geometry_map.get("contract_id") != CAPACITY_GEOMETRY_CONTRACT_ID:
+    from process.provider_directory_profile_initial_contract import (
+        GEOMETRY_CONTRACT, INITIAL_FIELDS, InitialCapacityGeometry,
+    )
+
+    initial = isinstance(geometry_map, Mapping) and geometry_map.get("contract_id") == GEOMETRY_CONTRACT
+    _exact_fields(geometry_map, _GEOMETRY_FIELDS | INITIAL_FIELDS if initial else _GEOMETRY_FIELDS, name="geometry")
+    if geometry_map.get("contract_id") not in {CAPACITY_GEOMETRY_CONTRACT_ID, GEOMETRY_CONTRACT}:
         raise _error("geometry_contract_invalid")
-    if geometry_map.get("materialization_mode") != PROFILE_MATERIALIZATION_MODE:
+    if geometry_map.get("materialization_mode") != ("full_swap" if initial else PROFILE_MATERIALIZATION_MODE):
         raise _error("materialization_mode_invalid")
+    if initial:
+        _exact_hash(geometry_map, "initial_target_state_sha256")
+        _exact_hash(geometry_map, "initial_receipt_storage_fingerprint")
+        _bounded_integer(geometry_map, "initial_receipt_oid", minimum=1, maximum=_MAX_OID)
+        if geometry_map.get("physical_projection_contract_id") != BOUNDED_ADMISSION_CONTRACT_ID:
+            raise _error("initial_physical_projection_invalid")
     if geometry_map.get("profile_strategy_version") != PROFILE_STRATEGY_VERSION:
         raise _error("profile_strategy_version_invalid")
     _validated_scalar_geometry(geometry_map)
@@ -316,7 +335,7 @@ def validated_capacity_geometry(
     )
     scalar_map = dict(geometry_map)
     scalar_map["relation_byte_caps"] = relation_caps
-    geometry = ProviderDirectoryProfileCapacityGeometry(**scalar_map)
+    geometry = (InitialCapacityGeometry if initial else ProviderDirectoryProfileCapacityGeometry)(**scalar_map)
     if len(
         {
             geometry.evidence_target_oid,
@@ -329,6 +348,12 @@ def validated_capacity_geometry(
         }
     ) != 7:
         raise _error("target_oid_collision")
+    if initial and geometry.initial_receipt_oid in {
+        geometry.evidence_target_oid, geometry.profile_target_oid, geometry.build_checkpoint_oid,
+        geometry.serving_generation_oid, geometry.delta_receipt_oid, geometry.import_run_oid,
+        geometry.capacity_consumption_oid,
+    }:
+        raise _error("initial_receipt_oid_collision")
     _assert_wave_geometry(geometry)
     _assert_execution_limits(geometry)
     reservation_bytes = geometry.reservation_bytes_by_storage_class.values()
@@ -375,7 +400,10 @@ def capacity_geometry_hash(
 ) -> str:
     """Return the deterministic executable-plan identity."""
     canonical_geometry = canonical_capacity_geometry_json(geometry)
-    hash_input = f"{_GEOMETRY_HASH_DOMAIN}:{canonical_geometry}"
+    from process.provider_directory_profile_initial_contract import GEOMETRY_CONTRACT, GEOMETRY_DOMAIN
+
+    domain = GEOMETRY_DOMAIN if geometry.contract_id == GEOMETRY_CONTRACT else _GEOMETRY_HASH_DOMAIN
+    hash_input = f"{domain}:{canonical_geometry}"
     return hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
 

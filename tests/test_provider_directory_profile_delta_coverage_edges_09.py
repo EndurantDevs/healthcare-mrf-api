@@ -225,6 +225,7 @@ async def test_admission_workload_success_edge(monkeypatch):
     identity = SimpleNamespace(
         source_ids=("source-a",),
         serving_state=object(),
+        initial_targets=None,
         batch_plan=object(),
     )
     source_fence = SimpleNamespace(datasets=[])
@@ -314,7 +315,7 @@ async def test_admission_database_guard_success_and_failure_edges(monkeypatch):
     )
     assert (
         await importer._admission_database_guard(
-            SimpleNamespace(serving_state=object()),
+            SimpleNamespace(serving_state=object(), initial_targets=None),
             expected,
         )
         is observed
@@ -328,7 +329,7 @@ async def test_admission_database_guard_success_and_failure_edges(monkeypatch):
         match="database_identity_changed",
     ):
         await importer._admission_database_guard(
-            SimpleNamespace(serving_state=object()),
+            SimpleNamespace(serving_state=object(), initial_targets=None),
             expected,
         )
 

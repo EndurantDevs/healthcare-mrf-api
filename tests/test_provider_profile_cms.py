@@ -13,6 +13,7 @@ from api import provider_profile as profile_api
 from api import provider_profile_cms as cms_api
 from api.endpoint import npi as npi_api
 from api.provider_profile_composer_parts import _existing_items_by_fhir_key
+from api import provider_profile_composer_parts as composer
 from db.models import CMSDoctorEducation
 
 
@@ -111,7 +112,7 @@ def test_source_manifest_is_visible_in_evidence():
 @pytest.mark.asyncio
 async def test_loader_distinguishes_absent_table_and_rows(monkeypatch):
     database = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[None, "mrf.cms_doctor_education", "mrf.cms_doctor_education"]),
+        scalar=AsyncMock(side_effect=[None, None, "mrf.cms_doctor_education", None, "mrf.cms_doctor_education", None]),
         all=AsyncMock(side_effect=[[], [SimpleNamespace(_mapping=_education_row()), SimpleNamespace(_mapping=_education_row("school-b", "Second School"))]]),
     )
     monkeypatch.setattr(cms_api, "db", database)
@@ -308,3 +309,119 @@ async def test_cms_route_serves_and_fences_pages(monkeypatch):
     next_response = await npi_api.get_provider_profile(request, str(NPI))
     assert next_response.status == 409
     assert json.loads(next_response.body)["error"] == "provider_profile_generation_changed"
+
+
+def _credential_row(row_number, credential, *, generation=CMS_GENERATION):
+    source_json = copy.deepcopy(_education_row(generation=generation)["source_json"])
+    source_json.update(row_number=row_number, raw_fields={"npi": str(NPI), "cred": credential})
+    return {"row_number": row_number, "generation_id": generation, "source_json": source_json}
+
+
+@pytest.mark.asyncio
+async def test_cms_loader_includes_credentials_without_education(monkeypatch):
+    credential = _credential_row(4, "NP")
+    database = SimpleNamespace(
+        scalar=AsyncMock(side_effect=["mrf.cms_doctor_education", "mrf.cms_doctor_group_site"]),
+        all=AsyncMock(side_effect=[[], [SimpleNamespace(_mapping=credential)]]),
+    )
+    monkeypatch.setattr(cms_api, "db", database)
+    cms_projection = await cms_api.fetch_cms_education_projection(NPI)
+    profile = _compose_projection(cms_api.merge_cms_education_projection(NPI, None, cms_projection))
+    assert profile["categories"]["education"]["items"] == []
+    fact = profile["categories"]["certifications"]["items"][0]
+    assert (fact["type"], fact["value"]) == ("credential", "NP")
+    assert fact["assertion_type"] == "cms_reported"
+    assert fact["verification_status"] == "not_independently_verified"
+    assert "issuer" not in fact and "period" not in fact
+    assert profile["categories"]["licenses"]["items"] == []
+    sql = str(database.all.await_args.args[0])
+    assert "npi = :npi" in sql and "json_typeof" in sql and "nullif(btrim" in sql
+    assert cms_projection["evidence"]["records"][0]["raw_fields"]["cred"] == "NP"
+
+
+def test_cms_credentials_deduplicate_and_filter_physical_source_evidence():
+    assert cms_api._cms_projection(NPI, [], [_credential_row(4, " \t ")]) is None
+    cms_projection = cms_api._cms_projection(
+        NPI,
+        [_education_row()],
+        [_credential_row(1, "MD"), _credential_row(2, " MD "), _credential_row(3, "DO"), _credential_row(4, " ")],
+    )
+    projection = cms_api.merge_cms_education_projection(NPI, None, cms_projection)
+    seen_credentials = set()
+    for offset in range(2):
+        profile = _compose_projection(
+            projection, requested_categories=["certifications"], page_category="certifications", page_limit=1, page_offset=offset,
+        )
+        fact = profile["categories"]["certifications"]["items"][0]
+        seen_credentials.add(fact["value"])
+        evidence = profile_api.compose_provider_profile_evidence(
+            state_projection=projection, fhir_evidence=None, provider_profile=profile
+        )
+        source_records = evidence["sources"]["cms_doctors"]["records"]
+        assert {source_row["source_record_id"] for source_row in source_records} == set(fact["source_record_ids"])
+        assert len(source_records) == (2 if fact["value"] == "MD" else 1)
+        assert all(source_row["raw_fields"]["cred"].strip() == fact["value"] for source_row in source_records)
+        assert all("Med_sch" not in source_row["raw_fields"] for source_row in source_records)
+    assert seen_credentials == {"MD", "DO"}
+    education_page = _compose_projection(projection, requested_categories=["education"])
+    evidence = profile_api.compose_provider_profile_evidence(
+        state_projection=projection, fhir_evidence=None, provider_profile=education_page
+    )
+    assert len(evidence["sources"]["cms_doctors"]["records"]) == 1
+    assert "Med_sch" in evidence["sources"]["cms_doctors"]["records"][0]["raw_fields"]
+
+
+def test_cms_credentials_preserve_fhir_issuer_period_and_source_generation_fence(monkeypatch):
+    cms_projection = cms_api._cms_projection(NPI, [], [_credential_row(1, "MD")])
+    projection = cms_api.merge_cms_education_projection(NPI, None, cms_projection)
+    qualification_by_field = {
+        "issuer_ref": "Organization/synthetic-issuer",
+        "issuer_display": "Synthetic Issuer",
+        "period_start": "2020-01-01",
+        "period_end": "2025-12-31",
+    }
+    fhir_by_field = {
+        "generation_id": "fhir-generation",
+        "facts": {
+            "credential": {"items": [{"value": {"coding": {"text": "MD"}, "classification": "credential"}}]},
+            "qualification_detail": {"items": [{"value": qualification_by_field}]},
+        },
+    }
+    original_fhir = copy.deepcopy(fhir_by_field)
+    profile = profile_api.compose_provider_profile(NPI, state_projection=projection, fhir_profile=fhir_by_field)
+    assert fhir_by_field == original_fhir
+    facts = profile["categories"]["certifications"]["items"]
+    assert {fact["type"] for fact in facts} == {"credential", "qualification_detail"}
+    assert next(fact for fact in facts if fact["type"] == "qualification_detail")["value"] == qualification_by_field
+    assert profile["categories"]["licenses"]["items"] == []
+    assert profile["source_generations"]["cms_doctors"] == CMS_GENERATION
+    assert profile["composer_version"] == "provider-profile-composer/v12"
+    current_generation = profile["generation_id"]
+    monkeypatch.setattr(composer, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v11")
+    previous_profile = profile_api.compose_provider_profile(NPI, state_projection=projection, fhir_profile=fhir_by_field)
+    assert previous_profile["generation_id"] != current_generation
+    assert previous_profile["source_generations"] == profile["source_generations"]
+    with pytest.raises(RuntimeError, match="generation_mixed"):
+        cms_api._cms_projection(NPI, [_education_row()], [_credential_row(1, "MD", generation="d" * 64)])
+
+
+@pytest.mark.asyncio
+async def test_cms_composer_change_rejects_previous_page_for_identical_source(monkeypatch):
+    projection = cms_api.merge_cms_education_projection(NPI, None, cms_api._cms_projection(NPI, [], [_credential_row(1, "MD")]))
+    monkeypatch.setattr(npi_api, "fetch_provider_profile_projection", AsyncMock(return_value=projection))
+    monkeypatch.setattr(npi_api, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
+    request = SimpleNamespace(args={"category": "certifications", "limit": "1"})
+    monkeypatch.setattr(composer, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v11")
+    previous = await npi_api.get_provider_profile(request, str(NPI))
+    previous_profile = json.loads(previous.body)["provider_profile"]
+    assert previous.status == 200
+    monkeypatch.setattr(composer, "PROFILE_COMPOSER_VERSION", "provider-profile-composer/v12")
+    current = await npi_api.get_provider_profile(request, str(NPI))
+    current_profile = json.loads(current.body)["provider_profile"]
+    assert current.status == 200
+    assert previous_profile["source_generations"] == current_profile["source_generations"] == {"cms_doctors": CMS_GENERATION}
+    assert previous_profile["generation_id"] != current_profile["generation_id"]
+    request.args["generation_id"] = previous_profile["generation_id"]
+    rejected = await npi_api.get_provider_profile(request, str(NPI))
+    assert rejected.status == 409
+    assert json.loads(rejected.body)["error"] == "provider_profile_generation_changed"

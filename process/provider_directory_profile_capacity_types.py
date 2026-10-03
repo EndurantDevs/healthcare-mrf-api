@@ -24,6 +24,15 @@ _CONTROL_WAL_HASH_DOMAIN = (
 PHYSICAL_PROJECTION_CONTRACT_ID = (
     "healthporta.provider-directory-profile-delta-physical-projection.v1"
 )
+BOUNDED_ADMISSION_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-bounded-admission.v2"
+)
+BOUNDED_CUTOVER_FORECAST_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-cutover-forecast.v2"
+)
+BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-cutover-actual.v2"
+)
 CUTOVER_FORECAST_CONTRACT_ID = (
     "healthporta.provider-directory-profile-cutover-forecast.v1"
 )
@@ -261,7 +270,7 @@ class ProviderDirectoryProfileTargetDeltaProjection:
 
 @dataclass(frozen=True)
 class ProviderDirectoryProfileDeltaProjection:
-    """Preventive data and WAL bounds for the complete atomic delta."""
+    """Complete typed delta projection under its versioned admission contract."""
 
     targets: tuple[ProviderDirectoryProfileTargetDeltaProjection, ...]
     target_data_bytes: int
@@ -459,6 +468,25 @@ class ProviderDirectoryProfileCapacityGeometry:
     max_affected_npis: int
     max_profile_rows: int
     relation_byte_caps: tuple[ProviderDirectoryProfileRelationByteCaps, ...]
+    @property
+    def is_bounded_admission(self) -> bool:
+        """Keep observed window admission distinct from immutable v1 forecasts."""
+        return self.physical_projection_contract_id == BOUNDED_ADMISSION_CONTRACT_ID
+
+    bounded_admission = is_bounded_admission
+
+    @property
+    def cutover_forecast_contract_id(self) -> str:
+        """Return the forecast wire contract for this admission model."""
+        return (BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if self.bounded_admission
+                else CUTOVER_FORECAST_CONTRACT_ID)
+
+    @property
+    def cutover_actual_contract_id(self) -> str:
+        """Return the actual wire contract for this admission model."""
+        return (BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID if self.bounded_admission
+                else CUTOVER_ACTUAL_CONTRACT_ID)
+
     @property
     def maximum_worker_count(self) -> int:
         """Return maximum concurrent Python workers in any frozen wave."""

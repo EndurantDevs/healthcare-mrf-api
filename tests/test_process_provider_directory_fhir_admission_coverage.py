@@ -210,7 +210,10 @@ async def test_admission_transaction_orchestration(monkeypatch):
         "_profile_admission_runtime_state",
         AsyncMock(return_value=(observed_identity, {"runtime": True})),
     )
-    identity = types.SimpleNamespace(serving_state=serving_state)
+    identity = types.SimpleNamespace(
+        serving_state=serving_state,
+        initial_targets=None,
+    )
     workload = types.SimpleNamespace(
         database_identity=object(),
         control_wal_plan_input=object(),
@@ -223,7 +226,7 @@ async def test_admission_transaction_orchestration(monkeypatch):
             object(),
             object(),
             workload,
-            object(),
+            _geometry(),
         )
         is observed_identity
     )
