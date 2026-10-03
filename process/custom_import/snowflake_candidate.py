@@ -9,7 +9,7 @@ import hashlib
 import hmac
 import inspect
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pyarrow as pa
@@ -632,12 +632,16 @@ async def _validate_bound_source_identity(session, request, prepared_statement, 
         )
     except SnowflakeSourceBindingError as exc:
         raise SnowflakeCandidateError("Snowflake source binding identity is invalid") from exc
+    try:
+        retained_bindings = replace(request.bundle_request, bindings=loaded.bundle_bindings).bindings
+    except SnowflakeBundleError as exc:
+        raise SnowflakeCandidateError("Snowflake source binding identity is invalid") from exc
     if (
         loaded.dataset_id != request.dataset_id
         or loaded.schema_revision_id != request.schema_revision_id
         or loaded.definition != request.definition
         or not hmac.compare_digest(loaded.source_binding_sha256, request.source_binding_sha256)
-        or loaded.bundle_bindings != request.bundle_request.bindings
+        or retained_bindings != request.bundle_request.bindings
         or request.bundle_request.processing_policy != processing_policy
         or getattr(loaded.binding, "processing_policy", None) != processing_policy
         or getattr(loaded.binding, "snapshot_token_mode", None) != request.bundle_request.snapshot_token_mode
@@ -649,7 +653,7 @@ async def _validate_bound_source_identity(session, request, prepared_statement, 
         tuple(
             approved_by_relation[binding.relation.parts].column_for(field_id) for field_id in binding.selected_field_ids
         )
-        for binding in loaded.bundle_bindings
+        for binding in retained_bindings
     )
     snapshot_columns = tuple(
         (
@@ -659,7 +663,7 @@ async def _validate_bound_source_identity(session, request, prepared_statement, 
                 binding.semantic_token_metadata_key
             )
         )
-        for binding in loaded.bundle_bindings
+        for binding in retained_bindings
     )
     if (
         selected_columns != prepared_statement.selected_columns_by_stream

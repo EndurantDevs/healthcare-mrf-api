@@ -277,7 +277,8 @@ async def test_already_bound_replay_checks_retained_headers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bound_request_cannot_invent_statement_mode(monkeypatch):
+@pytest.mark.parametrize("reverse_selected_fields", [False, True])
+async def test_bound_request_cannot_invent_statement_mode(monkeypatch, reverse_selected_fields):
     binding, builder, bundle = _statement_binding()
     request = candidate.SnowflakeBundleCandidateRequest(
         1,
@@ -290,12 +291,21 @@ async def test_bound_request_cannot_invent_statement_mode(monkeypatch):
         source_binding_revision_id=4,
         source_binding_sha256=bytes.fromhex(binding.digest),
     )
+    retained_bindings = (
+        tuple(
+            replace(stream, selected_field_ids=tuple(reversed(stream.selected_field_ids))) for stream in bundle.bindings
+        )
+        if reverse_selected_fields
+        else bundle.bindings
+    )
+    if reverse_selected_fields:
+        assert retained_bindings != bundle.bindings
     loaded = SimpleNamespace(
         dataset_id=1,
         schema_revision_id=3,
         definition=bundle.definition,
         source_binding_sha256=request.source_binding_sha256,
-        bundle_bindings=bundle.bindings,
+        bundle_bindings=retained_bindings,
         approved_relations=binding.bundle_components(bundle.definition)[0],
         binding=SimpleNamespace(processing_policy=None, snapshot_token_mode=None),
     )
