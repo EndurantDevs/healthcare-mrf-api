@@ -37,7 +37,7 @@ def _access():
     )
 
 
-def _request():
+def _request(*, network_count: int = 1):
     plan = contract.build_partitioned_candidate_audit_plan(
         binding=contract.PartitionedCandidateAuditBinding(
             snapshot_id="candidate-snapshot",
@@ -59,7 +59,7 @@ def _request():
                 npi=1_234_567_890,
                 source_artifact_key=0,
                 tuple_digest="e" * 64,
-                network_name_digests=("f" * 64,),
+                network_name_digests=tuple(f"{index:064x}" for index in range(network_count)),
                 multiplicity=1,
             ),
         ),
@@ -124,8 +124,9 @@ def _candidate_io():
 
 
 @pytest.mark.asyncio
-async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch):
-    audit_request = _request()
+@pytest.mark.parametrize(("network_count", "missing_last_network"), [(1, False), (65, False), (65, True)])
+async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch, network_count, missing_last_network):
+    audit_request = _request(network_count=network_count)
     session = _Session()
     monkeypatch.setattr(
         candidate_batch, "snapshot_serving_tables", AsyncMock(return_value=object())
@@ -151,7 +152,10 @@ async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch
                     frozenset(
                         canonical_network_name_digests(("ignored",))
                     )
-                    | frozenset(challenge.network_name_digests),
+                    | frozenset(
+                        challenge.network_name_digests[:-1]
+                        if missing_last_network else challenge.network_name_digests
+                    ),
                 )
             },
             candidate_processing_io=_candidate_io(),
@@ -164,17 +168,17 @@ async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch
         data_loader,
     )
 
-    audit_result = await candidate_partition.audit_candidate_partition(
-        session,
-        audit_request,
-        _access(),
-    )
-
-    assert audit_result.matched_challenge_count == 1
-    assert audit_result.validated_persisted_audit_occurrence_count == 1
+    if missing_last_network:
+        with pytest.raises(PTG2ManifestArtifactError, match="source witness is missing"):
+            await candidate_partition.audit_candidate_partition(session, audit_request, _access())
+    else:
+        audit_result = await candidate_partition.audit_candidate_partition(session, audit_request, _access())
+        assert audit_result.matched_challenge_count == 1
+        assert audit_result.validated_persisted_audit_occurrence_count == 1
     assert len(session.calls) == 1
     kwargs = data_loader.await_args.kwargs
     assert len(kwargs["challenges"]) == 1
+    assert kwargs["challenges"][0].network_name_digests == challenge.network_name_digests
     assert len(kwargs["persisted_audit_occurrences"]) == 1
     assert kwargs["retention_budget"].maximum_bytes == (
         PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
@@ -203,8 +207,9 @@ async def test_partition_access_mismatch_precedes_database_access():
 
 
 @pytest.mark.asyncio
-async def test_route_returns_strict_partition_result(monkeypatch):
-    audit_request = _request()
+@pytest.mark.parametrize("network_count", [1, 65, 31000])
+async def test_route_returns_strict_partition_result(monkeypatch, network_count):
+    audit_request = _request(network_count=network_count)
     raw_payload = audit_request.payload
     web_request = types.SimpleNamespace(
         body=orjson.dumps(raw_payload),
@@ -244,6 +249,24 @@ async def test_route_returns_strict_partition_result(monkeypatch):
     assert parsed_result.matched_source_occurrence_count == 1
     assert parsed_result.validated_persisted_occurrence_count == 1
     resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partition_route_preserves_wire_byte_ceiling_before_json_parsing(monkeypatch):
+    class UnparsedRequest:
+        body = b"x" * (2 * 1024 * 1024 + 1)
+
+        @property
+        def json(self):
+            raise AssertionError("Oversized body must not be parsed")
+
+    resolver = AsyncMock()
+    monkeypatch.setattr(pricing, "audit_candidate_partition", resolver)
+
+    with pytest.raises(Exception, match="candidate audit batch request is too large"):
+        await pricing.audit_ptg2_source_witness_batch(UnparsedRequest())
+
+    resolver.assert_not_awaited()
 
 
 @pytest.mark.asyncio

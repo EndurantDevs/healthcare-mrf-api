@@ -4,18 +4,20 @@
 import importlib.util
 import json
 from contextlib import asynccontextmanager
+from io import StringIO
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_serving_receipt as receipts
+from process import reference_family_result_generation as generation
 from tests.cms_npd_admission_postgres_support import _database_url
 from tests.reference_family_generation_fixture import install_source_generation_guards
 
@@ -96,7 +98,7 @@ def _create_profile_table(connection, schema):
 
 
 @asynccontextmanager
-async def _database(monkeypatch, *, install_receipt=True):
+async def _database(monkeypatch, *, install_receipt=True, install_source_guard=True):
     """Confine real guard SQL to a UUID schema in the existing UUID-owned database guard."""
     schema = "cms_receipt_" + uuid4().hex
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -108,7 +110,8 @@ async def _database(monkeypatch, *, install_receipt=True):
             await _create_scalar_tables(connection, schema)
             await connection.run_sync(lambda sync: _create_profile_table(sync, schema))
             await _create_native_tables(connection, schema)
-            await install_source_generation_guards(connection, schema)
+            if install_source_guard:
+                await install_source_generation_guards(connection, schema)
             if install_receipt:
                 await connection.run_sync(lambda sync: _apply(sync, "20260930100000"))
         yield engine, schema
@@ -119,6 +122,121 @@ async def _database(monkeypatch, *, install_receipt=True):
                 text("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=:schema)"), {"schema": schema}
             )
         await engine.dispose()
+
+
+def test_source_guard_flush_is_exact_and_precedes_new_ledger_ddl(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "synthetic")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    output = StringIO()
+    migration = _migration("20260929040000")
+    migration.op = Operations(
+        MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output})
+    )
+    migration.upgrade()
+    sql = output.getvalue()
+    immediate = 'SET CONSTRAINTS "synthetic".cms_serving_doctors_transition IMMEDIATE'
+    deferred = 'SET CONSTRAINTS "synthetic".cms_serving_doctors_transition DEFERRED'
+    assert sql.index("SET relation_oids=") < sql.index(immediate) < sql.index(deferred)
+    assert sql.index(deferred) < sql.index("ADD CONSTRAINT reference_family_result_generation_shape_check")
+    assert 'conrelid=\'"synthetic"."reference_family_result_generation"\'::regclass' in sql
+    assert "conname='cms_serving_doctors_transition' AND contype='t' AND condeferrable" in sql
+    assert "SET CONSTRAINTS ALL" not in sql
+
+
+async def _seed_legacy_mrf(connection, schema):
+    names = list(generation.RELATION_NAMES_BY_IMPORTER["mrf"])
+    names.insert(8, "shared_diagnostic")
+    for name in names:
+        await connection.execute(text(f'CREATE TABLE "{schema}"."{name}" (synthetic_id int)'))
+    await connection.execute(
+        text(f'''INSERT INTO "{schema}".reference_family_result_generation
+            (importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,relation_oids)
+            VALUES ('mrf',:lineage,7,:origin,3,'2026-01-01',
+            ARRAY(SELECT to_regclass(:schema||'.'||name)::oid::bigint FROM unnest(CAST(:names AS text[])) name))'''),
+        {"lineage": uuid4(), "origin": uuid4(), "schema": schema, "names": names},
+    )
+    return await _ledger_row(connection, schema, "mrf")
+
+
+async def _ledger_row(connection, schema, importer):
+    return dict(
+        (
+            await connection.execute(
+                text(f'SELECT * FROM "{schema}".reference_family_result_generation WHERE importer_id=:importer'),
+                {"importer": importer},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_guard_migration_flushes_legacy_mrf_and_keeps_cms_deferred(monkeypatch):
+    async with _database(monkeypatch, install_source_guard=False) as (engine, schema):
+        initial = await _publish_initial(engine, schema)
+        async with engine.begin() as connection:
+            before_by_field = await _seed_legacy_mrf(connection, schema)
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda sync: _apply(sync, "20260929040000"))
+            assert await _ledger_row(connection, schema, "mrf") == {
+                **before_by_field,
+                "relation_oids": before_by_field["relation_oids"][:8] + before_by_field["relation_oids"][9:],
+                "source_revision_tracked": False,
+            }
+            assert await receipts.read_current_receipt(connection, schema) == initial
+            async with connection.begin_nested() as nested:
+                await _advance_native(connection, schema, doctors=True)
+                with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
+                    await connection.execute(
+                        text(f'SET CONSTRAINTS "{schema}".cms_serving_doctors_transition IMMEDIATE')
+                    )
+                await nested.rollback()
+            assert await receipts.read_current_receipt(connection, schema) == initial
+
+
+@pytest.mark.asyncio
+async def test_source_guard_migration_rejects_queued_invalid_cms_and_rolls_back(monkeypatch):
+    async with _database(monkeypatch, install_source_guard=False) as (engine, schema):
+        initial = await _publish_initial(engine, schema)
+        async with engine.begin() as connection:
+            before_by_field = await _seed_legacy_mrf(connection, schema)
+            doctors_by_field = await _ledger_row(connection, schema, "cms-doctors")
+        queued_events = []
+
+        def queue_invalid_doctors(connection, _cursor, statement, _parameters, _context, _many):
+            if "SET relation_oids=relation_oids[1:8]" in statement:
+                queued_events.append(True)
+                connection.exec_driver_sql(f'''UPDATE "{schema}".reference_family_result_generation
+                    SET local_generation=local_generation+1,origin_lineage_id=local_lineage_id,
+                        origin_generation=local_generation+1 WHERE importer_id='cms-doctors' ''')
+
+        event.listen(engine.sync_engine, "after_cursor_execute", queue_invalid_doctors)
+        try:
+            with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
+                async with engine.begin() as connection:
+                    await connection.run_sync(lambda sync: _apply(sync, "20260929040000"))
+        finally:
+            event.remove(engine.sync_engine, "after_cursor_execute", queue_invalid_doctors)
+        assert queued_events == [True]
+        async with engine.connect() as connection:
+            assert await _ledger_row(connection, schema, "mrf") == before_by_field
+            assert await _ledger_row(connection, schema, "cms-doctors") == doctors_by_field
+            assert await receipts.read_current_receipt(connection, schema) == initial
+            assert not await connection.scalar(
+                text(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=:schema "
+                    "AND table_name='reference_family_result_generation' AND column_name='source_revision_tracked')"
+                ),
+                {"schema": schema},
+            )
+            assert await connection.scalar(
+                text(
+                    "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass(:ledger) "
+                    "AND conname='reference_family_result_generation_shape_check')"
+                ),
+                {"ledger": f'"{schema}".reference_family_result_generation'},
+            )
 
 
 async def _seed_source(connection, schema):
