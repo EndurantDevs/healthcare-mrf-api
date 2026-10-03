@@ -13,6 +13,71 @@ from process import reference_family_archive as archive
 from tests.test_reference_family_archive import _incumbent, _manifest, _ownership, _serving_generation
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer_id", ["label", "geo", "mrf"])
+async def test_source_lock_preserves_other_families_and_label_select_only_reader(importer_id):
+    spec = SimpleNamespace(importer_id=importer_id, table_names=("label" if importer_id == "label" else "synthetic",))
+    session = SimpleNamespace(execute=AsyncMock())
+    await archive._lock_source_family(session, spec, "synthetic")
+    names = archive.RELATION_NAMES_BY_IMPORTER["mrf"] if importer_id == "mrf" else spec.table_names
+    relations = ", ".join(f'"synthetic"."{name}"' for name in names)
+    mode = "ACCESS SHARE MODE NOWAIT" if importer_id == "label" else "SHARE MODE"
+    assert str(session.execute.await_args.args[0]) == f"LOCK TABLE {relations} IN {mode}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["valid", "incomplete", "drifted", "locked"])
+async def test_label_source_reader_keeps_snapshot_and_generation_fences(monkeypatch, state):
+    @asynccontextmanager
+    async def bounded(_session):
+        yield
+
+    async def execute(statement):
+        if state == "locked" and str(statement).startswith("LOCK TABLE"):
+            raise RuntimeError("synthetic source lock unavailable")
+        return SimpleNamespace(scalar_one=lambda: "00000001-00000001-1")
+
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(side_effect=execute))
+    spec = SimpleNamespace(importer_id="label", table_names=("label",))
+    serving = _serving_generation()
+    authority = SimpleNamespace(serving_generation=None if state == "incomplete" else serving, relation_oids=(99,))
+    tables = (replace(_manifest().tables[0], model_name="Label", table_name="label"),)
+    manifest = replace(
+        _manifest(),
+        importer_id="label",
+        tables=tables,
+        schema_sha256=archive._schema_digest(tables),
+        publication_authority="tracked-generation",
+        source_serving_generation=serving,
+    )
+    manifest_capture = AsyncMock(return_value=manifest)
+    monkeypatch.setattr(archive, "reference_family_spec", lambda _importer: spec)
+    monkeypatch.setattr(archive, "_bounded_capture", bounded)
+    monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority))
+    monkeypatch.setattr(
+        archive,
+        "capture_reference_family_serving_generation",
+        AsyncMock(return_value=serving, side_effect=RuntimeError("drifted") if state == "drifted" else None),
+    )
+    monkeypatch.setattr(archive, "_family_manifest", manifest_capture)
+    capture_argument_map = dict(importer_id="label", schema_name="synthetic", source_metadata={"release": "synthetic"})
+    if state == "valid":
+        capture = await archive.capture_reference_family_source(session, **capture_argument_map)
+        assert capture.manifest == manifest
+        assert capture.postgres_snapshot == "00000001-00000001-1"
+        assert manifest_capture.await_args.kwargs["source_serving_generation"] is serving
+    else:
+        with pytest.raises(RuntimeError, match="source generation|source lock"):
+            await archive.capture_reference_family_source(session, **capture_argument_map)
+        manifest_capture.assert_not_awaited()
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements[:2] == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        'LOCK TABLE "synthetic"."label" IN ACCESS SHARE MODE NOWAIT',
+    ]
+    assert ("SELECT pg_export_snapshot()" in statements) is (state == "valid")
+
+
 @pytest.mark.parametrize("authority,generation", [("unknown", None), ("tracked-generation", None), ("manual-only", 1)])
 def test_manifest_serialization_cannot_invent_generation_authority(authority, generation):
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="authority is invalid"):

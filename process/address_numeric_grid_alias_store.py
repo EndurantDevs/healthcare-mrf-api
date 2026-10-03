@@ -81,16 +81,14 @@ async def _alias_state(
     session: Any,
     *,
     schema: str,
-    lock: bool,
 ) -> tuple[int, int, int]:
-    suffix = " FOR UPDATE" if lock else ""
+    """Read state with SELECT authority; writers already hold the alias advisory lock."""
     state_record = (
         await session.execute(
             text(
                 address_alias_sql.active_alias_generation_sql(schema=schema)
                 .strip()
                 .removesuffix(";")
-                + suffix
             )
         )
     ).first()

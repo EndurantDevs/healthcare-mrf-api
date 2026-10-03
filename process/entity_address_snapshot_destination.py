@@ -18,6 +18,7 @@ from process.entity_address_cutover_contract import preserve_transaction_sql_set
 from process.entity_address_snapshot_alias import (
     EntityAddressAliasSemanticReceipt,
     EntityAddressSnapshotAliasError,
+    _capture_alias_semantic_receipt,
     capture_entity_address_alias_semantic_receipt,
     require_matching_entity_address_alias_semantics,
     validate_entity_address_alias_semantic_receipt,
@@ -170,6 +171,7 @@ async def _destination_alias_binding(
     *,
     db_schema: str,
     source_alias_receipt: Mapping[str, Any] | EntityAddressAliasSemanticReceipt,
+    provisional: bool = False,
 ) -> tuple[EntityAddressAliasSemanticReceipt, EntityAddressAliasSemanticReceipt]:
     """Lock aliases first and require portable equality without counter equality."""
 
@@ -180,10 +182,10 @@ async def _destination_alias_binding(
             ("work_mem",),
             entity_address_unified._sql_literal,
         ):
-            destination_alias = await capture_entity_address_alias_semantic_receipt(
-                session,
-                schema_name=db_schema,
-            )
+            if provisional:
+                destination_alias = await _capture_alias_semantic_receipt(session, schema_name=db_schema, provisional=True)
+            else:
+                destination_alias = await capture_entity_address_alias_semantic_receipt(session, schema_name=db_schema)
         require_matching_entity_address_alias_semantics(source_alias, destination_alias)
     except (EntityAddressSnapshotAliasError, ValueError) as error:
         raise EntityAddressSnapshotDestinationError(str(error)) from error
@@ -454,6 +456,7 @@ async def _move_remapped_destination(
     validated_owner: EntityAddressArchiveStageOwnership,
     normalized_schema: str,
     stage_names: Mapping[str, str],
+    preserve_private_stage: bool = False,
 ) -> tuple[tuple[str, int], ...]:
     """Move the validated remapped family into its native stage names."""
 
@@ -469,7 +472,8 @@ async def _move_remapped_destination(
         db_schema=normalized_schema,
         stage_oids=stage_oids,
     )
-    await restore._drop_empty_owned_schema(session, validated_owner)
+    if not preserve_private_stage:
+        await restore._drop_empty_owned_schema(session, validated_owner)
     return stage_oids
 
 
@@ -496,16 +500,11 @@ async def prepare_entity_address_archive_destination(
     if dependency_bindings is not None:
         dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
     async with db.bind_existing_session(session):
-        return await _prepare_bound_destination(
-            session,
-            owner=owner,
-            semantic_receipt=semantic_receipt,
-            source_alias_receipt=source_alias_receipt,
-            db_schema=db_schema,
-            import_date=import_date,
-            source_serving_generation=source_serving_generation,
-            **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
-        )
+        return await _prepare_bound_destination(session, {
+            "owner": owner, "semantic_receipt": semantic_receipt, "source_alias_receipt": source_alias_receipt,
+            "db_schema": db_schema, "import_date": import_date, "source_serving_generation": source_serving_generation,
+            "dependency_bindings": dependency_bindings,
+        })
 
 
 def _validated_source_generation(
@@ -521,28 +520,17 @@ def _validated_source_generation(
         raise EntityAddressSnapshotDestinationError("entity-address source serving generation is invalid") from error
 
 
-async def _prepare_bound_destination(
-    session: Any,
-    *,
-    owner: Mapping[str, Any] | EntityAddressArchiveStageOwnership,
-    semantic_receipt: Mapping[str, Any] | EntityAddressArchiveReceipt,
-    source_alias_receipt: Mapping[str, Any] | EntityAddressAliasSemanticReceipt,
-    db_schema: str,
-    import_date: str,
-    source_serving_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
-    dependency_bindings=None,
-) -> PreparedEntityAddressSnapshotDestination:
+async def _prepare_bound_destination(session, destination_payload, *, preserve_private_stage=False):
     """Prepare while the module database uses the caller-owned session."""
-    validated_source_generation = _validated_source_generation(source_serving_generation)
+    validated_source_generation = _validated_source_generation(destination_payload.get("source_serving_generation"))
     source_alias, destination_alias = await _destination_alias_binding(
-        session, db_schema=db_schema, source_alias_receipt=source_alias_receipt
+        session, db_schema=destination_payload["db_schema"], source_alias_receipt=destination_payload["source_alias_receipt"],
+        provisional=preserve_private_stage,
     )
     validated_owner, source_receipt, normalized_schema, normalized_date, stage_names = await _validate_owned_source(
         session,
-        owner=owner,
-        semantic_receipt=semantic_receipt,
-        db_schema=db_schema,
-        import_date=import_date,
+        owner=destination_payload["owner"], semantic_receipt=destination_payload["semantic_receipt"],
+        db_schema=destination_payload["db_schema"], import_date=destination_payload["import_date"],
     )
     remap_evidence, post_remap_receipt = await _remap_base_versions(
         session,
@@ -556,6 +544,7 @@ async def _prepare_bound_destination(
         validated_owner=validated_owner,
         normalized_schema=normalized_schema,
         stage_names=stage_names,
+        preserve_private_stage=preserve_private_stage,
     )
     prepared, geo_preparation, stage_integrity = await _prepare_moved_destination(
         session,
@@ -564,9 +553,9 @@ async def _prepare_bound_destination(
         stage_names=stage_names,
         stage_oids=stage_oids,
         source_serving_generation=validated_source_generation,
-        **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
+        dependency_bindings=destination_payload.get("dependency_bindings"),
     )
-    return PreparedEntityAddressSnapshotDestination(
+    prepared_destination = PreparedEntityAddressSnapshotDestination(
         restored=_prepared_restore_receipt(
             validated_owner=validated_owner,
             normalized_date=normalized_date,
@@ -581,6 +570,11 @@ async def _prepare_bound_destination(
         base_version_remap=remap_evidence,
         geo_assurance=geo_preparation,
     )
+    if preserve_private_stage:
+        await restore._return_owned_relations(
+            session, owner=validated_owner, db_schema=normalized_schema, stage_names=stage_names
+        )
+    return prepared_destination
 
 
 def _prepared_restore_receipt(
@@ -869,6 +863,13 @@ async def _activate_bound_destination(
 ) -> dict[str, int | dict[str, int]]:
     """Activate while the module database uses the caller-owned session."""
 
+    prepared = await _validated_bound_destination(session, stored=stored)
+    return await adoption.adopt_prepared_entity_address_snapshot(prepared, callbacks=callbacks)
+
+
+async def _validated_bound_destination(session, *, stored):
+    """Perform every content-dependent destination check without publishing."""
+
     source_alias, destination_alias, remap_evidence = _validated_destination_metadata(stored)
     current_alias_source, current_alias = await _destination_alias_binding(
         session,
@@ -906,10 +907,7 @@ async def _activate_bound_destination(
     )
     if actual_geo != expected_geo:
         raise EntityAddressSnapshotDestinationError("entity-address geo-assurance preparation changed")
-    return await adoption.adopt_prepared_entity_address_snapshot(
-        prepared,
-        callbacks=callbacks,
-    )
+    return prepared
 
 
 __all__ = [

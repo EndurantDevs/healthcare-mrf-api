@@ -116,7 +116,7 @@ class _NumericGridAliasRunner:
         alias_kind: str,
     ) -> NumericGridAliasResult:
         async with db.transaction() as session:
-            _, _, generation = await _alias_state(session, schema=schema, lock=False)
+            _, _, generation = await _alias_state(session, schema=schema)
         return NumericGridAliasResult(
             run_id=None,
             mode="off",
@@ -245,7 +245,6 @@ class _NumericGridAliasRunner:
         _, _, execution.generation = await _alias_state(
             session,
             schema=execution.schema,
-            lock=True,
         )
         execution.final_generation = execution.generation
 
@@ -432,7 +431,6 @@ class _NumericGridAliasRunner:
         _, _, execution.final_generation = await _alias_state(
             session,
             schema=execution.schema,
-            lock=False,
         )
 
     async def _seal_run(self, session: Any) -> None:
