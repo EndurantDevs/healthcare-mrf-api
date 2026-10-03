@@ -63,7 +63,7 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     assert migration.down_revision == ("20260901000000_hospital_price_csv_short_v2")
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
-    assert ScriptDirectory.from_config(alembic_config).get_heads() == ["20261003000000_address_alias_generation_guard"]
+    assert ScriptDirectory.from_config(alembic_config).get_heads() == ["20261001110000_profile_initial_publication"]
     for table_name in (
         "plan_pricing_em_distance_candidate",
         "plan_pricing_em_distance_attachment",

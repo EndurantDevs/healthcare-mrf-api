@@ -4,6 +4,10 @@
 import asyncio
 import datetime
 import json
+import importlib.util
+from pathlib import Path
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -22,6 +26,17 @@ from process import provider_directory_capacity_reservation_snapshot as snapshot
 from tests.cms_npd_admission_postgres_support import _database_url
 from tests.test_provider_directory_capacity_reservation_snapshot import RUN_ID, _consumption, _preflight, _run
 from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope
+
+
+def _install_cleanup_claim(connection):
+    """Install the real immutable cleanup ledger in this isolated fixture schema."""
+    directory = Path(__file__).resolve().parents[1] / "alembic/versions"
+    for name in ("20260930140000_cms_capacity_preflight_receipt.py", "20261001100000_profile_failed_cleanup_claim.py"):
+        spec = importlib.util.spec_from_file_location("snapshot_" + name[:-3], directory / name)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with Operations.context(MigrationContext.configure(connection)):
+            module.upgrade()
 
 
 @asynccontextmanager
@@ -58,6 +73,9 @@ async def _fixture(monkeypatch, session_type=AsyncSession):
         async with engine.begin() as connection:
             await connection.execute(text(f"CREATE SCHEMA {quote(schema)}"))
             await connection.run_sync(metadata.create_all)
+            with monkeypatch.context() as migration_environment:
+                migration_environment.setenv("HLTHPRT_DB_SCHEMA", schema)
+                await connection.run_sync(_install_cleanup_claim)
             await connection.execute(
                 text(f"""CREATE TABLE {fhir._provider_directory_profile_checkpoint_ref(schema)} (
                 build_id text,owner_run_id text,state text,evidence_stage text,profile_stage text,

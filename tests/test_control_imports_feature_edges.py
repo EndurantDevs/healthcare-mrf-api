@@ -11,6 +11,26 @@ control_imports = importlib.import_module("api.control_imports")
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["npi", "hospital-prices"])
+@pytest.mark.parametrize(
+    "field_name",
+    ["cms_npd_retained_operation", "cms_npd_retained_vector_sha256", "cms_npd_retained_receipt_sha256"],
+)
+async def test_retained_selector_rejects_other_importers_before_admission(monkeypatch, importer, field_name):
+    active = AsyncMock(side_effect=AssertionError("retained selector reached database"))
+    admission = AsyncMock(side_effect=AssertionError("retained selector reached admission"))
+    enqueue = AsyncMock(side_effect=AssertionError("retained selector reached queue"))
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", active)
+    monkeypatch.setattr(control_imports, "_admit_import_row", admission)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    with pytest.raises(ValueError, match="cms_npd_retained_requires_provider_directory_importer"):
+        await control_imports.create_import_run({"importer": importer, "params": {field_name: None}})
+    active.assert_not_awaited()
+    admission.assert_not_awaited()
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
     event_loop_thread = threading.get_ident()
     validation_threads: list[int] = []

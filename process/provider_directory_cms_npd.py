@@ -77,6 +77,11 @@ def durable_artifact_root() -> Path:
 def validate_task(task: dict[str, Any], run_id: str | None) -> None:
     """Exclude bounded or mixed-source runs from complete-release admission."""
 
+    retained_input = retained_input_selection(task)
+    if retained_input is not None and task.get("source_ids") not in ([SOURCE_ID], (SOURCE_ID,), SOURCE_ID):
+        raise ValueError("cms_npd_retained_requires_exclusive_source_scope")
+    if retained_input is not None and task.get("source_query"):
+        raise ValueError("cms_npd_import_parameters_invalid")
     if not run_id or not task.get("import_resources") or task.get("full_refresh") is not True:
         raise ValueError("cms_npd_complete_import_required")
     if any(
@@ -120,6 +125,41 @@ def validate_task(task: dict[str, Any], run_id: str | None) -> None:
         raise ValueError("cms_npd_rollback_root_invalid")
 
 
+def retained_input_selection(task: dict[str, Any]) -> dict[str, str] | None:
+    """Require one closed operator selection without changing ordinary requests."""
+    operation = task.get("cms_npd_retained_operation")
+    vector = task.get("cms_npd_retained_vector_sha256")
+    receipt = task.get("cms_npd_retained_receipt_sha256")
+    if operation is None and vector is None and receipt is None:
+        return None
+    if (
+        operation not in ("baseline", "rollback")
+        or any(not isinstance(value, str) or source._SHA256.fullmatch(value) is None for value in (vector, receipt))
+        or any(
+            task.get(name) is not None for name in ("cms_npd_rollback_vector_sha256", "cms_npd_rollback_root_run_id")
+        )
+    ):
+        raise ValueError("cms_npd_retained_selection_invalid")
+    root = task.get("provider_directory_pagination_root_run_id")
+    if root is not None and (not isinstance(root, str) or not root or root != root.strip() or len(root) > 160):
+        raise ValueError("cms_npd_retained_root_invalid")
+    return {"operation": operation, "vector_sha256": vector, "receipt_sha256": receipt}
+
+
+def validate_source_scope(task, run_id, requested_source_ids, test_mode):
+    """Reject retained controls before generic importer setup can write."""
+    if retained_input_selection(task) is not None:
+        if requested_source_ids != [SOURCE_ID]:
+            raise ValueError("cms_npd_retained_requires_exclusive_source_scope")
+        validate_task(task, run_id)
+        if test_mode:
+            raise ValueError("cms_npd_import_parameters_invalid")
+    if any(
+        task.get(name) is not None for name in ("cms_npd_rollback_vector_sha256", "cms_npd_rollback_root_run_id")
+    ) and requested_source_ids != [SOURCE_ID]:
+        raise ValueError("cms_npd_rollback_requires_exclusive_source_scope")
+
+
 def release_identity(receipt_by_field: dict[str, Any]) -> dict[str, Any]:
     """Keep the exact complete vector in immutable candidate metadata."""
 
@@ -144,15 +184,7 @@ def release_identity(receipt_by_field: dict[str, Any]) -> dict[str, Any]:
 async def _register_source(fhir: Any) -> str:
     """Bind one stable official-file endpoint and one source-scoped identity."""
 
-    admitted = fhir._admit_provider_directory_endpoint_components(
-        canonical_api_base=source.DOWNLOADS_URL,
-        credential_descriptor_json={},
-        endpoint_signature_json={
-            "transport": "cms_npd_bulk_files",
-            "adapter_contract": ADAPTER_CONTRACT,
-            "resource_types": sorted(RESOURCE_SET),
-        },
-    )
+    admitted = _source_endpoint(fhir)
     now = fhir._now()
     endpoint_id = admitted["endpoint_id"]
     await fhir._upsert_rows(
@@ -170,6 +202,19 @@ async def _register_source(fhir: Any) -> str:
     )
     await fhir._upsert_rows(fhir.ProviderDirectorySource, [_source_row(fhir, endpoint_id, now)])
     return endpoint_id
+
+
+def _source_endpoint(fhir: Any) -> dict[str, Any]:
+    """Derive the registered endpoint before baseline history checks can write."""
+    return fhir._admit_provider_directory_endpoint_components(
+        canonical_api_base=source.DOWNLOADS_URL,
+        credential_descriptor_json={},
+        endpoint_signature_json={
+            "transport": "cms_npd_bulk_files",
+            "adapter_contract": ADAPTER_CONTRACT,
+            "resource_types": sorted(RESOURCE_SET),
+        },
+    )
 
 
 def _source_row(fhir: Any, endpoint_id: str, now: Any) -> dict[str, Any]:
@@ -296,15 +341,57 @@ async def _assert_rollback_predecessor(fhir: Any, endpoint_id: str, identity: di
         raise RuntimeError("cms_npd_rollback_prior_publication_not_superseded")
 
 
+async def _assert_baseline_history(fhir, endpoint_id, identity, task, run_id):
+    """Allow first intake or the same acquisition's proved current composite result."""
+    history = await fhir.db.all(
+        f"SELECT dataset_id FROM {fhir._qt(fhir._schema(), 'provider_directory_endpoint_dataset')} "
+        "WHERE endpoint_id=:endpoint_id AND (published_at IS NOT NULL OR is_current) LIMIT 2",
+        endpoint_id=endpoint_id,
+    )
+    if not history:
+        return
+    if len(history) == 1:
+        current = await _current_release_publication(
+            identity["vector_sha256"], identity["manifest_sha256"], identity["generated_at"]
+        )
+        if (
+            current is not None
+            and current["dataset_id"] == history[0][0]
+            and current["endpoint_id"] == endpoint_id
+            and current["publication_metadata_json"].get("source_release") == identity
+            and await recovery.is_same_acquisition_replay(fhir, current["acquisition_root_run_id"], task, run_id)
+        ):
+            return
+    raise RuntimeError("cms_npd_baseline_prior_publication_exists")
+
+
+def _assert_retained_receipt_pin(directory: Path, task: dict[str, Any] | None) -> None:
+    """Recheck approved receipt bytes at the existing retained verification boundaries."""
+    expected = (task or {}).get("cms_npd_retained_receipt_sha256")
+    if expected is None:
+        return
+    path = directory / "receipt.json"
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_size > source.MAX_MANIFEST_BYTES
+        or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+    ):
+        raise source.CmsNpdSourceError("cms_npd_retained_receipt_changed")
+
+
 async def _verify_release(
     directory: Path,
     receipt_by_field: dict[str, Any],
     client: httpx.Client | None,
+    task: dict[str, Any] | None = None,
 ) -> None:
+    _assert_retained_receipt_pin(directory, task)
     if client is None:
         await asyncio.to_thread(source.verify_retained_release, directory, receipt_by_field)
     else:
         await asyncio.to_thread(source.verify_release, directory, receipt_by_field, client=client)
+    _assert_retained_receipt_pin(directory, task)
 
 
 async def _verify_or_dispose(
@@ -314,16 +401,27 @@ async def _verify_or_dispose(
     directory: Path,
     receipt_by_field: dict[str, Any],
     client: httpx.Client | None,
+    task: dict[str, Any] | None = None,
 ) -> None:
     try:
-        await _verify_release(directory, receipt_by_field, client)
+        await _verify_release(directory, receipt_by_field, client, task)
     except source.CmsNpdSourceError as error:
         if not candidate.already_published and str(error) in {
             "cms_npd_retained_file_missing",
             "cms_npd_source_vector_changed",
+            "cms_npd_retained_receipt_changed",
         }:
             await recovery.dispose_changed_vector(fhir, candidate, identity)
         raise
+
+
+def _rollback_selection(task, run_id):
+    """Keep legacy rollback roots and use the durable retry root for retained selections."""
+    if task.get("cms_npd_retained_operation") == "rollback":
+        return task.get("cms_npd_retained_vector_sha256"), task.get(
+            "provider_directory_pagination_root_run_id"
+        ) or run_id
+    return task.get("cms_npd_rollback_vector_sha256"), task.get("cms_npd_rollback_root_run_id") or run_id
 
 
 async def _admission_candidate(
@@ -332,32 +430,24 @@ async def _admission_candidate(
     run_id: str,
     identity: dict[str, Any],
     task: dict[str, Any],
+    repair_selection=None,
 ) -> Any:
     """Select a reusable exact vector candidate or a fresh recurring one."""
 
-    rollback_vector = task.get("cms_npd_rollback_vector_sha256")
+    rollback_vector, rollback_root = _rollback_selection(task, run_id)
     candidate_key = None
     existing_dataset_id = None
     if rollback_vector is not None:
         if rollback_vector != identity["vector_sha256"]:
             raise RuntimeError("cms_npd_rollback_vector_changed")
         await _assert_rollback_predecessor(fhir, endpoint_id, identity)
-        current_dataset_id = await fhir._current_endpoint_dataset_id(endpoint_id, exclude_dataset_id="")
-        current_state = await fhir._endpoint_dataset_state(current_dataset_id) if current_dataset_id else None
-        current_metadata = current_state.get("publication_metadata_json") if current_state else None
-        if (
-            current_state
-            and current_state.get("status") == fhir.ENDPOINT_DATASET_PUBLISHED
-            and current_state.get("is_current") is True
-            and isinstance(current_metadata, dict)
-            and current_metadata.get("source_release") == identity
-        ):
-            existing_dataset_id = current_dataset_id
-        elif current_dataset_id:
-            existing_dataset_id = await recovery.reusable_vector_candidate(
-                fhir, endpoint_id, identity, previous_dataset_id=current_dataset_id
-            )
-        rollback_root = task.get("cms_npd_rollback_root_run_id") or run_id
+    if repair_selection is None:
+        repair_selection = await recovery.repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id)
+    if repair_selection is not None:
+        repair_root, existing_dataset_id = repair_selection
+        candidate_key = f"cms-npd-repair:{identity['vector_sha256']}:{repair_root}"
+    elif rollback_vector is not None:
+        existing_dataset_id = await _rollback_candidate_id(fhir, endpoint_id, identity)
         candidate_key = f"cms-npd-rollback:{rollback_vector}:{rollback_root}"
     else:
         original_id = fhir._endpoint_dataset_candidate_id(
@@ -386,6 +476,24 @@ async def _admission_candidate(
         existing_dataset_id=existing_dataset_id,
     )
     return await _reacquire_unwitnessed_candidate(fhir, endpoint_id, run_id, identity, selected_candidate)
+
+
+async def _rollback_candidate_id(fhir, endpoint_id, identity):
+    """Reuse only this exact current release or a candidate pinned to its current predecessor."""
+    current_id = await fhir._current_endpoint_dataset_id(endpoint_id, exclude_dataset_id="")
+    current_state = await fhir._endpoint_dataset_state(current_id) if current_id else None
+    metadata = current_state.get("publication_metadata_json") if current_state else None
+    if (
+        current_state
+        and current_state.get("status") == fhir.ENDPOINT_DATASET_PUBLISHED
+        and current_state.get("is_current") is True
+        and isinstance(metadata, dict)
+        and metadata.get("source_release") == identity
+    ):
+        return current_id
+    if current_id:
+        return await recovery.reusable_vector_candidate(fhir, endpoint_id, identity, previous_dataset_id=current_id)
+    return None
 
 
 async def _reacquire_unwitnessed_candidate(
@@ -941,7 +1049,7 @@ async def _serving_candidate_descriptor(fhir, state, proof_by_field):
 async def _prepare_serving_candidate(fhir, candidate, identity, directory, receipt_by_field, client, ctx, task):
     """Seal complete candidate coverage without moving any serving pointer."""
     coverage = importlib.import_module("process.provider_directory_cms_serving_coverage")
-    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, client)
+    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, client, task)
     state = await fhir._endpoint_dataset_state(candidate.dataset_id)
     _assert_candidate_release(state, identity)
     dataset_hash = state.get("dataset_hash")
@@ -953,6 +1061,7 @@ async def _prepare_serving_candidate(fhir, candidate, identity, directory, recei
     )
     state = await fhir._endpoint_dataset_state(candidate.dataset_id)
     _assert_candidate_release(state, identity)
+    _assert_retained_receipt_pin(directory, task)
     return state, await _serving_candidate_descriptor(fhir, state, proof_by_field)
 
 
@@ -1056,21 +1165,24 @@ async def _stage_acquired(
     fhir = importlib.import_module("process.provider_directory_fhir")
 
     identity = release_identity(receipt_by_field)
+    await _verify_release(directory, receipt_by_field, client, task)
+    repair_selection = await recovery.repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id)
+    if task.get("cms_npd_retained_operation") or task.get("provider_directory_repair_id") is not None:
+        await _register_source(fhir)
     await recovery.resume_pending_cleanup(fhir, endpoint_id)
-    await _verify_release(directory, receipt_by_field, client)
     await recovery.dispose_prior_vectors(fhir, endpoint_id, identity["vector_sha256"])
-    candidate = await _admission_candidate(fhir, endpoint_id, run_id, identity, task)
+    candidate = await _admission_candidate(fhir, endpoint_id, run_id, identity, task, repair_selection)
     if not candidate.already_validated and not candidate.already_published:
         for name, resource_type in source.RESOURCE_FILES:
             count = await _stream_file(fhir, directory / f"{name}.zst", candidate, resource_type, ctx, task)
             if count != identity["files"][name]["row_count"]:
                 raise RuntimeError("cms_npd_file_row_count_changed")
     counts_by_type = await _assert_counts(fhir, candidate, identity)
-    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
+    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
     await _assert_witness_counts(fhir, candidate, identity)
     await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
     await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
-    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None)
+    await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
     await _validate_candidate(fhir, candidate, identity, counts_by_type)
     state, serving_candidate = await _prepare_serving_candidate(
         fhir, candidate, identity, directory, receipt_by_field, client, ctx, task
@@ -1096,13 +1208,29 @@ async def _stage_acquired(
 async def _run_acquired(ctx, task, run_id, directory, receipt_by_field, client):
     """Retain one endpoint owner's complete candidate before requesting publication."""
     fhir = importlib.import_module("process.provider_directory_fhir")
-    endpoint_id = await _register_source(fhir)
+    retained_operation = task.get("cms_npd_retained_operation")
+    has_retained_controls = bool(retained_operation) or task.get("provider_directory_repair_id") is not None
+    endpoint_id = _source_endpoint(fhir)["endpoint_id"] if has_retained_controls else await _register_source(fhir)
     async with _intake_guard(fhir, endpoint_id):
+        if retained_operation == "baseline":
+            await _assert_baseline_history(fhir, endpoint_id, release_identity(receipt_by_field), task, run_id)
+        elif retained_operation == "rollback" or (
+            task.get("provider_directory_repair_id") is not None
+            and task.get("cms_npd_rollback_vector_sha256") is not None
+        ):
+            await _assert_rollback_predecessor(fhir, endpoint_id, release_identity(receipt_by_field))
         return await _stage_acquired(ctx, task, run_id, directory, receipt_by_field, client, endpoint_id)
 
 
 async def _current_observed_publication(observed: source.ObservedRelease) -> dict[str, Any] | None:
     """Find the one covered CMS publication for this exact observed release."""
+    return await _current_release_publication(
+        observed.vector_sha256, observed.manifest.sha256, observed.manifest.generated_at
+    )
+
+
+async def _current_release_publication(vector_sha256, manifest_sha256, generated_at):
+    """Require the current composite receipt and coverage for the exact release."""
 
     from api.provider_directory_cms_generation import accepted_cms_generation
     from api.provider_directory_entities_contract import DirectoryReadError
@@ -1115,7 +1243,7 @@ async def _current_observed_publication(observed: source.ObservedRelease) -> dic
             await coverage.require_cms_coverage(session, fhir._schema(), generation)
     except DirectoryReadError:
         return None
-    if generation["release_id"] != observed.vector_sha256:
+    if generation["release_id"] != vector_sha256:
         return None
     state = await fhir._endpoint_dataset_state(generation["dataset_id"])
     metadata = state.get("publication_metadata_json")
@@ -1127,9 +1255,9 @@ async def _current_observed_publication(observed: source.ObservedRelease) -> dic
         or state.get("published_at") != generation["observed_at"]
         or not isinstance(release, dict)
         or release.get("source_id") != SOURCE_ID
-        or release.get("vector_sha256") != observed.vector_sha256
-        or release.get("manifest_sha256") != observed.manifest.sha256
-        or release.get("generated_at") != observed.manifest.generated_at
+        or release.get("vector_sha256") != vector_sha256
+        or release.get("manifest_sha256") != manifest_sha256
+        or release.get("generated_at") != generated_at
         or not isinstance(state.get("acquisition_root_run_id"), str)
         or not state["acquisition_root_run_id"]
     ):
@@ -1138,7 +1266,7 @@ async def _current_observed_publication(observed: source.ObservedRelease) -> dic
         fhir, state["dataset_id"]
     ):
         return None
-    if await relationships.completed_receipt_count(fhir, state["dataset_id"], observed.vector_sha256) is None:
+    if await relationships.completed_receipt_count(fhir, state["dataset_id"], vector_sha256) is None:
         return None
     return state
 
@@ -1256,12 +1384,19 @@ async def run(ctx: dict[str, Any], task: dict[str, Any], run_id: str | None) -> 
         raise ValueError("cms_npd_import_parameters_invalid")
     assert run_id is not None
     root = durable_artifact_root()
+    retained_input = retained_input_selection(task)
     rollback_vector = task.get("cms_npd_rollback_vector_sha256")
-    if rollback_vector is not None:
-        directory = source.retained_release_directory(root, rollback_vector)
+    retained_vector = retained_input["vector_sha256"] if retained_input is not None else rollback_vector
+    if retained_vector is not None:
+        directory = source.retained_release_directory(root, retained_vector)
         with source._release_lock(directory):
-            _, receipt_by_field = await asyncio.to_thread(source.load_retained_release, root, rollback_vector)
+            _assert_retained_receipt_pin(directory, task)
+            _, receipt_by_field = await asyncio.to_thread(source.load_retained_release, root, retained_vector)
+            _assert_retained_receipt_pin(directory, task)
             result = await _run_acquired(ctx, task, run_id, directory, receipt_by_field, None)
+            _assert_retained_receipt_pin(directory, task)
+            if retained_input is not None:
+                result["cms_retained_input"] = retained_input
     else:
         result = await _run_upstream_check(ctx, task, run_id, root)
     ctx.setdefault("context", {})["audit"] = result
