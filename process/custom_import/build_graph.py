@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from itertools import count
 
 from sqlalchemy import LargeBinary, String, func, or_, select, tuple_
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import aliased
 
 from db.models.custom_import import (
@@ -165,6 +166,7 @@ class _ReadPage:
     reserve_bytes: int = 0
     row_limit: int | None = None
     variable_columns: tuple | None = None
+    single_page: bool = False
 
 
 def _read_rows(session, request, build_id, statement, keys, models, *, after=None, bounds=_ReadPage()):
@@ -201,6 +203,8 @@ def _read_rows(session, request, build_id, statement, keys, models, *, after=Non
             # Nested bounded reads may renew the live window while reducing a
             # large family or group. Pure work must still fit the latest window.
             _require_budget(session.info["custom_import_build_read_deadline"])
+        if bounds.single_page:
+            return
 
 
 def _one_row(session, request, build_id, statement, keys, models):
@@ -734,7 +738,25 @@ def _child_ranges(registry, current):
         yield candidate_slot, after
 
 
-def _next_child(session, request, registry, family_input):
+def _child_page_limit(request, registry, plan):
+    """Reserve revision, occurrence and membership rows before scalar/context fanout."""
+
+    if plan.selection_kind == "retained":
+        return 1
+    scopes = material._profile_scopes(request.definition, registry.child_collection_slots)
+    maximum_work = max(
+        (
+            3
+            + sum(field.projection_slot is not None for field in request.definition.fields if field.collection == name)
+            + sum(scope.collection_slot == slot for scope in scopes)
+            for name, slot in registry.child_collection_slots.items()
+        ),
+        default=1,
+    )
+    return max(1, request.page_row_limit // maximum_work)
+
+
+def _next_children(session, request, registry, family_input, row_limit):
     plan = family_input.plan
     current = _one_row(
         session,
@@ -748,7 +770,7 @@ def _next_child(session, request, registry, family_input):
         (CustomImportBuildFamily,),
     )[0]
     if current.complete_at is not None:
-        return current, None
+        return current, []
     for slot, after in _child_ranges(registry, current):
         statement, keys = _child_statement(current, request.definition, collection_slot=slot)
         children = _read_rows(
@@ -759,18 +781,22 @@ def _next_child(session, request, registry, family_input):
             keys,
             (CustomImportChildRevision,),
             after=after,
-            bounds=_ReadPage(row_limit=1, reserve_bytes=_model_bytes((family_input.root, family_input.record))),
+            bounds=_ReadPage(
+                row_limit=row_limit,
+                reserve_bytes=_model_bytes((family_input.root, family_input.record)),
+                single_page=True,
+            ),
         )
         try:
-            child = next(children, (None,))[0]
-            if child is not None:
-                return current, child
+            child_revisions = [child for (child,) in children]
+            if child_revisions:
+                return current, child_revisions
         finally:
             children.close()
-    return current, None
+    return current, []
 
 
-async def _append_child_page(session, request, registry, build, family_input, child, family):
+async def _child_page_models(session, request, registry, build, family_input, child, family):
     collection = next(name for name, slot in registry.child_collection_slots.items() if slot == child.collection_slot)
     child_values = payload_values(
         fields_by_collection(request.definition)[collection], child.canonical_payload, label="build child payload"
@@ -784,35 +810,65 @@ async def _append_child_page(session, request, registry, build, family_input, ch
     projections.extend(
         _child_models(request, registry, build.build_id, family, family_input.values, child, child_values, collection)
     )
-    _page_cost(request, projections, reserved_rows=2 if family_input.plan.selection_kind == "source" else 0)
-    session.add_all(model for model in projections if not isinstance(model, CustomImportBuildCandidateContext))
-    await _flush_page(session)
-    session.add_all(model for model in projections if isinstance(model, CustomImportBuildCandidateContext))
+    return projections
+
+
+async def _append_child_batch(session_factory, request, registry, family_input, current, children):
+    plan = family_input.plan
+    async with _page_session(session_factory, request, plan.build_id) as (session, build):
+        await _prepare_statement(session)
+        progress = await session.get(
+            CustomImportBuildFamily, (plan.build_id, plan.root_record_id), with_for_update=True
+        )
+        if progress.attached_child_count != current.attached_child_count or progress.complete_at is not None:
+            return
+        await _prepare_statement(session)
+        family = await session.get(CustomImportFamilyRevision, progress.family_revision_id)
+        projections = []
+        for child in children:
+            projections.extend(await _child_page_models(session, request, registry, build, family_input, child, family))
+        _page_cost(request, projections, reserved_rows=2 * len(children) if plan.selection_kind == "source" else 0)
+        session.add_all(model for model in projections if not isinstance(model, CustomImportBuildCandidateContext))
+        await _flush_page(session)
+        session.add_all(model for model in projections if isinstance(model, CustomImportBuildCandidateContext))
+        progress_receipt = await _commit_family(session, plan.build_id, plan.root_record_id, family.family_revision_id)
+        if not children and not progress_receipt.complete:
+            raise CandidateRunnerError("family input ended before SQL completion")
+
+
+def _is_child_page_bound_error(error):
+    if getattr(error, "_custom_import_retry_blocked", False):
+        return False
+    if isinstance(error, CandidateRunnerError):
+        return str(error) in {
+            "record projection fanout exceeds the admitted row page",
+            "record projection fanout exceeds the admitted byte page",
+        }
+    original = error.orig
+    message = getattr(getattr(original, "__cause__", None), "message", None)
+    if message is None:
+        message = getattr(getattr(original, "diag", None), "message_primary", None)
+    return getattr(original, "sqlstate", None) == "P0001" and message == "custom_import_build_page_too_large"
 
 
 async def _append_children(session_factory, request, registry, family_input):
-    plan = family_input.plan
+    row_limit = _child_page_limit(request, registry, family_input.plan)
     while True:
         async with _session(session_factory) as session:
-            current, child = await session.run_sync(lambda sync: _next_child(sync, request, registry, family_input))
+            current, children = await session.run_sync(
+                lambda sync: _next_children(sync, request, registry, family_input, row_limit)
+            )
         if current.complete_at is not None:
             return
-        async with _page_session(session_factory, request, plan.build_id) as (session, build):
-            await _prepare_statement(session)
-            progress = await session.get(
-                CustomImportBuildFamily, (plan.build_id, plan.root_record_id), with_for_update=True
-            )
-            if progress.attached_child_count != current.attached_child_count or progress.complete_at is not None:
-                continue
-            await _prepare_statement(session)
-            family = await session.get(CustomImportFamilyRevision, progress.family_revision_id)
-            if child is not None:
-                await _append_child_page(session, request, registry, build, family_input, child, family)
-            progress_receipt = await _commit_family(
-                session, plan.build_id, plan.root_record_id, family.family_revision_id
-            )
-            if child is None and not progress_receipt.complete:
-                raise CandidateRunnerError("family input ended before SQL completion")
+        try:
+            await _append_child_batch(session_factory, request, registry, family_input, current, children)
+        except (CandidateRunnerError, DBAPIError) as error:
+            if len(children) < 2 or not _is_child_page_bound_error(error):
+                raise
+            # SQL charges serialized scalar rows exactly. Retry only after the
+            # whole oversized page has rolled back, retaining its original cursor.
+            row_limit = max(1, len(children) // 2)
+            continue
         await _heartbeat(session_factory, request)
 
 
