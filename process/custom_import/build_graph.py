@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from itertools import count
 
-from sqlalchemy import LargeBinary, String, func, select, tuple_
+from sqlalchemy import LargeBinary, String, func, or_, select, tuple_
+from sqlalchemy.orm import aliased
 
 from db.models.custom_import import (
     CustomImportBuildAttempt,
@@ -386,7 +387,7 @@ class _FamilyInput:
     entity_binding_id: int | None
 
 
-def _child_statement(plan, *, canonical=False, collection_slot=None):
+def _child_statement(plan, definition, *, canonical=False, collection_slot=None):
     child = CustomImportChildRevision
     occurrence = CustomImportBuildOccurrence
     if plan.selection_kind == "retained" and not canonical:
@@ -408,6 +409,32 @@ def _child_statement(plan, *, canonical=False, collection_slot=None):
             )
         )
         keys = (child.collection_slot, child.child_key_sha256, child.child_revision_id)
+        collapse_slots = tuple(
+            slot
+            for slot, stream in enumerate(definition.source_streams, 1)
+            if stream.duplicate_policy == "collapse_identical"
+        )
+        if plan.selection_kind == "source" and collapse_slots:
+            later = aliased(CustomImportBuildOccurrence)
+            statement = statement.where(
+                or_(
+                    occurrence.stream_slot.not_in(collapse_slots),
+                    ~select(later.occurrence_id)
+                    .where(
+                        later.build_id == occurrence.build_id,
+                        later.origin == "source",
+                        later.stream_slot == occurrence.stream_slot,
+                        later.root_record_id == occurrence.root_record_id,
+                        later.collection_slot == occurrence.collection_slot,
+                        later.raw_parent_key_sha256 == occurrence.raw_parent_key_sha256,
+                        later.child_key_sha256 == occurrence.child_key_sha256,
+                        later.child_revision_id.is_not(None),
+                        later.source_ordinal > occurrence.source_ordinal,
+                    )
+                    .correlate(occurrence)
+                    .exists(),
+                )
+            )
     if collection_slot is not None:
         statement = statement.where(child.collection_slot == collection_slot)
     return statement, keys
@@ -453,7 +480,7 @@ def _source_family_digest(session, request, registry, plan, root, root_record, r
 
     def _documents(collection):
         statement, keys = _child_statement(
-            plan, canonical=True, collection_slot=registry.child_collection_slots[collection]
+            plan, request.definition, canonical=True, collection_slot=registry.child_collection_slots[collection]
         )
         for (child,) in _read_rows(
             session,
@@ -723,7 +750,7 @@ def _next_child(session, request, registry, family_input):
     if current.complete_at is not None:
         return current, None
     for slot, after in _child_ranges(registry, current):
-        statement, keys = _child_statement(current, collection_slot=slot)
+        statement, keys = _child_statement(current, request.definition, collection_slot=slot)
         children = _read_rows(
             session,
             request,

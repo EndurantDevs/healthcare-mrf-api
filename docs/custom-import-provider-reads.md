@@ -33,9 +33,10 @@ canonical JSON and bind its exact bytes, target, route, authorization scope, and
 the provider-v2 signing domain. Fields and aliases must be declared by the
 pinned definition. `context` contains only non-null equality selectors for
 declared context dimensions. `filters` contains only non-null `eq`, `gt`, or
-`lt` metric predicates and cannot name a context dimension. Up to three context
-and metric terms combined, and three order terms, are accepted. Imported ordering
-requires an equality selector for every declared selection-context dimension.
+`lt` metric predicates and cannot name a context dimension. Ungrouped requests
+accept up to three context and metric terms combined, and three order terms.
+Imported ordering requires an equality selector for every declared
+selection-context dimension.
 
 - `require_match: false` retains native providers without a matching import.
   Metric `filters` are rejected in this mode; context selection remains allowed.
@@ -79,7 +80,8 @@ provider gains `custom_import`, either null for an absent order-only match or:
 Projected values distinguish `value`, `null`, and `missing`. Decimal values are
 strings. The returned fields come from the exact matching family and context;
 filter-only queries matching multiple contexts use a deterministic winner
-tie-break. Detail reads remain the route for all children of a selected family.
+tie-break. Detail reads return all children of a selected family; opted-in grouped
+full-family list and geo pages also return all children, as described below.
 
 Authorization, native count/page queries, batched field hydration, and finality
 checks run inside one bounded read snapshot. Responses are private and no-store.
@@ -87,6 +89,27 @@ A missing required match, invalid native page, unavailable pinned generation, or
 response exceeding 256 KiB fails closed; the route does not return a partial or
 unextended fallback. Requests without extension composition retain the ordinary
 provider endpoints and their existing behavior.
+
+Opted-in grouped list and geo requests with `family_entitlement: "full_family"`
+return `custom_import` as a `custom-import/entity-family-set/v1` document with
+`target`, `projection`, `selection`, `families`, and `missing_group_values`.
+`projection` is `full_family`; each selected family includes its root fields and
+complete child collections, not only the query-context child. Grouped requests
+accept four combined context and metric predicates, or five with the declared
+grouped child query. An implicit default selection value counts as one predicate.
+The limit of three order terms is unchanged.
+
+These full-family pages allow at most 50 native rows. A `limit` or `page_size`
+above 50 is rejected with HTTP 400 before storage reads, even if fewer providers
+would match. Each provider's complete
+selected family set, including both groups, retains the 1,000-child and 256 KiB limits. Child
+hydration uses batches of at most 1,000 children and checks each provider's
+projected bytes before retaining further batches. The complete page is bounded
+by `(returned row count + 1) * 256 KiB`: one allowance per row plus one for the
+native envelope. Repeated geo addresses hydrate their shared provider once but
+each serialized occurrence counts toward the page bound. Neither children nor
+rows are truncated; exact totals, native ordering, and pagination are unchanged.
+Legacy/query-projection pages and detail responses keep the 256 KiB bound.
 
 ## Geo pages
 

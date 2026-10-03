@@ -73,6 +73,25 @@ even when it is not projected for later use. The capture path still encodes
 every selected source field, so an out-of-range integer produces an unavailable
 runtime-compatibility result before family admission.
 
+An optional root `decimal_conversions` object on the retained Snowflake source
+binding explicitly admits selected, non-identity `decimal` fields from physical
+`REAL`/`FLOAT` columns. Each entry has the closed form
+`"score": "float64_round_half_even_12"`. It applies to both binding versions;
+omitting it preserves their existing canonical bytes. Empty maps, unknown modes,
+keys, non-decimal fields, and conflicting aliases of one source column are rejected.
+
+Preview and capture share one conversion: the exact returned binary64 value is
+rounded once to 12 fractional digits, ties to even, independently of the ambient
+decimal context. This is an explicit lossy conversion, not recovery of the
+original decimal precision. NULL stays NULL; nonfinite values and values outside
+`NUMERIC(30,12)` before or after rounding fail closed. Tiny finite values can round
+to zero. Existing nullability and admission rules still apply.
+
+Source metadata remains `REAL`; captured Parquet uses `decimal128(30,12)` and
+does not retain the original float bits. The option binds the source, request,
+statement, capture and replay identities, including empty streams and retained
+capture reuse. No SQL cast or generic scalar-decoder relaxation is involved.
+
 When selected-family admission fails, an unavailable result can carry at most
 one generic rejection code for each selected root key. Those bounded keys and
 codes are repr-suppressed and never logged by the core. They are selected-scope
@@ -97,8 +116,20 @@ The preview query has one deterministic root-key CTE:
 Metadata rows are separate from data limits. A configured semantic snapshot is
 read through the existing scalar subquery shape, so absent, null, or multi-row
 metadata cannot be silently accepted. All stream tokens must match. A
-single-root query-identity token remains valid only under the existing binding
-rule that permits it.
+single-root query-identity token remains valid under the existing binding rule.
+
+Bindings may explicitly set the optional root property
+`"snapshot_token_mode": "statement_query_id"` to use one statement identity
+across all declared streams. Every stream must then have a null snapshot-token
+relation and column; mixed modes are rejected. Empty streams retain metadata
+and a schema-bearing capture. Binding and request identities include the option;
+omitting it preserves the legacy contract and single-root restriction.
+
+The token is `snowflake-query:<sfqid>` from the sole data statement. Preview uses
+its own separate statement identity, not the later import's identity. This
+proves common acquisition identity, not upstream business-release completeness,
+source eligibility or authority to replace a published snapshot. Existing
+admission, complete-scope, cleanup and publication requirements remain in force.
 
 The core runs `assemble_root_families` only after all selected roots and child
 streams are complete. Rejections, candidate-wide errors, missing root data,

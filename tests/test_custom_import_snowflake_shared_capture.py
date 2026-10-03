@@ -95,9 +95,18 @@ def _configuration(*, interleaved=False):
 
 
 def _runtime(
-    monkeypatch, data_rows=(), *, interleaved=False, limits=None, partition_rows=1, processing_policy=_PROCESSING_POLICY
+    monkeypatch,
+    data_rows=(),
+    *,
+    interleaved=False,
+    limits=None,
+    partition_rows=1,
+    processing_policy=_PROCESSING_POLICY,
+    snapshot_token_mode=None,
 ):
     definition, approved, bindings = _configuration(interleaved=interleaved)
+    if snapshot_token_mode is not None:
+        bindings = tuple(replace(binding, source_snapshot_token_relation=None) for binding in bindings)
     adapter = snowflake_python.SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
     connector = SnowflakeBundleAcquisitionConnector(
         approved_relations=approved,
@@ -110,9 +119,16 @@ def _runtime(
         bindings=bindings,
         encoding=SnowflakeBundleEncoding(partition_rows=partition_rows),
         processing_policy=processing_policy,
+        snapshot_token_mode=snapshot_token_mode,
     )
     metadata_rows = tuple(
-        (0, ordinal, binding.stream_id, _SNAPSHOT, *((None,) * len(definition.fields)))
+        (
+            0,
+            ordinal,
+            binding.stream_id,
+            None if snapshot_token_mode is not None else _SNAPSHOT,
+            *((None,) * len(definition.fields)),
+        )
         for ordinal, binding in enumerate(request.bindings, start=1)
     )
     cursor = _PythonCursor((*metadata_rows, *data_rows))

@@ -250,10 +250,10 @@ def test_family_retry_traverses_completed_keys_without_a_filter_scan(monkeypatch
 
 def test_retained_copy_order_uses_membership_not_typed_hash():
     plan = CustomImportBuildFamily(build_id=7, root_record_id=8, selection_kind="retained", base_family_revision_id=6)
-    statement, keys = graph._child_statement(plan)
+    statement, keys = graph._child_statement(plan, _request().definition)
     assert [column.key for column in keys] == ["collection_slot", "child_revision_id"]
     assert "custom_import_family_child" in str(statement)
-    statement, keys = graph._child_statement(plan, canonical=True)
+    statement, keys = graph._child_statement(plan, _request().definition, canonical=True)
     assert [column.key for column in keys] == ["collection_slot", "child_key_sha256", "child_revision_id"]
     assert statement.compile().params["origin_1"] == "retained"
 

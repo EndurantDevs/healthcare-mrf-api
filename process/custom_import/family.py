@@ -133,6 +133,14 @@ def assemble_root_families(
         child_fields_by_collection,
         rejection_codes_by_root_key,
     )
+    if definition.child_memberships:
+        for root_key in root_records_by_key:
+            family_children_by_collection = {
+                collection_name: records_by_root.get(root_key, ())
+                for collection_name, records_by_root in child_records_by_root_and_collection.items()
+            }
+            if not has_child_membership(definition, family_children_by_collection):
+                rejection_codes_by_root_key[root_key].add("child_membership_missing")
     rejection_evidence_entries.extend(
         FamilyRejection(root_key, rejection_code)
         for root_key in sorted(rejection_codes_by_root_key, key=repr)
@@ -230,8 +238,11 @@ def _admit_child_records(
         collection.name: defaultdict(list) for collection in definition.child_collections
     }
     candidate_error_codes: set[str] = set()
+    duplicate_policy_by_collection = {
+        stream.child_collection: stream.duplicate_policy for stream in definition.source_streams
+    }
     for collection in definition.child_collections:
-        child_keys_by_parent: dict[tuple[Any, ...], set[tuple[Any, ...]]] = defaultdict(set)
+        child_positions_by_parent: dict[tuple[Any, ...], dict[tuple[Any, ...], int]] = defaultdict(dict)
         for child_record in children_by_collection[collection.name]:
             if not isinstance(child_record, Mapping):
                 candidate_error_codes.add("child_not_object")
@@ -259,12 +270,66 @@ def _admit_child_records(
             if canonical_child_key is None:
                 rejection_codes_by_root_key[root_key].add("field_type_invalid")
                 continue
-            if canonical_child_key in child_keys_by_parent[root_key]:
-                rejection_codes_by_root_key[root_key].add("duplicate_child_key")
+            family_children = child_records_by_root_and_collection[collection.name][root_key]
+            positions = child_positions_by_parent[root_key]
+            if canonical_child_key in positions:
+                position = positions[canonical_child_key]
+                if duplicate_policy_by_collection[collection.name] != "collapse_identical" or not _has_identical_values(
+                    child_fields_by_collection[collection.name].values(), family_children[position], child_record
+                ):
+                    rejection_codes_by_root_key[root_key].add("duplicate_child_key")
+                    continue
+                family_children[position] = _freeze_record(child_record)
                 continue
-            child_keys_by_parent[root_key].add(canonical_child_key)
-            child_records_by_root_and_collection[collection.name][root_key].append(_freeze_record(child_record))
+            positions[canonical_child_key] = len(family_children)
+            family_children.append(_freeze_record(child_record))
     return child_records_by_root_and_collection, candidate_error_codes
+
+
+def _has_identical_values(fields, left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Compare all declared typed values, preserving missing versus null."""
+
+    for field in fields:
+        name = field.field_id
+        if (name in left) != (name in right):
+            return False
+        first, second = left.get(name), right.get(name)
+        if first is None or second is None:
+            if first != second:
+                return False
+            continue
+        if field.value_type == "decimal":
+            first, second = normalize_source_decimal(first), normalize_source_decimal(second)
+        elif field.value_type == "timestamp":
+            try:
+                first, second = first.astimezone(UTC), second.astimezone(UTC)
+            except OverflowError:
+                return False
+        if first != second:
+            return False
+    return True
+
+
+def has_child_membership(
+    definition: CustomImportDefinition,
+    children_by_collection: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> bool:
+    """Require every inner child to match an outer child in one root family."""
+
+    try:
+        for membership in definition.child_memberships:
+            outer_keys = {
+                tuple(child[outer_field] for outer_field, _ in membership.key_mapping)
+                for child in children_by_collection.get(membership.outer_collection, ())
+            }
+            if any(
+                tuple(child[inner_field] for _, inner_field in membership.key_mapping) not in outer_keys
+                for child in children_by_collection.get(membership.inner_collection, ())
+            ):
+                return False
+    except KeyError, TypeError:
+        return False
+    return True
 
 
 def _assemble_accepted_families(

@@ -16,6 +16,7 @@ from process.custom_import.snowflake import (
     SnowflakeDeclaredColumn,
     SnowflakeKeyPairCredentials,
     SnowflakeRelation,
+    SnowflakeRowFilter,
 )
 from process.custom_import.snowflake_bundle import (
     SnowflakeBundleBinding,
@@ -251,6 +252,24 @@ def test_preflight_adapter_executes_generated_statement_once_with_bounded_timeou
     assert connection.close_count == 1
     with pytest.raises(SnowflakeConnectorError, match="preflight cursor is closed"):
         preflight_cursor.fetchone()
+
+
+def test_preflight_adapter_binds_the_generated_scope_for_both_root_reads(monkeypatch, credentials):
+    bundle = _bundle_statement()
+    request = replace(
+        bundle.request,
+        bindings=(replace(bundle.request.bindings[0], row_filters=(SnowflakeRowFilter("npi", "eq", "1003000126"),)),),
+    )
+    statement = SnowflakePreflightStatement(replace(bundle, request=request), SnowflakePreflightLimits())
+    cursor = _Cursor((), description=_description(statement))
+    calls = []
+    cursor.execute = lambda *arguments: calls.append(arguments)
+    connection, _arguments = _connect(monkeypatch, cursor)
+    adapter, _provider = _adapter(credentials)
+    preflight_cursor = adapter.open_preflight(statement, timeout_seconds=17)
+    assert calls == [("USE SECONDARY ROLES NONE",), (statement.sql, ("1003000126", "1003000126"))]
+    preflight_cursor.close()
+    assert cursor.close_count == connection.close_count == 1
 
 
 def test_preflight_adapter_bounds_login_timeout_to_the_requested_second(monkeypatch, credentials):

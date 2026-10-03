@@ -8,7 +8,7 @@ import re
 import warnings
 from collections import deque
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from io import BytesIO
 from typing import Any, BinaryIO
@@ -30,7 +30,11 @@ from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
 
 from process.custom_import.capture import SealedCapture, _decoded_record, capture_stream, iter_records
 from process.custom_import.capture_limits import CaptureLimits
-from process.custom_import.family import SourceSnapshotError, validate_source_snapshot_tokens
+from process.custom_import.family import (
+    SourceSnapshotError,
+    is_decimal_scalar_storage_valid,
+    validate_source_snapshot_tokens,
+)
 from process.custom_import.snowflake import (
     MAX_RESULT_BYTES,
     MAX_RESULT_PARTITION_BYTES,
@@ -58,6 +62,7 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleStreamMetadata,
     SnowflakeBundleStreamResult,
     _bundle_source_field_ids,
+    _bundle_source_key,
     _capture_limits,
     _query_identity_snapshot_token,
 )
@@ -66,6 +71,8 @@ from process.custom_import.snowflake_preflight_schema import (
     _fixed_type_parts,
     _is_integral_fixed,
     _metadata_integer,
+    convert_snowflake_float,
+    validate_decimal_conversion_sources,
     validate_preflight_result_schema,
 )
 from process.custom_import.snowflake_preflight_schema import (
@@ -80,6 +87,17 @@ _NETWORK_TIMEOUT_SECONDS = 120
 _STATEMENT_TIMEOUT_SECONDS = 120
 _MIN_INT64 = -(2**63)
 _MAX_INT64 = 2**63 - 1
+
+
+def _execute_filtered_statement(cursor, statement) -> None:
+    """Bind only parameters rebuilt from the sealed declarative statement."""
+
+    if replace(statement) != statement:
+        raise SnowflakeConnectorError("generated Snowflake statement has a stale identity seal")
+    if statement.parameters:
+        cursor.execute(statement.sql, statement.parameters)
+    else:
+        cursor.execute(statement.sql)
 
 
 @dataclass(frozen=True)
@@ -212,7 +230,7 @@ class SnowflakePythonConnectorAdapter:
         cursor = None
         try:
             connection, cursor = self._connect(credentials)
-            cursor.execute(statement.sql)
+            _execute_filtered_statement(cursor, statement)
             query_id = getattr(cursor, "sfqid", None)
             if not isinstance(query_id, str) or not query_id.strip():
                 raise SnowflakeConnectorError("Snowflake did not return a statement identity")
@@ -280,7 +298,7 @@ class SnowflakePythonConnectorAdapter:
         connection = cursor = None
         try:
             connection, cursor = self._connect(credentials, timeout_seconds=timeout_seconds)
-            cursor.execute(statement.sql)
+            _execute_filtered_statement(cursor, statement)
             query_id = getattr(cursor, "sfqid", None)
             if not isinstance(query_id, str) or not query_id.strip():
                 raise SnowflakeConnectorError("Snowflake did not return a statement identity")
@@ -385,7 +403,7 @@ class SnowflakePythonPreflightAdapter:
             if not isinstance(credentials, SnowflakeKeyPairCredentials):
                 raise SnowflakeCredentialError("credential provider returned an invalid key-pair value")
             connection, cursor = self._connector._connect(credentials, timeout_seconds=timeout_seconds)
-            cursor.execute(statement.sql)
+            _execute_filtered_statement(cursor, statement)
             _preflight_result_schema(statement, cursor.description)
             query_id = getattr(cursor, "sfqid", None)
             if query_id is not None and not isinstance(query_id, str):
@@ -582,7 +600,7 @@ def _bundle_result_schemas(
         for field, metadata in zip(fields, description[4:], strict=True)
     }
     source_fields = _bundle_source_field_ids(statement.request, statement.selected_columns_by_stream)
-    return tuple(
+    schemas = tuple(
         tuple(
             SnowflakeResultColumn(
                 field_id=column.field_id,
@@ -593,6 +611,9 @@ def _bundle_result_schemas(
         )
         for selected_columns in statement.selected_columns_by_stream
     )
+    for schema in schemas:
+        validate_decimal_conversion_sources(schema, statement.request.decimal_conversions)
+    return schemas
 
 
 def _bundle_stream_metadata(
@@ -703,7 +724,7 @@ class _SnowflakeBundlePartitionSources:
 
         streams_by_source = {}
         for index, binding in enumerate(statement.request.bindings):
-            source_key = binding.stream_id if statement.request.processing_policy is None else binding.relation
+            source_key = _bundle_source_key(statement.request, binding, statement.selected_columns_by_stream[index])
             streams_by_source.setdefault(source_key, []).append(index)
         self._streams_by_source = {indexes[0]: tuple(indexes) for indexes in streams_by_source.values()}
         self._source_field_indexes = {}
@@ -807,6 +828,10 @@ class _SnowflakeBundlePartitionSources:
             if ordinal < expected_ordinal:
                 raise SnowflakeConnectorError("Snowflake bundle result rows are not ordered by stream")
             schema = self._source_schemas[stream_index]
+            selected_values = tuple(
+                convert_snowflake_float(scalar_value) if column.source_type == "REAL" else scalar_value
+                for scalar_value, column in zip(selected_values, schema, strict=True)
+            )
             row_variable_bytes = _result_row_variable_bytes(selected_values, schema)
             has_exceeded_projection = False
             if self._landing_limits is not None:
@@ -1061,6 +1086,7 @@ def _result_schema(statement: SnowflakeReadStatement, description: object) -> tu
                 nullable=_is_nullable(metadata),
             )
         )
+    validate_decimal_conversion_sources(result_columns, None)
     return tuple(result_columns)
 
 
@@ -1204,11 +1230,15 @@ def _arrow_fixed_bytes(source_type: str, row_count: int) -> int:
 
 
 def _variable_scalar_bytes(scalar_value: object, result_column: SnowflakeResultColumn) -> int:
+    source_type = result_column.source_type
     if scalar_value is None:
         if not result_column.nullable:
             raise SnowflakeConnectorError("Snowflake non-nullable result cannot be null")
         return 0
-    source_type = result_column.source_type
+    if source_type == "REAL":
+        if not is_decimal_scalar_storage_valid(scalar_value):
+            raise SnowflakeConnectorError("Snowflake converted REAL result is invalid")
+        return 0
     if source_type == "TEXT":
         if not isinstance(scalar_value, str) or len(scalar_value) > MAX_RESULT_PARTITION_BYTES:
             raise SnowflakeConnectorError("Snowflake TEXT result value is invalid or oversized")
@@ -1238,6 +1268,8 @@ def _arrow_type(result_column: SnowflakeResultColumn) -> pa.DataType:
         return pa.string()
     if result_column.source_type == "BOOLEAN":
         return pa.bool_()
+    if result_column.source_type == "REAL":
+        return pa.decimal128(30, 12)
     precision, scale = _fixed_type_parts(result_column.source_type)
     if not _uses_decimal_storage(result_column.source_type):
         return pa.int64()
@@ -1245,6 +1277,8 @@ def _arrow_type(result_column: SnowflakeResultColumn) -> pa.DataType:
 
 
 def _uses_decimal_storage(source_type: str) -> bool:
+    if source_type == "REAL":
+        return True
     if source_type in {"TEXT", "BOOLEAN"}:
         return False
     precision, scale = _fixed_type_parts(source_type)

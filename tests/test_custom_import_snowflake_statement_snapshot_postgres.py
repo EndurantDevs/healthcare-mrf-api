@@ -1,23 +1,135 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native source reads exercise the generated one-statement bundle protocol."""
+"""Native statement-snapshot retention and source-free fenced replay."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, text, update
 
+from db.models.custom_import import CustomImportCaptureBundle, CustomImportLease
 from process.custom_import import snowflake_bundle, snowflake_python
+from process.custom_import.capture import iter_records
+from process.custom_import.capture_store import open_segmented_parquet_parts
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.snowflake import DEFAULT_CAPTURE_LIMITS, SnowflakeConnectorError, SnowflakeRelation
 from process.custom_import.snowflake_bundle_replay import prepare_bundle_replay
+from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest
+from process.custom_import.snowflake_capture import acquire_segmented_snowflake_capture
+from process.custom_import.snowflake_source_binding import register_snowflake_source_binding
 from tests import test_custom_import_runner_postgres as runner_fixture
 from tests import test_custom_import_snowflake_single_root_query_identity as identity_fixture
 from tests.custom_import_postgres_support import isolated_publication_case
+from tests.test_custom_import_segmented_runner_postgres import _binding
+from tests.test_custom_import_snowflake_capture import _policy
+from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
+from tests.test_custom_import_snowflake_source_binding import _processing_policy_migration
+
+
+async def _registered_statement(case, connector, bundle, policy):
+    async with case.engine.begin() as connection:
+        await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).upgrade())
+    binding = _binding(connector.build_statement(bundle), policy)
+    async with case.sessions() as session, session.begin():
+        registered = await register_snowflake_source_binding(
+            session, dataset_key="synthetic_statement_snapshot", definition=bundle.definition, binding=binding
+        )
+    return SnowflakeBundleCandidateRequest(
+        registered.dataset_id,
+        registered.definition_revision_id,
+        registered.schema_revision_id,
+        bundle.definition,
+        bundle,
+        "synthetic-statement-snapshot",
+        b"synthetic-source-owner",
+        source_binding_revision_id=registered.source_binding_revision_id,
+        source_binding_sha256=registered.source_binding_sha256,
+    )
+
+
+async def _capture_statement(case, connector, request, policy):
+    return await acquire_segmented_snowflake_capture(
+        case.sessions,
+        request,
+        statement_builder=connector,
+        adapter=connector._adapter,
+        credential_provider=connector._credential_provider,
+        policy=policy.capture,
+        driver_timeout_seconds=policy.driver_timeout_seconds,
+        processing_policy=policy,
+    )
+
+
+async def _replay_and_expire(case, request, captured, policy, query_id):
+    streams_by_id = {stream.stream_id: stream for stream in request.definition.source_streams}
+    counts_by_stream = dict.fromkeys(streams_by_id, 0)
+    async with case.sessions() as session, session.begin():
+        bundle = await session.get(CustomImportCaptureBundle, captured.capture_bundle_id)
+        assert bundle.snapshot_token == f"snowflake-query:{query_id}"
+        assert bundle.source_binding_sha256 == request.source_binding_sha256
+        async with open_segmented_parquet_parts(
+            session,
+            capture_bundle_id=captured.capture_bundle_id,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+        ) as parts:
+            seen_stream_ids = set()
+            async for part in parts:
+                stream_id = part.receipt.stream_id
+                seen_stream_ids.add(stream_id)
+                source_by_field = json.loads(part.receipt.canonical_manifest)["source"]
+                assert source_by_field["query_id"] == query_id
+                assert source_by_field["request_sha256"] == request.bundle_request.request_sha256
+                counts_by_stream[stream_id] += sum(
+                    1 for _ in iter_records(part.capture, streams_by_id[stream_id], limits=policy.capture.part_limits)
+                )
+            assert seen_stream_ids == set(streams_by_id)
+        await session.execute(
+            update(CustomImportLease)
+            .where(CustomImportLease.execution_id == captured.execution_id)
+            .values(expires_at=func.clock_timestamp() - dt.timedelta(seconds=1))
+        )
+    return counts_by_stream
+
+
+@pytest.mark.parametrize("has_rows", [False, True])
+@pytest.mark.parametrize("interleaved", [False, True])
+async def test_statement_capture_and_bound_replay(monkeypatch, has_rows, interleaved):
+    policy = ProcessingPolicy(_policy(), 17, BuildPolicy(2, 4096, 1000, 60, 300))
+    rows = (_shared_row(),) if has_rows else ()
+    if interleaved:
+        rows = tuple((*row, None, None, None) for row in rows)
+    connector, bundle, adapter, cursor, connection = _runtime(
+        monkeypatch, rows, interleaved=interleaved, processing_policy=policy, snapshot_token_mode="statement_query_id"
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
+    async with isolated_publication_case() as case:
+        request = await _registered_statement(case, connector, bundle, policy)
+        captured = await _capture_statement(case, connector, request, policy)
+        assert captured.status == "capture_sealed"
+        counts = await _replay_and_expire(case, request, captured, policy, cursor.sfqid)
+        assert counts["root_source"] == counts["detail_source"] == int(has_rows)
+        if interleaved:
+            assert counts["other_source"] == 0
+        forbidden = Mock(side_effect=AssertionError("retained replay must not access a source"))
+        monkeypatch.setattr(connector._credential_provider, "load_key_pair", forbidden)
+        monkeypatch.setattr(adapter, "_connect", forbidden)
+        resumed = await _capture_statement(
+            case, connector, replace(request, lease_token=b"synthetic-next-owner"), policy
+        )
+        assert resumed.status == "capture_bound" and resumed.fence == 2
+        assert resumed.capture_bundle_id == captured.capture_bundle_id
+        forbidden.assert_not_called()
+    assert cursor.executed == [connector.build_statement(bundle).sql]
+    assert cursor.closed and connection.closed
 
 
 class _NativeCursor:

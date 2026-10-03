@@ -640,6 +640,8 @@ async def _validate_bound_source_identity(session, request, prepared_statement, 
         or loaded.bundle_bindings != request.bundle_request.bindings
         or request.bundle_request.processing_policy != processing_policy
         or getattr(loaded.binding, "processing_policy", None) != processing_policy
+        or getattr(loaded.binding, "snapshot_token_mode", None) != request.bundle_request.snapshot_token_mode
+        or getattr(loaded.binding, "decimal_conversions", None) != request.bundle_request.decimal_conversions
     ):
         raise SnowflakeCandidateError("Snowflake source binding identity is invalid")
     approved_by_relation = {relation.relation.parts: relation for relation in loaded.approved_relations}

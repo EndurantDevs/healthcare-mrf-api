@@ -8,8 +8,9 @@ import json
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -18,10 +19,12 @@ from api import control_execution_evidence as evidence
 from api import control_execution_stop as stop
 from db.models.custom_import import CustomImportExecution
 from process.custom_import import execution as lifecycle
+from process.custom_import.snowflake_binding import SnowflakeSourceBinding
 from process.custom_import.snowflake_bundle import SnowflakeBundleAcquisitionConnector
 from process.custom_import.snowflake_candidate import bundle_request_identity_sha256
 from process.custom_import.snowflake_capture import segmented_bundle_request_identity_sha256
 from tests.custom_import_postgres_support import isolated_publication_case
+from tests.test_custom_import_snowflake_decimal_conversions import _binding as _decimal_binding
 from tests.test_custom_import_snowflake_operator_cli import (
     _Adapter,
     _configured_loaded_binding,
@@ -66,6 +69,65 @@ class _Session:
 def _payload(reply):
     assert reply.headers["Cache-Control"] == "no-store"
     return json.loads(reply.body)
+
+
+def _loaded_binding_with_source_options(configured, source_options):
+    loaded = _configured_loaded_binding() if configured else _loaded_binding()
+    if source_options == "legacy":
+        return loaded
+    definition, binding = _decimal_binding(opted_in=source_options != "statement", version=2 if configured else 1)
+    if source_options in {"statement", "combined"}:
+        document = json.loads(binding.canonical)
+        document["snapshot_token_mode"] = "statement_query_id"
+        for stream in document["streams"]:
+            stream["source_snapshot_token_relation"] = None
+            stream["source_snapshot_token_column_identifier"] = None
+        binding = SnowflakeSourceBinding.from_mapping(document)
+    approved_relations, bundle_bindings = binding.bundle_components(definition)
+    return replace(
+        loaded,
+        definition=definition,
+        binding=binding,
+        source_binding_sha256=bytes.fromhex(binding.digest),
+        approved_relations=approved_relations,
+        bundle_bindings=bundle_bindings,
+    )
+
+
+async def _assert_stop_phases_use_identity(monkeypatch, loaded, expected_identity):
+    """Require both stop phases to match the worker without source access."""
+
+    monkeypatch.setenv(stop._TOKEN_ENV, "synthetic-stop-token")
+    monkeypatch.setattr(stop, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    source_access = Mock(side_effect=stop._no_source_access)
+    monkeypatch.setattr(stop, "_no_source_access", source_access)
+
+    async def exact_transition(_session, **pins):
+        if pins["request_identity_sha256"] != expected_identity:
+            raise lifecycle.IdempotencyConflict("retained request identity differs")
+        return SimpleNamespace(execution_id=40, state="canceled")
+
+    requested = AsyncMock(side_effect=exact_transition)
+    finalized = AsyncMock(side_effect=exact_transition)
+    monkeypatch.setattr(stop, "request_bound_execution_cancellation", requested)
+    monkeypatch.setattr(stop, "finalize_stopped_execution_request", finalized)
+    for finalize, transition in ((False, requested), (True, finalized)):
+        reply = await stop.serve_execution_stop(
+            _request(
+                document={
+                    "dataset_id": loaded.dataset_id,
+                    "definition_revision_id": loaded.definition_revision_id,
+                    "source_binding_revision_id": loaded.source_binding_revision_id,
+                    "idempotency_key": "synthetic-resume",
+                }
+            ),
+            _Session(),
+            finalize=finalize,
+        )
+        assert reply.status == 200 and _payload(reply) == {"execution_id": 40, "state": "canceled"}
+        transition.assert_awaited_once()
+        assert transition.await_args.kwargs["request_identity_sha256"] == expected_identity
+    source_access.assert_not_called()
 
 
 def test_stop_route_import_does_not_load_the_source_runtime():
@@ -168,9 +230,12 @@ async def test_stop_reconstructs_the_worker_request_digest_without_source_access
 
 
 @pytest.mark.parametrize("configured", (False, True))
-async def test_execute_resume_and_stop_share_the_exact_retained_policy_identity(monkeypatch, configured):
+@pytest.mark.parametrize("source_options", ("legacy", "decimal", "statement", "combined"))
+async def test_execute_resume_and_stop_share_the_exact_retained_source_identity(
+    monkeypatch, configured, source_options
+):
     """Keep retained v1/v2 identity coherent across dispatch, replay, and stop."""
-    loaded = _configured_loaded_binding() if configured else _loaded_binding()
+    loaded = _loaded_binding_with_source_options(configured, source_options)
     database = _resume_database(loaded)
     _install_resume_preflight(monkeypatch, database, loaded)
     monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", _CredentialProvider)
@@ -195,6 +260,8 @@ async def test_execute_resume_and_stop_share_the_exact_retained_policy_identity(
     (statement, candidate), (resume_statement, resumed) = calls
     assert candidate.bundle_request == resumed.bundle_request and statement == resume_statement
     assert candidate.bundle_request.processing_policy == loaded.binding.processing_policy
+    assert candidate.bundle_request.snapshot_token_mode == loaded.binding.snapshot_token_mode
+    assert candidate.bundle_request.decimal_conversions == loaded.binding.decimal_conversions
     assert candidate.source_binding_sha256 == resumed.source_binding_sha256 == loaded.source_binding_sha256
     legacy = bundle_request_identity_sha256(
         candidate.bundle_request, statement, source_binding_sha256=loaded.source_binding_sha256
@@ -208,25 +275,7 @@ async def test_execute_resume_and_stop_share_the_exact_retained_policy_identity(
             source_binding_sha256=loaded.source_binding_sha256,
         )
     assert (expected != legacy) is configured
-    monkeypatch.setenv(stop._TOKEN_ENV, "synthetic-stop-token")
-    monkeypatch.setattr(stop, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
-    transition = AsyncMock(return_value=SimpleNamespace(execution_id=40, state="canceled"))
-    monkeypatch.setattr(stop, "request_bound_execution_cancellation", transition)
-    reply = await stop.serve_execution_stop(
-        _request(
-            document={
-                "dataset_id": loaded.dataset_id,
-                "definition_revision_id": loaded.definition_revision_id,
-                "source_binding_revision_id": loaded.source_binding_revision_id,
-                "idempotency_key": "synthetic-resume",
-            }
-        ),
-        _Session(),
-        finalize=False,
-    )
-    assert reply.status == 200 and _payload(reply) == {"execution_id": 40, "state": "canceled"}
-    transition.assert_awaited_once()
-    assert transition.await_args.kwargs["request_identity_sha256"] == expected
+    await _assert_stop_phases_use_identity(monkeypatch, loaded, expected)
     assert database.resume_lookup_arguments["request_identity_sha256"] == expected
 
 
