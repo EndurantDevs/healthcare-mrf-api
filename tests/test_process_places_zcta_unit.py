@@ -2,7 +2,6 @@
 
 import datetime
 import importlib
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -38,6 +37,15 @@ def test_normalize_zcta(value, expected, places_module):
 def test_worker_aliases_preserve_registered_function_names(places_module):
     assert places_module.process_data.__name__ == "process_data"
     assert places_module.shutdown.__name__ == "shutdown"
+
+
+def test_stage_index_names_fit_maximum_supported_import_id(places_module):
+    stage = "pricing_places_zcta_" + "a" * 32
+    names = [places_module._places_stage_index_name(stage, position) for position in range(3)]
+    assert len(set(names)) == 3
+    assert all(len(name.encode()) <= 63 for name in names)
+    with pytest.raises(RuntimeError, match="identifier limit"):
+        places_module._places_stage_index_name(stage + "abcdefgh", 0)
 
 
 def test_build_places_record_filters_latest_year(places_module):
@@ -85,8 +93,14 @@ async def test_process_data_dedupes_rows_latest_year(monkeypatch, places_module,
 
     monkeypatch.setattr(places_module, "download_it_and_save", _fake_download)
     monkeypatch.setattr(places_module, "ensure_database", AsyncMock())
-    monkeypatch.setattr(places_module, "make_class", lambda _cls, suffix: SimpleNamespace(__tablename__=f"pricing_places_zcta_{suffix}"))
+    monkeypatch.setattr(
+        places_module, "make_class", lambda _cls, suffix: SimpleNamespace(__tablename__=f"pricing_places_zcta_{suffix}")
+    )
     monkeypatch.setattr(places_module, "push_objects", _fake_push)
+    monkeypatch.setattr(places_module, "_create_places_stage", AsyncMock())
+    monkeypatch.setattr(places_module.db, "scalar", AsyncMock(return_value=15))
+    publish = AsyncMock()
+    monkeypatch.setattr(places_module, "publish_places_zcta_generation", publish)
 
     job_context_by_field = {"import_date": "20260319", "context": {}}
     await places_module.process_data(job_context_by_field, {"test_mode": False})
@@ -99,6 +113,7 @@ async def test_process_data_dedupes_rows_latest_year(monkeypatch, places_module,
     assert by_measure["CSMOKING"]["data_value"] == 11.0
     assert by_measure["BPHIGH"]["data_value"] == 20.0
     assert job_context_by_field["context"]["audit"]["latest_year"] == 2025
+    publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -122,19 +137,24 @@ async def test_process_data_honors_test_row_limit(monkeypatch, places_module, tm
 
     monkeypatch.setattr(places_module, "download_it_and_save", _fake_download)
     monkeypatch.setattr(places_module, "ensure_database", AsyncMock())
-    monkeypatch.setattr(places_module, "make_class", lambda _cls, _suffix: SimpleNamespace(__tablename__="pricing_places_zcta_test"))
+    monkeypatch.setattr(
+        places_module, "make_class", lambda _cls, _suffix: SimpleNamespace(__tablename__="pricing_places_zcta_test")
+    )
     monkeypatch.setattr(places_module, "push_objects", _fake_push)
+    monkeypatch.setattr(places_module, "_create_places_stage", AsyncMock())
+    monkeypatch.setattr(places_module.db, "scalar", AsyncMock(return_value=15))
+    monkeypatch.setattr(places_module, "publish_places_zcta_generation", AsyncMock())
     monkeypatch.setenv("HLTHPRT_PLACES_ZCTA_TEST_ROWS", "2")
 
     job_context_by_field = {"import_date": "20260319", "context": {}}
     await places_module.process_data(job_context_by_field, {"test_mode": True})
 
     assert len(pushed_rows) == 2
-    assert {row["measure_id"] for row in pushed_rows} == {"M1", "M2"}
+    assert {measure_row["measure_id"] for measure_row in pushed_rows} == {"M1", "M2"}
 
 
 @pytest.mark.asyncio
-async def test_startup_creates_stage_table(monkeypatch, places_module):
+async def test_stage_creation_never_drops_or_reuses_existing_stage(monkeypatch, places_module):
     create_calls = []
     status_calls = []
 
@@ -160,14 +180,26 @@ async def test_startup_creates_stage_table(monkeypatch, places_module):
         "status",
         AsyncMock(side_effect=lambda stmt: status_calls.append(stmt)),
     )
-    monkeypatch.setenv("HLTHPRT_IMPORT_ID_OVERRIDE", "2026-03-19")
-
-    startup_context_by_field = {}
-    await places_module.startup(startup_context_by_field)
-
-    assert startup_context_by_field["import_date"] == "20260319"
+    stage = places_module.make_class(places_module.PricingPlacesZcta, "20260319")
+    await places_module._create_places_stage(stage)
     assert create_calls == ["pricing_places_zcta_20260319"]
+    places_module.db.create_table.assert_awaited_once_with(stage.__table__, checkfirst=False)
+    assert not any("DROP" in stmt for stmt in status_calls)
     assert any("CREATE UNIQUE INDEX" in stmt for stmt in status_calls)
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_touch_stage_tables(monkeypatch, places_module):
+    monkeypatch.setenv("HLTHPRT_PLACES_ZCTA_PROTECTED_PUBLICATION", "true")
+    monkeypatch.setattr(places_module, "my_init_db", AsyncMock())
+    monkeypatch.setattr(places_module, "ensure_database", AsyncMock())
+    stage = AsyncMock()
+    monkeypatch.setattr(places_module, "_create_places_stage", stage)
+    worker_context_by_field = {}
+    await places_module.startup(worker_context_by_field)
+    stage.assert_not_awaited()
+    assert worker_context_by_field["context"]["run"] == 0
+    assert "import_date" not in worker_context_by_field
 
 
 @pytest.mark.asyncio
