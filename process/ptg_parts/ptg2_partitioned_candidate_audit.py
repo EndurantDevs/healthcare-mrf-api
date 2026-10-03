@@ -7,6 +7,7 @@ import asyncio
 import datetime
 import json
 import time
+from functools import partial
 from typing import Any, Mapping, Sequence
 
 import aiohttp
@@ -329,6 +330,7 @@ async def _execute_partition_plan(
             timeout=timeout,
             connector=connector,
             trust_env=False,
+            json_serialize=partial(json.dumps, separators=(",", ":"), ensure_ascii=False, allow_nan=False),
         ) as client:
             tasks = _create_partition_tasks(
                 client=client,

@@ -64,6 +64,38 @@ _ALLOWLISTED_REJECTION_DETAIL_BY_MESSAGE = {
     "PTG2 candidate persisted audit provider is missing from its NPI graph": (
         "persisted_provider_graph_membership_missing"
     ),
+    "partitioned_audit_request_fields_invalid": (
+        "partitioned_audit_request_fields_invalid"
+    ),
+    "partitioned_audit_request_contract_invalid": (
+        "partitioned_audit_request_contract_invalid"
+    ),
+    "partitioned_audit_request_items_invalid": (
+        "partitioned_audit_request_items_invalid"
+    ),
+    "partitioned_audit_request_item_count_invalid": (
+        "partitioned_audit_request_item_count_invalid"
+    ),
+    "partitioned_audit_request_binding_invalid": (
+        "partitioned_audit_request_binding_invalid"
+    ),
+    "partitioned_audit_request_duplicate_ordinal": (
+        "partitioned_audit_request_duplicate_ordinal"
+    ),
+    "partitioned_audit_source_fields_invalid": (
+        "partitioned_audit_source_fields_invalid"
+    ),
+    "partitioned_audit_persisted_fields_invalid": (
+        "partitioned_audit_persisted_fields_invalid"
+    ),
+    "partitioned_audit_network_digests_invalid": (
+        "partitioned_audit_network_digests_invalid"
+    ),
+    "partitioned_audit_occurrence_id_invalid": (
+        "partitioned_audit_occurrence_id_invalid"
+    ),
+    "partitioned_audit_npi_invalid": "partitioned_audit_npi_invalid",
+    "partitioned_audit_request_too_large": "partitioned_audit_request_too_large",
 }
 
 

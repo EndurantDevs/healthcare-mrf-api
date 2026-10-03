@@ -160,9 +160,9 @@ from db.procedure_taxonomy_signal_sql import (
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
-    build_partitioned_candidate_audit_result,
-    parse_partitioned_candidate_audit_request,
+    build_partitioned_candidate_audit_result, parse_partitioned_candidate_audit_request,
 )
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
@@ -12256,7 +12256,7 @@ async def audit_ptg2_source_witness_batch(request):
     """Verify one legacy witness or one explicit bounded partition."""
 
     request_body_bytes = len(request.body or b"")
-    if request_body_bytes > 2 * 1024 * 1024:
+    if request_body_bytes > PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES:
         raise InvalidUsage("candidate audit batch request is too large")
     _require_candidate_audit_batch_auth(request)
     raw_request = request.json

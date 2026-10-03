@@ -159,6 +159,19 @@ def _grant_existing_protected_owners(schema):
         op.execute(f'GRANT EXECUTE ON FUNCTION "{schema}"."{_FUNCTION}"() TO {preparer.quote(owner)}')
 
 
+def _flush_cms_transition(schema):
+    # Even an unrelated MRF update queues the deferred Doctors trigger on this ledger.
+    # Validate that queue before further DDL, then retain the normal deferred boundary.
+    op.execute(f'''DO $cms_transition$ BEGIN
+        IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint
+            WHERE conrelid='"{schema}"."{_TABLE}"'::regclass
+              AND conname='cms_serving_doctors_transition' AND contype='t' AND condeferrable) THEN
+            SET CONSTRAINTS "{schema}".cms_serving_doctors_transition IMMEDIATE;
+            SET CONSTRAINTS "{schema}".cms_serving_doctors_transition DEFERRED;
+        END IF;
+    END; $cms_transition$''')
+
+
 def upgrade():
     """Preserve prior records; only explicit new boundaries become trusted."""
     schema = _schema()
@@ -171,6 +184,7 @@ def upgrade():
         f"UPDATE {authority} SET relation_oids=relation_oids[1:8] || relation_oids[10:13] "
         "WHERE importer_id='mrf' AND relation_oids IS NOT NULL"
     )
+    _flush_cms_transition(schema)
     op.create_check_constraint(_SHAPE, _TABLE, _shape_check(12), schema=schema)
     op.add_column(
         _TABLE,
