@@ -21,16 +21,22 @@ from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.snowflake import (
     MAX_APPROVED_RELATIONS,
     MAX_SELECTED_COLUMNS,
+    MAX_SOURCE_ROW_FILTERS,
     SnowflakeApprovedRelation,
     SnowflakeConnectorError,
     SnowflakeDeclaredColumn,
     SnowflakeRelation,
+    SnowflakeRowFilter,
+    _normalized_row_filters,
+    _row_filters_document,
 )
 from process.custom_import.snowflake_bundle import (
     SnowflakeBundleBinding,
     SnowflakeBundleError,
     SnowflakeBundleRequest,
+    _snapshot_token_mode,
 )
+from process.custom_import.snowflake_preflight_schema import normalize_decimal_conversions
 
 __all__ = (
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
@@ -153,6 +159,7 @@ class _StreamBinding:
     relation: SnowflakeRelation
     snapshot: _SnapshotBinding
     columns: tuple[SnowflakeDeclaredColumn, ...]
+    row_filters: tuple[SnowflakeRowFilter, ...] = ()
 
     def __post_init__(self) -> None:
         stream_id = _field_id(self.stream_id)
@@ -173,9 +180,16 @@ class _StreamBinding:
         if len(field_ids) != len(set(field_ids)) or len(column_identifiers) != len(set(column_identifiers)):
             raise SnowflakeSourceBindingError("source binding stream columns are not unique")
         object.__setattr__(self, "stream_id", stream_id)
+        try:
+            object.__setattr__(self, "row_filters", _normalized_row_filters(self.row_filters))
+        except SnowflakeConnectorError as exc:
+            raise SnowflakeSourceBindingError("source binding filters are invalid") from exc
 
 
 def _stream_binding(stream_mapping: object) -> _StreamBinding:
+    optional_keys = (
+        {"row_filters"} if isinstance(stream_mapping, Mapping) and "row_filters" in stream_mapping else set()
+    )
     stream_document = _exact_mapping(
         stream_mapping,
         frozenset(
@@ -187,7 +201,8 @@ def _stream_binding(stream_mapping: object) -> _StreamBinding:
                 "source_snapshot_token_relation",
                 "stream_id",
             }
-        ),
+        )
+        | optional_keys,
     )
     raw_columns = stream_document["columns"]
     if not isinstance(raw_columns, list):
@@ -205,7 +220,23 @@ def _stream_binding(stream_mapping: object) -> _StreamBinding:
             column_identifier=stream_document["source_snapshot_token_column_identifier"],
         ),
         columns=tuple(_declared_column(column) for column in raw_columns),
+        row_filters=_source_row_filters(stream_document),
     )
+
+
+def _source_row_filters(document: Mapping[str, Any]) -> tuple[SnowflakeRowFilter, ...]:
+    if "row_filters" not in document:
+        return ()
+    values = document["row_filters"]
+    if not isinstance(values, list) or not 1 <= len(values) <= MAX_SOURCE_ROW_FILTERS:
+        raise SnowflakeSourceBindingError("source binding filters must be a nonempty array")
+    predicates = tuple(_exact_mapping(value, frozenset({"field_id", "operator", "value"})) for value in values)
+    if any(predicate["operator"] == "in" and type(predicate["value"]) is not list for predicate in predicates):
+        raise SnowflakeSourceBindingError("source binding membership requires an array")
+    try:
+        return _normalized_row_filters(tuple(SnowflakeRowFilter(**predicate) for predicate in predicates))
+    except SnowflakeConnectorError as exc:
+        raise SnowflakeSourceBindingError("source binding filters are invalid") from exc
 
 
 def _processing_policy(document: Mapping[str, Any]) -> ProcessingPolicy | None:
@@ -239,6 +270,8 @@ class SnowflakeSourceBinding:
     warehouse: str
     streams: tuple[_StreamBinding, ...]
     processing_policy: ProcessingPolicy | None = None
+    snapshot_token_mode: str | None = None
+    decimal_conversions: Mapping[str, str] | None = None
     canonical: str = field(init=False)
     digest: str = field(init=False)
 
@@ -263,6 +296,24 @@ class SnowflakeSourceBinding:
         object.__setattr__(self, "role", role)
         object.__setattr__(self, "warehouse", warehouse)
         object.__setattr__(self, "processing_policy", _validated_processing_policy(self.processing_policy))
+        try:
+            conversions = normalize_decimal_conversions(self.decimal_conversions)
+        except SnowflakeConnectorError as exc:
+            raise SnowflakeSourceBindingError("source binding decimal conversions are invalid") from exc
+        selected_field_ids = {column.field_id for stream in self.streams for column in stream.columns}
+        if conversions is not None and not set(conversions) <= selected_field_ids:
+            raise SnowflakeSourceBindingError("source binding decimal conversions require selected fields")
+        object.__setattr__(self, "decimal_conversions", conversions)
+        try:
+            _snapshot_token_mode(self.snapshot_token_mode)
+        except SnowflakeBundleError as exc:
+            raise SnowflakeSourceBindingError("source binding snapshot token mode is invalid") from exc
+        if self.snapshot_token_mode is not None and any(
+            stream.snapshot.relation is not None for stream in self.streams
+        ):
+            raise SnowflakeSourceBindingError(
+                "statement query identity requires all snapshot token relations to be null"
+            )
         canonical = canonical_json(self._document())
         object.__setattr__(self, "canonical", canonical)
         object.__setattr__(
@@ -294,6 +345,14 @@ class SnowflakeSourceBinding:
             raise SnowflakeSourceBindingError("source binding object shape is invalid")
         contract = mapping.get("contract")
         keys = _BINDING_KEYS | {"processing_policy"} if contract == SOURCE_BINDING_V2_CONTRACT else _BINDING_KEYS
+        if "decimal_conversions" in mapping:
+            keys = keys | {"decimal_conversions"}
+            if mapping["decimal_conversions"] is None:
+                raise SnowflakeSourceBindingError("source binding decimal conversions must not be null")
+        if "snapshot_token_mode" in mapping:
+            keys = keys | {"snapshot_token_mode"}
+            if mapping["snapshot_token_mode"] is None:
+                raise SnowflakeSourceBindingError("source binding snapshot token mode must not be null")
         document = _exact_mapping(mapping, keys)
         if (
             not isinstance(contract, str)
@@ -316,6 +375,8 @@ class SnowflakeSourceBinding:
             warehouse=_identifier(document["warehouse"]),
             streams=tuple(_stream_binding(raw_stream) for raw_stream in raw_streams),
             processing_policy=_processing_policy(document),
+            snapshot_token_mode=document.get("snapshot_token_mode"),
+            decimal_conversions=document.get("decimal_conversions"),
         )
 
     def _document(self) -> dict[str, object]:
@@ -342,6 +403,7 @@ class SnowflakeSourceBinding:
                         None if stream.snapshot.relation is None else list(stream.snapshot.relation.parts)
                     ),
                     "stream_id": stream.stream_id,
+                    **_row_filters_document(stream.row_filters),
                 }
                 for stream in self.streams
             ],
@@ -349,6 +411,10 @@ class SnowflakeSourceBinding:
         }
         if self.processing_policy is not None:
             document_by_field["processing_policy"] = self.processing_policy.to_mapping()
+        if self.snapshot_token_mode is not None:
+            document_by_field["snapshot_token_mode"] = self.snapshot_token_mode
+        if self.decimal_conversions is not None:
+            document_by_field["decimal_conversions"] = dict(self.decimal_conversions)
         return document_by_field
 
     def bundle_components(
@@ -372,7 +438,11 @@ class SnowflakeSourceBinding:
         )
         try:
             SnowflakeBundleRequest(
-                definition=definition, bindings=bundle_bindings, processing_policy=self.processing_policy
+                definition=definition,
+                bindings=bundle_bindings,
+                processing_policy=self.processing_policy,
+                snapshot_token_mode=self.snapshot_token_mode,
+                decimal_conversions=self.decimal_conversions,
             )
             approved_relations = tuple(
                 SnowflakeApprovedRelation(
@@ -393,7 +463,7 @@ class SnowflakeSourceBinding:
         binding_by_stream = {stream.stream_id: stream for stream in self.streams}
         if set(binding_by_stream) != {stream.stream_id for stream in definition.source_streams}:
             raise SnowflakeSourceBindingError("source binding stream coverage does not match the definition")
-        supports_query_identity_snapshot = (
+        supports_query_identity_snapshot = self.snapshot_token_mode is not None or (
             len(definition.source_streams) == 1 and definition.source_streams[0].record_kind == "root"
         )
         for source_stream in definition.source_streams:
@@ -452,6 +522,7 @@ class SnowflakeSourceBinding:
             source_snapshot_token_relation=stream_binding.snapshot.relation,
             selected_field_ids=tuple(field.field_id for field in expected_fields),
             semantic_token_metadata_key=stream_binding.snapshot.selector,
+            row_filters=stream_binding.row_filters,
         )
 
 

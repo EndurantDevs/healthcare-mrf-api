@@ -28,7 +28,7 @@ from db.models.custom_import import (
 )
 from process.custom_import.definition import Field, canonical_json
 from process.custom_import.execution import LeaseGrant, lease_token_sha256
-from process.custom_import.family import FamilyBuildResult, FamilyRejection, RootFamily
+from process.custom_import.family import FamilyBuildResult, FamilyRejection, RootFamily, has_child_membership
 from process.custom_import.materialization import (
     ChildScalarTarget,
     GenerationIdentity,
@@ -36,6 +36,7 @@ from process.custom_import.materialization import (
     ValidatedWinnerCandidateStream,
     WinnerCandidate,
     WinnerMaterialization,
+    _profile_scopes,
     materialize_winners,
     persist_scalar_projections,
     persist_winner_materialization,
@@ -221,7 +222,16 @@ async def select_candidate_families(
                 if root_hash in rejected_root_hashes
             }
         )
-    return tuple(family for _, family in sorted(selected_by_root_hash.items(), key=lambda pair: pair[0]))
+    selected_families = tuple(family for _, family in sorted(selected_by_root_hash.items(), key=lambda pair: pair[0]))
+    if request.definition.child_memberships:
+        for family in selected_families:
+            if isinstance(family, StoredCandidateFamily):
+                children_by_collection = defaultdict(list)
+                for child in family.children:
+                    children_by_collection[child.collection].append(child.values_by_field)
+                if not has_child_membership(request.definition, children_by_collection):
+                    raise CandidateRunnerError("retained family violates child membership")
+    return selected_families
 
 
 async def load_previous_families(
@@ -1226,9 +1236,12 @@ def winner_candidates(
     root_query_fields = request.definition.query.root_fields
     child_collection = request.definition.query.child_collection
     child_query_fields = request.definition.query.child_fields
+    uses_child_context = any(
+        scope.collection_slot != 0 for scope in _profile_scopes(request.definition, registry.child_collection_slots)
+    )
     for family in published_families:
         candidates.append(root_winner_candidate(family, root_query_fields))
-        if child_collection is not None:
+        if child_collection is not None and uses_child_context:
             candidates.extend(
                 child_winner_candidates(
                     family,

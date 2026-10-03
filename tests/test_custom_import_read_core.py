@@ -1144,7 +1144,10 @@ async def test_read_service_rejects_unavailable_cursor_and_invalid_public_shapes
 
     monkeypatch.setattr(read_core, "verify_published_generation", verified)
     assert await cached_service._root_detail_from_context(
-        object(), SimpleNamespace(target=_target()), winner, scope
+        object(),
+        SimpleNamespace(target=_target(), definition=SimpleNamespace(query=SimpleNamespace(entity_selection=None))),
+        winner,
+        scope,
     ) == (cached, None)
 
 
@@ -1244,7 +1247,7 @@ async def test_root_detail_caches_only_after_a_verified_non_cached_hydration(mon
     service = CustomImportReadService(authorizer=_AllowingAuthorizer(), cache=cache)
 
     async def load_context(_session, target):
-        return SimpleNamespace(target=target)
+        return SimpleNamespace(target=target, definition=SimpleNamespace(query=SimpleNamespace(entity_selection=None)))
 
     async def locate_winner(_session, _context, _entity):
         return winner

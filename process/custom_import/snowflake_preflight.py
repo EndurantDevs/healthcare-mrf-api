@@ -39,10 +39,14 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleRequest,
     SnowflakeBundleStatement,
     SnowflakeBundleStatementBuilder,
+    _filtered_relation_sql,
     _query_identity_snapshot_token,
+    _row_filter_parameters,
+    _row_filter_sql,
     _snapshot_token_expression,
     _validated_bundle_statement,
 )
+from process.custom_import.snowflake_preflight_schema import convert_snowflake_float
 
 DEFAULT_MAX_ROOT_KEYS = 32
 DEFAULT_MAX_CHILD_ROWS = 256
@@ -212,6 +216,7 @@ class SnowflakePreflightStatement:
     bundle_statement: SnowflakeBundleStatement = field(repr=False)
     limits: SnowflakePreflightLimits = field(repr=False)
     sql: str = field(init=False)
+    parameters: tuple[str, ...] = field(init=False, repr=False)
     column_ids: tuple[str, ...] = field(init=False)
     definition: CustomImportDefinition = field(init=False, repr=False)
     bundle_bindings: tuple[SnowflakeBundleBinding, ...] = field(init=False, repr=False)
@@ -244,7 +249,7 @@ class SnowflakePreflightStatement:
             root_binding = binding_by_stream[root_stream.stream_id]
             ctes = _root_key_ctes(
                 definition,
-                root_binding.relation.quoted_sql,
+                _filtered_relation_sql(root_binding, tuple(columns_by_stream[root_stream.stream_id].values())),
                 columns_by_stream[root_stream.stream_id],
                 limits,
             )
@@ -271,6 +276,21 @@ class SnowflakePreflightStatement:
         object.__setattr__(self, "bundle_bindings", bundle_statement.request.bindings)
         object.__setattr__(self, "column_ids", columns)
         object.__setattr__(self, "sql", sql)
+        object.__setattr__(
+            self,
+            "parameters",
+            _preflight_parameters((root_binding, *bundle_statement.request.bindings), columns_by_stream),
+        )
+
+
+def _preflight_parameters(bindings, columns_by_stream) -> tuple[str, ...]:
+    """Root predicates occur once for keys and again in the root data branch."""
+
+    return tuple(
+        value
+        for binding in bindings
+        for value in _row_filter_parameters(binding, tuple(columns_by_stream[binding.stream_id].values()))
+    )
 
 
 @dataclass(frozen=True)
@@ -348,7 +368,11 @@ def _prepare_preflight(
         if not isinstance(builder, SnowflakeBundleStatementBuilder):
             raise TypeError
         request = builder.prepare_request(
-            definition, bindings=bundle_bindings, processing_policy=binding.processing_policy
+            definition,
+            bindings=bundle_bindings,
+            processing_policy=binding.processing_policy,
+            snapshot_token_mode=binding.snapshot_token_mode,
+            decimal_conversions=binding.decimal_conversions,
         )
         if not isinstance(request, SnowflakeBundleRequest):
             raise TypeError
@@ -358,6 +382,8 @@ def _prepare_preflight(
             encoding=request.encoding,
             capture_limits=request.capture_limits,
             processing_policy=binding.processing_policy,
+            snapshot_token_mode=binding.snapshot_token_mode,
+            decimal_conversions=binding.decimal_conversions,
         )
         bundle_statement = builder.build_statement(request)
         if not isinstance(bundle_statement, SnowflakeBundleStatement):
@@ -642,6 +668,8 @@ def _data_branch(
         field_values={field.field_id: expression_by_field.get(field.field_id, "NULL") for field in fields},
         fields=fields,
     )
+    predicate = _row_filter_sql(binding, tuple(columns_by_field.values()), alias=alias)
+    scope = f"{predicate} AND " if predicate else ""
     if source_stream.record_kind == "root":
         root_columns = columns_by_field
         conditions = " AND ".join(
@@ -650,7 +678,7 @@ def _data_branch(
             for field_id in definition.root_logical_key
         )
         return (
-            f"{branch} FROM {binding.relation.quoted_sql} AS {alias} WHERE EXISTS "
+            f"{branch} FROM {binding.relation.quoted_sql} AS {alias} WHERE {scope}EXISTS "
             f"(SELECT 1 FROM {_quoted('__ci_preflight_selected_keys')} WHERE {conditions})"
         )
     collection = definition.collections_by_name[source_stream.child_collection]
@@ -668,7 +696,7 @@ def _data_branch(
         f"{alias}.{_quoted(columns_by_field[field_id].column_identifier)} ASC NULLS FIRST" for field_id in order_fields
     )
     return (
-        f"SELECT * FROM ({branch} FROM {binding.relation.quoted_sql} AS {alias} WHERE EXISTS "
+        f"SELECT * FROM ({branch} FROM {binding.relation.quoted_sql} AS {alias} WHERE {scope}EXISTS "
         f"(SELECT 1 FROM {_quoted('__ci_preflight_selected_keys')} WHERE {conditions}) "
         f"ORDER BY {order} LIMIT {child_limit + 1}) AS {_quoted(f'__ci_preflight_child_{ordinal}')}"
     )
@@ -774,6 +802,14 @@ def _read_rows(
         sentinel_reason = _byte_limit_sentinel_reason(result_values)
         if sentinel_reason is not None:
             return state, sentinel_reason
+        conversions = prepared.statement.bundle_statement.request.decimal_conversions or {}
+        try:
+            result_values = tuple(
+                convert_snowflake_float(scalar_value) if column_id in conversions else scalar_value
+                for column_id, scalar_value in zip(prepared.statement.column_ids, result_values, strict=True)
+            )
+        except SnowflakeConnectorError:
+            return state, "result_invalid"
         result_bytes = _row_bytes(result_values)
         if result_bytes is None:
             return state, "result_invalid"

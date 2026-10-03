@@ -99,6 +99,41 @@ retrying. Run acquisition in a supervised worker process: driver timeouts and
 cooperative cancellation alone cannot guarantee hard termination of a blocked
 driver. No policy declaration grants database or source authorization.
 
+## Related child collections
+
+A definition may include up to eight `child_memberships` constraints when two
+declared child collections must refer to the same logical item within a root:
+
+```json
+{
+  "child_memberships": [
+    {
+      "outer_collection": "items",
+      "inner_collection": "observations",
+      "key_mapping": [
+        {"outer_field": "item_id", "inner_field": "observation_item_id"}
+      ]
+    }
+  ]
+}
+```
+
+Each mapping must cover the outer collection's complete child key, in order,
+using distinct required fields of the inner child key. Corresponding fields
+must share the supported `string` or `integer` type. Both collections still
+belong directly to the same root; this does not enable cross-child query joins.
+
+Admission checks all constraints after duplicate handling, across capture parts.
+A missing referenced child rejects the whole source root family with
+`child_membership_missing` evidence. An upsert may retain a compatible prior
+family, but every family retained in the new candidate must also satisfy the
+new constraints. Incompatible retained data fails the candidate without changing
+the active generation; it is not silently removed.
+
+Changing these constraints requires a new definition revision and import.
+It does not by itself change the schema revision. Omitting `child_memberships`
+preserves existing definition behavior and canonical identity.
+
 ## Explicit publication and rollback
 
 Activate an initial generation only while the current pointer is absent:

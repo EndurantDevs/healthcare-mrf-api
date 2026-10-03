@@ -226,6 +226,15 @@ class ChildCollection:
 
 
 @dataclass(frozen=True)
+class ChildMembership:
+    """One required sibling-child relationship within the same root family."""
+
+    outer_collection: str
+    inner_collection: str
+    key_mapping: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class SourceStream:
     """Declarative input format shape, without a connector or secrets."""
 
@@ -236,6 +245,7 @@ class SourceStream:
     compression: str
     record_path: str | None
     snapshot_token: str
+    duplicate_policy: str = "reject"
 
 
 @dataclass(frozen=True)
@@ -265,6 +275,29 @@ class SortTerm:
 
 
 @dataclass(frozen=True)
+class EntitySelection:
+    """Closed root-only grouping over one required integer selection field."""
+
+    field_id: str
+    group_field_id: str
+    group_values: tuple[str, ...]
+    by_value_profile: str
+    default_profile: str
+
+    def document(self) -> dict[str, object]:
+        """Return the exact optional definition and authenticated request object."""
+
+        return {
+            "contract": "custom-import/grouped-entity-selection/v1",
+            "field": self.field_id,
+            "default": "max_per_entity",
+            "family_dimension": {"field": self.group_field_id, "values": list(self.group_values)},
+            "by_value_profile": self.by_value_profile,
+            "default_profile": self.default_profile,
+        }
+
+
+@dataclass(frozen=True)
 class QueryContract:
     """Permitted fields and ordering for one root plus optional child context."""
 
@@ -274,6 +307,7 @@ class QueryContract:
     order_terms: tuple[SortTerm, ...]
     aliases: tuple[QueryAlias, ...] = ()
     sortable_fields: tuple[str, ...] = ()
+    entity_selection: EntitySelection | None = None
 
     def resolve_field_id(self, name: str) -> str | None:
         """Resolve one canonical query field or immutable query alias."""
@@ -305,6 +339,7 @@ class CustomImportDefinition:
     root_fields: tuple[Field, ...]
     child_fields: tuple[Field, ...]
     child_collections: tuple[ChildCollection, ...]
+    child_memberships: tuple[ChildMembership, ...]
     aliases: tuple[FieldAlias, ...]
     query: QueryContract
     selection_profiles: tuple[SelectionProfile, ...]
@@ -373,6 +408,7 @@ def _parse_definition_header(definition_value: Mapping[str, Any]) -> Mapping[str
             "refresh_mode",
             "streams",
             "schema",
+            "child_memberships",
             "aliases",
             "query",
             "selection_profiles",
@@ -396,6 +432,11 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
     )
     child_collections, child_fields = _parse_children(schema.get("children", []), root_fields, root_logical_key)
     _validate_field_identity(root_fields, child_fields)
+    child_memberships = (
+        _parse_child_memberships(definition["child_memberships"], child_collections, child_fields)
+        if "child_memberships" in definition
+        else ()
+    )
     source_streams = _parse_streams(
         _required(definition, "streams", "definition"),
         {collection.name for collection in child_collections},
@@ -403,6 +444,7 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
     aliases = _parse_aliases(definition.get("aliases", {}), source_streams, root_fields, child_fields)
     query = _parse_query(definition.get("query", {}), root_fields, child_fields, child_collections)
     selection_profiles = _parse_profiles(definition.get("selection_profiles", []), query, (*root_fields, *child_fields))
+    _validate_entity_selection(query, selection_profiles, root_logical_key, entity_field)
     schema_by_scope = {"root": root_schema, "children": schema.get("children", [])}
     return CustomImportDefinition(
         definition_revision=definition_revision,
@@ -414,6 +456,7 @@ def _parse_definition_contents(definition: Mapping[str, Any]) -> CustomImportDef
         root_fields=root_fields,
         child_fields=child_fields,
         child_collections=child_collections,
+        child_memberships=child_memberships,
         aliases=aliases,
         query=query,
         selection_profiles=selection_profiles,
@@ -519,6 +562,51 @@ def _parse_children(
     if len({collection.name for collection in child_collections}) != len(child_collections):
         raise DefinitionError("child collection names must be unique")
     return tuple(child_collections), tuple(child_field_definitions)
+
+
+def _parse_child_memberships(
+    raw: Any, collections: tuple[ChildCollection, ...], fields: tuple[Field, ...]
+) -> tuple[ChildMembership, ...]:
+    entries = _array(raw, "definition.child_memberships")
+    if not 1 <= len(entries) <= 8:
+        raise DefinitionError("child_memberships must contain one to eight associations")
+    memberships = tuple(_parse_membership_entry(entry, collections, fields) for entry in entries)
+    if len(set(memberships)) != len(memberships):
+        raise DefinitionError("child_memberships cannot repeat an association")
+    return memberships
+
+
+def _parse_membership_entry(
+    raw: Any, collections: tuple[ChildCollection, ...], fields: tuple[Field, ...]
+) -> ChildMembership:
+    document = _mapping(
+        raw, "definition.child_membership", keys={"outer_collection", "inner_collection", "key_mapping"}
+    )
+    outer_name = _identifier(_required(document, "outer_collection", "definition.child_membership"), "outer_collection")
+    inner_name = _identifier(_required(document, "inner_collection", "definition.child_membership"), "inner_collection")
+    by_name = {collection.name: collection for collection in collections}
+    if outer_name == inner_name or outer_name not in by_name or inner_name not in by_name:
+        raise DefinitionError("child_membership requires two declared sibling collections")
+    outer, inner = by_name[outer_name], by_name[inner_name]
+    mapping = _array(_required(document, "key_mapping", "definition.child_membership"), "child_membership.key_mapping")
+    if len(mapping) != len(outer.child_key):
+        raise DefinitionError("child_membership must map the complete outer child key")
+    fields_by_id = {field.field_id: field for field in fields}
+    pairs: list[tuple[str, str]] = []
+    for ordinal, mapping_entry in enumerate(mapping):
+        pair = _mapping(mapping_entry, f"child_membership.key_mapping[{ordinal}]", keys={"outer_field", "inner_field"})
+        outer_field = _identifier(_required(pair, "outer_field", "child_membership.key_mapping"), "outer_field")
+        inner_field = _identifier(_required(pair, "inner_field", "child_membership.key_mapping"), "inner_field")
+        if (
+            outer_field != outer.child_key[ordinal]
+            or inner_field not in inner.child_key
+            or inner_field in (previous_inner for _, previous_inner in pairs)
+            or fields_by_id[outer_field].value_type != fields_by_id[inner_field].value_type
+            or fields_by_id[outer_field].value_type not in {"string", "integer"}
+        ):
+            raise DefinitionError("child_membership key mapping is incompatible")
+        pairs.append((outer_field, inner_field))
+    return ChildMembership(outer_name, inner_name, tuple(pairs))
 
 
 def _parse_child_collection(
@@ -672,7 +760,7 @@ def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[
     stream = _mapping(
         raw_stream,
         path,
-        keys={"id", "kind", "child", "format", "compression", "record_path", "snapshot_token"},
+        keys={"id", "kind", "child", "format", "compression", "record_path", "snapshot_token", "duplicate_policy"},
     )
     kind = _required(stream, "kind", path)
     if not isinstance(kind, str) or kind not in {"root", "child"}:
@@ -680,6 +768,11 @@ def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[
     child = stream.get("child")
     if kind == "root" and child is not None:
         raise DefinitionError("root streams cannot declare child")
+    duplicate_policy = stream.get("duplicate_policy", "reject")
+    if "duplicate_policy" in stream and kind == "root":
+        raise DefinitionError("root streams cannot declare duplicate_policy")
+    if not isinstance(duplicate_policy, str) or duplicate_policy not in {"reject", "collapse_identical"}:
+        raise DefinitionError(f"{path}.duplicate_policy must be reject or collapse_identical")
     if kind == "child":
         child = _identifier(child, f"{path}.child")
         if child not in child_names:
@@ -707,6 +800,7 @@ def _source_stream_from_mapping(raw_stream: Any, ordinal: int, child_names: set[
         compression=compression,
         record_path=record_path,
         snapshot_token=_identifier(_required(stream, "snapshot_token", path), f"{path}.snapshot_token"),
+        duplicate_policy=duplicate_policy,
     )
 
 
@@ -763,7 +857,7 @@ def _parse_query(
     query = _mapping(
         raw,
         "definition.query",
-        keys={"root_fields", "child", "order", "aliases", "sortable_fields"},
+        keys={"root_fields", "child", "order", "aliases", "sortable_fields", "entity_selection"},
     )
     root_ids = {field.field_id for field in root_fields if field.projection_slot is not None}
     child_by_collection: dict[str, set[str]] = {}
@@ -793,7 +887,69 @@ def _parse_query(
         order_terms,
         query_aliases,
         _parse_sortable_fields(query.get("sortable_fields", []), permitted_field_ids),
+        _parse_entity_selection(query["entity_selection"], root_fields, root_query_fields)
+        if "entity_selection" in query
+        else None,
     )
+
+
+def _parse_entity_selection(raw, root_fields, query_fields) -> EntitySelection:
+    """Admit only bounded, projected, required root selection dimensions."""
+
+    keys = {"contract", "field", "default", "family_dimension", "by_value_profile", "default_profile"}
+    selection = _mapping(raw, "definition.query.entity_selection", keys=keys)
+    if set(selection) != keys or selection["contract"] != "custom-import/grouped-entity-selection/v1":
+        raise DefinitionError("entity selection contract is invalid")
+    dimension = _mapping(selection["family_dimension"], "entity selection family dimension", keys={"field", "values"})
+    if set(dimension) != {"field", "values"} or selection["default"] != "max_per_entity":
+        raise DefinitionError("entity selection dimensions are invalid")
+    selected = EntitySelection(
+        _identifier(selection["field"], "entity selection field"),
+        _identifier(dimension["field"], "entity selection group field"),
+        tuple(_array(dimension["values"], "entity selection group values")),
+        _identifier(selection["by_value_profile"], "entity selection by-value profile"),
+        _identifier(selection["default_profile"], "entity selection default profile"),
+    )
+    try:
+        has_valid_groups = 1 <= len(selected.group_values) <= 2 and all(
+            type(group) is str and group and "\x00" not in group and len(group.encode("utf-8")) <= 2048
+            for group in selected.group_values
+        )
+    except UnicodeEncodeError:
+        has_valid_groups = False
+    if not has_valid_groups:
+        raise DefinitionError("entity selection group values must be bounded nonempty strings")
+    if len(set(selected.group_values)) != len(selected.group_values):
+        raise DefinitionError("entity selection group values must be distinct")
+    fields_by_id = {field.field_id: field for field in root_fields}
+    for field_id, value_type in ((selected.field_id, "integer"), (selected.group_field_id, "string")):
+        field = fields_by_id.get(field_id)
+        if field is None or field.nullable or field.value_type != value_type or field_id not in query_fields:
+            raise DefinitionError("entity selection fields must be required projected root query fields")
+    return selected
+
+
+def _validate_entity_selection(query, profiles, root_key, entity_field) -> None:
+    """Require exact root grain and the two definition-owned profile roles."""
+
+    selected = query.entity_selection
+    if selected is None:
+        return
+    expected_keys = {entity_field, selected.field_id, selected.group_field_id}
+    if len(expected_keys) != 3 or len(root_key) != 3 or set(root_key) != expected_keys:
+        raise DefinitionError("entity selection requires the complete entity, selection, and group root key")
+    profiles_by_id = {profile.profile_id: profile for profile in profiles}
+    if len(profiles) != 2 or set(profiles_by_id) != {selected.by_value_profile, selected.default_profile}:
+        raise DefinitionError("entity selection admits exactly two distinct root profiles")
+    by_value = profiles_by_id[selected.by_value_profile]
+    latest = profiles_by_id[selected.default_profile]
+    if (
+        by_value.context_dimensions != (selected.field_id, selected.group_field_id)
+        or by_value.selection_terms
+        or latest.context_dimensions
+        or latest.selection_terms != (SortTerm(selected.field_id, "desc", "last"),)
+    ):
+        raise DefinitionError("entity selection profile roles are invalid")
 
 
 def _parse_query_child(

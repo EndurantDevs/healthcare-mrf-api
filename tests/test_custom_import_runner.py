@@ -928,7 +928,7 @@ def test_family_validation_rejects_missing_child_identity_after_field_validation
     )
     rejection_codes = defaultdict(set)
     family._admit_child_records(
-        SimpleNamespace(child_collections=(collection,)),
+        SimpleNamespace(child_collections=(collection,), source_streams=()),
         {"rates": ({"parent": "root", "value": None},)},
         {("root",): {}},
         {"rates": {"value": _codec_field("value", "string", nullable=True)}},

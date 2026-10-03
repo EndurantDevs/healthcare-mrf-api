@@ -43,6 +43,9 @@ FIXED_KEY_PAIR_CREDENTIAL_FILENAME = "snowflake-key-pair.json"
 MAX_APPROVED_RELATIONS = 128
 MAX_DECLARED_COLUMNS = 128
 MAX_SELECTED_COLUMNS = 128
+MAX_SOURCE_ROW_FILTERS = 3
+MAX_SOURCE_FILTER_VALUE_BYTES = 2_048
+MAX_SOURCE_FILTER_OPERANDS = 8
 MAX_RESULT_PARTITIONS = 4_096
 MAX_RESULT_PARTITION_BYTES = 64 * 1024 * 1024
 MAX_RESULT_BYTES = 256 * 1024 * 1024
@@ -297,6 +300,66 @@ class SnowflakeRelation:
         """Return the only SQL spelling used by the connector's statement builder."""
 
         return ".".join(f'"{part}"' for part in self.parts)
+
+
+@dataclass(frozen=True)
+class SnowflakeRowFilter:
+    """One bounded, non-null string predicate on a declared source field."""
+
+    field_id: str
+    operator: str
+    value: str | tuple[str, ...] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "field_id", _field_id(self.field_id, "source filter field id"))
+        if type(self.operator) is not str or self.operator not in {"eq", "in"}:
+            raise SnowflakeConnectorError("source filter operator is unsupported")
+        if self.operator == "eq":
+            operands = (self.value,)
+        elif type(self.value) in {list, tuple} and 1 <= len(self.value) <= MAX_SOURCE_FILTER_OPERANDS:
+            operands = tuple(self.value)
+        else:
+            raise SnowflakeConnectorError("source filter membership requires 1 to 8 strings")
+        if any(type(value) is not str or "\x00" in value for value in operands):
+            raise SnowflakeConnectorError("source filter requires non-null strings")
+        if len(set(operands)) != len(operands):
+            raise SnowflakeConnectorError("source filter membership cannot repeat a value")
+        try:
+            has_valid_length = sum(len(value.encode("utf-8")) for value in operands) <= MAX_SOURCE_FILTER_VALUE_BYTES
+        except UnicodeEncodeError:
+            has_valid_length = False
+        if not has_valid_length:
+            raise SnowflakeConnectorError("source filter value exceeds its UTF-8 bound")
+        if self.operator == "in":
+            object.__setattr__(self, "value", tuple(sorted(operands)))
+
+    def to_mapping(self) -> dict[str, object]:
+        """Return the exact predicate sealed by source and request identities."""
+
+        return {
+            "field_id": self.field_id,
+            "operator": self.operator,
+            "value": list(self.value) if self.operator == "in" else self.value,
+        }
+
+
+def _normalized_row_filters(value: object) -> tuple[SnowflakeRowFilter, ...]:
+    """Validate immutable predicates; the empty tuple represents absence only."""
+
+    if not isinstance(value, tuple) or len(value) > MAX_SOURCE_ROW_FILTERS:
+        raise SnowflakeConnectorError("source filters must be a bounded tuple")
+    if not all(isinstance(predicate, SnowflakeRowFilter) for predicate in value):
+        raise SnowflakeConnectorError("source filters require declared predicates")
+    normalized_filters = tuple(SnowflakeRowFilter(item.field_id, item.operator, item.value) for item in value)
+    if len({item.field_id for item in normalized_filters}) != len(normalized_filters):
+        raise SnowflakeConnectorError("source filters cannot repeat a field")
+    return tuple(sorted(normalized_filters, key=lambda item: item.field_id))
+
+
+def _row_filters_document(filters: tuple[SnowflakeRowFilter, ...]) -> dict[str, object]:
+    """Omit absent filters so existing canonical documents remain unchanged."""
+
+    return {"row_filters": [item.to_mapping() for item in filters]} if filters else {}
 
 
 @dataclass(frozen=True)

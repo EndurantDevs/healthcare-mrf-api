@@ -493,7 +493,7 @@ def _verified_root(session, request, build_id, root, root_record, binding, retai
 
 def _verified_child_documents(session, request, registry, plan, root_record, retained_bytes, collection, child_counter):
     statement, keys = _child_statement(
-        plan, canonical=True, collection_slot=registry.child_collection_slots[collection]
+        plan, request.definition, canonical=True, collection_slot=registry.child_collection_slots[collection]
     )
     for (child,) in _read_rows(
         session,

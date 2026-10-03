@@ -2592,6 +2592,17 @@ class CustomImportBuildOccurrence(_CustomImportModel):
             "child_revision_id",
             postgresql_where=text("child_revision_id IS NOT NULL"),
         ),
+        Index(
+            "custom_import_build_final_child_idx",
+            "build_id",
+            "stream_slot",
+            "root_record_id",
+            "collection_slot",
+            "raw_parent_key_sha256",
+            "child_key_sha256",
+            text("source_ordinal DESC"),
+            postgresql_where=text("origin = 'source' AND child_revision_id IS NOT NULL"),
+        ),
         Index("custom_import_build_occurrence_pack_idx", "pack_id", "occurrence_id"),
         Index("custom_import_build_occurrence_page_idx", "build_id", "origin", "occurrence_id"),
     )

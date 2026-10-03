@@ -21,11 +21,12 @@ from typing import TYPE_CHECKING, Any
 
 import orjson
 from sanic import response
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from db.models.custom_import import CustomImportDataset
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
+    MAX_FAMILY_RESPONSE_BYTES,
     CustomImportReadAuthorizationError,
     CustomImportReadCursorError,
     CustomImportReadEntityAbsentError,
@@ -37,12 +38,15 @@ from process.custom_import.read_contracts import (
 )
 from process.custom_import.read_core import (
     CustomImportReadService,
+    EntityFamilySet,
     EntityLocator,
     ReadFilter,
     ReadOrderTerm,
     RootDetailRequest,
     SearchRequest,
 )
+from process.custom_import.read_payload import field_value_payload as _field_value
+from process.custom_import.read_payload import full_family_payload as _full_family_payload
 
 if TYPE_CHECKING:
     from api.custom_import_provider_http import _ParsedProviderRequest
@@ -64,7 +68,7 @@ CUSTOM_IMPORT_READ_MAX_TTL_SECONDS = 60
 
 _CACHE_CONTROL = "private, no-store"
 _MAX_BODY_BYTES = 16 * 1024
-_MAX_RESPONSE_BYTES = 256 * 1024
+_MAX_RESPONSE_BYTES = MAX_FAMILY_RESPONSE_BYTES
 _MAX_CONTEXT_BYTES = 2048
 _MAX_CONTEXT_CHARACTERS = 3072
 _MAX_KEYRING_BYTES = 4096
@@ -423,6 +427,9 @@ class _ParsedDetailRequest:
     target: _TransportTarget
     entity: EntityLocator
     family_entitlement: str
+    context: tuple[ReadFilter, ...] | None = None
+    grouped_entity_selection: dict[str, object] | None = None
+    grouped_child_query: dict[str, object] | None = None
 
     def bind(self, dataset_id: int) -> RootDetailRequest:
         """Bind the verified external request to one internal dataset ID."""
@@ -437,6 +444,9 @@ class _ParsedDetailRequest:
             ),
             entity=self.entity,
             family_entitlement=self.family_entitlement,
+            context_filters=self.context,
+            grouped_entity_selection=self.grouped_entity_selection,
+            grouped_child_query=self.grouped_child_query,
         )
 
 
@@ -504,19 +514,49 @@ def _parse_search_request(body: bytes) -> _ParsedSearchRequest:
         raise _fail() from None
 
 
+def _parse_grouped_child_descriptor(document):
+    """Keep the optional capability closed before pinned semantic verification."""
+
+    if "grouped_child_query" not in document:
+        return None
+    child = document["grouped_child_query"]
+    if (
+        type(document.get("grouped_entity_selection")) is not dict
+        or type(child) is not dict
+        or set(child) != {"contract", "collection", "key_field_id"}
+        or child["contract"] != "custom-import/grouped-child-query/v1"
+        or any(type(child[key]) is not str or not child[key] for key in ("collection", "key_field_id"))
+    ):
+        raise _fail()
+    return child
+
+
 def _parse_detail_request(body: bytes) -> _ParsedDetailRequest:
     """Parse one canonical, closed, signed entity detail request body."""
 
     document = _strict_json(body)
-    if type(document) is not dict or frozenset(document) != {"entity", "family_entitlement", "target"}:
+    base_keys = {"entity", "family_entitlement", "target"}
+    if type(document) is not dict or set(document) not in (
+        base_keys,
+        base_keys | {"grouped_entity_selection"},
+        base_keys | {"grouped_entity_selection", "context"},
+        base_keys | {"grouped_entity_selection", "grouped_child_query"},
+        base_keys | {"grouped_entity_selection", "grouped_child_query", "context"},
+    ):
         raise _fail()
     if _canonical_json_bytes(document) != body:
+        raise _fail()
+    grouped = document.get("grouped_entity_selection")
+    if "grouped_entity_selection" in document and type(grouped) is not dict:
         raise _fail()
     try:
         parsed_request = _ParsedDetailRequest(
             target=_parse_target(document.get("target")),
             entity=_parse_entity(document.get("entity")),
             family_entitlement=document.get("family_entitlement"),
+            context=_parse_filter_documents(document.get("context", [])) if grouped is not None else None,
+            grouped_entity_selection=grouped,
+            grouped_child_query=_parse_grouped_child_descriptor(document),
         )
         parsed_request.bind(1)
         return parsed_request
@@ -765,23 +805,6 @@ def _trusted_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _field_value(value: Any) -> dict[str, object]:
-    encoded: object = value.value
-    if value.state == "value":
-        if value.field_type == "decimal":
-            encoded = format(encoded, "f")
-        elif value.field_type == "date":
-            encoded = encoded.isoformat()
-        elif value.field_type == "timestamp":
-            encoded = encoded.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    return {
-        "field_id": value.field_id,
-        "field_type": value.field_type,
-        "state": value.state,
-        "value": encoded,
-    }
-
-
 def _page_payload(page: Any, target: _TransportTarget) -> dict[str, object]:
     return {
         "target": _target_document(target),
@@ -800,17 +823,36 @@ def _search_item_payload(item: Any) -> dict[str, object]:
 
 
 def _detail_payload(detail: Any, target: _TransportTarget) -> dict[str, object]:
+    if type(detail) is EntityFamilySet:
+        return _family_set_payload(detail, target)
     return {
         "target": _target_document(target),
-        "root_fields": [_field_value(value) for value in detail.root_fields],
-        "children": [
-            {
-                "collection": child.collection,
-                "fields": [_field_value(value) for value in child.fields],
-            }
-            for child in detail.children
-        ],
+        **_full_family_payload(detail),
     }
+
+
+def _family_set_payload(families: EntityFamilySet, target: _TransportTarget) -> dict[str, object]:
+    """Encode the closed opt-in family set without internal winner locators."""
+
+    project = _full_family_payload if families.projection == "full_family" else _search_item_payload
+    return {
+        "contract": "custom-import/entity-family-set/v1",
+        "target": _target_document(target),
+        "projection": families.projection,
+        "selection": {"field_id": families.selection_field_id, "value": families.selection_value},
+        "families": [{"group_value": group, **project(family)} for group, family in families.families],
+        "missing_group_values": list(families.missing_group_values),
+    }
+
+
+def _provider_import_payload(imported: Any, target: _TransportTarget) -> dict[str, object] | None:
+    """Preserve legacy optional projections and admit the versioned family set."""
+
+    if imported is None:
+        return None
+    if type(imported) is EntityFamilySet:
+        return _family_set_payload(imported, target)
+    return {"target": _target_document(target), **_search_item_payload(imported)}
 
 
 def _response(body: bytes, status: int):
@@ -907,6 +949,8 @@ async def serve_custom_import_detail(request: Any, session: Any):
             keyring=keyring,
             path=CUSTOM_IMPORT_DETAIL_PATH,
         )
+        if parsed_request.grouped_entity_selection is not None:
+            return await _serve_grouped_detail(session, parsed_request, verified)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + DEFAULT_READ_TIMEOUT_MS / 1_000
         async with asyncio.timeout_at(deadline):
@@ -934,6 +978,29 @@ async def serve_custom_import_detail(request: Any, session: Any):
         _log_failure(failure)
         return _error(_failure_status(failure))
     return _response(encoded, 200)
+
+
+async def _serve_grouped_detail(session, parsed, verified):
+    """Resolve, select, and hydrate the opt-in set in one read-only snapshot."""
+
+    if session is None or session.in_transaction():
+        raise CustomImportReadUnavailableError("fresh grouped detail session is required")
+    async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        pinned = await _resolve_pinned_target(session, parsed.target)
+        service = CustomImportReadService(authorizer=_TransportAuthorizer(verified, pinned))
+        try:
+            detail = await service.root_detail_for_entity(
+                session,
+                authorization=ExtensionReadAuthorization(verified.credential),
+                request=parsed.bind(pinned.dataset_id),
+            )
+        except CustomImportReadEntityAbsentError:
+            return _error(404, detail=_ENTITY_ABSENT_ERROR)
+        encoded = orjson.dumps(_detail_payload(detail, parsed.target))
+        if len(encoded) > _MAX_RESPONSE_BYTES:
+            raise CustomImportReadUnavailableError("custom import response exceeds the bound")
+        return _response(encoded, 200)
 
 
 __all__ = (

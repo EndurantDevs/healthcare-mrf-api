@@ -87,6 +87,8 @@ async def _retained_identity(session, dataset_id, definition_revision_id, source
         loaded.definition,
         bindings=loaded.bundle_bindings,
         processing_policy=getattr(loaded.binding, "processing_policy", None),
+        snapshot_token_mode=getattr(loaded.binding, "snapshot_token_mode", None),
+        decimal_conversions=getattr(loaded.binding, "decimal_conversions", None),
     )
     statement = connector.build_statement(bundle_request)
     digest = configured_request_identity(

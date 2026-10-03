@@ -702,6 +702,8 @@ async def _run_retained_snowflake_binding(
     idempotency_key: str,
     database=db,
 ) -> CandidateRunResult:
+    """Run only the immutable source configuration loaded under database authority."""
+
     with _receipt_only_database_output(database):
         engine = None
         previous_echo = _MISSING
@@ -724,11 +726,7 @@ async def _run_retained_snowflake_binding(
                     credential_provider=credential_provider,
                     adapter=adapter,
                 )
-                bundle_request = connector.prepare_request(
-                    loaded.definition,
-                    bindings=loaded.bundle_bindings,
-                    processing_policy=getattr(loaded.binding, "processing_policy", None),
-                )
+                bundle_request = _retained_bundle_request(connector, loaded)
                 request = SnowflakeBundleCandidateRequest(
                     dataset_id=loaded.dataset_id,
                     definition_revision_id=loaded.definition_revision_id,
@@ -758,6 +756,18 @@ async def _run_retained_snowflake_binding(
 
 def _resume_source_access_forbidden(*_args: object, **_kwargs: object) -> None:
     raise AssertionError("resume must not acquire a source")
+
+
+def _retained_bundle_request(connector, loaded):
+    """Forward all retained source identity options for fresh runs and resume."""
+
+    return connector.prepare_request(
+        loaded.definition,
+        bindings=loaded.bundle_bindings,
+        processing_policy=getattr(loaded.binding, "processing_policy", None),
+        snapshot_token_mode=getattr(loaded.binding, "snapshot_token_mode", None),
+        decimal_conversions=getattr(loaded.binding, "decimal_conversions", None),
+    )
 
 
 async def _run_configured_candidate(session_factory, connector, request, processing_policy):
@@ -836,9 +846,7 @@ async def _resumable_snowflake_candidate(
     )
     bundle_connector = _resume_connector(loaded_binding)
     processing_policy = getattr(loaded_binding.binding, "processing_policy", None)
-    bundle_request = bundle_connector.prepare_request(
-        loaded_binding.definition, bindings=loaded_binding.bundle_bindings, processing_policy=processing_policy
-    )
+    bundle_request = _retained_bundle_request(bundle_connector, loaded_binding)
     request_identity_sha256 = configured_request_identity(
         bundle_request,
         bundle_connector.build_statement(bundle_request),
