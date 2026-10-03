@@ -18,6 +18,7 @@ import pytest
 
 from process.custom_import import snowflake_capture as capture
 from process.custom_import.capture_limits import CaptureLimits
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import ExecutionSubmission, LeaseGrant
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
@@ -232,6 +233,32 @@ def _assert_framing(receipt, parts):
     assert document["payload_set_sha256"] == payload.hexdigest() == receipt.content_sha256
     assert document["manifest_set_sha256"] == manifest.hexdigest()
     assert hashlib.sha256(receipt.canonical_manifest.encode()).hexdigest() == receipt.manifest_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scopes", [("root",), ("child",), ("root", "child")])
+async def test_capture_uses_field_slots_when_declarations_are_reordered(monkeypatch, scopes):
+    """Capture accepts slot-ordered projections independent of declaration order."""
+
+    harness = _Harness(monkeypatch, (_shared_row(),))
+    bundle = harness.request.bundle_request
+    document = json.loads(bundle.definition.canonical)
+    if "root" in scopes:
+        document["schema"]["root"]["fields"].reverse()
+    if "child" in scopes:
+        document["schema"]["children"][0]["fields"].reverse()
+    definition = CustomImportDefinition.from_mapping(document)
+    reordered_bundle = replace(bundle, definition=definition)
+    assert reordered_bundle.bindings == bundle.bindings
+    harness.request = replace(harness.request, definition=definition, bundle_request=reordered_bundle)
+
+    result = await harness.run()
+
+    assert result == capture.SnowflakeCaptureResult("capture_sealed", 9, 23, 1)
+    assert len(harness.parts) == len(harness.receipts) == 2
+    assert all(part["record_count"] == 1 for part in harness.parts)
+    assert harness.cursor.closed and harness.connection.closed
+    assert harness.finishes == []
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ from process.custom_import.snowflake_bundle import (
 )
 from process.custom_import.snowflake_bundle_replay import (
     _is_bundle_column_type_valid,
+    _stream_fields,
     _validate_replay_partition_schema,
 )
 from process.custom_import.snowflake_candidate import (
@@ -447,11 +448,7 @@ class _AffinityLanding:
             if event.stream_id not in streams_by_id:
                 raise SnowflakeCaptureError("capture event stream coverage is invalid")
             stream = streams_by_id[event.stream_id]
-            fields = tuple(
-                field
-                for field in self.statement.request.definition.fields
-                if field.collection == stream.child_collection
-            )
+            fields = _stream_fields(self.statement.request.definition, stream)
             _validate_replay_partition_schema(
                 event.capture,
                 fields=fields,
