@@ -202,6 +202,74 @@ def _processing_policy():
     return ProcessingPolicy(capture, 30, BuildPolicy(2, 4096, 1000, 60, 300))
 
 
+def _definition_with_children():
+    """Add two synthetic sibling collections with complete parent keys."""
+
+    definition_document = _definition_document()
+    for ordinal, collection in enumerate(("items", "observations")):
+        definition_document["streams"].append(
+            {
+                "id": collection,
+                "kind": "child",
+                "child": collection,
+                "format": "ndjson",
+                "compression": "none",
+                "snapshot_token": "root_snapshot",
+            }
+        )
+        definition_document["schema"]["children"].append(
+            {
+                "name": collection,
+                "parent_key": [{"child": f"{collection}_{field}", "root": field} for field in ("npi", "edition")],
+                "child_key": [f"{collection}_key"],
+                "fields": [
+                    {
+                        "id": f"{collection}_{field}",
+                        "slot": 4 + ordinal * 3 + offset,
+                        "type": field_type,
+                        "nullable": False,
+                    }
+                    for offset, (field, field_type) in enumerate(
+                        (("npi", "string"), ("edition", "integer"), ("key", "string"))
+                    )
+                ],
+            }
+        )
+    return definition_document
+
+
+def _verify_child_membership():
+    """Exercise family admission from the installed pure package alone."""
+
+    definition_document = _definition_with_children()
+    previous_definition = CustomImportDefinition.from_mapping(definition_document)
+    definition_document["revision"]["definition"] += 1
+    definition_document["child_memberships"] = [
+        {
+            "outer_collection": "items",
+            "inner_collection": "observations",
+            "key_mapping": [{"outer_field": "items_key", "inner_field": "observations_key"}],
+        }
+    ]
+    definition = CustomImportDefinition.from_mapping(definition_document, previous=previous_definition)
+    assert (
+        definition.schema_digest == previous_definition.schema_digest
+        and definition.digest != previous_definition.digest
+    )
+    root_values_by_field = {"npi": "1003000126", "edition": 1, "label": "sample"}
+    children_by_collection = {
+        collection: [
+            {f"{collection}_npi": root_values_by_field["npi"], f"{collection}_edition": 1, f"{collection}_key": "A"}
+        ]
+        for collection in ("items", "observations")
+    }
+    assert len(assemble_root_families(definition, [root_values_by_field], children_by_collection).families) == 1
+    children_by_collection["observations"][0]["observations_key"] = "B"
+    rejected = assemble_root_families(definition, [root_values_by_field], children_by_collection)
+    assert rejected.families == () and rejected.candidate_errors == ()
+    assert [rejection.code for rejection in rejected.rejections] == ["child_membership_missing"]
+
+
 assert importlib.util.find_spec("process") is None
 _native_source = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 if _native_source is None:
@@ -234,6 +302,7 @@ assert all(
 
 from custom_import_preflight.capture_limits import CaptureLimits
 from custom_import_preflight.definition import CustomImportDefinition
+from custom_import_preflight.family import assemble_root_families
 from custom_import_preflight.processing_policy import BuildPolicy, ProcessingPolicy
 from custom_import_preflight.segmented_capture_policy import SegmentedCapturePolicy
 from custom_import_preflight.snowflake import SnowflakeConnectorError
@@ -253,6 +322,7 @@ from custom_import_preflight.snowflake_preflight import (
 )
 from custom_import_preflight.snowflake_preflight_schema import validate_preflight_result_schema
 
+_verify_child_membership()
 _definition = CustomImportDefinition.from_mapping(_definition_document())
 _binding = SnowflakeSourceBinding.from_mapping(_binding_document(_definition))
 _approved_relations, _bundle_bindings = _binding.bundle_components(_definition)

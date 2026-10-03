@@ -55,9 +55,11 @@ from process.custom_import.snowflake_bundle import (
     _DurableBundleReceipt,
     _field_id,
     _remaining_partition_limits,
+    _retained_statement_query_id,
     _snapshot_token,
     _stream_content_sha256,
 )
+from process.custom_import.snowflake_preflight_schema import validate_decimal_conversion_sources
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,7 @@ def _rebuilt_bundle_statement(
                 ),
                 selected_field_ids=tuple(binding.selected_field_ids),
                 semantic_token_metadata_key=binding.semantic_token_metadata_key,
+                row_filters=binding.row_filters,
             )
             for binding in supplied_request.bindings
         ),
@@ -163,6 +166,8 @@ def _rebuilt_bundle_statement(
         ),
         capture_limits=supplied_request.capture_limits,
         processing_policy=supplied_request.processing_policy,
+        snapshot_token_mode=supplied_request.snapshot_token_mode,
+        decimal_conversions=supplied_request.decimal_conversions,
     )
     statement = SnowflakeBundleStatement(
         request=request,
@@ -261,6 +266,7 @@ def _validate_replay_partition_schema(
     *,
     fields: tuple[Field, ...],
     limits: CaptureLimits,
+    decimal_conversions: Mapping[str, str] | None = None,
 ) -> None:
     _validate_parquet_envelope(capture.payload)
     with _open_parquet_reader(capture.payload, limits) as parquet_reader:
@@ -272,6 +278,8 @@ def _validate_replay_partition_schema(
     fields_by_id = {field.field_id: field for field in fields}
     if any(not _is_bundle_column_type_valid(column.type, fields_by_id[column.name]) for column in schema):
         raise SnowflakeBundleError("bundle replay schema type does not match the declared field")
+    if any(column.name in (decimal_conversions or {}) and column.type != pa.decimal128(30, 12) for column in schema):
+        raise SnowflakeBundleError("bundle converted decimal transport must be decimal128(30, 12)")
 
 
 def _replay_stream_records(
@@ -281,6 +289,7 @@ def _replay_stream_records(
     fields: tuple[Field, ...],
     limits: CaptureLimits,
     decoded_bytes: int,
+    decimal_conversions: Mapping[str, str] | None = None,
 ) -> tuple[tuple[Mapping[str, Any], ...], int]:
     expected_field_ids = tuple(field.field_id for field in fields)
     if tuple(column.field_id for column in stream_capture.schema) != expected_field_ids:
@@ -288,7 +297,9 @@ def _replay_stream_records(
     stream_records: list[Mapping[str, Any]] = []
     for capture in stream_capture.captures:
         try:
-            _validate_replay_partition_schema(capture, fields=fields, limits=limits)
+            _validate_replay_partition_schema(
+                capture, fields=fields, limits=limits, decimal_conversions=decimal_conversions
+            )
             for decoded_record in iter_records(capture, stream, limits=limits):
                 record_by_field = dict(decoded_record.values)
                 if tuple(record_by_field) != expected_field_ids:
@@ -395,6 +406,7 @@ def prepare_bundle_replay(acquisition: SnowflakeBundleAcquisition) -> SnowflakeB
             fields=fields,
             limits=verified_acquisition.capture_limits,
             decoded_bytes=decoded_bytes,
+            decimal_conversions=verified_acquisition.statement.request.decimal_conversions,
         )
         replay_streams.append(
             SnowflakeBundleReplayStream(
@@ -448,6 +460,8 @@ def _validated_durable_bundle(
         raise SnowflakeBundleError("durable bundle replay statement contains a stale identity seal")
     definition = request.definition
     captures_by_stream, source_snapshot_token = _validated_durable_captures(definition, captures)
+    if request.snapshot_token_mode is not None:
+        _retained_statement_query_id(source_snapshot_token)
     durable_receipts_by_stream = _validated_durable_receipts(statement, source_snapshot_token, captures_by_stream)
     return statement, definition, captures_by_stream, source_snapshot_token, durable_receipts_by_stream
 
@@ -523,6 +537,8 @@ def _validated_durable_receipts(
         raise SnowflakeBundleError("durable bundle replay receipts do not match the configured request")
     if any(receipt.statement_sha256 != statement.statement_sha256 for receipt in durable_receipts_by_stream.values()):
         raise SnowflakeBundleError("durable bundle replay receipts do not match the configured statement")
+    for receipt in durable_receipts_by_stream.values():
+        validate_decimal_conversion_sources(receipt.result_schema, request.decimal_conversions)
     expected_manifest_sha256 = _expected_acquisition_manifest_sha256(
         statement,
         source_snapshot_token,
@@ -615,7 +631,7 @@ def reconstruct_replayable_parquet_bundle(
             stream,
             fields,
             capture_sha256s=durable_receipt.capture_sha256s,
-            limits=statement.request.capture_limits,
+            request=statement.request,
             capture_compressed_bytes=capture_compressed_bytes,
             capture_decoded_bytes=capture_decoded_bytes,
             decoded_bytes=decoded_bytes,
@@ -650,13 +666,14 @@ def _replay_durable_stream(
     fields: tuple[Field, ...],
     *,
     capture_sha256s: tuple[str, ...],
-    limits: CaptureLimits,
+    request: SnowflakeBundleRequest,
     capture_compressed_bytes: int,
     capture_decoded_bytes: int,
     decoded_bytes: int,
 ) -> tuple[tuple[Mapping[str, Any], ...], int, int, int]:
     """Reseal durable bytes before decoding them through the shared parser."""
 
+    limits = request.capture_limits
     stream_records: list[Mapping[str, Any]] = []
     expected_field_ids = tuple(field.field_id for field in fields)
     stream_compressed_bytes = 0
@@ -679,7 +696,9 @@ def _replay_durable_stream(
             capture_compressed_bytes += sealed.manifest.compressed_bytes
             capture_decoded_bytes += sealed.manifest.decoded_bytes
             stream_compressed_bytes += sealed.manifest.compressed_bytes
-            _validate_replay_partition_schema(sealed, fields=fields, limits=part_limits)
+            _validate_replay_partition_schema(
+                sealed, fields=fields, limits=part_limits, decimal_conversions=request.decimal_conversions
+            )
             for decoded_record in iter_records(sealed, stream, limits=part_limits):
                 record_by_field = dict(decoded_record.values)
                 if tuple(record_by_field) != expected_field_ids:

@@ -32,6 +32,13 @@ from process.custom_import.snowflake import (
     SnowflakeParquetResult,
     SnowflakeRelation,
     SnowflakeResultColumn,
+    SnowflakeRowFilter,
+    _normalized_row_filters,
+    _row_filters_document,
+)
+from process.custom_import.snowflake_preflight_schema import (
+    normalize_decimal_conversions,
+    validate_decimal_conversion_sources,
 )
 
 if TYPE_CHECKING:
@@ -148,6 +155,21 @@ def _query_identity_snapshot_token(query_id: object) -> str:
     if query_id is None or not query_id.strip():
         raise SnowflakeBundleError("bundle query-identity snapshot requires a statement identity")
     return _snapshot_token(f"snowflake-query:{query_id}")
+
+
+def _snapshot_token_mode(value: object) -> str | None:
+    if value is not None and (type(value) is not str or value != "statement_query_id"):
+        raise SnowflakeBundleError("bundle snapshot token mode is unsupported")
+    return value
+
+
+def _retained_statement_query_id(token: str) -> str:
+    prefix = "snowflake-query:"
+    if not isinstance(token, str) or not token.startswith(prefix):
+        raise SnowflakeBundleError("bundle snapshot token lacks a statement identity")
+    query_id = token[len(prefix) :]
+    _query_identity_snapshot_token(query_id)
+    return query_id
 
 
 def _remaining_partition_limits(
@@ -363,6 +385,7 @@ class SnowflakeBundleBinding:
     source_snapshot_token_relation: SnowflakeRelation | None
     selected_field_ids: tuple[str, ...]
     semantic_token_metadata_key: str | None
+    row_filters: tuple[SnowflakeRowFilter, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stream_id", _field_id(self.stream_id, "bundle stream id"))
@@ -381,6 +404,10 @@ class SnowflakeBundleBinding:
         if len(field_ids) != len(set(field_ids)):
             raise SnowflakeBundleError("bundle selected field ids must be unique")
         object.__setattr__(self, "selected_field_ids", field_ids)
+        try:
+            object.__setattr__(self, "row_filters", _normalized_row_filters(self.row_filters))
+        except SnowflakeConnectorError as exc:
+            raise SnowflakeBundleError("bundle source filters are invalid") from exc
         if self.semantic_token_metadata_key is not None:
             object.__setattr__(
                 self,
@@ -398,6 +425,8 @@ class SnowflakeBundleRequest:
     encoding: SnowflakeBundleEncoding = DEFAULT_BUNDLE_ENCODING
     capture_limits: CaptureLimits = field(default=DEFAULT_CAPTURE_LIMITS, repr=False)
     processing_policy: ProcessingPolicy | None = field(default=None, repr=False)
+    snapshot_token_mode: str | None = None
+    decimal_conversions: Mapping[str, str] | None = None
     canonical_request: str = field(init=False, repr=False)
     request_sha256: str = field(init=False)
 
@@ -425,26 +454,15 @@ class SnowflakeBundleRequest:
         bindings_by_stream = {binding.stream_id: binding for binding in self.bindings}
         if len(bindings_by_stream) != len(self.bindings) or set(bindings_by_stream) != set(streams_by_id):
             raise SnowflakeBundleError("bundle bindings must exactly cover the declared source streams")
-        if any(binding.source_snapshot_token_relation is None for binding in self.bindings) and not (
-            len(self.definition.source_streams) == 1 and self.definition.source_streams[0].record_kind == "root"
-        ):
-            raise SnowflakeBundleError("bundle query-identity snapshot requires exactly one root stream")
+        _validate_snapshot_bindings(self.definition, self.bindings, self.snapshot_token_mode)
         bindings = _normalized_bundle_bindings(self.definition, bindings_by_stream)
+        try:
+            conversions = normalize_decimal_conversions(self.decimal_conversions, self.definition)
+        except SnowflakeConnectorError as exc:
+            raise SnowflakeBundleError("bundle decimal conversions are invalid") from exc
+        object.__setattr__(self, "decimal_conversions", conversions)
         request_identity_by_key = {
-            "bindings": [
-                {
-                    "relation": list(binding.relation.parts),
-                    "selected_field_ids": list(binding.selected_field_ids),
-                    "semantic_token_metadata_key": binding.semantic_token_metadata_key,
-                    "source_snapshot_token_relation": (
-                        None
-                        if binding.source_snapshot_token_relation is None
-                        else list(binding.source_snapshot_token_relation.parts)
-                    ),
-                    "stream_id": binding.stream_id,
-                }
-                for binding in bindings
-            ],
+            "bindings": [_bundle_binding_identity(binding) for binding in bindings],
             "capture_limits": _capture_limits_document(capture_limits),
             "contract": self.contract,
             "definition_sha256": self.definition.digest,
@@ -453,6 +471,10 @@ class SnowflakeBundleRequest:
         }
         if self.processing_policy is not None:
             request_identity_by_key["processing_policy"] = self.processing_policy.to_mapping()
+        if self.snapshot_token_mode is not None:
+            request_identity_by_key["snapshot_token_mode"] = self.snapshot_token_mode
+        if conversions is not None:
+            request_identity_by_key["decimal_conversions"] = dict(conversions)
         canonical, digest = _canonical_identity("request", request_identity_by_key, contract=self.contract)
         object.__setattr__(self, "bindings", bindings)
         object.__setattr__(self, "capture_limits", capture_limits)
@@ -464,6 +486,34 @@ class SnowflakeBundleRequest:
         """Keep the legacy wire identity unless a complete policy explicitly selects v2."""
 
         return BUNDLE_CONNECTOR_CONTRACT if self.processing_policy is None else BUNDLE_V2_CONNECTOR_CONTRACT
+
+
+def _bundle_binding_identity(binding: SnowflakeBundleBinding) -> dict[str, Any]:
+    return {
+        "relation": list(binding.relation.parts),
+        "selected_field_ids": list(binding.selected_field_ids),
+        "semantic_token_metadata_key": binding.semantic_token_metadata_key,
+        "source_snapshot_token_relation": (
+            None
+            if binding.source_snapshot_token_relation is None
+            else list(binding.source_snapshot_token_relation.parts)
+        ),
+        "stream_id": binding.stream_id,
+        **_row_filters_document(binding.row_filters),
+    }
+
+
+def _validate_snapshot_bindings(definition, bindings, mode):
+    """Permit query identities only for legacy roots or an explicit all-stream opt-in."""
+
+    _snapshot_token_mode(mode)
+    if mode is not None:
+        if any(binding.source_snapshot_token_relation is not None for binding in bindings):
+            raise SnowflakeBundleError("statement query identity requires all snapshot token relations to be null")
+    elif any(binding.source_snapshot_token_relation is None for binding in bindings) and not (
+        len(definition.source_streams) == 1 and definition.source_streams[0].record_kind == "root"
+    ):
+        raise SnowflakeBundleError("bundle query-identity snapshot requires exactly one root stream")
 
 
 def _normalized_bundle_bindings(
@@ -482,6 +532,12 @@ def _normalized_bundle_bindings(
             raise SnowflakeBundleError("bundle streams require explicit semantic token metadata")
         if binding.semantic_token_metadata_key != stream.snapshot_token:
             raise SnowflakeBundleError("bundle semantic token metadata must match the declared stream selector")
+        if any(
+            predicate.field_id not in expected_field_ids
+            or definition.fields_by_id[predicate.field_id].value_type != "string"
+            for predicate in binding.row_filters
+        ):
+            raise SnowflakeBundleError("bundle source filters require declared stream string fields")
         normalized_bindings.append(
             SnowflakeBundleBinding(
                 stream_id=binding.stream_id,
@@ -489,6 +545,7 @@ def _normalized_bundle_bindings(
                 source_snapshot_token_relation=binding.source_snapshot_token_relation,
                 selected_field_ids=expected_field_ids,
                 semantic_token_metadata_key=binding.semantic_token_metadata_key,
+                row_filters=binding.row_filters,
             )
         )
     return tuple(normalized_bindings)
@@ -513,6 +570,7 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
                     ),
                     selected_field_ids=tuple(binding.selected_field_ids),
                     semantic_token_metadata_key=binding.semantic_token_metadata_key,
+                    row_filters=binding.row_filters,
                 )
                 for binding in request.bindings
             ),
@@ -522,6 +580,8 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
             ),
             capture_limits=request.capture_limits,
             processing_policy=request.processing_policy,
+            snapshot_token_mode=request.snapshot_token_mode,
+            decimal_conversions=request.decimal_conversions,
         )
     except (AttributeError, TypeError) as exc:
         raise SnowflakeBundleError("bundle request seal is invalid") from exc
@@ -559,14 +619,14 @@ class SnowflakeBundleStatement:
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...]
     source_snapshot_token_columns_by_stream: tuple[SnowflakeDeclaredColumn | None, ...]
     sql: str = field(init=False)
+    parameters: tuple[str, ...] = field(init=False, repr=False)
     canonical_statement: str = field(init=False, repr=False)
     statement_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
         """Validate stream-local mappings before generating the fixed bundle SQL."""
 
-        if not isinstance(self.request, SnowflakeBundleRequest):
-            raise SnowflakeBundleError("bundle statement requires a declared bundle request")
+        _validated_bundle_request(self.request)
         if not isinstance(self.selected_columns_by_stream, tuple) or len(self.selected_columns_by_stream) != len(
             self.request.bindings
         ):
@@ -603,6 +663,7 @@ class SnowflakeBundleStatement:
             if self.request.processing_policy is not None:
                 _validate_stream_column_uniqueness(binding, selected_columns, snapshot_column)
 
+        _validate_shared_decimal_conversions(self.request, self.selected_columns_by_stream)
         sql = _bundle_sql(
             self.request,
             self.selected_columns_by_stream,
@@ -613,10 +674,28 @@ class SnowflakeBundleStatement:
             "request_sha256": self.request.request_sha256,
             "sql": sql,
         }
+        parameters = _bundle_parameters(self.request, self.selected_columns_by_stream)
+        if parameters:
+            statement_identity_by_key["parameters"] = list(parameters)
         canonical, digest = _canonical_identity("statement", statement_identity_by_key, contract=self.request.contract)
         object.__setattr__(self, "sql", sql)
+        object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "canonical_statement", canonical)
         object.__setattr__(self, "statement_sha256", digest)
+
+
+def _validate_shared_decimal_conversions(request, selected_columns_by_stream) -> None:
+    """One physical scalar cannot carry conflicting conversion declarations."""
+
+    configured = request.decimal_conversions or {}
+    modes_by_source = {}
+    for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True):
+        for column in columns:
+            source = (binding.relation, column.column_identifier)
+            mode = configured.get(column.field_id)
+            if source in modes_by_source and modes_by_source[source] != mode:
+                raise SnowflakeBundleError("shared Snowflake column decimal conversions are inconsistent")
+            modes_by_source[source] = mode
 
 
 def _validated_bundle_statement(statement: object) -> SnowflakeBundleStatement:
@@ -683,6 +762,62 @@ def _snapshot_token_expression(
     )
 
 
+def _resolved_row_filters(
+    binding: SnowflakeBundleBinding, columns: tuple[SnowflakeDeclaredColumn, ...]
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    """Use physical predicates for both SQL ordering and shared-source identity."""
+
+    columns_by_field = {column.field_id: column.column_identifier for column in columns}
+    try:
+        return tuple(
+            sorted(
+                (columns_by_field[item.field_id], item.operator, (item.value,) if item.operator == "eq" else item.value)
+                for item in binding.row_filters
+            )
+        )
+    except KeyError as exc:
+        raise SnowflakeBundleError("source filter field has no approved column") from exc
+
+
+def _row_filter_sql(
+    binding: SnowflakeBundleBinding, columns: tuple[SnowflakeDeclaredColumn, ...], *, alias: str = ""
+) -> str:
+    prefix = f"{alias}." if alias else ""
+    return " AND ".join(
+        f"{prefix}{_quoted_identifier(column)} "
+        + ("= %s" if operator == "eq" else f"IN ({', '.join('%s' for _ in operands)})")
+        for column, operator, operands in _resolved_row_filters(binding, columns)
+    )
+
+
+def _row_filter_parameters(binding, columns) -> tuple[str, ...]:
+    return tuple(
+        value for _column, _operator, operands in _resolved_row_filters(binding, columns) for value in operands
+    )
+
+
+def _bundle_source_key(request, binding, columns):
+    if request.processing_policy is None:
+        return binding.stream_id
+    return binding.relation, _resolved_row_filters(binding, columns)
+
+
+def _filtered_relation_sql(binding, columns) -> str:
+    predicate = _row_filter_sql(binding, columns)
+    return binding.relation.quoted_sql + (f" WHERE {predicate}" if predicate else "")
+
+
+def _bundle_parameters(request, selected_columns_by_stream) -> tuple[str, ...]:
+    seen_sources = set()
+    parameters = []
+    for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True):
+        key = _bundle_source_key(request, binding, columns)
+        if key not in seen_sources:
+            seen_sources.add(key)
+            parameters.extend(_row_filter_parameters(binding, columns))
+    return tuple(parameters)
+
+
 def _bundle_source_field_ids(
     request: SnowflakeBundleRequest,
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
@@ -693,7 +828,9 @@ def _bundle_source_field_ids(
         return {column.field_id: column.field_id for columns in selected_columns_by_stream for column in columns}
     fields_by_source = {}
     return {
-        column.field_id: fields_by_source.setdefault((binding.relation, column.column_identifier), column.field_id)
+        column.field_id: fields_by_source.setdefault(
+            (_bundle_source_key(request, binding, columns), column.column_identifier), column.field_id
+        )
         for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True)
         for column in columns
     }
@@ -709,7 +846,7 @@ def _bundle_sql_branches(
     source_fields = _bundle_source_field_ids(request, selected_columns_by_stream)
     columns_by_source = {}
     for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True):
-        source_key = binding.stream_id if request.processing_policy is None else binding.relation
+        source_key = _bundle_source_key(request, binding, columns)
         columns_by_source.setdefault(source_key, {}).update(
             (column.field_id, column) for column in columns if source_fields[column.field_id] == column.field_id
         )
@@ -733,7 +870,7 @@ def _bundle_sql_branches(
             *(f"NULL AS {_quoted_identifier(field.field_id)}" for field in fields),
         ]
         metadata_branches.append(f"SELECT {', '.join(metadata_values)}")
-        source_key = binding.stream_id if request.processing_policy is None else binding.relation
+        source_key = _bundle_source_key(request, binding, selected_columns)
         selected_by_field = columns_by_source.pop(source_key, None)
         if selected_by_field is None:
             continue
@@ -752,7 +889,9 @@ def _bundle_sql_branches(
             )
             for field in fields
         )
-        data_branches.append(f"SELECT {', '.join(data_values)} FROM {binding.relation.quoted_sql}")
+        data_branches.append(
+            f"SELECT {', '.join(data_values)} FROM {_filtered_relation_sql(binding, selected_columns)}"
+        )
     return metadata_branches, data_branches
 
 
@@ -935,6 +1074,8 @@ class SnowflakeBundleAcquisition:
         expected_stream_ids = tuple(binding.stream_id for binding in self.statement.request.bindings)
         if tuple(capture.stream_id for capture in self.stream_captures) != expected_stream_ids:
             raise SnowflakeBundleError("bundle captures must retain declared stream order")
+        for capture in self.stream_captures:
+            validate_decimal_conversion_sources(capture.schema, self.statement.request.decimal_conversions)
 
         manifest_streams = _validated_stream_capture_manifests(
             self.statement,
@@ -1097,6 +1238,8 @@ class SnowflakeBundleStatementBuilder:
         bindings: tuple[SnowflakeBundleBinding, ...],
         encoding: SnowflakeBundleEncoding = DEFAULT_BUNDLE_ENCODING,
         processing_policy: ProcessingPolicy | None = None,
+        snapshot_token_mode: str | None = None,
+        decimal_conversions: Mapping[str, str] | None = None,
     ) -> SnowflakeBundleRequest:
         """Validate definition-owned stream configuration before generating SQL."""
 
@@ -1106,6 +1249,8 @@ class SnowflakeBundleStatementBuilder:
             encoding=encoding,
             capture_limits=self._capture_limits,
             processing_policy=processing_policy,
+            snapshot_token_mode=snapshot_token_mode,
+            decimal_conversions=decimal_conversions,
         )
 
     def build_statement(self, request: SnowflakeBundleRequest) -> SnowflakeBundleStatement:

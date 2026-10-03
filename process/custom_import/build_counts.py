@@ -28,7 +28,8 @@ _FIELD_CODES = frozenset(
 _UNKEYED_ROOT_CODES = frozenset({"root_not_object", "root_key_missing"})
 _ROOT_CODES = _FIELD_CODES | _UNKEYED_ROOT_CODES | {"entity_binding_invalid"}
 _CHILD_CANDIDATE_CODES = frozenset({"child_not_object", "orphan_child"})
-_CHILD_CODES = _FIELD_CODES | _CHILD_CANDIDATE_CODES | {"child_key_missing", "duplicate_child_key"}
+_CHILD_RESOLVED_CODES = frozenset({"duplicate_child_key", "child_membership_missing"})
+_CHILD_CODES = _FIELD_CODES | _CHILD_CANDIDATE_CODES | {"child_key_missing"} | _CHILD_RESOLVED_CODES
 _ADMITTED_PHASES = frozenset({"graph", "rejected", "output", "verifying", "verified"})
 
 
@@ -180,13 +181,13 @@ def _child_statement(scan, root, collection_slot, *, keyed):
 def _child_code(child, root):
     if child.raw_parent_key_canonical != root.raw_parent_key_canonical:
         raise CandidateRunnerError("source outcome raw-key digest collision")
-    initial = _require_code(child.initial_code, _CHILD_CODES - {"duplicate_child_key"})
+    initial = _require_code(child.initial_code, _CHILD_CODES - _CHILD_RESOLVED_CODES)
     resolved = _require_code(child.resolved_code, _CHILD_CODES)
     if resolved in _CHILD_CANDIDATE_CODES or initial in _CHILD_CANDIDATE_CODES:
         return None
     if initial is not None:
         return initial
-    if resolved not in {None, "duplicate_child_key"}:
+    if resolved is not None and resolved not in _CHILD_RESOLVED_CODES:
         raise CandidateRunnerError("source outcome lacks its initial rejection evidence")
     return resolved
 

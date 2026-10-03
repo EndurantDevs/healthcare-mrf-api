@@ -15,7 +15,12 @@ from sqlalchemy import text
 
 from api import custom_import_read_http as transport
 from api.custom_import_provider_geo_cursor import GeoCursorState, issue_geo_cursor, open_geo_cursor
-from api.custom_import_provider_http import _hydrate_provider_rows, _parse_provider_request, _provider_relation_query
+from api.custom_import_provider_http import (
+    _hydrate_provider_rows,
+    _parse_provider_request,
+    _provider_relation_query,
+    _provider_response_limit,
+)
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
@@ -156,7 +161,7 @@ async def serve_custom_import_provider_geo(request: Any, session: Any):
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 geo_payload = await _read_geo_payload(request, session, parsed, verified, cursor_secret, trusted_now)
                 encoded = transport._canonical_json_bytes(geo_payload)
-                if len(encoded) > transport._MAX_RESPONSE_BYTES:
+                if len(encoded) > _provider_response_limit(parsed, len(geo_payload["items"])):
                     raise CustomImportReadUnavailableError("provider geo response is unavailable")
                 return transport._response(encoded, 200)
     except Exception as failure:

@@ -41,9 +41,11 @@ def _binding(statement, policy):
         {
             "stream_id": binding.stream_id,
             "relation": list(binding.relation.parts),
-            "source_snapshot_token_relation": list(binding.source_snapshot_token_relation.parts),
+            "source_snapshot_token_relation": None
+            if binding.source_snapshot_token_relation is None
+            else list(binding.source_snapshot_token_relation.parts),
             "semantic_token_metadata_key": binding.semantic_token_metadata_key,
-            "source_snapshot_token_column_identifier": snapshot.column_identifier,
+            "source_snapshot_token_column_identifier": None if snapshot is None else snapshot.column_identifier,
             "columns": [asdict(column) for column in columns],
         }
         for binding, columns, snapshot in zip(
@@ -64,6 +66,11 @@ def _binding(statement, policy):
             "warehouse": "import_wh",
             "streams": streams,
             "processing_policy": policy.to_mapping(),
+            **(
+                {"snapshot_token_mode": statement.request.snapshot_token_mode}
+                if statement.request.snapshot_token_mode is not None
+                else {}
+            ),
         }
     )
 

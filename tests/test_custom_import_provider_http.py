@@ -16,7 +16,8 @@ from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from api.endpoint import extension_reads
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
-from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue
+from process.custom_import.read_core import EntityFamilySet, PreparedNpiEntityRelation, ReadFieldValue
+from tests import custom_import_grouped_support as grouped_fixture
 from tests import test_custom_import_read_http as fixtures
 
 
@@ -271,6 +272,89 @@ async def test_provider_response_limit_applies_after_imported_field_hydration(mo
     reply = await provider_http.serve_custom_import_providers(_request(), session)
     assert reply.status == 503 and session.rolled_back
     assert len(reply.body) < 256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["limit", "page_size"])
+@pytest.mark.parametrize("limit", ["51", "100"])
+@pytest.mark.parametrize("row_count", [0, 50, 100])
+async def test_full_family_page_size_is_rejected_before_storage(monkeypatch, alias, limit, row_count):
+    session = _Session()
+    _install(monkeypatch, session, page_rows=[{"npi": str(1000000000 + index)} for index in range(row_count)])
+    request = _request(
+        _body(
+            native_query={"name_like": ["Synthetic", "Example"], alias: limit},
+            family_entitlement="full_family",
+            grouped_entity_selection=grouped_fixture.selection_document(),
+        )
+    )
+
+    reply = await provider_http.serve_custom_import_providers(request, session)
+
+    assert reply.status == 400
+    assert session.events == []
+
+
+@pytest.mark.parametrize("alias", ["limit", "page_size"])
+def test_full_family_page_bound_preserves_native_defaults_and_legacy_sizes(alias):
+    for value in ("50", " 50 ", "0", "", "null"):
+        parsed = provider_http._parse_provider_request(
+            _body(
+                native_query={alias: value},
+                family_entitlement="full_family",
+                grouped_entity_selection=grouped_fixture.selection_document(),
+            )
+        )
+        assert parsed.native_args[alias] == [value]
+    legacy = provider_http._parse_provider_request(_body(native_query={alias: "100"}))
+    assert legacy.native_args[alias] == ["100"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_count", "field_bytes", "status"), [(25, 300, 200), (50, 300, 200), (51, 300, 503), (25, 262144, 503)]
+)
+async def test_full_provider_page_bounds_apply_per_entity_and_to_actual_rows(
+    monkeypatch, row_count, field_bytes, status
+):
+    session = _Session()
+    family = SimpleNamespace(
+        root_fields=(),
+        children=tuple(
+            SimpleNamespace(collection="rates", fields=(ReadFieldValue("code", "string", "value", "x" * field_bytes),))
+            for _ in range(21)
+        ),
+    )
+    imported = EntityFamilySet(
+        None, "full_family", "period", 2024, (("segment_a", family), ("segment_b", family)), (), "b" * 64, "c" * 64
+    )
+    provider_rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(
+        monkeypatch,
+        session,
+        page_rows=provider_rows,
+        imported_items={provider["npi"]: imported for provider in provider_rows},
+    )
+    request = _request(
+        _body(family_entitlement="full_family", grouped_entity_selection=grouped_fixture.selection_document())
+    )
+    reply = await provider_http.serve_custom_import_providers(request, session)
+    assert reply.status == status
+    if status == 200:
+        provider_payload = json.loads(reply.body)
+        assert len(reply.body) > transport._MAX_RESPONSE_BYTES
+        assert len(reply.body) <= (row_count + 1) * transport._MAX_RESPONSE_BYTES
+        assert provider_payload["total"] == row_count
+        assert [provider["npi"] for provider in provider_payload["rows"]] == [
+            provider["npi"] for provider in provider_rows
+        ]
+        assert all(
+            len(group["children"]) == 21
+            for provider in provider_payload["rows"]
+            for group in provider["custom_import"]["families"]
+        )
+    else:
+        assert session.rolled_back and len(reply.body) < 256
 
 
 @pytest.mark.asyncio

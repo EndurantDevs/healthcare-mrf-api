@@ -15,6 +15,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,13 @@ from process.custom_import.capture_pending import (
     mark_pending_parquet_eof,
     seal_pending_parquet_bundle,
 )
-from process.custom_import.capture_store import _PARQUET_PART_SET_DOMAIN, CaptureReceipt, _add_payload_part_digest
+from process.custom_import.capture_store import (
+    _PARQUET_PART_SET_DOMAIN,
+    CaptureReceipt,
+    _add_payload_part_digest,
+    _identity,
+    _load_parquet_part_metadata,
+)
 from process.custom_import.definition import canonical_json
 from process.custom_import.family import validate_source_snapshot_tokens
 from process.custom_import.runner_types import SessionFactory
@@ -53,6 +60,7 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleStreamMetadata,
     _diagnostic_query_id,
     _query_identity_snapshot_token,
+    _retained_statement_query_id,
     _validated_bundle_statement,
 )
 from process.custom_import.snowflake_bundle_replay import (
@@ -70,6 +78,7 @@ from process.custom_import.snowflake_candidate import (
     _validated_bundle_request,
     bundle_request_identity_sha256,
 )
+from process.custom_import.snowflake_preflight_schema import validate_decimal_conversion_sources
 from process.custom_import.snowflake_python import (
     SnowflakeBundleLandingResult,
     SnowflakeLandingEOF,
@@ -229,6 +238,7 @@ def _schema_source(statement, binding, schema, query_id) -> dict[str, Any]:
     rebuilt_columns = tuple(SnowflakeResultColumn(**asdict(column)) for column in schema)
     if rebuilt_columns != schema or tuple(column.field_id for column in rebuilt_columns) != binding.selected_field_ids:
         raise SnowflakeCaptureError("capture result schema does not match selected fields")
+    validate_decimal_conversion_sources(rebuilt_columns, statement.request.decimal_conversions)
     fields_by_id = {field.field_id: field for field in statement.request.definition.fields}
     if any(
         not _is_bundle_column_type_valid(_arrow_type(column), fields_by_id[column.field_id])
@@ -284,6 +294,96 @@ def _landing_metadata(statement, landing_result):
     ):
         raise SnowflakeCaptureError("capture source snapshot identity has drifted")
     return token, source_by_stream
+
+
+def _validate_statement_receipts(statement, token, receipts):
+    """Bind every opted-in stream's retained source metadata to the sole statement."""
+
+    if statement.request.snapshot_token_mode is None:
+        return
+    try:
+        query_id = _retained_statement_query_id(token)
+        receipts_by_stream = {receipt.stream_id: receipt for receipt in receipts}
+        bindings = statement.request.bindings
+        if len(receipts_by_stream) != len(receipts) or set(receipts_by_stream) != {
+            binding.stream_id for binding in bindings
+        }:
+            raise ValueError("statement capture stream coverage has drifted")
+        for binding in bindings:
+            receipt = receipts_by_stream[binding.stream_id]
+            receipt_document = json.loads(receipt.canonical_manifest)
+            expected_by_field = {
+                "source_request_sha256": statement.request.request_sha256,
+                "statement_sha256": statement.statement_sha256,
+                "source_snapshot_token": token,
+                "stream_id": binding.stream_id,
+            }
+            if (
+                receipt.source_snapshot_token != token
+                or hashlib.sha256(receipt.canonical_manifest.encode("utf-8")).hexdigest() != receipt.manifest_sha256
+                or any(receipt_document.get(name) != expected for name, expected in expected_by_field.items())
+            ):
+                raise ValueError("statement capture receipt identity has drifted")
+            source_document = receipt_document["source"]
+            columns = tuple(SnowflakeResultColumn(**column) for column in source_document["result_schema"])
+            if source_document != _schema_source(statement, binding, columns, query_id):
+                raise ValueError("statement capture source identity has drifted")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise SnowflakeCaptureError("capture statement metadata is invalid") from exc
+
+
+def _validate_decimal_receipts(statement, token, receipts):
+    """Recheck converted source metadata against the authenticated request, including empty streams."""
+
+    if statement.request.decimal_conversions is None:
+        return
+    try:
+        by_stream = {receipt.stream_id: receipt for receipt in receipts}
+        if len(by_stream) != len(receipts) or set(by_stream) != {
+            binding.stream_id for binding in statement.request.bindings
+        }:
+            raise ValueError("converted capture coverage has drifted")
+        query_ids = set()
+        for binding in statement.request.bindings:
+            receipt = by_stream[binding.stream_id]
+            document = json.loads(receipt.canonical_manifest)
+            if (
+                hashlib.sha256(receipt.canonical_manifest.encode()).hexdigest() != receipt.manifest_sha256
+                or receipt.source_snapshot_token != token
+                or document.get("source_snapshot_token") != token
+                or document.get("stream_id") != binding.stream_id
+                or document.get("source_request_sha256") != statement.request.request_sha256
+                or document.get("statement_sha256") != statement.statement_sha256
+            ):
+                raise ValueError("converted capture identity has drifted")
+            source_document = document["source"]
+            query_id = _diagnostic_query_id(source_document["query_id"])
+            if query_id is None:
+                raise ValueError("converted capture query identity is missing")
+            query_ids.add(query_id)
+            columns = tuple(SnowflakeResultColumn(**column) for column in source_document["result_schema"])
+            if source_document != _schema_source(statement, binding, columns, query_id):
+                raise ValueError("converted capture source metadata has drifted")
+        if len(query_ids) != 1:
+            raise ValueError("converted capture query identities differ")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise SnowflakeCaptureError("capture decimal conversion metadata is invalid") from exc
+
+
+async def _validate_retained_source(session, request, statement, bundle):
+    """Load bounded sealed headers once for all configured source identity checks."""
+
+    if statement.request.snapshot_token_mode is None and statement.request.decimal_conversions is None:
+        return
+    identity = _identity(
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+    )
+    receipts_by_slot, _, _ = await _load_parquet_part_metadata(session, identity, bundle.capture_bundle_id)
+    receipts = tuple(receipts_by_slot.values())
+    _validate_statement_receipts(statement, bundle.snapshot_token, receipts)
+    _validate_decimal_receipts(statement, bundle.snapshot_token, receipts)
 
 
 class _AffinityLanding:
@@ -352,7 +452,12 @@ class _AffinityLanding:
                 for field in self.statement.request.definition.fields
                 if field.collection == stream.child_collection
             )
-            _validate_replay_partition_schema(event.capture, fields=fields, limits=self.policy.part_limits)
+            _validate_replay_partition_schema(
+                event.capture,
+                fields=fields,
+                limits=self.policy.part_limits,
+                decimal_conversions=self.statement.request.decimal_conversions,
+            )
         return event
 
     def close(self):
@@ -500,9 +605,12 @@ async def _append_event(session_factory, request, bundle_id, event, state, attem
     state.committed(event, canonical, values)
 
 
-async def _finish_landing(session_factory, request, bundle_id, receipt_by_stream, attempt):
+async def _finish_landing(session_factory, request, bundle_id, receipt_by_stream, attempt, statement):
     if not all(state.eof for state in receipt_by_stream.values()):
         raise SnowflakeCaptureError("capture did not exhaust every declared stream")
+    receipts = tuple(state.receipt(request) for state in receipt_by_stream.values())
+    _validate_statement_receipts(statement, request.source_snapshot_token, receipts)
+    _validate_decimal_receipts(statement, request.source_snapshot_token, receipts)
     for stream_id, state in receipt_by_stream.items():
         attempt.check()
         async with session_factory() as session, session.begin():
@@ -522,7 +630,7 @@ async def _finish_landing(session_factory, request, bundle_id, receipt_by_stream
             session,
             request=request,
             capture_bundle_id=bundle_id,
-            receipts=tuple(state.receipt(request) for state in receipt_by_stream.values()),
+            receipts=receipts,
         )
     return SnowflakeCaptureResult("capture_sealed", request.execution_id, bundle_id, request.fence)
 
@@ -552,7 +660,7 @@ async def _land(session_factory, pending, definition, source_by_stream, bundle_i
         event = None
     await _await_owned(submit(owner.close), attempt)
     attempt.check()
-    return await _finish_landing(session_factory, pending, bundle_id, receipt_by_stream, attempt)
+    return await _finish_landing(session_factory, pending, bundle_id, receipt_by_stream, attempt, owner.statement)
 
 
 async def _bound_result(session_factory, request, grant, bundle_id, identity, statement, policy):
@@ -581,6 +689,7 @@ async def _bound_result(session_factory, request, grant, bundle_id, identity, st
             or any(getattr(bundle, key) != value for key, value in digests_by_field.items())
         ):
             raise SnowflakeCaptureError("bound capture identity has drifted")
+        await _validate_retained_source(session, request, statement, bundle)
     return SnowflakeCaptureResult("capture_bound", grant.execution_id, bundle_id, grant.fence)
 
 
