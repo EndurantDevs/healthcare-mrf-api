@@ -142,7 +142,10 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
         raise CustomImportReadRequestError("metric filters are invalid")
     return _ParsedProviderRequest(
         target=transport._parse_target(document["target"]),
-        native_args=_bounded_native_args(document["native_query"], native_query_parser, entitlement),
+        native_args=_bounded_native_args(
+            document["native_query"], native_query_parser,
+            complete_family=grouped is None or entitlement == "full_family",
+        ),
         context=context,
         filters=filters,
         order_terms=order,
@@ -153,11 +156,11 @@ def _parse_provider_request(body: bytes, *, native_query_parser=_parse_native_qu
     )
 
 
-def _bounded_native_args(document, parser, entitlement):
-    """Reject oversized full-family requests before reading any provider rows."""
+def _bounded_native_args(document, parser, *, complete_family):
+    """Reject oversized complete-family requests before reading any provider rows."""
 
     args = parser(document)
-    if entitlement == "full_family":
+    if complete_family:
         for name in ("limit", "page_size"):
             limit = _parse_non_negative_int(args.get(name), name)
             if limit is not None and limit > MAX_FULL_FAMILY_PAGE_SIZE:
@@ -246,7 +249,7 @@ async def _hydrate_provider_rows(
     for entity, imported_item in imported_items.items():
         payload = transport._provider_import_payload(imported_item, parsed.target)
         if (
-            parsed.family_entitlement == "full_family"
+            (parsed.grouped_entity_selection is None or parsed.family_entitlement == "full_family")
             and len(transport._canonical_json_bytes(payload)) > transport._MAX_RESPONSE_BYTES
         ):
             raise CustomImportReadUnavailableError("provider import response is unavailable")
@@ -261,7 +264,7 @@ async def _hydrate_provider_rows(
 def _provider_response_limit(parsed, row_count):
     """One bounded native envelope plus one unchanged bound per full-family row."""
 
-    if parsed.family_entitlement != "full_family":
+    if parsed.grouped_entity_selection is not None and parsed.family_entitlement != "full_family":
         return transport._MAX_RESPONSE_BYTES
     if not 0 <= row_count <= MAX_FULL_FAMILY_PAGE_SIZE:
         raise CustomImportReadUnavailableError("full-family provider page exceeds its bound")

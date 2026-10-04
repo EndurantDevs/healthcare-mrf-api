@@ -15,11 +15,10 @@ from process.custom_import import read_core as core
 from process.custom_import.definition import canonical_json
 from process.custom_import.materialization import _context_digest
 from process.custom_import.read_contracts import (
-    MAX_FAMILY_RESPONSE_BYTES,
+    MAX_FAMILY_RESPONSE_BYTES as MAX_FAMILY_RESPONSE_BYTES,
     MAX_FULL_FAMILY_PAGE_SIZE,
     canonical_read_document,
 )
-from process.custom_import.read_payload import full_family_payload
 
 
 @dataclass(frozen=True)
@@ -344,50 +343,19 @@ async def hydrate_page(session, context, query, prepared, entity_values, scope):
 
 
 async def _hydrate_complete_families(session, context, selected_rows, scope, *, is_page=False):
-    """Preflight every entity and bound projections retained for ASCII-wire pages.
+    """Keep the grouped row cap and use the shared bounded family hydration."""
 
-    Each scalar/membership batch keeps the existing detail child bound; a page
-    cannot multiply the size of an unchecked database hydration by its row count.
-    Detail keeps its existing final UTF-8 response bound instead.
-    """
-
-    rows_by_entity = {}
-    for index, selected_row in enumerate(selected_rows):
-        rows_by_entity.setdefault(selected_row[-3], []).append((index, selected_row))
-    if len(rows_by_entity) > MAX_FULL_FAMILY_PAGE_SIZE:
+    entity_values = tuple(selected_row[-3] for selected_row in selected_rows)
+    if len(set(entity_values)) > MAX_FULL_FAMILY_PAGE_SIZE:
         raise core.CustomImportReadUnavailableError("full-family provider page exceeds its bound")
-    batches = [[]]
-    batch_children = 0
-    for entity_rows in rows_by_entity.values():
-        children = sum(selected_row[1].child_count for _, selected_row in entity_rows)
-        if children > core.MAX_DETAIL_CHILDREN:
-            raise core.CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
-        if batch_children + children > core.MAX_DETAIL_CHILDREN:
-            batches.append([])
-            batch_children = 0
-        batches[-1].append(entity_rows)
-        batch_children += children
-    projections = [None] * len(selected_rows)
-    for batch in batches:
-        batch_rows = [selected_row for entity_rows in batch for _, selected_row in entity_rows]
-        hydrated = iter(
-            await core._hydrate_selected_families(
-                session,
-                context,
-                tuple(core._winner_row(selected_row[:3], False) for selected_row in batch_rows),
-                core._scope_digest(scope),
-            )
-        )
-        for entity_rows in batch:
-            families = tuple(next(hydrated) for _ in entity_rows)
-            if is_page and (
-                len(canonical_read_document({"families": [full_family_payload(family) for family in families]}))
-                > MAX_FAMILY_RESPONSE_BYTES
-            ):
-                raise core.CustomImportReadUnavailableError("selected family response exceeds its bound")
-            for (index, _), family in zip(entity_rows, families, strict=True):
-                projections[index] = family
-    return tuple(projections)
+    return await core._hydrate_complete_family_entities(
+        session,
+        context,
+        tuple(core._winner_row(selected_row[:3], False) for selected_row in selected_rows),
+        entity_values,
+        core._scope_digest(scope),
+        is_page=is_page,
+    )
 
 
 async def hydrate_detail(session, context, request, scope):

@@ -47,11 +47,14 @@ context = SimpleNamespace(
     target=SimpleNamespace(dataset_id=11, schema_revision_id=21),
     definition=_DEFINITION,
     profile_context_slot=1,
+    collection_slots_by_name={"rates": 1},
+    collection_names_by_slot={1: "rates"},
 )
-items = asyncio.run(read_core._hydrate_search_page_items(session, context, tuple(row[:-1] for row in rows)))
+items = asyncio.run(read_core._hydrate_provider_page_items(session, context, tuple(row[:-1] for row in rows), "a" * 64))
 assert len(items) == len(_NPIS)
 assert tuple(item.root_fields[0].value for item in items) == _NPIS
 assert all(item.context_fields for item in items)
+assert all(len(item.children) == 1 and item.children[0].collection == "rates" for item in items)
 assert _FIXTURE_STATE.request_event_by_name["hydration"]
 """
     child_process = subprocess.run(

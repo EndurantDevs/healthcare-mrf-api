@@ -55,8 +55,9 @@ Native query values are strings, except `name_like`, which may also be a bounded
 list of strings. The signed route requires exact totals and a provider-page
 response; count-only, sitemap, and alternate-format requests are not supported.
 Filtering and imported ordering precede pagination over the complete eligible
-native relation. Pages retain the native 200-provider maximum and native NPI
-tie-break order.
+native relation. Complete-family composition pages admit at most 50 returned
+provider rows and retain the native NPI tie-break order. Generic search and
+grouped query-projection reads keep their existing page limits.
 
 The native response envelope and provider fields remain unchanged. Each returned
 provider gains `custom_import`, either null for an absent order-only match or:
@@ -73,22 +74,58 @@ provider gains `custom_import`, either null for an absent order-only match or:
   "root_fields": [],
   "context_fields": [
     {"field_id": "amount", "field_type": "decimal", "state": "value", "value": "12.50"}
+  ],
+  "children": [
+    {
+      "collection": "facts",
+      "fields": [
+        {"field_id": "amount", "field_type": "decimal", "state": "value", "value": "12.50"}
+      ]
+    }
   ]
 }
 ```
 
 Projected values distinguish `value`, `null`, and `missing`. Decimal values are
-strings. The returned fields come from the exact matching family and context;
+strings. In the signed provider query contract, a gateway preserves a caller's
+fractional or exponent JSON number as an exact tagged value such as
+`{"decimal":"25e-1"}`. Quoted JSON strings remain strings rather than becoming
+numeric tags; schema validation still determines which values a field accepts.
+Numeric envelopes are decoded against the declared field schema. Integer metrics
+accept exact fractional comparison thresholds; stored integer values, grouped
+selection keys, and complete child keys remain integral. Decimal comparisons
+retain declared storage bounds without converting through binary floating point.
+The returned fields come from the exact matching family and context;
 filter-only queries matching multiple contexts use a deterministic winner
-tie-break. Detail reads return all children of a selected family; opted-in grouped
+tie-break. `context_fields` describes that selected context; `children` contains
+every child in every collection of the same selected family, with all declared
+scalar projections. Child expansion does not change matching, ordering, totals,
+or provider pagination. Repeated addresses of one provider share the same family.
+Detail reads return all children of a selected family; opted-in grouped
 full-family list and geo pages also return all children, as described below.
 
-Authorization, native count/page queries, batched field hydration, and finality
-checks run inside one bounded read snapshot. Responses are private and no-store.
+Child membership and scalar values are hydrated in batches for the returned page.
+Each selected family may contain at most 1,000 children; all families are
+preflighted before hydration, and each membership/scalar batch contains at most
+1,000 children. Each complete family projection is bounded by 256 KiB before
+further batches are retained. Complete ordinary provider list, geo, and service
+pages use the same finite response policy as grouped full-family pages: at most
+50 actual rows, at most 256 KiB per imported provider payload, and a final page
+envelope of `(actual_rows + 1) * 256 KiB`. Each repeated geo-address occurrence
+counts toward that envelope. Generic search and grouped query-projection pages
+retain their existing 256 KiB response limit. Complete-family pages require a
+compatible reader applying these bounds during transport, decoding, presentation,
+and final response serialization; a legacy reader's aggregate bound is insufficient.
+
+Provider-page signatures must originate from a host-authorized full-family
+attachment. Generic summary/search reads retain their selected-context projection
+and do not expand children. Authorization, native count/page queries, batched
+field hydration, and finality checks run inside one bounded read snapshot.
+Responses are private and no-store.
 A missing required match, invalid native page, unavailable pinned generation, or
-response exceeding 256 KiB fails closed; the route does not return a partial or
-unextended fallback. Requests without extension composition retain the ordinary
-provider endpoints and their existing behavior.
+response exceeding the applicable per-provider or page bound fails closed; the
+route does not return a partial or unextended fallback. Requests without extension
+composition retain the ordinary provider endpoints and their existing behavior.
 
 Opted-in grouped list and geo requests with `family_entitlement: "full_family"`
 return `custom_import` as a `custom-import/entity-family-set/v1` document with
@@ -99,9 +136,10 @@ accept four combined context and metric predicates, or five with the declared
 grouped child query. An implicit default selection value counts as one predicate.
 The limit of three order terms is unchanged.
 
-These full-family pages allow at most 50 native rows. A `limit` or `page_size`
-above 50 is rejected with HTTP 400 before storage reads, even if fewer providers
-would match. Each provider's complete
+Ordinary complete-family pages and opted-in grouped full-family pages allow at
+most 50 native rows. List pages accept `limit` or `page_size`; service pages accept
+`limit`. A value above 50 is rejected with HTTP 400 before storage reads, even if
+fewer providers would match. Each provider's complete
 selected family set, including both groups, retains the 1,000-child and 256 KiB limits. Child
 hydration uses batches of at most 1,000 children and checks each provider's
 projected bytes before retaining further batches. The complete page is bounded

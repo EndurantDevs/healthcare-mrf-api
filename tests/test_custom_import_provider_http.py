@@ -5,6 +5,7 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +17,7 @@ from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from api.endpoint import extension_reads
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
-from process.custom_import.read_core import EntityFamilySet, PreparedNpiEntityRelation, ReadFieldValue
+from process.custom_import.read_core import EntityFamilySet, PreparedNpiEntityRelation, ReadChild, ReadFieldValue
 from tests import custom_import_grouped_support as grouped_fixture
 from tests import test_custom_import_read_http as fixtures
 
@@ -233,6 +234,7 @@ async def test_provider_hydration_preserves_order_native_values_and_absence(monk
     imported_item = SimpleNamespace(
         root_fields=(ReadFieldValue("metric", "integer", "value", 7),),
         context_fields=(ReadFieldValue("context_metric", "decimal", "null", None),),
+        children=(ReadChild("facts", 1, (ReadFieldValue("score", "decimal", "value", Decimal("2.5")),)),),
     )
     _install(
         monkeypatch,
@@ -242,14 +244,20 @@ async def test_provider_hydration_preserves_order_native_values_and_absence(monk
     )
     reply = await provider_http.serve_custom_import_providers(_request(), session)
     assert reply.status == 200
-    payload = json.loads(reply.body)
-    assert [provider["npi"] for provider in payload["rows"]] == [1104212877, "1000000000"]
-    assert payload["rows"][0]["latitude"] == 40.25
-    assert payload["rows"][0]["custom_import"] == {
+    provider_payload = json.loads(reply.body)
+    assert [provider["npi"] for provider in provider_payload["rows"]] == [1104212877, "1000000000"]
+    assert provider_payload["rows"][0]["latitude"] == 40.25
+    assert provider_payload["rows"][0]["custom_import"] == {
         "target": fixtures._TARGET,
         **transport._search_item_payload(imported_item),
+        "children": [
+            {
+                "collection": "facts",
+                "fields": [{"field_id": "score", "field_type": "decimal", "state": "value", "value": "2.5"}],
+            }
+        ],
     }
-    assert payload["rows"][1]["custom_import"] is None
+    assert provider_payload["rows"][1]["custom_import"] is None
     assert session.events.index("hydrate") < session.events.index("finality")
 
 
@@ -266,7 +274,11 @@ async def test_missing_required_imported_match_cannot_return_native_provider(mon
 async def test_provider_response_limit_applies_after_imported_field_hydration(monkeypatch):
     session = _Session()
     oversized = SimpleNamespace(
-        root_fields=(ReadFieldValue("text", "string", "value", "x" * transport._MAX_RESPONSE_BYTES),), context_fields=()
+        root_fields=(),
+        context_fields=(),
+        children=(
+            ReadChild("facts", 1, (ReadFieldValue("text", "string", "value", "x" * transport._MAX_RESPONSE_BYTES),)),
+        ),
     )
     _install(monkeypatch, session, page_rows=[{"npi": 1104212877}], imported_items={"1104212877": oversized})
     reply = await provider_http.serve_custom_import_providers(_request(), session)
@@ -277,17 +289,15 @@ async def test_provider_response_limit_applies_after_imported_field_hydration(mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ["limit", "page_size"])
 @pytest.mark.parametrize("limit", ["51", "100"])
-@pytest.mark.parametrize("row_count", [0, 50, 100])
-async def test_full_family_page_size_is_rejected_before_storage(monkeypatch, alias, limit, row_count):
+@pytest.mark.parametrize("row_count", [0, 50, 51])
+@pytest.mark.parametrize("grouped", [False, True])
+async def test_complete_family_page_size_is_rejected_before_storage(monkeypatch, alias, limit, row_count, grouped):
     session = _Session()
     _install(monkeypatch, session, page_rows=[{"npi": str(1000000000 + index)} for index in range(row_count)])
-    request = _request(
-        _body(
-            native_query={"name_like": ["Synthetic", "Example"], alias: limit},
-            family_entitlement="full_family",
-            grouped_entity_selection=grouped_fixture.selection_document(),
-        )
-    )
+    body_map = {"native_query": {"name_like": ["Synthetic", "Example"], alias: limit}}
+    if grouped:
+        body_map.update(family_entitlement="full_family", grouped_entity_selection=grouped_fixture.selection_document())
+    request = _request(_body(**body_map))
 
     reply = await provider_http.serve_custom_import_providers(request, session)
 
@@ -296,7 +306,7 @@ async def test_full_family_page_size_is_rejected_before_storage(monkeypatch, ali
 
 
 @pytest.mark.parametrize("alias", ["limit", "page_size"])
-def test_full_family_page_bound_preserves_native_defaults_and_legacy_sizes(alias):
+def test_full_family_page_bound_preserves_native_defaults_and_grouped_projection_sizes(alias):
     for value in ("50", " 50 ", "0", "", "null"):
         parsed = provider_http._parse_provider_request(
             _body(
@@ -306,8 +316,28 @@ def test_full_family_page_bound_preserves_native_defaults_and_legacy_sizes(alias
             )
         )
         assert parsed.native_args[alias] == [value]
-    legacy = provider_http._parse_provider_request(_body(native_query={alias: "100"}))
+    legacy = provider_http._parse_provider_request(
+        _body(native_query={alias: "100"}, grouped_entity_selection=grouped_fixture.selection_document())
+    )
     assert legacy.native_args[alias] == ["100"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["limit", "page_size"])
+@pytest.mark.parametrize("row_count", [0, 50])
+async def test_ordinary_page_limit_accepts_fifty_before_hydrating_unmatched_rows(monkeypatch, alias, row_count):
+    session = _Session()
+    rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(monkeypatch, session, page_rows=rows)
+    request = _request(_body(native_query={"name_like": ["Synthetic", "Example"], alias: "50"}))
+
+    reply = await provider_http.serve_custom_import_providers(request, session)
+
+    assert reply.status == 200
+    payload = json.loads(reply.body)
+    assert len(payload["rows"]) == row_count and payload["total"] == row_count
+    assert all(row["custom_import"] is None for row in payload["rows"])
+    assert session.events.index("hydrate") < session.events.index("finality")
 
 
 @pytest.mark.asyncio
@@ -355,6 +385,56 @@ async def test_full_provider_page_bounds_apply_per_entity_and_to_actual_rows(
         )
     else:
         assert session.rolled_back and len(reply.body) < 256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_count", "field_bytes", "status"),
+    [(25, 300, 200), (50, 300, 200), (51, 300, 503), (25, 262144, 503)],
+)
+async def test_ordinary_complete_page_has_finite_per_provider_envelope(monkeypatch, row_count, field_bytes, status):
+    session = _Session()
+    imported = SimpleNamespace(
+        root_fields=(),
+        context_fields=(),
+        children=tuple(
+            ReadChild(
+                "facts",
+                index + 1,
+                (ReadFieldValue("text", "string", "value", "x" * field_bytes),),
+            )
+            for index in range(42)
+        ),
+    )
+    provider_rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(
+        monkeypatch,
+        session,
+        page_rows=provider_rows,
+        imported_items={provider_document["npi"]: imported for provider_document in provider_rows},
+    )
+    reply = await provider_http.serve_custom_import_providers(_request(), session)
+    assert reply.status == status
+    if status == 200:
+        response_document = json.loads(reply.body)
+        assert transport._MAX_RESPONSE_BYTES < len(reply.body) <= (row_count + 1) * transport._MAX_RESPONSE_BYTES
+        assert response_document["total"] == row_count
+        assert [provider_document["npi"] for provider_document in response_document["rows"]] == [
+            provider_document["npi"] for provider_document in provider_rows
+        ]
+        assert all(
+            len(provider_document["custom_import"]["children"]) == 42 for provider_document in response_document["rows"]
+        )
+        assert session.events.index("hydrate") < session.events.index("finality")
+    else:
+        assert session.rolled_back and len(reply.body) < 256
+        if row_count > 50:
+            assert "hydrate" not in session.events
+
+
+def test_grouped_query_projection_keeps_legacy_envelope():
+    parsed = provider_http._parse_provider_request(_body(grouped_entity_selection=grouped_fixture.selection_document()))
+    assert provider_http._provider_response_limit(parsed, 200) == transport._MAX_RESPONSE_BYTES
 
 
 @pytest.mark.asyncio
