@@ -852,7 +852,11 @@ def _provider_import_payload(imported: Any, target: _TransportTarget) -> dict[st
         return None
     if type(imported) is EntityFamilySet:
         return _family_set_payload(imported, target)
-    return {"target": _target_document(target), **_search_item_payload(imported)}
+    return {
+        "target": _target_document(target),
+        **_search_item_payload(imported),
+        "children": _full_family_payload(imported)["children"],
+    }
 
 
 def _response(body: bytes, status: int):

@@ -262,6 +262,7 @@ async def test_geo_hydrates_unique_npis_in_one_snapshot_and_issues_private_ancho
     imported_item = SimpleNamespace(
         root_fields=(ReadFieldValue("metric", "integer", "value", 7),),
         context_fields=(ReadFieldValue("region", "string", "value", "north"),),
+        children=(SimpleNamespace(collection="facts", fields=(ReadFieldValue("score", "integer", "value", 3),)),),
     )
     observed_calls_by_name = _install_geo_service(monkeypatch, session, imported_items={"1104212877": imported_item})
     observed_bindings = []
@@ -295,6 +296,11 @@ async def test_geo_hydrates_unique_npis_in_one_snapshot_and_issues_private_ancho
     ]
     assert response_document["items"][0]["custom_import"]["target"] == fixtures._TARGET
     assert response_document["items"][1]["custom_import"]["root_fields"][0]["value"] == 7
+    assert (
+        response_document["items"][0]["custom_import"]["children"]
+        == response_document["items"][1]["custom_import"]["children"]
+    )
+    assert response_document["items"][0]["custom_import"]["children"][0]["fields"][0]["value"] == 3
     assert response_document["items"][2]["custom_import"] is None
     assert "_custom_import_next_anchor" not in response_document
     assert isinstance(response_document["next_cursor"], str)
@@ -302,6 +308,61 @@ async def test_geo_hydrates_unique_npis_in_one_snapshot_and_issues_private_ancho
     assert observed_calls_by_name["hydration"][0]["prepared"] is observed_calls_by_name["prepared"][0]
     assert observed_bindings[0].session is session
     assert session.events == ["begin", "snapshot", "bounded", "resolve", "prepare", "hydrate", "finality", "end"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_count", "field_bytes", "status"),
+    [(25, 300, 200), (50, 300, 200), (25, 262144, 503)],
+)
+async def test_complete_geo_page_counts_each_address_in_finite_envelope(monkeypatch, row_count, field_bytes, status):
+    session = _Session()
+    imported = SimpleNamespace(
+        root_fields=(),
+        context_fields=(),
+        children=tuple(
+            SimpleNamespace(
+                collection="facts",
+                fields=(ReadFieldValue("text", "string", "value", "x" * field_bytes),),
+            )
+            for _ in range(42)
+        ),
+    )
+    observed = _install_geo_service(monkeypatch, session, imported_items={"1104212877": imported})
+    provider_rows = [_provider(1104212877, str(uuid.UUID(int=index + 1))) for index in range(row_count)]
+
+    async def page(request, *, native_args, import_context, prepare_cursor):
+        assert await _prepare_geo_cursor(prepare_cursor, session, native_args) is None
+        return _geo_reply(provider_rows)
+
+    monkeypatch.setattr(geo, "_geo_page", page)
+    reply = await geo.serve_custom_import_provider_geo(
+        _request(_body(native_query=_native_query(limit=str(row_count)))), session
+    )
+    assert reply.status == status
+    assert len(observed["hydration"]) == 1
+    assert observed["hydration"][0]["entity_values"] == ("1104212877",)
+    if status == 200:
+        response_document = json.loads(reply.body)
+        assert transport._MAX_RESPONSE_BYTES < len(reply.body) <= (row_count + 1) * transport._MAX_RESPONSE_BYTES
+        assert (
+            response_document["total_count"] == row_count
+            and response_document["has_more"] is False
+            and response_document["next_cursor"] is None
+        )
+        assert [provider_document["address_key"] for provider_document in response_document["items"]] == [
+            provider_document["address_key"] for provider_document in provider_rows
+        ]
+        assert all(
+            provider_document["custom_import"] == response_document["items"][0]["custom_import"]
+            for provider_document in response_document["items"]
+        )
+        assert all(
+            len(provider_document["custom_import"]["children"]) == 42
+            for provider_document in response_document["items"]
+        )
+    else:
+        assert session.rolled_back and len(reply.body) < 256
 
 
 @pytest.mark.asyncio

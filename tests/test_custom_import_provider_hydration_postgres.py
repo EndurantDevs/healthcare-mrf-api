@@ -57,7 +57,7 @@ async def test_native_page_hydration_uses_only_matching_context_and_family(monke
             "query": NpiEntityRelationQuery(filters=filters),
         }
         prepared = await service.prepare_npi_entity_relation(session, target=fixture.target, **query_map)
-        result = await service.hydrate_npi_page(
+        hydrated_by_npi = await service.hydrate_npi_page(
             session,
             pinned_target=fixture.target,
             **query_map,
@@ -65,12 +65,20 @@ async def test_native_page_hydration_uses_only_matching_context_and_family(monke
             entity_values=(npi_fixture._NPI, npi_fixture._ABSENT_NPI),
         )
 
-        assert set(result) == {npi_fixture._NPI}
-        selected_item = result[npi_fixture._NPI]
+        assert set(hydrated_by_npi) == {npi_fixture._NPI}
+        selected_item = hydrated_by_npi[npi_fixture._NPI]
         assert selected_item.winner.family_revision_id == fixture.selected_family.family_revision_id
         assert selected_item.context_child_revision_id == fixture.selected_family.child_revision_ids[child_index]
-        assert next(value for value in selected_item.context_fields if value.field_id == "amount").state == state
+        assert (
+            next(field_value for field_value in selected_item.context_fields if field_value.field_id == "amount").state
+            == state
+        )
         assert selected_item.root_fields[0].value == "synthetic-root"
+        assert (
+            tuple(child.child_revision_id for child in selected_item.children)
+            == fixture.selected_family.child_revision_ids
+        )
+        assert fixture.foreign_child_revision_id not in {child.child_revision_id for child in selected_item.children}
 
 
 @pytest.mark.asyncio

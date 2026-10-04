@@ -51,6 +51,7 @@ async def _resolve(database, schema, source, target, *, bit=1, priority=4):
 
 async def _install_archive_schema(database, schema):
     """Install canonical functions, archive columns, revision guards and the write seal."""
+    await database.status("CREATE EXTENSION IF NOT EXISTS postgis WITH SCHEMA public")
     foundation = _canonical_migration()
     async with database.engine.begin() as connection:
         await connection.run_sync(
