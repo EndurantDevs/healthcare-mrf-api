@@ -59,7 +59,8 @@ def test_migration_offline_orders_guards(monkeypatch, direction):
     assert statements.index("LOCK TABLE") < statements.index("ADD CONSTRAINT")
     assert statements.count("NOT VALID") == 3
     assert statements.count("VALIDATE CONSTRAINT") == 1
-    assert "conbin IS DISTINCT FROM probe_row.conbin" in statements
+    assert "pg_get_expr(live_row.conbin, live_row.conrelid)" in statements
+    assert "pg_get_expr(probe_row.conbin, probe_row.conrelid)" in statements
     assert "NOT live_row.convalidated" in statements
     assert "DROP TABLE" not in statements and "DELETE FROM" not in statements
     if direction == "downgrade":
@@ -189,6 +190,28 @@ def test_native_upgrade_retains_ledger(monkeypatch):
                 async with engine.begin() as connection:
                     await connection.execute(sa.text(f"DELETE FROM {original._qt(schema, original._TABLE)}"))
             assert await _snapshot(engine, schema) == after
+
+    asyncio.run(exercise())
+
+
+def test_native_upgrade_accepts_equivalent_cast_encoding(monkeypatch):
+    """A historical explicit cast can deparse identically with different conbin."""
+
+    async def exercise():
+        async with _ledger(monkeypatch) as (engine, schema):
+            await _insert(engine, schema, _row("incumbent"))
+            table = original._qt(schema, original._TABLE)
+            equivalent = original._values_check().replace("contract_id =", "contract_id::text =", 1)
+            async with engine.begin() as connection:
+                await connection.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT {original._VALUES_CONSTRAINT}"))
+                await connection.execute(
+                    sa.text(f"ALTER TABLE {table} ADD CONSTRAINT {original._VALUES_CONSTRAINT} CHECK ({equivalent})")
+                )
+            before = await _snapshot(engine, schema)
+            await _migrate(engine, schema, "upgrade")
+            assert await _snapshot(engine, schema) == before
+            await _insert(engine, schema, _row("candidate", 4))
+            assert len((await _snapshot(engine, schema))[0]) == 2
 
     asyncio.run(exercise())
 
