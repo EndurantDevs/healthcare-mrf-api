@@ -180,10 +180,14 @@ def test_discovery_result_exposes_public_catalog_metrics():
         "file_probe_ok",
         "crawl_run_id",
         "errors",
+        "pending_identity_count",
+        "identity_resolution_complete",
         "process_workers",
     }
     assert result["catalog_export_version"] == 1
     assert result["process_workers"] == 1
+    assert result["pending_identity_count"] == 0
+    assert result["identity_resolution_complete"] is True
 
 
 def test_discovery_command_exposes_public_options():
@@ -14547,8 +14551,9 @@ class _DirectDiscoveryHarness:
     async def push_objects(self, row_dicts, model, *, rewrite, use_copy):
         self.persisted_batches.append((model, row_dicts, rewrite, use_copy))
 
-    async def store_candidates(self, _candidates, *, discovery_run_id):
+    async def store_candidates(self, _candidates, *, discovery_run_id, identity_errors):
         assert discovery_run_id.startswith("mrfcrawl_")
+        assert identity_errors == []
         return (
             [{"payer_id": "payer_1"}],
             [{"source_id": "source_1", "index_url": "https://example.com/index.json"}],
@@ -14633,7 +14638,10 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
     assert metrics["source_set_count"] == 1
     assert metrics["completed_source_count"] == 1
     assert metrics["sources"] in {1}
-    assert [crawl_row["run_id"] for crawl_row in crawl_rows] == [control_run_id, control_run_id]
+    assert [crawl_row["run_id"] for crawl_row in crawl_rows] == [control_run_id] * 3
+    assert [crawl_row["status"] for crawl_row in crawl_rows] == ["running", "running", "succeeded"]
+    assert crawl_rows[1]["sources_discovered"] == 1
+    assert crawl_rows[1]["errors"] == []
     assert [progress_update["run_id"] for progress_update in harness.progress] == [
         control_run_id,
         control_run_id,
