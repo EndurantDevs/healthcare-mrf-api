@@ -45,10 +45,10 @@ def fetch_max_bytes(default: int) -> int:
     return default
 
 
-def assert_public_ip(ip: ipaddress._BaseAddress) -> None:
-    """Reject loopback and private destination addresses."""
+def assert_public_ip(ip: ipaddress._BaseAddress, *, strict: bool = False) -> None:
+    """Reject non-public addresses; strict callers ignore the local override."""
     if ip.is_loopback or ip.is_private:
-        if _is_local_allowed():
+        if not strict and _is_local_allowed():
             return
         raise UnsafeUrlError(f"non-public IP address is not allowed: {ip}")
     # not is_global also catches ranges the flag checks miss, e.g. CGNAT 100.64.0.0/10
