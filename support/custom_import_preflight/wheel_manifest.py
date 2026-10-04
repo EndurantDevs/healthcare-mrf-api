@@ -18,6 +18,7 @@ CANONICAL_MODULES = (
     "process/custom_import/snowflake_binding.py",
     "process/custom_import/snowflake_preflight.py",
     "process/custom_import/snowflake_preflight_schema.py",
+    "process/custom_import/snowflake_inspection.py",
 )
 WHEEL_INITIALIZERS = ("custom_import_preflight/__init__.py",)
 

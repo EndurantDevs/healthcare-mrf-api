@@ -4,11 +4,77 @@ Run these commands from an installed application environment with the existing
 database configuration. They use the standalone engine; no external control
 service is required. IDs below are synthetic examples, not default targets.
 
+| Entry point | Commands | Purpose |
+| --- | --- | --- |
+| `custom_import_cli` | `validate` | Validate a definition from stdin without database access. |
+| `custom_import_cli` | `status`, `captures` | Read exact retained lifecycle evidence. |
+| `custom_import_cli` | `cancel`, `activate`, `rollback` | Request cancellation or perform guarded publication. |
+| `custom_import_snowflake_operator` | `register`, `register-authority` | Register a canonical binding using local database authority or a fixed mounted capability. |
+| `custom_import_snowflake_operator` | `execute`, `resume` | Acquire an approved source or resume a retained capture. |
+| `custom_import_snowflake_operator` | `discover`, `estimate`, `preflight` | Inspect selected metadata, count approved source streams, or preview bounded families. |
+
 Validate a bounded definition from standard input without opening the database:
 
 ```sh
 python -m custom_import_cli validate --format json < definition.json
 ```
+
+Register a canonical JSON envelope containing exactly `dataset_key`,
+`definition`, and `source_binding`, then execute its returned retained IDs:
+
+```sh
+python -m custom_import_snowflake_operator register < registration.json
+python -m custom_import_snowflake_operator execute \
+  --definition-revision-id 12 --source-binding-revision-id 14 \
+  --idempotency-key synthetic-import
+```
+
+`register-authority` also reads stdin, using its separately prepared fixed
+registration capability and authority mounts. It accepts no command-line
+authority, credential, SQL, path, or environment overrides. Registration does
+not itself acquire source records. `execute` uses the fixed local key-pair
+credential directory, the retained role/warehouse, and disabled secondary roles.
+
+Inspect only the selected fields of the approved relations:
+
+```sh
+python -m custom_import_snowflake_operator discover \
+  --definition-revision-id 12 --source-binding-revision-id 14
+python -m custom_import_snowflake_operator estimate \
+  --definition-revision-id 12 --source-binding-revision-id 14 \
+  --maximum-total-bytes 65536 --maximum-elapsed-seconds 30
+```
+
+`discover` runs a generated selected-column `LIMIT 0` query per stream. Its
+receipt includes approved logical field IDs, recognized source types, and
+capture-runtime type compatibility, including explicit decimal conversions.
+Unrecognized or unavailable types are
+`unknown` with compatibility false; this is not proof of data validity,
+nullability, root-key uniqueness, or family completeness. No records are fetched.
+The separate metadata queries do not constitute a single source snapshot.
+
+`estimate` runs one generated statement containing `COUNT(*)` for each approved
+stream relation with its approved row filters. Source row counts are exact
+for that statement, including duplicates and unmatched child rows.
+Counts are not retained import snapshots
+or admitted family counts. Import yield, storage bytes, and warehouse credits
+are explicitly `unknown`. Counts from repeated use of a relation are separate
+stream observations, not additive distinct records.
+
+Both commands load retained bindings read-only and emit no source samples,
+physical relation names, SQL, or driver diagnostics. Their only optional
+arguments are `--maximum-total-bytes` (default 1 MiB, cap 16 MiB) and
+`--maximum-elapsed-seconds` (default 30, cap 120). The byte limit applies to the
+serialized successful receipt; a fixed redacted error envelope is separate.
+Errors discard the result. Elapsed time is shared across source queries,
+with driver timeouts rounded up to whole seconds and a deadline check after
+each call. A stalled driver or cleanup may exceed the deadline before returning.
+These are not process-memory or warehouse-scan limits: an exact count may
+scan the entire source relation and incur warehouse cost.
+
+For bounded family preview, use the existing [`preflight` command](./custom-import-snowflake-preflight.md).
+Samples require its explicit `--include-sample` option; discovery and estimate
+do not accept that option.
 
 Inspect an exact execution or retained generation:
 

@@ -41,6 +41,11 @@ from process.custom_import.snowflake_candidate import (
     SnowflakeBundleCandidateRequest,
     run_snowflake_bundle_candidate,
 )
+from process.custom_import.snowflake_inspection import (
+    INSPECTION_ERROR_CODES,
+    SnowflakeInspectionError,
+    inspect_snowflake_bundle,
+)
 from process.custom_import.snowflake_preflight import (
     DEFAULT_MAX_CHILD_ROWS,
     DEFAULT_MAX_ELAPSED_SECONDS,
@@ -70,8 +75,9 @@ from process.custom_import.snowflake_source_binding import (
 
 FIXED_CREDENTIAL_DIRECTORY = Path("/run/custom-import-operator")
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", flags=re.ASCII)
-_SAFE_ERROR_CODES = frozenset(
-    {"canceled", "failed", "invalid_arguments", "invalid_registration", "source_binding_unavailable"}
+_SAFE_ERROR_CODES = (
+    frozenset({"canceled", "failed", "invalid_arguments", "invalid_registration", "source_binding_unavailable"})
+    | INSPECTION_ERROR_CODES
 )
 _SAFE_STATUSES = frozenset(
     {
@@ -151,14 +157,18 @@ def _parser() -> argparse.ArgumentParser:
         operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
         operation.add_argument("--idempotency-key", required=True, type=_idempotency_key)
-    preflight = commands.add_parser("preflight", allow_abbrev=False)
-    preflight.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
-    preflight.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
-    preflight.add_argument("--maximum-root-keys", default=DEFAULT_MAX_ROOT_KEYS, type=_positive_identifier)
-    preflight.add_argument("--maximum-child-rows", default=DEFAULT_MAX_CHILD_ROWS, type=_positive_identifier)
-    preflight.add_argument("--maximum-total-bytes", default=DEFAULT_MAX_TOTAL_BYTES, type=_positive_identifier)
-    preflight.add_argument("--maximum-elapsed-seconds", default=DEFAULT_MAX_ELAPSED_SECONDS, type=_positive_identifier)
-    preflight.add_argument("--include-sample", action="store_true")
+    for command in ("preflight", "discover", "estimate"):
+        operation = commands.add_parser(command, allow_abbrev=False)
+        operation.add_argument("--definition-revision-id", required=True, type=_positive_identifier)
+        operation.add_argument("--source-binding-revision-id", required=True, type=_positive_identifier)
+        operation.add_argument("--maximum-total-bytes", default=DEFAULT_MAX_TOTAL_BYTES, type=_positive_identifier)
+        operation.add_argument(
+            "--maximum-elapsed-seconds", default=DEFAULT_MAX_ELAPSED_SECONDS, type=_positive_identifier
+        )
+        if command == "preflight":
+            operation.add_argument("--maximum-root-keys", default=DEFAULT_MAX_ROOT_KEYS, type=_positive_identifier)
+            operation.add_argument("--maximum-child-rows", default=DEFAULT_MAX_CHILD_ROWS, type=_positive_identifier)
+            operation.add_argument("--include-sample", action="store_true")
     return parser
 
 
@@ -333,8 +343,8 @@ def _preflight_limits(parsed: argparse.Namespace) -> SnowflakePreflightLimits:
     """Build the core's bounded limit contract from fixed CLI fields."""
 
     return SnowflakePreflightLimits(
-        maximum_root_keys=parsed.maximum_root_keys,
-        maximum_child_rows=parsed.maximum_child_rows,
+        maximum_root_keys=getattr(parsed, "maximum_root_keys", DEFAULT_MAX_ROOT_KEYS),
+        maximum_child_rows=getattr(parsed, "maximum_child_rows", DEFAULT_MAX_CHILD_ROWS),
         maximum_total_bytes=parsed.maximum_total_bytes,
         maximum_elapsed_seconds=parsed.maximum_elapsed_seconds,
     )
@@ -613,9 +623,10 @@ async def _preflight_retained_snowflake_binding(
     source_binding_revision_id: int,
     limits: SnowflakePreflightLimits,
     include_sample: bool,
+    operation: str = "preflight",
     database=db,
 ) -> str:
-    """Run one bounded retained-binding preflight without lifecycle writes."""
+    """Preview or inspect one retained binding without lifecycle writes."""
 
     with _receipt_only_database_output(database):
         engine = None
@@ -632,15 +643,23 @@ async def _preflight_retained_snowflake_binding(
                     definition_revision_id=definition_revision_id,
                     source_binding_revision_id=source_binding_revision_id,
                 )
-            preflight_result = _run_snowflake_preflight(loaded_binding, limits)
+            preflight_result = (
+                _run_snowflake_preflight(loaded_binding, limits)
+                if operation == "preflight"
+                else _run_snowflake_preflight(loaded_binding, limits, operation=operation)
+            )
             # Let a pending first SIGINT become primary before cleanup awaits.
             await asyncio.sleep(0)
-            rendered = _preflight_receipt(
-                preflight_result,
-                definition=loaded_binding.definition,
-                source_binding_sha256=loaded_binding.source_binding_sha256,
-                limits=limits,
-                include_sample=include_sample,
+            rendered = (
+                _preflight_receipt(
+                    preflight_result,
+                    definition=loaded_binding.definition,
+                    source_binding_sha256=loaded_binding.source_binding_sha256,
+                    limits=limits,
+                    include_sample=include_sample,
+                )
+                if operation == "preflight"
+                else preflight_result
             )
             # Receipt rendering is also synchronous before the cleanup boundary.
             await asyncio.sleep(0)
@@ -654,8 +673,10 @@ async def _preflight_retained_snowflake_binding(
             await _disconnect_preflight_database(database, has_primary_failure=has_primary_failure)
 
 
-def _run_snowflake_preflight(loaded_binding: Any, limits: SnowflakePreflightLimits) -> SnowflakePreflightResult:
-    """Compose the fixed local credential and generated preflight adapter."""
+def _run_snowflake_preflight(
+    loaded_binding: Any, limits: SnowflakePreflightLimits, *, operation: str = "preflight"
+) -> SnowflakePreflightResult | str:
+    """Compose fixed credentials and the generated preview/inspection adapter."""
 
     source_adapter = SnowflakePythonConnectorAdapter(
         role=loaded_binding.binding.role,
@@ -671,6 +692,15 @@ def _run_snowflake_preflight(loaded_binding: Any, limits: SnowflakePreflightLimi
             connector=source_adapter,
             credential_provider=credential_provider,
         )
+        if operation != "preflight":
+            return inspect_snowflake_bundle(
+                loaded_binding.definition,
+                loaded_binding.binding,
+                bundle_connector,
+                preflight_adapter,
+                operation=operation,
+                limits=limits,
+            )
         return preflight_snowflake_bundle(
             loaded_binding.definition,
             loaded_binding.binding,
@@ -685,12 +715,14 @@ def _run_preflight_command(parsed: argparse.Namespace, limits: SnowflakePrefligh
 
     if limits is None:
         raise ValueError("preflight limits are unavailable")
+    inspection_arguments = {"operation": parsed.command} if parsed.command in {"discover", "estimate"} else {}
     return asyncio.run(
         _preflight_retained_snowflake_binding(
             definition_revision_id=parsed.definition_revision_id,
             source_binding_revision_id=parsed.source_binding_revision_id,
             limits=limits,
-            include_sample=parsed.include_sample,
+            include_sample=getattr(parsed, "include_sample", False),
+            **inspection_arguments,
         )
     )
 
@@ -973,7 +1005,9 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
     parser = _parser()
     parsed = parser.parse_args(arguments)
     try:
-        preflight_limits = _preflight_limits(parsed) if parsed.command == "preflight" else None
+        preflight_limits = (
+            _preflight_limits(parsed) if parsed.command in {"preflight", "discover", "estimate"} else None
+        )
     except SnowflakePreflightError:
         parser.error("invalid")
     try:
@@ -1008,6 +1042,9 @@ def run_command(arguments: Sequence[str] | None = None, *, stream: Any | None = 
     except KeyboardInterrupt:
         print(_error_json("canceled"), file=sys.stderr)
         return 130
+    except SnowflakeInspectionError as exc:
+        print(_error_json(exc.code), file=sys.stderr)
+        return 1
     except DefinitionRegistrationError, SnowflakeSourceBindingError:
         code = (
             "invalid_registration"
