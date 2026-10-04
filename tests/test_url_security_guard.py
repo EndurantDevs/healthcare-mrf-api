@@ -15,7 +15,6 @@ from process.url_security import (
     urlopen_safe,
 )
 
-
 NON_GLOBAL_ADDRESSES = [
     "100.64.1.1",  # CGNAT / Tailscale shared space (not caught by is_private)
     "198.18.0.1",  # benchmarking range
@@ -134,6 +133,27 @@ def test_private_addresses_require_explicit_local_fetch_opt_in(monkeypatch):
     monkeypatch.setenv(url_security.FETCH_ALLOW_LOCAL_ENV, "yes")
 
     assert_public_ip(ipaddress.ip_address("127.0.0.1"))
+
+
+@pytest.mark.parametrize("address", NON_GLOBAL_ADDRESSES + ["::1", "fc00::1", "ff02::1"])
+def test_strict_policy_ignores_local_override(monkeypatch, address):
+    monkeypatch.setenv(url_security.FETCH_ALLOW_LOCAL_ENV, "yes")
+
+    with pytest.raises(UnsafeUrlError):
+        assert_public_ip(ipaddress.ip_address(address), strict=True)
+
+
+def test_strict_policy_accepts_global_addresses(monkeypatch):
+    monkeypatch.setenv(url_security.FETCH_ALLOW_LOCAL_ENV, "yes")
+
+    assert_public_ip(ipaddress.ip_address("8.8.8.8"), strict=True)
+    assert_public_ip(ipaddress.ip_address("2606:4700:4700::1111"), strict=True)
+
+
+def test_explicit_default_preserves_local_override(monkeypatch):
+    monkeypatch.setenv(url_security.FETCH_ALLOW_LOCAL_ENV, "yes")
+
+    assert_public_ip(ipaddress.ip_address("127.0.0.1"), strict=False)
 
 
 @pytest.mark.parametrize(
