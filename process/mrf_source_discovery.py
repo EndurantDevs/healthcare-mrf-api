@@ -238,6 +238,11 @@ class DiscoveryResult:
     source_batch_summary: SourceBatchSummary | None = None
     process_workers: int = 1
 
+    @property
+    def pending_identity_count(self) -> int:
+        """Count candidates still awaiting unambiguous source continuity."""
+        return sum(error.get("code") == SOURCE_IDENTITY_AMBIGUOUS for error in self.errors)
+
     def as_dict(self) -> dict[str, Any]:
         """Serialize discovery counters, errors, and run identity."""
         result_by_field = {
@@ -253,6 +258,8 @@ class DiscoveryResult:
             "file_probe_ok": self.file_probe_ok,
             "crawl_run_id": self.crawl_run_id,
             "errors": self.errors,
+            "pending_identity_count": self.pending_identity_count,
+            "identity_resolution_complete": self.pending_identity_count == 0,
             "process_workers": self.process_workers,
         }
         if self.source_batch_summary is not None:
@@ -3105,10 +3112,14 @@ def _merge_payer_candidate_row(
 
 
 from process.mrf_payer_identity import (
+    SOURCE_IDENTITY_AMBIGUOUS,
     _curated_payer_row_key,
     _preserved_payer_updates,
     _preserved_source_updates,
+    discovery_control_metrics as _discovery_control_metrics,
     is_candidate_bound_to_source as _candidate_matches_stored_source,
+    load_pending_identity_errors as _load_pending_identity_errors,
+    persist_running_identity_errors as _persist_running_identity_errors,
     store_candidates as _store_candidates,
 )
 
@@ -16555,36 +16566,6 @@ def _control_status_from_crawl_status(crawl_status: str) -> str:
     return "succeeded" if crawl_status == "succeeded_with_errors" else crawl_status
 
 
-def _discovery_control_metrics(
-    result: DiscoveryResult,
-    *,
-    crawl_status: str,
-    crawl_run_id: str,
-    run_mode: str,
-    bytes_streamed: int = 0,
-) -> dict[str, Any]:
-    metrics_by_name = {
-        "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
-        "crawl_run_id": crawl_run_id,
-        "crawl_status": crawl_status,
-        "run_mode": run_mode,
-        "candidates": result.candidates,
-        "payers": result.payers,
-        "sources": result.sources,
-        "urls_checked": result.urls_checked,
-        "plans_discovered": result.plans,
-        "files_discovered": result.files,
-        "files_probed": result.files_probed,
-        "file_probe_ok": result.file_probe_ok,
-        "process_workers": result.process_workers,
-        "bytes_streamed": bytes_streamed,
-        "error_count": len(result.errors),
-    }
-    if result.source_batch_summary is not None:
-        metrics_by_name.update(result.source_batch_summary.proof_metrics())
-    return metrics_by_name
-
-
 def _discovery_crawl_run_row(
     run_context_dict: dict[str, Any],
     *,
@@ -16630,7 +16611,7 @@ async def _persist_failed_discovery_crawl_row(
                     status="failed",
                     result=discovery_result,
                     finished_at=finished_at,
-                    error_dicts=[error_dict],
+                    error_dicts=[*discovery_result.errors, error_dict],
                 )
             ],
             MRFCrawlRun,
@@ -17363,12 +17344,12 @@ async def _initialize_discovery_persistence(state: _DiscoveryCommandState) -> No
             await init_db(db, asyncio.get_event_loop())
             await ensure_database(state.test_mode)
             await _ensure_catalog_tables()
-            await push_objects(
-                [_discovery_crawl_run_row(state.run_context_dict, status="running")],
-                MRFCrawlRun,
-                rewrite=True,
-                use_copy=False,
+            pending_identity_errors = (
+                await _load_pending_identity_errors(state.retry_parent_run_id)
+                if state.retry_parent_run_id else []
             )
+            state.result.errors.extend(pending_identity_errors)
+            await _persist_running_identity_errors(state.run_context_dict, state.result)
             if state.retry_parent_run_id:
                 state.resumed_source_rows = await state.checkpoint_store.resume_batch(
                     requested_root_run_id,
@@ -17464,25 +17445,35 @@ def _filter_discovery_candidates(
 async def _store_discovery_sources(
     state: _DiscoveryCommandState, candidates: list[SourceCandidate]
 ) -> list[dict[str, Any]]:
-    if state.result.errors:
+    if state.resumed_source_rows is None and any(
+        error.get("code") != SOURCE_IDENTITY_AMBIGUOUS
+        for error in state.result.errors
+    ):
         provider_error = RuntimeError(
             "MRF discovery provider loading failed; source set was not frozen"
         )
         await _record_discovery_command_failure(state, provider_error)
         raise provider_error
     if state.resumed_source_rows is None:
+        current_identity_errors: list[dict[str, Any]] = []
         try:
             payer_rows, source_rows = await _store_candidates(
                 candidates,
                 discovery_run_id=state.control_run_id,
+                identity_errors=current_identity_errors,
             )
         except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
             await _record_discovery_command_failure(state, exc)
             raise
+        state.result.errors = current_identity_errors
         state.result.payers = len(payer_rows)
+        if not source_rows and state.result.pending_identity_count:
+            identity_error = ValueError(SOURCE_IDENTITY_AMBIGUOUS)
+            await _record_discovery_command_failure(state, identity_error)
+            raise identity_error
         return source_rows
     source_rows = state.resumed_source_rows
-    state.result.candidates = len(source_rows)
+    state.result.candidates = len(source_rows) + state.result.pending_identity_count
     state.result.payers = len(
         {
             str(source_row.get("payer_id") or "").strip()
@@ -17504,6 +17495,7 @@ async def _execute_discovery_source_work(
     if not state.needs_source_load:
         return
     try:
+        await _persist_running_identity_errors(state.run_context_dict, state.result)
         source_batch_summary = await _execute_discovery_source_batch(
             DiscoverySourceBatchContext(
                 root_run_id=state.checkpoint_root_run_id,

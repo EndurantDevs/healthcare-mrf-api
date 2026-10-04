@@ -123,6 +123,110 @@ async def _check_curated_multi_url_row(suffix, payer_ids, source_ids):
     source_ids.update(source_record["source_id"] for source_record in grouped_sources)
 
 
+async def _seed_ambiguous_sources(candidate, suffix, payer_ids, source_ids):
+    ambiguous_source_ids = set()
+    async with db.session() as session:
+        for index in range(2):
+            payer_id = f"mrfpayer_ambiguous_{suffix}_{index}"
+            source_id = f"mrfsource_ambiguous_{suffix}_{index}"
+            payer_row, source_row = discovery._candidate_to_rows(
+                candidate,
+                dt.datetime(2025, 1, 1),
+                payer_id=payer_id,
+                source_id=source_id,
+            )
+            assert source_row is not None
+            payer_row.update(lifecycle="reviewed", eins=["12-3456789"])
+            source_row.update(status="active", etag=f"retained-{index}")
+            source_row["metadata_json"]["catalog_paging_manifest"] = {"snapshot": f"keep-{index}"}
+            await session.execute(MRFPayer.__table__.insert().values(**payer_row))
+            await session.execute(MRFSource.__table__.insert().values(**source_row))
+            payer_ids.add(payer_id)
+            source_ids.add(source_id)
+            ambiguous_source_ids.add(source_id)
+    return ambiguous_source_ids
+
+
+async def _identity_snapshot(selected_source_ids):
+    async with db.session() as session:
+        sources = [
+            dict(row)
+            for row in (
+                await session.execute(
+                    select(MRFSource.__table__)
+                    .where(MRFSource.source_id.in_(selected_source_ids))
+                    .order_by(MRFSource.source_id)
+                )
+            ).mappings()
+        ]
+        payers = [
+            dict(row)
+            for row in (
+                await session.execute(
+                    select(MRFPayer.__table__)
+                    .where(MRFPayer.payer_id.in_(source["payer_id"] for source in sources))
+                    .order_by(MRFPayer.payer_id)
+                )
+            ).mappings()
+        ]
+    return payers, sources
+
+
+async def _check_ambiguous_curated_row_isolation(suffix, payer_ids, source_ids):
+    ambiguous, sibling = discovery.parse_master_list(
+        "| Payer | Type | Public MRF TOC / landing URL | Notes |\n"
+        "|---|---|---|---|\n"
+        f"| Example Ambiguous {suffix} | regional | "
+        f"https://example.test/{suffix}/ambiguous · https://example.test/{suffix}/sibling "
+        "| public indexes |\n"
+    )
+    safe = discovery.SourceCandidate(
+        payer_name=f"Independent {suffix}",
+        provider="master-list",
+        index_url=f"https://example.test/{suffix}/independent",
+    )
+    ambiguous_ids = await _seed_ambiguous_sources(ambiguous, suffix, payer_ids, source_ids)
+    before = await _identity_snapshot(ambiguous_ids)
+    with pytest.raises(ValueError, match="^mrf_discovery_source_identity_ambiguous$"):
+        await discovery._store_candidates([safe, sibling, ambiguous])
+    async with db.session() as session:
+        partial_sources = (
+            (
+                await session.execute(
+                    select(MRFSource.__table__).where(MRFSource.index_url.in_([safe.index_url, sibling.index_url]))
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert partial_sources == []
+    first_errors = []
+    first_payers, first_sources = await discovery._store_candidates(
+        [sibling, safe, ambiguous], discovery_run_id="run_isolated", identity_errors=first_errors
+    )
+    assert len(first_payers) == len(first_sources) == 1
+    assert first_sources[0]["index_url"] == safe.index_url
+    payer_ids.add(first_payers[0]["payer_id"])
+    source_ids.add(first_sources[0]["source_id"])
+    repeated_errors = []
+    repeated_payers, repeated_sources = await discovery._store_candidates(
+        [sibling, safe, ambiguous], identity_errors=repeated_errors
+    )
+    assert repeated_payers[0]["payer_id"] == first_payers[0]["payer_id"]
+    assert repeated_sources[0]["source_id"] == first_sources[0]["source_id"]
+    assert repeated_errors == first_errors
+    assert len(first_errors) == 2
+    assert {error["curated_row_pending"] for error in first_errors} == {False, True}
+    assert await _identity_snapshot(ambiguous_ids) == before
+    async with db.session() as session:
+        sibling_rows = (
+            (await session.execute(select(MRFSource.__table__).where(MRFSource.index_url == sibling.index_url)))
+            .mappings()
+            .all()
+        )
+    assert sibling_rows == []
+
+
 @pytest.mark.asyncio
 async def test_discovery_preserves_legacy_ids_and_serializes_new_identity():
     """A rerun or alias rename keeps IDs while scoped siblings remain distinct."""
@@ -143,6 +247,7 @@ async def test_discovery_preserves_legacy_ids_and_serializes_new_identity():
         renamed_candidate = await _check_legacy_rename(old_candidate, legacy_payer, legacy_source)
         await _check_shared_url_and_query_scope(old_candidate, renamed_candidate, suffix, payer_ids, source_ids)
         await _check_curated_multi_url_row(suffix, payer_ids, source_ids)
+        await _check_ambiguous_curated_row_isolation(suffix, payer_ids, source_ids)
     finally:
         async with db.session() as session:
             await session.execute(MRFSource.__table__.delete().where(MRFSource.source_id.in_(source_ids)))

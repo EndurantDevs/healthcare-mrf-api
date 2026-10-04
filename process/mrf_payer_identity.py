@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from typing import Any
 
 from sqlalchemy import or_, select, text, update
 
-from db.models import MRFPayer, MRFSource, db
+from db.models import MRFCrawlRun, MRFPayer, MRFSource, db
 from process.mrf_source_discovery import (
+    DISCOVERY_CATALOG_EXPORT_VERSION,
+    DiscoveryResult,
     SourceCandidate,
     _candidate_target_payer_query,
     _candidate_to_rows,
@@ -18,6 +22,113 @@ from process.mrf_source_discovery import (
     _merge_payer_candidate_row,
     _utc_now,
 )
+
+SOURCE_IDENTITY_AMBIGUOUS = "mrf_discovery_source_identity_ambiguous"
+
+
+def _partition_source_matches(candidates, source_records_by_locator, identity_errors):
+    """Exclude ambiguous identities and their scoped reviewed-row siblings."""
+    candidate_matches = [
+        [
+            source_record
+            for source_record in source_records_by_locator.get(_candidate_source_locator(candidate), [])
+            if is_candidate_bound_to_source(candidate, source_record)
+        ]
+        for candidate in candidates
+    ]
+    pending_curated_row_keys = {
+        row_key
+        for candidate, matches in zip(candidates, candidate_matches)
+        if len(matches) > 1 and (row_key := _curated_payer_row_key(candidate)) is not None
+    }
+    resolved_candidates, matched_sources = [], []
+    for candidate, matches in zip(candidates, candidate_matches):
+        if len(matches) > 1 or _curated_payer_row_key(candidate) in pending_curated_row_keys:
+            if identity_errors is None:
+                raise ValueError(SOURCE_IDENTITY_AMBIGUOUS)
+            identity_components = [
+                _candidate_source_locator(candidate),
+                candidate.payer_name,
+                sorted(candidate.aliases),
+                _curated_payer_row_key(candidate),
+            ]
+            identity_errors.append(
+                {
+                    "code": SOURCE_IDENTITY_AMBIGUOUS,
+                    "candidate_sha256": hashlib.sha256(
+                        json.dumps(identity_components, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "matched_source_ids": sorted(source_record["source_id"] for source_record in matches),
+                    "curated_row_pending": len(matches) <= 1,
+                }
+            )
+            continue
+        resolved_candidates.append(candidate)
+        matched_sources.append(matches[0] if matches else None)
+    return resolved_candidates, matched_sources
+
+
+def discovery_control_metrics(
+    discovery_result: DiscoveryResult,
+    *,
+    crawl_status: str,
+    crawl_run_id: str,
+    run_mode: str,
+    bytes_streamed: int = 0,
+) -> dict[str, Any]:
+    """Project verified-source progress without hiding unresolved identities."""
+    metrics_by_name = {
+        "catalog_export_version": DISCOVERY_CATALOG_EXPORT_VERSION,
+        "crawl_run_id": crawl_run_id,
+        "crawl_status": crawl_status,
+        "run_mode": run_mode,
+        "candidates": discovery_result.candidates,
+        "payers": discovery_result.payers,
+        "sources": discovery_result.sources,
+        "urls_checked": discovery_result.urls_checked,
+        "plans_discovered": discovery_result.plans,
+        "files_discovered": discovery_result.files,
+        "files_probed": discovery_result.files_probed,
+        "file_probe_ok": discovery_result.file_probe_ok,
+        "process_workers": discovery_result.process_workers,
+        "bytes_streamed": bytes_streamed,
+        "error_count": len(discovery_result.errors),
+        "pending_identity_count": discovery_result.pending_identity_count,
+        "identity_resolution_complete": discovery_result.pending_identity_count == 0,
+    }
+    if discovery_result.source_batch_summary is not None:
+        metrics_by_name.update(discovery_result.source_batch_summary.proof_metrics())
+    return metrics_by_name
+
+
+async def load_pending_identity_errors(parent_run_id: str) -> list[dict[str, Any]]:
+    """Keep unresolved identities visible when resuming the verified source set."""
+    async with db.session() as session:
+        errors = await session.scalar(
+            select(MRFCrawlRun.errors)
+            .where(MRFCrawlRun.run_id == parent_run_id)
+            .order_by(MRFCrawlRun.started_at.desc(), MRFCrawlRun.crawl_run_id.desc())
+            .limit(1)
+        )
+    return [
+        dict(error)
+        for error in errors or []
+        if isinstance(error, dict) and error.get("code") == SOURCE_IDENTITY_AMBIGUOUS
+    ]
+
+
+async def persist_running_identity_errors(run_context: dict[str, Any], result: DiscoveryResult) -> None:
+    """Persist known identity outcomes before a crawl can claim checkpoint work."""
+    from process import mrf_source_discovery
+
+    await mrf_source_discovery.push_objects(
+        [mrf_source_discovery._discovery_crawl_run_row(
+            run_context, status="running", result=result, error_dicts=result.errors,
+        )],
+        MRFCrawlRun,
+        rewrite=True,
+        use_copy=False,
+    )
 
 
 def _candidate_source_locator(candidate: SourceCandidate) -> tuple[str, str | None, str | None]:
@@ -61,6 +172,7 @@ def _curated_payer_row_key(candidate: SourceCandidate) -> tuple[str, ...] | None
         str(raw["raw_payer_name"]),
         str(raw["url_cell"]),
         str(raw.get("notes") or ""),
+        _candidate_target_payer_query(candidate) or "",
     )
 
 
@@ -131,7 +243,7 @@ def _preserved_source_updates(
     return {key: value for key, value in updates_by_field.items() if existing.get(key) != value}
 
 
-async def _match_existing_sources(session, candidates):
+async def _match_existing_sources(session, candidates, identity_errors=None):
     """Resolve only source continuity supported by scoped URL and name evidence."""
     canonical_urls = sorted(
         {_candidate_source_locator(candidate)[1] for candidate in candidates if _candidate_source_locator(candidate)[1]}
@@ -157,25 +269,20 @@ async def _match_existing_sources(session, candidates):
     source_records_by_locator = {}
     for source_record in source_records:
         source_records_by_locator.setdefault(_stored_source_locator(source_record), []).append(source_record)
-    matched_sources = []
+    candidates, matched_sources = _partition_source_matches(
+        candidates,
+        source_records_by_locator,
+        identity_errors,
+    )
     payer_ids_by_curated_row = {}
-    for candidate in candidates:
-        matches = [
-            source_record
-            for source_record in source_records_by_locator.get(_candidate_source_locator(candidate), [])
-            if is_candidate_bound_to_source(candidate, source_record)
-        ]
-        if len(matches) > 1:
-            raise ValueError("mrf_discovery_source_identity_ambiguous")
-        matched_source = matches[0] if matches else None
-        matched_sources.append(matched_source)
+    for candidate, matched_source in zip(candidates, matched_sources):
         curated_row_key = _curated_payer_row_key(candidate)
         existing_payer_id = matched_source.get("payer_id") if matched_source else None
         if curated_row_key and existing_payer_id:
             previous_id = payer_ids_by_curated_row.setdefault(curated_row_key, existing_payer_id)
             if previous_id != existing_payer_id:
                 raise ValueError("mrf_discovery_payer_identity_conflict")
-    return matched_sources, payer_ids_by_curated_row
+    return candidates, matched_sources, payer_ids_by_curated_row
 
 
 def _prepare_candidate_rows(candidates, matched_sources, payer_ids_by_curated_row, now, discovery_run_id):
@@ -292,6 +399,7 @@ async def store_candidates(
     candidates: list[SourceCandidate],
     *,
     discovery_run_id: str | None = None,
+    identity_errors: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Persist payer discovery with source-bound IDs and additive updates."""
     if any(not (candidate.index_url or candidate.human_url) for candidate in candidates):
@@ -306,7 +414,13 @@ async def store_candidates(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
             {"lock_name": "mrf_source_discovery_payer_identity"},
         )
-        matched_sources, payer_ids_by_curated_row = await _match_existing_sources(session, candidates)
+        candidates, matched_sources, payer_ids_by_curated_row = await _match_existing_sources(
+            session,
+            candidates,
+            identity_errors,
+        )
+        if not candidates:
+            return [], []
         (payer_rows_by_id, source_rows_by_id, source_updates_by_id, payer_renames_by_id) = _prepare_candidate_rows(
             candidates,
             matched_sources,
