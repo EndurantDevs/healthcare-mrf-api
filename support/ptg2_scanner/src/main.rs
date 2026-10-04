@@ -27224,12 +27224,7 @@ fn run_cli() -> io::Result<()> {
 
 fn scanner_failure_code(error: &io::Error) -> &'static str {
     let message = error.to_string();
-    if message.contains("source witness")
-        && (message.contains("payload budget")
-            || message.contains("intermediate budget")
-            || message.contains("fail-closed")
-            || message.contains("spool byte limit"))
-    {
+    if source_witness::is_capacity_failure(&message) {
         "witness_payload_limit"
     } else {
         "scanner_failure"

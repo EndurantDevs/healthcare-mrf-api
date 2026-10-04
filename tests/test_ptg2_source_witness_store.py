@@ -130,8 +130,16 @@ def test_segmented_source_witness_payload_rejects_incomplete_or_corrupt_parts(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "contract",
+    [
+        witness_store.PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+        witness_store.PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT,
+    ],
+)
 async def test_source_witness_row_replacement_persists_all_parts_in_one_session(
     monkeypatch,
+    contract,
 ):
     class RecordingSession:
         def __init__(self):
@@ -142,6 +150,7 @@ async def test_source_witness_row_replacement_persists_all_parts_in_one_session(
 
     witness_payload = b"01234567abcdefghIJKLMNOP"
     witness_metadata_by_field = {
+        "contract": contract,
         "source_set_digest": "11" * 32,
         "sample_digest": "22" * 32,
         "queryable_occurrence_population_count": 1,
@@ -163,6 +172,7 @@ async def test_source_witness_row_replacement_persists_all_parts_in_one_session(
 
     assert len(session.calls) == 4
     assert "DELETE FROM" in session.calls[0][0]
+    assert session.calls[1][1]["contract"] == contract
     assert session.calls[1][1]["payload"] == b"01234567"
     assert [call[1]["part_number"] for call in session.calls[2:]] == [1, 2]
     assert [call[1]["payload"] for call in session.calls[2:]] == [
@@ -173,6 +183,21 @@ async def test_source_witness_row_replacement_persists_all_parts_in_one_session(
         call[1]["part_sha256"] == hashlib.sha256(call[1]["payload"]).digest()
         for call in session.calls[2:]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract", [None, "unsupported-witness-format"])
+async def test_source_witness_publication_rejects_unknown_contract_before_sql(contract):
+    session = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(RuntimeError, match="publication contract is invalid"):
+        await witness_store._insert_source_witness_parent(
+            schema='"synthetic"',
+            snapshot_key=7,
+            witness_metadata={"contract": contract},
+            first_payload_part=b"payload",
+            session=session,
+        )
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

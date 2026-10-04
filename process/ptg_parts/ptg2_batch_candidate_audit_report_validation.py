@@ -342,6 +342,7 @@ def _validate_http_and_io(
         candidate_processing_io=io_ledgers_by_kind[
             "candidate_processing_io"
         ],
+        expected_source_witness=witness,
     )
     if (
         witness_io["record_decodes"] != int(witness["record_count"])

@@ -90,13 +90,27 @@ def projection_dependency_bindings_match_sql(schema_name: str, dependency_bindin
     checks = []
     for name, binding in bindings_by_name.items():
         relation = projection_dependency_relation_sql(schema_name, name, dependency_bindings=bindings_by_name)
+        inheritance = _held_inheritance_sql(name)
         checks.append(
             f"EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=to_regclass('{relation}') "
             f"AND held.oid={binding['relation_oid']} AND pg_relation_filenode(held.oid)={binding['relfilenode']} "
             "AND held.relkind='r' AND held.relpersistence='p' AND NOT held.relispartition "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=held.oid OR inhparent=held.oid))"
+            "AND NOT held.relrowsecurity AND NOT held.relforcerowsecurity "
+            f"AND {inheritance})"
         )
     return " AND ".join(checks)
+
+
+def _held_inheritance_sql(canonical_name):
+    """A TIGER held leaf may inherit only its fixed canonical extension parent."""
+    allowed_parent = (
+        f" AND inhparent IS DISTINCT FROM to_regclass('{canonical_name}')"
+        if canonical_name in {"tiger.zip_state", "tiger.zcta5"} else ""
+    )
+    return (
+        "NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhparent=held.oid "
+        f"OR (inhrelid=held.oid{allowed_parent}))"
+    )
 
 
 def projection_relation_signature_sql(schema_name: str, *, dependency_bindings=None) -> str:
@@ -140,34 +154,85 @@ def projection_dependency_lock_sql(schema_name: str, *, dependency_bindings=None
     return f"LOCK TABLE {', '.join(relations)} IN ACCESS SHARE MODE;"
 
 
+def projection_stored_bindings_sql(schema_name: str, column: str) -> tuple[str, str]:
+    """Read closed persisted bindings without interpolating their values into SQL.
+
+    The second expression rejects malformed maps and changed physical heaps.
+    NULL preserves the existing canonical-name projection contract.
+    """
+    schema_name = _sql_identifier(schema_name, field_name="address schema")
+    if column not in {"active_dependency_bindings", "candidate_dependency_bindings"}:
+        raise ValueError("geo projection binding column is invalid")
+    names = [f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES]
+    safe_object = f"CASE WHEN jsonb_typeof({column})='object' THEN {column} ELSE '{{}}'::jsonb END"
+    checks = [f"(SELECT count(*) FROM jsonb_object_keys({safe_object}))=6",
+              f"(SELECT count(DISTINCT value->>'relation_oid') FROM jsonb_each({safe_object}))=6"]
+    pairs = []
+    for name in names:
+        entry = f"({column}->'{name}')"
+        physical = (
+            f"CASE WHEN {entry}->>'schema_name' ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$' "
+            f"AND {entry}->>'table_name' ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$' "
+            f"THEN to_regclass(format('%I.%I',{entry}->>'schema_name',{entry}->>'table_name')) END"
+        )
+        pairs.extend((repr(name), f"jsonb_build_array(COALESCE(({physical})::oid::bigint,-1), "
+                     f"COALESCE(pg_relation_filenode({physical})::bigint,-1))"))
+        checks.append(
+            f"(jsonb_typeof({entry})='object' AND "
+            f"{entry} - ARRAY['schema_name','table_name','relation_oid','relfilenode']='{{}}'::jsonb "
+            f"AND jsonb_typeof({entry}->'relation_oid')='number' "
+            f"AND jsonb_typeof({entry}->'relfilenode')='number' "
+            f"AND EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=({physical}) "
+            f"AND held.oid::text={entry}->>'relation_oid' "
+            f"AND pg_relation_filenode(held.oid)::text={entry}->>'relfilenode' "
+            "AND held.relkind='r' AND held.relpersistence='p' AND NOT held.relispartition "
+            "AND NOT held.relrowsecurity AND NOT held.relforcerowsecurity "
+            f"AND {_held_inheritance_sql(name)}))"
+        )
+    signature = (
+        f"CASE WHEN {column} IS NULL THEN {projection_relation_signature_sql(schema_name)} "
+        f"ELSE jsonb_build_object({', '.join(pairs)}) END"
+    )
+    return signature, f"(({column} IS NULL AND NOT ({retained_tiger_children_sql()})) OR ({' AND '.join(checks)}))"
+
+
+def retained_tiger_children_sql() -> str:
+    """Legacy root signatures cannot identify protected received snapshot children.
+
+    Ordinary geocoder source inheritance remains compatible with legacy state.
+    This is only a refusal predicate, never authority for a held binding.
+    """
+    return """EXISTS (
+        SELECT 1 FROM pg_catalog.pg_inherits edge
+        JOIN pg_catalog.pg_class child ON child.oid=edge.inhrelid
+        JOIN pg_catalog.pg_namespace namespace ON namespace.oid=child.relnamespace
+        JOIN pg_catalog.pg_roles owner ON owner.oid=child.relowner
+        JOIN pg_catalog.pg_depend membership ON membership.classid='pg_class'::regclass
+          AND membership.objid=edge.inhparent AND membership.objsubid=0
+          AND membership.refclassid='pg_extension'::regclass AND membership.deptype='e'
+        JOIN pg_catalog.pg_extension extension ON extension.oid=membership.refobjid
+        WHERE edge.inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5'))
+          AND namespace.nspname ~ '^reference_family_archive_[0-9a-f]{32}$'
+          AND namespace.nspowner=child.relowner AND NOT owner.rolcanlogin AND NOT owner.rolsuper
+          AND NOT owner.rolcreaterole AND NOT owner.rolcreatedb AND NOT owner.rolreplication
+          AND NOT owner.rolbypassrls AND extension.extname='postgis_tiger_geocoder'
+    )"""
+
+
 def projection_state_available_sql(schema_name: str) -> str:
     """Require the active projection to match every published dependency."""
 
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     live_table = f"{schema_name}.entity_address_unified"
-    signature_checks: list[str] = []
-    for dependency_schema, table_name in _PROJECTION_DEPENDENCIES:
-        relation_schema = dependency_schema or schema_name
-        qualified_name = f"{relation_schema}.{table_name}"
-        signature_checks.extend(
-            (
-                "COALESCE(geo_assurance_state.active_relation_signature #>> "
-                f"ARRAY[{qualified_name!r}, '0'], '') = "
-                f"COALESCE(to_regclass('{qualified_name}')::oid::bigint, -1)::text",
-                "COALESCE(geo_assurance_state.active_relation_signature #>> "
-                f"ARRAY[{qualified_name!r}, '1'], '') = "
-                "COALESCE(pg_relation_filenode("
-                f"to_regclass('{qualified_name}'))::bigint, -1)::text",
-            )
-        )
-    signature_match_sql = "\n           AND ".join(signature_checks)
+    signature, binding_matches = projection_stored_bindings_sql(schema_name, "active_dependency_bindings")
     return f"""EXISTS (
         SELECT 1
           FROM {schema_name}.{GEO_ASSURANCE_STATE_TABLE} AS geo_assurance_state
          WHERE geo_assurance_state.singleton IS TRUE
            AND geo_assurance_state.active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
            AND geo_assurance_state.active_table_oid = to_regclass('{live_table}')::oid
-           AND {signature_match_sql}
+           AND {binding_matches}
+           AND geo_assurance_state.active_relation_signature = ({signature})
     )"""
 
 

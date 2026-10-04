@@ -11,6 +11,7 @@ from process import entity_address_snapshot_receipt as receipt
 from process import entity_address_snapshot_restore as restore
 from tests.test_entity_address_archive_ownership_guards import _owner
 from tests.test_entity_address_snapshot_stage import _receipt
+from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
 
 def _stored_restore():
@@ -55,6 +56,11 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
     assert validation == stored["native_validation"]
     context["address_alias_generation"] = 8
     assert stored["context"]["address_alias_generation"] == 7
+    stored["context"]["dependency_bindings"] = _example_bindings()
+    *_, context, _validation = restore._validated_rehydration_state(stored)
+    assert context["dependency_bindings"] == stored["context"]["dependency_bindings"]
+    context["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 1
+    assert context["dependency_bindings"] != stored["context"]["dependency_bindings"]
 
 
 @pytest.mark.asyncio
@@ -73,6 +79,7 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
         ("context", {"address_alias_generation": True, "stage_persistence": "p"}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "u"}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "p", "unexpected": 1}),
+        ("context", {"address_alias_generation": 7, "stage_persistence": "p", "dependency_bindings": {}}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "p", "phase_timings": object()}),
         ("native_validation", {"address_alias_generation": 8}),
     ],

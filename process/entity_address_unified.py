@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import hashlib
 import importlib
+import json
 import logging
 import os
 import re
@@ -34,21 +35,21 @@ from db.models import (
     FacilityAnchorNPICandidate,
     db,
 )
-from process.control_lifecycle import mark_control_run
 from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_preparation_admission as preparation_admission
+from process import entity_address_result_generation as result_generation
+from process import provider_directory_profile as profile_artifact
+from process.control_lifecycle import mark_control_run
 from process.entity_address_candidate_preparation import (
-    ProviderDirectoryAddressDatasetPin,
-    ProviderDirectoryAddressPreparationInput,
-    PreparedEntityAddressGeneration,
-    prepare_provider_directory_entity_address,
-    publish_prepared_entity_address_generation,
-    cleanup_prepared_entity_address_generation,
     _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE,
     _PROVIDER_DIRECTORY_PARTIAL_OVERLAY_SOURCE_TEMPLATE,
+    PreparedEntityAddressGeneration,
+    ProviderDirectoryAddressDatasetPin,
+    ProviderDirectoryAddressPreparationInput,
+    cleanup_prepared_entity_address_generation,
+    prepare_provider_directory_entity_address,
+    publish_prepared_entity_address_generation,
 )
-from process import entity_address_result_generation as result_generation
-from process.entity_address_serving_receipt import ordinary_address_receipt_callbacks
 from process.entity_address_cutover_contract import (
     EntityAddressCutoverCallbacks,
     apply_transaction_sql_settings,
@@ -58,6 +59,19 @@ from process.entity_address_cutover_contract import (
     require_caller_owned_cutover_transaction,
     run_publish_validation_operations,
 )
+from process.entity_address_dependency_bindings import (
+    activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
+)
+from process.entity_address_dependency_bindings import (
+    record_geo_assurance_candidate_sql as _record_geo_assurance_candidate_sql,
+)
+from process.entity_address_dependency_bindings import (
+    selected_publication_dependencies,
+)
+from process.entity_address_dependency_bindings import (
+    validate_schema_name as _validate_schema_name,
+)
+from process.entity_address_serving_receipt import ordinary_address_receipt_callbacks
 from process.ext import address_alias_sql
 from process.ext.address_format import (
     ADDRESS_FORMAT_FUNCTION,
@@ -66,7 +80,6 @@ from process.ext.address_format import (
 )
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress, write_live_progress
-from process import provider_directory_profile as profile_artifact
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -281,15 +294,6 @@ def _archived_identifier(name: str, suffix: str = "_old") -> str:
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
     return f"{name[:trim_to]}_{digest}{suffix}"
-
-
-def _validate_schema_name(schema: str) -> str:
-    cleaned = (schema or "").strip()
-    if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
-        raise ValueError(f"Invalid schema name: {schema!r}")
-    if not all(ch.isalnum() or ch == "_" for ch in cleaned):
-        raise ValueError(f"Invalid schema name: {schema!r}")
-    return cleaned
 
 
 def _is_env_enabled(name: str, default: bool) -> bool:
@@ -5960,67 +5964,6 @@ async def _validate_geo_assurance_projection(
     return invalid_rows
 
 
-def _record_geo_assurance_candidate_sql(
-    db_schema: str,
-    stage_table: str,
-    projected_rows: int,
-    *,
-    dependency_bindings=None,
-) -> str:
-    db_schema = _validate_schema_name(db_schema)
-    stage_table = _validate_schema_name(stage_table)
-    state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
-    stage_relation = f"{db_schema}.{stage_table}"
-    signature_sql = geo_projection.projection_relation_signature_sql(
-        db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
-    )
-    return f"""
-    INSERT INTO {db_schema}.{state_table} (
-        singleton,
-        candidate_geo_assurance_version,
-        candidate_table_oid,
-        candidate_relation_signature,
-        candidate_projected_rows
-    )
-    SELECT
-        true,
-        {geo_projection.GEO_ASSURANCE_VERSION},
-        to_regclass('{stage_relation}')::oid,
-        {signature_sql},
-        {int(projected_rows)}::bigint
-     WHERE to_regclass('{stage_relation}') IS NOT NULL
-    ON CONFLICT (singleton) DO UPDATE SET
-        candidate_geo_assurance_version = EXCLUDED.candidate_geo_assurance_version,
-        candidate_table_oid = EXCLUDED.candidate_table_oid,
-        candidate_relation_signature = EXCLUDED.candidate_relation_signature,
-        candidate_projected_rows = EXCLUDED.candidate_projected_rows
-    RETURNING candidate_table_oid::bigint;
-    """
-
-
-def _activate_geo_assurance_candidate_sql(db_schema: str) -> str:
-    db_schema = _validate_schema_name(db_schema)
-    state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
-    live_relation = f"{db_schema}.{EntityAddressUnified.__main_table__}"
-    return f"""
-    UPDATE {db_schema}.{state_table}
-       SET active_geo_assurance_version = candidate_geo_assurance_version,
-           active_table_oid = candidate_table_oid,
-           active_relation_signature = candidate_relation_signature,
-           candidate_geo_assurance_version = NULL,
-           candidate_table_oid = NULL,
-           candidate_relation_signature = NULL,
-           candidate_projected_rows = NULL
-     WHERE singleton IS TRUE
-       AND candidate_geo_assurance_version = {geo_projection.GEO_ASSURANCE_VERSION}
-       AND candidate_table_oid = to_regclass('{live_relation}')::oid
-       AND candidate_relation_signature = (
-           {geo_projection.projection_relation_signature_sql(db_schema)}
-       )
-    RETURNING active_table_oid::bigint;
-    """
-
-
 def _emit_geo_assurance_progress(
     run_id: str,
     stage_rows: int,
@@ -6134,6 +6077,7 @@ async def _project_geo_assurance_transaction(
                 db_schema,
                 stage_table,
                 projected_rows,
+                require_canonical_publication=candidate_preparation.has_prepared_doctors(),
                 **binding_options,
             )
         )
@@ -13676,7 +13620,7 @@ async def startup(ctx):
     )
 
 
-async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool = False):
+async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool = False, dependency_bindings=None):
     """Finalize, validate, and publish one entity-address-unified import."""
     if prepare_only and candidate_preparation.current() is None:
         raise RuntimeError("entity-address preparation requires internal desired inputs")
@@ -13691,6 +13635,18 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     await ensure_database(bool(context.get("test_mode")))
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    geo_dependency_options_dict = candidate_preparation.geo_dependency_options()
+    if dependency_bindings is not None:
+        selected = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
+        if geo_dependency_options_dict and geo_dependency_options_dict["dependency_bindings"] != selected:
+            raise RuntimeError("entity-address desired dependency bindings differ")
+        geo_dependency_options_dict = {"dependency_bindings": selected}
+    elif not geo_dependency_options_dict and context.get("publish_requested", True):
+        async with selected_publication_dependencies(db, db_schema) as selected:
+            if selected is not None:
+                return await publish_entity_address_unified_generation(
+                    ctx, prepare_only=prepare_only, dependency_bindings=selected
+                )
     stage_cls = make_class(EntityAddressUnified, import_date)
     serving_only_refresh = bool(context.get("serving_only_refresh"))
     support_stage_class_map = {} if serving_only_refresh else _support_stage_classes(import_date)
@@ -13921,7 +13877,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         context=context,
         run_id=run_id,
         stage_rows=stage_rows,
-        **candidate_preparation.geo_dependency_options(),
+        **geo_dependency_options_dict,
     )
     compaction_started = time.monotonic()
     context["geo_assurance_compaction"] = await _compact_geo_assurance_stage(

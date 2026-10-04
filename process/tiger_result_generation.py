@@ -3,6 +3,8 @@
 
 from dataclasses import asdict
 
+from sqlalchemy import text
+
 from process.reference_family_archive import (
     ReferenceFamilyArchiveError,
     _bounded_capture,
@@ -40,6 +42,12 @@ async def publish_tiger_generation(
     ):
         raise ReferenceFamilyArchiveError("TIGER local publication scope differs")
     async with _bounded_capture(session):
+        if await session.scalar(
+            text("""SELECT EXISTS(SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid
+            WHERE d.classid='pg_class'::regclass AND d.objid=to_regclass('tiger.zip_state')
+              AND d.refclassid='pg_extension'::regclass AND d.deptype='e' AND e.extname='postgis_tiger_geocoder')""")
+        ):
+            raise ReferenceFamilyArchiveError("extension TIGER requires explicit inherited snapshot activation")
         receipt = await activate_validated_reference_family_stage(
             session,
             ownership=ownership,

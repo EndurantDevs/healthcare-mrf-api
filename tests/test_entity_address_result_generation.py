@@ -106,7 +106,7 @@ def test_automatic_order_fails_closed_without_same_lineage_monotonic_evidence(
 
 
 def test_legacy_prepared_adoption_context_is_explicitly_generationless():
-    context = restore._rehydrated_context({"address_alias_generation": 7, "stage_persistence": "p"})
+    context = restore._rehydrated_context({"address_alias_generation": 7, "stage_persistence": "p"}, db_schema="mrf")
 
     assert context["result_generation_mode"] == "adoption"
     assert context["source_serving_generation"] is None
@@ -119,7 +119,8 @@ def test_prepared_adoption_context_requires_both_generation_fields():
                 "address_alias_generation": 7,
                 "stage_persistence": "p",
                 "result_generation_mode": "adoption",
-            }
+            },
+            db_schema="mrf",
         )
 
 
