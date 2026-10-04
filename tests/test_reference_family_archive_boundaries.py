@@ -21,7 +21,7 @@ async def test_source_lock_preserves_other_families_and_label_select_only_reader
     await archive._lock_source_family(session, spec, "synthetic")
     names = archive.RELATION_NAMES_BY_IMPORTER["mrf"] if importer_id == "mrf" else spec.table_names
     relations = ", ".join(f'"synthetic"."{name}"' for name in names)
-    mode = "ACCESS SHARE MODE NOWAIT" if importer_id == "label" else "SHARE MODE"
+    mode = "ACCESS SHARE MODE NOWAIT" if importer_id == "label" else "ACCESS SHARE MODE"
     assert str(session.execute.await_args.args[0]) == f"LOCK TABLE {relations} IN {mode}"
 
 

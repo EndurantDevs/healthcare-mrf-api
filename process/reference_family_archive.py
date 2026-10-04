@@ -555,14 +555,14 @@ async def _lock_family(
 
 
 async def _lock_source_family(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
-    """Keep table-before-summary order with a SELECT-only Label replacement fence."""
+    """Pin source relations before summaries; repeatable read pins their row versions."""
 
     names = RELATION_NAMES_BY_IMPORTER["mrf"] if spec.importer_id == "mrf" else spec.table_names
     if spec.importer_id == "label":
         # Repeatable-read/exported snapshots pin rows; this lock blocks replacement DDL.
         await _lock_family(session, schema_name, names, "ACCESS SHARE", nowait=True)
         return
-    await _lock_family(session, schema_name, names, "SHARE")
+    await _lock_family(session, schema_name, names, "ACCESS SHARE")
 
 
 async def _has_source_generation_authority(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> bool:

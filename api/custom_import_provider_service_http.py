@@ -12,7 +12,12 @@ from sanic.request.parameters import RequestParameters
 from sqlalchemy import text
 
 from api import custom_import_read_http as transport
-from api.custom_import_provider_http import _hydrate_provider_rows, _parse_provider_request, _provider_relation_query
+from api.custom_import_provider_http import (
+    _hydrate_provider_rows,
+    _parse_provider_request,
+    _provider_relation_query,
+    _provider_response_limit,
+)
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
@@ -75,7 +80,7 @@ async def serve_custom_import_provider_service(request: Any, session: Any):
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 service_payload = await _read_service_payload(request, session, parsed, verified)
                 encoded = transport._canonical_json_bytes(service_payload)
-                if len(encoded) > transport._MAX_RESPONSE_BYTES:
+                if len(encoded) > _provider_response_limit(parsed, len(service_payload["items"])):
                     raise CustomImportReadUnavailableError("provider-service response is unavailable")
                 return transport._response(encoded, 200)
     except Exception as failure:
