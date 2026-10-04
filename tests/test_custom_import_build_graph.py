@@ -23,6 +23,7 @@ from db.models.custom_import import (
     CustomImportBuildFamily,
     CustomImportBuildOccurrence,
     CustomImportChildRevision,
+    CustomImportChildScalar,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
     CustomImportPack,
@@ -578,8 +579,14 @@ def test_copy_models_preserve_payload_but_use_local_pack_position():
     assert occurrence.source_ordinal is None and occurrence.origin == "retained"
 
 
-def test_child_projection_retains_every_profile_context():
-    request = _request()
+@pytest.mark.parametrize("uses_child_context", [False, True])
+def test_projection_contexts_follow_declared_profile_scope(uses_child_context):
+    document = _raw_definition()
+    if not uses_child_context:
+        for profile in document["selection_profiles"]:
+            profile["selection"] = [{"field": "display_name", "direction": "asc", "nulls": "last"}]
+            profile["context_dimensions"] = []
+    request = _request(definition=CustomImportDefinition.from_mapping(document))
     registry = _registry(request.definition)
     child_values_by_field = dict(rate_npi="1234567893", service_code="A100", amount=Decimal("12.50"))
     child = _revision(request.definition, "rates", child_values_by_field)
@@ -588,9 +595,17 @@ def test_child_projection_retains_every_profile_context():
     )
     projections = graph._child_models(request, registry, 6, family, _root(), child, child_values_by_field, "rates")
     contexts = [model for model in projections if isinstance(model, CustomImportBuildCandidateContext)]
-    assert len(contexts) == len(request.definition.selection_profiles)
+    profile_count = len(request.definition.selection_profiles)
+    assert len(contexts) == (profile_count if uses_child_context else 0)
     assert all(context.context_child_revision_id == child.child_revision_id for context in contexts)
     assert any(isinstance(model, CustomImportFamilyChild) for model in projections)
+    assert {model.field_slot for model in projections if isinstance(model, CustomImportChildScalar)} == {
+        field.field_slot for field in request.definition.child_fields if field.projection_slot is not None
+    }
+    root_models = graph._root_models(request, registry, 6, family, _root())
+    root_contexts = [model for model in root_models if isinstance(model, CustomImportBuildCandidateContext)]
+    assert len(root_contexts) == (0 if uses_child_context else profile_count)
+    assert all(context.context_child_revision_id is None for context in root_contexts)
 
 
 def test_read_statement_budget_is_strictly_inside_remaining_window(monkeypatch):

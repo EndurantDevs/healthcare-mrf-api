@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -18,9 +19,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import process.custom_import.snowflake_operator_cli as operator_cli
 import process.custom_import.snowflake_source_binding as source_binding
+from db.connection import Database, current_session
 from db.models.custom_import import (
     CustomImportDataset,
     CustomImportDefinitionRevision,
@@ -28,6 +31,7 @@ from db.models.custom_import import (
     CustomImportLease,
     CustomImportSourceBindingRevision,
 )
+from process.custom_import.build_graph import _session as build_session
 from process.custom_import.definition import MAX_DEFINITION_BYTES, CustomImportDefinition
 from process.custom_import.definition_store import DefinitionRegistrationError
 from process.custom_import.execution import ExecutionSubmission
@@ -136,6 +140,7 @@ class _Database:
         self.connected = 0
         self.disconnected = 0
         self.sessions = []
+        self.session_factory = Mock(side_effect=AssertionError("dispatch must not open a session"))
 
     async def connect(self) -> None:
         self.connected += 1
@@ -399,7 +404,7 @@ async def test_operator_dispatches_only_the_retained_processing_policy(monkeypat
     selected.assert_awaited_once()
     unselected.assert_not_awaited()
     session_factory, connector, request = selected.await_args.args
-    assert session_factory == database.session
+    assert session_factory == (database.session_factory if configured else database.session)
     assert request.definition == loaded.definition and request.source_binding_sha256 == loaded.source_binding_sha256
     assert request.source_binding_revision_id == loaded.source_binding_revision_id
     assert selected.await_args.kwargs == ({"processing_policy": loaded.binding.processing_policy} if configured else {})
@@ -408,6 +413,55 @@ async def test_operator_dispatches_only_the_retained_processing_policy(monkeypat
     if operation == "resume":
         forbidden.assert_not_called()
     assert database.connected == database.disconnected == 1
+
+
+@pytest.mark.parametrize("cancel_cleanup", (False, True))
+async def test_configured_operator_preserves_context_through_build_cleanup(monkeypatch, cancel_cleanup):
+    database = Database(session_factory=async_sessionmaker(expire_on_commit=False, autoflush=False))
+    close_started, close_release, close_finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    expected = CandidateRunResult(status="sealed_unpublished", execution_id=40)
+
+    async def run(session_factory, _connector, _request, *, processing_policy):
+        async with build_session(session_factory, transaction=True) as session:
+            assert session.in_transaction()
+            native_close = session.close
+
+            async def close():
+                close_started.set()
+                await close_release.wait()
+                await native_close()
+                close_finished.set()
+
+            monkeypatch.setattr(session, "close", close)
+        assert current_session() is contextual_session
+        return expected
+
+    monkeypatch.setattr(operator_cli, "run_segmented_snowflake_candidate", run)
+    async with database.session() as contextual_session:
+        dispatch = asyncio.create_task(
+            operator_cli._run_configured_candidate(
+                database, object(), object(), ProcessingPolicy.from_mapping(_policy_document())
+            )
+        )
+        try:
+            await asyncio.wait_for(close_started.wait(), 5)
+            if cancel_cleanup:
+                for _ in range(2):
+                    dispatch.cancel()
+                    await asyncio.sleep(0)
+                assert not dispatch.done()
+            close_release.set()
+            if cancel_cleanup:
+                with pytest.raises(asyncio.CancelledError) as failure:
+                    await dispatch
+                assert failure.value.__cause__ is None
+            else:
+                assert await dispatch == expected
+            assert close_finished.is_set()
+            assert current_session() is contextual_session
+        finally:
+            close_release.set()
+            await asyncio.gather(dispatch, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

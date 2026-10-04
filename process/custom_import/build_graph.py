@@ -310,6 +310,8 @@ def _candidate(definition, family, root_values, child=None, child_values=None):
 
 def _contexts(request, registry, build_id, candidate):
     scopes = material._profile_scopes(request.definition, registry.child_collection_slots)
+    if not any(scope.collection_slot == candidate.context_collection_slot for scope in scopes):
+        return
     contract = material._winner_candidate_contract(request.definition, scopes)
     normalized = material._normalize_winner_candidate(candidate, contract)
     for slot, (profile, scope) in enumerate(zip(request.definition.selection_profiles, scopes, strict=True), 1):

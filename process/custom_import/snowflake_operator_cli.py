@@ -739,7 +739,7 @@ async def _run_retained_snowflake_binding(
                     source_binding_sha256=loaded.source_binding_sha256,
                 )
                 return await _run_configured_candidate(
-                    database.session, connector, request, getattr(loaded.binding, "processing_policy", None)
+                    database, connector, request, getattr(loaded.binding, "processing_policy", None)
                 )
         except BaseException:
             has_primary_failure = True
@@ -770,13 +770,13 @@ def _retained_bundle_request(connector, loaded):
     )
 
 
-async def _run_configured_candidate(session_factory, connector, request, processing_policy):
+async def _run_configured_candidate(database, connector, request, processing_policy):
     """Choose only the runner selected by the retained immutable binding."""
 
     if processing_policy is None:
-        return await run_snowflake_bundle_candidate(session_factory, connector, request)
+        return await run_snowflake_bundle_candidate(database.session, connector, request)
     return await run_segmented_snowflake_candidate(
-        session_factory, connector, request, processing_policy=processing_policy
+        database.session_factory, connector, request, processing_policy=processing_policy
     )
 
 
@@ -938,7 +938,7 @@ async def _run_resumed_snowflake_binding(
                     idempotency_key=idempotency_key,
                 )
             candidate_result = await _run_configured_candidate(
-                database.session,
+                database,
                 bundle_connector,
                 candidate_request,
                 processing_policy,
