@@ -31,7 +31,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import and_, exists, func, not_, select, text, tuple_
@@ -64,11 +64,14 @@ from process.custom_import.definition import (
     canonical_sha256,
     load_json_definition,
 )
+from process.custom_import.read_payload import full_family_payload
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
     MAX_DETAIL_CHILDREN,
+    MAX_FAMILY_RESPONSE_BYTES,
     MAX_FILTER_TERMS,
+    MAX_FULL_FAMILY_PAGE_SIZE,
     MAX_GROUPED_PREDICATE_TERMS,
     MAX_GROUPED_CHILD_PREDICATE_TERMS,
     MAX_NPI_PAGE_SIZE,
@@ -270,6 +273,7 @@ class SearchItem:
     root_fields: tuple[ReadFieldValue, ...]
     context_child_revision_id: int | None
     context_fields: tuple[ReadFieldValue, ...]
+    children: tuple[ReadChild, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,7 +634,9 @@ class CustomImportReadService:
         winners = tuple(
             _winner_row(selected_row[:-1], context.profile_context_slot > 0) for selected_row in selected_rows
         )
-        hydrated_items = await _hydrate_search_page_items(session, context, winners)
+        hydrated_items = await _hydrate_provider_page_items(
+            session, context, winners, _scope_digest(authorization_scope)
+        )
         await verify_published_generation(session, context.target)
         return {
             selected_row[-1]: hydrated_item
@@ -1921,6 +1927,28 @@ def _winner_row(
     return winner, family, root_revision, None
 
 
+async def _hydrate_provider_page_items(session, context, selected_rows, scope_digest) -> tuple[SearchItem, ...]:
+    """Attach all children from the distinct exact selected provider families."""
+
+    unique_rows = tuple({selected_row[1].family_revision_id: selected_row for selected_row in selected_rows}.values())
+    if len(unique_rows) > MAX_FULL_FAMILY_PAGE_SIZE:
+        raise CustomImportReadUnavailableError("full-family provider page exceeds its bound")
+    details = await _hydrate_complete_family_entities(
+        session,
+        context,
+        unique_rows,
+        tuple(selected_row[1].family_revision_id for selected_row in unique_rows),
+        scope_digest,
+        is_page=True,
+    )
+    children_by_family = {detail.winner.family_revision_id: detail.children for detail in details}
+    provider_items = await _hydrate_search_page_items(session, context, selected_rows)
+    return tuple(
+        replace(provider_item, children=children_by_family[provider_item.winner.family_revision_id])
+        for provider_item in provider_items
+    )
+
+
 async def _hydrate_search_page_items(
     session: AsyncSession,
     context: _ReadContext,
@@ -2148,6 +2176,53 @@ async def _hydrate_root_detail(
     return (await _hydrate_selected_families(session, context, (selected_row,), scope_digest))[0]
 
 
+async def _hydrate_complete_family_entities(
+    session, context, selected_rows, entity_values, scope_digest, *, is_page=False
+):
+    """Preflight every entity and bound projections retained for ASCII-wire pages.
+
+    Each scalar/membership batch keeps the existing detail child bound; a page
+    cannot multiply the size of an unchecked database hydration by its row count.
+    Detail keeps its existing final UTF-8 response bound instead.
+    """
+
+    rows_by_entity = {}
+    for index, (selected_row, entity_value) in enumerate(zip(selected_rows, entity_values, strict=True)):
+        rows_by_entity.setdefault(entity_value, []).append((index, selected_row))
+    batches = [[]]
+    batch_children = 0
+    for entity_rows in rows_by_entity.values():
+        children = sum(selected_row[1].child_count for _, selected_row in entity_rows)
+        if any(selected_row[1].child_count < 0 for _, selected_row in entity_rows) or children > MAX_DETAIL_CHILDREN:
+            raise CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
+        if batch_children + children > MAX_DETAIL_CHILDREN:
+            batches.append([])
+            batch_children = 0
+        batches[-1].append(entity_rows)
+        batch_children += children
+    projections = [None] * len(selected_rows)
+    for batch in batches:
+        batch_rows = [selected_row for entity_rows in batch for _, selected_row in entity_rows]
+        hydrated = iter(
+            await _hydrate_selected_families(
+                session,
+                context,
+                tuple(batch_rows),
+                scope_digest,
+            )
+        )
+        for entity_rows in batch:
+            families = tuple(next(hydrated) for _ in entity_rows)
+            if is_page and (
+                len(_canonical_bytes({"families": [full_family_payload(family) for family in families]}))
+                > MAX_FAMILY_RESPONSE_BYTES
+            ):
+                raise CustomImportReadUnavailableError("selected family response exceeds its bound")
+            for (index, _), family in zip(entity_rows, families, strict=True):
+                projections[index] = family
+    return tuple(projections)
+
+
 async def _hydrate_selected_families(
     session: AsyncSession,
     context: _ReadContext,
@@ -2163,7 +2238,10 @@ async def _hydrate_selected_families(
 
     if not selected_rows:
         return ()
-    if sum(selected_row[1].child_count for selected_row in selected_rows) > MAX_DETAIL_CHILDREN:
+    if (
+        any(selected_row[1].child_count < 0 for selected_row in selected_rows)
+        or sum(selected_row[1].child_count for selected_row in selected_rows) > MAX_DETAIL_CHILDREN
+    ):
         raise CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
     root_fields = _detail_root_fields(context.definition)
     root_rows_by_key = await _root_scalar_rows(

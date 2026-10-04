@@ -3353,6 +3353,8 @@ def test_provider_directory_capacity_override_allows_third_disjoint_acquisition(
 class _CancelUpdateResult:
     """Minimal SQLAlchemy result stub for cancel update tests."""
 
+    rowcount = 1
+
     def scalar_one_or_none(self):
         return None
 

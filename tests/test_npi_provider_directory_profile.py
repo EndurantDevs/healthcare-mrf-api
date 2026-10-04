@@ -455,3 +455,32 @@ async def test_npi_detail_optional_query_failures_release_savepoints(
         ["rollback", "names", "rollback"] if other_names_unavailable
         else ["enrichment", "rollback", "names", "release"]
     )]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_query", ["profile", "enrichment"])
+async def test_npi_detail_keeps_base_provider_when_optional_query_fails(monkeypatch, failed_query):
+    provider_npi = 1000000491
+    profile_payload = _build_profile_payload_by_kind("pdfhir_source_a")
+    _patch_npi_detail_dependencies(monkeypatch, profile_payload, provider_npi=provider_npi)
+    failed_function = (
+        "_fetch_provider_directory_profile_map" if failed_query == "profile"
+        else "_fetch_provider_enrichment_detail"
+    )
+    monkeypatch.setattr(npi_module, failed_function, AsyncMock(side_effect=RuntimeError("query unavailable")))
+    request = types.SimpleNamespace(
+        args={"sync_geocode": "0", "lookup_stored_geocode": "0"},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+
+    response = await npi_module.get_npi(request, str(provider_npi))
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["npi"] == provider_npi
+    assert payload["address_list"] == []
+    assert payload["other_name_list"] == []
+    assert payload["provider_enrichment"]["summary"] is None
+    assert payload.get("provider_directory_profile") == (
+        None if failed_query == "profile" else profile_payload["profile"]
+    )
