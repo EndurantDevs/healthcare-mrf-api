@@ -48,6 +48,7 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine_evidence,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
+    PTG2_SOURCE_WITNESS_FRAGMENT_MANIFEST_FIELDS,
     PTG2_SOURCE_WITNESS_MANIFEST_FIELDS,
     source_witness_manifest_projection,
 )
@@ -307,8 +308,12 @@ def validated_report_source(
         witness_by_field = strict_report_mapping(
             source_by_field.get("witness"),
             field_name="source.witness",
-            expected_fields=frozenset(PTG2_SOURCE_WITNESS_MANIFEST_FIELDS),
         )
+        expected_fields = frozenset(PTG2_SOURCE_WITNESS_MANIFEST_FIELDS)
+        if witness_by_field.get("format_version") == 6:
+            expected_fields |= frozenset(PTG2_SOURCE_WITNESS_FRAGMENT_MANIFEST_FIELDS)
+        if set(witness_by_field) != expected_fields:
+            raise ValueError("batch audit report witness fields are invalid")
         witness = source_witness_manifest_projection(
             witness_by_field,
             expected_source_count=source_count,

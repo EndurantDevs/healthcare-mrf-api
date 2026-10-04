@@ -100,9 +100,12 @@ def _candidate_io():
 
 
 def _loaded_worker_witness():
+    provider_record = types.SimpleNamespace(kind="provider_reference", linked_provider_sha256=None)
+    occurrence_record = types.SimpleNamespace(kind="rate_occurrence", linked_provider_sha256="provider")
     return types.SimpleNamespace(
-        provider_records=("provider-record",),
-        occurrence_records=("occurrence-record",),
+        provider_records=(provider_record,),
+        occurrence_records=(occurrence_record,),
+        records=(provider_record, occurrence_record),
         evidence_by_sha256={"evidence": {}},
         metadata={
             "sample_digest": "b" * 64,
@@ -391,11 +394,11 @@ def test_partition_plan_processes_each_source_and_persisted_record_once(monkeypa
     )
 
     provider_validator.assert_called_once_with(
-        "provider-record",
+        loaded_witness.provider_records[0],
         parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
     )
     condition_builder.assert_called_once_with(
-        "occurrence-record",
+        loaded_witness.occurrence_records[0],
         parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
     )
     challenge_grouper.assert_called_once_with(

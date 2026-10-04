@@ -24,6 +24,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT,
     PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+    PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     SourceWitnessPublication,
 )
@@ -245,6 +246,9 @@ async def _insert_source_witness_parent(
     first_payload_part: bytes,
     session: Any,
 ) -> None:
+    contract = witness_metadata.get("contract")
+    if contract not in {PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT, PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT}:
+        raise RuntimeError("source witness publication contract is invalid")
     await session.execute(
         db.text(
             f"DELETE FROM {schema}.ptg2_v3_source_audit_witness "
@@ -269,7 +273,7 @@ async def _insert_source_witness_parent(
         ),
         {
             "snapshot_key": snapshot_key,
-            "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+            "contract": contract,
             "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
             "source_set_digest": bytes.fromhex(str(witness_metadata["source_set_digest"])),
             "sample_digest": bytes.fromhex(str(witness_metadata["sample_digest"])),

@@ -543,12 +543,26 @@ def _encode_staged_payload(
     return witness_payload
 
 
+def _uses_fragment_locators(selected_records: Sequence[SourceWitnessCandidate]) -> bool:
+    """Choose the versioned fragment writer only for authenticated v4 locators."""
+
+    return any(
+        isinstance(candidate, SourceWitnessRecordLocator)
+        and any(locator.fragments_by_sha256 is not None for locator in candidate.evidence_by_sha256.values())
+        for candidate in selected_records
+    )
+
+
 def encode_persisted_source_witness_candidates(
     selected_records: Sequence[SourceWitnessCandidate],
     counts: SourceWitnessPayloadCounts,
 ) -> tuple[bytes, dict[str, object]]:
     """Encode exact selected records with bounded one-evidence-at-a-time decoding."""
 
+    if _uses_fragment_locators(selected_records):
+        from process.ptg_parts.ptg2_source_witness_fragment_encode import encode_fragment_source_witness_candidates
+
+        return encode_fragment_source_witness_candidates(selected_records, counts)
     budget = _preflight_selected_evidence(selected_records)
     staged_record_by_index: list[_StagedRecord | None] = [None] * len(selected_records)
     staged_evidence_by_sha256: dict[str, _StagedEvidence] = {}
