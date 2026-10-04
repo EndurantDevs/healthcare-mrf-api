@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: EndurantDevs/endurant-ci
-          ref: 144a26a285e2c04270de3ad0e999f6afe9058be8
+          ref: 05a4b6c2cea5a0423f02eeec4e9d1ee161acdc08
           path: ci
           persist-credentials: false
       - name: Delete only obsolete authenticated artifacts
