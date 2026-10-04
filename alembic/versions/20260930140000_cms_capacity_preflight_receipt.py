@@ -85,7 +85,8 @@ def _assert_exact_check(schema: str, condition: str) -> None:
                AND constraint_row.conname={_ORIGINAL._literal(_PROBE)};
             IF live_row.contype<>'c' OR NOT live_row.convalidated
                OR live_row.condeferrable OR live_row.condeferred OR live_row.connoinherit
-               OR live_row.conbin IS DISTINCT FROM probe_row.conbin THEN
+               OR pg_get_expr(live_row.conbin, live_row.conrelid)
+                  IS DISTINCT FROM pg_get_expr(probe_row.conbin, probe_row.conrelid) THEN
                 RAISE EXCEPTION 'cms_capacity_preflight_constraint_drift';
             END IF;
         END;
