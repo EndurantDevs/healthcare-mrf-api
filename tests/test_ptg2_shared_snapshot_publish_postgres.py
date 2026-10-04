@@ -27,7 +27,7 @@ from api.ptg2_db_sidecars import (
 )
 from api.ptg2_shared_blocks import fetch_shared_blocks, fetch_shared_graph_members
 from db.connection import Database, db
-from process.ptg_parts import ptg2_shared_publish
+from process.ptg_parts import ptg2_shared_blocks, ptg2_shared_publish
 from process.ptg_parts import ptg2_shared_gc
 from process.ptg_parts import ptg2_shared_snapshot_publish
 from process.ptg_parts import ptg2_v4_snapshot_maps
@@ -51,6 +51,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
     seal_shared_layout,
     shared_block_hash,
+    shared_mapping_digest,
     shared_semantic_fingerprint,
     summarize_shared_snapshot_mappings,
 )
@@ -530,6 +531,84 @@ async def _selective_block_database(monkeypatch):
     finally:
         await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await db.disconnect()
+
+
+async def _insert_summary_test_mappings(session, schema, references):
+    """Insert uncommitted mappings and an unrelated snapshot for isolation checks."""
+    await session.execute(
+        db.text(f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (41, :kind, :key, 0, :entries, :hash)"),
+        [
+            {
+                "kind": reference.object_kind,
+                "key": reference.block_key,
+                "entries": reference.entry_count,
+                "hash": reference.block_hash,
+            }
+            for reference in references
+        ],
+    )
+    await session.execute(
+        db.text(
+            f"INSERT INTO {schema}.ptg2_v3_snapshot_block "
+            "SELECT 42, object_kind, block_key, fragment_no, entry_count, block_hash "
+            f"FROM {schema}.ptg2_v3_snapshot_block WHERE snapshot_key=41 LIMIT 1"
+        )
+    )
+
+
+@pytest.mark.parametrize("case", ("empty", "distinct", "reused", "overflow", "missing"))
+@pytest.mark.asyncio
+async def test_mapping_summary_preserves_grouped_multiplicity(monkeypatch, case):
+    """Keep exact summaries, snapshot isolation and unresolved-block rejection."""
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    async with _selective_block_database(monkeypatch) as (schema_name, schema):
+        payloads = (b"aaa", b"bbb", b"ccc", b"ddd", b"eee", b"fff")
+        hashes = [
+            await _insert_selective_durable_block(schema_name, block_payload)
+            for block_payload in payloads[: 6 if case == "distinct" else 2]
+        ]
+        raw_bytes = 2**63 - 1 if case == "overflow" else 3
+        if case == "overflow":
+            await db.status(f"UPDATE {schema}.ptg2_v3_block SET raw_byte_count=:size", size=raw_bytes)
+        if case == "missing":
+            await db.execute_ddl(
+                f"ALTER TABLE {schema}.ptg2_v3_snapshot_block DROP CONSTRAINT ptg2_v3_snapshot_block_block_hash_fkey"
+            )
+        references = [
+            SharedBlockReference(
+                ("a_kind", "b_kind")[index // 3],
+                index,
+                0,
+                0 if index % 2 else 2**63 - 1,
+                b"x" * 32 if case == "missing" else hashes[index % len(hashes)],
+                raw_bytes,
+            )
+            for index in range(0 if case == "empty" else 6)
+        ]
+        async with db.transaction() as session:
+            if references:
+                await _insert_summary_test_mappings(session, schema, references)
+            if case == "missing":
+                with pytest.raises(RuntimeError, match="could not resolve every block_hash"):
+                    await ptg2_shared_blocks._mapping_aggregates_by_kind(
+                        session,
+                        schema=schema,
+                        snapshot_key=41,
+                    )
+                return
+            summary = await summarize_shared_snapshot_mappings(
+                session,
+                schema_name=schema_name,
+                snapshot_key=41,
+            )
+            assert summary.mapping_digest == shared_mapping_digest(references)
+            assert summary.mapping_count == len(references)
+            assert summary.unique_block_count == len(
+                {(reference.object_kind, reference.block_hash) for reference in references}
+            )
+            assert summary.entry_count == sum(reference.entry_count for reference in references)
+            assert summary.logical_byte_count == sum(reference.raw_byte_count for reference in references)
 
 
 def _owned_cas_preparers(prepare_v4_cas, prepare_shared_cas):
