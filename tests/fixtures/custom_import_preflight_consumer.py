@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import pathlib
 import sys
 from dataclasses import replace
@@ -291,6 +292,7 @@ _MODULE_NAMES = (
     "custom_import_preflight.snowflake_binding",
     "custom_import_preflight.snowflake_preflight",
     "custom_import_preflight.snowflake_preflight_schema",
+    "custom_import_preflight.snowflake_inspection",
 )
 _modules = tuple(importlib.import_module(name) for name in _MODULE_NAMES)
 assert all(pathlib.Path(module.__file__).resolve().is_relative_to(_TARGET_DIRECTORY) for module in _modules)
@@ -316,6 +318,7 @@ from custom_import_preflight.snowflake_bundle import (
     SnowflakeBundleError,
     SnowflakeBundleStatementBuilder,
 )
+from custom_import_preflight.snowflake_inspection import inspect_snowflake_bundle
 from custom_import_preflight.snowflake_preflight import (
     SnowflakePreflightLimits,
     preflight_snowflake_bundle,
@@ -338,6 +341,39 @@ _result = preflight_snowflake_bundle(
 )
 assert _result.status == "complete"
 assert _adapter.cursor.closed
+
+
+class InspectionAdapter:
+    def open_inspection(self, statement, *, timeout_seconds):
+        assert timeout_seconds == 30
+        rows = [(0, 1)] if statement.operation == "estimate" else []
+        cursor = SimpleNamespace(
+            description=tuple(
+                SimpleNamespace(
+                    name=name, type_name="FIXED" if statement.operation == "estimate" else "TEXT", precision=38, scale=0
+                )
+                for name in statement.column_ids
+            ),
+            fetchone=lambda: rows.pop(0) if rows else None,
+            closed=False,
+        )
+        cursor.close = lambda: setattr(cursor, "closed", True)
+        self.cursor = cursor
+        return cursor
+
+
+_inspection_adapter = InspectionAdapter()
+for _operation in ("discover", "estimate"):
+    _inspection = json.loads(
+        inspect_snowflake_bundle(
+            _definition, _binding, _builder, _inspection_adapter, operation=_operation, clock=lambda: 0
+        )
+    )
+    assert _inspection["status"] == "complete"
+    assert _inspection_adapter.cursor.closed
+assert _inspection["streams"][0]["source_rows"] == 1
+assert _inspection["estimates"]["import_rows"] == {"precision": "unknown", "value": None}
+
 
 _configured_binding = replace(_binding, processing_policy=_processing_policy())
 _configured_request = _builder.prepare_request(
