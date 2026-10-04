@@ -167,9 +167,12 @@ def test_clone_capacity_observes_only_existing_write_waves(
     assert f'"{phase}"' in source
     assert all(f'"{coordinate}"' in source for coordinate in coordinates)
     if phase == "evidence":
-        source = inspect.getsource(
+        plan_source = inspect.getsource(
             importer._execute_bounded_profile_evidence_plan
         )
+        assert plan_source.count("_execute_bounded_evidence_window(") == 1
+        source = inspect.getsource(importer._execute_bounded_evidence_window)
+        assert source.index("_profile_capacity_mutation_window(") < source.index("_preflight_profile")
         assert source.index("_preflight_profile") < source.index(
             "_run_profile_evidence_window("
         )

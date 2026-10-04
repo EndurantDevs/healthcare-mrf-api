@@ -401,6 +401,40 @@ def _artifact_stage(
     )
 
 
+def _initial_profile_stages():
+    """Carry the real initial evidence/Profile pair through bundle promotion."""
+    build = importer.replace(_profile_build(), owner_run_id="run-a")
+    token = importer.profile_initial.REQUESTED.set(True)
+    try:
+        return importer._prepare_profile_full_swap_stages(
+            build,
+            importer.ProviderDirectoryArtifactBuildFence(target_oid=21),
+            importer.ProviderDirectoryArtifactBuildFence(target_oid=22),
+        )
+    finally:
+        importer.profile_initial.REQUESTED.reset(token)
+
+
+def _initial_profile_recovery(monkeypatch):
+    """Mock persisted receipt readback while retaining real completion dispatch."""
+    monkeypatch.setattr(importer.profile_initial, "preparation_timeout_seconds", AsyncMock(return_value=2))
+    stages = _initial_profile_stages()
+    identities = tuple(
+        importer.ProviderDirectoryArtifactPromotionIdentity(stage, oid)
+        for stage, oid in zip(stages, (11, 12), strict=True)
+    )
+    monkeypatch.setattr(
+        importer,
+        "_capture_provider_directory_artifact_promotion_identities",
+        AsyncMock(return_value=identities),
+    )
+    monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+    receipt_committed = AsyncMock(return_value=True)
+    monkeypatch.setattr(importer.profile_initial, "is_committed", receipt_committed)
+    return stages, identities, receipt_committed
+
+
 def _promotion_dataset(
     **overrides: object,
 ) -> importer.ProviderDirectoryArtifactDataset:
@@ -2070,8 +2104,8 @@ async def test_profile_stage_finalization_supports_deferred_and_immediate_cutove
 ):
     """Return prepared stages when deferred and clean both after immediate cutover."""
     stages = (
-        SimpleNamespace(stage_table="a", resume_checkpoint=None),
-        SimpleNamespace(stage_table="b", resume_checkpoint=None),
+        _artifact_stage(stage_table="a", target_relation="evidence"),
+        _artifact_stage(stage_table="b", target_relation="profile"),
     )
     metric_map = {"profile_rows": 2}
     promote = AsyncMock()
@@ -2101,6 +2135,17 @@ async def test_profile_stage_finalization_supports_deferred_and_immediate_cutove
     assert [call.args[0] for call in remove.await_args_list] == list(
         reversed(stages)
     )
+
+    initial_stages = _initial_profile_stages()
+    promote.reset_mock()
+    remove.reset_mock()
+    assert await importer._finalize_provider_directory_profile_stages(
+        metric_map,
+        initial_stages,
+        defer_cutover=False,
+    ) == metric_map
+    promote.assert_awaited_once_with(initial_stages)
+    remove.assert_not_awaited()
 
 
 async def _assert_resumable_artifact_cleanup(
@@ -3180,7 +3225,7 @@ async def test_candidate_bundle_restores_budget_before_table_lock(monkeypatch):
     async def lock_tables(_schema, _relations):
         events.append("lock-tables")
 
-    stage = _artifact_stage()
+    stage = _artifact_stage(target_relation="ordinary_target")
     relation_attribute = AsyncMock(return_value="r")
     monkeypatch.setattr(importer, "_provider_directory_relation_attribute", relation_attribute)
     fence = importer.ProviderDirectoryArtifactDatasetFence(
@@ -3554,15 +3599,7 @@ async def test_artifact_bundle_timeout_recovers_only_verified_commit(
     monkeypatch,
 ):
     """Treat timeout as success only when exact stage identities moved."""
-    stage = _artifact_stage()
-    identities = (
-        importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_capture_provider_directory_artifact_promotion_identities",
-        AsyncMock(return_value=identities),
-    )
+    stages, identities, receipt_committed = _initial_profile_recovery(monkeypatch)
     monkeypatch.setattr(
         importer,
         "_promote_provider_directory_artifact_bundle_transaction",
@@ -3574,9 +3611,16 @@ async def test_artifact_bundle_timeout_recovers_only_verified_commit(
         "_is_provider_directory_artifact_promotion_committed",
         committed,
     )
-    await importer._promote_provider_directory_artifact_bundle((stage,))
+    await importer._promote_provider_directory_artifact_bundle(stages)
     with pytest.raises(TimeoutError):
-        await importer._promote_provider_directory_artifact_bundle((stage,))
+        await importer._promote_provider_directory_artifact_bundle(stages)
+    assert committed.await_count == 2
+    committed.assert_awaited_with(identities, None)
+    receipt_committed.assert_awaited_with(importer, stages)
+    receipt_committed.return_value = False
+    with pytest.raises(TimeoutError):
+        await importer._promote_provider_directory_artifact_bundle(stages)
+    assert committed.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -3585,27 +3629,22 @@ async def test_artifact_bundle_connection_loss_reconciles_verified_commit(
 ):
     """Treat a non-timeout lost acknowledgement like any ambiguous commit."""
 
-    stage = _artifact_stage()
-    identities = (
-        importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_capture_provider_directory_artifact_promotion_identities",
-        AsyncMock(return_value=identities),
-    )
+    stages, identities, receipt_committed = _initial_profile_recovery(monkeypatch)
     monkeypatch.setattr(
         importer,
         "_promote_provider_directory_artifact_bundle_transaction",
         AsyncMock(side_effect=RuntimeError("connection acknowledgement lost")),
     )
+    committed = AsyncMock(return_value=True)
     monkeypatch.setattr(
         importer,
         "_is_provider_directory_artifact_promotion_committed",
-        AsyncMock(return_value=True),
+        committed,
     )
 
-    await importer._promote_provider_directory_artifact_bundle((stage,))
+    await importer._promote_provider_directory_artifact_bundle(stages)
+    committed.assert_awaited_once_with(identities, None)
+    receipt_committed.assert_awaited_once_with(importer, stages)
 
 
 @pytest.mark.asyncio
@@ -4092,7 +4131,7 @@ async def test_profile_unbounded_and_completed_batch_paths(monkeypatch):
 @pytest.mark.asyncio
 async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     """Exercise active dataset fencing and the ordinary bundle branch."""
-    stage = _artifact_stage()
+    stage = _artifact_stage(target_relation="ordinary_target")
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_promotion_dataset(),)
     )

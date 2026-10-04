@@ -9,7 +9,7 @@ import logging
 import os
 import secrets
 import tempfile
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from arq import create_pool
 
@@ -35,6 +35,7 @@ from process.cms_doctors_groups import (
 from process.cms_doctors_organizations import bind_group_site_organizations
 from process.cms_doctors_sites import bind_cms_doctors_sites
 from process.cms_doctors_rows import doctor_address_row
+from process.cms_doctors_source_provenance import read_doctors_source_provenance
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
 from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
@@ -217,7 +218,8 @@ async def _consume_doctors_reader(
     accepted_rows = 0
     provider_batch_rows = []
     seen_checksums: set[int] = set()
-    now = datetime.datetime.utcnow()
+    observation_time = ctx.get("context", {}).get("education", {}).get("downloaded_at")
+    now = datetime.datetime.fromisoformat(observation_time) if observation_time else datetime.datetime.utcnow()
     for provider_row in reader:
         address_row = doctor_address_row(provider_row, now)
         if address_row is None:
@@ -276,12 +278,15 @@ async def _download_doctors_source(client, url: str, source_path: str) -> None:
                 destination.write(chunk)
 
 
-async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode):
+async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode, *, source_manifest=None):
     """Stage the retained source, education, and group-site records together."""
-    if not test_mode:
+    if not test_mode and source_manifest is None:
         ctx["context"]["artifact"] = retain_doctors_artifact(source_path, url)
+    manifest_kwargs = {"source_manifest": source_manifest} if source_manifest is not None else {}
     ctx["context"]["education"] = await import_doctor_education(
-        source_path, url, ctx, task, DEFAULT_DOCTORS_DATASET_ID,
+        source_path, url, ctx, task,
+        source_manifest["dataset_id"] if source_manifest is not None else DEFAULT_DOCTORS_DATASET_ID,
+        **manifest_kwargs,
     )
     if not test_mode and (
         ctx["context"]["artifact"]["content_sha256"]
@@ -297,8 +302,36 @@ async def _stage_doctors_sidecars(source_path, url, ctx, task, test_mode):
     )
 
 
+async def _replay_doctors_source(ctx, task, stage_cls, batch_size, test_mode, test_row_limit):
+    """Replay exact retained bytes with their original closed source observations."""
+    original = read_doctors_source_provenance(task["cms_doctors_retained_source_provenance"])
+    source_path = verify_doctors_artifact(original["artifact"])
+    ctx["context"]["artifact"] = dict(original["artifact"])
+    source_manifest_by_field = {
+        key: value for key, value in original["education"].items()
+        if key not in {"source_rows", "education_rows"}
+    }
+    await _stage_doctors_sidecars(
+        source_path, original["artifact"]["source_url"], ctx, task, test_mode,
+        source_manifest=source_manifest_by_field,
+    )
+    accepted_rows = await _import_doctors_source(
+        source_path, ctx=ctx, task=task, stage_cls=stage_cls, batch_size=batch_size,
+        test_mode=test_mode, test_row_limit=test_row_limit,
+    )
+    verify_doctors_artifact(original["artifact"])
+    if not test_mode and (
+        ctx["context"]["education"] != original["education"]
+        or ctx["context"]["group_site"] != original["group_site"]
+        or accepted_rows != original["rows"]
+    ):
+        raise RuntimeError("cms_doctors_retained_source_counts_changed")
+    ctx["context"]["retained_source"] = original
+    return accepted_rows
+
+
 async def import_cms_doctors_data(ctx, task=None):
-    """Download and import the current CMS doctors address dataset."""
+    """Import the current distribution or replay verified original source evidence."""
 
     task = task or {}
     await raise_if_cancelled(ctx, task)
@@ -317,36 +350,43 @@ async def import_cms_doctors_data(ctx, task=None):
     batch_size = int(os.getenv("HLTHPRT_CMS_DOCTORS_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
     test_row_limit = int(os.getenv("HLTHPRT_CMS_DOCTORS_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
 
-    import aiohttp
-    client = aiohttp.ClientSession()
+    client = None
     accepted_rows = 0
 
     try:
-        url = await _fetch_doctors_download_url(client)
-        logger.info("Found CMS Doctors source: %s", url)
-
-        # Download to temp file to avoid loading large files into memory
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_ext = ".zip" if url.lower().endswith(".zip") else ".csv"
-            source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
-
-            await _download_doctors_source(client, url, source_path)
-            await _stage_doctors_sidecars(source_path, url, ctx, task, test_mode)
-            accepted_rows += await _import_doctors_source(
-                source_path,
-                ctx=ctx,
-                task=task,
-                stage_cls=stage_cls,
-                batch_size=batch_size,
-                test_mode=test_mode,
-                test_row_limit=test_row_limit,
+        if "cms_doctors_retained_source_provenance" in task:
+            accepted_rows = await _replay_doctors_source(
+                ctx, task, stage_cls, batch_size, test_mode, test_row_limit,
             )
+        else:
+            import aiohttp
+            client = aiohttp.ClientSession()
+            url = await _fetch_doctors_download_url(client)
+            logger.info("Found CMS Doctors source: %s", url)
+
+            # Download to temp file to avoid loading large files into memory
+            with tempfile.TemporaryDirectory() as tmpdir:
+                source_ext = ".zip" if url.lower().endswith(".zip") else ".csv"
+                source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
+
+                await _download_doctors_source(client, url, source_path)
+                await _stage_doctors_sidecars(source_path, url, ctx, task, test_mode)
+                accepted_rows += await _import_doctors_source(
+                    source_path,
+                    ctx=ctx,
+                    task=task,
+                    stage_cls=stage_cls,
+                    batch_size=batch_size,
+                    test_mode=test_mode,
+                    test_row_limit=test_row_limit,
+                )
     except BaseException:
         await discard_group_site_stage(ctx)
         await discard_education_stage(ctx)
         raise
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
     logger.info("CMS Doctors import done: %d rows accepted", accepted_rows)
@@ -495,7 +535,7 @@ async def _finish_cms_doctors_test_run(ctx, db_schema: str, stage_rows: int) -> 
 
 
 async def _validate_cms_doctors_publication_sources(import_date, db_schema, context):
-    """Validate both staged datasets against the retained source artifact."""
+    """Validate the staged family against the retained source artifact."""
     education_manifest = context.get("education")
     if not education_manifest:
         raise RuntimeError("cms_education_manifest_missing")
@@ -527,6 +567,11 @@ async def _prepare_cms_doctors_sources(ctx, stage_cls, db_schema, stage_rows):
     )
     organization_groups = await bind_group_site_organizations(ctx, ctx["import_date"], db_schema, group_receipt)
     sites = await bind_cms_doctors_sites(ctx, ctx["import_date"], db_schema, group_receipt)
+    retained_source = context.get("retained_source")
+    if retained_source and (
+        organization_groups != retained_source["organization_groups"] or sites != retained_source["sites"]
+    ):
+        raise RuntimeError("cms_doctors_retained_source_binding_counts_changed")
     address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
     await raise_if_cancelled(ctx, {"run_id": run_id})
     return {
@@ -594,7 +639,7 @@ async def _publish_cms_doctors_generation(ctx):
 
 
 async def publish_cms_doctors_generation(ctx):
-    """Publish both CMS datasets and release any remaining owned education stage."""
+    """Publish the CMS family and release remaining owned sidecar stages."""
     try:
         return await _publish_cms_doctors_generation(ctx)
     finally:
@@ -606,13 +651,21 @@ shutdown = publish_cms_doctors_generation
 shutdown.__name__ = "shutdown"
 
 
-async def main(test_mode: bool = False):
+async def main(test_mode: bool = False, retained_source_manifest: str | None = None):
     """Queue the CMS Doctors import with the requested bounded test mode."""
 
+    payload = {"test_mode": bool(test_mode)}
+    if retained_source_manifest is not None:
+        with Path(retained_source_manifest).open("rb") as manifest_file:
+            manifest_bytes = manifest_file.read(64 * 1024 + 1)
+        if len(manifest_bytes) > 64 * 1024:
+            raise ValueError("cms_doctors_retained_source_manifest_too_large")
+        source_provenance = manifest_bytes.decode("utf-8").strip()
+        read_doctors_source_provenance(source_provenance)
+        payload["cms_doctors_retained_source_provenance"] = source_provenance
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
         job_deserializer=deserialize_job,
     )
-    payload = {"test_mode": bool(test_mode)}
     await redis.enqueue_job("process_data", payload, _queue_name=CMS_DOCTORS_QUEUE_NAME)

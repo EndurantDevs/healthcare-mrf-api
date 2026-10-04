@@ -21,6 +21,32 @@ from tests.provider_directory_cms_postgres_support import (
     publication_summary,
     reseal,
 )
+from tests.provider_directory_entities_postgres_support import _database_url
+
+
+@pytest.mark.parametrize("port", (5432, 5440))
+def test_entities_fixture_accepts_explicit_local_ports(monkeypatch, port):
+    monkeypatch.setenv(
+        "HLTHPRT_DIRECTORY_ENTITIES_TEST_DSN",
+        f"postgresql+asyncpg://test_role@localhost:{port}/hc_directory_entities_" + "1" * 32,
+    )
+    assert _database_url().port == port
+
+
+@pytest.mark.parametrize(
+    "authority, database",
+    [
+        ("localhost", "hc_directory_entities_" + "1" * 32),
+        ("localhost:0", "hc_directory_entities_" + "1" * 32),
+        ("localhost:65536", "hc_directory_entities_" + "1" * 32),
+        ("example.invalid:5440", "hc_directory_entities_" + "1" * 32),
+        ("localhost:5440", "shared_database"),
+    ],
+)
+def test_entities_fixture_rejects_non_disposable_connections(monkeypatch, authority, database):
+    monkeypatch.setenv("HLTHPRT_DIRECTORY_ENTITIES_TEST_DSN", f"postgresql+asyncpg://test_role@{authority}/{database}")
+    with pytest.raises(pytest.fail.Exception, match="UUID-owned local PostgreSQL test database"):
+        _database_url()
 
 
 def cms_query(kind="organizations", shape="entities", entity_id=None, limit=1):
@@ -779,6 +805,182 @@ async def test_identity_binder_replays_and_rolls_back_without_reassignment(monke
 
 
 @pytest.mark.asyncio
+async def test_identity_binder_fresh_batches_return_scoped_ids_without_rereading(monkeypatch):
+    """Fresh insert results suffice, including duplicate input and separate identity scopes."""
+    identities = []
+    async with cms_database(monkeypatch) as sessions:
+        for source_id, resource_type in (
+            ("cms-npd", "InsurancePlan"),
+            ("other-source", "InsurancePlan"),
+            ("cms-npd", "PractitionerRole"),
+        ):
+            async with sessions() as session, session.begin():
+                executed_select_flags = []
+                original_execute = session.execute
+
+                async def observe(statement, *args, **kwargs):
+                    executed_select_flags.append(statement.is_select)
+                    return await original_execute(statement, *args, **kwargs)
+
+                monkeypatch.setattr(session, "execute", observe)
+                ids = await bind_resource_identity_batch(
+                    session,
+                    source_id=source_id,
+                    resource_type=resource_type,
+                    resource_ids=["fresh-resource", "fresh-resource"],
+                )
+                expected = source_resource_uuid(source_id, resource_type, "fresh-resource")
+                assert ids == [expected, expected]
+                assert executed_select_flags == [False]
+                identities.append(ids[0])
+        assert len(set(identities)) == 3
+
+
+@pytest.mark.asyncio
+async def test_identity_binder_mixed_batch_rereads_only_replayed_keys(monkeypatch):
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as session, session.begin():
+            reread_keys = []
+            original_execute = session.execute
+
+            async def observe(statement, *args, **kwargs):
+                if statement.is_select:
+                    reread_keys.append(statement.compile().params["resource_id_1"])
+                return await original_execute(statement, *args, **kwargs)
+
+            monkeypatch.setattr(session, "execute", observe)
+            ids = await bind_resource_identity_batch(
+                session,
+                source_id="cms-npd",
+                resource_type="InsurancePlan",
+                resource_ids=["fresh-plan", "plan-example", "fresh-plan"],
+            )
+            assert ids == [
+                source_resource_uuid("cms-npd", "InsurancePlan", resource_id)
+                for resource_id in ("fresh-plan", "plan-example", "fresh-plan")
+            ]
+            assert reread_keys == [["plan-example"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_field", ["source", "type", "resource", "entity", "duplicate"])
+async def test_identity_binder_rejects_invalid_returned_mapping(invalid_field):
+    """Validate the actual returned scope and UUID rather than trusting insert inputs."""
+    expected = source_resource_uuid("cms-npd", "InsurancePlan", "fresh-plan")
+    returned_fields = ["cms-npd", "InsurancePlan", "fresh-plan", expected]
+    if invalid_field == "source":
+        returned_fields[0] = "other-source"
+    elif invalid_field == "type":
+        returned_fields[1] = "PractitionerRole"
+    elif invalid_field == "resource":
+        returned_fields[2] = "unexpected-plan"
+    elif invalid_field == "entity":
+        returned_fields[3] = UUID("00000000-0000-0000-0000-000000000099")
+    rows = [tuple(returned_fields)] * (2 if invalid_field == "duplicate" else 1)
+
+    class InsertResult:
+        def all(self):
+            return rows
+
+    class Session:
+        async def execute(self, statement):
+            assert statement.is_insert
+            return InsertResult()
+
+    with pytest.raises(ValueError, match="identity_conflict"):
+        await bind_resource_identity_batch(
+            Session(), source_id="cms-npd", resource_type="InsurancePlan", resource_ids=["fresh-plan"]
+        )
+
+
+async def _contend_identity_insert(sessions, started, contender_by_field):
+    async with sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+        contender_by_field["pid"] = await session.scalar(text("SELECT pg_catalog.pg_backend_pid()"))
+        started.set()
+        return await bind_resource_identity_batch(
+            session,
+            source_id="cms-npd",
+            resource_type="InsurancePlan",
+            resource_ids=["fresh-during-race", "concurrent-plan", "fresh-during-race"],
+        )
+
+
+async def _wait_for_identity_block(winner, winner_pid, contender_by_field, contender_task):
+    while not await winner.scalar(
+        text("SELECT :holder = ANY(pg_catalog.pg_blocking_pids(:contender))"),
+        {"holder": winner_pid, "contender": contender_by_field["pid"]},
+    ):
+        assert not contender_task.done()
+        await asyncio.sleep(0.01)
+
+
+async def _assert_identity_contender(contender_task, winner_outcome):
+    if winner_outcome == "conflicting_commit":
+        with pytest.raises(ValueError, match="identity_conflict"):
+            await asyncio.wait_for(contender_task, 3)
+    else:
+        assert await asyncio.wait_for(contender_task, 3) == [
+            source_resource_uuid("cms-npd", "InsurancePlan", resource_id)
+            for resource_id in ("fresh-during-race", "concurrent-plan", "fresh-during-race")
+        ]
+
+
+async def _run_identity_contender(sessions, winner, winner_pid, winner_outcome):
+    started = asyncio.Event()
+    contender_by_field = {"pid": None}
+    contender_task = None
+    try:
+        contender_task = asyncio.create_task(_contend_identity_insert(sessions, started, contender_by_field))
+        await asyncio.wait_for(started.wait(), 3)
+        await asyncio.wait_for(
+            _wait_for_identity_block(winner, winner_pid, contender_by_field, contender_task), 3
+        )
+        if winner_outcome == "rollback":
+            await winner.rollback()
+        else:
+            await winner.commit()
+        await _assert_identity_contender(contender_task, winner_outcome)
+    finally:
+        await winner.rollback()
+        if contender_task is not None:
+            if not contender_task.done():
+                contender_task.cancel()
+            await asyncio.wait_for(asyncio.gather(contender_task, return_exceptions=True), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner_outcome", ["compatible_commit", "conflicting_commit", "rollback"])
+async def test_identity_binder_reads_a_concurrent_insert_after_its_statement(monkeypatch, winner_outcome):
+    """The contender must observe the winner after its INSERT waits on the exact owned key."""
+    expected = source_resource_uuid("cms-npd", "InsurancePlan", "concurrent-plan")
+    winner_entity = UUID("00000000-0000-0000-0000-000000000099")
+    if winner_outcome == "compatible_commit":
+        winner_entity = expected
+    async with cms_database(monkeypatch) as sessions:
+        async with sessions() as winner:
+            await winner.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            winner_pid = await winner.scalar(text("SELECT pg_catalog.pg_backend_pid()"))
+            await winner.execute(
+                text(
+                    "INSERT INTO provider_directory_resource_identity VALUES "
+                    "('cms-npd','InsurancePlan','concurrent-plan',:entity_id,now())"
+                ),
+                {"entity_id": winner_entity},
+            )
+            await _run_identity_contender(sessions, winner, winner_pid, winner_outcome)
+        if winner_outcome == "conflicting_commit":
+            async with sessions() as session:
+                assert await session.scalar(
+                    text(
+                        "SELECT entity_id FROM provider_directory_resource_identity "
+                        "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
+                        "AND resource_id='fresh-during-race'"
+                    )
+                ) is None
+
+
+@pytest.mark.asyncio
 async def test_resource_identity_binder_accepts_one_thousand_ids(monkeypatch):
     resource_ids = [f"role-{index}" for index in range(1_000)]
     async with cms_database(monkeypatch) as sessions:
@@ -876,9 +1078,19 @@ async def test_binder_rejects_existing_conflicting_identity(monkeypatch):
         async with sessions() as session:
             with pytest.raises(ValueError, match="identity_conflict"):
                 await bind_resource_identity_batch(
-                    session, source_id="cms-npd", resource_type="InsurancePlan", resource_ids=["conflicting-plan"]
+                    session,
+                    source_id="cms-npd",
+                    resource_type="InsurancePlan",
+                    resource_ids=["conflicting-plan", "fresh-with-conflict"],
                 )
             await session.rollback()
+            assert await session.scalar(
+                text(
+                    "SELECT entity_id FROM provider_directory_resource_identity "
+                    "WHERE source_id='cms-npd' AND resource_type='InsurancePlan' "
+                    "AND resource_id='fresh-with-conflict'"
+                )
+            ) is None
 
 
 @pytest.mark.asyncio

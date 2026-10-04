@@ -205,11 +205,24 @@ async def test_capacity_admission_refuses_to_reap_stale_profile_build(
 
 
 @pytest.mark.asyncio
-async def test_profile_cutover_deletes_exact_checkpoint(monkeypatch):
-    checkpoint = ("mrf", "profile-build-a")
-    stages = (
-        SimpleNamespace(stage_table="evidence-stage", resume_checkpoint=checkpoint),
-        SimpleNamespace(stage_table="profile-stage", resume_checkpoint=checkpoint),
+@pytest.mark.parametrize("initial", [False, True])
+async def test_profile_cutover_deletes_exact_checkpoint(monkeypatch, initial):
+    """Retire the exact ordinary checkpoint; initial publication owns its retirement."""
+    build = _build()
+    checkpoint = (build.schema, build.build_id)
+    stages = tuple(
+        importer.ProviderDirectoryPreparedArtifactStage(
+            schema=build.schema,
+            stage_table=stage_table,
+            target_relation=target_relation if initial else role,
+            rename_stage_indexes=AsyncMock(),
+            resume_checkpoint=checkpoint,
+            profile_initial_build=build if initial else None,
+        )
+        for stage_table, target_relation, role in (
+            (build.evidence_stage, profile.PROFILE_EVIDENCE_TABLE, "evidence"),
+            (build.profile_stage, profile.PROFILE_TABLE, "profile"),
+        )
     )
     promote = AsyncMock()
     delete_checkpoint = AsyncMock()
@@ -239,8 +252,13 @@ async def test_profile_cutover_deletes_exact_checkpoint(monkeypatch):
         )
         == metrics_by_name
     )
-    delete_checkpoint.assert_awaited_once_with(*checkpoint)
-    assert remove_stage.await_count == 2
+    promote.assert_awaited_once_with(stages)
+    if initial:
+        delete_checkpoint.assert_not_awaited()
+        remove_stage.assert_not_awaited()
+    else:
+        delete_checkpoint.assert_awaited_once_with(*checkpoint)
+        assert [call.args[0] for call in remove_stage.await_args_list] == list(reversed(stages))
 
 
 def _patch_profile_capacity_admission(monkeypatch):

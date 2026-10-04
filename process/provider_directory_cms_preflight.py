@@ -323,6 +323,10 @@ async def _produce(fhir, request, *, issue):
         raise _error("own_transaction_required")
     profile_lease = await _verified_pair(fhir, request)
     token = fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(request.execution)
+    from process import provider_directory_profile_initial as initial
+    from process.provider_directory_profile_initial_contract import initial_profile_for_request
+
+    initial_token = initial.REQUESTED.set(initial_profile_for_request(request))
     try:
         await _register_inputs(fhir)
         inputs = await _read_inputs(fhir, request, profile_lease)
@@ -334,6 +338,7 @@ async def _produce(fhir, request, *, issue):
         )
         return result_by_field
     finally:
+        initial.REQUESTED.reset(initial_token)
         fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(token)
 
 

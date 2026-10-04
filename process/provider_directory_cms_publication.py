@@ -17,6 +17,7 @@ from process.entity_address_cutover_contract import lock_live_serving_relations
 from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
 from process.provider_directory_cms_address import admitted_native_input_fence
 from process.provider_directory_cms_native_inputs import assert_native_address_input_fence
+from process.provider_directory_cms_preparation import remaining_build_seconds
 from process.reference_family_result_generation import RELATION_NAMES_BY_IMPORTER
 
 _PIN_FIELDS = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "acquisition_root_run_id")
@@ -166,12 +167,22 @@ async def _publication_transaction(fhir, execution, prepared, native_dependencie
     timeout_seconds = fhir._provider_directory_artifact_transaction_timeout_seconds(
         prepared.fence, profile_delta=prepared.profile_delta
     )
-    async with _cutover_authorization(prepared), asyncio.timeout(timeout_seconds) as cutover_timeout:
-        async with fhir.db.transaction() as session:
+    async with _cutover_authorization(prepared):
+        initial_build = fhir.profile_initial.build_from_stages(fhir, prepared.stages, prepared.profile_delta)
+        if initial_build is not None:
+            timeout_seconds = await fhir.profile_initial.preparation_timeout_seconds(
+                fhir, prepared.stages, timeout_seconds
+            )
+            if prepared.nonprofile_admission is not None:
+                timeout_seconds = min(
+                    timeout_seconds, await remaining_build_seconds(fhir, prepared.nonprofile_admission)
+                )
+        async with asyncio.timeout(timeout_seconds) as cutover_timeout, fhir.db.transaction() as session:
             _schema, _relations, lock_timeout, statement_timeout = fhir._provider_directory_artifact_bundle_context(
                 fhir._ordered_provider_directory_artifact_bundle(prepared.stages), prepared.profile_delta
             )
             await fhir._configure_provider_directory_artifact_promotion(lock_timeout, statement_timeout)
+            await fhir.profile_initial.lock_metadata(fhir, prepared.stages, prepared.profile_delta)
             await _lock_retained_relations(fhir, session, prepared.fence)
             archive = getattr(prepared, "archive_delta", None)
             if archive is not None:
@@ -207,7 +218,7 @@ async def _lock_live_swap_relations(fhir, session, prepared, address, doctors):
         for name in sorted(relation_names)
         if await session.scalar(
             text(
-                "SELECT c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                 "WHERE n.nspname=:schema AND c.relname=:name"
             ),
             {"schema": fhir._schema(), "name": name},
@@ -228,6 +239,8 @@ async def _apply_prepared_results(
 
     async def before_swaps():
         """Keep every prepared swap behind the complete live lock phase."""
+        if fhir.profile_initial.build_from_stages(fhir, prepared.stages, prepared.profile_delta) is not None:
+            await prepared.assert_ready(cutover=True)
         await _lock_live_swap_relations(fhir, session, prepared, address, doctors)
         if doctors is not None:
             await apply_prepared_cms_doctors_generation(doctors)

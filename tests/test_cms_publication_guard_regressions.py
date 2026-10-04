@@ -157,6 +157,8 @@ def _publication_fhir(session, *, bound=False, commit_error=None, observed_wal=0
     )
     return SimpleNamespace(
         db=database,
+        profile_initial=_preflight_fhir.profile_initial,
+        profile_artifact=_preflight_fhir.profile_artifact,
         _schema=lambda: "synthetic",
         _qt=lambda schema, table: f'"{schema}"."{table}"',
         _provider_directory_artifact_transaction_timeout_seconds=lambda *_args, **_kwargs: 5,
@@ -447,22 +449,79 @@ def _composite_session(snapshot):
     return session, events
 
 
+def _composite_initial_stages():
+    build = SimpleNamespace(
+        schema="synthetic", evidence_stage="initial_evidence_stage", profile_stage="initial_profile_stage",
+        materialization_mode="full_swap",
+    )
+    return tuple(
+        _preflight_fhir.ProviderDirectoryPreparedArtifactStage(
+            schema=build.schema, stage_table=stage_table, target_relation=target,
+            rename_stage_indexes=AsyncMock(), profile_initial_build=build,
+        )
+        for target, stage_table in (
+            (_preflight_fhir.profile_artifact.PROFILE_EVIDENCE_TABLE, build.evidence_stage),
+            (_preflight_fhir.profile_artifact.PROFILE_TABLE, build.profile_stage),
+        )
+    )
+
+
+async def _lock_composite_delta(monkeypatch, session, profile_delta):
+    async def status(sql):
+        await session.execute(publication.text(sql))
+
+    with monkeypatch.context() as context:
+        context.setattr(_preflight_fhir, "db", SimpleNamespace(status=status))
+        await _preflight_fhir._lock_profile_delta_relations(_preflight_fhir._profile_delta_relations(profile_delta))
+
+
+def _composite_prepared(fhir, with_forecast):
+    admission = _wal_tracker_admission()
+    fhir._provider_directory_profile_capacity_admission = lambda: admission
+    fhir._validate_profile_delta_total_wal = AsyncMock()
+    prepared = _prepared(fhir)
+    prepared.stages = () if with_forecast else _composite_initial_stages()
+    prepared.profile_delta = SimpleNamespace(
+        schema="synthetic", evidence_stage="delta_evidence_stage", profile_stage="delta_profile_stage",
+        affected_npi_stage="delta_affected_stage",
+    ) if with_forecast else None
+    prepared.archive_delta = SimpleNamespace(apply=AsyncMock(return_value=_archive_result()))
+    prepared.nonprofile_admission = SimpleNamespace(assert_cutover_complete=AsyncMock())
+    return prepared
+
+
+def _assert_composite_delta_locks(session):
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    exclusive_index = next(index for index, sql in enumerate(statements) if "IN ACCESS EXCLUSIVE MODE" in sql)
+    for name in ("provider_directory_profile_evidence", "provider_directory_profile"):
+        writer_lock = f'LOCK TABLE "synthetic"."{name}" IN SHARE ROW EXCLUSIVE MODE NOWAIT;'
+        assert statements.index(writer_lock) < exclusive_index
+    for name in ("delta_evidence_stage", "delta_profile_stage", "delta_affected_stage"):
+        stage_lock = f'LOCK TABLE "synthetic"."{name}" IN SHARE MODE NOWAIT;'
+        assert statements.index(stage_lock) < exclusive_index
+
+
 def _assert_composite_completion(fhir, session, prepared, has_doctors, forecast):
     """Require complete live locks and validate archive, admission, and WAL completion."""
     locks = [
         str(call.args[0]) for call in session.execute.await_args_list if "IN ACCESS EXCLUSIVE MODE" in str(call.args[0])
     ]
-    assert len(locks) == 1 and '"entity_address_unified"' in locks[0] and '"provider_directory_profile"' in locks[0]
+    assert len(locks) == 1 and '"entity_address_unified"' in locks[0]
     assert '"provider_directory_profile_evidence"' not in locks[0]
     if has_doctors:
         assert all(f'"{name}"' in locks[0] for name in publication.RELATION_NAMES_BY_IMPORTER["cms-doctors"])
     prepared.archive_delta.apply.assert_awaited_once_with(fhir, session)
     prepared.nonprofile_admission.assert_cutover_complete.assert_awaited_once()
     if forecast is not None:
+        assert '"provider_directory_profile"' not in locks[0]
+        _assert_composite_delta_locks(session)
+        prepared.assert_ready.assert_not_awaited()
         fhir._validate_profile_delta_total_wal.assert_awaited_once_with(
             fhir._provider_directory_profile_capacity_admission(), forecast
         )
     else:
+        assert '"provider_directory_profile"' in locks[0]
+        prepared.assert_ready.assert_awaited_once_with(cutover=True)
         fhir._validate_profile_delta_total_wal.assert_not_awaited()
 
 
@@ -472,40 +531,36 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
     receipt_payload = _native_payload()
     session, events = _composite_session(_snapshot(receipt_payload))
     fhir = _publication_fhir(session, bound=True)
-    admission = _wal_tracker_admission()
-    fhir._provider_directory_profile_capacity_admission = lambda: admission
-    fhir._validate_profile_delta_total_wal = AsyncMock()
-    prepared = _prepared(fhir)
-    prepared.stages = tuple(
-        SimpleNamespace(target_relation=name)
-        for name in ("provider_directory_profile", "provider_directory_profile_evidence")
-    )
-    prepared.profile_delta = SimpleNamespace() if with_forecast else None
-    prepared.archive_delta = SimpleNamespace(apply=AsyncMock(return_value=_archive_result()))
-    prepared.nonprofile_admission = SimpleNamespace(assert_cutover_complete=AsyncMock())
+    prepared = _composite_prepared(fhir, with_forecast)
     address = SimpleNamespace(
         swaps=(SimpleNamespace(live_cls=SimpleNamespace(__main_table__="entity_address_unified")),)
     )
     doctors = SimpleNamespace() if with_doctors else None
     forecast = SimpleNamespace() if with_forecast else None
+    prior_events = ["delta-targets-locked", "profile-applied"] if with_forecast else []
 
     async def apply_bundle(_fhir, stages, **options):
         assert stages is prepared.stages
         assert options["settings_configured"] is True
         assert options["cutover_timeout"] is (None if with_forecast else timeout)
+        if with_forecast:
+            await _lock_composite_delta(monkeypatch, session, prepared.profile_delta)
+            events.extend(prior_events)
         await options["before_swaps"]()
-        assert events[0] == "all-live-locked"
+        assert events[len(prior_events)] == "all-live-locked"
         if with_doctors:
-            assert events[1] == "doctors-applied"
-        events.append("profile-applied")
+            assert events[len(prior_events) + 1] == "doctors-applied"
+        if not with_forecast:
+            events.append("profile-applied")
         return forecast
 
     async def apply_doctors(actual):
-        assert actual is doctors and events == ["all-live-locked"]
+        assert actual is doctors and events == [*prior_events, "all-live-locked"]
         events.append("doctors-applied")
 
     async def apply_address(actual):
-        assert actual is address and events[-1] == "profile-applied"
+        last_delta_event = "doctors-applied" if with_doctors else "all-live-locked"
+        assert actual is address and events[-1] == (last_delta_event if with_forecast else "profile-applied")
         events.append("address-applied")
 
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", apply_bundle)
@@ -517,9 +572,10 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
     )
     assert receipt_id == "d" * 64 and receipt_result_by_field["archive"] == _archive_result()
     assert events == [
+        *prior_events,
         "all-live-locked",
         *(["doctors-applied"] if with_doctors else []),
-        "profile-applied",
+        *([] if with_forecast else ["profile-applied"]),
         "address-applied",
         "common-receipt",
         "constraints-checked",

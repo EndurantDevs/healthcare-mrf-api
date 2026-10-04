@@ -38,7 +38,7 @@ capacity = importlib.import_module("process.provider_directory_profile_capacity"
         importer._provider_directory_profile_current_wal_bytes,
         importer._profile_cutover_observation,
         importer._profile_delta_target_wal_start_lsn,
-        importer._profile_delta_cutover_actual,
+        importer.profile_capacity_cutover._observe_cutover_wal,
         importer._validate_profile_delta_final_wal,
         importer._PROFILE_CAPACITY_DATABASE_IDENTITY_SQL,
     ),
@@ -48,6 +48,49 @@ def test_capacity_wal_samplers_use_one_insert_location(sampler):
     source = sampler if isinstance(sampler, str) else inspect.getsource(sampler)
     assert "pg_current_wal_lsn()" not in source
     assert source.count("pg_current_wal_insert_lsn()") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_bounded", (False, True))
+async def test_cutover_actual_samples_one_insert_location(monkeypatch, is_bounded):
+    """Exercise the wrapper and extracted helpers with one shared WAL sample."""
+    admission = _wal_tracker_admission()
+    admission = dataclasses.replace(
+        admission,
+        geometry=SimpleNamespace(
+            bounded_admission=is_bounded,
+            relation_byte_caps=admission.geometry.relation_byte_caps,
+        ),
+    )
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: admission)
+    forecast = SimpleNamespace(
+        forecast_hash="a" * 64,
+        forecast_json=importer.json.dumps({
+            "contract_id": (capacity.BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if is_bounded
+                            else capacity.CUTOVER_FORECAST_CONTRACT_ID),
+        }),
+        wal_start_lsn="0/1",
+        evidence_target_bytes_before=10,
+        profile_target_bytes_before=20,
+        target_projection=SimpleNamespace(wal_bytes=100),
+        metadata_projection=SimpleNamespace(wal_bytes=5, commit_envelope_bytes=3),
+    )
+    database = SimpleNamespace(first=AsyncMock(return_value={
+        "wal_observed_lsn": "0/20", "cutover_wal_bytes": 17,
+    }))
+    monkeypatch.setattr(importer, "db", database)
+
+    actual_by_field = await importer._profile_delta_cutover_actual(
+        forecast, "0/F", importer._ProfileDeltaTargetBytes(evidence_after=30, profile_after=40),
+    )
+
+    database.first.assert_awaited_once()
+    query = database.first.await_args.args[0]
+    assert database.first.await_args.kwargs == {"wal_start_lsn": "0/F"}
+    assert query.count("pg_current_wal_insert_lsn()") == 1
+    assert "pg_current_wal_lsn()" not in query
+    assert actual_by_field["wal_observed_lsn"] == "0/20"
+    assert actual_by_field["cutover_wal_bytes"] == 17
 
 
 @pytest.mark.asyncio

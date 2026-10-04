@@ -12,7 +12,7 @@ from process.cms_npd_tax_candidate_report import CmsNpiTaxCandidate
 from tests.test_cms_npd_source import _client, _source
 
 
-def _organization(index, *, npi=True, name="Synthetic"):
+def _organization(index, *, npi=True, name="Synthetic", npi_system="http://hl7.org/fhir/sid/us-npi"):
     identifiers = [
         {
             "system": "https://npd.cms.gov/fhir/sid/us-pseudo-ein",
@@ -20,7 +20,7 @@ def _organization(index, *, npi=True, name="Synthetic"):
         }
     ]
     if npi:
-        identifiers.append({"system": "http://hl7.org/fhir/sid/us-npi", "value": "1000000004"})
+        identifiers.append({"system": npi_system, "value": "1000000004"})
     return {
         "resourceType": "Organization",
         "id": f"synthetic-{index}",
@@ -73,8 +73,15 @@ async def _run_candidate_report(monkeypatch, directory, output):
 
 
 @pytest.mark.asyncio
-async def test_runner_streams_complete_admitted_rows_with_unicode_hash_and_bounded_batches(tmp_path, monkeypatch):
-    organizations = [_organization(0, name="Clínica")] + [_organization(index) for index in range(1, 257)]
+@pytest.mark.parametrize(
+    "npi_system", ["http://hl7.org/fhir/sid/us-npi", "http://terminology.hl7.org/NamingSystem/npi"]
+)
+async def test_runner_streams_complete_admitted_rows_with_unicode_hash_and_bounded_batches(
+    tmp_path, monkeypatch, npi_system
+):
+    organizations = [_organization(0, name="Clínica", npi_system=npi_system)] + [
+        _organization(index, npi_system=npi_system) for index in range(1, 257)
+    ]
     directory, receipt = _admitted_release(tmp_path, organizations)
     expected_hash = next(
         _decoded_resource_fingerprints(
@@ -83,14 +90,18 @@ async def test_runner_streams_complete_admitted_rows_with_unicode_hash_and_bound
         )
     )[1].hex()
     output = tmp_path / "candidate-report.json"
-    report, calls, result = await _run_candidate_report(monkeypatch, directory, output)
+    report, calls, candidate_result = await _run_candidate_report(monkeypatch, directory, output)
     assert calls == [(), (1000000004,), (1000000004,)]
     assert report["release_id"] == receipt["vector_sha256"]
     assert report["source_file_row_count"] == 257
     assert report["candidate_organization_count"] == 257
     assert len(report["organizations"]) == 257
     assert (
-        next(row for row in report["organizations"] if row["resource_id"] == "synthetic-0")["payload_sha256"]
+        next(
+            organization_entry
+            for organization_entry in report["organizations"]
+            if organization_entry["resource_id"] == "synthetic-0"
+        )["payload_sha256"]
         == expected_hash
     )
     assert report["extraction_policy_sha256"] == runner.CMS_NPD_NPI_ONLY_POLICY.descriptor_sha256
@@ -98,8 +109,8 @@ async def test_runner_streams_complete_admitted_rows_with_unicode_hash_and_bound
     assert report["organizations"][0]["missing_real_ein"] is True
     assert b"synthetic-surrogate" not in output.read_bytes()
     assert output.stat().st_mode & 0o077 == 0
-    assert len(result.sha256) == 64
-    assert result.candidate_organization_count == 257
+    assert len(candidate_result.sha256) == 64
+    assert candidate_result.candidate_organization_count == 257
 
 
 @pytest.mark.asyncio
@@ -123,15 +134,57 @@ async def test_runner_persists_explicit_empty_report_and_rejects_changed_witness
 
 
 @pytest.mark.asyncio
-async def test_runner_skips_unreviewed_identifier_system_without_projecting_tax(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "identifier_system",
+    [
+        "https://example.test/tax",
+        "http://terminology.hl7.org/NamingSystem/npi/",
+        "https://terminology.hl7.org/NamingSystem/npi",
+        "http://terminology.hl7.org/NamingSystem/NPI",
+    ],
+)
+async def test_runner_skips_unreviewed_identifier_system_without_projecting_tax(
+    tmp_path, monkeypatch, identifier_system
+):
     organization = _organization(1)
-    organization["identifier"].append({"system": "https://example.test/tax", "value": "12-3456789"})
+    organization["identifier"].append({"system": identifier_system, "value": "12-3456789"})
     directory, _ = _admitted_release(tmp_path, [organization])
     report, calls, _ = await _run_candidate_report(monkeypatch, directory, tmp_path / "report.json")
     assert calls == [()]
     assert report["organizations"] == []
     assert report["skipped_distinct_organizations"] == {"unreviewed_identifier_system": 1}
     assert b"12-3456789" not in (tmp_path / "report.json").read_bytes()
+
+
+def test_runner_keeps_exact_npi_aliases_candidate_only_and_deduplicated():
+    organization = _organization(1, npi_system="http://terminology.hl7.org/NamingSystem/npi")
+    organization["identifier"].extend(
+        [
+            {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1000000004"},
+            {"system": "http://terminology.hl7.org/NamingSystem/npi", "value": "1234567893"},
+        ]
+    )
+    organization["identifier"][0].update(
+        {
+            "value": "01-2345678",
+            "type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/v2-0203", "code": "TAX"}]},
+        }
+    )
+    _, cutoff = runner._identifier_cutoff("2026-09-24T00:00:00.000000Z")
+    extraction, reason = runner._extract_npi_only(organization, cutoff)
+    assert reason is None
+    assert extraction.state is runner.FhirOrganizationEvidenceState.MISSING_EIN
+    assert extraction.npi_candidates == (1000000004, 1234567893)
+    assert extraction.evidence == ()
+
+
+def test_runner_actual_npi_namespace_still_rejects_invalid_npi():
+    organization = _organization(1, npi_system="http://terminology.hl7.org/NamingSystem/npi")
+    organization["identifier"][1]["value"] = "1000000005"
+    _, cutoff = runner._identifier_cutoff("2026-09-24T00:00:00.000000Z")
+    extraction, reason = runner._extract_npi_only(organization, cutoff)
+    assert extraction is None
+    assert reason == "malformed_npi"
 
 
 @pytest.mark.asyncio

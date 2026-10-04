@@ -164,6 +164,6 @@ async def test_registered_snapshot_uses_real_reader_and_closes_transaction(monke
     assert snapshot_response.headers["Cache-Control"] == "no-store"
     assert snapshot_response.status == (200 if outcome == "success" else 503)
     if outcome == "success":
-        assert snapshot_response.json == _project() and len(statements) == 10
+        assert snapshot_response.json == _project() and len(statements) == 11
     else:
         assert snapshot_response.json["error"]["message"] == "capacity reservation snapshot unavailable"

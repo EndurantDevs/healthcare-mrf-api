@@ -4,16 +4,24 @@
 import datetime
 import json
 from copy import deepcopy
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from process import provider_directory_capacity_reservation_snapshot as snapshot
 from process import provider_directory_cms_capacity_contract as cms_contract
 from process import provider_directory_profile_capacity_preflight_contract as preflight
+from process import provider_directory_profile_failed_cleanup as cleanup
+from process import provider_directory_profile_initial_contract as initial_contract
 from process.provider_directory_profile_capacity_attestation_contract import CapacityLeaseConsumptionBinding
 from process.provider_directory_profile_capacity_consumption import capacity_lease_consumption_values
 from tests.provider_directory_cms_capacity_test_support import cms_guard, sign_guard
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope, _verify
+from tests.test_provider_directory_profile_failed_cleanup import authorization_fixture
+from tests.provider_directory_profile_initial_test_support import signed_initial_envelope
+from tests.test_provider_directory_profile_initial import _geometry, _target, fhir
+from tests.test_provider_directory_profile_initial_replay import _selection
 
 RUN_ID = "run_" + "a" * 32
 
@@ -62,6 +70,28 @@ def _preflight(envelope):
     }
 
 
+def _initial_envelope(accepted_at=VALIDATION_TIME):
+    execution = _selection()
+    target = _target()
+    geometry = _geometry()
+    pairs = tuple((pair["source_id"], pair["dataset_id"]) for pair in execution.attestation.pairs)
+    geometry = replace(
+        geometry,
+        profile_as_of=execution.attestation.desired_profile_as_of,
+        selection_proof_id=execution.attestation.proof_id,
+        profile_input_digest=execution.attestation.profile_input_digest,
+        profile_schema_version=execution.attestation.profile_schema_version,
+        profile_strategy_version=execution.attestation.profile_strategy_version,
+        desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(pairs),
+        initial_target_state_sha256=initial_contract.target_state_sha256(target),
+        **{name: value for name, value in target.items() if "_target_" in name and name in vars(geometry)},
+    )
+    database = SimpleNamespace(
+        **vars(geometry), temp_tablespace_oid=geometry.tablespace_oid, temp_tablespace_name=geometry.tablespace_name
+    )
+    return signed_initial_envelope(geometry, database, target, execution, accepted_at)[0]
+
+
 def _run(envelope, *, status="running", run_id=RUN_ID):
     execution = envelope["lease"]["signing_preflight_guard"]["healthcare_request"]["profile_execution"]
     params_by_field = {**deepcopy(execution), snapshot.PROFILE_CAPACITY_PARAM: envelope}
@@ -79,10 +109,50 @@ def _run(envelope, *, status="running", run_id=RUN_ID):
     }
 
 
-def _project(*, consumptions=(), runs=(), preflights=(), stages=(), observed_at=VALIDATION_TIME):
+def _project(*, consumptions=(), runs=(), preflights=(), stages=(), cleanup_claims=(), observed_at=VALIDATION_TIME):
     return snapshot.reservation_projection(
-        _metadata(observed_at=observed_at), list(consumptions), list(runs), list(preflights), list(stages)
+        _metadata(observed_at=observed_at), list(consumptions), list(runs), list(preflights), list(stages),
+        list(cleanup_claims),
     )
+
+
+def _cleanup_claim():
+    envelope, _trust, _key = authorization_fixture(VALIDATION_TIME)
+    body = envelope["authorization"]
+    return {
+        **{name: body[name] for name in ("operation_id", "reservation_id", "nonce")},
+        **{name: body["checkpoint"][name] for name in ("build_id", "owner_run_id")},
+        "checkpoint_preimage_sha256": body["checkpoint"]["preimage_sha256"],
+        "authorization_sha256": cleanup.digest(envelope),
+        "authorization_json": cleanup.canonical(body),
+        "signature": envelope["signature"],
+        "claimed_at": cleanup.timestamp(body["issued_at"]),
+        "expires_at": cleanup.timestamp(body["expires_at"]),
+        "max_operation_deadline": cleanup.timestamp(body["max_operation_deadline"]),
+    }, envelope
+
+
+@pytest.mark.parametrize("offset_microseconds,expected_count", [(-1, 1), (0, 0), (1, 0)])
+def test_cleanup_snapshot_excludes_only_signed_expiry(offset_microseconds, expected_count):
+    claim, envelope = _cleanup_claim()
+    before = deepcopy(claim)
+    observed_at = claim["expires_at"] + datetime.timedelta(microseconds=offset_microseconds)
+    assert claim["max_operation_deadline"] < observed_at
+    result = _project(cleanup_claims=[claim], observed_at=observed_at)
+    assert len(result["failed_profile_cleanup_claims"]) == expected_count
+    if expected_count:
+        assert result["failed_profile_cleanup_claims"][0]["envelope"] == envelope
+    assert claim == before
+    assert result["release_proof_available"] is False
+
+
+@pytest.mark.parametrize("field", ["expires_at", "authorization_sha256"])
+def test_cleanup_snapshot_refuses_corrupt_expired_claim(field):
+    claim, _envelope = _cleanup_claim()
+    observed_at = claim["expires_at"] + datetime.timedelta(seconds=1)
+    claim[field] = observed_at if field == "expires_at" else "0" * 64
+    with pytest.raises(RuntimeError, match="claim_corrupt"):
+        _project(cleanup_claims=[claim], observed_at=observed_at)
 
 
 def test_consumption_and_pending_run_share_one_original_reservation(monkeypatch):
@@ -129,6 +199,83 @@ def test_pending_preflight_preserves_receipt_without_inventing_envelope():
     assert pending["original_envelope_missing"] is True
     assert pending["reservation_id"] is None
     assert pending["record"]["receipt_json"] == json.loads(row["receipt_json"])
+
+
+@pytest.mark.parametrize("state", ["pending", "consumed", "expired"])
+def test_initial_receipt_lifecycle_preserves_conservative_snapshot(state):
+    envelope = _initial_envelope()
+    row = _preflight(envelope)
+    observed = VALIDATION_TIME
+    if state == "consumed":
+        row.update(consumed_at=observed, consumed_run_id=RUN_ID,
+                   consumed_attestation_id=envelope["lease"]["attestation_id"])
+    elif state == "expired":
+        observed = row["expires_at"] + datetime.timedelta(seconds=1)
+    before = deepcopy(row)
+    result = _project(preflights=[row], observed_at=observed)
+    assert row == before
+    assert result["reservations"] == result["owners"] == []
+    receipt = result["preflight_receipts"][0]
+    assert receipt["pending"] is (state == "pending")
+    assert receipt["original_envelope_missing"] is True
+    assert receipt["record"]["receipt_json"] == json.loads(row["receipt_json"])
+    assert result["capacity_complete"] is False
+    assert result["control_authority_required"] is result["signature_verification_required"] is True
+    assert result["release_proof_available"] is False
+
+
+def test_initial_receipt_matches_original_signed_owner_envelope():
+    envelope = _initial_envelope()
+    result = _project(runs=[_run(envelope)], preflights=[_preflight(envelope)])
+    reservation = result["reservations"][0]
+    assert reservation["envelope"] == envelope
+    assert reservation["durable_preflight_present"] is True
+    assert result["preflight_receipts"][0]["reservation_id"] == envelope["lease"]["reservation_id"]
+    assert result["preflight_receipts"][0]["original_envelope_missing"] is False
+    assert result["release_proof_available"] is False
+
+
+@pytest.mark.parametrize("field", ["request_contract_id", "profile_materialization", "execution_mode", "row_mode"])
+def test_initial_receipt_refuses_rehashed_contract_or_mode_drift(field):
+    row = _preflight(_initial_envelope())
+    receipt = json.loads(row["receipt_json"])
+    if field == "execution_mode":
+        receipt["profile_execution_identity"]["materialization_mode"] = "source_delta"
+    elif field == "row_mode":
+        row["materialization_mode"] = "source_delta"
+    else:
+        receipt[field] = "unsupported"
+        if field in row:
+            row[field] = receipt[field]
+    receipt.pop("receipt_sha256")
+    receipt["receipt_sha256"] = preflight.preflight_domain_sha256(initial_contract.RECEIPT_CONTRACT, receipt)
+    row.update(receipt_sha256=receipt["receipt_sha256"], receipt_json=receipt)
+    with pytest.raises(RuntimeError, match="preflight_initial_contract_changed"):
+        _project(preflights=[row])
+
+
+@pytest.mark.parametrize("wrong_domain", [False, True])
+def test_initial_receipt_refuses_corruption_and_other_contract_hash_domain(wrong_domain):
+    row = _preflight(_initial_envelope())
+    receipt = json.loads(row["receipt_json"])
+    if wrong_domain:
+        receipt.pop("receipt_sha256")
+        receipt["receipt_sha256"] = preflight.preflight_domain_sha256(preflight.CAPACITY_PREFLIGHT_CONTRACT_ID, receipt)
+        row["receipt_sha256"] = receipt["receipt_sha256"]
+    else:
+        receipt["capacity_geometry_hash"] = "00" * 32
+    row["receipt_json"] = receipt
+    with pytest.raises(RuntimeError, match="preflight_digest_changed"):
+        _project(preflights=[row])
+
+
+@pytest.mark.parametrize("field", ["contract_id", "request_contract_id", "request_sha256", "request_nonce",
+                                  "control_plane_receipt_sha256", "capacity_geometry_hash", "issued_at", "expires_at"])
+def test_initial_receipt_retains_all_row_metadata_checks(field):
+    row = _preflight(_initial_envelope())
+    row[field] = row[field] + datetime.timedelta(seconds=1) if field.endswith("_at") else "changed"
+    with pytest.raises(RuntimeError, match="preflight_metadata_changed"):
+        _project(preflights=[row])
 
 
 def test_cms_run_retains_two_independent_exact_envelopes_once(monkeypatch):

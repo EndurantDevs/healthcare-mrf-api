@@ -78,6 +78,11 @@ def _sample_resources():
         "resourceType": "Organization",
         "id": "1234567890",
         "name": "Example Medical Group",
+        "type": [
+            {"coding": [{"system": "urn:example:organization-role", "code": "grp", "display": "Medical group"}]},
+            {"text": "ntwk"},
+            {"text": "unknown-source-role"},
+        ],
         "identifier": [
             {"system": "urn:example:npi", "value": "1234567890"},
             {"system": "urn:example:npi", "value": "1098765432"},
@@ -156,6 +161,8 @@ async def _assert_release_history(source_id, suffix, old_organization, first_id)
     original = next(observation for observation in observations if observation["release_id"] == "release-one")
     assert original["payload_json"]["identifier"] == old_organization["identifier"]
     assert original["payload_json"]["partOf"] == old_organization["partOf"]
+    assert original["payload_json"] == old_organization
+    assert all(observation["payload_json"]["type"] == old_organization["type"] for observation in observations)
     assert len(bindings) == 5
     assert {binding["organization_id"] for binding in bindings if binding["resource_type"] == "Organization"} >= {
         first_id

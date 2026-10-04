@@ -62,6 +62,8 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261002040000_custom_import_child_memberships",
     "20261003000000_address_alias_generation_guard",
     "20261004000000_geo_assurance_dependency_bindings",
+    "20261001100000_profile_failed_cleanup_claim",
+    "20261001110000_profile_initial_publication",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -95,7 +97,7 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
     source_binding_revision = "20260923030000_custom_import_source_binding"
     doctors_revision = "20260929000000_cms_doctor_group_site"
-    assert script.get_heads() == ["20261004000000_geo_assurance_dependency_bindings"]
+    assert script.get_heads() == ["20261001110000_profile_initial_publication"]
     assert script.get_revision("20260930080000_cms_npd_coverage_version").down_revision == (
         "20260930070000_provider_directory_entity_redirect"
     )
@@ -129,6 +131,22 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     )
     assert tuple(step.revision.revision for step in script._upgrade_revs("head", service_network_revision)) == (
         _SERVICE_NETWORK_UPGRADE_REVISIONS
+    )
+
+
+def test_profile_migrations_follow_custom_import_processing_policy() -> None:
+    """The initial publication upgrade extends the prior migration head in order."""
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    assert tuple(
+        step.revision.revision
+        for step in script._upgrade_revs("head", "20261002020000_custom_import_processing_policy")
+    ) == (
+        "20261002030000_custom_import_identical_children",
+        "20261002040000_custom_import_child_memberships",
+        "20261003000000_address_alias_generation_guard",
+        "20261004000000_geo_assurance_dependency_bindings",
+        "20261001100000_profile_failed_cleanup_claim",
+        "20261001110000_profile_initial_publication",
     )
 
 

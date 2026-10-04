@@ -5,12 +5,23 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 DELETE_BATCH_SIZE = 5_000
 RECOVERY_PAGE_SIZE = 100
 TABLE = "provider_directory_cms_npd_stale_candidate"
+_DISPATCH_FIELDS = (
+    "provider_directory_dispatch_id",
+    "provider_directory_dispatch_request_id",
+    "provider_directory_dispatch_request_fingerprint",
+    "provider_directory_dispatch_catalog_digest",
+    "provider_directory_dispatch_contract_version",
+)
+_RETAINED_FIELDS = ("cms_npd_retained_operation", "cms_npd_retained_vector_sha256", "cms_npd_retained_receipt_sha256")
+_FAILED_STATUSES = {"failed", "canceled", "dead_letter"}
 
 
 def candidate_available_sql(dataset_alias: str, schema: str) -> str:
@@ -146,7 +157,7 @@ async def _record_disposition(fhir: Any, candidate: Any, identity: dict[str, Any
 
 
 async def _dispose_locked(fhir: Any, candidate: Any, identity: dict[str, Any]) -> str:
-    """Record only an exact acquiring or validated source-vector replacement."""
+    """Record only an exact unpublished acquiring or validated candidate disposition."""
 
     state = await _locked_candidate_state(fhir, candidate, identity)
     status = state.get("status")
@@ -212,6 +223,220 @@ async def retire_unwitnessed_validated_candidate(fhir: Any, candidate: Any, iden
         prior_status = await _dispose_locked(fhir, candidate, identity)
         if prior_status != fhir.ENDPOINT_DATASET_VALIDATED:
             raise RuntimeError("cms_npd_witness_upgrade_candidate_state_changed")
+
+
+def _retained_selection(params):
+    """Compare optional selectors without admitting partial or altered retained requests."""
+    values = tuple(params.get(name) for name in _RETAINED_FIELDS)
+    if values == (None, None, None):
+        return values
+    if values[0] not in ("baseline", "rollback") or any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in values[1:]
+    ):
+        raise RuntimeError("cms_npd_repair_identity_invalid")
+    return values
+
+
+def _dispatch_identity(params, *, is_repair=False):
+    """Validate the existing typed dispatch identity without treating declared fields as authority."""
+    generation = params.get("provider_directory_dispatch_generation")
+    try:
+        request_id = params["provider_directory_dispatch_request_id"]
+        if str(UUID(request_id)) != request_id:
+            raise ValueError
+        if is_repair:
+            repair_id = params["provider_directory_repair_id"]
+            if str(UUID(repair_id)) != repair_id:
+                raise ValueError
+    except KeyError, TypeError, ValueError, AttributeError:
+        raise RuntimeError("cms_npd_repair_identity_invalid") from None
+    if (
+        type(generation) is not int
+        or generation < int(is_repair)
+        or type(params.get("provider_directory_dispatch_contract_version")) is not int
+        or params["provider_directory_dispatch_contract_version"] != 2
+        or not isinstance(params.get("provider_directory_dispatch_id"), str)
+        or re.fullmatch(r"pdd_[0-9a-f]{32}", params["provider_directory_dispatch_id"]) is None
+        or any(
+            not isinstance(params.get(name), str) or re.fullmatch(r"[0-9a-f]{64}", params[name]) is None
+            for name in _DISPATCH_FIELDS[2:4]
+        )
+    ):
+        raise RuntimeError("cms_npd_repair_identity_invalid")
+    return tuple(params[name] for name in _DISPATCH_FIELDS), generation, _retained_selection(params)
+
+
+async def _run_records(fhir, *, run_id=None, parent_id=None):
+    """Lock a primary-key run or bounded retry children under importer admission serialization."""
+    predicate = "run_id=:run_id" if parent_id is None else "retry_of_run_id=:parent_id"
+    rows = await fhir.db.all(
+        "SELECT run_id, retry_of_run_id, engine, node_id, importer, status, finished_at, params "
+        f"FROM {_table(fhir, 'import_run')} WHERE {predicate} LIMIT 2 FOR UPDATE",
+        **({"run_id": run_id} if parent_id is None else {"parent_id": parent_id}),
+    )
+    return [fhir._pagination_checkpoint_row_mapping(row) for row in rows]
+
+
+async def _run_lineage(fhir, root_run_id, *, running_run_id=None):
+    """Follow actual unique retry edges; only the executing leaf may still be running."""
+    if not isinstance(root_run_id, str) or not root_run_id or len(root_run_id) > 64:
+        raise RuntimeError("cms_npd_acquisition_lineage_invalid")
+    run_records = await _run_records(fhir, run_id=root_run_id)
+    lineage_runs = []
+    visited_run_ids = set()
+    for _depth in range(256):
+        if len(run_records) != 1:
+            break
+        run = run_records[0]
+        params = run.get("params")
+        if (
+            run["run_id"] in visited_run_ids
+            or not isinstance(params, dict)
+            or run["importer"] != "provider-directory-fhir"
+            or run["engine"] != "healthcare-mrf-api"
+            or not run["node_id"]
+            or (lineage_runs and run["node_id"] != lineage_runs[0]["node_id"])
+            or params.get("source_ids") != ["cms-npd"]
+            or params.get("import_resources") is not True
+            or params.get("full_refresh") is not True
+            or (params.get("provider_directory_pagination_root_run_id") or run["run_id"]) != root_run_id
+            or (not lineage_runs and run["retry_of_run_id"] is not None)
+        ):
+            break
+        visited_run_ids.add(run["run_id"])
+        lineage_runs.append(run)
+        children = await _run_records(fhir, parent_id=run["run_id"])
+        is_executing = run["run_id"] == running_run_id and run["status"] == "running"
+        if is_executing:
+            if run["finished_at"] is not None or children:
+                break
+        elif run["status"] not in _FAILED_STATUSES | {"succeeded"} or run["finished_at"] is None:
+            break
+        if not children:
+            if running_run_id is None or run["run_id"] == running_run_id:
+                return lineage_runs
+            break
+        run_records = children
+    raise RuntimeError("cms_npd_acquisition_lineage_invalid")
+
+
+async def _executing_lineage(fhir, task, run_id):
+    """Bind the supplied selector and root to the stored executing run and its actual ancestors."""
+    rows = await _run_records(fhir, run_id=run_id)
+    if len(rows) != 1 or not isinstance(rows[0].get("params"), dict):
+        raise RuntimeError("cms_npd_acquisition_lineage_invalid")
+    params = rows[0]["params"]
+    root = params.get("provider_directory_pagination_root_run_id") or run_id
+    if root != (task.get("provider_directory_pagination_root_run_id") or run_id):
+        raise RuntimeError("cms_npd_acquisition_lineage_invalid")
+    lineage = await _run_lineage(fhir, root, running_run_id=run_id)
+    identity_fields = (*_DISPATCH_FIELDS, "provider_directory_dispatch_generation", "provider_directory_repair_id")
+    if any(
+        _retained_selection(run["params"]) != _retained_selection(task)
+        or any(run["params"].get(name) != task.get(name) for name in identity_fields)
+        for run in lineage
+    ):
+        raise RuntimeError("cms_npd_acquisition_lineage_invalid")
+    return lineage
+
+
+async def is_same_acquisition_replay(fhir, owner_run_id, task, run_id):
+    """Accept only an actual owning run on the current retry chain, never a claimed root string."""
+    from api.control_imports import _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY
+
+    async with fhir.db.transaction():
+        await fhir.db.first(
+            "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))",
+            lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
+        )
+        lineage = await _executing_lineage(fhir, task, run_id)
+        return owner_run_id in {run["run_id"] for run in lineage}
+
+
+async def _repair_candidate_state(fhir, endpoint_id, identity):
+    """Find at most one exact reusable vector, including protected current state."""
+    rows = await fhir.db.all(
+        f"SELECT dataset_id, acquisition_root_run_id, import_run_id FROM {_table(fhir, 'provider_directory_endpoint_dataset')} "
+        "AS candidate WHERE endpoint_id=:endpoint_id "
+        "AND (status IN (:acquiring,:validated) OR (status=:published AND is_current)) "
+        "AND publication_metadata_json::jsonb -> 'source_release' = CAST(:release AS jsonb) "
+        f"AND {candidate_available_sql('candidate', fhir._schema())} LIMIT 2",
+        endpoint_id=endpoint_id,
+        release=json.dumps(identity, sort_keys=True),
+        acquiring=fhir.ENDPOINT_DATASET_ACQUIRING,
+        validated=fhir.ENDPOINT_DATASET_VALIDATED,
+        published=fhir.ENDPOINT_DATASET_PUBLISHED,
+    )
+    if len(rows) > 1:
+        raise RuntimeError("cms_npd_repair_candidate_ambiguous")
+    return fhir._pagination_checkpoint_row_mapping(rows[0]) if rows else None
+
+
+async def _retire_repaired_owner(fhir, candidate, identity, current_lineage, declared_identity):
+    """Retire only the failed older generation of this exact authenticated dispatch."""
+    rows = await _run_records(fhir, run_id=candidate.acquisition_root_run_id)
+    if len(rows) != 1 or not isinstance(rows[0].get("params"), dict):
+        raise RuntimeError("cms_npd_repair_owner_invalid")
+    owner_params = rows[0]["params"]
+    owner_identity = _dispatch_identity(owner_params)
+    if (
+        owner_identity[0] != declared_identity[0]
+        or owner_identity[2] != declared_identity[2]
+        or owner_identity[1] >= declared_identity[1]
+    ):
+        raise RuntimeError("cms_npd_repair_owner_invalid")
+    old_root = owner_params.get("provider_directory_pagination_root_run_id") or candidate.acquisition_root_run_id
+    old_lineage = await _run_lineage(fhir, old_root)
+    if (
+        old_lineage[-1]["status"] not in _FAILED_STATUSES
+        or old_lineage[0]["node_id"] != current_lineage[0]["node_id"]
+        or any(
+            _dispatch_identity(run["params"], is_repair=owner_identity[1] > 0) != owner_identity
+            or run["params"].get("provider_directory_repair_id") != owner_params.get("provider_directory_repair_id")
+            for run in old_lineage
+        )
+        or not {candidate.acquisition_root_run_id, candidate.import_run_id} <= {run["run_id"] for run in old_lineage}
+    ):
+        raise RuntimeError("cms_npd_repair_owner_invalid")
+    return await _dispose_locked(fhir, candidate, identity)
+
+
+async def repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id):
+    """Move a typed repair to a fresh candidate while retaining immutable prior ownership and seals."""
+    if task.get("provider_directory_repair_id") is None:
+        if task.get("provider_directory_dispatch_generation") not in (None, 0):
+            raise RuntimeError("cms_npd_repair_identity_invalid")
+        return None
+    from api.control_imports import _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY
+
+    declared_identity = _dispatch_identity(task, is_repair=True)
+    prior_status = None
+    async with fhir.db.transaction():
+        await fhir.db.first(
+            "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))",
+            lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
+        )
+        lineage = await _executing_lineage(fhir, task, run_id)
+        if (
+            lineage[-1]["status"] != "running"
+            or any(_dispatch_identity(run["params"], is_repair=True) != declared_identity for run in lineage)
+            or any(
+                run["params"].get("provider_directory_repair_id") != task["provider_directory_repair_id"]
+                for run in lineage
+            )
+        ):
+            raise RuntimeError("cms_npd_repair_identity_invalid")
+        await fhir._lock_endpoint_dataset_candidate_admission(fhir.db, endpoint_id)
+        state = await _repair_candidate_state(fhir, endpoint_id, identity)
+        if state is None:
+            return lineage[0]["run_id"], None
+        if {state["acquisition_root_run_id"], state["import_run_id"]} <= {run["run_id"] for run in lineage}:
+            return lineage[0]["run_id"], state["dataset_id"]
+        candidate = SimpleNamespace(**state, endpoint_id=endpoint_id)
+        prior_status = await _retire_repaired_owner(fhir, candidate, identity, lineage, declared_identity)
+    if prior_status == fhir.ENDPOINT_DATASET_ACQUIRING:
+        await _clear_failed_rows(fhir, candidate, identity)
+    return lineage[0]["run_id"], None
 
 
 async def dispose_prior_vectors(fhir: Any, endpoint_id: str, new_vector_sha256: str) -> None:

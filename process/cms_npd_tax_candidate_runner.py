@@ -30,7 +30,10 @@ from process.tin_npi_connector_support import FhirOrganizationEvidenceState
 _ORGANIZATION_FILE = RESOURCE_FILES[0][0]
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _FHIR_ID = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
-_NPI_SYSTEM = "http://hl7.org/fhir/sid/us-npi"
+_NPI_SYSTEMS = (
+    "http://hl7.org/fhir/sid/us-npi",
+    "http://terminology.hl7.org/NamingSystem/npi",
+)
 _MAX_NPIS_PER_LOOKUP = 256
 
 # The EIN selector is deliberately unreachable: this policy class requires one,
@@ -42,7 +45,7 @@ CMS_NPD_NPI_ONLY_POLICY = FhirTinNpiIdentifierPolicy(
             rule_id="cms-npd-exact-npi-v1",
             source_id="cms-npd",
             endpoint_id="cms-npd-bulk",
-            npi_systems=(_NPI_SYSTEM,),
+            npi_systems=_NPI_SYSTEMS,
             npi_type_codings=(),
             ein_systems=("urn:cms-npd:candidate-lane-never-ein",),
             ein_type_codings=(),
@@ -132,7 +135,7 @@ def _extract_npi_only(resource: dict[str, Any], cutoff: Any):
     if not isinstance(identifiers, list) or not identifiers:
         return None, "missing_identifiers"
     if any(
-        not isinstance(identifier, dict) or identifier.get("system") not in (_NPI_SYSTEM, CMS_NPD_PSEUDO_EIN_SYSTEM)
+        not isinstance(identifier, dict) or identifier.get("system") not in (*_NPI_SYSTEMS, CMS_NPD_PSEUDO_EIN_SYSTEM)
         for identifier in identifiers
     ):
         return None, "unreviewed_identifier_system"

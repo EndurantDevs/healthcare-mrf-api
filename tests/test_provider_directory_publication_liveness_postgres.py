@@ -278,7 +278,11 @@ async def test_profile_projection_counts_both_spans_and_final_budget_counts_inte
                     metadata_projection=SimpleNamespace(wal_bytes=0, commit_envelope_bytes=8192),
                 )
                 admission = SimpleNamespace(
-                    initial_wal_lsn=start, geometry=SimpleNamespace(reservation_bytes_by_storage_class={"wal": 10**8})
+                    initial_wal_lsn=start,
+                    geometry=SimpleNamespace(
+                        bounded_admission=False, reservation_bytes_by_storage_class={"wal": 10**8}
+                    ),
+                    wal_tracker=None,
                 )
                 if overrun == "metadata":
                     await database.status(

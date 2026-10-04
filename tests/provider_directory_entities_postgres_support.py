@@ -29,7 +29,8 @@ def _database_url():
     url = make_url(raw)
     if (
         url.host not in {"localhost", "127.0.0.1"}
-        or url.port != 5432
+        or url.port is None
+        or not 1 <= url.port <= 65535
         or not url.drivername.startswith("postgresql")
         or not re.fullmatch(r"hc_directory_entities_[0-9a-f]{32}", url.database or "")
     ):

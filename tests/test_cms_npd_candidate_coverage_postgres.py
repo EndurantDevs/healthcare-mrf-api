@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Candidate coverage freezes exact inputs before any serving pointer moves."""
+"""Candidate coverage and relationship witnesses retain exact source scope."""
 
 import asyncio
+import hashlib
+import json
 from contextvars import Context
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,12 +13,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from process import provider_directory_cms_npd as cms
+from process import provider_directory_cms_npd_relationship as relationships
 from process import provider_directory_cms_serving_coverage as coverage
 from process.provider_directory_entity_identity import bind_entity_batch
 from process.provider_directory_insurance_network_identity import record_insurance_network_plan
 from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import cms_artifact_root, fhir
+from tests.test_cms_npd_admission_postgres import _write_location_batch
 
 
 class _Staged(Exception):
@@ -85,7 +89,8 @@ async def _assert_seal_guards(database, proof):
 async def test_candidate_coverage_is_unpublished_immutable_and_replayable(monkeypatch, cms_artifact_root, published):
     """A full fixture seals once, preserves the current pointer, and rejects changed identities."""
     _include_candidate_migration(monkeypatch)
-    async with support.admission_database(monkeypatch) as database:
+    migration_prefixes = support.LEGACY_MIGRATION_PREFIXES if published else support.MIGRATION_PREFIXES
+    async with support.admission_database(monkeypatch, migration_prefixes=migration_prefixes) as database:
         candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
         if published:
             await publish_validated_source_local_dataset(
@@ -190,3 +195,171 @@ async def _assert_other_source_writes(database, release_id):
                 "network": [{"reference": "Organization/network-1"}],
             },
         )
+
+
+def _relationship_page_params(candidate, identity):
+    return {
+        "dataset_id": candidate.dataset_id,
+        "release_id": identity["vector_sha256"],
+        "after_type": "",
+        "after_id": "",
+        "last_type": "zzzz",
+        "last_id": "zzzz",
+    }
+
+
+async def _stage_scoped_witnesses(monkeypatch, candidate, identity, endpoint_id):
+    resources = [
+        {
+            "resourceType": "Location",
+            "id": resource_id,
+            "name": "Example",
+            "endpoint": [{"reference": "Endpoint/example"}, {"display": "No reference"}],
+            "unmapped": {"nullable": None, "is_active": False},
+        }
+        for resource_id in ("page-a", "page-b", "page-c")
+    ]
+    original_insert = cms._insert_verified_witnesses
+
+    async def insert_hash_mismatch(session, witness_by_id):
+        changed_by_id = {key: dict(value) for key, value in witness_by_id.items()}
+        bad_witness = changed_by_id["page-a"]
+        bad_witness["normalized_payload_hash"] = (
+            "0" * 64 if bad_witness["normalized_payload_hash"] != "0" * 64 else "1" * 64
+        )
+        await original_insert(session, changed_by_id)
+
+    with monkeypatch.context() as changed:
+        changed.setattr(cms, "_insert_verified_witnesses", insert_hash_mismatch)
+        await _write_location_batch(candidate, resources)
+    with monkeypatch.context() as other_source:
+        other_source.setattr(cms.source, "DOWNLOADS_URL", "https://example.test/cms-key-join-other")
+        other_endpoint_id = await cms._register_source(fhir)
+    assert await cms._register_source(fhir) == endpoint_id
+    assert endpoint_id != other_endpoint_id
+    other = await cms._candidate(
+        fhir, other_endpoint_id, "cms-key-join-other", identity, candidate_key="cms-key-join-other"
+    )
+    assert other.dataset_id != candidate.dataset_id
+    await _write_location_batch(other, [{**resources[1], "name": "Other dataset"}])
+    return resources, other
+
+
+async def _relationship_page_rows(session, params_by_field):
+    page = relationships._page_sql(
+        fhir._qt(fhir._schema(), relationships._RESOURCE),
+        fhir._qt(fhir._schema(), relationships._WITNESS),
+    )
+    return (
+        await session.execute(
+            text(f"SELECT * FROM ({page}) retained_page ORDER BY resource_type, resource_id"), params_by_field
+        )
+    ).all()
+
+
+@pytest.mark.asyncio
+async def test_relationship_key_join_preserves_scope_hash_and_raw_rows(monkeypatch, cms_artifact_root):
+    """Filtering after the key join retains exact scope, bounds and raw JSON."""
+    _, receipt = support.retained_release(cms_artifact_root)
+    identity = cms.release_identity(receipt)
+    async with support.admission_database(monkeypatch) as database:
+        endpoint_id = await cms._register_source(fhir)
+        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-key-join", identity, {})
+        resources, other = await _stage_scoped_witnesses(monkeypatch, candidate, identity, endpoint_id)
+        params_by_field = _relationship_page_params(candidate, identity)
+        async with database.session() as session:
+            witness_rows = await _relationship_page_rows(session, params_by_field)
+            assert [witness_row[1] for witness_row in witness_rows] == ["page-b", "page-c"]
+            assert [witness_row[4] for witness_row in witness_rows] == resources[1:]
+            assert all(
+                witness_row[3]
+                == hashlib.sha256(
+                    json.dumps(witness_row[4], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                ).hexdigest()
+                for witness_row in witness_rows
+            )
+            for fields, expected_ids in (
+                (
+                    {"after_type": "Location", "after_id": "page-a", "last_type": "Location", "last_id": "page-b"},
+                    ["page-b"],
+                ),
+                (
+                    {"after_type": "Location", "after_id": "page-b", "last_type": "Location", "last_id": "page-c"},
+                    ["page-c"],
+                ),
+                ({"release_id": "0" * 64}, []),
+                ({"dataset_id": other.dataset_id}, ["page-b"]),
+            ):
+                selected = await _relationship_page_rows(session, {**params_by_field, **fields})
+                assert [witness_row[1] for witness_row in selected] == expected_ids
+                if fields.get("dataset_id") == other.dataset_id:
+                    assert selected[0][4]["name"] == "Other dataset"
+        assert (
+            await database.scalar(
+                "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id",
+                dataset_id=candidate.dataset_id,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_relationship_key_join_replay_completeness_and_rollback(monkeypatch, cms_artifact_root):
+    """The shared page preserves atomic inserts, NULL references and missing-link rejection."""
+    _, receipt = support.retained_release(cms_artifact_root)
+    identity = cms.release_identity(receipt)
+    async with support.admission_database(monkeypatch) as database:
+        endpoint_id = await cms._register_source(fhir)
+        candidate = await cms._admission_candidate(fhir, endpoint_id, "cms-key-join-rollback", identity, {})
+        await _write_location_batch(
+            candidate,
+            [
+                {
+                    "resourceType": "Location",
+                    "id": "page-site",
+                    "name": "Example",
+                    "endpoint": [{"reference": "Endpoint/example"}, {"display": "No reference"}],
+                }
+            ],
+        )
+        params_by_field = _relationship_page_params(candidate, identity)
+        with pytest.raises(RuntimeError, match="synthetic_relationship_page_failure"):
+            async with database.transaction() as session:
+                await session.execute(text(relationships._insert_sql(fhir)), params_by_field)
+                assert (
+                    await relationships._page_complete(
+                        fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
+                    )
+                    == 2
+                )
+                raise RuntimeError("synthetic_relationship_page_failure")
+        ledger_count = await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_cms_npd_relationship WHERE dataset_id=:dataset_id",
+            dataset_id=candidate.dataset_id,
+        )
+        assert ledger_count == 0
+        for _ in range(2):
+            async with database.session() as session:
+                await session.execute(text(relationships._insert_sql(fhir)), params_by_field)
+                assert (
+                    await relationships._page_complete(
+                        fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
+                    )
+                    == 2
+                )
+        links = await database.all(
+            "SELECT target_reference,resolution_status FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id ORDER BY reference_ordinal",
+            dataset_id=candidate.dataset_id,
+        )
+        assert [tuple(link) for link in links] == [("Endpoint/example", "unresolved"), (None, "unresolved")]
+        await database.status(
+            "DELETE FROM mrf.provider_directory_cms_npd_relationship "
+            "WHERE dataset_id=:dataset_id AND reference_ordinal=2",
+            dataset_id=candidate.dataset_id,
+        )
+        async with database.session() as session:
+            with pytest.raises(RuntimeError, match="cms_npd_relationship_projection_incomplete"):
+                await relationships._page_complete(
+                    fhir, session, candidate.dataset_id, identity["vector_sha256"], "", "", "zzzz", "zzzz"
+                )

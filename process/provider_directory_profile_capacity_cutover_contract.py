@@ -67,9 +67,11 @@ def _cutover_target_projection(
     )
     if (
         relation_cap is None
-        or growth_bytes > relation_cap.max_target_growth_bytes
         or deleted_bytes > relation_cap.max_deleted_logical_bytes
-        or wal_bytes > relation_cap.max_wal_bytes
+        or (not geometry.bounded_admission and (
+            growth_bytes > relation_cap.max_target_growth_bytes
+            or wal_bytes > relation_cap.max_wal_bytes
+        ))
     ):
         raise _error("cutover_target_projection_exceeded:" + expected_name)
     return growth_bytes, deleted_bytes, wal_bytes

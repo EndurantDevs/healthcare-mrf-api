@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import text
 
 from process import provider_directory_profile_capacity_attestation as lease_contract
+from process import provider_directory_profile_initial_contract as initial_contract
 from process.provider_directory_cms_capacity_contract import CMS_ADMISSION_FIELD, CMS_PREFLIGHT_CONTRACT
 from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
 from process.provider_directory_profile_capacity_preflight_contract import (
@@ -24,7 +25,7 @@ from process.provider_directory_profile_capacity_preflight_contract import (
 )
 from process.provider_directory_profile_selection_contract import CMS_CAPACITY_EXECUTION_PARAM
 
-CONTRACT_ID = "provider-directory-healthcare-capacity-reservation-snapshot.v1"
+CONTRACT_ID = "provider-directory-healthcare-capacity-reservation-snapshot.v2"
 PROFILE_CAPACITY_PARAM = "provider_directory_profile_capacity_attestation"
 ACTIVE_RUN_STATUSES = ("queued", "starting", "running", "finalizing", "canceling")
 _DATABASE_FIELDS = ("database_system_identifier", "database_oid", "database_name")
@@ -283,13 +284,22 @@ def _preflight_observations(
     for preflight_by_field in preflight_rows:
         receipt = _json_object(preflight_by_field["receipt_json"])
         contract = receipt.get("contract_id")
-        if contract not in {CAPACITY_PREFLIGHT_CONTRACT_ID, CMS_PREFLIGHT_CONTRACT}:
+        if contract not in {
+            CAPACITY_PREFLIGHT_CONTRACT_ID, CMS_PREFLIGHT_CONTRACT, initial_contract.RECEIPT_CONTRACT
+        }:
             _fail("preflight_contract_unsupported")
         digest = preflight_domain_sha256(
             contract, {name: receipt_value for name, receipt_value in receipt.items() if name != "receipt_sha256"}
         )
         if digest != preflight_by_field["receipt_sha256"] or receipt.get("receipt_sha256") != digest:
             _fail("preflight_digest_changed")
+        if contract == initial_contract.RECEIPT_CONTRACT and (
+            receipt.get("request_contract_id") != initial_contract.REQUEST_CONTRACT
+            or receipt.get("profile_materialization") != initial_contract.MATERIALIZATION
+            or _json_object(receipt.get("profile_execution_identity")).get("materialization_mode") != "full_swap"
+            or preflight_by_field.get("materialization_mode") != "full_swap"
+        ):
+            _fail("preflight_initial_contract_changed")
         for field in (
             "contract_id",
             "request_contract_id",
@@ -321,8 +331,19 @@ def _preflight_observations(
     return receipts
 
 
+_RESERVATION_LIMITATIONS = [
+            "original_signed_bytes_are_not_remaining_reservations",
+            "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
+            "expiry_and_terminal_run_status_do_not_prove_physical_release",
+            "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
+            "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
+            "legacy_consumptions_are_opaque_unverified_ledger_observations",
+        ]
+
+
 def reservation_projection(
-    metadata: dict, consumptions: list[dict], runs: list[dict], preflights: list[dict], stages: list[dict]
+    metadata: dict, consumptions: list[dict], runs: list[dict], preflights: list[dict], stages: list[dict],
+    cleanup_claims: list[dict] = (),
 ) -> dict:
     """Deduplicate original leases; observed lifecycle states never release bytes."""
     observed_at = _timestamp(metadata["observed_at"])
@@ -372,14 +393,8 @@ def reservation_projection(
         "owners": owners,
         "preflight_receipts": receipts,
         "profile_stage_observations": _json_values(stages),
-        "limitations": [
-            "original_signed_bytes_are_not_remaining_reservations",
-            "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
-            "expiry_and_terminal_run_status_do_not_prove_physical_release",
-            "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
-            "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
-            "legacy_consumptions_are_opaque_unverified_ledger_observations",
-        ],
+        "failed_profile_cleanup_claims": _cleanup_claim_projection(cleanup_claims, observed_at),
+        "limitations": _RESERVATION_LIMITATIONS,
     }
 
 
@@ -485,4 +500,20 @@ async def capacity_reservation_snapshot(fhir: Any) -> dict:
             ).mappings()
         ]
         stages = await _snapshot_stage_rows(session, checkpoint, schema)
-        return reservation_projection(metadata, consumptions, runs, preflights, stages)
+        cleanup_claims = [dict(database_record) for database_record in (await session.execute(text(
+            f"SELECT * FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_failed_cleanup_claim')} ORDER BY operation_id"
+        ))).mappings()]
+        return reservation_projection(metadata, consumptions, runs, preflights, stages, cleanup_claims)
+
+
+def _cleanup_claim_projection(claims, observed_at):
+    """Validate immutable claims and project their unexpired reservation ceilings."""
+    from process.provider_directory_profile_failed_cleanup import _claim_envelope
+
+    unexpired_claims = []
+    for claim in claims:
+        envelope = _claim_envelope(claim)
+        if claim["expires_at"] > observed_at:
+            unexpired_claims.append({"record": _json_values(claim), "envelope": envelope,
+                           "signature_verification": "required_by_independent_cleanup_authority"})
+    return unexpired_claims

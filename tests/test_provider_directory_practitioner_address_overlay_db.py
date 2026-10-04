@@ -636,7 +636,8 @@ async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references
         await database.status(
             f'INSERT INTO "{schema_name}"."provider_directory_organization_affiliation" '
             "VALUES ('cms-npd', 'aff-1', true, 'Organization/org-1', NULL, "
-            "'[\"Location/physical\"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'run-current', now())"
+            "'[\"Location/kind\",\"Location/postal\",\"Location/physical\"]'::jsonb, "
+            "'[]'::jsonb, '[]'::jsonb, 'run-current', now())"
         )
         await database.status(
             f'INSERT INTO "{schema_name}"."provider_directory_healthcare_service" '
@@ -646,6 +647,9 @@ async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references
             schema_name, "cms_affiliation_stage", component="organization_affiliation", source_ids=["cms-npd"]
         )
         assert await database.status(insert_sql, source_ids=["cms-npd"]) == 1
+        assert await database.scalar(
+            f'SELECT first_line FROM "{schema_name}"."cms_affiliation_stage"'
+        ) == "physical Road"
         await database.status(f'DELETE FROM "{schema_name}"."cms_affiliation_stage"')
         for organization_ref, location_refs, service_refs in (
             ("https://other.invalid/Organization/org-1", ["Location/physical"], []),

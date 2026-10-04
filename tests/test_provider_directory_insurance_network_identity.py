@@ -198,35 +198,58 @@ async def test_network_identity_is_source_scoped_and_release_evidence_is_immutab
 
 @pytest.mark.asyncio
 async def test_source_declared_network_reuses_id_when_plan_arrives():
-    organization_map = {"resourceType": "Organization", "id": "network-2", "type": [{"text": "ntwk"}]}
-    payload_json = json.dumps(organization_map, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Share one network across plans without merging a same-name network."""
+    organization_map = {
+        "resourceType": "Organization", "id": "network-2", "name": "Example Network", "type": [{"text": "ntwk"}]
+    }
+    plan_maps = [
+        _plan(network="Organization/network-2"),
+        {
+            **_plan(network="Organization/network-2"),
+            "id": "plan-2",
+            "ownedBy": {"reference": "Organization/insurer-2"},
+            "administeredBy": {"reference": "Organization/administrator-2"},
+        },
+    ]
     async with _network_test_engine() as engine:
         async with AsyncSession(engine) as session, session.begin():
-            await session.execute(
-                text(
-                    "UPDATE mrf.provider_directory_entity_release_evidence "
-                    "SET payload_json=CAST(:payload AS jsonb), payload_sha256=:sha "
-                    "WHERE source_id='source-a' AND resource_id='network-2'"
-                ),
-                {"payload": payload_json, "sha": hashlib.sha256(payload_json.encode()).hexdigest()},
-            )
-            network_id = await record_insurance_network_organization(
-                session, source_id="source-a", release_id="release-1", organization=organization_map
-            )
+            network_ids = []
+            for organization in (organization_map, {**organization_map, "id": "network-1"}):
+                payload_json = json.dumps(organization, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                await session.execute(
+                    text(
+                        "UPDATE mrf.provider_directory_entity_release_evidence "
+                        "SET payload_json=CAST(:payload AS jsonb), payload_sha256=:sha "
+                        "WHERE source_id='source-a' AND release_id='release-1' AND resource_id=:resource_id"
+                    ),
+                    {"payload": payload_json, "sha": hashlib.sha256(payload_json.encode()).hexdigest(),
+                     "resource_id": organization["id"]},
+                )
+                network_ids.append(await record_insurance_network_organization(
+                    session, source_id="source-a", release_id="release-1", organization=organization
+                ))
+            network_id = network_ids[0]
+            assert network_id != network_ids[1]
             assert network_id == await record_insurance_network_organization(
                 session, source_id="source-a", release_id="release-1", organization=organization_map
             )
-            assert network_id == await record_insurance_network_plan(
-                session,
-                source_id="source-a",
-                release_id="release-1",
-                network_resource_id="network-2",
-                plan=_plan(network="Organization/network-2"),
-            )
-            assert (
-                await session.scalar(text("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity"))
-                == 1
-            )
+            for plan in plan_maps:
+                assert network_id == await record_insurance_network_plan(
+                    session, source_id="source-a", release_id="release-1", network_resource_id="network-2", plan=plan
+                )
+        async with AsyncSession(engine) as session:
+            evidence_rows = (await session.scalars(select(ProviderDirectoryInsuranceNetworkPlanEvidence))).all()
+            evidence_by_plan = {evidence_row.insurance_plan_resource_id: evidence_row for evidence_row in evidence_rows}
+            assert len(evidence_rows) == 2 and set(evidence_by_plan) == {"plan-1", "plan-2"}
+            for plan in plan_maps:
+                evidence = evidence_by_plan[plan["id"]]
+                assert evidence.owned_by_ref == plan["ownedBy"]["reference"]
+                assert evidence.administered_by_ref == plan["administeredBy"]["reference"]
+                assert evidence.network_refs == ["Organization/network-2"]
+                assert evidence.plan_payload_json == plan
+            assert await session.scalar(
+                text("SELECT count(*) FROM mrf.provider_directory_insurance_network_identity")
+            ) == 2
 
 
 async def _assert_network_failures(engine):

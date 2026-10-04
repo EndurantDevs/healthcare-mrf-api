@@ -323,6 +323,10 @@ async def test_capacity_settings_fail_before_mutation_without_temp_privilege(
             assert "has_parameter_privilege" in statement
             return json.loads("false")
 
+        async def all(self, statement):
+            assert "pg_catalog.pg_proc" in statement
+            return []
+
         async def status(self, _statement):
             raise AssertionError("capacity settings must not be mutated")
 

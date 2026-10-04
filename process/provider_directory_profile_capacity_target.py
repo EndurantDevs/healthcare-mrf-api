@@ -87,6 +87,8 @@ def _btree_wal_page_touches(
 def _target_delta_projection(
     geometry: ProviderDirectoryProfileCapacityGeometry,
     delta_input: ProviderDirectoryProfileTargetDeltaInput,
+    *,
+    enforce_caps: bool = True,
 ) -> ProviderDirectoryProfileTargetDeltaProjection:
     """Project one validated target relation within its signed byte caps."""
 
@@ -95,12 +97,15 @@ def _target_delta_projection(
     target_growth_bytes = _target_growth_bytes(geometry, delta_input)
     deleted_logical_bytes = delta_input.deleted_logical_bytes
     wal_bytes = _target_wal_bytes(geometry, delta_input)
-    _assert_target_projection_caps(
-        relation_cap,
-        target_growth_bytes=target_growth_bytes,
-        deleted_logical_bytes=deleted_logical_bytes,
-        wal_bytes=wal_bytes,
-    )
+    if enforce_caps or not geometry.bounded_admission:
+        _assert_target_projection_caps(
+            relation_cap,
+            target_growth_bytes=target_growth_bytes,
+            deleted_logical_bytes=deleted_logical_bytes,
+            wal_bytes=wal_bytes,
+        )
+    elif deleted_logical_bytes > relation_cap.max_deleted_logical_bytes:
+        raise _error("delta_projection_deleted_logical_bytes_exceeded:" + delta_input.relation_name)
     return ProviderDirectoryProfileTargetDeltaProjection(
         relation_name=delta_input.relation_name,
         target_growth_bytes=target_growth_bytes,
@@ -254,6 +259,8 @@ def _assert_target_projection_caps(
 def project_profile_delta_capacity(
     geometry: ProviderDirectoryProfileCapacityGeometry,
     target_inputs: tuple[ProviderDirectoryProfileTargetDeltaInput, ...],
+    *,
+    enforce_caps: bool = True,
 ) -> ProviderDirectoryProfileDeltaProjection:
     """Project signed physical and WAL bounds before the first target DML."""
 
@@ -268,7 +275,8 @@ def project_profile_delta_capacity(
     ):
         raise _error("delta_projection_target_order_invalid")
     target_projections = tuple(
-        _target_delta_projection(verified_geometry, target_input)
+        (_target_delta_projection(verified_geometry, target_input) if enforce_caps
+         else _target_delta_projection(verified_geometry, target_input, enforce_caps=False))
         for target_input in target_inputs
     )
     target_data_bytes = _checked_add(
@@ -284,7 +292,8 @@ def project_profile_delta_capacity(
         ),
     )
     if (
-        wal_bytes
+        (enforce_caps or not verified_geometry.bounded_admission)
+        and wal_bytes
         > verified_geometry.reservation_bytes_by_storage_class["wal"]
     ):
         raise _error("delta_projection_total_wal_exceeded")

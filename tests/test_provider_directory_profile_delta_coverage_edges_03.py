@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import hashlib
+
+from process import provider_directory_profile_failed_cleanup as cleanup
 from tests.provider_directory_profile_delta_coverage_support import (
     AsyncMock,
     Mock,
@@ -22,6 +25,11 @@ from tests.provider_directory_profile_delta_coverage_support import (
     json,
     profile,
     pytest,
+)
+from tests.test_provider_directory_profile_failed_cleanup import (
+    NOW,
+    authorization_fixture,
+    sign,
 )
 
 
@@ -414,22 +422,119 @@ async def test_stale_build_cleanup_marker_edges(monkeypatch):
         "_provider_directory_profile_stage_relation_identity",
         relation_identity,
     )
-    assert (
+    with pytest.raises(RuntimeError, match="failed_profile_cleanup_completion_missing"):
         await importer._reap_stale_provider_directory_profile_builds(
             "mrf",
             current_build_id=current_build_id,
         )
-        == 0
+    relation_identity.assert_not_awaited()
+
+
+def _cleanup_completion_claim(checkpoint):
+    """Bind the existing synthetic signing fixture to the exact failed checkpoint."""
+    envelope, trust, key = authorization_fixture()
+    body = envelope["authorization"]
+    body["checkpoint"]["build_id"] = checkpoint["build_id"]
+    body["checkpoint"]["preimage_sha256"] = cleanup.digest(
+        cleanup.json_values(checkpoint), cleanup.CONTRACT + ".checkpoint"
     )
-    assert relation_identity.await_count == 3
+    body["checkpoint"]["original_error_sha256"] = hashlib.sha256(
+        checkpoint["last_error"].encode()
+    ).hexdigest()
+    envelope = sign(body, key)
+    claim_by_field = {
+        "operation_id": body["operation_id"],
+        "reservation_id": body["reservation_id"],
+        "nonce": body["nonce"],
+        "build_id": body["checkpoint"]["build_id"],
+        "owner_run_id": body["checkpoint"]["owner_run_id"],
+        "checkpoint_preimage_sha256": body["checkpoint"]["preimage_sha256"],
+        "authorization_sha256": cleanup.digest(envelope),
+        "authorization_json": cleanup.canonical(body),
+        "signature": envelope["signature"],
+        "claimed_at": NOW,
+        "expires_at": cleanup.timestamp(body["expires_at"]),
+        "max_operation_deadline": cleanup.timestamp(body["max_operation_deadline"]),
+    }
+    return claim_by_field, trust, body
+
+
+def _completed_cleanup_checkpoint():
+    """Use the existing signed authority and exact receipt shape for retained cleanup."""
+    build_id = "pdpb_" + "d" * 32
+    checkpoint_by_field = {
+        "build_id": build_id,
+        "evidence_stage": profile.profile_evidence_stage_table_name(build_id),
+        "profile_stage": profile.profile_stage_table_name(build_id),
+        "affected_npi_stage": importer._bounded_identifier(
+            f"provider_directory_profile_affected_{build_id}"
+        ),
+        "materialization_mode": "source_delta",
+        "last_error": "projection failed",
+        "updated_at": NOW,
+    }
+    claim, trust, body = _cleanup_completion_claim(checkpoint_by_field)
+    completed_at = NOW + datetime.timedelta(seconds=1)
+    receipt_by_field = {
+        "contract_id": cleanup.RECEIPT_CONTRACT,
+        "operation_id": claim["operation_id"],
+        "authorization_sha256": claim["authorization_sha256"],
+        "checkpoint_preimage_sha256": claim["checkpoint_preimage_sha256"],
+        "original_updated_at": NOW.isoformat(),
+        "original_error_sha256": body["checkpoint"]["original_error_sha256"],
+        "disposed_stages": body["stages"],
+        "completed_at": completed_at.isoformat(),
+        "wal_start_lsn": "0/100",
+        "wal_precommit_lsn": "0/200",
+        "wal_precommit_bytes": 256,
+    }
+    checkpoint_by_field.update(
+        last_error=checkpoint_by_field["last_error"] + cleanup.completion_suffix(receipt_by_field),
+        updated_at=completed_at,
+    )
+    return checkpoint_by_field, claim, trust, body["database"]
+
+
+@pytest.mark.asyncio
+async def test_stale_build_authenticated_cleanup_completion(monkeypatch):
+    """Authenticate retained completion before accepting absent stages or refusing drift."""
+    checkpoint, claim, trust, database = _completed_cleanup_checkpoint()
+    database_binding_by_field = {
+        field: database[field] for field in (
+            "database_system_identifier", "database_oid", "database_name"
+        )
+    }
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[checkpoint]))
+    monkeypatch.setattr(
+        importer.db, "first", AsyncMock(side_effect=[
+            SimpleNamespace(_mapping=claim), SimpleNamespace(_mapping=database_binding_by_field)
+        ] * 3)
+    )
+    monkeypatch.setattr(cleanup, "configured_cleanup_trust", lambda: trust)
+    monkeypatch.setattr(cleanup, "_now_utc", lambda: NOW + datetime.timedelta(hours=1))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: SimpleNamespace())
+    relation_identity = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", relation_identity)
+    current_build_id = "pdpb_" + "c" * 32
+    assert await importer._reap_stale_provider_directory_profile_builds(
+        "mrf", current_build_id=current_build_id
+    ) == 0
+    assert {invocation.args for invocation in relation_identity.await_args_list} == {
+        ("mrf", checkpoint[field])
+        for field in ("evidence_stage", "profile_stage", "affected_npi_stage")
+    }
 
     relation_identity.reset_mock()
-    relation_identity.side_effect = [None, (22, "r", "p"), None]
+    # Keep completed-history stages absent, then test the reaper's final presence check.
+    relation_identity.side_effect = [None] * 4 + [(22, "r", "p"), None]
     with pytest.raises(RuntimeError, match="disposed_checkpoint_stage_present"):
-        await importer._reap_stale_provider_directory_profile_builds(
-            "mrf",
-            current_build_id=current_build_id,
-        )
+        await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id)
+
+    relation_identity.reset_mock()
+    checkpoint["profile_stage"] += "_changed"
+    with pytest.raises(RuntimeError, match="completion_preimage_changed"):
+        await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id)
+    relation_identity.assert_not_awaited()
 
 @pytest.mark.asyncio
 async def test_bundle_profile_delta_edges(monkeypatch):

@@ -106,9 +106,12 @@ def capacity_preflight_receipt_row_values(
     request: Any, receipt: Mapping[str, Any], *, issued_at: datetime.datetime
 ) -> dict[str, Any]:
     """Retain the exact matching receipt/request version and immutable row identity."""
+    from process import provider_directory_profile_initial_contract as initial
+
     is_cms = request.cms_nonprofile_admission is not None
-    receipt_contract = CMS_PREFLIGHT_CONTRACT if is_cms else CAPACITY_PREFLIGHT_CONTRACT_ID
-    request_contract = CMS_PREFLIGHT_REQUEST_CONTRACT if is_cms else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID
+    is_initial = initial.is_initial_request(request)
+    receipt_contract = CMS_PREFLIGHT_CONTRACT if is_cms else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
+    request_contract = CMS_PREFLIGHT_REQUEST_CONTRACT if is_cms else (initial.REQUEST_CONTRACT if is_initial else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
     if (
         receipt["contract_id"] != receipt_contract
         or receipt["request_contract_id"] != request_contract
@@ -149,14 +152,19 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
     from process import provider_directory_profile_capacity_preflight_contract as base
     from process.provider_directory_profile_capacity_signing_guard_contract import _HEALTHCARE_RECEIPT_FIELDS
 
+    from process import provider_directory_profile_initial_contract as initial
+
     signed_receipt = lease.signing_preflight_guard["healthcare_receipt"]
     is_cms = signed_receipt["contract_id"] == CMS_PREFLIGHT_CONTRACT
+    is_initial = signed_receipt["contract_id"] == initial.RECEIPT_CONTRACT
     fields = _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"} if is_cms else _HEALTHCARE_RECEIPT_FIELDS
+    if is_initial:
+        fields = fields | {"profile_materialization"}
     raw_receipt = receipt_row.get("receipt_json")
     if isinstance(raw_receipt, str):
         raw_receipt = json.loads(raw_receipt)
     receipt_by_field = dict(_exact_mapping(raw_receipt, fields, reason="stored_receipt_fields_invalid"))
-    contract = CMS_PREFLIGHT_CONTRACT if is_cms else CAPACITY_PREFLIGHT_CONTRACT_ID
+    contract = CMS_PREFLIGHT_CONTRACT if is_cms else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
     digest = preflight_domain_sha256(
         contract, {name: field_value for name, field_value in receipt_by_field.items() if name != "receipt_sha256"}
     )
@@ -166,7 +174,7 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
         or (digest != lease.nonce or receipt_row.get("receipt_sha256") != digest)
     ):
         _invalid("stored_receipt_changed")
-    if is_cms:
+    if is_cms or is_initial:
         request = base.validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
         expected_by_field = capacity_preflight_receipt_row_values(
             request, receipt_by_field, issued_at=base._utc_timestamp(receipt_by_field["issued_at"])
@@ -202,6 +210,7 @@ def _paired_profile_envelope(raw: Any) -> dict[str, Any]:
     """Parse a current Profile pair without admitting a recursive CMS envelope."""
     from process import provider_directory_profile_capacity_attestation as lease
     from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
+    from process import provider_directory_profile_initial_contract as initial
 
     envelope_by_field = dict(_exact_mapping(raw, frozenset({"lease", "signature"}), reason="cms_pair_fields_invalid"))
     body_by_field = dict(
@@ -212,10 +221,11 @@ def _paired_profile_envelope(raw: Any) -> dict[str, Any]:
     request = guard.get("healthcare_request") if isinstance(guard, Mapping) else None
     if (
         not isinstance(receipt, Mapping)
-        or receipt.get("contract_id") != CAPACITY_PREFLIGHT_CONTRACT_ID
+        or receipt.get("contract_id") not in {CAPACITY_PREFLIGHT_CONTRACT_ID, initial.RECEIPT_CONTRACT}
         or (
             not isinstance(request, Mapping)
-            or request.get("contract_id") != CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID
+            or request.get("contract_id") != (initial.REQUEST_CONTRACT if receipt.get("contract_id") == initial.RECEIPT_CONTRACT
+                                              else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
             or CMS_ADMISSION_FIELD in request
         )
     ):

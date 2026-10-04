@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,8 +34,9 @@ from tests.test_provider_directory_fhir_subset_runtime_boundaries import (
     _reviewed_source_record,
     importer,
 )
+from tests.test_provider_directory_profile_initial import _geometry as _initial_geometry
 from tests.test_provider_directory_trust_boundaries import (
-    _artifact_stage,
+    _initial_profile_stages,
     _promotion_dataset,
 )
 
@@ -339,6 +341,21 @@ async def test_artifact_alias_cas_failure_stops_before_publication(monkeypatch):
     publish.assert_not_awaited()
 
 
+def _mock_initial_profile_admission(monkeypatch, stages):
+    """Supply a matching initial admission while keeping lock writes in memory."""
+    build = stages[0].profile_initial_build
+    admission = SimpleNamespace(
+        geometry=_initial_geometry(),
+        admitted_identity=SimpleNamespace(initial_targets=object()),
+        run_id=build.owner_run_id,
+        build_id=importer._provider_directory_profile_build_id(build),
+    )
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: admission)
+    monkeypatch.setattr(importer, "_profile_capacity_remaining_ms", AsyncMock())
+    monkeypatch.setattr(importer, "_lock_profile_capacity_preflight_state", AsyncMock())
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+
+
 @pytest.mark.asyncio
 async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
     monkeypatch,
@@ -365,7 +382,8 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
         assert importer.db._transaction_binding() is not None
         raise RuntimeError("publication failed")
 
-    stage = _artifact_stage()
+    stages = _initial_profile_stages()
+    _mock_initial_profile_admission(monkeypatch, stages)
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
         importer,
@@ -390,7 +408,7 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
 
     with pytest.raises(RuntimeError, match="publication failed"):
         await importer._promote_provider_directory_artifact_bundle_transaction(
-            (stage,)
+            stages
         )
 
     assert events == ["begin", "rollback"]

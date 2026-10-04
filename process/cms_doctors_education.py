@@ -125,10 +125,14 @@ async def discard_education_stage(ctx) -> None:
 
 async def import_doctor_education(
     source_path, source_url: str, ctx, task, dataset_id: str = CMS_EDUCATION_DATASET_ID,
+    *, source_manifest: dict | None = None,
 ) -> dict:
     """Stage all distinct education tuples before allowing generation publication."""
     stage_cls = make_class(CMSDoctorEducation, ctx["import_date"])
-    manifest = education_source_manifest(source_path, source_url, dataset_id)
+    manifest = (
+        education_source_manifest(source_path, source_url, dataset_id)
+        if source_manifest is None else dict(source_manifest)
+    )
     await db.create_table(stage_cls.__table__, checkfirst=False)
     ctx.setdefault("context", {})["education_stage_owned"] = True
     try:

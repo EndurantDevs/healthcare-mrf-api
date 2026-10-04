@@ -74,6 +74,7 @@ async def apply_prepared_artifact_bundle(
         if settings_configured
         else await fhir._configure_provider_directory_artifact_promotion(lock_timeout, statement_timeout)
     )
+    await fhir.profile_initial.lock_metadata(fhir, ordered_stages, profile_delta)
     if any(
         stage.build_fence is not None and stage.build_fence.alias_generation is not None for stage in ordered_stages
     ):
@@ -93,6 +94,8 @@ async def apply_prepared_artifact_bundle(
 
 async def validate_profile_delta_total_wal(fhir, capacity_admission, capacity_forecast) -> None:
     """Keep the signed whole-admission bound and original commit envelope at the owner boundary."""
+    if capacity_admission.geometry.bounded_admission:
+        await fhir._assert_provider_directory_profile_wal_budget(capacity_admission)
     final_wal_bytes = await fhir._provider_directory_profile_current_wal_bytes(capacity_admission)
     maximum_wal_bytes = capacity_admission.geometry.reservation_bytes_by_storage_class["wal"]
     commit_envelope_bytes = capacity_forecast.metadata_projection.commit_envelope_bytes

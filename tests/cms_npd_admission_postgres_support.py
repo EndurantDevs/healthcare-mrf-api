@@ -33,6 +33,7 @@ _ARTIFACT_ENV = "HLTHPRT_CMS_NPD_ADMISSION_TEST_ARTIFACT_ROOT"
 # This is the admission dependency slice, not a fresh-install Alembic chain.
 MIGRATION_PREFIXES = (
     "20260610120000",
+    "20260611100000",
     "20260628100000",
     "20260628170000",
     "20260629100000",
@@ -60,8 +61,12 @@ MIGRATION_PREFIXES = (
     "20260714150000",
     "20260714160000",
     "20260720100000",
+    "20260720120000",
+    "20260721100000",
     "20260728130000",
     "20260729110000",
+    "20260730110000",
+    "20260801130000",
     "20260807100000",
     "20260808190000",
     "20260808200000",
@@ -82,7 +87,9 @@ MIGRATION_PREFIXES = (
     "20260810110000",
     "20260810120000_provider",
     "20260810130000",
+    "20260811010000",
     "20260811020000",
+    "20260811100000",
     "20260811120000",
     "20260811130000",
     "20260812010000",
@@ -95,6 +102,8 @@ MIGRATION_PREFIXES = (
     "20260830100000",
     "20260904163000",
     "20260904223000",
+    "20260914100000",
+    "20260914110000",
     "20260929010000",
     "20260929020000",
     "20260929030000",
@@ -106,7 +115,14 @@ MIGRATION_PREFIXES = (
     "20260930070000",
     "20260930080000",
     "20260930090000",
+    "20260930100000",
+    "20260930110000",
+    "20260930120000",
+    "20260930130000",
+    "20260930140000",
+    "20261001100000",
 )
+LEGACY_MIGRATION_PREFIXES = MIGRATION_PREFIXES[: MIGRATION_PREFIXES.index("20260930100000")]
 
 
 def _database_url():
@@ -118,17 +134,19 @@ def _database_url():
         not url.drivername.startswith("postgresql")
         or url.query
         or url.host not in {"127.0.0.1", "localhost"}
-        or url.port != 5432
+        or url.port is None
+        or not 1 <= url.port <= 65535
         or not re.fullmatch(r"hc_cms_admission_test_[0-9a-f]{32}", url.database or "")
     ):
         pytest.fail("CMS admission proof requires a UUID-owned local PostgreSQL test database")
     return url
 
 
-def _run_migrations(connection):
+def _run_migrations(connection, migration_prefixes=None):
+    migration_prefixes = MIGRATION_PREFIXES if migration_prefixes is None else migration_prefixes
     context = MigrationContext.configure(connection)
     with context.begin_transaction(), Operations.context(context):
-        for prefix in MIGRATION_PREFIXES:
+        for prefix in migration_prefixes:
             paths = list(_MIGRATIONS.glob(prefix + "*.py"))
             if len(paths) > 1:
                 paths = [path for path in paths if "provider_directory" in path.name]
@@ -169,8 +187,9 @@ async def _owned_database(source_url, template_name="template0"):
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
-async def cms_admission_template():
+async def cms_admission_template(request):
     """Migrate one closed baseline and clone every native object for each admission test."""
+    migration_prefixes = getattr(request, "param", MIGRATION_PREFIXES)
     source_url = _database_url()
     async with _owned_database(source_url) as (template_url, admin):
         engine = create_async_engine(template_url)
@@ -181,7 +200,7 @@ async def cms_admission_template():
                 async with engine.begin() as connection:
                     await connection.exec_driver_sql('CREATE SCHEMA "mrf"')
                 async with engine.connect() as connection:
-                    await connection.run_sync(_run_migrations)
+                    await connection.run_sync(_run_migrations, migration_prefixes)
         finally:
             await engine.dispose()
         assert not await admin.fetchval(
@@ -191,27 +210,36 @@ async def cms_admission_template():
         with pytest.MonkeyPatch.context() as clone_scope:
             clone_scope.setattr(
                 f"{__name__}._admission_database_url",
-                partial(_admission_database_url, source_url, template_url.database),
+                partial(
+                    _admission_database_url,
+                    source_url,
+                    template_url.database,
+                    template_migration_prefixes=migration_prefixes,
+                ),
             )
             yield
 
 
 @asynccontextmanager
-async def _admission_database_url(template_source_url=None, template_name=None):
+async def _admission_database_url(
+    template_source_url=None, template_name=None, *, template_migration_prefixes=None, migration_prefixes
+):
     """Use the active module baseline without changing standalone migration fixtures."""
     source_url = _database_url()
     if template_name is None:
         yield source_url, False
         return
     assert source_url == template_source_url
+    assert migration_prefixes == template_migration_prefixes, "CMS admission template migration profile mismatch"
     async with _owned_database(source_url, template_name) as (database_url, _admin):
         yield database_url, True
 
 
 @asynccontextmanager
-async def admission_database(monkeypatch):
+async def admission_database(monkeypatch, *, migration_prefixes=None):
     """Keep native guards and committed multi-session visibility isolated in each test."""
-    async with _admission_database_url() as (url, is_migrated):
+    migration_prefixes = MIGRATION_PREFIXES if migration_prefixes is None else migration_prefixes
+    async with _admission_database_url(migration_prefixes=migration_prefixes) as (url, is_migrated):
         for name, setting_value in {
             "DRIVER": "asyncpg",
             "HOST": url.host,
@@ -234,7 +262,7 @@ async def admission_database(monkeypatch):
                     await connection.exec_driver_sql('CREATE SCHEMA "mrf"')
                 is_schema_created = True
                 async with database.engine.connect() as connection:
-                    await connection.run_sync(_run_migrations)
+                    await connection.run_sync(_run_migrations, migration_prefixes)
             yield database
         finally:
             try:

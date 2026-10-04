@@ -28,6 +28,21 @@ def source_resource_uuid(source_id, resource_type, resource_id):
     return uuid5(RESOURCE_ID_NAMESPACE, json.dumps([source_id, resource_type, resource_id], separators=(",", ":")))
 
 
+def _inserted_resource_identity_mapping(inserted_rows, source_id, resource_type, identities_by_resource_id):
+    """Validate every returned scope and reject duplicate resource mappings."""
+    stored_by_resource_id = {}
+    for stored_source_id, stored_resource_type, stored_resource_id, stored_entity_id in inserted_rows:
+        if (
+            stored_source_id != source_id
+            or stored_resource_type != resource_type
+            or stored_resource_id not in identities_by_resource_id
+            or stored_resource_id in stored_by_resource_id
+        ):
+            raise ValueError("provider_directory_resource_identity_conflict")
+        stored_by_resource_id[stored_resource_id] = stored_entity_id
+    return stored_by_resource_id
+
+
 async def bind_resource_identity_batch(session, *, source_id, resource_type, resource_ids):
     """Bind at most 1,000 already-validated IDs; caller commits each batch before cutover.
 
@@ -41,33 +56,46 @@ async def bind_resource_identity_batch(session, *, source_id, resource_type, res
         resource_id: source_resource_uuid(source_id, resource_type, resource_id) for resource_id in resource_ids
     }
     table = ProviderDirectoryResourceIdentity.__table__
-    await session.execute(
-        insert(table)
-        .values(
-            [
-                {
-                    "source_id": source_id,
-                    "resource_type": resource_type,
-                    "resource_id": resource_id,
-                    "entity_id": entity_id,
-                    "created_at": datetime.now(timezone.utc),
-                }
-                for resource_id, entity_id in identities_by_resource_id.items()
-            ]
-        )
-        .on_conflict_do_nothing(index_elements=["source_id", "resource_type", "resource_id"])
-    )
-    stored_by_resource_id = dict(
-        (
-            await session.execute(
-                select(table.c.resource_id, table.c.entity_id).where(
-                    table.c.source_id == source_id,
-                    table.c.resource_type == resource_type,
-                    table.c.resource_id.in_(identities_by_resource_id),
-                )
+    inserted_rows = (
+        await session.execute(
+            insert(table)
+            .values(
+                [
+                    {
+                        "source_id": source_id,
+                        "resource_type": resource_type,
+                        "resource_id": resource_id,
+                        "entity_id": entity_id,
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                    for resource_id, entity_id in identities_by_resource_id.items()
+                ]
             )
-        ).all()
+            .on_conflict_do_nothing(index_elements=["source_id", "resource_type", "resource_id"])
+            .returning(table.c.source_id, table.c.resource_type, table.c.resource_id, table.c.entity_id)
+        )
+    ).all()
+    stored_by_resource_id = _inserted_resource_identity_mapping(
+        inserted_rows, source_id, resource_type, identities_by_resource_id
     )
+    missing_resource_ids = [
+        resource_id for resource_id in identities_by_resource_id if resource_id not in stored_by_resource_id
+    ]
+    if missing_resource_ids:
+        # A separate statement observes committed conflicting inserts at READ COMMITTED.
+        stored_by_resource_id.update(
+            dict(
+                (
+                    await session.execute(
+                        select(table.c.resource_id, table.c.entity_id).where(
+                            table.c.source_id == source_id,
+                            table.c.resource_type == resource_type,
+                            table.c.resource_id.in_(missing_resource_ids),
+                        )
+                    )
+                ).all()
+            )
+        )
     if stored_by_resource_id != identities_by_resource_id:
         raise ValueError("provider_directory_resource_identity_conflict")
     return [identities_by_resource_id[resource_id] for resource_id in resource_ids]

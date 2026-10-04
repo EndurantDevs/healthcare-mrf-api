@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import sys
 from compression import zstd
@@ -18,6 +19,7 @@ import pytest
 from api.control_imports import importer_registry
 from api.provider_directory_sources import provider_directory_source_catalog
 from process import provider_directory_cms_npd as cms
+from process import provider_directory_cms_observation as cms_observation
 from process.cms_npd_source import RESOURCE_FILES, CmsNpdSourceError
 from process.provider_directory_insurance_network_identity import has_source_declared_network_role
 from process.provider_directory_profile_source_spec_contract import (
@@ -26,6 +28,7 @@ from process.provider_directory_profile_source_spec_contract import (
 from process.provider_directory_source_local_publication import (
     publish_validated_source_local_dataset,
 )
+from tests.test_cms_npd_source import _client, _source
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
@@ -90,6 +93,7 @@ def _synthetic_recovery(monkeypatch):
         yield
 
     monkeypatch.setattr(cms, "_intake_guard", intake_guard)
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", Mock())
     monkeypatch.setattr(cms.recovery, "resume_pending_cleanup", AsyncMock())
     monkeypatch.setattr(cms.recovery, "dispose_prior_vectors", AsyncMock())
     monkeypatch.setattr(cms.recovery, "is_disposed", AsyncMock(return_value=False))
@@ -174,6 +178,8 @@ async def test_current_observation_requires_exact_covered_publication(monkeypatc
 
 @pytest.mark.asyncio
 async def test_unchanged_run_skips_acquisition_and_preserves_required_followup(monkeypatch):
+    reporter = Mock()
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", reporter)
     observation = _observation()
     state_by_field = {
         "dataset_id": "dataset-synthetic",
@@ -215,6 +221,10 @@ async def test_unchanged_run_skips_acquisition_and_preserves_required_followup(m
     followup.assert_awaited_once_with(fhir, state_by_field, observation.vector_sha256)
     recheck.assert_called_once()
     acquire.assert_not_called()
+    assert [call.kwargs["phase"] for call in reporter.call_args_list] == [
+        "cms-npd-source_probe", "cms-npd-release_validation", "cms-npd-intake_guard",
+        "cms-npd-coverage", "cms-npd-complete",
+    ]
 
 
 @pytest.mark.asyncio
@@ -737,9 +747,11 @@ async def test_finalized_replay_checks_identity_without_rewriting_entire_release
     candidate = SimpleNamespace(dataset_id="finalized", already_validated=validated, already_published=published)
     identity = cms.release_identity(_receipt())
     fake_fhir = object()
-    await cms._materialize_identity_evidence(fake_fhir, tmp_path, candidate, identity, {}, {})
-    backfill.assert_awaited_once_with(fake_fhir, identity, {}, {})
+    ctx_by_field = {}
+    await cms._materialize_identity_evidence(fake_fhir, tmp_path, candidate, identity, ctx_by_field, {})
+    backfill.assert_awaited_once_with(fake_fhir, identity, ctx_by_field, {})
     check.assert_awaited_once_with(fake_fhir, candidate, identity)
+    assert ctx_by_field["context"]["audit"]["cms_intake"]["phase"] == "identity_validation"
 
 
 @pytest.mark.asyncio
@@ -909,6 +921,16 @@ async def test_stream_flushes_on_decoded_byte_bound(monkeypatch, tmp_path: Path)
     )
     assert await cms._stream_file(fake_fhir, path, candidate, "Organization", {}, {}) == 3
     assert persist.await_count == 3
+
+    failure = RuntimeError("synthetic-write-failed")
+    persist.reset_mock()
+    persist.side_effect = [None, failure]
+    ctx_by_field = {"context": {}}
+    with pytest.raises(RuntimeError) as caught:
+        await cms._stream_file(fake_fhir, path, candidate, "Organization", ctx_by_field, {})
+    assert caught.value is failure and persist.await_count == 2
+    observed = ctx_by_field["context"]["audit"]["cms_intake"]
+    assert observed["family"] == "Organization" and observed["completed_input_rows"] == 1
 
 
 @pytest.mark.asyncio
@@ -1236,3 +1258,439 @@ async def test_rollback_run_never_opens_an_upstream_client(monkeypatch, tmp_path
     result = await cms.run({"context": {}}, task_by_field, "run-synthetic")
     assert result == {"status": "published"}
     assert admission.await_args.args[-1] is None
+
+
+def _retained_task(directory, receipt, operation="baseline"):
+    return {
+        "source_ids": ["cms-npd"],
+        "import_resources": True,
+        "full_refresh": True,
+        "cms_npd_retained_operation": operation,
+        "cms_npd_retained_vector_sha256": receipt["vector_sha256"],
+        "cms_npd_retained_receipt_sha256": hashlib.sha256((directory / "receipt.json").read_bytes()).hexdigest(),
+    }
+
+
+def _dispatch_task(task, generation=0):
+    return {
+        **task,
+        "provider_directory_dispatch_id": "pdd_" + "a" * 32,
+        "provider_directory_dispatch_request_id": "11111111-1111-4111-8111-111111111111",
+        "provider_directory_dispatch_request_fingerprint": "b" * 64,
+        "provider_directory_dispatch_catalog_digest": "c" * 64,
+        "provider_directory_dispatch_contract_version": 2,
+        "provider_directory_dispatch_generation": generation,
+        **({"provider_directory_repair_id": "22222222-2222-4222-8222-222222222222"} if generation else {}),
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider_directory_dispatch_generation": True},
+        {"provider_directory_dispatch_generation": 0},
+        {"provider_directory_dispatch_contract_version": True},
+        {"provider_directory_dispatch_id": "other"},
+        {"provider_directory_dispatch_request_id": None},
+        {"provider_directory_repair_id": "invalid"},
+        {"provider_directory_dispatch_request_fingerprint": "A" * 64},
+        {"cms_npd_retained_operation": "baseline"},
+        {"cms_npd_retained_vector_sha256": "a" * 64},
+    ],
+)
+def test_repair_identity_rejects_malformed_or_partial_controls(overrides):
+    with pytest.raises(RuntimeError, match="cms_npd_repair_identity_invalid"):
+        cms.recovery._dispatch_identity({**_dispatch_task({}, 1), **overrides}, is_repair=True)
+
+
+def _lineage_run(run_id, parent=None):
+    return {
+        "run_id": run_id,
+        "retry_of_run_id": parent,
+        "engine": "healthcare-mrf-api",
+        "node_id": "test-node",
+        "importer": "provider-directory-fhir",
+        "status": "failed",
+        "finished_at": "finished",
+        "params": {
+            "source_ids": ["cms-npd"],
+            "import_resources": True,
+            "full_refresh": True,
+            **({"provider_directory_pagination_root_run_id": "run-0"} if parent else {}),
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption", ["missing", "ambiguous", "active", "unfinished", "foreign_node", "foreign_source", "claimed_root"]
+)
+async def test_repair_lineage_rejects_unproved_retry_chains(monkeypatch, corruption):
+    root = _lineage_run("run-0")
+    child = _lineage_run("run-1", "run-0")
+    child.update(
+        {
+            "active": {"status": "running", "finished_at": None},
+            "unfinished": {"finished_at": None},
+            "foreign_node": {"node_id": "another-node"},
+        }.get(corruption, {})
+    )
+    child["params"].update(
+        {
+            "foreign_source": {"source_ids": ["another-source"]},
+            "claimed_root": {"provider_directory_pagination_root_run_id": "run-1"},
+        }.get(corruption, {})
+    )
+
+    async def records(_fhir, *, run_id=None, parent_id=None):
+        if run_id is not None:
+            return [] if corruption == "missing" else [root]
+        if parent_id == "run-0":
+            return [child, _lineage_run("branch", "run-0")] if corruption == "ambiguous" else [child]
+        return []
+
+    monkeypatch.setattr(cms.recovery, "_run_records", records)
+    with pytest.raises(RuntimeError, match="cms_npd_acquisition_lineage_invalid"):
+        await cms.recovery._run_lineage(object(), "run-0")
+
+
+@pytest.mark.asyncio
+async def test_repair_lineage_is_bounded_and_partial_repair_cannot_fall_back(monkeypatch):
+    async def records(_fhir, *, run_id=None, parent_id=None):
+        if run_id is not None:
+            return [_lineage_run(run_id)]
+        index = int(parent_id.split("-")[1]) + 1
+        return [_lineage_run(f"run-{index}", parent_id)]
+
+    observed = AsyncMock(side_effect=records)
+    monkeypatch.setattr(cms.recovery, "_run_records", observed)
+    with pytest.raises(RuntimeError, match="cms_npd_acquisition_lineage_invalid"):
+        await cms.recovery._run_lineage(object(), "run-0")
+    assert observed.await_count == 257
+    with pytest.raises(RuntimeError, match="cms_npd_repair_identity_invalid"):
+        await cms.recovery.repaired_candidate_selection(
+            object(), "endpoint", {}, {"provider_directory_dispatch_generation": 1}, "run-0"
+        )
+
+
+def _sealed_input(root):
+    manifest, payloads = _source()
+    client, _ = _client(manifest, payloads)
+    with client:
+        return cms.source.acquire_release(root, client=client)
+
+
+def test_retained_controls_leave_unselected_defaults_empty():
+    registry = next(row for row in importer_registry() if row["name"] == "provider-directory-fhir")
+    retained_fields = {
+        "cms_npd_retained_operation",
+        "cms_npd_retained_vector_sha256",
+        "cms_npd_retained_receipt_sha256",
+    }
+    assert retained_fields <= {row["name"] for row in registry["params_schema"]}
+    assert cms.retained_input_selection({}) is None
+    assert cms.retained_input_selection(dict.fromkeys(retained_fields)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cms_npd_retained_operation": None},
+        {"cms_npd_retained_operation": "replace"},
+        {"cms_npd_retained_vector_sha256": None},
+        {"cms_npd_retained_receipt_sha256": "A" * 64},
+        {"cms_npd_retained_receipt_sha256": False},
+        {"cms_npd_rollback_vector_sha256": "b" * 64},
+        {"cms_npd_rollback_root_run_id": "root"},
+        {"provider_directory_pagination_root_run_id": " root "},
+        {"source_ids": ["other-source"]},
+        {"source_ids": ["cms-npd", "other-source"]},
+        {"resource_limit": 1},
+        {"page_limit": 1},
+        {"source_query": "bounded"},
+        {"full_refresh": False},
+        {"test": True},
+        {"dataset_rehydrate_only": True},
+        {"dataset_followup_only": True},
+        {"publish_artifacts_only": True},
+        {"canonical_backfill_only": True},
+    ],
+)
+async def test_invalid_retained_selector_rejects_before_database(monkeypatch, overrides):
+    database = AsyncMock(side_effect=AssertionError("invalid retained selection reached database"))
+    monkeypatch.setattr(fhir, "ensure_database", database)
+    task_by_field = {
+        "source_ids": ["cms-npd"],
+        "run_id": "run-synthetic",
+        "import_resources": True,
+        "full_refresh": True,
+        "cms_npd_retained_operation": "baseline",
+        "cms_npd_retained_vector_sha256": "a" * 64,
+        "cms_npd_retained_receipt_sha256": "b" * 64,
+    }
+    with pytest.raises(ValueError):
+        await fhir.process_provider_directory_fhir_data({"context": {}}, {**task_by_field, **overrides})
+    database.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["baseline", "rollback"])
+async def test_selected_retained_run_verifies_real_seal_and_emits_closed_proof(monkeypatch, tmp_path, operation):
+    directory, receipt = _sealed_input(tmp_path)
+    task = _retained_task(directory, receipt, operation)
+    monkeypatch.setattr(cms, "durable_artifact_root", lambda: tmp_path)
+    monkeypatch.setattr(cms.httpx, "Client", lambda **_kwargs: pytest.fail("retained input reached upstream"))
+    admission = AsyncMock(return_value={"status": "validated", "vector_sha256": receipt["vector_sha256"]})
+    monkeypatch.setattr(cms, "_run_acquired", admission)
+    result = await cms.run({"context": {}}, task, "run-synthetic")
+    assert result["cms_retained_input"] == {
+        "operation": operation,
+        "vector_sha256": receipt["vector_sha256"],
+        "receipt_sha256": task["cms_npd_retained_receipt_sha256"],
+    }
+    assert admission.await_args.args[-1] is None
+    assert admission.await_args.args[-2] == receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ["receipt", "file", "missing_file"])
+async def test_selected_retained_run_rejects_changed_bytes_before_admission(monkeypatch, tmp_path, corruption):
+    directory, receipt = _sealed_input(tmp_path)
+    task = _retained_task(directory, receipt)
+    if corruption == "receipt":
+        path = directory / "receipt.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        path = directory / (RESOURCE_FILES[0][0] + ".zst")
+        path.unlink() if corruption == "missing_file" else path.write_bytes(b"changed")
+    monkeypatch.setattr(cms, "durable_artifact_root", lambda: tmp_path)
+    admission = AsyncMock(side_effect=AssertionError("changed seal reached admission"))
+    monkeypatch.setattr(cms, "_run_acquired", admission)
+    with pytest.raises(CmsNpdSourceError):
+        await cms.run({"context": {}}, task, "run-synthetic")
+    admission.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_selected_receipt_is_rechecked_after_verification(monkeypatch, tmp_path):
+    directory, receipt = _sealed_input(tmp_path)
+    task = _retained_task(directory, receipt)
+    original = cms.source.verify_retained_release
+
+    def change_receipt(*args):
+        original(*args)
+        path = directory / "receipt.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+
+    monkeypatch.setattr(cms.source, "verify_retained_release", change_receipt)
+    with pytest.raises(CmsNpdSourceError, match="retained_receipt_changed"):
+        await cms._verify_release(directory, receipt, None, task)
+
+
+@pytest.mark.asyncio
+async def test_baseline_history_requires_same_proved_publication_and_root(monkeypatch):
+    identity = cms.release_identity(_receipt())
+    database = SimpleNamespace(all=AsyncMock(return_value=[]))
+    fake_fhir = SimpleNamespace(db=database, _qt=lambda _schema, name: name, _schema=lambda: "synthetic")
+    current = AsyncMock(return_value=None)
+    monkeypatch.setattr(cms, "_current_release_publication", current)
+    same_lineage = AsyncMock(return_value=True)
+    monkeypatch.setattr(cms.recovery, "is_same_acquisition_replay", same_lineage)
+    await cms._assert_baseline_history(fake_fhir, "endpoint", identity, {}, "first-root")
+    current.assert_not_awaited()
+    database.all.return_value = [("dataset",)]
+    with pytest.raises(RuntimeError, match="baseline_prior_publication_exists"):
+        await cms._assert_baseline_history(fake_fhir, "endpoint", identity, {}, "first-root")
+    current.return_value = {
+        "dataset_id": "dataset",
+        "endpoint_id": "endpoint",
+        "acquisition_root_run_id": "first-root",
+        "publication_metadata_json": {"source_release": identity},
+    }
+    await cms._assert_baseline_history(fake_fhir, "endpoint", identity, {}, "first-root")
+    same_lineage.return_value = False
+    with pytest.raises(RuntimeError, match="baseline_prior_publication_exists"):
+        await cms._assert_baseline_history(fake_fhir, "endpoint", identity, {}, "unrelated-run")
+    same_lineage.return_value = True
+    await cms._assert_baseline_history(
+        fake_fhir, "endpoint", identity, {"provider_directory_pagination_root_run_id": "first-root"}, "retry"
+    )
+    current.return_value["acquisition_root_run_id"] = "first-writing-retry"
+    await cms._assert_baseline_history(
+        fake_fhir, "endpoint", identity, {"provider_directory_pagination_root_run_id": "first-root"}, "later-retry"
+    )
+    assert same_lineage.await_args.args[1] == "first-writing-retry"
+    database.all.return_value.append(("previous-publication",))
+    with pytest.raises(RuntimeError, match="baseline_prior_publication_exists"):
+        await cms._assert_baseline_history(fake_fhir, "endpoint", identity, {}, "first-root")
+
+
+@pytest.mark.asyncio
+async def test_retained_rollback_preserves_existing_predecessor_guard_and_retry_root(monkeypatch):
+    identity = cms.release_identity(_receipt())
+    candidate_factory, _, _, _ = _stub_rollback_publication(monkeypatch, identity)
+    task_by_field = {
+        "cms_npd_retained_operation": "rollback",
+        "cms_npd_retained_vector_sha256": identity["vector_sha256"],
+        "cms_npd_retained_receipt_sha256": "c" * 64,
+        "provider_directory_pagination_root_run_id": "original-root",
+    }
+    await cms._admission_candidate(fhir, "endpoint", "retry-leaf", identity, task_by_field)
+    cms._assert_rollback_predecessor.assert_awaited_once_with(fhir, "endpoint", identity)
+    assert candidate_factory.await_args.kwargs["candidate_key"] == (
+        f"cms-npd-rollback:{identity['vector_sha256']}:original-root"
+    )
+    cms._assert_rollback_predecessor.side_effect = RuntimeError("cms_npd_rollback_prior_publication_missing")
+    candidate_factory.reset_mock()
+    with pytest.raises(RuntimeError, match="prior_publication_missing"):
+        await cms._admission_candidate(fhir, "endpoint", "retry-leaf", identity, task_by_field)
+    candidate_factory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reporting_fails", [False, True])
+async def test_intake_failure_preserves_terminal_guard_cause_without_exception_text(monkeypatch, reporting_fails):
+    from process.control_lifecycle import _control_failure_error, _terminal_metrics_from_context
+
+    class ConnectionLostError(RuntimeError):
+        sqlstate = "08006"
+
+    cause = ConnectionLostError("synthetic-private-text")
+    guard = RuntimeError("cms_npd_intake_guard_lost")
+    guard.__cause__ = cause
+    ctx_by_field = {"context": {"audit": {"existing_observation": True}}}
+    reporter = Mock(side_effect=RuntimeError("synthetic-private-text") if reporting_fails else None)
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", reporter)
+    monkeypatch.setattr(cms, "durable_artifact_root", lambda: Path("/synthetic/artifacts"))
+
+    async def fail(ctx, *_args):
+        cms_observation.observe_intake(ctx, phase="identity", family="InsurancePlan", completed_rows=123)
+        raise guard
+
+    monkeypatch.setattr(cms, "_run_upstream_check", fail)
+    with pytest.raises(RuntimeError) as caught:
+        await cms.run(ctx_by_field, {"import_resources": True, "full_refresh": True}, "run-synthetic")
+    assert caught.value is guard and caught.value.__cause__ is cause
+    metrics = _terminal_metrics_from_context(ctx_by_field["context"])
+    observed = metrics["audit"]["cms_intake"]
+    assert metrics["audit"]["existing_observation"] is True
+    assert observed["phase"] == "identity" and observed["family"] == "InsurancePlan"
+    assert observed["completed_input_rows"] == 123
+    assert observed["exception_chain"] == [
+        {"class": "RuntimeError"}, {"class": "ConnectionLostError", "sqlstate": "08006"},
+    ]
+    assert "synthetic-private-text" not in str(observed)
+    assert _control_failure_error(guard) == {"code": "import_failed", "message": "cms_npd_intake_guard_lost"}
+
+
+def test_intake_chain_redacts_malformed_class_and_sqlstate_and_bounds_cycles():
+    error = type("Invalid/private-text", (Exception,), {})("synthetic-private-text")
+    error.sqlstate = "08006 synthetic-private-text"
+    error.orig = error
+    assert cms_observation.intake_exception_chain(error) == [{"class": "Exception"}]
+    previous = error
+    for _ in range(12):
+        current = RuntimeError("synthetic-private-text")
+        current.__cause__ = previous
+        previous = current
+    observed = cms_observation.intake_exception_chain(previous)
+    assert len(observed) == 6 and observed == [{"class": "RuntimeError"}] * 6
+
+
+def test_intake_progress_reports_only_real_bounded_safe_observations(monkeypatch):
+    clock = iter([0.0, 1.0, 2.0, 15.0, 15.1])
+    monkeypatch.setattr(cms_observation, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    events = []
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", lambda **payload: events.append(payload))
+    ctx_by_field = {"context": {}}
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=0)
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=1_000)
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=2_000)
+    assert len(events) == 1
+    assert ctx_by_field["context"]["audit"]["cms_intake"]["completed_input_rows"] == 2_000
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=3_000)
+    assert len(events) == 2
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="Organization", completed_rows=3_000, force=True)
+    assert len(events) == 3
+    assert events[-1]["counters"] == {"completed_input_rows": 3_000}
+    assert events[-1]["elapsed_seconds"] == 15.1
+    assert events[-1]["done"] == 0 and events[-1]["total"] == 1
+    cms_observation.observe_intake(ctx_by_field, phase="synthetic-private-text", family="Organization")
+    cms_observation.observe_intake(ctx_by_field, phase="staging", family="synthetic-private-text")
+    assert len(events) == 3 and "synthetic-private-text" not in str(ctx_by_field)
+
+
+@pytest.mark.asyncio
+async def test_intake_cancellation_is_not_reclassified_or_consumed(monkeypatch):
+    cancellation = asyncio.CancelledError()
+    ctx_by_field = {"context": {}}
+    monkeypatch.setattr(cms, "durable_artifact_root", lambda: Path("/synthetic/artifacts"))
+
+    async def cancel(ctx, *_args):
+        cms_observation.observe_intake(ctx, phase="relationships")
+        raise cancellation
+
+    monkeypatch.setattr(cms, "_run_upstream_check", cancel)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await cms.run(ctx_by_field, {"import_resources": True, "full_refresh": True}, "run-synthetic")
+    assert caught.value is cancellation
+    observed = ctx_by_field["context"]["audit"]["cms_intake"]
+    assert observed["phase"] == "relationships" and "exception_chain" not in observed
+    assert "run" not in ctx_by_field["context"]
+
+
+@pytest.mark.parametrize("context", [None, {}, {"context": None}])
+def test_intake_observation_tolerates_missing_context_and_reporting_failure(monkeypatch, context):
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", Mock(side_effect=RuntimeError("synthetic-private-text")))
+    cms_observation.observe_intake(context, phase="staging", family="Location", completed_rows=1)
+
+
+def test_intake_observation_does_not_raise_when_context_reporting_is_broken(monkeypatch):
+    class Context(dict):
+        def __setitem__(self, name, value):
+            if name == "audit":
+                raise RuntimeError("synthetic-private-text")
+            return super().__setitem__(name, value)
+
+    reporter = Mock()
+    monkeypatch.setattr(cms_observation, "enqueue_live_progress", reporter)
+    cms_observation.observe_intake({"context": Context()}, phase="staging", family="Location", completed_rows=1)
+    reporter.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_times_out", [False, True])
+async def test_intake_chain_distinguishes_implicit_poll_timeout_from_probe_cause(probe_times_out):
+    polling_timeout = TimeoutError("synthetic-poll-text")
+    probe_timeout = TimeoutError("synthetic-probe-text")
+    connection = SimpleNamespace(
+        scalar=AsyncMock(side_effect=probe_timeout) if probe_times_out else AsyncMock(return_value=False),
+        commit=AsyncMock(),
+    )
+    # The watcher invokes this actual guard probe while handling its routine polling timeout.
+    try:
+        raise polling_timeout
+    except TimeoutError:
+        with pytest.raises(RuntimeError, match="cms_npd_intake_guard_lost") as caught:
+            await cms._assert_intake_guard(connection, "synthetic-lock", 1)
+    guard_error = caught.value
+    if probe_times_out:
+        assert guard_error.__cause__ is probe_timeout
+        expected_chain_entries = [{"class": "RuntimeError"}, {"class": "TimeoutError"}]
+    else:
+        assert guard_error.__cause__ is None and guard_error.__context__ is polling_timeout
+        expected_chain_entries = [{"class": "RuntimeError"}]
+    assert cms_observation.intake_exception_chain(guard_error) == expected_chain_entries
+
+
+@pytest.mark.asyncio
+async def test_unchanged_publication_helper_keeps_three_argument_call_compatible(monkeypatch):
+    observation = _observation()
+    state_by_field = {"endpoint_id": "endpoint-synthetic", "dataset_id": "dataset-synthetic", "resource_count": 8}
+    descriptor_by_field = {"status": "required"}
+    monkeypatch.setattr(cms.source, "assert_observed_release_unchanged", Mock())
+    monkeypatch.setattr(cms, "_prepare_current_serving_candidate", AsyncMock(return_value=descriptor_by_field))
+    result = await cms._unchanged_publication_result(observation, state_by_field, object())
+    assert result["cms_serving_candidate"] == descriptor_by_field and result["replayed"] is True
+    cms_observation.enqueue_live_progress.assert_not_called()

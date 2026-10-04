@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import MetaData
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from api.endpoint import npi as npi_endpoint
 from db.connection import Database
@@ -2574,3 +2574,188 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
             stale_build,
             current_build,
         )
+
+
+def _endpoint_evidence_sql(schema: str, *, count_only: bool = False) -> str:
+    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
+    compiler = (
+        profile.profile_evidence_count_sql
+        if count_only
+        else profile.profile_evidence_insert_sql
+    )
+    return compiler(
+        target_ref=table_ref("profile_evidence"),
+        source_ref=table_ref("provider_directory_source"),
+        practitioner_ref=table_ref("provider_directory_practitioner"),
+        role_ref=table_ref("provider_directory_practitioner_role"),
+        organization_ref=table_ref("provider_directory_organization"),
+        service_ref=table_ref("provider_directory_healthcare_service"),
+        endpoint_ref=table_ref("provider_directory_endpoint"),
+        fact_type="endpoint",
+    )
+
+
+async def _seed_endpoint_reference(database, schema, source_id):
+    await _insert_typed_resource(
+        database,
+        schema,
+        source_id,
+        {
+            "resourceType": "Endpoint",
+            "id": "shared-endpoint",
+            "status": "active",
+            "address": f"https://{source_id}.test/fhir",
+        },
+    )
+    await database.status(
+        f"UPDATE {schema}.provider_directory_practitioner_role "
+        "SET endpoint_refs = '[\"Endpoint/shared-endpoint\"]'::jsonb "
+        "WHERE source_id = 'profile-source-a';"
+    )
+
+
+async def _read_endpoint_evidence(database, schema, source_ids, dataset_ids):
+    params_by_name = {
+        "source_ids": source_ids,
+        "dataset_ids": dataset_ids,
+        "profile_as_of": "2026-07-19",
+    }
+    projection_row = await database.first(
+        _endpoint_evidence_sql(schema, count_only=True), **params_by_name
+    )
+    inserted_rows = await database.status(
+        _endpoint_evidence_sql(schema), **params_by_name
+    )
+    evidence_rows = await database.all(
+        f"SELECT * FROM {schema}.profile_evidence ORDER BY evidence_key;"
+    )
+    assert inserted_rows == projection_row.projected_rows == len(evidence_rows)
+    assert (projection_row.projected_logical_bytes > 0) == bool(evidence_rows)
+    return evidence_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_refs", ['"invalid"', "{}", "null"])
+@pytest.mark.parametrize("has_endpoint", [False, True])
+@pytest.mark.parametrize("count_only", [False, True])
+async def test_endpoint_malformed_reference_scope(
+    monkeypatch, endpoint_refs, has_endpoint, count_only
+):
+    """Malformed arrays fail only when their endpoint scope is present."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        if has_endpoint:
+            await _seed_endpoint_reference(database, schema, "profile-source-a")
+        await database.status(
+            f"UPDATE {schema}.provider_directory_practitioner_role "
+            "SET endpoint_refs = CAST(:endpoint_refs AS jsonb) "
+            "WHERE source_id = 'profile-source-a';",
+            endpoint_refs=endpoint_refs,
+        )
+        sql = _endpoint_evidence_sql(schema, count_only=count_only)
+        params_by_name = {
+            "source_ids": ["profile-source-a"],
+            "dataset_ids": ["profile-dataset-a"],
+            "profile_as_of": "2026-07-19",
+        }
+        query = database.first if count_only else database.status
+        if has_endpoint:
+            with pytest.raises(DBAPIError) as raised:
+                async with database.transaction():
+                    await query(sql, **params_by_name)
+            assert raised.value.orig.sqlstate == "22023"
+        else:
+            projection_row = await query(sql, **params_by_name)
+            if count_only:
+                assert projection_row.projected_rows == 0
+                assert projection_row.projected_logical_bytes == 0
+            else:
+                assert projection_row == 0
+        assert await database.scalar(
+            f"SELECT count(*) FROM {schema}.profile_evidence;"
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_endpoint_reference_source_scope(monkeypatch):
+    """Equivalent references deduplicate without borrowing another source."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        for source_id in ("profile-source-a", "profile-source-b"):
+            await _seed_endpoint_reference(database, schema, source_id)
+        source_ids = ["profile-source-a", "profile-source-b"]
+        dataset_ids = ["profile-dataset-a", "profile-dataset-b"]
+        expected_rows = await _read_endpoint_evidence(
+            database, schema, source_ids, dataset_ids
+        )
+        assert len(expected_rows) == 1
+        assert expected_rows[0].source_id == "profile-source-a"
+        await database.status(f"DELETE FROM {schema}.profile_evidence;")
+        await database.status(
+            f"UPDATE {schema}.provider_directory_practitioner_role "
+            "SET endpoint_refs = CAST(:endpoint_refs AS jsonb) "
+            "WHERE source_id = 'profile-source-a';",
+            endpoint_refs=json.dumps([
+                "shared-endpoint", "Endpoint/shared-endpoint",
+                "Endpoint/shared-endpoint",
+                "https://payer.test/fhir/Endpoint/shared-endpoint",
+                "Endpoint/shared-endpoint/_history/1?mode=test#fragment",
+            ]),
+        )
+        assert await _read_endpoint_evidence(
+            database, schema, source_ids, dataset_ids
+        ) == expected_rows
+        await database.status(f"DELETE FROM {schema}.profile_evidence;")
+        await database.status(
+            f"DELETE FROM {schema}.provider_directory_endpoint "
+            "WHERE source_id = 'profile-source-a';"
+        )
+        assert await _read_endpoint_evidence(
+            database, schema, source_ids, dataset_ids
+        ) == []
+
+
+@pytest.mark.asyncio
+async def test_endpoint_reference_dataset_scope(monkeypatch):
+    """A same-ID endpoint in another selected dataset cannot resolve a role."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _seed_endpoint_reference(database, schema, "profile-source-a")
+        source_id, endpoint_id = (
+            profile.configured_dataset_scoped_profile_endpoints()[0]
+        )
+        await database.status(
+            f"INSERT INTO {schema}.provider_directory_source "
+            "SELECT :source_id, :endpoint_id, canonical_api_base, "
+            f"org_name, plan_name FROM {schema}.provider_directory_source "
+            "WHERE source_id = 'profile-source-a';",
+            source_id=source_id,
+            endpoint_id=endpoint_id,
+        )
+        for resource_type, table_name, dataset_id in (
+            ("PractitionerRole", "practitioner_role", "endpoint-dataset-local"),
+            ("Endpoint", "endpoint", "endpoint-dataset-other"),
+        ):
+            await database.status(
+                f"INSERT INTO {schema}.provider_directory_dataset_resource "
+                "SELECT :dataset_id, :resource_type, resource_id, "
+                f"repeat('a', 64), to_jsonb(resource) FROM "
+                f"{schema}.provider_directory_{table_name} AS resource "
+                "WHERE source_id = 'profile-source-a';",
+                dataset_id=dataset_id,
+                resource_type=resource_type,
+            )
+        source_ids = [source_id, source_id]
+        dataset_ids = ["endpoint-dataset-local", "endpoint-dataset-other"]
+        assert await _read_endpoint_evidence(
+            database, schema, source_ids, dataset_ids
+        ) == []
+        await database.status(
+            f"INSERT INTO {schema}.provider_directory_dataset_resource "
+            "SELECT 'endpoint-dataset-local', resource_type, resource_id, "
+            f"payload_hash, payload_json FROM "
+            f"{schema}.provider_directory_dataset_resource "
+            "WHERE dataset_id = 'endpoint-dataset-other';"
+        )
+        evidence_rows = await _read_endpoint_evidence(
+            database, schema, source_ids, dataset_ids
+        )
+        assert len(evidence_rows) == 1
+        assert evidence_rows[0].dataset_id == "endpoint-dataset-local"

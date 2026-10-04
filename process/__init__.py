@@ -1432,6 +1432,12 @@ def provider_enrichment(test: bool):
 )
 @click.option("--cms-npd-rollback-vector-sha256", help="Replay one previously published retained CMS release vector.")
 @click.option("--cms-npd-rollback-root-run-id", help="Stable root run id when retrying the same CMS rollback.")
+@click.option(
+    "--cms-npd-retained-operation", type=click.Choice(("baseline", "rollback")),
+    help="Select an approved retained CMS baseline or rollback.",
+)
+@click.option("--cms-npd-retained-vector-sha256", help="Exact approved retained CMS release vector.")
+@click.option("--cms-npd-retained-receipt-sha256", help="SHA-256 of the approved complete retained CMS receipt bytes.")
 @click.option("--dataset-rehydrate-only", is_flag=True, help="Rebuild typed rows from one retained current dataset without network calls.")
 @click.option("--rehydrate-dataset-id", help="Exact current immutable dataset id to rehydrate.")
 @click.option("--rehydrate-acquisition-root-run-id", help="Exact acquisition root run id recorded by the dataset.")
@@ -1654,9 +1660,14 @@ def medicare_enrollment(test: bool):
 
 @click.command(help="Run CMS Doctors and Clinicians import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-def cms_doctors(test: bool):
+@click.option(
+    "--retained-source-manifest", type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Replay retained bytes using their original closed source manifest.",
+)
+def cms_doctors(test: bool, retained_source_manifest: str | None = None):
     """Run the CMS Doctors and Clinicians importer."""
-    _run(initiate_cms_doctors(test_mode=test))
+    options = {"retained_source_manifest": retained_source_manifest} if retained_source_manifest is not None else {}
+    _run(initiate_cms_doctors(test_mode=test, **options))
 
 
 @click.command(help="Run Facility Anchors import (HRSA FQHCs + CMS Hospitals)")

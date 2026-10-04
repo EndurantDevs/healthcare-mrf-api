@@ -16,6 +16,7 @@ from process import reference_family_result_generation as reference_generation
 from process.npi_canonical_publication import NPI_CANONICAL_TABLES
 
 _SNAPSHOT = ContextVar("provider_profile_read_snapshot", default=None)
+_CMS_SERVING = ContextVar("provider_profile_cms_serving_generation", default=None)
 _CMS_RECEIPT_TABLE = "provider_directory_cms_serving_receipt"
 _PROFILE_GENERATION_TABLE = "provider_directory_profile_serving_generation"
 _DOCTORS_TABLES = reference_generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"]
@@ -73,6 +74,17 @@ def snapshot_relation_available(table_ref):
     if snapshot is None or table_ref not in snapshot:
         return None
     return snapshot[table_ref] is not None
+
+
+def snapshot_cms_serving_generation(schema):
+    """Expose only the Doctors authority validated against this read's locked relations."""
+    serving = _CMS_SERVING.get()
+    if serving is None:
+        return None
+    snapshot_schema, authority = serving
+    if schema != snapshot_schema:
+        raise ServiceUnavailable("Provider data is temporarily unavailable.")
+    return authority.serving_generation.as_dict() if authority and authority.serving_generation else None
 
 
 def provider_read_savepoint(session):
@@ -243,9 +255,11 @@ async def _read_snapshot_scope(session, schema, *, include_detail):
     session.info["provider_profile_native_authorities"] = authorities_by_family
     session.info["provider_profile_cms_serving_receipt"] = receipt
     token = _SNAPSHOT.set(relation_oids)
+    cms_token = _CMS_SERVING.set((schema, authorities_by_family.get("cms-doctors")))
     try:
         yield session
     finally:
+        _CMS_SERVING.reset(cms_token)
         _SNAPSHOT.reset(token)
         session.info.pop("provider_profile_native_authorities", None)
         session.info.pop("provider_profile_cms_serving_receipt", None)
