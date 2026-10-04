@@ -62,7 +62,7 @@ async def _register(database, schema, execution):
         (
             selection.ProviderDirectoryProfileSelectionObservation,
             {
-                "authority_revision": 7,
+                "authority_revision": execution.attestation.authority_revision,
                 "input_identity_digest": digest,
                 "payload_json": execution.attestation.payload,
                 "created_at": now,

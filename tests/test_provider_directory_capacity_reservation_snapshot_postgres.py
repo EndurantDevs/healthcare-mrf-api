@@ -4,6 +4,10 @@
 import asyncio
 import datetime
 import json
+import importlib.util
+from pathlib import Path
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -20,8 +24,27 @@ from db.models.system import (
 )
 from process import provider_directory_capacity_reservation_snapshot as snapshot
 from tests.cms_npd_admission_postgres_support import _database_url
-from tests.test_provider_directory_capacity_reservation_snapshot import RUN_ID, _consumption, _preflight, _run
+from tests.test_provider_directory_capacity_reservation_snapshot import (
+    RUN_ID, _consumption, _initial_envelope, _preflight, _run,
+)
 from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope
+
+
+def _install_cleanup_claim(connection):
+    """Install the real immutable cleanup ledger in this isolated fixture schema."""
+    directory = Path(__file__).resolve().parents[1] / "alembic/versions"
+    for name in ("20260930140000_cms_capacity_preflight_receipt.py", "20261001100000_profile_failed_cleanup_claim.py",
+                 "20261001110000_profile_initial_publication.py"):
+        spec = importlib.util.spec_from_file_location("snapshot_" + name[:-3], directory / name)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with Operations.context(MigrationContext.configure(connection)):
+            if name == "20261001110000_profile_initial_publication.py":
+                schema = module._PREVIOUS._locked_schema()
+                module._PREVIOUS._assert_exact_check(schema, module._PREVIOUS._cms_values_check())
+                module._PREVIOUS._replace_check(schema, module._initial_preflight_check())
+            else:
+                module.upgrade()
 
 
 @asynccontextmanager
@@ -58,6 +81,10 @@ async def _fixture(monkeypatch, session_type=AsyncSession):
         async with engine.begin() as connection:
             await connection.execute(text(f"CREATE SCHEMA {quote(schema)}"))
             await connection.run_sync(metadata.create_all)
+            with monkeypatch.context() as migration_environment:
+                migration_environment.setenv("HLTHPRT_DB_SCHEMA", schema)
+                migration_environment.setenv("DB_SCHEMA", schema)
+                await connection.run_sync(_install_cleanup_claim)
             await connection.execute(
                 text(f"""CREATE TABLE {fhir._provider_directory_profile_checkpoint_ref(schema)} (
                 build_id text,owner_run_id text,state text,evidence_stage text,profile_stage text,
@@ -97,6 +124,32 @@ def _pinned_snapshot_session(pinned, resume, settings):
             return result
 
     return SnapshotSession
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "consumed", "expired"])
+async def test_native_initial_receipt_is_visible_in_migrated_snapshot(monkeypatch, state):
+    async with _fixture(monkeypatch) as (fhir, engine, tables):
+        async with engine.begin() as connection:
+            now = (await connection.execute(text("SELECT transaction_timestamp()"))).scalar_one().replace(microsecond=0)
+            accepted = now - datetime.timedelta(days=2) if state == "expired" else now
+            envelope = _initial_envelope(accepted)
+            receipt = _preflight(envelope)
+            receipt["receipt_json"] = json.loads(receipt["receipt_json"])
+            if state == "consumed":
+                receipt.update(consumed_at=now, consumed_run_id=RUN_ID,
+                               consumed_attestation_id=envelope["lease"]["attestation_id"])
+            await connection.execute(
+                tables[ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__].insert().values(**receipt)
+            )
+        result = await snapshot.capacity_reservation_snapshot(fhir)
+        observed = result["preflight_receipts"][0]
+        assert observed["record"]["receipt_json"] == receipt["receipt_json"]
+        assert observed["pending"] is (state == "pending")
+        assert observed["original_envelope_missing"] is True
+        assert result["reservations"] == result["owners"] == []
+        assert result["capacity_complete"] is result["release_proof_available"] is False
+        assert result["control_authority_required"] is result["signature_verification_required"] is True
 
 
 @pytest.mark.asyncio

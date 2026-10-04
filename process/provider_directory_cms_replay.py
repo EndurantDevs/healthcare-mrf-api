@@ -5,6 +5,8 @@ import re
 from types import SimpleNamespace
 
 from process import provider_directory_cms_serving_receipt as common
+from process import provider_directory_profile_initial as initial
+from process import provider_directory_profile_initial_contract as initial_contract
 from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_contract as contract
 
@@ -36,13 +38,18 @@ async def _registered_execution(fhir, execution):
         raise _stale(fhir, "observation_not_registered")
 
 
-async def _historical_common(fhir, schema, generation_id):
+async def _historical_common(fhir, schema, generation_id, *, publication_xid=None):
     """Use the generation index to retain the original result through address-only successors."""
+    parameters_by_name = {"generation_id": generation_id}
+    xid_filter = ""
+    if publication_xid is not None:
+        parameters_by_name["publication_xid"] = publication_xid
+        xid_filter = "AND publication_xid=:publication_xid "
     row = await fhir.db.first(
         f"SELECT receipt_id,payload FROM {fhir._unscoped_qt(schema, common._TABLE)} "
-        "WHERE profile_generation_id=:generation_id "
+        f"WHERE profile_generation_id=:generation_id {xid_filter}"
         "ORDER BY created_at,receipt_id LIMIT 1;",
-        generation_id=generation_id,
+        **parameters_by_name,
     )
     if row is None:
         return None
@@ -129,8 +136,20 @@ async def _assert_database(fhir, lease):
 async def _replay(fhir, execution, run_id, metrics):
     """Reuse immutable Profile ownership, signature, geometry, and timeline validation."""
     schema = fhir._schema()
-    await fhir._replay_control_run(schema, run_id)
     consumption_ref = fhir._unscoped_qt(schema, fhir.ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__)
+    if initial_contract.execution_initial_requested(execution):
+        profile = await initial.committed_replay(fhir, schema, consumption_ref, run_id, execution, None)
+        if profile is None:
+            return None
+        publication_xid = await fhir.db.scalar(
+            f"SELECT publication_xid FROM {fhir._unscoped_qt(schema, initial_contract.RECEIPT_TABLE)} WHERE build_id=:build;",
+            build=profile["committed_replay"]["build_id"],
+        )
+        receipt = await _historical_common(fhir, schema, profile["generation_id"], publication_xid=publication_xid)
+        if receipt is None or publication_xid is None:
+            raise _stale(fhir, "common_receipt_missing")
+        return _result(fhir, execution, metrics, profile, receipt)
+    await fhir._replay_control_run(schema, run_id)
     current = await fhir._replay_current_consumption(consumption_ref, run_id)
     delta = await fhir._replay_exact_receipt(schema, execution, current)
     if delta is None:
@@ -154,15 +173,20 @@ async def _replay(fhir, execution, run_id, metrics):
     serving = SimpleNamespace(
         generation_id=delta["generation_id"], profile_as_of=delta["profile_as_of"], source_vector=source_pairs
     )
-    result_by_field = dict(metrics)
-    result_by_field["profile"] = fhir._provider_directory_profile_replay_metrics(
+    profile = fhir._provider_directory_profile_replay_metrics(
         delta, serving, geometry, lease, owner, run_id
     )
+    return _result(fhir, execution, metrics, profile, receipt)
+
+
+def _result(fhir, execution, metrics, profile, receipt):
+    """Preserve one composite result shape for either committed Profile mode."""
+    result_by_field = {**metrics, "profile": profile}
     payload_by_field = receipt["payload"]
     result_by_field["cms_serving"] = {
         "receipt_id": receipt["receipt_id"],
         "dataset_id": payload_by_field["cms"]["dataset_id"],
-        "profile_generation_id": delta["generation_id"],
+        "profile_generation_id": profile["generation_id"],
         "address_generation": payload_by_field["address"]["local_generation"],
         "doctors_generation": payload_by_field["doctors"]["local_generation"],
         "recovered_commit": True,

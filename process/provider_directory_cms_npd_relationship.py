@@ -114,23 +114,33 @@ def _references(page_sql):
       )"""
 
 
+def _page_sql(resource, witness):
+    """Look up at most one qualifying witness for each full source key."""
+    return f"""SELECT source.resource_type, source.resource_id, source.payload_hash,
+        witness.raw_payload_sha256, witness.raw_payload_json FROM {resource} source
+      JOIN LATERAL (
+        SELECT witness.raw_payload_sha256, witness.raw_payload_json
+        FROM {witness} witness
+        WHERE witness.dataset_id=source.dataset_id
+          AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
+          AND witness.source_id='cms-npd' AND witness.release_id=:release_id
+          AND (witness.resource_type, witness.resource_id) > (:after_type, :after_id)
+          AND (witness.resource_type, witness.resource_id) <= (:last_type, :last_id)
+          AND witness.normalized_payload_hash=source.payload_hash
+        LIMIT 1
+      ) witness ON TRUE
+      WHERE source.dataset_id=:dataset_id
+        AND (source.resource_type, source.resource_id) > (:after_type, :after_id)
+        AND (source.resource_type, source.resource_id) <= (:last_type, :last_id)"""
+
+
 def _insert_sql(fhir):
     schema = fhir._schema()
     resource = fhir._qt(schema, _RESOURCE)
     witness = fhir._qt(schema, _WITNESS)
     binding = fhir._qt(schema, _BINDING)
     relationship = fhir._qt(schema, _TABLE)
-    page = f"""SELECT source.resource_type, source.resource_id, source.payload_hash,
-        witness.raw_payload_sha256, witness.raw_payload_json FROM {resource} source
-      JOIN {witness} witness ON witness.dataset_id=source.dataset_id
-        AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
-        AND witness.source_id='cms-npd' AND witness.release_id=:release_id
-        AND (witness.resource_type, witness.resource_id) > (:after_type, :after_id)
-        AND (witness.resource_type, witness.resource_id) <= (:last_type, :last_id)
-        AND witness.normalized_payload_hash=source.payload_hash
-      WHERE source.dataset_id=:dataset_id
-        AND (source.resource_type, source.resource_id) > (:after_type, :after_id)
-        AND (source.resource_type, source.resource_id) <= (:last_type, :last_id)"""
+    page = _page_sql(resource, witness)
     return (
         _references(page)
         + f""",
@@ -177,17 +187,7 @@ async def _page_complete(fhir, session, dataset_id, release_id, after_type, afte
     resource = fhir._qt(schema, _RESOURCE)
     witness = fhir._qt(schema, _WITNESS)
     relationship = fhir._qt(schema, _TABLE)
-    page = f"""SELECT source.resource_type, source.resource_id, source.payload_hash,
-        witness.raw_payload_sha256, witness.raw_payload_json FROM {resource} source
-      JOIN {witness} witness ON witness.dataset_id=source.dataset_id
-        AND witness.resource_type=source.resource_type AND witness.resource_id=source.resource_id
-        AND witness.source_id='cms-npd' AND witness.release_id=:release_id
-        AND (witness.resource_type, witness.resource_id) > (:after_type, :after_id)
-        AND (witness.resource_type, witness.resource_id) <= (:last_type, :last_id)
-        AND witness.normalized_payload_hash=source.payload_hash
-      WHERE source.dataset_id=:dataset_id
-        AND (source.resource_type, source.resource_id) > (:after_type, :after_id)
-        AND (source.resource_type, source.resource_id) <= (:last_type, :last_id)"""
+    page = _page_sql(resource, witness)
     params_by_field = {
         "dataset_id": dataset_id,
         "release_id": release_id,

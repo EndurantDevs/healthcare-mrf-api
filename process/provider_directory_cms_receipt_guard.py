@@ -67,7 +67,7 @@ async def profile_receipt_guard_count(database, relation_by_field):
             raise RuntimeError("provider_directory_profile_capacity_receipt_guard_shape_changed")
         return 0
     await assert_profile_receipt_guards(database, relation_by_field)
-    return 2
+    return int(relation_by_field["user_trigger_count"])
 
 
 async def assert_profile_receipt_guards(database, relation_by_field, captured_triggers=None):
@@ -84,6 +84,12 @@ async def assert_profile_receipt_guards(database, relation_by_field, captured_tr
             RAISE EXCEPTION 'cms_serving_native_truncate_forbidden'; END IF; RETURN NULL; END""",
         ),
     }
+    if await database.scalar("SELECT to_regclass(:relation) IS NOT NULL",
+                             relation=f"{quoted_schema}.provider_directory_profile_initial_receipt") is True:
+        from process.provider_directory_profile_initial_guards import initial_serving_guard_expected, _assert_match_function
+
+        expected_by_name.update(initial_serving_guard_expected(schema))
+        await _assert_match_function(database, schema)
     await _assert_guards(database, relation_by_field, expected_by_name, captured_triggers)
 
 
