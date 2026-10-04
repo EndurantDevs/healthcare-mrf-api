@@ -1555,7 +1555,7 @@ async def test_partition_failure_progress_retains_authenticated_request_identity
 
 @pytest.mark.asyncio
 async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
-    witness = Mock(occurrence_records=(object(), object()))
+    witness = Mock(metadata={"occurrence_witness_count": 2}, occurrence_records=(object(), object()))
     report = _passing_report()
     http_config = object()
     witness_loader = AsyncMock(return_value=witness)

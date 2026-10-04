@@ -358,6 +358,7 @@ async def _migrate_tiger_as_app(engine, schema, role):
         await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
         assert not await connection.scalar(text("SELECT has_schema_privilege(current_user,'tiger','CREATE')"))
         await _run_migration(connection, _MIGRATION, "upgrade")
+        await connection.execute(text("RESET ROLE"))
         assert (
             await connection.execute(
                 text("SELECT oid,relowner,relacl FROM pg_class WHERE relnamespace='tiger'::regnamespace ORDER BY oid")
@@ -447,6 +448,31 @@ async def test_tiger_upgrade_and_explicit_owner_bootstrap(monkeypatch):
                 changed = await _observe(session, "tiger", "tiger")
                 assert changed.relation_oids == initial.relation_oids
                 assert changed.local_generation == initial.local_generation + 4
+
+
+@pytest.mark.parametrize(
+    "revocation",
+    (
+        'REVOKE USAGE ON SCHEMA tiger FROM "{role}"',
+        'REVOKE ALL ON TABLE tiger.zip_state, tiger.zcta5 FROM "{role}"',
+        'REVOKE ALL ON TABLE tiger.zcta5 FROM "{role}"',
+    ),
+    ids=("schema", "tables", "one_table"),
+)
+async def test_tiger_migration_preserves_inaccessible_protected_tables(monkeypatch, revocation):
+    async with _source_family(monkeypatch, migrate=False) as (engine, schema, sessions):
+        async with _tiger_publisher(engine, schema) as (role, owner):
+            async with engine.begin() as connection:
+                await connection.execute(text(revocation.format(role=role)))
+            await _migrate_tiger_as_app(engine, schema, role)
+            async with sessions.begin() as session:
+                await _assert_function_grantees(session, schema, (role,))
+            with pytest.raises(RuntimeError, match="tracking is unavailable"):
+                async with sessions.begin() as session:
+                    await _observe(session, "tiger", "tiger")
+            with pytest.raises(DBAPIError) as denied:
+                await _install_tiger_guards(sessions, owner)
+            assert denied.value.orig.sqlstate == "42501"
 
 
 async def test_tiger_preserves_protected_owner_boundary(monkeypatch):

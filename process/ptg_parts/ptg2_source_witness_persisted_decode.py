@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from process.ptg_parts.ptg2_source_witness_codec import decode_persisted_record
 from process.ptg_parts.ptg2_source_witness_contract import (
     LoadedSourceWitness,
+    FRAGMENT_PERSISTED_PAYLOAD_MAGIC,
     PERSISTED_PAYLOAD_MAGIC,
     PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
@@ -416,6 +417,14 @@ def decode_persisted_source_witness(
 ) -> LoadedSourceWitness:
     """Decode a PostgreSQL payload and fail on any count, digest, or contract drift."""
 
+    if bytes(witness_payload).startswith(FRAGMENT_PERSISTED_PAYLOAD_MAGIC):
+        from process.ptg_parts.ptg2_source_witness_fragment_decode import decode_fragment_source_witness
+
+        return decode_fragment_source_witness(
+            witness_payload,
+            expected_raw_source_sha256=expected_raw_source_sha256,
+            expected_metadata=expected_metadata,
+        )
     payload_bytes = bytes(witness_payload)
     if (
         not payload_bytes

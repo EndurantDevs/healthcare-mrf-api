@@ -80,6 +80,10 @@ from process.ptg_parts.ptg2_source_witness import (
     source_set_digest,
 )
 from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witness
+from process.ptg_parts.ptg2_source_witness_contract import (
+    PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT,
+    validate_source_witness_manifest,
+)
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
 
@@ -510,11 +514,15 @@ def _validated_candidate_witness(
         layout_serving_index_by_name.get("audit_sample")
     )
     expected_digest = source_set_digest(raw_container_sha256)
+    if source_witness_by_name.get("contract") == PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT:
+        validate_source_witness_manifest(source_witness_by_name, expected_source_count=len(raw_container_sha256))
     if (
         source_witness_by_name != layout_witness_by_name
         or audit_sample_by_name != layout_sample_by_name
-        or source_witness_by_name.get("contract")
-        != PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT
+        or source_witness_by_name.get("contract") not in {
+            PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+            PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT,
+        }
         or int(source_witness_by_name.get("source_count") or -1)
         != len(raw_container_sha256)
         or source_witness_by_name.get("source_set_digest")
@@ -1632,7 +1640,7 @@ async def _execute_rolling_release_audit(
         snapshot_id=candidate_target.snapshot_id,
         phase="candidate release audit",
         message=(
-            f"auditing {len(witness.occurrence_records):,} sealed source occurrences "
+            f"auditing {int(witness.metadata['occurrence_witness_count']):,} sealed source occurrences "
             "through concurrent public API requests"
         ),
         pct=35,

@@ -131,6 +131,8 @@ def _protected_relation_owners():
                 "JOIN pg_catalog.pg_roles r ON r.oid=c.relowner "
                 "WHERE c.relnamespace=pg_catalog.to_regnamespace('tiger') "
                 "AND c.relname IN ('zip_state','zcta5') AND c.relkind='r' AND c.relpersistence='p' "
+                "AND pg_catalog.has_schema_privilege(c.relnamespace,'USAGE') "
+                "AND pg_catalog.has_table_privilege(c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,MAINTAIN') "
                 "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
                 "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
                 "ORDER BY c.relname"

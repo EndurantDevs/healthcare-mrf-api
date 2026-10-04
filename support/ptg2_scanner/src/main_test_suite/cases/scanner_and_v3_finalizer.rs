@@ -1,6 +1,120 @@
 use super::*;
 
 #[test]
+fn source_witness_population_overflow_never_wraps_the_failed_counter() {
+    for counter in ["rows", "unqueryable", "occurrences"] {
+        let mut delta = SourceWitnessPopulationDelta::default();
+        match counter {
+            "rows" => delta.rate_rows = u64::MAX,
+            "unqueryable" => delta.unqueryable_rate_rows = u64::MAX,
+            _ => delta.occurrence_count = u64::MAX,
+        }
+        let error = delta
+            .record_rate(u64::from(counter != "unqueryable"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("population overflow"));
+        let failed_counter = match counter {
+            "rows" => delta.rate_rows,
+            "unqueryable" => delta.unqueryable_rate_rows,
+            _ => delta.occurrence_count,
+        };
+        assert_eq!(failed_counter, u64::MAX);
+    }
+    let mut delta = SourceWitnessPopulationDelta::default();
+    delta.record_rate(0).unwrap();
+    delta.record_rate(2).unwrap();
+    assert_eq!(
+        (
+            delta.rate_rows,
+            delta.unqueryable_rate_rows,
+            delta.occurrence_count
+        ),
+        (2, 1, 2)
+    );
+}
+
+#[test]
+fn source_witness_linked_provider_revalidates_raw_evidence_against_cached_identity() {
+    for corruption in [
+        "none",
+        "reference",
+        "id",
+        "wrong_id",
+        "groups",
+        "group_type",
+        "npi",
+        "locator",
+    ] {
+        let context = test_compact_context();
+        context.source_witness.configure_provider_spools(1).unwrap();
+        let mut provider = valid_provider_reference();
+        let (key, mut entry) = provider_ref_definition(&provider).unwrap();
+        let selected_npi = entry.npi[0];
+        match corruption {
+            "id" => {
+                provider
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("provider_group_id");
+            }
+            "wrong_id" => provider["provider_group_id"] = json!(8),
+            "groups" => {
+                provider.as_object_mut().unwrap().remove("provider_groups");
+            }
+            "group_type" => provider["provider_groups"] = json!({}),
+            "npi" => provider["provider_groups"][0]["npi"] = json!([2222222222_i64]),
+            _ => {}
+        }
+        let raw = format!(" \n{provider}\t").into_bytes();
+        let locator = context
+            .source_witness
+            .store_provider_source(0, &raw)
+            .unwrap();
+        context.source_witness.seal_provider_sources().unwrap();
+        if corruption != "locator" {
+            entry.source_locators.push(locator);
+        }
+        let provider_map = if corruption == "reference" {
+            HashMap::new()
+        } else {
+            HashMap::from([(key.clone(), entry)])
+        };
+        let rate = RateLite {
+            provider_refs: vec![key],
+            provider_groups: Vec::new(),
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: None,
+        };
+        let result =
+            linked_provider_source_evidence(&rate, &[], &provider_map, &context, selected_npi);
+        if corruption == "none" {
+            let (evidence, retained_locator, digest) = result.unwrap();
+            assert_eq!(evidence["source_kind"], "provider_reference");
+            assert_eq!(evidence["provider_group_ordinal"], 0);
+            assert_eq!(evidence["npi_ordinal"], 0);
+            assert_eq!(retained_locator, Some(locator));
+            assert_eq!(digest, Some(<[u8; 32]>::from(Sha256::digest(&raw))));
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{corruption}"
+            );
+        }
+        assert_eq!(
+            context
+                .source_witness
+                .read_provider_source(locator)
+                .unwrap(),
+            raw
+        );
+    }
+}
+
+#[test]
 fn skipped_inline_provider_quarantine_covers_raw_and_parsed_rates() {
     let parsed_rate = RateLite {
         provider_refs: Vec::new(),

@@ -47,6 +47,9 @@ def _install_observation_results(monkeypatch: pytest.MonkeyPatch, schema_name: s
         AsyncMock(return_value=(1, 10, _geo_signature(schema_name))),
     )
     monkeypatch.setattr(serving, "_result_generation_state", AsyncMock(return_value=None))
+    async def lock_dependencies(session, schema, **_options):
+        await session.execute(serving.text(serving.geo_projection.projection_dependency_lock_sql(schema)))
+    monkeypatch.setattr(serving, "lock_active_dependencies", lock_dependencies)
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,6 @@ from process.ext.address_pub28 import (
     PUB28_UNIT_DESIGNATOR_MAP,
 )
 
-
 address_canon = importlib.import_module("process.ext.address_canon")
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 utils = importlib.import_module("process.ext.utils")
@@ -2559,9 +2558,40 @@ def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids()
     assert "ROW_NUMBER() OVER ())::bigint AS evidence_id" in sql_blob
 
 
+class _OrdinaryPublicationDB:
+    """Expose transactional ordinary input selection without snapshot custody."""
+
+    is_in_transaction = False
+
+    @asynccontextmanager
+    async def session_factory(self):
+        yield self
+
+    @asynccontextmanager
+    async def begin(self):
+        self.is_in_transaction = True
+        try:
+            yield self
+        finally:
+            self.is_in_transaction = False
+
+    def in_transaction(self):
+        return self.is_in_transaction
+
+    async def scalar(self, statement, _params=None):
+        assert self.in_transaction()
+        statement = str(statement)
+        if statement == "SELECT to_regclass(:name)":
+            return None
+        if "SELECT EXISTS(SELECT 1 FROM pg_inherits" in statement:
+            return False
+        raise AssertionError(f"unexpected ordinary input SQL: {statement}")
+
+
 @pytest.mark.asyncio
 async def test_entity_address_unified_shutdown_rejects_live_main_patch_publish(monkeypatch):
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "db", _OrdinaryPublicationDB())
     shutdown_context_map = {
         "import_date": "20260614",
         "context": {
@@ -2709,6 +2739,7 @@ def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
 @pytest.mark.asyncio
 async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeypatch):
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "db", _OrdinaryPublicationDB())
     shutdown_context_map = {
         "import_date": "20260614",
         "context": {
@@ -2749,14 +2780,15 @@ def _partial_shutdown_payload():
 
 @pytest.mark.asyncio
 async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeypatch):
+    """Publish the replacement stage atomically without mutating live relations."""
     statements = []
     publish_mock = AsyncMock()
 
-    class FakeDB:
-        async def scalar(self, statement):
-            if "COUNT(*) FROM mrf.entity_address_unified" in statement:
+    class FakeDB(_OrdinaryPublicationDB):
+        async def scalar(self, statement, _params=None):
+            if "COUNT(*) FROM mrf.entity_address_unified" in str(statement):
                 return 100
-            raise AssertionError(f"unexpected scalar SQL: {statement}")
+            return await super().scalar(statement, _params)
 
         async def status(self, statement):
             statements.append(statement)

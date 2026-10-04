@@ -36,6 +36,7 @@ from process.ptg_parts.ptg2_fast_candidate_audit_report import (
     build_fast_audit_report,
 )
 from process.ptg_parts.ptg2_source_witness import LoadedSourceWitness
+from process.ptg_parts.ptg2_source_witness_audit import map_source_witness_records
 from scripts.validation import ptg2_v3_source_api_audit as source_audit
 
 
@@ -446,17 +447,20 @@ async def run_fast_candidate_audit(
     """Verify all sealed source witnesses through bounded concurrent API calls."""
 
     event_loop_contract = _event_loop_contract(require_uvloop=http.require_uvloop)
-    occurrence_records = witness.occurrence_records
-    provider_records = witness.provider_records
     expected_challenge_count = int(witness.metadata["occurrence_witness_count"])
-    if len(occurrence_records) != expected_challenge_count:
+    def derive(witness_record, parsed_evidence):
+        """Release raw evidence after deriving an exact HTTP challenge."""
+
+        if witness_record.kind == "provider_reference":
+            validate_provider_witness(witness_record, parsed_evidence_by_sha256=parsed_evidence or None)
+            return None
+        return source_challenge(witness_record, parsed_evidence_by_sha256=parsed_evidence or None)
+
+    derived, _processing_io = map_source_witness_records(witness, derive)
+    challenges = [challenge for challenge in derived if challenge is not None]
+    provider_count = len(derived) - len(challenges)
+    if len(challenges) != expected_challenge_count:
         raise FastCandidateAuditError("source_witness_challenge_count_mismatch")
-    challenges = tuple(
-        source_challenge(witness_record)
-        for witness_record in occurrence_records
-    )
-    for provider_record in provider_records:
-        validate_provider_witness(provider_record)
     started_at = datetime.datetime.now(datetime.timezone.utc)
     audit_sample, metrics, concurrency = await _execute_audit_requests(
         challenges,
@@ -473,7 +477,7 @@ async def run_fast_candidate_audit(
             http_metrics=metrics,
             concurrency=concurrency,
             challenge_count=len(challenges),
-            provider_count=len(provider_records),
+            provider_count=provider_count,
             event_loop_contract=event_loop_contract,
             started_at=started_at,
             completed_at=completed_at,

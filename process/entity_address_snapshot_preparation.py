@@ -599,12 +599,25 @@ async def activate_validated_entity_address_archive_destination(
     async with destination.db.bind_existing_session(session):
         schema, names = await _move_to_destination(session, stored, owner)
         prepared = _prepared_adoption(stored)
+        from process.entity_address_dependency_bindings import resolve_prepared_bindings
+
+        expected_bindings = prepared.context.get("dependency_bindings")
+        dependency_bindings = await resolve_prepared_bindings(session, schema, expected_bindings)
+        if dependency_bindings != expected_bindings:
+            changed = await session.scalar(text(
+                f'UPDATE "{schema}".entity_address_geo_assurance_state '
+                "SET candidate_dependency_bindings=CAST(:bindings AS jsonb) "
+                "WHERE singleton IS TRUE AND candidate_dependency_bindings=CAST(:expected AS jsonb) "
+                "RETURNING singleton"
+            ), {"bindings": json.dumps(dependency_bindings), "expected": json.dumps(expected_bindings)})
+            _require(changed is True, "dependency bindings changed")
         expected_geo = destination._validated_geo_preparation(stored["geo_assurance"], db_schema=schema)
         actual_geo = await destination._capture_geo_preparation(
             session,
             db_schema=schema,
             stage_table_oid=expected_geo.stage_table_oid,
             projected_rows=expected_geo.projected_rows,
+            dependency_bindings=dependency_bindings,
         )
         _require(actual_geo == expected_geo, "geo assurance changed")
         await _restore_builder_owner(session, proof, owner, schema, names)

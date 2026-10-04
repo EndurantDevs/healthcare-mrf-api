@@ -539,18 +539,18 @@ async def _lock_stored_stage_relations(
     await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE"))
 
 
-def _rehydrated_context(stored_context: Any) -> dict[str, Any]:
+def _rehydrated_context(stored_context: Any, *, db_schema: str) -> dict[str, Any]:
     """Require the exact durable native preparation context before cutover."""
 
     context = _json_object(stored_context, "context")
-    allowed_legacy_fields = {"address_alias_generation", "stage_persistence", "phase_timings"}
+    allowed_context_fields = {"address_alias_generation", "stage_persistence", "phase_timings", "dependency_bindings"}
     allowed_generation_fields = {
         "result_generation_mode",
         "source_serving_generation",
     }
     if (
         not {"address_alias_generation", "stage_persistence"} <= set(context)
-        or set(context) - allowed_legacy_fields - allowed_generation_fields
+        or set(context) - allowed_context_fields - allowed_generation_fields
         or type(context["address_alias_generation"]) is not int
         or context["address_alias_generation"] < 0
         or context["stage_persistence"] != "p"
@@ -573,6 +573,15 @@ def _rehydrated_context(stored_context: Any) -> dict[str, Any]:
             )
         except ValueError as error:
             raise EntityAddressSnapshotRestoreError("entity-address restore context is invalid") from error
+    if "dependency_bindings" in context:
+        try:
+            context["dependency_bindings"] = (
+                entity_address_unified.geo_projection.validate_projection_dependency_bindings(
+                    db_schema, context["dependency_bindings"]
+                )
+            )
+        except ValueError as error:
+            raise EntityAddressSnapshotRestoreError("entity-address restore dependency bindings are invalid") from error
     return context
 
 
@@ -636,7 +645,7 @@ def _validated_rehydration_state(
         )
     except EntityAddressArchiveReceiptError as error:
         raise EntityAddressSnapshotRestoreError(str(error)) from error
-    context = _rehydrated_context(stored["context"])
+    context = _rehydrated_context(stored["context"], db_schema=normalized_schema)
     native_validation = _rehydrated_native_validation(stored["native_validation"], context)
     return normalized_schema, normalized_date, stage_names, stage_oids, stage_integrity, context, native_validation
 

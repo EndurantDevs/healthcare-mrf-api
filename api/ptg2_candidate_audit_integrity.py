@@ -30,6 +30,7 @@ from process.ptg_parts.ptg2_candidate_audit_evidence import (
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_shared_audit import persisted_audit_sample_digest
 from process.ptg_parts.ptg2_source_witness import decode_persisted_source_witness
+from process.ptg_parts.ptg2_source_witness_audit import map_source_witness_records
 from process.ptg_parts.ptg2_source_witness_store import (
     assemble_source_witness_payload,
 )
@@ -44,6 +45,7 @@ class CandidateWitnessScope:
     unique_evidence_count: int
     evidence_reference_count: int
     persisted_audit_occurrences: tuple["PersistedAuditOccurrence", ...] = ()
+    processing_io: Mapping[str, int] | None = None
 
     @property
     def ledger(self) -> dict[str, int]:
@@ -63,6 +65,7 @@ class CandidateWitnessScope:
             "repeated_evidence_decompressions": 0,
             "repeated_evidence_sha256_hashes": 0,
             "repeated_evidence_json_parses": 0,
+            **(self.processing_io or {}),
         }
 
 
@@ -146,6 +149,7 @@ async def validate_candidate_source_scope(
         unique_evidence_count=witness_scope.unique_evidence_count,
         evidence_reference_count=witness_scope.evidence_reference_count,
         persisted_audit_occurrences=persisted_audit_occurrences,
+        processing_io=witness_scope.processing_io,
     )
 
 
@@ -205,30 +209,26 @@ async def _sealed_witness_challenges(
             expected_raw_source_sha256=raw_source_sha256,
             expected_metadata=source_witness,
         )
-        for provider_record in loaded_witness.provider_records:
-            validate_provider_witness(
-                provider_record,
-                parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
-            )
-        source_conditions = tuple(
-            source_audit_condition(
-                occurrence_record,
-                parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
-            )
-            for occurrence_record in loaded_witness.occurrence_records
-        )
-        evidence_reference_count = sum(
-            1 + int(witness_record.linked_provider_sha256 is not None)
-            for witness_record in loaded_witness.records
-        )
+        def derive(witness_record, parsed_evidence):
+            """Validate one provider or derive its compact occurrence condition."""
+
+            if witness_record.kind == "provider_reference":
+                validate_provider_witness(witness_record, parsed_evidence_by_sha256=parsed_evidence)
+                condition = None
+            else:
+                condition = source_audit_condition(witness_record, parsed_evidence_by_sha256=parsed_evidence)
+            return condition, 1 + int(witness_record.linked_provider_sha256 is not None)
+
+        derived, processing_io = map_source_witness_records(loaded_witness, derive)
         return CandidateWitnessScope(
             challenges=group_audit_batch_challenges(
                 raw_source_sha256,
-                source_conditions,
+                tuple(condition for condition, _ in derived if condition is not None),
             ),
             record_count=len(loaded_witness.records),
-            unique_evidence_count=len(loaded_witness.evidence_by_sha256),
-            evidence_reference_count=evidence_reference_count,
+            unique_evidence_count=processing_io["unique_evidence_entries"],
+            evidence_reference_count=sum(references for _, references in derived),
+            processing_io=processing_io,
         )
     except (RuntimeError, ValueError) as exc:
         raise PTG2ManifestArtifactError(

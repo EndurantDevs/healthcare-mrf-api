@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
 from process import entity_address_result_generation as result_generation
+from process.entity_address_dependency_bindings import lock_active_dependencies
 from process.ext import address_alias_sql
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -300,13 +301,14 @@ async def _geo_assurance_state(
     live_table_oid: int,
     require_current_dependencies: bool = True,
 ) -> tuple[int, int, tuple[tuple[str, int, int], ...]]:
+    signature, bindings_match = geo_projection.projection_stored_bindings_sql(schema_name, "active_dependency_bindings")
     geo_state_rows = (
         (
             await session.execute(
                 text(
                     f"SELECT singleton, active_geo_assurance_version, active_table_oid::bigint, "
-                    f"active_relation_signature, {geo_projection.projection_relation_signature_sql(schema_name)} "
-                    f"AS current_relation_signature FROM {_quoted(schema_name)}."
+                    f"active_relation_signature, {signature} AS current_relation_signature, "
+                    f"{bindings_match} AS dependency_bindings_match FROM {_quoted(schema_name)}."
                     f"{_quoted(geo_projection.GEO_ASSURANCE_STATE_TABLE)} ORDER BY singleton"
                 )
             )
@@ -319,7 +321,11 @@ async def _geo_assurance_state(
     geo_state = geo_state_rows[0]
     try:
         active_signature = _signature_tuple(geo_state["active_relation_signature"], schema_name=schema_name)
-        current_signature = _signature_tuple(geo_state["current_relation_signature"], schema_name=schema_name)
+        current_signature = (
+            _signature_tuple(geo_state["current_relation_signature"], schema_name=schema_name)
+            if require_current_dependencies
+            else active_signature
+        )
         active_table_oid = _positive_oid(geo_state["active_table_oid"], field_name="geo active table OID")
     except ValueError as error:
         raise RuntimeError("entity-address observed serving geo assurance state is invalid") from error
@@ -328,6 +334,7 @@ async def _geo_assurance_state(
         or geo_state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
         or active_table_oid != live_table_oid
         or (require_current_dependencies and active_signature != current_signature)
+        or (require_current_dependencies and geo_state.get("dependency_bindings_match") is not True)
     ):
         raise RuntimeError("entity-address observed serving geo assurance is not active")
     return geo_state["active_geo_assurance_version"], active_table_oid, active_signature
@@ -372,7 +379,7 @@ async def observe_entity_address_serving(
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
     for _model_name, table_name in _RELATIONS:
         await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN SHARE MODE"))
-    await session.execute(text(geo_projection.projection_dependency_lock_sql(schema)))
+    await lock_active_dependencies(session, schema)
     return await _read_observed_serving(session, schema, require_current_dependencies=True)
 
 
@@ -424,7 +431,7 @@ async def _observe_receive_destination(session, *, schema_name, lock_mode):
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
     for _model_name, table_name in _RELATIONS:
         await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN {lock_mode} MODE"))
-    await session.execute(text(geo_projection.projection_dependency_lock_sql(schema)))
+    await lock_active_dependencies(session, schema, receiving=True)
     # A grouped replacement may already have swapped its dependencies. Its
     # separate dependency fence selects the new package identities; the exact
     # stored incumbent signature must still match the queued destination token.

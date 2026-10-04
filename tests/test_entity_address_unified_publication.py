@@ -1,12 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import asynccontextmanager
 import importlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -85,7 +84,7 @@ class _RecordingDB:
         self.events.append(statement)
         if "to_regclass(:relation) IS NOT NULL" in statement:
             return False
-        if "relpersistence" in statement:
+        if "SELECT c.relpersistence::text" in statement:
             return self.persistence_values.pop(0)
         if "address_numeric_grid_alias_v1" in statement:
             return 1

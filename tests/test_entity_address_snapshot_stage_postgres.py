@@ -407,7 +407,7 @@ async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
             text(
                 f'CREATE TABLE "{live_schema}"."entity_address_geo_assurance_state" ('
                 "singleton boolean PRIMARY KEY, active_geo_assurance_version smallint, "
-                "active_table_oid oid, active_relation_signature jsonb)"
+                "active_table_oid oid, active_relation_signature jsonb, active_dependency_bindings jsonb)"
             )
         )
         await connection.execute(

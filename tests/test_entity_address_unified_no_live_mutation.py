@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
-
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -84,6 +84,11 @@ def _shutdown_callbacks(events: list[tuple[str, str]]) -> dict[str, object]:
 
 
 def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> None:
+    @asynccontextmanager
+    async def canonical_dependencies(_database, _schema):
+        yield None
+
+    monkeypatch.setattr(entity_address_unified, "selected_publication_dependencies", canonical_dependencies)
     monkeypatch.setattr(entity_address_unified.db, "scalar", AsyncMock(return_value=100))
     mocks_by_name = {
         "ensure_database": AsyncMock(),
