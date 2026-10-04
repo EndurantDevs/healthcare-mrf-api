@@ -43,6 +43,9 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
     async def no_op_async(*_args, **_kwargs):
         return None
 
+    async def no_pending_identities(*_args, **_kwargs):
+        return []
+
     async def fail_if_candidates_load(*_args, **_kwargs):
         raise AssertionError("retry reloaded provider candidates")
 
@@ -67,6 +70,7 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
     for dependency_name in ("init_db", "ensure_database", "_ensure_catalog_tables", "push_objects"):
         monkeypatch.setattr(discovery, dependency_name, no_op_async)
     monkeypatch.setattr(discovery, "_load_candidates", fail_if_candidates_load)
+    monkeypatch.setattr(discovery, "_load_pending_identity_errors", no_pending_identities)
     monkeypatch.setattr(discovery, "_retag_sources_for_discovery_run", capture_retag)
     monkeypatch.setattr(discovery, "execute_checkpointed_source_batch", capture_execution)
     monkeypatch.setattr(
