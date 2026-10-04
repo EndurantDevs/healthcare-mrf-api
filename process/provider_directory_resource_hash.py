@@ -79,10 +79,6 @@ def _is_mapped_practitioner_payload(
     return PRACTITIONER_NAME_PAYLOAD_FIELDS.issubset(payload_by_field)
 
 
-def _human_name_sort_key(name_by_field: Mapping[str, Any]) -> str:
-    return _stable_json(name_by_field)
-
-
 def canonical_practitioner_names(value: Any) -> list[dict[str, Any]]:
     """Return an exact, permutation-stable mapped HumanName set."""
 
@@ -97,7 +93,7 @@ def canonical_practitioner_names(value: Any) -> list[dict[str, Any]]:
         name_by_field = copy.deepcopy(dict(raw_name))
         identity = _stable_json(name_by_field)
         names_by_identity[identity] = name_by_field
-    return sorted(names_by_identity.values(), key=_human_name_sort_key)
+    return [names_by_identity[key] for key in sorted(names_by_identity)]
 
 
 def _practitioner_primary_name_projection(
@@ -130,13 +126,21 @@ def canonical_practitioner_payload(
 ) -> dict[str, Any]:
     """Canonicalize repeating names and their searchable projection."""
 
-    canonical = copy.deepcopy(dict(payload_by_field))
-    if "names" not in canonical:
-        return canonical
-    names = canonical_practitioner_names(canonical.get("names"))
-    canonical["names"] = names
-    canonical.update(_practitioner_primary_name_projection(names))
-    return canonical
+    return _canonical_practitioner_hash_view(copy.deepcopy(dict(payload_by_field)))
+
+
+def _canonical_practitioner_hash_view(
+    payload_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize names without copying unchanged content for read-only hashing."""
+
+    canonical_by_field = dict(payload_by_field)
+    if "names" not in canonical_by_field:
+        return canonical_by_field
+    names = canonical_practitioner_names(canonical_by_field.get("names"))
+    canonical_by_field["names"] = names
+    canonical_by_field.update(_practitioner_primary_name_projection(names))
+    return canonical_by_field
 
 
 def _without_volatile_fhir_time(
@@ -197,7 +201,14 @@ def practitioner_semantic_base_payload(
 ) -> dict[str, Any]:
     """Return all stable Practitioner content except repeating names."""
 
-    semantic_payload = semantic_resource_content_hash_payload(payload_by_field)
+    return _practitioner_base_payload_from_semantic(
+        semantic_resource_content_hash_payload(payload_by_field)
+    )
+
+
+def _practitioner_base_payload_from_semantic(
+    semantic_payload: Mapping[str, Any],
+) -> dict[str, Any]:
     if not _is_mapped_practitioner_payload(semantic_payload):
         raise ValueError("provider_directory_practitioner_payload_invalid")
     return {
@@ -220,7 +231,14 @@ def practitioner_name_hashes(
 ) -> tuple[str, ...]:
     """Return the ordered exact mapped HumanName digest set."""
 
-    canonical = canonical_practitioner_payload(payload_by_field)
+    return _practitioner_name_hashes_from_canonical(
+        canonical_practitioner_payload(payload_by_field)
+    )
+
+
+def _practitioner_name_hashes_from_canonical(
+    canonical: Mapping[str, Any],
+) -> tuple[str, ...]:
     return tuple(
         sorted({_payload_sha256(name_by_field) for name_by_field in canonical["names"]})
     )
@@ -256,7 +274,34 @@ def practitioner_semantic_payload_sha256(
 ) -> str:
     """Hash one canonical mapped Practitioner under the v3 contract."""
 
-    canonical = canonical_practitioner_payload(payload_by_field)
+    canonical = _canonical_practitioner_hash_view(payload_by_field)
+    _assert_practitioner_name_projection(payload_by_field, canonical)
+    return composed_practitioner_semantic_sha256(
+        *_practitioner_hash_components_from_canonical(canonical)
+    )
+
+
+def practitioner_semantic_hash_components(
+    payload_by_field: Mapping[str, Any],
+) -> tuple[str, tuple[str, ...], str]:
+    """Derive exact proof commitments in base, name, projection order."""
+
+    if not _is_mapped_practitioner_payload(payload_by_field):
+        practitioner_semantic_base_sha256(payload_by_field)
+    canonical = _canonical_practitioner_hash_view(payload_by_field)
+    base_hash, name_hashes = _practitioner_hash_components_from_canonical(canonical)
+    _assert_practitioner_name_projection(payload_by_field, canonical)
+    return (
+        base_hash,
+        name_hashes,
+        composed_practitioner_semantic_sha256(base_hash, name_hashes),
+    )
+
+
+def _assert_practitioner_name_projection(
+    payload_by_field: Mapping[str, Any],
+    canonical: Mapping[str, Any],
+) -> None:
     if any(
         _stable_json(payload_by_field.get(field_name))
         != _stable_json(canonical.get(field_name))
@@ -265,10 +310,18 @@ def practitioner_semantic_payload_sha256(
         raise ValueError(
             "provider_directory_practitioner_name_projection_invalid"
         )
-    return composed_practitioner_semantic_sha256(
-        practitioner_semantic_base_sha256(canonical),
-        practitioner_name_hashes(canonical),
+
+
+def _practitioner_hash_components_from_canonical(
+    canonical: Mapping[str, Any],
+) -> tuple[str, tuple[str, ...]]:
+    semantic_payload = _without_volatile_fhir_time(
+        resource_content_hash_payload(canonical)
     )
+    base_hash = _payload_sha256(
+        _practitioner_base_payload_from_semantic(semantic_payload)
+    )
+    return base_hash, _practitioner_name_hashes_from_canonical(canonical)
 
 
 def _observation_provenance(payload_by_field: Mapping[str, Any]) -> dict[str, Any]:

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from process import provider_directory_profile_capacity_runtime as capacity_runtime
+from process import provider_directory_profile_initial as profile_initial
 from process.provider_directory_cms_preparation import (
     NonprofileAdmission,
     NonprofileAdmissionCheck,
@@ -72,7 +73,9 @@ async def resume_profile_capacity(
 ) -> Any:
     """Recheck exact capacity and preserve all own WAL while resuming its window."""
     admission = paused.admission
-    identity = await fhir._profile_admission_identity(fence, serving_state=admission.admitted_identity.serving_state)
+    identity = await fhir._profile_admission_identity(
+        fence, serving_state=profile_initial.targets(admission.admitted_identity)
+    )
     if identity != admission.admitted_identity:
         raise _error("profile_build_identity_changed")
     workload = await fhir._profile_admission_workload(identity, fence, resource_fence, types)
@@ -80,12 +83,13 @@ async def resume_profile_capacity(
     if geometry.geometry != admission.geometry or geometry.control_wal_projection != admission.control_wal_projection:
         raise _error("profile_geometry_changed")
     async with fhir.db.transaction():
+        if identity.initial_targets is not None:
+            await fhir._lock_profile_capacity_preflight_state(fhir._schema())
         await fhir.assert_profile_selection_current_in_transaction(
             execution.attestation, fhir._provider_directory_profile_selection_catalog()
         )
         await fhir._lock_and_verify_artifact_dataset_fence(fence)
-        observed_serving = await fhir._provider_directory_profile_serving_state(fhir._schema(), for_update=True)
-        fhir._assert_provider_directory_profile_capacity_serving_state(identity.serving_state, observed_serving)
+        await _assert_resumed_profile_state(fhir, identity, admission.geometry)
         database_identity, _runtime = await fhir._profile_admission_runtime_state(
             identity,
             admission.database_identity,
@@ -99,6 +103,22 @@ async def resume_profile_capacity(
             )
     await fhir._assert_provider_directory_profile_wal_budget(resumed)
     return resumed
+
+
+async def _assert_resumed_profile_state(fhir: Any, identity: Any, geometry: Any) -> None:
+    """Recheck the original predecessor or initial physical snapshot under its locks."""
+    if identity.initial_targets is None:
+        observed_serving = await fhir._provider_directory_profile_serving_state(fhir._schema(), for_update=True)
+        fhir._assert_provider_directory_profile_capacity_serving_state(identity.serving_state, observed_serving)
+        return
+    observed_targets = await profile_initial.capture_targets(fhir, fhir._schema())
+    receipt_layout = await profile_initial.receipt_layout(fhir, fhir._schema())
+    if (
+        observed_targets != identity.initial_targets
+        or receipt_layout.relation_oid != geometry.initial_receipt_oid
+        or receipt_layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
+    ):
+        raise _error("profile_initial_target_changed")
 
 
 def _error(reason: str) -> RuntimeError:

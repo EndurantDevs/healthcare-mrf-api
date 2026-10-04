@@ -88,7 +88,7 @@ def retain_doctors_artifact(source_path: str, source_url: str) -> dict:
             temporary_path.unlink(missing_ok=True)
 
 
-def verify_doctors_artifact(receipt: dict) -> None:
+def verify_doctors_artifact(receipt: dict) -> Path:
     """Reject publication if the retained source bytes no longer match their receipt."""
     if not isinstance(receipt, dict):
         raise RuntimeError("cms_doctors_artifact_receipt_invalid")
@@ -115,3 +115,4 @@ def verify_doctors_artifact(receipt: dict) -> None:
                 raise RuntimeError("cms_doctors_artifact_changed")
     except FileNotFoundError as error:
         raise RuntimeError("cms_doctors_artifact_missing") from error
+    return path

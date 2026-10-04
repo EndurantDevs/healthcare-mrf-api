@@ -4,7 +4,9 @@
 import asyncio
 import contextvars
 import datetime
+import hashlib
 import importlib
+import json
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from functools import partial
@@ -28,6 +30,7 @@ importer = importlib.import_module("process.provider_directory_fhir")
 def emulate_only_in_memory_sql_backend(monkeypatch):
     """Keep statement-order stubs separate from the actual PostgreSQL limit checks."""
     original = preparation.nonprofile_sql_transaction
+    original_manifest = preparation._emit_prepared_manifest
 
     @asynccontextmanager
     async def transaction(fhir, admission):
@@ -38,6 +41,13 @@ def emulate_only_in_memory_sql_backend(monkeypatch):
                 yield
 
     monkeypatch.setattr(preparation, "nonprofile_sql_transaction", transaction)
+
+    async def emit_manifest(prepared, run_id, control_run_id):
+        """Legacy statement-order stubs lack catalogs; full boundary cases below retain the real emitter."""
+        if not isinstance(prepared.fhir, PreparationFakeFHIR):
+            await original_manifest(prepared, run_id, control_run_id)
+
+    monkeypatch.setattr(preparation, "_emit_prepared_manifest", emit_manifest)
 
 
 def _inputs():
@@ -892,3 +902,335 @@ async def test_native_registry_rejects_replacement_and_preserves_native_ownershi
         await admission.retire_external_relation(fake, "test_schema", "native_stage", 321)
     assert admission._relations == {("test_schema", "native_stage"): 321}
     assert preparation._owned_cleanup_names(admission, "test_schema", []) == []
+
+
+def _manifest_add_heap(fixture, name, required_indexes, *, persistence="p", primary_key=False):
+    """Supply catalog-shaped rows independently of the production manifest collector."""
+    oid = len(fixture.heaps) + 100
+    fixture.heaps[name] = {"oid": oid, "persistence": persistence, "total_bytes": 100}
+    fixture.attributes.append({"relation_oid": oid, "attnum": 1, "attname": "npi"})
+    names = list(required_indexes) + ([name + "_pkey"] if primary_key else [])
+    for index_name in names:
+        fixture.indexes.append(
+            {
+                "relation_oid": oid,
+                "index_oid": 1000 + len(fixture.indexes),
+                "index_name": index_name,
+                "indisvalid": True,
+                "indisready": True,
+                "indislive": True,
+                "indisprimary": index_name == name + "_pkey",
+                "index_am": "btree",
+                "indkey": "1",
+                "index_expressions": "",
+                "index_predicate": "",
+            }
+        )
+    return oid
+
+
+def _manifest_scope_heaps(fixture):
+    """Represent all eight actual resource models and their source heap."""
+    fhir = fixture.fhir
+    for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS):
+        name = "scope_" + model.__tablename__
+        required_indexes = [fhir._artifact_scope_pk_names(name)[1]]
+        if model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation):
+            required_indexes.append(fhir._provider_directory_profile_bucket_index_sql("test_schema", name)[0])
+        oid = _manifest_add_heap(fixture, name, required_indexes, persistence="u")
+        fixture.prepared.relation_overrides[model.__tablename__] = name
+        fixture.admission._relations[("test_schema", name)] = oid
+    for target, suffixes, naming in (
+        (
+            fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES,
+            fhir._address_overlay_index_name,
+        ),
+        (
+            fhir.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+            fhir.PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES,
+            fhir._network_catalog_index_name,
+        ),
+    ):
+        name = target + "_stage"
+        oid = _manifest_add_heap(fixture, name, [naming(name, suffix) for suffix in suffixes])
+        fixture.admission._relations[("test_schema", name)] = oid
+        fixture.prepared.nonprofile_bundle.stages.append(
+            SimpleNamespace(schema="test_schema", stage_table=name, target_relation=target)
+        )
+
+
+def _manifest_native_heaps(fixture):
+    """Use the native seven-model declaration and exact prepared stage tuples."""
+    native = importlib.import_module("process.entity_address_unified")
+    models = importlib.import_module("process.entity_address_result_generation").ENTITY_ADDRESS_RESULT_MODELS
+    fixture.admission.plan = replace(
+        fixture.admission.plan, native_address_targets=tuple(model.__tablename__ for model in models)
+    )
+    fixture.admission.lease = _signed_lease(fixture.admission.plan)
+    fixture.address = SimpleNamespace(db_schema="test_schema", stage_oids=[], swaps=[])
+    for model in models:
+        name = model.__tablename__ + "_cms" + "a" * 20
+        required_indexes = [
+            native._stage_index_name(name, index.get("name", "_".join(index["index_elements"])))
+            for index in model.__my_additional_indexes__
+        ]
+        oid = _manifest_add_heap(fixture, name, required_indexes)
+        fixture.admission._relations[("test_schema", name)] = oid
+        fixture.address.stage_oids.append((model.__tablename__, name, oid))
+        fixture.address.swaps.append(
+            SimpleNamespace(
+                stage_cls=SimpleNamespace(__tablename__=name, __my_additional_indexes__=model.__my_additional_indexes__)
+            )
+        )
+
+
+def _manifest_profile_heaps(fixture, mode):
+    """Retain separate initial-checkpoint and ordinary delta ownership contracts."""
+    profile = importer.profile_artifact
+    build = SimpleNamespace(
+        schema="test_schema",
+        evidence_stage="profile_evidence_stage",
+        profile_stage="profile_stage",
+        owner_run_id="run-a",
+        selection_proof_id="proof-a",
+        materialization_mode="full_swap",
+    )
+    bundle = SimpleNamespace(stages=[], profile_delta=None)
+    for name, target_relation, suffixes in (
+        (build.evidence_stage, profile.PROFILE_EVIDENCE_TABLE, profile.PROFILE_EVIDENCE_INDEX_SUFFIXES),
+        (build.profile_stage, profile.PROFILE_TABLE, profile.PROFILE_INDEX_SUFFIXES),
+    ):
+        _manifest_add_heap(
+            fixture, name, [profile.profile_index_name(name, suffix) for suffix in suffixes], primary_key=True
+        )
+        bundle.stages.append(
+            SimpleNamespace(
+                schema=build.schema,
+                stage_table=name,
+                target_relation=target_relation,
+                profile_initial_build=build,
+                build_fence=object(),
+            )
+        )
+    if mode == "delta":
+        affected_oid = _manifest_add_heap(fixture, "affected_npi_stage", [], primary_key=True)
+        bundle.profile_delta = SimpleNamespace(
+            schema=build.schema,
+            owner_run_id=build.owner_run_id,
+            selection_proof_id=build.selection_proof_id,
+            evidence_stage=build.evidence_stage,
+            evidence_stage_oid=fixture.heaps[build.evidence_stage]["oid"],
+            profile_stage=build.profile_stage,
+            profile_stage_oid=fixture.heaps[build.profile_stage]["oid"],
+            affected_npi_stage="affected_npi_stage",
+            affected_npi_stage_oid=affected_oid,
+        )
+        bundle.stages = []
+    fixture.profile_bundle = bundle
+
+
+def _manifest_fixture(monkeypatch, mode):
+    """Exercise the real final preparation boundary with catalog and worker-log seams only."""
+    execution, fence, _projection = _inputs()
+    execution.attestation.selection_fingerprint = "ef" * 32
+    fixture = SimpleNamespace(heaps={}, indexes=[], attributes=[], admission=_admission())
+    names = (
+        "ProviderDirectorySource",
+        "RESOURCE_MODELS",
+        "ProviderDirectoryPractitionerRole",
+        "ProviderDirectoryOrganizationAffiliation",
+        "PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE",
+        "PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE",
+        "PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES",
+        "PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES",
+        "_artifact_scope_pk_names",
+        "_provider_directory_profile_bucket_index_sql",
+        "_address_overlay_index_name",
+        "_network_catalog_index_name",
+        "profile_artifact",
+        "profile_initial",
+    )
+    fixture.fhir = SimpleNamespace(
+        **{name: getattr(importer, name) for name in names},
+        db=_database(),
+        _schema=lambda: "test_schema",
+        _unscoped_qt=lambda schema, name: schema + "." + name,
+        _pagination_checkpoint_row_mapping=lambda row: row,
+        _profile_capacity_preflight_clock=AsyncMock(return_value=VALIDATION_TIME),
+        _assert_provider_directory_profile_checkpoint_ready=AsyncMock(),
+    )
+    fixture.prepared = preparation.PreparedServingArtifacts(
+        fixture.fhir, fence, execution, fixture.admission, SimpleNamespace(stages=[]), None, {}, {}, None
+    )
+    _manifest_scope_heaps(fixture)
+    _manifest_native_heaps(fixture)
+    _manifest_profile_heaps(fixture, mode)
+    _manifest_install_seams(monkeypatch, fixture)
+    return fixture
+
+
+def _manifest_install_seams(monkeypatch, fixture):
+    """Keep real ownership and readiness code while replacing physical host I/O."""
+    fixture.admission._started = True
+    fixture.fhir.db.relations.update({"test_schema." + name: heap for name, heap in fixture.heaps.items()})
+
+    async def identities(_schema, names):
+        return {
+            name: (fixture.heaps[name]["oid"], "r", fixture.heaps[name]["persistence"])
+            for name in names
+            if name in fixture.heaps
+        }
+
+    async def catalog(oids):
+        assert set(oids) == {heap["oid"] for heap in fixture.heaps.values()}
+        assert fixture.fhir.db._transaction_binding() is not None
+        assert fixture.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is fixture.resumed_profile
+        assert preparation._ACTIVE.get() is None
+        return fixture.attributes, fixture.indexes, [], []
+
+    @asynccontextmanager
+    async def profile_scope(*_args):
+        token = fixture.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(fixture.resumed_profile)
+        try:
+            yield fixture.profile_bundle, {"profile": {"prepared": True}}
+        finally:
+            fixture.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
+
+    fixture.fhir._artifact_scope_relation_identities = identities
+    fixture.fhir._profile_capacity_relation_catalog = catalog
+    monkeypatch.setattr(preparation, "_profile_scope", profile_scope)
+    _manifest_sql_backend(fixture)
+
+
+def _manifest_sql_backend(fixture):
+    """Run the real paired-deadline and SQL-setting helpers on a local settings stub."""
+    fixture.resumed_profile = object()
+    fixture.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION = contextvars.ContextVar(
+        "manifest_profile", default=None
+    )
+    fixture.admission.paired_profile_lease = SimpleNamespace(
+        max_build_deadline=VALIDATION_TIME + datetime.timedelta(seconds=15)
+    )
+    fixture.settings_by_name = {
+        name: "0"
+        for name in (
+            "temp_file_limit",
+            "max_parallel_workers_per_gather",
+            "max_parallel_maintenance_workers",
+            "statement_timeout",
+            "lock_timeout",
+        )
+    }
+    fixture.initial_settings = dict(fixture.settings_by_name)
+    fixture.limits_observed = []
+
+    async def scalar(_query, **params):
+        if "setting_name" in params:
+            return fixture.settings_by_name[params["setting_name"]]
+        fixture.limits_observed.append(dict(params))
+        assert params == {"limit": 1024, "timeout_ms": 14000}
+        return fixture.settings_by_name == {
+            "temp_file_limit": "1kB",
+            "max_parallel_workers_per_gather": "0",
+            "max_parallel_maintenance_workers": "0",
+            "statement_timeout": "14000ms",
+            "lock_timeout": "14000ms",
+        }
+
+    async def status(statement):
+        assert statement.startswith("SET LOCAL ") and statement.endswith("';")
+        name, value = statement.removeprefix("SET LOCAL ").removesuffix(";").split(" = ")
+        fixture.settings_by_name[name] = value.strip("'")
+
+    @asynccontextmanager
+    async def transaction():
+        previous = fixture.fhir.db.transaction_active
+        fixture.fhir.db.transaction_active = True
+        try:
+            yield
+        finally:
+            fixture.fhir.db.transaction_active = previous
+
+    fixture.fhir.db.scalar, fixture.fhir.db.status, fixture.fhir.db.transaction = scalar, status, transaction
+
+
+@asynccontextmanager
+async def _manifest_boundary(fixture):
+    """Call the actual boundary after native and Profile preparation and before publication."""
+
+    @asynccontextmanager
+    async def address_scope(*_args):
+        yield fixture.address
+
+    async with preparation._prepare_address_and_profile(
+        fixture.prepared, run_id="run-a", control_run_id="run-a", metrics={}, address_preparation=address_scope
+    ):
+        yield
+
+
+@pytest.mark.parametrize("mode", ["initial", "delta"])
+@pytest.mark.asyncio
+async def test_prepared_manifest_is_complete_before_publication(monkeypatch, capsys, mode):
+    fixture = _manifest_fixture(monkeypatch, mode)
+    async with _manifest_boundary(fixture):
+        records = capsys.readouterr().out.splitlines()
+        assert len(records) == 1
+        prefix, encoded_record = records[0].split("\t", 1)
+        assert prefix == "PROVIDER_DIRECTORY_CMS_PREPARED_LAYOUT"
+        record = json.loads(encoded_record)
+        manifest = record["prepared_manifest"]
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        assert record["manifest_sha256"] == hashlib.sha256(encoded.encode("ascii")).hexdigest()
+        assert manifest["run_id"] == manifest["control_run_id"] == "run-a"
+        assert manifest["selection_proof_id"] == "proof-a"
+        assert manifest["source_vector"] == [["cms-npd", "cms-new"], ["retained", "retained-current"]]
+        assert manifest["desired_fence_hash"] == preparation.desired_fence_hash(fixture.prepared.fence)
+        relations = manifest["relations"]
+        assert {row["relation"] for row in relations} == set(fixture.heaps)
+        assert len(relations) == (20 if mode == "initial" else 21)
+        assert {row["target"] for row in relations if row["role"] == "resource_scope"} == {
+            model.__tablename__ for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS)
+        }
+        assert all(row["columns"] and row["indexes"] for row in relations)
+        assert all(
+            set(row["required_indexes"]) <= {index["index_name"] for index in row["indexes"]} for row in relations
+        )
+    fixture.fhir._assert_provider_directory_profile_checkpoint_ready.assert_not_awaited()
+    assert fixture.limits_observed == [{"limit": 1024, "timeout_ms": 14000}]
+    assert fixture.settings_by_name == fixture.initial_settings
+    assert fixture.fhir.db._transaction_binding() is None
+
+
+@pytest.mark.parametrize(
+    "corruption,reason",
+    [
+        ("missing-index", "prepared_manifest_indexes_incomplete"),
+        ("invalid-index", "prepared_manifest_indexes_incomplete"),
+        ("wrong-oid", "nonprofile_relation_changed"),
+        ("missing-scope", "prepared_manifest_ownership_changed"),
+        ("wrong-profile-owner", "prepared_manifest_profile_changed"),
+        ("unlogged-serving", "prepared_manifest_stage_not_logged"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_prepared_manifest_refuses_incomplete_or_foreign_layout(monkeypatch, capsys, corruption, reason):
+    fixture = _manifest_fixture(monkeypatch, "initial")
+    first_name = "scope_" + importer.ProviderDirectorySource.__tablename__
+    match corruption:
+        case "missing-index":
+            fixture.indexes.pop(0)
+        case "invalid-index":
+            fixture.indexes[0]["indisready"] = False
+        case "wrong-oid":
+            fixture.heaps[first_name]["oid"] += 500
+        case "missing-scope":
+            fixture.prepared.relation_overrides.pop(importer.ProviderDirectorySource.__tablename__)
+        case "wrong-profile-owner":
+            fixture.profile_bundle.stages[0].profile_initial_build.owner_run_id = "run-other"
+        case "unlogged-serving":
+            fixture.heaps[importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE + "_stage"]["persistence"] = "u"
+    with pytest.raises(RuntimeError, match=reason):
+        async with _manifest_boundary(fixture):
+            pytest.fail("incomplete layout reached publication")
+    assert capsys.readouterr().out == ""

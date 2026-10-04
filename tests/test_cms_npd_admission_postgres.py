@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 from contextvars import Context
+from functools import partial
 from itertools import count
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -31,7 +32,6 @@ from process import provider_directory_cms_serving_coverage as coverage
 from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
 from tests import cms_npd_admission_postgres_support as support
 from tests.cms_npd_admission_postgres_support import (
-    admission_database,
     cms_admission_template,
     cms_artifact_root,
     fhir,
@@ -39,12 +39,17 @@ from tests.cms_npd_admission_postgres_support import (
     retained_release,
 )
 
+pytestmark = pytest.mark.parametrize(
+    "cms_admission_template", [support.LEGACY_MIGRATION_PREFIXES], indirect=True, ids=["legacy"]
+)
+admission_database = partial(support.admission_database, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES)
+
 
 async def _publish_legacy_source(fhir, candidate, identity, directory, receipt, client, ctx, task):
     """Publish the dependency-slice fixture through real source and coverage guards."""
     state = await fhir._endpoint_dataset_state(candidate.dataset_id)
     cms._assert_candidate_release(state, identity)
-    await cms._verify_or_dispose(fhir, candidate, identity, directory, receipt, client)
+    await cms._verify_or_dispose(fhir, candidate, identity, directory, receipt, client, task)
     if not candidate.already_published:
 
         async def before_cutover(session):
@@ -914,9 +919,10 @@ async def test_daily_check_upgrades_current_release_without_witnesses(monkeypatc
         legacy = await _admit_without_witnesses(monkeypatch, directory, receipt, "cms-daily-legacy")
         await _assert_current(database, legacy["dataset_id"])
         acquired = Mock(return_value=(directory, receipt))
+        verify_release = cms._verify_release
 
-        async def verify_retained(path, release_receipt, _client):
-            await asyncio.to_thread(cms.source.verify_retained_release, path, release_receipt)
+        async def verify_retained(path, release_receipt, _client, task=None):
+            await verify_release(path, release_receipt, None, task)
 
         with monkeypatch.context() as daily:
             daily.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
@@ -953,9 +959,10 @@ async def test_daily_check_upgrades_witnessed_release_without_relationship_recei
             == legacy["resource_count"]
         )
         acquired = Mock(return_value=(directory, receipt))
+        verify_release = cms._verify_release
 
-        async def verify_retained(path, release_receipt, _client):
-            await asyncio.to_thread(cms.source.verify_retained_release, path, release_receipt)
+        async def verify_retained(path, release_receipt, _client, task=None):
+            await verify_release(path, release_receipt, None, task)
 
         with monkeypatch.context() as daily:
             daily.setattr(cms, "durable_artifact_root", lambda: cms_artifact_root)
@@ -1245,10 +1252,10 @@ async def test_interrupted_stale_cleanup_resumes_before_next_vector(monkeypatch,
         original_verify = cms._verify_release
         original_cleanup = recovery._clear_failed_rows
 
-        async def changed_vector(directory, receipt, client):
+        async def changed_vector(directory, receipt, client, task=None):
             if client is None:
                 raise cms.source.CmsNpdSourceError("cms_npd_source_vector_changed")
-            return await original_verify(directory, receipt, client)
+            return await original_verify(directory, receipt, client, task)
 
         monkeypatch.setattr(cms, "_verify_release", changed_vector)
         monkeypatch.setattr(
@@ -1504,3 +1511,14 @@ async def test_migrated_clone_setup_failure_removes_owned_database(monkeypatch):
                 )
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_historical_template_refuses_a_different_requested_profile(monkeypatch):
+    """The real historical schema cannot silently satisfy a request for current receipt guards."""
+    async with admission_database(monkeypatch) as database:
+        assert await database.scalar("SELECT to_regclass('mrf.provider_directory_cms_serving_receipt') IS NULL")
+        assert await database.scalar("SELECT to_regclass('mrf.provider_directory_cms_candidate_coverage') IS NOT NULL")
+    with pytest.raises(AssertionError, match="migration profile mismatch"):
+        async with support.admission_database(monkeypatch):
+            pytest.fail("current migration profile used a historical template")

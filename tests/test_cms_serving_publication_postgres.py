@@ -13,6 +13,7 @@ from sqlalchemy import text
 from process import provider_directory_cms_preparation as preparation
 from process import provider_directory_cms_publication as publication
 from process import provider_directory_cms_serving_receipt as receipts
+from process import provider_directory_profile_initial as profile_initial
 from tests import test_provider_directory_cms_serving_receipt_postgres as native
 from tests.test_provider_directory_cms_nonprofile_capacity import _cutover_producer, _signed_plan
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
@@ -90,10 +91,10 @@ async def _serving_state(engine, schema):
         return snapshot, counts_by_table
 
 
-async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack=False):
-    """Bind a sealed fixture to real transaction ownership and deferred guards."""
-    database = _Database(engine, lose_ack=lose_ack)
+def _publication_backend(database, schema):
+    """Bind the real initial protocol and transaction settings to the native fixture."""
     fhir = SimpleNamespace(db=database, _schema=lambda: schema, _qt=lambda schema, table: f'"{schema}"."{table}"')
+    fhir.profile_initial = profile_initial
     fhir._provider_directory_artifact_transaction_timeout_seconds = lambda _fence, **_kwargs: 5
     fhir._ordered_provider_directory_artifact_bundle = lambda stages: stages
     fhir._provider_directory_artifact_bundle_context = lambda _stages, _delta: (schema, (), "5s", "5s")
@@ -103,6 +104,13 @@ async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack
         await database.connection.execute(text("SET LOCAL statement_timeout='5s'"))
 
     fhir._configure_provider_directory_artifact_promotion = configure_settings
+    return fhir
+
+
+async def _prepare_publication(monkeypatch, engine, schema, failure, *, lose_ack=False):
+    """Bind a sealed fixture to real transaction ownership and deferred guards."""
+    database = _Database(engine, lose_ack=lose_ack)
+    fhir = _publication_backend(database, schema)
     address = SimpleNamespace(committed=False, context={}, swaps=[])
 
     async def assert_ready(*, cutover):

@@ -31,9 +31,7 @@ from process.provider_directory_resource_hash import (
     composed_practitioner_semantic_sha256,
     is_semantic_resource_hash_contract,
     persisted_resource_hash_contract,
-    practitioner_name_hashes,
-    practitioner_semantic_base_sha256,
-    practitioner_semantic_payload_sha256,
+    practitioner_semantic_hash_components,
     resource_payload_sha256_for_contract,
 )
 
@@ -212,12 +210,10 @@ def _semantic_proof_hash_fields(
     """Return base, label, primary-name, and payload commitments."""
 
     if resource_type == "Practitioner":
-        return (
-            practitioner_semantic_base_sha256(payload_by_field),
-            list(practitioner_name_hashes(payload_by_field)),
-            None,
-            practitioner_semantic_payload_sha256(payload_by_field),
+        base_hash, name_hashes, payload_hash = practitioner_semantic_hash_components(
+            payload_by_field
         )
+        return base_hash, list(name_hashes), None, payload_hash
     if (
         resource_type == "Organization"
         and resource_hash_contract

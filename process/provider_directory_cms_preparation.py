@@ -803,7 +803,232 @@ async def _prepare_address_and_profile(
             prepared.metrics["profile"] = profile_metrics["profile"]
             await prepared.assert_ready()
             metrics.update(prepared.metrics)
+            await _emit_prepared_manifest(prepared, run_id, control_run_id)
             yield
+
+
+def _manifest_required_indexes(fhir, target, name):
+    """Reuse the serving builders' required index names without parsing their SQL."""
+    if target == fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+        return [
+            fhir._address_overlay_index_name(name, suffix)
+            for suffix in fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES
+        ]
+    if target == fhir.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE:
+        return [
+            fhir._network_catalog_index_name(name, suffix)
+            for suffix in fhir.PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES
+        ]
+    profile = fhir.profile_artifact
+    if target not in {profile.PROFILE_EVIDENCE_TABLE, profile.PROFILE_TABLE}:
+        raise RuntimeError("provider_directory_prepared_manifest_target_invalid")
+    suffixes = (
+        profile.PROFILE_EVIDENCE_INDEX_SUFFIXES
+        if target == profile.PROFILE_EVIDENCE_TABLE
+        else profile.PROFILE_INDEX_SUFFIXES
+    )
+    return [profile.profile_index_name(name, suffix) for suffix in suffixes]
+
+
+def _manifest_relation(relations, schema, name, *, target, role, required_indexes=(), primary_key=False, oid=None):
+    """Bind a prepared role to its original owned heap, never a name-only discovery."""
+    relation = relations.get((schema, name))
+    if relation is None or (oid is not None and relation["oid"] != oid) or "role" in relation:
+        raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+    relation.update(
+        target=target, role=role, required_indexes=sorted(required_indexes), primary_key_required=primary_key
+    )
+
+
+async def _manifest_profile_relations(prepared, relations, run_id):
+    """Retain the separately admitted Profile ownership instead of charging it to CMS."""
+    fhir, bundle = prepared.fhir, prepared.profile_bundle
+    delta = prepared.profile_delta
+    if delta is not None:
+        if delta.owner_run_id != run_id or delta.selection_proof_id != prepared.execution.attestation.proof_id:
+            raise RuntimeError("provider_directory_prepared_manifest_profile_changed")
+        stages = [
+            (getattr(delta, field), getattr(delta, field + "_oid"), target_relation)
+            for field, target_relation in (
+                ("evidence_stage", fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
+                ("profile_stage", fhir.profile_artifact.PROFILE_TABLE),
+                ("affected_npi_stage", None),
+            )
+        ]
+        schema = delta.schema
+    else:
+        build = fhir.profile_initial.build_from_stages(fhir, bundle.stages)
+        if (
+            build is None
+            or build.owner_run_id != run_id
+            or build.selection_proof_id != prepared.execution.attestation.proof_id
+        ):
+            raise RuntimeError("provider_directory_prepared_manifest_profile_changed")
+        # Preparation already verified the ready checkpoint; the immutable initial
+        # receipt will bind these observed replacement OIDs after the guarded swap.
+        schema = build.schema
+        identities = await fhir._artifact_scope_relation_identities(
+            schema, [stage.stage_table for stage in bundle.stages]
+        )
+        stages = [
+            (stage.stage_table, identities.get(stage.stage_table, (None,))[0], stage.target_relation)
+            for stage in bundle.stages
+        ]
+    for name, oid, target_relation in stages:
+        if type(oid) is not int or oid <= 0 or (schema, name) in relations:
+            raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+        relations[(schema, name)] = {"schema": schema, "relation": name, "oid": oid}
+        required = _manifest_required_indexes(fhir, target_relation, name) if target_relation is not None else ()
+        _manifest_relation(
+            relations, schema, name, target=target_relation, role="profile", required_indexes=required, primary_key=True
+        )
+
+
+async def _prepared_manifest_relations(prepared, run_id):
+    """Inventory the complete prepared scopes using only their actual owner objects."""
+    fhir, admission = prepared.fhir, prepared.nonprofile_admission
+    relation_by_coordinate = {
+        (relation.schema, relation.relation): asdict(relation)
+        for relation in await admission.measure(fhir, fhir._schema())
+    }
+    for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS):
+        name = prepared.relation_overrides.get(model.__tablename__)
+        if name is None:
+            raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+        required_indexes = [fhir._artifact_scope_pk_names(name)[1]] if model.__table__.primary_key.columns else []
+        if model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation):
+            required_indexes.append(fhir._provider_directory_profile_bucket_index_sql(fhir._schema(), name)[0])
+        _manifest_relation(
+            relation_by_coordinate,
+            fhir._schema(),
+            name,
+            target=model.__tablename__,
+            role="resource_scope",
+            required_indexes=required_indexes,
+        )
+    for stage in prepared.nonprofile_bundle.stages:
+        _manifest_relation(
+            relation_by_coordinate,
+            stage.schema,
+            stage.stage_table,
+            target=stage.target_relation,
+            role="serving_stage",
+            required_indexes=_manifest_required_indexes(fhir, stage.target_relation, stage.stage_table),
+        )
+    address = prepared.address
+    native = importlib.import_module("process.entity_address_unified")
+    by_stage = {swap.stage_cls.__tablename__: swap.stage_cls for swap in address.swaps}
+    if {target_relation for target_relation, _name, _oid in address.stage_oids} != set(
+        admission.plan.native_address_targets
+    ):
+        raise RuntimeError("provider_directory_prepared_manifest_native_changed")
+    for target_relation, name, oid in address.stage_oids:
+        required_indexes = [
+            native._stage_index_name(name, index.get("name", "_".join(index["index_elements"])))
+            for index in by_stage[name].__my_additional_indexes__
+        ]
+        _manifest_relation(
+            relation_by_coordinate,
+            address.db_schema,
+            name,
+            target=target_relation,
+            role="native_stage",
+            required_indexes=required_indexes,
+            oid=oid,
+        )
+    await _manifest_profile_relations(prepared, relation_by_coordinate, run_id)
+    for relation in relation_by_coordinate.values():
+        if "role" not in relation:
+            relation.update(role="nonprofile_scratch", target=None, required_indexes=[], primary_key_required=False)
+    return [relation_by_coordinate[key] for key in sorted(relation_by_coordinate)]
+
+
+async def _prepared_manifest_catalog(fhir, relations):
+    """Read bounded metadata only, refusing missing heaps or unfinished required indexes."""
+    if not 1 <= len(relations) <= 64 or len({relation["oid"] for relation in relations}) != len(relations):
+        raise RuntimeError("provider_directory_prepared_manifest_inventory_invalid")
+    for schema in sorted({relation["schema"] for relation in relations}):
+        selected_relations = [relation for relation in relations if relation["schema"] == schema]
+        identities = await fhir._artifact_scope_relation_identities(
+            schema, [relation["relation"] for relation in selected_relations]
+        )
+        for relation in selected_relations:
+            identity = identities.get(relation["relation"])
+            if identity is None or identity[:2] != (relation["oid"], "r") or identity[2] not in {"u", "p"}:
+                raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+            if relation.get("role") in {"profile", "serving_stage", "native_stage"} and identity[2] != "p":
+                raise RuntimeError("provider_directory_prepared_manifest_stage_not_logged")
+            relation["persistence"] = identity[2]
+    attributes, indexes, _constraints, _triggers = await fhir._profile_capacity_relation_catalog(
+        [relation["oid"] for relation in relations]
+    )
+    for relation in relations:
+        relation["columns"] = [
+            {"number": catalog_row["attnum"], "name": catalog_row["attname"]}
+            for catalog_row in attributes
+            if catalog_row["relation_oid"] == relation["oid"]
+        ]
+        relation["indexes"] = [catalog_row for catalog_row in indexes if catalog_row["relation_oid"] == relation["oid"]]
+        required_indexes = set(relation.get("required_indexes", ()))
+        if (
+            not relation["columns"]
+            or not required_indexes <= {catalog_row["index_name"] for catalog_row in relation["indexes"]}
+            or (
+                relation.get("primary_key_required")
+                and not any(catalog_row["indisprimary"] for catalog_row in relation["indexes"])
+            )
+            or any(
+                not all(catalog_row[field] is True for field in ("indisvalid", "indisready", "indislive"))
+                for catalog_row in relation["indexes"]
+            )
+        ):
+            raise RuntimeError("provider_directory_prepared_manifest_indexes_incomplete")
+
+
+async def _emit_prepared_manifest(prepared, run_id, control_run_id):
+    """Retain the complete pre-swap catalog witness in the existing private worker log."""
+    fhir, admission = prepared.fhir, prepared.nonprofile_admission
+    if fhir.db._transaction_binding() is not None:
+        raise RuntimeError("provider_directory_prepared_manifest_requires_no_transaction")
+    async with nonprofile_sql_transaction(fhir, admission):
+        relations = await _prepared_manifest_relations(prepared, run_id)
+        await _prepared_manifest_catalog(fhir, relations)
+    selection = prepared.execution.attestation
+    manifest_by_field = {
+        "contract_id": "provider-directory-cms-prepared-layout-v1",
+        "run_id": run_id,
+        "control_run_id": control_run_id,
+        "observed_at": (await fhir._profile_capacity_preflight_clock()).isoformat(),
+        "selection_proof_id": selection.proof_id,
+        "selection_fingerprint": selection.selection_fingerprint,
+        "desired_fence_hash": desired_fence_hash(prepared.fence),
+        "source_vector": sorted((dataset.source_id, dataset.dataset_id) for dataset in prepared.fence.datasets),
+        "capacity_geometry_hash": admission.plan.capacity_geometry_hash,
+        "lease_digest": admission.lease.lease_digest,
+        "reservation_id": admission.lease.reservation_id,
+        "paired_profile_lease_digest": admission.plan.paired_profile_lease_digest,
+        "database_system_identifier": admission.lease.database_system_identifier,
+        "database_oid": admission.lease.database_oid,
+        "database_name": admission.lease.database_name,
+        "relations": relations,
+    }
+    encoded = json.dumps(manifest_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    if len(encoded) > 1024 * 1024:
+        raise RuntimeError("provider_directory_prepared_manifest_too_large")
+    print(
+        "PROVIDER_DIRECTORY_CMS_PREPARED_LAYOUT\t"
+        + json.dumps(
+            {
+                "prepared_manifest": manifest_by_field,
+                "manifest_sha256": hashlib.sha256(encoded.encode("ascii")).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ),
+        flush=True,
+    )
 
 
 async def _prepare_full_bundle(

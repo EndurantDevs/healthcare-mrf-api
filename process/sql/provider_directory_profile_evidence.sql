@@ -353,6 +353,29 @@
             SELECT * FROM role_service_rows
             UNION ALL
             SELECT * FROM direct_service_rows
+        ), endpoint_scope_rows AS MATERIALIZED (
+            SELECT DISTINCT source_id, dataset_id
+              FROM endpoint_rows
+        ), role_endpoint_reference_rows AS MATERIALIZED (
+            SELECT role_rows.resolved_npi,
+                   role_rows.source_id,
+                   role_rows.endpoint_id,
+                   role_rows.dataset_id,
+                   role_rows.canonical_api_base,
+                   role_rows.source_org_name,
+                   role_rows.source_plan_name,
+                   role_rows.resource_id AS role_resource_id,
+                   {{ROLE_ENDPOINT_RESOURCE_ID_SQL}} AS endpoint_resource_id
+              FROM role_rows
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                         FROM endpoint_scope_rows AS endpoint_scope
+                        WHERE endpoint_scope.source_id = role_rows.source_id
+                          AND endpoint_scope.dataset_id = role_rows.dataset_id
+                   ) THEN COALESCE(role_rows.endpoint_refs::jsonb, '[]'::jsonb)
+                   ELSE '[]'::jsonb END
+              ) AS endpoint_reference(value)
         ), role_endpoint_rows AS MATERIALIZED (
             SELECT role_rows.resolved_npi AS npi,
                    role_rows.source_id,
@@ -361,7 +384,7 @@
                    role_rows.canonical_api_base,
                    role_rows.source_org_name,
                    role_rows.source_plan_name,
-                   role_rows.resource_id AS role_resource_id,
+                   role_rows.role_resource_id,
                    endpoint.resource_id, endpoint.status,
                    endpoint.connection_type_system,
                    endpoint.connection_type_code,
@@ -370,14 +393,11 @@
                    endpoint.contact, endpoint.period_start, endpoint.period_end,
                    endpoint.payload_type_codes, endpoint.payload_mime_types,
                    endpoint.address, endpoint.updated_at
-              FROM role_rows
-              CROSS JOIN LATERAL jsonb_array_elements_text(
-                   COALESCE(role_rows.endpoint_refs::jsonb, '[]'::jsonb)
-              ) AS endpoint_reference(value)
+              FROM role_endpoint_reference_rows AS role_rows
               JOIN endpoint_rows AS endpoint
                 ON endpoint.source_id = role_rows.source_id
                AND endpoint.dataset_id = role_rows.dataset_id
-               AND endpoint.resource_id = {{ROLE_ENDPOINT_RESOURCE_ID_SQL}}
+               AND endpoint.resource_id = role_rows.endpoint_resource_id
         ), affiliation_rows AS MATERIALIZED (
             SELECT role_rows.resolved_npi AS npi,
                    role_rows.source_id,
