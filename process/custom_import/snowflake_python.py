@@ -66,6 +66,7 @@ from process.custom_import.snowflake_bundle import (
     _capture_limits,
     _query_identity_snapshot_token,
 )
+from process.custom_import.snowflake_inspection import SnowflakeInspectionStatement
 from process.custom_import.snowflake_preflight import SnowflakePreflightStatement
 from process.custom_import.snowflake_preflight_schema import (
     _fixed_type_parts,
@@ -395,6 +396,26 @@ class SnowflakePythonPreflightAdapter:
 
         if not isinstance(statement, SnowflakePreflightStatement):
             raise SnowflakeConnectorError("preflight adapter requires a generated Snowflake preflight statement")
+        return self._open_statement(statement, timeout_seconds=timeout_seconds)
+
+    def open_inspection(
+        self,
+        statement: SnowflakeInspectionStatement,
+        *,
+        timeout_seconds: int,
+    ) -> _SnowflakePreflightCursor:
+        """Execute only a rebuilt discovery/count statement, without source rows."""
+
+        if not isinstance(statement, SnowflakeInspectionStatement):
+            raise SnowflakeConnectorError("inspection adapter requires a generated Snowflake inspection statement")
+        return self._open_statement(statement.validated(), timeout_seconds=timeout_seconds)
+
+    def _open_statement(
+        self,
+        statement: SnowflakePreflightStatement | SnowflakeInspectionStatement,
+        *,
+        timeout_seconds: int,
+    ) -> _SnowflakePreflightCursor:
         timeout_seconds = _execution_timeout(timeout_seconds)
         connection = None
         cursor = None
@@ -404,7 +425,8 @@ class SnowflakePythonPreflightAdapter:
                 raise SnowflakeCredentialError("credential provider returned an invalid key-pair value")
             connection, cursor = self._connector._connect(credentials, timeout_seconds=timeout_seconds)
             _execute_filtered_statement(cursor, statement)
-            _preflight_result_schema(statement, cursor.description)
+            if isinstance(statement, SnowflakePreflightStatement):
+                _preflight_result_schema(statement, cursor.description)
             query_id = getattr(cursor, "sfqid", None)
             if query_id is not None and not isinstance(query_id, str):
                 raise SnowflakeConnectorError("Snowflake preflight statement identity is invalid")
@@ -414,6 +436,9 @@ class SnowflakePythonPreflightAdapter:
                 column_ids=statement.column_ids,
                 query_id=query_id,
             )
+            if isinstance(statement, SnowflakeInspectionStatement):
+                preflight_cursor.description = cursor.description
+                preflight_cursor.field_types = SNOWFLAKE_FIELD_TYPES
             connection = None
             cursor = None
             return preflight_cursor

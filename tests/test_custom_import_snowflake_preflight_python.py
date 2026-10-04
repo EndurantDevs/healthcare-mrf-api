@@ -23,6 +23,7 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleRequest,
     SnowflakeBundleStatement,
 )
+from process.custom_import.snowflake_inspection import SnowflakeInspectionError, SnowflakeInspectionStatement
 from process.custom_import.snowflake_preflight import SnowflakePreflightLimits, SnowflakePreflightStatement
 from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter, SnowflakePythonPreflightAdapter
 
@@ -212,6 +213,85 @@ def _adapter(credentials: SnowflakeKeyPairCredentials) -> tuple[SnowflakePythonP
         ),
         provider,
     )
+
+
+@pytest.mark.parametrize("operation", ["discover", "estimate"])
+def test_inspection_adapter_reuses_fixed_credentials_timeouts_and_cursor_ownership(monkeypatch, credentials, operation):
+    statement = SnowflakeInspectionStatement(_bundle_statement(), operation, 0 if operation == "discover" else None)
+    column_descriptions = tuple(
+        _Metadata(name, "FIXED" if operation == "estimate" else "TEXT", False, 38, 0) for name in statement.column_ids
+    )
+    cursor = _Cursor((), description=column_descriptions)
+    connection, arguments = _connect(monkeypatch, cursor)
+    adapter, provider = _adapter(credentials)
+    owned = adapter.open_inspection(statement, timeout_seconds=4)
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", statement.sql]
+    assert arguments["authenticator"] == "SNOWFLAKE_JWT"
+    assert arguments["role"] == "READER_ROLE"
+    assert arguments["warehouse"] == "IMPORT_WH"
+    assert arguments["session_parameters"]["STATEMENT_TIMEOUT_IN_SECONDS"] == 4
+    assert owned.description == column_descriptions
+    assert provider.calls == 1
+    owned.close()
+    owned.close()
+    assert cursor.close_count == connection.close_count == 1
+
+
+def test_inspection_adapter_rejects_forged_sql_before_credentials(credentials):
+    statement = SnowflakeInspectionStatement(_bundle_statement(), "estimate")
+    object.__setattr__(statement, "sql", "SELECT sensitive_unapproved_relation")
+    adapter, provider = _adapter(credentials)
+    with pytest.raises(SnowflakeInspectionError, match="^result_invalid$"):
+        adapter.open_inspection(statement, timeout_seconds=4)
+    assert provider.calls == 0
+
+
+def test_inspection_adapter_rejects_forged_parameters_before_credentials(credentials):
+    statement = SnowflakeInspectionStatement(_bundle_statement(), "estimate")
+    object.__setattr__(statement, "parameters", ("unapproved",))
+    adapter, provider = _adapter(credentials)
+    with pytest.raises(SnowflakeInspectionError, match="^result_invalid$"):
+        adapter.open_inspection(statement, timeout_seconds=4)
+    assert provider.calls == 0
+
+
+@pytest.mark.parametrize("operation", ["discover", "estimate"])
+def test_inspection_adapter_binds_sealed_filter_parameters(monkeypatch, credentials, operation):
+    bundle = _bundle_statement()
+    request = replace(
+        bundle.request,
+        bindings=(replace(bundle.request.bindings[0], row_filters=(SnowflakeRowFilter("npi", "eq", "1003000126"),)),),
+    )
+    statement = SnowflakeInspectionStatement(
+        replace(bundle, request=request), operation, 0 if operation == "discover" else None
+    )
+    cursor = _Cursor((), description=())
+    calls = []
+    cursor.execute = lambda *arguments: calls.append(arguments)
+    connection, _ = _connect(monkeypatch, cursor)
+    adapter, _ = _adapter(credentials)
+    owned = adapter.open_inspection(statement, timeout_seconds=4)
+    assert calls == [("USE SECONDARY ROLES NONE",), (statement.sql, ("1003000126",))]
+    owned.close()
+    assert cursor.close_count == connection.close_count == 1
+
+
+def test_inspection_adapter_closes_both_resources_on_execution_failure(monkeypatch, credentials):
+    statement = SnowflakeInspectionStatement(_bundle_statement(), "estimate")
+    cursor = _Cursor((), description=())
+    connection, _ = _connect(monkeypatch, cursor)
+    original_execute = cursor.execute
+
+    def execute(sql):
+        if sql == statement.sql:
+            raise RuntimeError("sensitive-driver-detail")
+        original_execute(sql)
+
+    cursor.execute = execute
+    adapter, _ = _adapter(credentials)
+    with pytest.raises(SnowflakeConnectorError, match="Snowflake preflight read failed"):
+        adapter.open_inspection(statement, timeout_seconds=4)
+    assert cursor.close_count == connection.close_count == 1
 
 
 def test_preflight_adapter_executes_generated_statement_once_with_bounded_timeout(monkeypatch, credentials):
