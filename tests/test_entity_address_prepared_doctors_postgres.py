@@ -146,6 +146,12 @@ async def test_source_ranges_and_geo_use_prepared_doctors_until_exact_native_app
                 assert (projected, invalid, forced) == (5, 0, True)
                 assert (
                     await database.scalar(
+                        f'SELECT candidate_dependency_bindings IS NULL FROM "{schema}".entity_address_geo_assurance_state'
+                    )
+                    is True
+                )
+                assert (
+                    await database.scalar(
                         f"SELECT geo_evidence_source_id FROM \"{schema}\".address_stage WHERE location_key='cms'"
                     )
                     == 3
@@ -200,6 +206,7 @@ async def _assert_apply_and_rollback(fixture, doctors, captured, stage_oid):
         "wrong_oid",
         "wrong_filenode",
         "unproven_other",
+        "held_tiger",
         "family",
         "disabled_seal",
     ],
@@ -224,6 +231,19 @@ async def test_unproven_or_changed_doctors_inputs_fail_before_native_work(monkey
                     address["relfilenode"] += 100000
                 case "unproven_other":
                     bindings[f"{fixture.schema}.npi_address"]["table_name"] = "address_stage"
+                case "held_tiger":
+                    await fixture.database.status(f'CREATE TABLE "{fixture.schema}".held_zcta AS TABLE tiger.zcta5')
+                    identity = await fixture.database.first(
+                        "SELECT oid::bigint,pg_relation_filenode(oid)::bigint FROM pg_class "
+                        "WHERE oid=to_regclass(:name)",
+                        name=f"{fixture.schema}.held_zcta",
+                    )
+                    bindings["tiger.zcta5"] = {
+                        "schema_name": fixture.schema,
+                        "table_name": "held_zcta",
+                        "relation_oid": identity[0],
+                        "relfilenode": identity[1],
+                    }
                 case "family":
                     supplied = replace(doctors, stage_oids=doctors.stage_oids[:1])
                 case "disabled_seal":

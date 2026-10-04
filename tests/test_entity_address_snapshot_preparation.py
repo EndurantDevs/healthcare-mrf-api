@@ -104,7 +104,7 @@ def _install_activation(monkeypatch):
     monkeypatch.setattr(preparation.serving, "require_entity_address_receive_incumbent", receive)
     monkeypatch.setattr(preparation, "_require_alias_fence", AsyncMock())
     monkeypatch.setattr(preparation, "_lock_publication_state", AsyncMock())
-    prepared = object()
+    prepared = SimpleNamespace(context={})
     monkeypatch.setattr(preparation, "_prepared_adoption", Mock(return_value=prepared))
     geo = SimpleNamespace(stage_table_oid=17, projected_rows=4)
     stored["geo_assurance"] = {}

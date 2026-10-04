@@ -64,6 +64,26 @@ def _observed_capture():
     )
 
 
+def _legacy_prepared_adoption():
+    """Build complete legacy prepared state for destination refusal fixtures."""
+    return destination.adoption.PreparedEntityAddressSnapshotAdoption(
+        db_schema="mrf",
+        stage_cls=type("Stage", (), {"__tablename__": "stage"}),
+        support_stage_class_map={},
+        swaps=[],
+        patch_statements=[],
+        relation_names=["stage"],
+        required_names=["stage"],
+        context={
+            "address_alias_generation": 2,
+            "stage_persistence": "p",
+            "result_generation_mode": "adoption",
+            "source_serving_generation": None,
+        },
+        publish_validation={},
+    )
+
+
 @pytest.mark.parametrize("invalid", [None, 0, -1, True, (1 << 32)])
 def test_serving_oid_guard_rejects_non_postgres_identity(invalid):
     """Reject booleans, missing values, and out-of-range relation identities."""
@@ -330,7 +350,7 @@ async def test_destination_runtime_cas_guards(monkeypatch):
         await destination._capture_geo_preparation(session, db_schema="mrf", stage_table_oid=1, projected_rows=0)
 
     monkeypatch.setattr(destination, "_base_version_counts", AsyncMock(return_value=(0, 0, 1, 0)))
-    prepared = SimpleNamespace(db_schema="mrf", stage_cls=SimpleNamespace(__tablename__="stage"))
+    prepared = _legacy_prepared_adoption()
     remap = destination.EntityAddressBaseVersionRemapEvidence(1, 2, 0, 0, 0, 0, "a" * 64, "b" * 64)
     local_alias = alias.EntityAddressAliasSemanticReceipt(2, 1, 2, 0, "c" * 64)
     with pytest.raises(
@@ -447,7 +467,7 @@ async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypat
         "_destination_alias_binding",
         AsyncMock(return_value=(source_alias, observed_alias)),
     )
-    prepared = SimpleNamespace(db_schema="mrf", stage_cls=SimpleNamespace(__tablename__="stage"))
+    prepared = _legacy_prepared_adoption()
     monkeypatch.setattr(
         destination.restore, "rehydrate_entity_address_archive_restore", AsyncMock(return_value=prepared)
     )
@@ -471,3 +491,4 @@ async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypat
             stored={"restored": {"db_schema": "mrf"}, "geo_assurance": {}},
             callbacks=SimpleNamespace(),
         )
+    destination.adoption.adopt_prepared_entity_address_snapshot.assert_not_awaited()

@@ -99,6 +99,21 @@ This path does not provide that populated-history integration. Unknown or
 altered guards, unsupported receipt catalogs, and concurrent receipt writers
 also refuse without publishing the candidate.
 
+### Captured TIGER source selection
+
+Native publication first selects an installed TIGER generation from protected
+local custody. To select a source-bound captured epoch instead, configure both
+`HLTHPRT_TIGER_SOURCE_BINDING_RELATION` and
+`HLTHPRT_TIGER_SOURCE_PACKAGE_RELATION`. There are no default relation names.
+Each value must be a distinct, unquoted, lowercase `schema.table` name with
+identifier components no longer than 63 characters. These are trusted process
+settings, not import-request parameters. The binding relation supplies
+`node_id`, `inventory`, `package_id`, `importer_id`, `dataset_key`, and `is_current`;
+the package relation supplies `package_id` and `manifest`. These rows only select
+an epoch: protected local custody and exact physical identities remain required.
+An inherited source without selected protected custody cannot publish a new
+Address generation. Ordinary non-inherited canonical inputs remain supported.
+
 ## Key Environment Variables
 
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BATCH_SIZE`

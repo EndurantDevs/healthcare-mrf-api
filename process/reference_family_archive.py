@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 CONTRACT = "reference-replacement-family.postgres.v1"
 VALIDATION_CONTRACT = "reference-replacement-family.validation.v1"
 GUARDED_SOURCE_CAPTURE_CONTRACT = "reference-family.guarded-source-capture.v1"
+CAPTURED_TIGER_CONTRACT = "tiger.immutable-captured-epoch.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
 _STAGE_PREFIX = "reference_family_archive_"
@@ -125,7 +126,7 @@ class ReferenceFamilyManifest:
 
         if (self.publication_authority == "tracked-generation") != (
             self.source_serving_generation is not None
-        ) or self.publication_authority not in {"manual-only", "tracked-generation"}:
+        ) or self.publication_authority not in {"manual-only", "tracked-generation", "captured-epoch"}:
             raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
 
         manifest_by_field = {
@@ -818,7 +819,13 @@ def _manifest_family_spec(manifest_value) -> ReferenceFamilySpec:
 def _validate_source_capture_contract(manifest_value: Mapping[str, Any]) -> None:
     """Recognize guarded non-Label capture without upgrading legacy provenance."""
 
-    if (
+    if manifest_value["source_capture_contract"] == CAPTURED_TIGER_CONTRACT:
+        from process.tiger_captured_epoch import validate_captured_origin
+
+        if manifest_value.get("publication_authority") != "captured-epoch" or manifest_value.get("importer_id") != "tiger":
+            raise ReferenceFamilyArchiveError("captured epoch requires the TIGER family")
+        validate_captured_origin(manifest_value.get("source_metadata"))
+    elif (
         manifest_value["source_capture_contract"] != GUARDED_SOURCE_CAPTURE_CONTRACT
         or manifest_value.get("publication_authority") != "tracked-generation"
         or manifest_value.get("importer_id") == "label"
@@ -852,8 +859,10 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         _validate_source_capture_contract(manifest_value)
     if set(manifest_value) - {"dependencies"} != expected_fields:
         raise ReferenceFamilyArchiveError("reference family manifest is invalid")
-    if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation"}:
+    if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation", "captured-epoch"}:
         raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
+    if authority == "captured-epoch" and manifest_value.get("source_capture_contract") != CAPTURED_TIGER_CONTRACT:
+        raise ReferenceFamilyArchiveError("captured epoch contract is required")
     spec = _manifest_family_spec(manifest_value)
     if spec.importer_id == "label" and authority != "tracked-generation":
         raise ReferenceFamilyArchiveError("label source generation is required")
@@ -867,7 +876,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
     try:
         source_serving_generation = (
             None
-            if authority == "manual-only"
+            if authority != "tracked-generation"
             else validate_reference_family_serving_generation(manifest_value["source_serving_generation"])
         )
     except (KeyError, ValueError) as error:
@@ -1013,6 +1022,7 @@ async def _capture_reference_family_source(
     source_metadata: Mapping[str, Any],
     configure_isolation: bool,
     dependencies: Mapping[str, str] | None = None,
+    source_capture_contract: str | None = None,
 ) -> ReferenceFamilySourceCapture:
     """Capture after either this function or its caller establishes isolation."""
 
@@ -1027,7 +1037,15 @@ async def _capture_reference_family_source(
         publication = None
         if importer_id == "mrf":
             publication = await require_completed_publication(session, schema)
-        source_serving_generation = await _source_serving_generation(session, spec, schema)
+        if source_capture_contract is not None:
+            if source_capture_contract != CAPTURED_TIGER_CONTRACT or importer_id != "tiger" or schema != "tiger":
+                raise ReferenceFamilyArchiveError("reference family capture contract is unsupported")
+            from process.tiger_captured_epoch import validate_captured_origin
+
+            validate_captured_origin(source_metadata)
+            source_serving_generation = None
+        else:
+            source_serving_generation = await _source_serving_generation(session, spec, schema)
         if importer_id == "facility-anchors":
             from process.facility_address_contribution_merge import validate_observations
 
@@ -1491,7 +1509,8 @@ async def _validate_stage_manifest(
         auxiliary=validated.auxiliary,
         source_serving_generation=validated.source_serving_generation,
     )
-    observed = replace(observed, source_capture_contract=validated.source_capture_contract)
+    observed = replace(observed, source_capture_contract=validated.source_capture_contract,
+                       publication_authority=validated.publication_authority)
     if _is_legacy_cms_manifest(validated):
         if not _has_matching_manifest_stage_tables(validated, observed.tables):
             raise ReferenceFamilyArchiveError("reference family restored stage differs")
@@ -1675,7 +1694,7 @@ async def export_prepared_reference_family_archive(
                 stage_session,
                 stage_schema,
                 reference_family_spec(importer_id).archive_names,
-                "SHARE",
+                "ACCESS SHARE" if manifest.publication_authority == "captured-epoch" else "SHARE",
             )
             await verify_reference_family_stage_ownership(stage_session, ownership)
             await _validate_stage_manifest(stage_session, ownership=ownership, manifest=manifest)

@@ -33,7 +33,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
         assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261003000000_address_alias_generation_guard"
+            "20261004000000_geo_assurance_dependency_bindings"
         )
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():

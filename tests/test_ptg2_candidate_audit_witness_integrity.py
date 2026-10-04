@@ -26,13 +26,13 @@ async def test_sealed_witness_reads_validates_and_groups_one_payload(monkeypatch
         network_name_digests=(),
         multiplicity=1,
     )
-    provider_record = object()
-    occurrence_record = object()
+    provider_record = SimpleNamespace(kind="provider_reference", linked_provider_sha256=None)
+    occurrence_record = SimpleNamespace(kind="rate_occurrence", linked_provider_sha256="provider")
     condition = object()
     loaded_witness = SimpleNamespace(
         provider_records=(provider_record,),
         occurrence_records=(occurrence_record,),
-        records=(SimpleNamespace(linked_provider_sha256="provider"),),
+        records=(provider_record, occurrence_record),
         evidence_by_sha256={"evidence": {}},
     )
     decoder = Mock(return_value=loaded_witness)
@@ -58,9 +58,9 @@ async def test_sealed_witness_reads_validates_and_groups_one_payload(monkeypatch
     )
 
     assert scope.challenges == (challenge,)
-    assert scope.record_count == 1
+    assert scope.record_count == 2
     assert scope.unique_evidence_count == 1
-    assert scope.evidence_reference_count == 2
+    assert scope.evidence_reference_count == 3
     provider_validator.assert_called_once_with(
         provider_record,
         parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
@@ -80,7 +80,7 @@ async def test_sealed_witness_accepts_iterable_result_without_provider_records(
     loaded_witness = SimpleNamespace(
         provider_records=(),
         occurrence_records=(),
-        records=(SimpleNamespace(linked_provider_sha256=None),),
+        records=(SimpleNamespace(kind="provider_reference", linked_provider_sha256=None),),
         evidence_by_sha256={},
     )
     session = SimpleNamespace(
@@ -101,6 +101,7 @@ async def test_sealed_witness_accepts_iterable_result_without_provider_records(
         "group_audit_batch_challenges",
         Mock(return_value=()),
     )
+    monkeypatch.setattr(integrity, "validate_provider_witness", Mock())
 
     scope = await integrity._sealed_witness_challenges(
         session,

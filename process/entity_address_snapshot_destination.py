@@ -15,6 +15,10 @@ from sqlalchemy import text
 from api import ptg2_geo_projection as geo_projection
 from db.connection import db
 from process.entity_address_cutover_contract import preserve_transaction_sql_settings
+from process.entity_address_result_generation import (
+    EntityAddressServingGeneration,
+    validate_entity_address_serving_generation,
+)
 from process.entity_address_snapshot_alias import (
     EntityAddressAliasSemanticReceipt,
     EntityAddressSnapshotAliasError,
@@ -38,10 +42,6 @@ from process.entity_address_snapshot_receipt import (
     capture_entity_address_stage_integrity_receipt,
     validate_entity_address_archive_receipt,
     validate_entity_address_stage_integrity_receipt,
-)
-from process.entity_address_result_generation import (
-    EntityAddressServingGeneration,
-    validate_entity_address_serving_generation,
 )
 
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
@@ -323,13 +323,17 @@ async def _capture_geo_preparation(
     signature_sql = geo_projection.projection_relation_signature_sql(
         db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
     )
+    bindings_match_sql = (
+        "TRUE" if dependency_bindings is None
+        else geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)
+    )
     state = (
         (
             await session.execute(
                 text(
                     "SELECT candidate_geo_assurance_version, candidate_table_oid::bigint, "
-                    "candidate_relation_signature, candidate_projected_rows, "
-                    f"{signature_sql} AS current_signature "
+                    "candidate_relation_signature, candidate_projected_rows, candidate_dependency_bindings, "
+                    f"{signature_sql} AS current_signature, {bindings_match_sql} AS bindings_match "
                     f'FROM "{db_schema}"."{state_table}" WHERE singleton IS TRUE'
                 )
             )
@@ -343,6 +347,8 @@ async def _capture_geo_preparation(
         or state["candidate_table_oid"] != stage_table_oid
         or state["candidate_projected_rows"] != projected_rows
         or state["candidate_relation_signature"] != state["current_signature"]
+        or state.get("candidate_dependency_bindings") != dependency_bindings
+        or state["bindings_match"] is not True
     ):
         raise EntityAddressSnapshotDestinationError("entity-address geo-assurance candidate is stale")
     return EntityAddressGeoAssurancePreparation(
@@ -390,6 +396,8 @@ async def _prepare_moved_destination(
         preserve_unversioned_base_rows=True,
         source_serving_generation=source_serving_generation,
     )
+    if dependency_bindings is not None:
+        prepared.context["dependency_bindings"] = dependency_bindings
     geo_preparation = await _capture_geo_preparation(
         session,
         db_schema=db_schema,
@@ -493,8 +501,8 @@ async def prepare_entity_address_archive_destination(
     ``source_serving_generation`` is the source capture's portable origin
     tuple. ``None`` explicitly selects generation-less manual compatibility.
     ``dependency_bindings`` is trusted local held-relation authority, never
-    peer metadata. Its exact physical identity is checked under locks; only
-    canonical-key signatures survive preparation for the final live recheck.
+    peer metadata. Its exact physical identity is checked under locks and
+    retained alongside the canonical-key signature through publication.
     """
     _require_caller_transaction(session)
     if dependency_bindings is not None:
@@ -889,7 +897,10 @@ async def _validated_bound_destination(session, *, stored):
         remap_evidence=remap_evidence,
         destination_alias=destination_alias,
     )
-    await session.execute(text(geo_projection.projection_dependency_lock_sql(prepared.db_schema)))
+    dependency_bindings = prepared.context.get("dependency_bindings")
+    await session.execute(text(geo_projection.projection_dependency_lock_sql(
+        prepared.db_schema, dependency_bindings=dependency_bindings
+    )))
     expected_geo = _validated_geo_preparation(
         stored["geo_assurance"],
         db_schema=prepared.db_schema,
@@ -904,6 +915,7 @@ async def _validated_bound_destination(session, *, stored):
         db_schema=prepared.db_schema,
         stage_table_oid=expected_geo.stage_table_oid,
         projected_rows=expected_geo.projected_rows,
+        dependency_bindings=dependency_bindings,
     )
     if actual_geo != expected_geo:
         raise EntityAddressSnapshotDestinationError("entity-address geo-assurance preparation changed")

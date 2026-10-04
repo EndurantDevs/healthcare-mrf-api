@@ -26,6 +26,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
     SOURCE_BUNDLE_MAGIC,
     SOURCE_DICTIONARY_BUNDLE_MAGIC,
+    SOURCE_FRAGMENT_BUNDLE_MAGIC,
     SourceWitnessBundleIdentity,
     SourceWitnessCandidate,
     SourceWitnessEvidenceLocator,
@@ -135,7 +136,7 @@ def _authenticated_bundle_file(
 
         bundle_file.seek(0)
         bundle_magic = bundle_file.read(len(SOURCE_DICTIONARY_BUNDLE_MAGIC))
-        if bundle_magic not in {SOURCE_BUNDLE_MAGIC, SOURCE_DICTIONARY_BUNDLE_MAGIC}:
+        if bundle_magic not in {SOURCE_BUNDLE_MAGIC, SOURCE_DICTIONARY_BUNDLE_MAGIC, SOURCE_FRAGMENT_BUNDLE_MAGIC}:
             raise RuntimeError("strict V3 source witness bundle magic is invalid")
         bundle_file.seek(0)
         try:
@@ -321,7 +322,7 @@ def _read_current_dictionary_bundle(
     bundle_identity: SourceWitnessBundleIdentity,
     bundle_entry: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[SourceWitnessCandidate]]:
-    _read_exact_file(
+    bundle_magic = _read_exact_file(
         bundle_file,
         len(SOURCE_DICTIONARY_BUNDLE_MAGIC),
         field_name="bundle magic",
@@ -337,17 +338,25 @@ def _read_current_dictionary_bundle(
         _read_exact_file(bundle_file, header_length, field_name="bundle header"),
         field_name="bundle header",
     )
-    _validate_bundle_header(bundle_header, bundle_entry, format_version=3)
+    is_fragment_format = bundle_magic == SOURCE_FRAGMENT_BUNDLE_MAGIC
+    _validate_bundle_header(bundle_header, bundle_entry, format_version=4 if is_fragment_format else 3)
     raw_source_sha256 = sha256_hex(
         bundle_header.get("raw_source_sha256"),
         field_name="raw source digest",
     )
     expected_record_count = _validated_entry_row_count(bundle_entry)
-    evidence_locator_by_sha256 = _read_dictionary_evidence_locators(
-        bundle_file,
-        bundle_identity=bundle_identity,
-        maximum_evidence_count=expected_record_count * 2,
-    )
+    if is_fragment_format:
+        from process.ptg_parts.ptg2_source_witness_fragment_bundle import read_fragment_evidence_locators
+
+        evidence_locator_by_sha256 = read_fragment_evidence_locators(
+            bundle_file, bundle_identity=bundle_identity,
+            maximum_evidence_count=expected_record_count * 2, header=bundle_header,
+        )
+    else:
+        evidence_locator_by_sha256 = _read_dictionary_evidence_locators(
+            bundle_file, bundle_identity=bundle_identity,
+            maximum_evidence_count=expected_record_count * 2,
+        )
     record_locators = _read_dictionary_record_locators(
         bundle_file,
         bundle_identity=bundle_identity,
@@ -358,6 +367,10 @@ def _read_current_dictionary_bundle(
     if bundle_file.tell() != bundle_identity.byte_count:
         raise RuntimeError("strict V3 source witness bundle record count does not match")
     _validate_local_coverage(bundle_header, record_locators)
+    if is_fragment_format and set(evidence_locator_by_sha256) != {
+        digest for candidate in record_locators for digest in candidate.evidence_by_sha256
+    }:
+        raise RuntimeError("source witness recipe coverage is inconsistent")
     return bundle_header, record_locators
 
 

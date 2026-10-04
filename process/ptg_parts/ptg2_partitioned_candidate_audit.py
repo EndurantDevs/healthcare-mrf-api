@@ -67,6 +67,7 @@ from process.ptg_parts.ptg2_shared_source_set import (
 from process.ptg_parts.ptg2_source_witness_contract import (
     LoadedSourceWitness,
 )
+from process.ptg_parts.ptg2_source_witness_audit import map_source_witness_records
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
@@ -112,46 +113,29 @@ def _event_loop_contract(*, require_uvloop: bool) -> str:
 
 
 def _witness_io(witness: LoadedSourceWitness) -> dict[str, int]:
-    evidence_reference_count = sum(
-        1 + int(record.linked_provider_sha256 is not None)
-        for record in witness.records
-    )
-    unique_evidence_count = len(witness.evidence_by_sha256)
-    return {
-        "payload_reads": 1,
-        "payload_decodes": 1,
-        "record_decodes": len(witness.records),
-        "unique_evidence_entries": unique_evidence_count,
-        "evidence_decompressions": unique_evidence_count,
-        "evidence_sha256_hashes": unique_evidence_count,
-        "evidence_json_parses": unique_evidence_count,
-        "evidence_reuse_deliveries": (
-            evidence_reference_count - unique_evidence_count
-        ),
-        "repeated_evidence_decompressions": 0,
-        "repeated_evidence_sha256_hashes": 0,
-        "repeated_evidence_json_parses": 0,
-    }
+    _values, processing_io = map_source_witness_records(witness, lambda _record, _parsed: None)
+    return processing_io
 
 
 def _source_challenges(
     witness: LoadedSourceWitness,
     raw_container_sha256: Sequence[str],
+    processing_io: dict[str, int] | None = None,
 ) -> tuple[PartitionedSourceChallenge, ...]:
-    for provider_witness in witness.provider_records:
-        validate_provider_witness(
-            provider_witness,
-            parsed_evidence_by_sha256=witness.evidence_by_sha256,
-        )
+    def derive(record, parsed_evidence):
+        """Validate a provider or retain only its compact rate condition."""
+
+        if record.kind == "provider_reference":
+            validate_provider_witness(record, parsed_evidence_by_sha256=parsed_evidence)
+            return None
+        return source_audit_condition(record, parsed_evidence_by_sha256=parsed_evidence)
+
+    derived, observed_io = map_source_witness_records(witness, derive)
+    if processing_io is not None:
+        processing_io.update(observed_io)
     grouped = group_audit_batch_challenges(
         raw_container_sha256,
-        tuple(
-            source_audit_condition(
-                witness_record,
-                parsed_evidence_by_sha256=witness.evidence_by_sha256,
-            )
-            for witness_record in witness.occurrence_records
-        ),
+        tuple(condition for condition in derived if condition is not None),
     )
     return tuple(
         PartitionedSourceChallenge(
@@ -194,6 +178,7 @@ def build_candidate_audit_partition_plan(
     audit_target: BatchAuditReportTarget,
     witness: LoadedSourceWitness,
     persisted_sample: PersistedAuditSample,
+    witness_processing_io: dict[str, int] | None = None,
 ) -> PartitionedCandidateAuditPlan:
     """Validate local evidence once and build the exact request plan."""
 
@@ -224,6 +209,7 @@ def build_candidate_audit_partition_plan(
         source_challenges=_source_challenges(
             witness,
             audit_target.raw_container_sha256,
+            witness_processing_io,
         ),
         persisted_occurrences=_persisted_occurrences(persisted_sample),
     )
@@ -436,10 +422,12 @@ async def run_partitioned_candidate_audit(
 ) -> dict[str, Any]:
     """Execute every exact partition once at the configured request-start rate."""
 
+    processing_io_by_kind: dict[str, int] = {}
     plan = build_candidate_audit_partition_plan(
         audit_target=audit_target,
         witness=witness,
         persisted_sample=persisted_sample,
+        witness_processing_io=processing_io_by_kind,
     )
     event_loop_contract = _event_loop_contract(
         require_uvloop=http_config.require_uvloop
@@ -469,7 +457,7 @@ async def run_partitioned_candidate_audit(
             aggregate=aggregate,
             metrics=metrics,
             http_config=http_config,
-            witness_io=_witness_io(witness),
+            witness_io=processing_io_by_kind or _witness_io(witness),
             event_loop_contract=event_loop_contract,
             started_at=started_at,
             completed_at=completed_at,
