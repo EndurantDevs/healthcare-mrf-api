@@ -758,8 +758,24 @@ async def _materialize_identity_evidence(
         _observe_intake(ctx, phase="identity", family=resource_type, completed_rows=row_count, force=True)
         if row_count != identity["files"][name]["row_count"]:
             raise RuntimeError("cms_npd_identity_file_row_count_changed")
+    await _refresh_identity_statistics(fhir, ctx, task)
     _observe_intake(ctx, phase="identity_validation")
     await _assert_identity_evidence(fhir, candidate, identity)
+
+
+async def _refresh_identity_statistics(fhir: Any, ctx: dict, task: dict) -> None:
+    """Refresh planner statistics after all fresh identity batches commit."""
+
+    schema = fhir._schema()
+    tables = (
+        "provider_directory_resource_identity",
+        "provider_directory_entity_source_binding",
+        "provider_directory_entity_release_evidence",
+    )
+    for table in tables:
+        await fhir._raise_if_resource_import_cancelled(ctx, task)
+        await fhir.db.status(f"ANALYZE {fhir._qt(schema, table)};")
+    await fhir._raise_if_resource_import_cancelled(ctx, task)
 
 
 async def _backfill_network_roles(fhir: Any, identity: dict[str, Any], ctx: dict, task: dict) -> None:
