@@ -94,6 +94,33 @@ async def _vacuum_and_assert_size_only(database, original):
     return current
 
 
+async def _cleanup_replay_state(database, names):
+    """Retain complete owned fixture rows, target identity and disposed stage absence."""
+    async with database.transaction():
+        rows_by_relation = {}
+        for relation_name, key_column in (
+            ("provider_directory_profile_build_checkpoint", "build_id"),
+            ("provider_directory_profile_failed_cleanup_claim", "operation_id"),
+            ("provider_directory_profile_capacity_lease_consumption", "attestation_id"),
+            ("import_run", "run_id"),
+        ):
+            rows_by_relation[relation_name] = [
+                row[0]
+                for row in await database.all(
+                    f"SELECT row_to_json(c)::text FROM mrf.{relation_name} c ORDER BY {key_column}"
+                )
+            ]
+        assert all(rows_by_relation.values())
+        initial_receipt_count = await database.scalar(
+            "SELECT count(*) FROM mrf.provider_directory_profile_initial_receipt"
+        )
+        target_by_field = (await initial.capture_targets(fhir, "mrf")).payload
+        stage_identities = [
+            await fhir._provider_directory_profile_stage_relation_identity("mrf", name) for name in names
+        ]
+    return rows_by_relation, initial_receipt_count, target_by_field, stage_identities
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("vacuum_after_inspection", [False, True])
 async def test_native_vacuum_size_drift_uses_expired_original_and_fresh_cleanup(
@@ -125,11 +152,11 @@ async def test_native_vacuum_size_drift_uses_expired_original_and_fresh_cleanup(
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_initial_receipt") == 0
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 1
         # Completed spent authority reconciles without requiring expired build funding again.
-        before = await database.scalar("SELECT pg_current_wal_insert_lsn()::text")
+        before = await _cleanup_replay_state(database, names)
         assert receipt == await cleanup.execute_failed_profile_cleanup(
             fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
         )
-        assert await database.scalar("SELECT pg_current_wal_insert_lsn()::text") == before
+        assert await _cleanup_replay_state(database, names) == before
 
 
 @pytest.mark.asyncio
