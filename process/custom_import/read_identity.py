@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hmac
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -26,6 +26,40 @@ from process.custom_import.read_contracts import (
     CustomImportReadUnavailableError,
     PinnedReadTarget,
 )
+
+
+async def resolve_generation_snapshot(session: AsyncSession, pinned_target: PinnedReadTarget) -> int | None:
+    """Resolve a sealed generation through the protected, OID-checked registry.
+
+    Only an explicit NULL permits canonical legacy storage. Missing functions,
+    invalid bindings, or SQL errors must never select another storage family.
+    """
+
+    connection = await session.connection()
+    model_schema = CustomImportGeneration.__table__.schema
+    schema_map = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
+    schema = schema_map.get(model_schema, model_schema)
+    if not schema:
+        raise CustomImportReadUnavailableError("generation snapshot resolver requires an explicit model schema")
+    quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+    family_id = (
+        await session.execute(
+            text(
+                f"SELECT {quoted}.resolve_custom_import_generation_snapshot("
+                "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
+                "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
+            ),
+            {
+                "generation_id": pinned_target.generation_id,
+                "dataset_id": pinned_target.dataset_id,
+                "definition_revision_id": pinned_target.definition_revision_id,
+                "schema_revision_id": pinned_target.schema_revision_id,
+            },
+        )
+    ).scalar_one()
+    if family_id is not None and (type(family_id) is not int or not 0 < family_id < 2**63):
+        raise CustomImportReadUnavailableError("generation snapshot identity is invalid")
+    return family_id
 
 
 def verified_definition(

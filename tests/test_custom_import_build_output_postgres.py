@@ -28,6 +28,8 @@ from db.models.custom_import import (
     CustomImportPack,
 )
 from process.custom_import import build_graph as graph
+from process.custom_import import build_graph_prepare_page as graph_prepare
+from process.custom_import import build_graph_sets as graph_sets
 from process.custom_import import build_output as output
 from process.custom_import import execution as lifecycle
 from process.custom_import import publication
@@ -36,7 +38,7 @@ from process.custom_import.capture_pending import seal_pending_parquet_bundle
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.definition_store import register_definition
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
-from tests.test_custom_import_build_source_postgres import _sealed_parts, _source_case
+from tests.test_custom_import_build_source_postgres import _candidate_models, _sealed_parts, _source_case
 from tests.test_custom_import_capture_pending_postgres import _receipt, _retain, _start_attempt
 from tests.test_custom_import_definition import _raw_definition
 from tests.test_custom_import_snowflake_shared_capture import _shared_definition
@@ -159,7 +161,7 @@ async def test_bounded_output_matches_legacy_digest_and_replays():
         async with case.sessions() as session:
             build = await session.get(CustomImportBuildAttempt, build_id)
             proof = await session.get(CustomImportBuildVerification, build_id)
-            assert build.plan_page_sequence > 1 and proof.page_sequence > 1
+            assert build.plan_page_sequence > 1 and proof.page_sequence == 1
             assert build.candidate_context_count == 33
             assert await session.get(CustomImportCurrentGeneration, request.dataset_id) is None
 
@@ -179,20 +181,15 @@ async def test_retained_copy_pages_record_no_change_with_exact_pointer():
         replay = await output.build_output(case.sessions, request, build_id)
         assert replay.no_change.replayed
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
+            occurrence = models[CustomImportBuildOccurrence]
+            pack = models[CustomImportPack]
             pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
             assert (pointer.generation_id, pointer.pointer_version) == (first.generation_id, 1)
-            copies = (
-                await session.scalars(
-                    select(CustomImportBuildOccurrence).where(CustomImportBuildOccurrence.build_id == build_id)
-                )
-            ).all()
+            copies = (await session.scalars(select(occurrence).where(occurrence.build_id == build_id))).all()
             assert len(copies) == 27 and all(copy.origin == "retained" for copy in copies)
             assert all(copy.source_ordinal is None for copy in copies)
-            packs = (
-                await session.scalars(
-                    select(CustomImportPack).where(CustomImportPack.execution_id == request.execution_id)
-                )
-            ).all()
+            packs = (await session.scalars(select(pack).where(pack.execution_id == request.execution_id))).all()
             assert len(packs) == 27 and all(pack.record_count == 1 for pack in packs)
 
 
@@ -259,7 +256,7 @@ async def test_pointer_drift_allows_seal_but_not_no_change_or_old_cas():
 
 
 async def test_python_verification_rejects_structurally_valid_wrong_family_hash(monkeypatch):
-    original = graph.new_family_hash_ordered
+    original = graph_prepare.new_family_hash_ordered
 
     def _wrong_digest(*args, **kwargs):
         original(*args, **kwargs)
@@ -267,8 +264,9 @@ async def test_python_verification_rejects_structurally_valid_wrong_family_hash(
 
     async with _source_case() as case:
         request = await _request_for(case, _records(1))
-        monkeypatch.setattr(graph, "new_family_hash_ordered", _wrong_digest)
+        monkeypatch.setattr(graph_prepare, "new_family_hash_ordered", _wrong_digest)
         build_id, generation_id = await _build(case, request)
+        monkeypatch.setattr(graph_prepare, "new_family_hash_ordered", original)
         with pytest.raises(CandidateRunnerError, match="family digest"):
             await output.build_output(case.sessions, request, build_id)
         async with case.sessions() as session:
@@ -278,34 +276,40 @@ async def test_python_verification_rejects_structurally_valid_wrong_family_hash(
 
 
 async def test_python_verification_rechecks_losers_before_sealing(monkeypatch):
-    original = output._reduce_group
+    original = output._winner_batch
     written_flags = []
 
-    def _wrong_first_group(session, request, registry, build_id, generation, group):
-        winner, context_id = original(session, request, registry, build_id, generation, group)
-        if written_flags:
-            return winner, context_id
+    def _wrong_first_page(session, request, registry, build_id, generation, after):
+        context_ids, page_sizes = original(session, request, registry, build_id, generation, after)
+        if written_flags or not context_ids:
+            return context_ids, page_sizes
         written_flags.append(True)
-        context = CustomImportBuildCandidateContext
+        with graph._read_transaction(session, request, build_id):
+            context = _candidate_models(session, request)[CustomImportBuildCandidateContext]
+        selected = graph._one_row(
+            session,
+            request,
+            build_id,
+            select(context).where(context.build_id == build_id, context.candidate_context_id == context_ids[0]),
+            (context.candidate_context_id,),
+            (context,),
+        )[0]
         other = graph._one_row(
             session,
             request,
             build_id,
             select(context).where(
                 context.build_id == build_id,
-                context.candidate_context_id != context_id,
-                tuple_(context.profile_slot, context.entity_binding_id, context.context_key_sha256) == group,
+                context.candidate_context_id != selected.candidate_context_id,
+                tuple_(context.profile_slot, context.entity_binding_id, context.context_key_sha256)
+                == output._group_key(selected),
             ),
             (context.candidate_context_id,),
             (context,),
         )[0]
-        return replace(
-            winner,
-            family_revision_id=other.family_revision_id,
-            context_child_revision_id=other.context_child_revision_id,
-        ), other.candidate_context_id
+        return (other.candidate_context_id, *context_ids[1:]), page_sizes
 
-    monkeypatch.setattr(output, "_reduce_group", _wrong_first_group)
+    monkeypatch.setattr(output, "_winner_batch", _wrong_first_page)
     async with _source_case() as case:
         request = await _request_for(case, _records(2))
         build_id, generation_id = await _build(case, request)
@@ -323,52 +327,56 @@ async def test_projection_fanout_failure_rolls_back_family_page():
         with pytest.raises(CandidateRunnerError, match="fanout"):
             await graph.build_graph(case.sessions, request, staged.build_id)
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
             assert (
-                await session.execute(select(func.count()).select_from(CustomImportFamilyRevision))
+                await session.execute(select(func.count()).select_from(models[CustomImportFamilyRevision]))
             ).scalar_one() == 0
             assert (await session.get(CustomImportBuildAttempt, staged.build_id)).generation_id is None
 
 
 @pytest.mark.parametrize("committed", [False, True])
 async def test_child_batches_resume_from_the_committed_cursor(monkeypatch, committed):
-    original_commit = graph._commit_family
-    original_batch = graph._append_child_batch
+    original_receipts = graph_sets._child_receipts
+    original_heartbeat = graph._heartbeat
     failed_counts = []
+    pending_counts = []
 
-    async def _fail_before_commit(*args):
-        receipt = await original_commit(*args)
-        if receipt.attached_child_count and not failed_counts:
-            failed_counts.append(receipt.attached_child_count)
-            raise ConnectionError("synthetic uncommitted child page")
-        return receipt
+    def _observe_receipts(groups, receipts):
+        updates = original_receipts(groups, receipts)
+        if not pending_counts:
+            pending_counts.append(sum(len(group.children) for group in groups))
+            if not committed:
+                failed_counts.extend(pending_counts)
+                raise ConnectionError("synthetic uncommitted child page")
+        return updates
 
     async def _fail_after_commit(*args):
-        await original_batch(*args)
-        if not failed_counts:
-            failed_counts.append(len(args[-1]))
+        await original_heartbeat(*args)
+        if pending_counts and not failed_counts:
+            failed_counts.extend(pending_counts)
             raise ConnectionError("synthetic committed child page acknowledgement")
 
     async with _source_case() as case:
         request = await _request_for(case, _records(1, 13), page_rows=32)
+        monkeypatch.setattr(graph_sets, "MAX_BATCH_ROWS", 2 * request.page_row_limit)
         staged = await stage_segmented_source(case.sessions, request)
-        monkeypatch.setattr(
-            graph,
-            "_append_child_batch" if committed else "_commit_family",
-            _fail_after_commit if committed else _fail_before_commit,
-        )
+        monkeypatch.setattr(graph_sets, "_child_receipts", _observe_receipts)
+        if committed:
+            monkeypatch.setattr(graph, "_heartbeat", _fail_after_commit)
         with pytest.raises(ConnectionError, match="synthetic"):
             await graph.build_graph(case.sessions, request, staged.build_id)
         assert 1 < failed_counts[0] < 13
         async with case.sessions() as session:
-            plan = (await session.scalars(select(CustomImportBuildFamily))).one()
+            models = await session.run_sync(_candidate_models, request)
+            plan = (await session.scalars(select(models[CustomImportBuildFamily]))).one()
             assert plan.attached_child_count == (failed_counts[0] if committed else 0)
             assert (
-                await session.scalar(select(func.count()).select_from(CustomImportFamilyChild))
+                await session.scalar(select(func.count()).select_from(models[CustomImportFamilyChild]))
                 == plan.attached_child_count
             )
             assert plan.complete_at is None
-        monkeypatch.setattr(graph, "_commit_family", original_commit)
-        monkeypatch.setattr(graph, "_append_child_batch", original_batch)
+        monkeypatch.setattr(graph_sets, "_child_receipts", original_receipts)
+        monkeypatch.setattr(graph, "_heartbeat", original_heartbeat)
         await graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await output.build_output(case.sessions, request, staged.build_id)
         assert sealed.seal.family_child_count == 13
@@ -376,26 +384,35 @@ async def test_child_batches_resume_from_the_committed_cursor(monkeypatch, commi
 
 
 async def test_child_batches_shrink_after_exact_sql_byte_rejection(monkeypatch):
-    original = graph._append_child_batch
+    original = graph._source_call
     rejected_sizes = []
 
-    async def _observe_rollback(*args):
+    async def _observe_rollback(session, name, arguments):
+        if name != "append_custom_import_build_source_families_page":
+            return await original(session, name, arguments)
         try:
-            await original(*args)
+            return await original(session, name, arguments)
         except DBAPIError as error:
             assert graph._is_child_page_bound_error(error)
-            current, children = args[-2:]
-            async with args[0]() as session:
-                plan = await session.get(CustomImportBuildFamily, (current.build_id, current.root_record_id))
-                assert plan.attached_child_count == current.attached_child_count
+            async with case.sessions() as reader:
+                models = await reader.run_sync(_candidate_models, request)
+                plan = (
+                    await reader.scalars(
+                        select(models[CustomImportBuildFamily]).where(
+                            models[CustomImportBuildFamily].build_id == arguments[0][1],
+                            models[CustomImportBuildFamily].root_record_id == arguments[4][1][0],
+                        )
+                    )
+                ).one()
+                assert plan.attached_child_count == arguments[6][1][0]
                 assert (
-                    await session.scalar(select(func.count()).select_from(CustomImportFamilyChild))
+                    await reader.scalar(select(func.count()).select_from(models[CustomImportFamilyChild]))
                     == plan.attached_child_count
                 )
-            rejected_sizes.append(len(children))
+            rejected_sizes.append(len(arguments[11][1]))
             raise
 
-    monkeypatch.setattr(graph, "_append_child_batch", _observe_rollback)
+    monkeypatch.setattr(graph, "_source_call", _observe_rollback)
     async with _source_case() as case:
         request = await _request_for(case, _records(1, 13), page_rows=256)
         request = replace(request, page_byte_limit=4096)
@@ -407,31 +424,42 @@ async def test_child_batches_shrink_after_exact_sql_byte_rejection(monkeypatch):
 
 @pytest.mark.parametrize("canceled", [False, True])
 async def test_child_batches_stop_at_the_next_authority_check(monkeypatch, canceled):
-    original = graph._append_child_batch
+    original_receipts = graph_sets._child_receipts
+    original_heartbeat = graph._heartbeat
+    pending_counts = []
     appended_sizes = []
 
-    async def _stop_after_page(*args):
-        await original(*args)
-        appended_sizes.append(len(args[-1]))
-        async with args[0]() as session, session.begin():
-            if canceled:
-                await lifecycle.request_cancellation(session, execution_id=args[1].execution_id)
-            else:
-                await session.execute(
-                    update(CustomImportLease)
-                    .where(CustomImportLease.execution_id == args[1].execution_id)
-                    .values(expires_at=func.clock_timestamp() - dt.timedelta(seconds=1))
-                )
+    def _observe_receipts(groups, receipts):
+        updates = original_receipts(groups, receipts)
+        pending_counts.append(sum(len(group.children) for group in groups))
+        return updates
 
-    monkeypatch.setattr(graph, "_append_child_batch", _stop_after_page)
+    async def _stop_after_page(session_factory, request):
+        if pending_counts and not appended_sizes:
+            appended_sizes.extend(pending_counts)
+            async with session_factory() as session, session.begin():
+                if canceled:
+                    await lifecycle.request_cancellation(session, execution_id=request.execution_id)
+                else:
+                    await session.execute(
+                        update(CustomImportLease)
+                        .where(CustomImportLease.execution_id == request.execution_id)
+                        .values(expires_at=func.clock_timestamp() - dt.timedelta(seconds=1))
+                    )
+        await original_heartbeat(session_factory, request)
+
+    monkeypatch.setattr(graph_sets, "_child_receipts", _observe_receipts)
+    monkeypatch.setattr(graph, "_heartbeat", _stop_after_page)
     async with _source_case() as case:
         request = await _request_for(case, _records(1, 13), page_rows=32)
+        monkeypatch.setattr(graph_sets, "MAX_BATCH_ROWS", 2 * request.page_row_limit)
         staged = await stage_segmented_source(case.sessions, request)
         with pytest.raises(CancellationRequested if canceled else LeaseAuthorityLost):
             await graph.build_graph(case.sessions, request, staged.build_id)
         assert len(appended_sizes) == 1 and 1 < appended_sizes[0] < 13
         async with case.sessions() as session:
-            plan = (await session.scalars(select(CustomImportBuildFamily))).one()
+            models = await session.run_sync(_candidate_models, request)
+            plan = (await session.scalars(select(models[CustomImportBuildFamily]))).one()
             assert plan.attached_child_count == appended_sizes[0] and plan.complete_at is None
             assert (await session.get(CustomImportBuildAttempt, staged.build_id)).generation_id is None
 
@@ -440,20 +468,21 @@ async def test_child_batches_stop_at_the_next_authority_check(monkeypatch, cance
 async def test_child_batches_preserve_duplicate_and_membership_admission(monkeypatch, membership):
     from tests import test_custom_import_identical_children_postgres as admission
 
-    original = graph._append_child_batch
+    original = graph_sets._child_receipts
     batch_sizes = []
 
-    async def _observe_page(*args):
-        await original(*args)
-        batch_sizes.append(len(args[-1]))
+    def _observe_page(groups, receipts):
+        updates = original(groups, receipts)
+        batch_sizes.append(sum(len(group.children) for group in groups))
+        return updates
 
-    monkeypatch.setattr(graph, "_append_child_batch", _observe_page)
+    monkeypatch.setattr(graph_sets, "_child_receipts", _observe_page)
     if membership:
-        case_factory = admission._membership_case
+        case_factory = admission._source_case
         definition = admission._membership_definition(reverse=True)
         records_by_stream = admission._membership_records(inner_count=13, missing=True)
     else:
-        case_factory = admission._case
+        case_factory = admission._source_case
         definition = admission._configured_definition()
         records_by_stream = _records(1, 13)
         records_by_stream["rates"].append([child.copy() for page in records_by_stream["rates"] for child in page])

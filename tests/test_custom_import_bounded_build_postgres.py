@@ -87,7 +87,7 @@ def _install(connection, schema):
 
 @asynccontextmanager
 async def _case():
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(is_snapshot_storage_enabled=False) as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(_install, case.schema_name)
         yield case
@@ -1280,7 +1280,7 @@ async def test_ordinary_unpublished_seal_allows_pointer_drift_after_begin():
 
 
 async def test_legacy_sealing_remains_available_and_keeps_original_count_guard():
-    async with _case() as case:
+    async with isolated_publication_case(migration_through="20261005030000") as case:
         async with case.sessions() as session, session.begin():
             graph = await seed_publication_graph(session)
         async with case.sessions() as session:

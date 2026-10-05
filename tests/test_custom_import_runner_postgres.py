@@ -51,6 +51,7 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
+from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import snowflake
 from process.custom_import.capture import capture_stream
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
@@ -65,6 +66,8 @@ from process.custom_import.execution import (
     reserve_execution,
 )
 from process.custom_import.family import assemble_root_families
+from process.custom_import.read_contracts import PinnedReadTarget
+from process.custom_import.read_identity import resolve_generation_snapshot
 from process.custom_import.runner import CandidateRunnerError, CandidateRunRequest, CandidateRunResult, run_candidate
 from process.custom_import.runner_codec import child_key_hash, new_family_hash
 from process.custom_import.snowflake_bundle import (
@@ -82,6 +85,7 @@ from process.custom_import.snowflake_candidate import (
     run_snowflake_candidate,
 )
 from process.custom_import.snowflake_python import _parquet_reader
+from process.custom_import.storage_layout import snapshot_models
 from tests.custom_import_postgres_support import digest, isolated_publication_case
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
@@ -702,6 +706,37 @@ async def _seed_case(case, suffix: str, definition: CustomImportDefinition | Non
         return await _seed_identity(session, suffix, definition)
 
 
+async def _generation_models(session: AsyncSession, generation_id: int):
+    """Pin the exact sealed runner snapshot without a canonical fallback."""
+
+    generation = await session.get(CustomImportGeneration, generation_id)
+    assert generation is not None
+    family_id = await resolve_generation_snapshot(
+        session,
+        PinnedReadTarget(
+            generation.dataset_id,
+            generation.generation_id,
+            generation.definition_revision_id,
+            generation.schema_revision_id,
+            "default",
+        ),
+    )
+    assert family_id is not None
+    return snapshot_models(family_id)
+
+
+async def _assert_projection_counts(session: AsyncSession, generation_id: int) -> None:
+    """Require the exact scalar and winner counts in one pinned runner snapshot."""
+
+    models_by_type = await _generation_models(session, generation_id)
+    for model, expected_count in (
+        (CustomImportRootScalar, 2),
+        (CustomImportChildScalar, 2),
+        (CustomImportWinner, 1),
+    ):
+        assert await session.scalar(select(func.count()).select_from(models_by_type[model])) == expected_count
+
+
 async def _seed_mapping_drift_execution(
     case,
     seed: _Seed,
@@ -780,9 +815,7 @@ async def test_runner_materializes_seals_and_activates_typed_candidate_rows():
             assert seal is not None
             assert seal.root_count == 1
             assert seal.family_count == 1
-            assert len((await session.scalars(select(CustomImportRootScalar))).all()) == 2
-            assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
-            assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
+            await _assert_projection_counts(session, run_result.generation_id)
 
 
 @pytest.mark.asyncio
@@ -870,8 +903,9 @@ async def test_snowflake_bundle_rehydrates_durable_streams_before_exact_activati
                     )
                 )
             ).all()
-            family = (await session.scalars(select(CustomImportFamilyRevision))).one()
-            child = (await session.scalars(select(CustomImportChildRevision))).one()
+            models_by_type = await _generation_models(session, run_result.generation_id)
+            family = (await session.scalars(select(models_by_type[CustomImportFamilyRevision]))).one()
+            child = (await session.scalars(select(models_by_type[CustomImportChildRevision]))).one()
             binding = (await session.scalars(select(CustomImportEntityBinding))).one()
             pointer = await session.get(CustomImportCurrentGeneration, seed.dataset_id)
         assert len(parts) == 2 and all(part.payload for part in parts)
@@ -881,9 +915,7 @@ async def test_snowflake_bundle_rehydrates_durable_streams_before_exact_activati
         assert child.root_record_id == family.root_record_id
         assert binding.adapter_id == "npi" and binding.canonical_value == "1234567893"
         async with case.sessions() as session:
-            assert len((await session.scalars(select(CustomImportRootScalar))).all()) == 2
-            assert len((await session.scalars(select(CustomImportChildScalar))).all()) == 2
-            assert len((await session.scalars(select(CustomImportWinner))).all()) == 1
+            await _assert_projection_counts(session, run_result.generation_id)
         assert pointer is not None and pointer.generation_id == run_result.generation_id
 
 
@@ -1210,12 +1242,12 @@ async def test_snowflake_bundle_retains_only_the_family_with_an_invalid_child():
         assert update_run.accepted_family_count == 1
         assert update_run.rejection_count == 1
         async with case.sessions() as session:
+            models_by_type = await _generation_models(session, update_run.generation_id)
+            rejection = models_by_type[CustomImportRejection]
             rejections = (
-                await session.scalars(
-                    select(CustomImportRejection).where(CustomImportRejection.execution_id == update_run.execution_id)
-                )
+                await session.scalars(select(rejection).where(rejection.execution_id == update_run.execution_id))
             ).all()
-            root_revisions = await _generation_root_revisions(session, update_run.generation_id)
+            root_revisions = await _generation_root_revisions(session, update_run.generation_id, models_by_type)
         assert {rejection.code for rejection in rejections} == {"field_type_invalid"}
         assert {
             json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"]
@@ -1330,12 +1362,12 @@ async def test_runner_retains_prior_family_for_rejected_canonical_root_duplicate
         assert second.accepted_family_count == 0
         assert second.rejection_count == 2
         async with case.sessions() as session:
+            models_by_type = await _generation_models(session, second.generation_id)
+            rejection = models_by_type[CustomImportRejection]
             rejections = (
-                await session.scalars(
-                    select(CustomImportRejection).where(CustomImportRejection.execution_id == second_execution)
-                )
+                await session.scalars(select(rejection).where(rejection.execution_id == second_execution))
             ).all()
-            root_revisions = await _generation_root_revisions(session, second.generation_id)
+            root_revisions = await _generation_root_revisions(session, second.generation_id, models_by_type)
         assert {rejection.code for rejection in rejections} == {"duplicate_root_key", "field_type_invalid"}
         assert {
             json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"]
@@ -1372,12 +1404,10 @@ async def test_runner_rejects_canonical_child_duplicate_without_blocking_other_r
         assert run_result.accepted_family_count == 1
         assert run_result.rejection_count == 1
         async with case.sessions() as session:
-            rejections = (
-                await session.scalars(
-                    select(CustomImportRejection).where(CustomImportRejection.execution_id == execution_id)
-                )
-            ).all()
-            root_revisions = await _generation_root_revisions(session, run_result.generation_id)
+            models_by_type = await _generation_models(session, run_result.generation_id)
+            rejection = models_by_type[CustomImportRejection]
+            rejections = (await session.scalars(select(rejection).where(rejection.execution_id == execution_id))).all()
+            root_revisions = await _generation_root_revisions(session, run_result.generation_id, models_by_type)
         assert {rejection.code for rejection in rejections} == {"duplicate_child_key"}
         assert {
             json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"]
@@ -1421,12 +1451,10 @@ async def test_runner_rejects_same_instant_timestamp_child_duplicate_without_blo
         assert run_result.accepted_family_count == 1
         assert run_result.rejection_count == 1
         async with case.sessions() as session:
-            rejections = (
-                await session.scalars(
-                    select(CustomImportRejection).where(CustomImportRejection.execution_id == execution_id)
-                )
-            ).all()
-            root_revisions = await _generation_root_revisions(session, run_result.generation_id)
+            models_by_type = await _generation_models(session, run_result.generation_id)
+            rejection = models_by_type[CustomImportRejection]
+            rejections = (await session.scalars(select(rejection).where(rejection.execution_id == execution_id))).all()
+            root_revisions = await _generation_root_revisions(session, run_result.generation_id, models_by_type)
         assert {rejection.code for rejection in rejections} == {"duplicate_child_key"}
         assert {
             json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"]
@@ -1466,7 +1494,8 @@ async def test_runner_accepts_distinct_timestamp_folds():
         assert run_result.accepted_family_count == 1
         assert run_result.rejection_count == 0
         async with case.sessions() as session:
-            children = (await session.scalars(select(CustomImportChildRevision))).all()
+            models_by_type = await _generation_models(session, run_result.generation_id)
+            children = (await session.scalars(select(models_by_type[CustomImportChildRevision]))).all()
         assert len(children) == 2
 
 
@@ -1519,17 +1548,14 @@ async def _assert_retained_generation(case, generation_id: int, execution_id: in
     """Verify that rejected roots retain prior data and exact rejection evidence."""
 
     async with case.sessions() as session:
+        models_by_type = await _generation_models(session, generation_id)
+        membership = models_by_type[CustomImportGenerationFamily]
+        rejection = models_by_type[CustomImportRejection]
         generation_families = (
-            await session.scalars(
-                select(CustomImportGenerationFamily).where(CustomImportGenerationFamily.generation_id == generation_id)
-            )
+            await session.scalars(select(membership).where(membership.generation_id == generation_id))
         ).all()
-        rejections = (
-            await session.scalars(
-                select(CustomImportRejection).where(CustomImportRejection.execution_id == execution_id)
-            )
-        ).all()
-        root_revisions = await _generation_root_revisions(session, generation_id)
+        rejections = (await session.scalars(select(rejection).where(rejection.execution_id == execution_id))).all()
+        root_revisions = await _generation_root_revisions(session, generation_id, models_by_type)
     retained_names = {
         json.loads(root_revision.canonical_payload)["fields"][1]["value"]["value"] for root_revision in root_revisions
     }
@@ -1539,22 +1565,21 @@ async def _assert_retained_generation(case, generation_id: int, execution_id: in
     assert retained_names == {"Synthetic First", "Synthetic Second Changed"}
 
 
-async def _generation_root_revisions(session: AsyncSession, generation_id: int) -> list[CustomImportRootRevision]:
+async def _generation_root_revisions(
+    session: AsyncSession, generation_id: int, models_by_type
+) -> list[CustomImportRootRevision]:
     """Load exact root payload revisions for one generation membership set."""
 
+    root = models_by_type[CustomImportRootRevision]
+    family = models_by_type[CustomImportFamilyRevision]
+    membership = models_by_type[CustomImportGenerationFamily]
     return list(
         (
             await session.scalars(
-                select(CustomImportRootRevision)
-                .join(
-                    CustomImportFamilyRevision,
-                    CustomImportFamilyRevision.root_revision_id == CustomImportRootRevision.root_revision_id,
-                )
-                .join(
-                    CustomImportGenerationFamily,
-                    CustomImportGenerationFamily.family_revision_id == CustomImportFamilyRevision.family_revision_id,
-                )
-                .where(CustomImportGenerationFamily.generation_id == generation_id)
+                select(root)
+                .join(family, family.root_revision_id == root.root_revision_id)
+                .join(membership, membership.family_revision_id == family.family_revision_id)
+                .where(membership.generation_id == generation_id)
             )
         ).all()
     )
@@ -1698,6 +1723,13 @@ async def test_runner_rolls_back_partial_materialization_if_projection_fails(mon
             )
 
         async with case.sessions() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CustomImportSnapshotFamily)
+                    .where(CustomImportSnapshotFamily.execution_id == execution_id)
+                )
+            ) == 0
             for model in (
                 CustomImportPack,
                 CustomImportGeneration,
@@ -1709,3 +1741,138 @@ async def test_runner_rolls_back_partial_materialization_if_projection_fails(mon
                 CustomImportSelectionProfile,
             ):
                 assert len((await session.scalars(select(model))).all()) == 0
+
+
+async def _assert_failed_index_snapshot(case, incumbent_pointer, execution_id):
+    """Keep the incumbent readable while the committed failed graph stays unsealed."""
+
+    async with case.sessions() as session:
+        pointer_query = select(CustomImportCurrentGeneration.__table__).where(
+            CustomImportCurrentGeneration.dataset_id == incumbent_pointer.dataset_id
+        )
+        assert (await session.execute(pointer_query)).one() == incumbent_pointer
+        models_by_type = await _generation_models(session, incumbent_pointer.generation_id)
+        roots = await _generation_root_revisions(session, incumbent_pointer.generation_id, models_by_type)
+        assert {json.loads(root.canonical_payload)["fields"][1]["value"]["value"] for root in roots} == {
+            "Synthetic First",
+            "Synthetic Second",
+        }
+        generation_query = select(CustomImportGeneration.__table__).where(
+            CustomImportGeneration.execution_id == execution_id
+        )
+        snapshot_query = select(CustomImportSnapshotFamily.__table__).where(
+            CustomImportSnapshotFamily.execution_id == execution_id
+        )
+        failed_generation = (await session.execute(generation_query)).one()
+        failed_snapshot = (await session.execute(snapshot_query)).one()
+        lease = await session.get(CustomImportLease, execution_id)
+        execution = await session.get(CustomImportExecution, execution_id)
+        assert execution.state == "running"
+        assert failed_generation.base_generation_id == incumbent_pointer.generation_id
+        assert failed_snapshot.generation_id == failed_generation.generation_id
+        assert failed_snapshot.frozen_at is not None
+        assert failed_generation.producing_fence == failed_snapshot.producing_fence == lease.fence
+        assert failed_generation.producing_token_sha256 == failed_snapshot.producing_token_sha256 == lease.token_sha256
+        assert await session.get(CustomImportGenerationSeal, failed_generation.generation_id) is None
+    return failed_generation, failed_snapshot
+
+
+async def _assert_reclaimed_index_snapshot(case, recovery_run, failed_graph):
+    """Require a new sealed producer and preserve every old graph registry field."""
+
+    failed_generation, failed_snapshot = failed_graph
+    assert recovery_run.status == "activated" and recovery_run.seal is not None
+    assert recovery_run.generation_id != failed_generation.generation_id
+    async with case.sessions() as session:
+        generation = await session.get(CustomImportGeneration, recovery_run.generation_id)
+        lease = await session.get(CustomImportLease, failed_generation.execution_id)
+        snapshot = (
+            await session.scalars(
+                select(CustomImportSnapshotFamily).where(
+                    CustomImportSnapshotFamily.generation_id == recovery_run.generation_id
+                )
+            )
+        ).one()
+        pointer = await session.get(CustomImportCurrentGeneration, generation.dataset_id)
+        seal = await session.get(CustomImportGenerationSeal, recovery_run.generation_id)
+        assert pointer.generation_id == recovery_run.generation_id
+        assert generation.base_generation_id == failed_generation.base_generation_id
+        assert (
+            generation.producing_fence
+            == snapshot.producing_fence
+            == lease.fence
+            == failed_generation.producing_fence + 1
+        )
+        assert generation.producing_token_sha256 == snapshot.producing_token_sha256 == lease.token_sha256
+        assert generation.producing_token_sha256 != failed_generation.producing_token_sha256
+        assert snapshot.family_id != failed_snapshot.family_id and snapshot.frozen_at is not None
+        assert seal is not None and seal.sealing_fence == generation.producing_fence
+        for model, previous_row in (
+            (CustomImportGeneration, failed_generation),
+            (CustomImportSnapshotFamily, failed_snapshot),
+        ):
+            previous_query = select(model.__table__).where(
+                model.execution_id == failed_generation.execution_id,
+                model.producing_fence == failed_generation.producing_fence,
+            )
+            assert (await session.execute(previous_query)).one() == previous_row
+        assert await session.get(CustomImportGenerationSeal, failed_generation.generation_id) is None
+        models_by_type = await _generation_models(session, recovery_run.generation_id)
+        roots = await _generation_root_revisions(session, recovery_run.generation_id, models_by_type)
+        assert {json.loads(root.canonical_payload)["fields"][1]["value"]["value"] for root in roots} == {
+            "Synthetic Replacement",
+            "Synthetic Second",
+        }
+
+
+@pytest.mark.asyncio
+async def test_runner_reclaims_with_new_candidate_after_serving_index_failure(monkeypatch):
+    """An index failure preserves committed work without adopting its expired fence."""
+
+    async with isolated_publication_case() as case:
+        seed = await _seed_case(case, "index_reclaim")
+        await _run_initial_retention_candidate(case, seed)
+        async with case.sessions() as session:
+            incumbent_query = select(CustomImportCurrentGeneration.__table__).where(
+                CustomImportCurrentGeneration.dataset_id == seed.dataset_id
+            )
+            incumbent_pointer = (await session.execute(incumbent_query)).one()
+        execution_id, token = await _new_execution(case, seed, "index_reclaim")
+        request = _request(
+            seed,
+            execution_id,
+            token,
+            [_root("1234567893", "Synthetic Replacement")],
+            [_rate("1234567893", "REPLACEMENT", Decimal("11.00"))],
+        )
+        original_step = runner_graph.prepare_legacy_serving_step
+        attempted_generations = []
+
+        async def is_next_serving_index_ready(session, candidate_request, grant, generation_id):
+            attempted_generations.append(generation_id)
+            if len(attempted_generations) == 2:
+                raise CandidateRunnerError("synthetic serving index failure")
+            assert await original_step(session, candidate_request, grant, generation_id) is False
+            return False
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runner_graph, "prepare_legacy_serving_step", is_next_serving_index_ready)
+            with pytest.raises(CandidateRunnerError, match="synthetic serving index failure"):
+                await run_candidate(case.sessions, request)
+        failed_graph = await _assert_failed_index_snapshot(case, incumbent_pointer, execution_id)
+        failed_generation, _ = failed_graph
+        assert attempted_generations == [failed_generation.generation_id] * 2
+        assert (await run_candidate(case.sessions, request)).status == "not_claimed"
+        async with case.sessions() as session, session.begin():
+            expired = await session.execute(
+                update(CustomImportLease)
+                .where(
+                    CustomImportLease.execution_id == execution_id,
+                    CustomImportLease.fence == failed_generation.producing_fence,
+                )
+                .values(expires_at=func.clock_timestamp())
+            )
+            assert expired.rowcount == 1
+        recovery_request = replace(request, lease_token="synthetic-runner-index-recovery-token")
+        recovery_run = await run_candidate(case.sessions, recovery_request)
+        await _assert_reclaimed_index_snapshot(case, recovery_run, failed_graph)

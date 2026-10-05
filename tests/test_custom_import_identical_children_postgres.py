@@ -5,16 +5,16 @@
 from __future__ import annotations
 
 import json
-from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import (
@@ -48,7 +48,7 @@ from tests.test_custom_import_build_output_postgres import (
     _records,
     _request_for,
 )
-from tests.test_custom_import_build_source_postgres import _source_case
+from tests.test_custom_import_build_source_postgres import _candidate_models, _source_case
 from tests.test_custom_import_snowflake_shared_capture import _shared_definition
 
 _MIGRATION = Path(__file__).resolve().parents[1] / "alembic/versions/20261002030000_custom_import_identical_children.py"
@@ -59,14 +59,6 @@ def _migrate(connection, schema_name, *, downgrade=False):
     migration._schema = lambda: schema_name
     migration.op = Operations(MigrationContext.configure(connection))
     (migration.downgrade if downgrade else migration.upgrade)()
-
-
-@asynccontextmanager
-async def _case():
-    async with _source_case() as case:
-        async with case.engine.begin() as connection:
-            await connection.run_sync(_migrate, case.schema_name)
-        yield case
 
 
 def _configured_definition(*, revision=1):
@@ -85,17 +77,17 @@ def _duplicate_records(*, amount="10.000"):
 async def test_identical_children_resume_with_final_occurrence(monkeypatch):
     definition = _configured_definition()
     source_records = _duplicate_records()
-    original = build_source._store_page
+    original = build_source._store_pages
     acknowledgements = count()
 
-    async def lost_acknowledgement(*args):
-        await original(*args)
+    async def lost_acknowledgement(*args, **kwargs):
+        await original(*args, **kwargs)
         if next(acknowledgements) == 0:
             raise ConnectionError("synthetic lost source-page acknowledgement")
 
-    async with _case() as case:
+    async with _source_case() as case:
         request = await _request_for(case, source_records, definition=definition, page_rows=8)
-        monkeypatch.setattr(build_source, "_store_page", lost_acknowledgement)
+        monkeypatch.setattr(build_source, "_store_pages", lost_acknowledgement)
         with pytest.raises(ConnectionError, match="acknowledgement"):
             await build_source.stage_segmented_source(case.sessions, request)
         staged = await build_source.stage_segmented_source(case.sessions, request)
@@ -113,15 +105,16 @@ async def test_identical_children_resume_with_final_occurrence(monkeypatch):
             definition, source_records["providers"][0], {"rates": sum(source_records["rates"], [])}
         )
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
             capture = (await session.scalars(select(CustomImportCaptureBundle))).one()
             assert capture.committed_record_count == 5 and capture.committed_part_count == 3
-            occurrences = (await session.scalars(select(CustomImportBuildOccurrence))).all()
+            occurrences = (await session.scalars(select(models[CustomImportBuildOccurrence]))).all()
             assert len(occurrences) == 5 and all(entry.resolved_rejection_id is None for entry in occurrences)
-            children = (await session.scalars(select(CustomImportChildRevision))).all()
+            children = (await session.scalars(select(models[CustomImportChildRevision]))).all()
             assert len(children) == 3
-            selected_ids = set(await session.scalars(select(CustomImportFamilyChild.child_revision_id)))
+            selected_ids = set(await session.scalars(select(models[CustomImportFamilyChild].child_revision_id)))
             assert selected_ids == {child.child_revision_id for child in children if child.source_ordinal in {1, 2}}
-            families = (await session.scalars(select(CustomImportFamilyRevision))).all()
+            families = (await session.scalars(select(models[CustomImportFamilyRevision]))).all()
             assert sorted(bytes(family.family_sha256) for family in families) == sorted(
                 new_family_hash(definition, family) for family in eager.families
             )
@@ -129,7 +122,7 @@ async def test_identical_children_resume_with_final_occurrence(monkeypatch):
 
 @pytest.mark.parametrize("enabled,amount,accepted", [(False, "10.000", 1), (True, "12", 1), (True, "bad", 1)])
 async def test_database_default_conflict_and_invalid_rows_keep_family_rejection(enabled, amount, accepted):
-    async with _case() as case:
+    async with _source_case() as case:
         definition = _configured_definition() if enabled else _definition()
         request = await _request_for(case, _duplicate_records(amount=amount), definition=definition)
         staged = await build_source.stage_segmented_source(case.sessions, request)
@@ -144,47 +137,58 @@ async def test_database_default_conflict_and_invalid_rows_keep_family_rejection(
 
 
 async def test_policy_revision_preserves_previous_family_when_payloads_conflict():
-    async with _case() as case:
+    async with _source_case() as case:
         initial = await _request_for(case, _records(2), definition=_definition())
         _, base = await _complete(case, initial)
         await _activate(case, initial, base.generation_id)
-        records = _duplicate_records(amount="12")
-        records["rates"][0][1]["amount"] = "21"
+        source_records = _duplicate_records(amount="12")
+        source_records["rates"][0][1]["amount"] = "21"
         request = await _request_for(
-            case, records, definition=_configured_definition(revision=2), base=base.generation_id, version=1
+            case, source_records, definition=_configured_definition(revision=2), base=base.generation_id, version=1
         )
         assert request.schema_revision_id == initial.schema_revision_id
-        build_id, result = await _complete(case, request)
-        assert result.seal.family_count == result.seal.family_child_count == 2
-        await _assert_legacy_parity(case, request, result)
+        build_id, completed = await _complete(case, request)
+        assert completed.seal.family_count == completed.seal.family_child_count == 2
+        await _assert_legacy_parity(case, request, completed)
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
             plans = (
                 await session.scalars(
-                    select(CustomImportBuildFamily).where(CustomImportBuildFamily.build_id == build_id)
+                    select(models[CustomImportBuildFamily]).where(models[CustomImportBuildFamily].build_id == build_id)
                 )
             ).all()
             assert sorted(plan.selection_kind for plan in plans) == ["retained", "source"]
-            assert (await session.scalar(select(func.count()).select_from(CustomImportBuildOccurrence))) == 11
+            previous_models = await session.run_sync(_candidate_models, initial)
+            occurrence_count = await session.scalar(
+                select(func.count()).select_from(models[CustomImportBuildOccurrence])
+            )
+            previous_count = await session.scalar(
+                select(func.count()).select_from(previous_models[CustomImportBuildOccurrence])
+            )
+            assert occurrence_count + previous_count == 11
 
 
 async def test_final_lookup_uses_ordered_partial_index():
     source_records = _records(64)
     first_child = source_records["rates"][0][0]
     source_records["rates"] = [[first_child] * 64, sum(source_records["rates"], [])]
-    async with _case() as case:
+    async with _source_case() as case:
         request = await _request_for(case, source_records, definition=_configured_definition(), page_rows=256)
         staged = await build_source.stage_segmented_source(case.sessions, request)
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
+            occurrence_model = models[CustomImportBuildOccurrence]
             occurrence = await session.scalar(
-                select(CustomImportBuildOccurrence)
-                .where(CustomImportBuildOccurrence.child_revision_id.is_not(None))
-                .order_by(CustomImportBuildOccurrence.source_ordinal)
+                select(occurrence_model)
+                .where(occurrence_model.child_revision_id.is_not(None))
+                .order_by(occurrence_model.source_ordinal)
                 .limit(1)
             )
-            await session.execute(text(f'ANALYZE "{case.schema_name}".custom_import_build_occurrence'))
+            relation = session.get_bind().dialect.identifier_preparer.format_table(inspect(occurrence_model).selectable)
+            await session.execute(text(f"ANALYZE {relation}"))
             plan = await session.scalar(
                 text(f"""EXPLAIN (ANALYZE, FORMAT JSON)
-                    SELECT child_revision_id FROM "{case.schema_name}".custom_import_build_occurrence
+                    SELECT child_revision_id FROM {relation}
                     WHERE build_id=:build AND origin='source' AND stream_slot=:stream AND root_record_id=:root
                       AND collection_slot=:collection AND raw_parent_key_sha256=:raw AND child_key_sha256=:child
                       AND child_revision_id IS NOT NULL ORDER BY source_ordinal DESC LIMIT 1"""),
@@ -211,7 +215,7 @@ async def test_payload_comparison_respects_page_byte_bound(enabled):
     for part in source_records["rates"]:
         for child in part:
             child["note"] = "x" * 800
-    async with _case() as case:
+    async with _source_case() as case:
         request = await _request_for(case, source_records, definition=definition)
         prepared = build_source._prepare_row(request, definition.source_streams[1], source_records["rates"][0][0])
         request = replace(request, page_byte_limit=prepared.byte_count)
@@ -219,13 +223,14 @@ async def test_payload_comparison_respects_page_byte_bound(enabled):
             with pytest.raises(DBAPIError, match="custom_import_build_page_too_large"):
                 await build_source.stage_segmented_source(case.sessions, request)
             async with case.sessions() as session:
-                assert await session.scalar(select(func.count()).select_from(CustomImportBuildOccurrence)) == 5
+                models = await session.run_sync(_candidate_models, request)
+                assert await session.scalar(select(func.count()).select_from(models[CustomImportBuildOccurrence])) == 5
         else:
             assert (await build_source.stage_segmented_source(case.sessions, request)).phase == "graph"
 
 
 async def test_forward_migration_restores_old_functions_only_without_retained_policy():
-    async with _case() as case:
+    async with isolated_publication_case(migration_through="20261002030000") as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(lambda conn: _migrate(conn, case.schema_name, downgrade=True))
             index = await connection.scalar(
@@ -245,14 +250,6 @@ def _migrate_memberships(connection, schema_name, *, downgrade=False):
     migration._schema = lambda: schema_name
     migration.op = Operations(MigrationContext.configure(connection))
     (migration.downgrade if downgrade else migration.upgrade)()
-
-
-@asynccontextmanager
-async def _membership_case():
-    async with _case() as case:
-        async with case.engine.begin() as connection:
-            await connection.run_sync(_migrate_memberships, case.schema_name)
-        yield case
 
 
 def _membership_definition(*, enabled=True, revision=1, refresh="snapshot", reverse=False):
@@ -329,7 +326,7 @@ def _membership_records(*, inner_count=1, missing=False, panel_suffix=""):
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("missing", [False, True])
 async def test_membership_admission_is_typed_root_scoped_and_independent_of_pack_order(reverse, missing):
-    async with _membership_case() as case:
+    async with _source_case() as case:
         definition = _membership_definition(reverse=reverse)
         records_by_stream = _membership_records(missing=missing)
         request = await _request_for(case, records_by_stream, definition=definition)
@@ -348,14 +345,14 @@ async def test_membership_admission_is_typed_root_scoped_and_independent_of_pack
         )
         assert len(eager.families) == counts.accepted_family_count
         async with case.sessions() as session:
-            rejected = (await session.scalars(select(CustomImportRejection))).all()
+            models = await session.run_sync(_candidate_models, request)
+            occurrence_model = models[CustomImportBuildOccurrence]
+            rejected = (await session.scalars(select(models[CustomImportRejection]))).all()
             assert [rejection.code for rejection in rejected] == (["child_membership_missing"] if missing else [])
             assert all(rejection.canonical_evidence == "{}" for rejection in rejected)
             resolved = (
                 await session.scalars(
-                    select(CustomImportBuildOccurrence).where(
-                        CustomImportBuildOccurrence.resolved_rejection_id.is_not(None)
-                    )
+                    select(occurrence_model).where(occurrence_model.resolved_rejection_id.is_not(None))
                 )
             ).all()
             assert sorted(occurrence.record_kind for occurrence in resolved) == (["child", "root"] if missing else [])
@@ -378,7 +375,7 @@ async def test_membership_absence_is_legacy_and_every_declared_mapping_is_requir
                 ],
             }
         )
-    async with _membership_case() as case:
+    async with _source_case() as case:
         request = await _request_for(
             case, _membership_records(), definition=CustomImportDefinition.from_mapping(document)
         )
@@ -399,14 +396,15 @@ async def test_duplicate_inner_key_keeps_native_primary_rejection_before_members
         {"details": sum(records_by_stream["detail_source"], []), "other": sum(records_by_stream["other_source"], [])},
     )
     assert {rejection.code for rejection in eager.rejections} == {"duplicate_child_key", "child_membership_missing"}
-    async with _membership_case() as case:
+    async with _source_case() as case:
         request = await _request_for(case, records_by_stream, definition=definition)
         staged = await build_source.stage_segmented_source(case.sessions, request)
         counts = await count_source_outcomes(case.sessions, request, staged.build_id)
         assert counts.accepted_family_count == len(eager.families) == 1
         assert counts.rejection_count == 1 and staged.candidate_error_count == 0
         async with case.sessions() as session:
-            codes = (await session.scalars(select(CustomImportRejection.code))).all()
+            models = await session.run_sync(_candidate_models, request)
+            codes = (await session.scalars(select(models[CustomImportRejection].code))).all()
             assert codes == ["duplicate_child_key", "duplicate_child_key"]
         await build_graph.build_graph(case.sessions, request, staged.build_id)
         sealed = await build_output.build_output(case.sessions, request, staged.build_id)
@@ -435,7 +433,7 @@ async def _membership_progress(case, build_id):
 
 @pytest.mark.parametrize("refresh", ["snapshot", "upsert"])
 async def test_new_memberships_revalidate_and_resume_compatible_retained_families(refresh):
-    async with _membership_case() as case:
+    async with _source_case() as case:
         initial = await _request_for(
             case, _membership_records(inner_count=13), definition=_membership_definition(enabled=False, refresh=refresh)
         )
@@ -476,7 +474,7 @@ async def test_new_memberships_revalidate_and_resume_compatible_retained_familie
 
 @pytest.mark.parametrize("refresh", ["snapshot", "upsert"])
 async def test_incompatible_late_retained_child_blocks_candidate_before_any_copy_or_generation(refresh):
-    async with _membership_case() as case:
+    async with _source_case() as case:
         records_by_stream = _membership_records(inner_count=13)
         records_by_stream["other_source"][0][12]["other_version"] = 8
         initial = await _request_for(
@@ -502,15 +500,17 @@ async def test_incompatible_late_retained_child_blocks_candidate_before_any_copy
             await build_graph.build_graph(case.sessions, request, staged.build_id)
         assert await _membership_progress(case, staged.build_id) == before
         async with case.sessions() as session:
+            models = await session.run_sync(_candidate_models, request)
+            occurrence_model = models[CustomImportBuildOccurrence]
             assert await session.scalar(select(func.count()).select_from(CustomImportGeneration)) == 1
             pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
             assert (pointer.generation_id, pointer.pointer_version) == (base.generation_id, 1)
             copied = (
                 select(func.count())
-                .select_from(CustomImportBuildOccurrence)
+                .select_from(occurrence_model)
                 .where(
-                    CustomImportBuildOccurrence.build_id == staged.build_id,
-                    CustomImportBuildOccurrence.origin == "retained",
+                    occurrence_model.build_id == staged.build_id,
+                    occurrence_model.origin == "retained",
                 )
             )
             assert await session.scalar(copied) == 0
@@ -518,7 +518,7 @@ async def test_incompatible_late_retained_child_blocks_candidate_before_any_copy
 
 @pytest.mark.parametrize("failure", ["cancelled", "byte_bound"])
 async def test_retained_membership_pages_remain_fenced_and_byte_bounded(failure):
-    async with _membership_case() as case:
+    async with _source_case() as case:
         records_by_stream = _membership_records(inner_count=2)
         initial = await _request_for(
             case, records_by_stream, definition=_membership_definition(enabled=False, refresh="upsert")
@@ -551,7 +551,7 @@ async def test_retained_membership_pages_remain_fenced_and_byte_bounded(failure)
 
 @pytest.mark.parametrize("retain_prior", [False, True])
 async def test_membership_schema_check_applies_only_to_actually_retained_families(retain_prior):
-    async with _membership_case() as case:
+    async with _source_case() as case:
         initial = await _request_for(case, _membership_records(), definition=_membership_definition(enabled=False))
         _, base = await _complete(case, initial)
         await _activate(case, initial, base.generation_id)
@@ -581,7 +581,7 @@ async def test_membership_schema_check_applies_only_to_actually_retained_familie
 
 
 async def test_membership_migration_roundtrip_retains_checks_for_declared_policy():
-    async with _membership_case() as case:
+    async with isolated_publication_case(migration_through="20261002040000") as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(lambda conn: _migrate_memberships(conn, case.schema_name, downgrade=True))
             await connection.run_sync(_migrate_memberships, case.schema_name)
@@ -596,25 +596,58 @@ async def test_membership_migration_roundtrip_retains_checks_for_declared_policy
                 await connection.run_sync(lambda conn: _migrate_memberships(conn, case.schema_name, downgrade=True))
 
 
-async def _generation_children(session, generation_id):
+async def _generation_children(session, generation_id, request):
+    generation = await session.get(CustomImportGeneration, generation_id)
+    assert generation.execution_id == request.execution_id
+    producer = SimpleNamespace(**(vars(request) | {"fence": generation.producing_fence}))
+    models = await session.run_sync(_candidate_models, producer)
+    family = models[CustomImportFamilyRevision]
+    await _assert_ordinary_serving_indexes(session, request, inspect(family).selectable.schema)
+    child = models[CustomImportChildRevision]
+    generation_family = models[CustomImportGenerationFamily]
+    family_child = models[CustomImportFamilyChild]
     return (
         await session.execute(
-            select(CustomImportFamilyRevision, CustomImportChildRevision)
+            select(family, child)
             .join(
-                CustomImportGenerationFamily,
-                CustomImportGenerationFamily.family_revision_id == CustomImportFamilyRevision.family_revision_id,
+                generation_family,
+                generation_family.family_revision_id == family.family_revision_id,
             )
             .join(
-                CustomImportFamilyChild,
-                CustomImportFamilyChild.family_revision_id == CustomImportFamilyRevision.family_revision_id,
+                family_child,
+                family_child.family_revision_id == family.family_revision_id,
             )
             .join(
-                CustomImportChildRevision,
-                CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id,
+                child,
+                child.child_revision_id == family_child.child_revision_id,
             )
-            .where(CustomImportGenerationFamily.generation_id == generation_id)
+            .where(generation_family.generation_id == generation_id)
         )
     ).all()
+
+
+async def _assert_ordinary_serving_indexes(session, request, namespace):
+    """Ordinary seal and no-change require the complete candidate serving set."""
+
+    assert (
+        await session.scalar(
+            select(func.count(CustomImportBuildAttempt.build_id)).where(
+                CustomImportBuildAttempt.execution_id == request.execution_id
+            )
+        )
+        == 0
+    )
+    index_names = set(
+        await session.scalars(
+            text("SELECT indexname FROM pg_indexes WHERE schemaname=:namespace AND indexname LIKE '%scalar%_idx'"),
+            {"namespace": namespace},
+        )
+    )
+    assert index_names == {
+        f"custom_import_{record_kind}_scalar_{value_kind}_idx"
+        for record_kind in ("root", "child")
+        for value_kind in ("text", "int", "number", "date", "time")
+    }
 
 
 def _assert_fresh_children_after_partial_update(previous_child_rows, current_child_rows):
@@ -640,13 +673,12 @@ async def test_repeated_child_values_keep_distinct_keys_and_parent_membership():
         execution, token = await runner_fixture._new_execution(case, seed, "repeated_children")
         roots = [runner_fixture._root(npi, "Synthetic") for npi in ("1234567893", "1234567802")]
         child_records = [runner_fixture._rate(root["npi"], code, Decimal("4")) for root in roots for code in ("A", "B")]
-        first = await run_candidate(
-            case.sessions, runner_fixture._request(seed, execution, token, roots, child_records)
-        )
+        request = runner_fixture._request(seed, execution, token, roots, child_records)
+        first = await run_candidate(case.sessions, request)
         assert first.status == "activated" and first.accepted_family_count == 2
         assert first.rejection_count == 0
         async with case.sessions() as session:
-            family_child_rows = await _generation_children(session, first.generation_id)
+            family_child_rows = await _generation_children(session, first.generation_id, request)
             assert len(family_child_rows) == len({child.child_revision_id for _family, child in family_child_rows}) == 4
             assert len({family.family_revision_id for family, _child in family_child_rows}) == 2
             for family, child in family_child_rows:
@@ -655,13 +687,13 @@ async def test_repeated_child_values_keep_distinct_keys_and_parent_membership():
             assert len({bytes(child.child_key_sha256) for _family, child in family_child_rows}) == 2
             assert len({bytes(child.parent_key_sha256) for _family, child in family_child_rows}) == 2
         replay_execution, replay_token = await runner_fixture._new_execution(case, seed, "repeated_children_replay")
-        replay = await run_candidate(
-            case.sessions,
-            runner_fixture._request(seed, replay_execution, replay_token, roots, list(reversed(child_records))),
+        replay_request = runner_fixture._request(
+            seed, replay_execution, replay_token, roots, list(reversed(child_records))
         )
+        replay = await run_candidate(case.sessions, replay_request)
         assert replay.status == "no_change"
         async with case.sessions() as session:
-            replay_rows = await _generation_children(session, replay.generation_id)
+            replay_rows = await _generation_children(session, replay.generation_id, replay_request)
             assert {(family.root_record_id, bytes(child.child_key_sha256)) for family, child in replay_rows} == {
                 (family.root_record_id, bytes(child.child_key_sha256)) for family, child in family_child_rows
             }
@@ -675,9 +707,8 @@ async def test_identical_duplicate_key_rejects_only_its_parent_and_retains_previ
         roots = [runner_fixture._root(npi, "Before") for npi in ("1234567893", "1234567802")]
         child_records = [runner_fixture._rate(root["npi"], "A", Decimal("4")) for root in roots]
         first_execution, first_token = await runner_fixture._new_execution(case, seed, "duplicate_content_first")
-        first = await run_candidate(
-            case.sessions, runner_fixture._request(seed, first_execution, first_token, roots, child_records)
-        )
+        initial = runner_fixture._request(seed, first_execution, first_token, roots, child_records)
+        first = await run_candidate(case.sessions, initial)
         assert first.status == "activated"
         next_execution, next_token = await runner_fixture._new_execution(case, seed, "duplicate_content_next")
         changed_roots = [runner_fixture._root(root["npi"], "After") for root in roots]
@@ -686,19 +717,22 @@ async def test_identical_duplicate_key_rejects_only_its_parent_and_retains_previ
             dict(child_records[0]),
             runner_fixture._rate(roots[1]["npi"], "A", Decimal("8")),
         ]
-        changed = await run_candidate(
-            case.sessions,
-            runner_fixture._request(seed, next_execution, next_token, changed_roots, changed_child_records),
-        )
+        request = runner_fixture._request(seed, next_execution, next_token, changed_roots, changed_child_records)
+        changed = await run_candidate(case.sessions, request)
         assert changed.status == "activated" and changed.accepted_family_count == 1
         assert changed.rejection_count == 1
         async with case.sessions() as session:
+            generation = await session.get(CustomImportGeneration, changed.generation_id)
+            producer = SimpleNamespace(**(vars(request) | {"fence": generation.producing_fence}))
+            models = await session.run_sync(_candidate_models, producer)
             rejections = (
                 await session.scalars(
-                    select(CustomImportRejection).where(CustomImportRejection.execution_id == next_execution)
+                    select(models[CustomImportRejection]).where(
+                        models[CustomImportRejection].execution_id == next_execution
+                    )
                 )
             ).all()
             assert [rejection.code for rejection in rejections] == ["duplicate_child_key"]
-            before = await _generation_children(session, first.generation_id)
-            after = await _generation_children(session, changed.generation_id)
+            before = await _generation_children(session, first.generation_id, initial)
+            after = await _generation_children(session, changed.generation_id, request)
         _assert_fresh_children_after_partial_update(before, after)

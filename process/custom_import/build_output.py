@@ -5,11 +5,26 @@
 from __future__ import annotations
 
 import hmac
+from collections import deque
 from contextlib import closing
-from dataclasses import dataclass
-from itertools import chain, count, groupby, zip_longest
+from dataclasses import dataclass, replace
+from itertools import chain, groupby, islice
 
-from sqlalchemy import BigInteger, cast, exists, func, select, tuple_
+from sqlalchemy import (
+    BigInteger,
+    LargeBinary,
+    SmallInteger,
+    any_,
+    bindparam,
+    cast,
+    exists,
+    func,
+    literal_column,
+    select,
+    tuple_,
+)
+from sqlalchemy import column as sql_column
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from db.models.custom_import import (
     CustomImportBuildAttempt,
@@ -31,7 +46,6 @@ from db.models.custom_import import (
     CustomImportFieldSlot,
     CustomImportGeneration,
     CustomImportGenerationFamily,
-    CustomImportGenerationSeal,
     CustomImportLease,
     CustomImportPack,
     CustomImportRejection,
@@ -46,14 +60,16 @@ from db.models.custom_import import (
 from process.custom_import import materialization as material
 from process.custom_import import publication
 from process.custom_import.build_graph import (
+    _build_storage_models,
     _call,
     _candidate,
     _candidate_digest,
-    _child_statement,
+    _FamilyInput,
     _heartbeat,
     _model_bytes,
     _one_row,
-    _page_cost,
+    _prepare_read,
+    _read_query_pages,
     _read_rows,
     _read_transaction,
     _ReadPage,
@@ -63,25 +79,29 @@ from process.custom_import.build_graph import (
     _snapshot,
     _source_digest,
     _verify_request,
+    _variable_bytes,
 )
+from process.custom_import.build_graph_prepare_page import _source_input_with_digest
 from process.custom_import.build_source import (
     SourceBuildRequest,
     _flush_page,
     _lock_page,
     _page_session,
+    _prepare_snapshot_indexes,
     _prepare_statement,
 )
+from process.custom_import.build_source import _call as _typed_call
+from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import (
     digest_text,
     fields_by_collection,
-    new_family_hash_ordered,
     payload_values,
     record_payload,
 )
-from process.custom_import.runner_graph import stored_root_values, verify_stored_child
+from process.custom_import.runner_graph import stored_root_values
 from process.custom_import.runner_registry import load_registry
-from process.custom_import.runner_types import CandidateRunnerError, StoredCandidateChild
+from process.custom_import.runner_types import CandidateRunnerError
 
 _COUNT_NAMES = (
     "root_count",
@@ -93,6 +113,19 @@ _COUNT_NAMES = (
     "root_scalar_count",
     "child_scalar_count",
 )
+# Native winner fields, five lookup arrays, ordinal/ID result and ID checks.
+_WINNER_BUFFER_BYTES = 208
+_LOOKUP_ARRAY_HEADERS = 116  # Five array headers and one defensive overflow row.
+
+
+class _WinnerBatchFull(Exception):
+    """Stop before completing the current group, never manufacture its EOF."""
+
+
+@dataclass
+class _WinnerReadBudget:
+    winners: list
+    pending_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -115,11 +148,168 @@ def _group_key(context):
     return context.profile_slot, context.entity_binding_id, bytes(context.context_key_sha256)
 
 
-def _context_rows(session, request, build_id, *, group=None, after=None, generation=None):
-    context = CustomImportBuildCandidateContext
-    family = CustomImportFamilyRevision
-    root = CustomImportRootRevision
-    child = CustomImportChildRevision
+def _output_rows(session, request, build_id, query, *, bounds=_ReadPage()):
+    """Resolve the protected candidate and build its query inside every page."""
+
+    return _read_query_pages(
+        session,
+        request,
+        build_id,
+        lambda sync: query(_build_storage_models(sync, build_id)[0]),
+        bounds=replace(bounds, physical=True),
+    )
+
+
+def _winner_buffer_bytes(canonical_key, profile_id):
+    if type(canonical_key) is not str or type(profile_id) is not str:
+        raise CandidateRunnerError("winner context has invalid native text")
+    return _WINNER_BUFFER_BYTES + len(canonical_key.encode("utf-8")) + len(profile_id.encode("utf-8"))
+
+
+def _context_key(profile_slot, binding_id, digest, context_id):
+    if (
+        any(type(identity) is not int or not 0 < identity < 2**63 for identity in (binding_id, context_id))
+        or type(profile_slot) is not int
+        or not 0 < profile_slot < 2**15
+        or not isinstance(digest, (bytes, bytearray, memoryview))
+        or len(digest) != 32
+    ):
+        raise CandidateRunnerError("candidate context has invalid native identity")
+    return profile_slot, binding_id, bytes(digest), context_id
+
+
+def _context_capacity(read_budget):
+    """Reserve retained winners and the current group before another read."""
+    reserved_bytes = (
+        _LOOKUP_ARRAY_HEADERS
+        + read_budget.pending_bytes
+        + sum(_winner_buffer_bytes(winner.canonical_context_key, winner.profile_id) for winner in read_budget.winners)
+    )
+    # Each winner reserves its object, native-array input and ID result. A read
+    # also holds metadata and payload; reserve a pending group across chunks.
+    remaining_rows = MAX_BATCH_ROWS - 3 * len(read_budget.winners) - 1
+    remaining_bytes = MAX_BATCH_BYTES - reserved_bytes
+    return remaining_rows // 5, remaining_bytes
+
+
+def _context_batch_full(read_budget):
+    if read_budget.winners:
+        raise _WinnerBatchFull
+    raise CandidateRunnerError("one candidate context exceeds the admitted physical batch")
+
+
+def _admitted_context_keys(metadata, request, read_budget, available_bytes, fixed_bytes):
+    """Pack policy-sized logical pages without exceeding the shared envelope."""
+    admitted, used_bytes, logical_rows, logical_bytes = [], 0, 0, 0
+    for *identity, payload_bytes, key_bytes in metadata:
+        key = _context_key(*identity)
+        if (
+            type(payload_bytes) is not int
+            or payload_bytes < 0
+            or type(key_bytes) is not int
+            or not 1 <= key_bytes <= 8192
+            or key[0] > len(request.definition.selection_profiles)
+        ):
+            raise CandidateRunnerError("candidate context has invalid native metadata")
+        if payload_bytes > request.page_byte_limit:
+            raise CandidateRunnerError("one build record exceeds the admitted byte page")
+        if logical_rows == request.page_row_limit or logical_bytes + payload_bytes > request.page_byte_limit:
+            logical_rows, logical_bytes = 0, 0
+        profile = request.definition.selection_profiles[key[0] - 1]
+        size = fixed_bytes + payload_bytes + _WINNER_BUFFER_BYTES + key_bytes + len(profile.profile_id.encode("utf-8"))
+        if used_bytes + size > available_bytes:
+            break
+        admitted.append(key)
+        used_bytes += size
+        logical_rows += 1
+        logical_bytes += payload_bytes
+    if metadata and not admitted:
+        _context_batch_full(read_budget)
+    return admitted
+
+
+def _read_context_batch(session, request, build_id, query, after, read_budget):
+    """Resolve, size and validate one native-array read before leaving its TX."""
+    limit, available_bytes = _context_capacity(read_budget)
+    # Four ordered key fields and two sizes; digest bytes are additional.
+    metadata_bytes = 6 * 16 + 32
+    if limit <= 0 or available_bytes <= 0:
+        _context_batch_full(read_budget)
+    with _read_transaction(session, request, build_id) as (_build, deadline):
+        models = _build_storage_models(session, build_id)[0]
+        statement, keys, row_models = query(models)
+        context = models[CustomImportBuildCandidateContext]
+        # Fixed native fields, both ordered-key copies and the ID selection;
+        # every selected variable-width value is charged separately below.
+        fixed_bytes = 64 + 16 * (2 * len(keys) + 2 + len(statement.selected_columns))
+        limit = min(limit, available_bytes // (metadata_bytes + fixed_bytes + _WINNER_BUFFER_BYTES + 1))
+        if not limit:
+            _context_batch_full(read_budget)
+        if after is not None:
+            statement = statement.where(tuple_(*keys) > after)
+        _prepare_read(session, request, deadline)
+        metadata = session.execute(
+            statement.with_only_columns(
+                *keys,
+                _variable_bytes(*row_models),
+                func.octet_length(context.canonical_context_key),
+                maintain_column_froms=True,
+            )
+            .order_by(*keys)
+            .limit(limit)
+        ).all()
+        if len(metadata) > limit:
+            raise CandidateRunnerError("candidate context metadata exceeds its physical batch")
+        admitted = _admitted_context_keys(
+            metadata, request, read_budget, available_bytes - len(metadata) * metadata_bytes, fixed_bytes
+        )
+        if not admitted:
+            return (), None
+        identifiers = tuple(key[-1] for key in admitted)
+        if len(set(identifiers)) != len(identifiers):
+            raise CandidateRunnerError("candidate context identities are not unique")
+        _prepare_read(session, request, deadline)
+        context_records = session.execute(
+            statement.where(
+                context.candidate_context_id == any_(bindparam("context_ids", identifiers, type_=ARRAY(BigInteger)))
+            )
+            .order_by(*keys)
+            .limit(literal_column(str(len(admitted) + 1)))
+        ).all()
+        actual_keys = [
+            _context_key(
+                context_record[0].profile_slot,
+                context_record[0].entity_binding_id,
+                context_record[0].context_key_sha256,
+                context_record[0].candidate_context_id,
+            )
+            for context_record in context_records
+        ]
+        if actual_keys != admitted:
+            raise CandidateRunnerError("frozen build page changed during its read")
+    return context_records, admitted[-1]
+
+
+def _context_rows(session, request, build_id, *, group=None, after=None, generation=None, read_budget=None):
+    read_budget = _WinnerReadBudget([]) if read_budget is None else read_budget
+    query = lambda models: _context_query(models, build_id, group=group, after=after, generation=generation)
+    cursor = None
+    while True:
+        context_records, cursor = _read_context_batch(session, request, build_id, query, cursor, read_budget)
+        if not context_records:
+            return
+        for context_record in context_records:
+            _require_budget(session.info["custom_import_build_read_deadline"])
+            yield context_record
+            _require_budget(session.info["custom_import_build_read_deadline"])
+        del context_records, context_record
+
+
+def _context_query(models, build_id, *, group=None, after=None, generation=None):
+    context = models[CustomImportBuildCandidateContext]
+    family = models[CustomImportFamilyRevision]
+    root = models[CustomImportRootRevision]
+    child = models[CustomImportChildRevision]
     statement = (
         select(context, family, root, child)
         .join(family, family.family_revision_id == context.family_revision_id)
@@ -133,7 +323,7 @@ def _context_rows(session, request, build_id, *, group=None, after=None, generat
     if after is not None:
         statement = statement.where(tuple_(*group_columns) > after)
     if generation is not None:
-        winner = CustomImportWinner
+        winner = models[CustomImportWinner]
         statement = statement.add_columns(
             winner.family_revision_id, winner.context_collection_slot, winner.context_child_revision_id
         ).outerjoin(
@@ -143,18 +333,11 @@ def _context_rows(session, request, build_id, *, group=None, after=None, generat
             & (winner.entity_binding_id == context.entity_binding_id)
             & (winner.context_key_sha256 == context.context_key_sha256),
         )
-    return _read_rows(
-        session,
-        request,
-        build_id,
-        statement,
-        (*group_columns, context.candidate_context_id),
-        (context, family, root, child),
-    )
+    return statement, (*group_columns, context.candidate_context_id), (context, family, root, child)
 
 
-def _context_candidates(session, request, registry, build_id, group, *, context_records=None):
-    contract = material._winner_candidate_contract(
+def _context_candidates(session, request, registry, build_id, group, *, context_records=None, contract=None):
+    contract = contract or material._winner_candidate_contract(
         request.definition, material._profile_scopes(request.definition, registry.child_collection_slots)
     )
     profile = request.definition.selection_profiles[group[0] - 1]
@@ -204,17 +387,32 @@ def _complete_group_winner(request, registry, generation, group, candidates):
     return winner
 
 
-def _ordered_winners(session, request, registry, build_id, generation, *, after=None, verify=False):
+def _ordered_winners(session, request, registry, build_id, generation, *, after=None, verify=False, read_budget=None):
     """Reduce complete groups in one bounded scan; restart after writes from the committed group cursor."""
 
+    read_budget = _WinnerReadBudget([]) if read_budget is None else read_budget
+    contract = material._winner_candidate_contract(
+        request.definition, material._profile_scopes(request.definition, registry.child_collection_slots)
+    )
     with closing(
-        _context_rows(session, request, build_id, after=after, generation=generation if verify else None)
-    ) as rows:
-        for group, group_rows in groupby(rows, key=lambda row: _group_key(row[0])):
+        _context_rows(
+            session, request, build_id, after=after, generation=generation if verify else None, read_budget=read_budget
+        )
+    ) as context_records:
+        for group, group_rows in groupby(context_records, key=lambda context_record: _group_key(context_record[0])):
             first = next(group_rows)
             stored_identity = first[4:]
+            read_budget.pending_bytes = _winner_buffer_bytes(
+                first[0].canonical_context_key, request.definition.selection_profiles[group[0] - 1].profile_id
+            )
             candidates = _context_candidates(
-                session, request, registry, build_id, group, context_records=chain((first,), group_rows)
+                session,
+                request,
+                registry,
+                build_id,
+                group,
+                context_records=chain((first,), group_rows),
+                contract=contract,
             )
             del first
             winner = _complete_group_winner(request, registry, generation, group, candidates)
@@ -225,129 +423,136 @@ def _ordered_winners(session, request, registry, build_id, generation, *, after=
             ):
                 raise CandidateRunnerError("frozen winner differs from complete surviving-tie reduction")
             yield winner
-
-
-def _reduce_group(session, request, registry, build_id, generation, group):
-    winner = _complete_group_winner(
-        request, registry, generation, group, _context_candidates(session, request, registry, build_id, group)
-    )
-    context = CustomImportBuildCandidateContext
-    statement = select(context).where(
-        context.build_id == build_id,
-        context.profile_slot == winner.profile_slot,
-        context.entity_binding_id == winner.entity_binding_id,
-        context.context_key_sha256 == winner.context_key_sha256,
-        context.family_revision_id == winner.family_revision_id,
-        context.context_child_revision_id.is_(None)
-        if winner.context_child_revision_id is None
-        else context.context_child_revision_id == winner.context_child_revision_id,
-    )
-    selected = _one_row(session, request, build_id, statement, (context.candidate_context_id,), (context,))
-    if selected is None:
-        raise CandidateRunnerError("selected winner has no retained candidate context")
-    return winner, selected[0].candidate_context_id
+            read_budget.pending_bytes = 0
 
 
 async def _attach_families(session_factory, request, build_id):
     after_root_id = 0
     while True:
-        async with _page_session(session_factory, request, build_id) as (session, build):
-            plan, family, membership_model = (
-                CustomImportBuildFamily,
-                CustomImportFamilyRevision,
-                CustomImportGenerationFamily,
-            )
-            await _prepare_statement(session)
-            memberships = (
-                await session.execute(
-                    select(
-                        plan.root_record_id,
-                        family.family_revision_id,
-                        exists(
-                            select(1).where(
-                                membership_model.generation_id == build.generation_id,
-                                membership_model.root_record_id == plan.root_record_id,
-                            )
-                        ).label("attached"),
-                    )
-                    .join(family, family.family_revision_id == plan.family_revision_id)
-                    .where(
-                        plan.build_id == build_id,
-                        plan.root_record_id > after_root_id,
-                    )
-                    .order_by(plan.root_record_id)
-                    .limit(request.page_row_limit)
+        async with _page_session(session_factory, request, build_id) as (session, _build):
+            page = (
+                await _typed_call(
+                    session,
+                    "membership_batch_finalize",
+                    (("bigint", build_id), ("bigint", after_root_id)),
                 )
-            ).all()
-            if not memberships:
-                return
-            models = [
-                membership_model(
-                    generation_id=build.generation_id,
-                    dataset_id=request.dataset_id,
-                    definition_revision_id=request.definition_revision_id,
-                    schema_revision_id=request.schema_revision_id,
-                    root_record_id=membership.root_record_id,
-                    family_revision_id=membership.family_revision_id,
-                )
-                for membership in memberships
-                if not membership.attached
-            ]
-            _page_cost(request, models)
-            session.add_all(models)
-            await _flush_page(session)
-        after_root_id = memberships[-1].root_record_id
+            ).one()
+        if not page.rows_processed:
+            return
+        after_root_id = page.after_root_record_id
         await _heartbeat(session_factory, request)
 
 
-def _next_group(session, request, build_id, after):
-    context = CustomImportBuildCandidateContext
-    statement = select(context).where(context.build_id == build_id)
-    if after is not None:
-        statement = statement.where(
-            tuple_(context.profile_slot, context.entity_binding_id, context.context_key_sha256) > after
+def _winner_batch(session, request, registry, build_id, generation, after):
+    """Keep complete-group pages inside the existing bounded batch envelope.
+
+    Logical policy pages share bounded native reads and one ID lookup. Close
+    reduction before resolving IDs, and all reads before the next write page.
+    """
+
+    page_limit = min(256, request.page_row_limit, max(1, request.page_byte_limit // 32))
+    read_budget, retained_bytes = _WinnerReadBudget([]), _LOOKUP_ARRAY_HEADERS
+    winners = read_budget.winners
+    try:
+        with closing(
+            _ordered_winners(session, request, registry, build_id, generation, after=after, read_budget=read_budget)
+        ) as stream:
+            for winner in islice(stream, MAX_BATCH_ROWS // 3):
+                if request.page_byte_limit < 32:
+                    raise CandidateRunnerError("one winner exceeds the admitted byte page")
+                size = _winner_buffer_bytes(winner.canonical_context_key, winner.profile_id)
+                if size + _LOOKUP_ARRAY_HEADERS > MAX_BATCH_BYTES:
+                    raise CandidateRunnerError("one winner exceeds the admitted batch bytes")
+                if retained_bytes + size > MAX_BATCH_BYTES:
+                    break
+                winners.append(winner)
+                retained_bytes += size
+    except _WinnerBatchFull:
+        if not winners:
+            raise CandidateRunnerError("winner batch ended without a complete group") from None
+    if not winners:
+        return (), ()
+    page_sizes = []
+    for start in range(0, len(winners), page_limit):
+        page_sizes.append(min(page_limit, len(winners) - start))
+    return _selected_winner_context_ids(session, request, build_id, winners), tuple(page_sizes)
+
+
+def _selected_winner_context_ids(session, request, build_id, winners):
+    """Resolve one closed reduction batch with five native arrays, not VALUES."""
+
+    # Resolve this bounded selection in one join, after complete reduction has
+    # closed its read stream. NULL child IDs compare by physical identity too.
+    if not winners:
+        return ()
+    if (
+        3 * len(winners) > MAX_BATCH_ROWS
+        or _LOOKUP_ARRAY_HEADERS
+        + sum(_winner_buffer_bytes(winner.canonical_context_key, winner.profile_id) for winner in winners)
+        > MAX_BATCH_BYTES
+    ):
+        raise CandidateRunnerError("winner lookup exceeds its physical batch")
+    for winner in winners:
+        _context_key(
+            winner.profile_slot, winner.entity_binding_id, winner.context_key_sha256, winner.family_revision_id
         )
-    first = _one_row(
-        session,
-        request,
-        build_id,
-        statement,
-        (context.profile_slot, context.entity_binding_id, context.context_key_sha256, context.candidate_context_id),
-        (context,),
+        if winner.context_child_revision_id is not None and (
+            type(winner.context_child_revision_id) is not int or not 0 < winner.context_child_revision_id < 2**63
+        ):
+            raise CandidateRunnerError("selected winner has invalid native child identity")
+    chosen = (
+        func.unnest(
+            bindparam("profile_slots", [winner.profile_slot for winner in winners], type_=ARRAY(SmallInteger)),
+            bindparam("binding_ids", [winner.entity_binding_id for winner in winners], type_=ARRAY(BigInteger)),
+            bindparam("context_hashes", [winner.context_key_sha256 for winner in winners], type_=ARRAY(LargeBinary)),
+            bindparam("family_ids", [winner.family_revision_id for winner in winners], type_=ARRAY(BigInteger)),
+            bindparam("child_ids", [winner.context_child_revision_id for winner in winners], type_=ARRAY(BigInteger)),
+        )
+        .table_valued(
+            sql_column("profile_slot", SmallInteger),
+            sql_column("entity_binding_id", BigInteger),
+            sql_column("context_key_sha256", LargeBinary),
+            sql_column("family_revision_id", BigInteger),
+            sql_column("context_child_revision_id", BigInteger),
+            with_ordinality="ordinal",
+        )
+        .render_derived(name="chosen")
     )
-    return None if first is None else _group_key(first[0])
+    with _read_transaction(session, request, build_id) as (_build, deadline):
+        models = _build_storage_models(session, build_id)[0]
+        statement, keys, _models = _selected_context_query(models, build_id, chosen)
+        _prepare_read(session, request, deadline)
+        context_rows = session.execute(statement.order_by(*keys).limit(literal_column(str(len(winners) + 1)))).all()
+        _require_budget(deadline)
+    if len(context_rows) != len(winners) or any(
+        type(context_row[0]) is not int
+        or context_row[0] != ordinal
+        or type(context_row[1]) is not int
+        or not 0 < context_row[1] < 2**63
+        for ordinal, context_row in enumerate(context_rows, 1)
+    ):
+        raise CandidateRunnerError("selected winner has no unique retained candidate context")
+    if len({context_row[1] for context_row in context_rows}) != len(context_rows):
+        raise CandidateRunnerError("selected winner contexts are not unique")
+    return tuple(context_row[1] for context_row in context_rows)
 
 
-async def _store_winner(session, request, build_id, generation, winner, context_id):
-    await _prepare_statement(session)
-    existing = await session.get(
-        CustomImportWinner,
-        (generation.generation_id, winner.profile_slot, winner.entity_binding_id, winner.context_key_sha256),
+def _selected_context_query(models, build_id, chosen):
+    context = models[CustomImportBuildCandidateContext]
+    statement = (
+        select(chosen.c.ordinal, context.candidate_context_id)
+        .select_from(chosen)
+        .join(
+            context,
+            (context.build_id == build_id)
+            & (context.profile_slot == chosen.c.profile_slot)
+            & (context.entity_binding_id == chosen.c.entity_binding_id)
+            & (context.context_key_sha256 == chosen.c.context_key_sha256)
+            & (context.family_revision_id == chosen.c.family_revision_id)
+            & context.context_child_revision_id.is_not_distinct_from(chosen.c.context_child_revision_id),
+        )
     )
-    expected = CustomImportWinner(
-        generation_id=generation.generation_id,
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        profile_slot=winner.profile_slot,
-        entity_binding_id=winner.entity_binding_id,
-        family_revision_id=winner.family_revision_id,
-        context_collection_slot=winner.context_collection_slot,
-        context_key_sha256=winner.context_key_sha256,
-        context_child_revision_id=winner.context_child_revision_id,
-    )
-    if existing is None:
-        _page_cost(request, [expected])
-        session.add(expected)
-        await _flush_page(session)
-    elif publication._model_document(existing) != publication._model_document(expected):
-        raise CandidateRunnerError("winner retry differs from its complete candidate group")
-    await _call(
-        session,
-        "commit_custom_import_build_winner_group",
-        (build_id, context_id),
-        ("profile_slot", "entity_binding_id", "context_key_sha256", "winner_count"),
-    )
+    return statement, (chosen.c.ordinal,), ()
 
 
 async def _write_winners(session_factory, request, registry, build_id, generation):
@@ -363,25 +568,32 @@ async def _write_winners(session_factory, request, registry, build_id, generatio
             )
         )
         async with _session(session_factory) as session:
-
-            def _reduce_next(sync_session):
-                group = _next_group(sync_session, request, build_id, after)
-                return (
-                    None
-                    if group is None
-                    else _reduce_group(sync_session, request, registry, build_id, generation, group)
-                )
-
-            selected = await session.run_sync(_reduce_next)
-        if selected is None:
+            selected, page_sizes = await session.run_sync(
+                lambda sync: _winner_batch(sync, request, registry, build_id, generation, after)
+            )
+        if not selected:
             return
-        winner, context_id = selected
+        # Both immutable read streams and their session are closed before this
+        # clean write page. Uncertain commits restart from the durable snapshot.
         async with _page_session(session_factory, request, build_id) as (session, _build):
-            await _store_winner(session, request, build_id, generation, winner, context_id)
+            await _typed_call(
+                session,
+                "winner_batch_finalize",
+                (
+                    ("bigint", build_id),
+                    ("bigint[]", selected),
+                    ("smallint", None if after is None else after[0]),
+                    ("bigint", None if after is None else after[1]),
+                    ("bytea", None if after is None else after[2]),
+                    ("integer[]", page_sizes),
+                ),
+            )
 
 
 def _verify_page(session, request, build_id):
     with _read_transaction(session, request, build_id) as (_build, deadline):
+        _build_storage_models(session, build_id)
+        _prepare_read(session, request, deadline)
         declared_schema = CustomImportBuildAttempt.__table__.schema
         schema_map = session.connection().get_execution_options().get("schema_translate_map") or {}
         schema = schema_map.get(declared_schema, declared_schema)
@@ -428,10 +640,11 @@ def _proof_matches(build, generation, proof):
 
 def _hash_models(session, request, build_id, digests, section, statement, keys, model):
     count = 0
-    for (row,) in _read_rows(session, request, build_id, statement, keys, (model,)):
+    for (row,) in _read_rows(session, request, build_id, statement, keys, (model,), bounds=_ReadPage(physical=True)):
         for digest in digests:
             publication._add_digest_record(digest, section, publication._materialization_document(row))
         count += 1
+        del row
     return count
 
 
@@ -501,170 +714,188 @@ def _shape_material(session, request, build_id, digests):
     return profile_count
 
 
-def _verify_projections(session, request, build_id, expected, statement, model, keys, *, reserve_bytes=0):
-    actual_scalars = (
-        row
-        for (row,) in _read_rows(
-            session, request, build_id, statement, keys, (model,), bounds=_ReadPage(reserve_bytes=reserve_bytes)
-        )
-    )
-    for left, right in zip_longest(actual_scalars, expected):
-        if (
-            left is None
-            or right is None
-            or any(getattr(left, column.name) != getattr(right, column.name) for column in model.__table__.columns)
-        ):
-            raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
-
-
-def _verified_root(session, request, build_id, root, root_record, binding, retained_bytes):
+def _verified_root(request, root, root_record, binding):
     root_values = stored_root_values(request, root_record, root, binding)
     if (
         digest_text("root-payload", root.canonical_payload) != bytes(root.payload_sha256)
         or record_payload(request.definition.root_fields, root_values) != root.canonical_payload
     ):
         raise CandidateRunnerError("frozen root payload digest differs")
-    scalars = material.project_root_scalars(
-        request.definition,
-        root_target=material.RootScalarTarget(
-            request.dataset_id, request.schema_revision_id, root_record.root_record_id, root.root_revision_id
-        ),
-        root_values=root_values,
-    )
-    expected = material.scalar_projection_models(request.definition, root_scalars=scalars)
-    _verify_projections(
-        session,
-        request,
-        build_id,
-        sorted(expected, key=lambda scalar: scalar.field_slot),
-        select(CustomImportRootScalar).where(CustomImportRootScalar.root_revision_id == root.root_revision_id),
-        CustomImportRootScalar,
-        (CustomImportRootScalar.field_slot,),
-        reserve_bytes=retained_bytes,
-    )
     return root_values
 
 
-def _verified_child_documents(session, request, registry, plan, root_record, retained_bytes, collection, child_counter):
-    statement, keys = _child_statement(
-        plan, request.definition, canonical=True, collection_slot=registry.child_collection_slots[collection]
+def _family_query(models, build_id, generation, after):
+    """Load one root page and its plans in the persisted materialization order."""
+
+    plan, record = models[CustomImportBuildFamily], models[CustomImportRootRecord]
+    statement = publication._family_material_statement(generation, models=models).add_columns(plan)
+    statement = statement.outerjoin(plan, (plan.build_id == build_id) & (plan.root_record_id == record.root_record_id))
+    if after is not None:
+        statement = statement.where(record.logical_key_sha256 > after)
+    row_models = tuple(
+        models[model]
+        for model in (
+            CustomImportGenerationFamily,
+            CustomImportFamilyRevision,
+            CustomImportRootRevision,
+            CustomImportRootRecord,
+            CustomImportEntityBinding,
+            CustomImportBuildFamily,
+        )
     )
-    for (child,) in _read_rows(
-        session,
-        request,
-        plan.build_id,
-        statement,
-        keys,
-        (CustomImportChildRevision,),
-        bounds=_ReadPage(reserve_bytes=retained_bytes, row_limit=1),
-    ):
-        child_values = payload_values(
-            fields_by_collection(request.definition)[collection], child.canonical_payload, label="frozen child payload"
-        )
-        verify_stored_child(request, root_record, StoredCandidateChild(collection, child, child_values))
-        if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
-            raise CandidateRunnerError("frozen child payload digest differs")
-        scalars = material.project_child_scalars(
-            request.definition,
-            collection=collection,
-            child_target=material.ChildScalarTarget(
-                request.dataset_id,
-                request.schema_revision_id,
-                root_record.root_record_id,
-                child.collection_slot,
-                child.child_revision_id,
-            ),
-            child_values=child_values,
-            child_collection_slots=registry.child_collection_slots,
-        )
-        expected = material.scalar_projection_models(
-            request.definition, child_scalars=scalars, child_collection_slots=registry.child_collection_slots
-        )
-        _verify_projections(
+    return statement, (record.logical_key_sha256,), row_models
+
+
+def _family_children_query(models, generation, root_ids):
+    """Feed the shared reducer all selected children in canonical family order."""
+
+    child, record = models[CustomImportChildRevision], models[CustomImportRootRecord]
+    collection = CustomImportChildCollection
+    statement = publication._family_child_material_statement(generation, models=models).outerjoin(
+        collection,
+        (collection.dataset_id == child.dataset_id)
+        & (collection.schema_revision_id == child.schema_revision_id)
+        & (collection.collection_slot == child.collection_slot),
+    )
+    statement = statement.with_only_columns(
+        record.root_record_id,
+        func.coalesce(collection.collection_name, ""),
+        child,
+        collection.collection_slot.is_not(None),
+        maintain_column_froms=True,
+    ).where(record.root_record_id == any_(bindparam("root_ids", root_ids, type_=ARRAY(BigInteger))))
+    keys = (
+        record.root_record_id,
+        func.coalesce(collection.collection_name, "").collate("C"),
+        child.child_key_sha256,
+        child.child_revision_id,
+    )
+    return statement, keys, (child, collection)
+
+
+def _family_child_rows(session, request, build_id, generation, family_records):
+    """Reserve the root page and stream children, checking each logical root/child pair."""
+    root_bytes_by_id = {
+        family_record[3].root_record_id: _model_bytes(family_record) for family_record in family_records
+    }
+    reserved_bytes = sum(
+        root_bytes_by_id[family_record[3].root_record_id]
+        + 128
+        + 16 * sum(len(model.__table__.columns) for model in family_record)
+        for family_record in family_records
+    ) + max(root_bytes_by_id.values())
+    with closing(
+        _output_rows(
             session,
             request,
-            plan.build_id,
-            sorted(expected, key=lambda scalar: scalar.field_slot),
-            select(CustomImportChildScalar).where(CustomImportChildScalar.child_revision_id == child.child_revision_id),
-            CustomImportChildScalar,
-            (CustomImportChildScalar.field_slot,),
-            reserve_bytes=retained_bytes + _model_bytes((child,)),
+            build_id,
+            lambda models: _family_children_query(models, generation, tuple(root_bytes_by_id)),
+            bounds=_ReadPage(
+                reserve_bytes=reserved_bytes,
+                row_limit=(MAX_BATCH_ROWS - len(family_records) - 1) // 2,
+            ),
         )
-        next(child_counter)
-        yield bytes(child.child_key_sha256), child.canonical_child_key, child.canonical_payload
+    ) as children:
+        for child_row in children:
+            root_id, collection, child, _valid = child_row
+            if root_id not in root_bytes_by_id or child is None:
+                raise CandidateRunnerError("frozen child stream contains an unexpected family or collection")
+            if (
+                root_bytes_by_id[root_id] + _model_bytes((child,)) + len(collection.encode("utf-8"))
+                > request.page_byte_limit
+            ):
+                raise CandidateRunnerError("one build record exceeds the admitted byte page")
+            yield child_row
+            del child_row, child
 
 
-def _verify_family(session, request, registry, build_id, family, root, root_record, binding):
-    retained_bytes = _model_bytes((family, root, root_record, binding))
-    root_values = _verified_root(session, request, build_id, root, root_record, binding, retained_bytes)
-    plan = _one_row(
-        session,
-        request,
-        build_id,
-        select(CustomImportBuildFamily).where(
-            CustomImportBuildFamily.build_id == build_id,
-            CustomImportBuildFamily.root_record_id == root_record.root_record_id,
-        ),
-        (CustomImportBuildFamily.root_record_id,),
-        (CustomImportBuildFamily,),
-    )[0]
-    child_counter = count()
-    documents_by_collection = {
-        collection.name: _verified_child_documents(
-            session, request, registry, plan, root_record, retained_bytes, collection.name, child_counter
-        )
-        for collection in request.definition.child_collections
-    }
-    digest = new_family_hash_ordered(request.definition, root_values, documents_by_collection)
-    if next(child_counter) != family.child_count or digest != bytes(family.family_sha256):
-        raise CandidateRunnerError("frozen family digest or child count differs")
+def _verify_family_page(session, request, registry, build_id, generation, family_records):
+    """Reuse graph's reducer with one cross-root child stream, never a family child list."""
+    if any(row[5] is None or row[5].family_revision_id != row[1].family_revision_id for row in family_records):
+        raise CandidateRunnerError("frozen family differs from its selected plan")
+    with closing(_family_child_rows(session, request, build_id, generation, family_records)) as children:
+        groups, pending = groupby(children, key=lambda row: (row[0], row[1])), deque()
+        for _member, family, root, root_record, binding, plan in sorted(
+            family_records, key=lambda family_record: family_record[3].root_record_id
+        ):
+            _require_budget(session.info["custom_import_build_read_deadline"])
+            family_input = _FamilyInput(
+                plan,
+                root,
+                root_record,
+                _verified_root(request, root, root_record, binding),
+                bytes(family.family_sha256),
+                family.child_count,
+                None,
+            )
+            actual = _source_input_with_digest(request, registry, family_input, groups, pending)
+            if actual.child_count != family_input.child_count or actual.family_sha256 != family_input.family_sha256:
+                raise CandidateRunnerError("frozen family digest or child count differs")
+            _require_budget(session.info["custom_import_build_read_deadline"])
+            del actual, family_input
+        if pending or next(groups, None) is not None:
+            raise CandidateRunnerError("frozen child stream contains an unexpected family or collection")
 
 
 def _family_material(session, request, registry, build_id, generation, digests):
-    family_count = 0
-    family_models = (
-        CustomImportGenerationFamily,
-        CustomImportFamilyRevision,
-        CustomImportRootRevision,
-        CustomImportRootRecord,
-        CustomImportEntityBinding,
-    )
-    for family_record in _read_rows(
-        session,
-        request,
-        build_id,
-        publication._family_material_statement(generation),
-        (CustomImportRootRecord.logical_key_sha256,),
-        family_models,
-        bounds=_ReadPage(row_limit=1),
-    ):
-        _membership, family, root, root_record, binding = family_record
-        _verify_family(session, request, registry, build_id, family, root, root_record, binding)
-        for index, digest in enumerate(digests):
-            publication._add_family_revision_material(digest, family_record, {}, effective_output=bool(index))
-        family_count += 1
-    return family_count
+    family_count, after = 0, None
+    while True:
+        family_records = list(
+            _output_rows(
+                session,
+                request,
+                build_id,
+                lambda models: _family_query(models, build_id, generation, after),
+                bounds=_ReadPage(
+                    row_limit=max(1, MAX_BATCH_ROWS // 2), reserve_bytes=MAX_BATCH_BYTES // 2, single_page=True
+                ),
+            )
+        )
+        if not family_records:
+            return family_count
+        while True:
+            try:
+                _verify_family_page(session, request, registry, build_id, generation, family_records)
+                break
+            except CandidateRunnerError as exc:
+                if str(exc) != "one build record exceeds the admitted byte page" or len(family_records) == 1:
+                    raise
+                del family_records[max(1, len(family_records) // 2) :]
+        for family_record in family_records:
+            _require_budget(session.info["custom_import_build_read_deadline"])
+            for index, digest in enumerate(digests):
+                publication._add_family_revision_material(digest, family_record[:5], {}, effective_output=bool(index))
+        family_count += len(family_records)
+        after = bytes(family_records[-1][3].logical_key_sha256)
+        del family_records, family_record
 
 
 def _child_material(session, request, build_id, generation, digests):
     child_count = 0
-    child_models = (
-        CustomImportGenerationFamily,
-        CustomImportFamilyChild,
-        CustomImportChildRevision,
-        CustomImportRootRecord,
-    )
-    for _member, edge, child, root_record in _read_rows(
+
+    def query(models):
+        """Keep child material in the existing root, collection, and key order."""
+        row_models = tuple(
+            models[model]
+            for model in (
+                CustomImportGenerationFamily,
+                CustomImportFamilyChild,
+                CustomImportChildRevision,
+                CustomImportRootRecord,
+            )
+        )
+        keys = (
+            models[CustomImportRootRecord].logical_key_sha256,
+            models[CustomImportFamilyChild].collection_slot,
+            models[CustomImportChildRevision].child_key_sha256,
+        )
+        return publication._family_child_material_statement(generation, models=models), keys, row_models
+
+    for _member, edge, child, root_record in _output_rows(
         session,
         request,
         build_id,
-        publication._family_child_material_statement(generation),
-        (
-            CustomImportRootRecord.logical_key_sha256,
-            CustomImportFamilyChild.collection_slot,
-            CustomImportChildRevision.child_key_sha256,
-        ),
-        child_models,
+        query,
     ):
         if child.canonical_parent_key != root_record.canonical_logical_key or bytes(child.parent_key_sha256) != bytes(
             root_record.logical_key_sha256
@@ -687,65 +918,129 @@ def _child_material(session, request, build_id, generation, digests):
             )
             publication._add_digest_record(digest, "child_revision", document)
         child_count += 1
+        del _member, edge, child, root_record, document
     return child_count
 
 
-def _root_scalar_material(session, request, build_id, generation, digests):
-    root_scalars = 0
-    for _member, _family, scalar, root_record in _read_rows(
-        session,
-        request,
-        build_id,
-        publication._root_scalar_material_statement(generation),
-        (CustomImportRootRecord.logical_key_sha256, CustomImportRootScalar.field_slot),
-        (CustomImportGenerationFamily, CustomImportFamilyRevision, CustomImportRootScalar, CustomImportRootRecord),
-    ):
-        for digest in digests:
-            publication._add_digest_record(
-                digest,
-                "root_scalar",
-                {
-                    "root_key_sha256": bytes(root_record.logical_key_sha256).hex(),
-                    "scalar": publication._materialization_document(scalar),
-                },
-            )
-        root_scalars += 1
-    return root_scalars
+def _projection_query(models, generation, *, child):
+    """Keep every selected revision visible, even when all its scalars are missing."""
+
+    record = models[CustomImportRootRecord]
+    revision = models[CustomImportChildRevision if child else CustomImportRootRevision]
+    scalar = models[CustomImportChildScalar if child else CustomImportRootScalar]
+    revision_id = revision.child_revision_id if child else revision.root_revision_id
+    scalar_id = scalar.child_revision_id if child else scalar.root_revision_id
+    statement = (
+        publication._family_child_material_statement(generation, models=models)
+        if child
+        else publication._family_material_statement(generation, models=models)
+    )
+    # Compare every scalar column below. Joining only on revision identity also
+    # exposes rows with wrong dataset/schema ownership instead of filtering them.
+    statement = statement.outerjoin(scalar, scalar_id == revision_id).with_only_columns(
+        scalar, revision, record.logical_key_sha256, maintain_column_froms=True
+    )
+    keys = (record.logical_key_sha256,)
+    if child:
+        keys += (models[CustomImportFamilyChild].collection_slot, revision.child_key_sha256)
+    return statement, (*keys, func.coalesce(scalar.field_slot, 0)), (scalar, revision, record)
 
 
-def _child_scalar_material(session, request, build_id, generation, digests):
-    child_scalars = 0
-    for _member, _edge, scalar, child, root_record in _read_rows(
-        session,
-        request,
-        build_id,
-        publication._child_scalar_material_statement(generation),
-        (
-            CustomImportRootRecord.logical_key_sha256,
-            CustomImportFamilyChild.collection_slot,
-            CustomImportChildRevision.child_key_sha256,
-            CustomImportChildScalar.field_slot,
-        ),
-        (
-            CustomImportGenerationFamily,
-            CustomImportFamilyChild,
-            CustomImportChildScalar,
-            CustomImportChildRevision,
-            CustomImportRootRecord,
-        ),
+def _expected_projections(request, registry, revision, *, child):
+    if child:
+        collection = next(
+            name for name, slot in registry.child_collection_slots.items() if slot == revision.collection_slot
+        )
+        values_by_field = payload_values(
+            fields_by_collection(request.definition)[collection],
+            revision.canonical_payload,
+            label="frozen child payload",
+        )
+        projections = material.project_child_scalars(
+            request.definition,
+            collection=collection,
+            child_target=material.ChildScalarTarget(
+                request.dataset_id,
+                request.schema_revision_id,
+                revision.root_record_id,
+                revision.collection_slot,
+                revision.child_revision_id,
+            ),
+            child_values=values_by_field,
+            child_collection_slots=registry.child_collection_slots,
+        )
+        expected = material.scalar_projection_models(
+            request.definition, child_scalars=projections, child_collection_slots=registry.child_collection_slots
+        )
+    else:
+        values_by_field = payload_values(
+            request.definition.root_fields, revision.canonical_payload, label="frozen root payload"
+        )
+        projections = material.project_root_scalars(
+            request.definition,
+            root_target=material.RootScalarTarget(
+                request.dataset_id, request.schema_revision_id, revision.root_record_id, revision.root_revision_id
+            ),
+            root_values=values_by_field,
+        )
+        expected = material.scalar_projection_models(request.definition, root_scalars=projections)
+    return sorted(expected, key=lambda scalar: scalar.field_slot)
+
+
+def _verified_projection_rows(session, request, registry, build_id, generation, *, child):
+    """Compare the bounded scalar stream without retaining payloads across pages."""
+
+    model = CustomImportChildScalar if child else CustomImportRootScalar
+    previous_id, seen, expected_count = None, 0, 0
+    with closing(
+        _output_rows(session, request, build_id, lambda models: _projection_query(models, generation, child=child))
+    ) as projection_records:
+        for scalar, revision, root_key in projection_records:
+            revision_id = revision.child_revision_id if child else revision.root_revision_id
+            if revision_id != previous_id:
+                if seen != expected_count:
+                    raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
+                previous_id, seen = revision_id, 0
+            # Recompute the at-most-20 hot fields within this admitted tuple;
+            # do not retain a projection page while the next page is read.
+            expected = _expected_projections(request, registry, revision, child=child)
+            expected_count = len(expected)
+            if scalar is None and not expected:
+                del expected, scalar, revision, root_key
+                continue
+            if (
+                scalar is None
+                or seen >= expected_count
+                or any(
+                    getattr(scalar, column.name) != getattr(expected[seen], column.name)
+                    for column in model.__table__.columns
+                )
+            ):
+                raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
+            seen += 1
+            del expected
+            yield scalar, revision, root_key
+            del scalar, revision, root_key
+    if seen != expected_count:
+        raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
+
+
+def _scalar_material(session, request, registry, build_id, generation, digests, *, child):
+    scalar_count = 0
+    for scalar, revision, root_key in _verified_projection_rows(
+        session, request, registry, build_id, generation, child=child
     ):
+        document_by_field = {
+            "root_key_sha256": bytes(root_key).hex(),
+            "scalar": publication._materialization_document(scalar),
+        }
+        if child:
+            document_by_field["child_key_sha256"] = bytes(revision.child_key_sha256).hex()
         for digest in digests:
-            publication._add_digest_record(
-                digest,
-                "child_scalar",
-                {
-                    "child_key_sha256": bytes(child.child_key_sha256).hex(),
-                    "root_key_sha256": bytes(root_record.logical_key_sha256).hex(),
-                    "scalar": publication._materialization_document(scalar),
-                },
-            )
-        child_scalars += 1
-    return child_scalars
+            publication._add_digest_record(digest, "child_scalar" if child else "root_scalar", document_by_field)
+        scalar_count += 1
+        del scalar, revision, root_key, document_by_field
+    return scalar_count
 
 
 def _graph_material(session, request, registry, build_id, generation, material_digest, effective_digest):
@@ -753,8 +1048,8 @@ def _graph_material(session, request, registry, build_id, generation, material_d
     return (
         _family_material(session, request, registry, build_id, generation, digests),
         _child_material(session, request, build_id, generation, digests),
-        _root_scalar_material(session, request, build_id, generation, digests),
-        _child_scalar_material(session, request, build_id, generation, digests),
+        _scalar_material(session, request, registry, build_id, generation, digests, child=False),
+        _scalar_material(session, request, registry, build_id, generation, digests, child=True),
     )
 
 
@@ -762,30 +1057,32 @@ def _verify_winner_groups(session, request, registry, build_id, generation):
     return sum(1 for _ in _ordered_winners(session, request, registry, build_id, generation, verify=True))
 
 
+def _winner_query(models, generation):
+    winner = models[CustomImportWinner]
+    binding = models[CustomImportEntityBinding]
+    root = models[CustomImportRootRecord]
+    child = models[CustomImportChildRevision]
+    family = models[CustomImportFamilyRevision]
+    keys = (
+        winner.profile_slot,
+        binding.adapter_id,
+        binding.value_sha256,
+        binding.canonical_value,
+        root.key_contract_sha256,
+        root.logical_key_sha256,
+        func.coalesce(child.child_key_sha256, b""),
+        family.family_sha256,
+        winner.context_collection_slot,
+        winner.context_key_sha256,
+    )
+    row_models = (winner, binding, family, root, child, CustomImportSelectionProfile)
+    return publication._winner_material_statement(generation, models=models), keys, row_models
+
+
 def _winner_material(session, request, build_id, generation, digests):
     count = 0
-    keys = (
-        CustomImportWinner.profile_slot,
-        CustomImportEntityBinding.adapter_id,
-        CustomImportEntityBinding.value_sha256,
-        CustomImportEntityBinding.canonical_value,
-        CustomImportRootRecord.key_contract_sha256,
-        CustomImportRootRecord.logical_key_sha256,
-        func.coalesce(CustomImportChildRevision.child_key_sha256, b""),
-        CustomImportFamilyRevision.family_sha256,
-        CustomImportWinner.context_collection_slot,
-        CustomImportWinner.context_key_sha256,
-    )
-    models = (
-        CustomImportWinner,
-        CustomImportEntityBinding,
-        CustomImportFamilyRevision,
-        CustomImportRootRecord,
-        CustomImportChildRevision,
-        CustomImportSelectionProfile,
-    )
-    for winner, binding, family, root, child, profile in _read_rows(
-        session, request, build_id, publication._winner_material_statement(generation), keys, models
+    for winner, binding, family, root, child, profile in _output_rows(
+        session, request, build_id, lambda models: _winner_query(models, generation)
     ):
         if winner.context_collection_slot != (profile.context_collection_slot or 0):
             raise CandidateRunnerError("winner scope differs from immutable profile")
@@ -799,6 +1096,7 @@ def _winner_material(session, request, build_id, generation, digests):
             publication._add_digest_record(digest, "winner", document)
             publication._add_digest_record(digest, "winner_binding", publication._materialization_document(binding))
         count += 1
+        del winner, binding, family, root, child, profile, document
     return count
 
 
@@ -844,33 +1142,24 @@ def _identity_material(session, request, build_id, generation, digest, effective
 
 
 def _attempt_material(session, request, build_id, digest):
-    _hash_models(
-        session,
-        request,
-        build_id,
-        (digest,),
-        "pack",
-        select(CustomImportPack).where(
-            CustomImportPack.execution_id == request.execution_id,
-            CustomImportPack.producing_fence == request.fence,
-            CustomImportPack.producing_token_sha256 == lease_token_sha256(request.lease_token),
+    for section, model in (("pack", CustomImportPack), ("rejection", CustomImportRejection)):
+        rows = _output_rows(session, request, build_id, lambda models: _attempt_query(models, request, model))
+        for (row,) in rows:
+            publication._add_digest_record(digest, section, publication._materialization_document(row))
+            del row
+
+
+def _attempt_query(models, request, model):
+    row = models[model]
+    keys = (row.stream_slot, row.pack_ordinal) if model is CustomImportPack else (row.rejection_ordinal,)
+    return (
+        select(row).where(
+            row.execution_id == request.execution_id,
+            row.producing_fence == request.fence,
+            row.producing_token_sha256 == lease_token_sha256(request.lease_token),
         ),
-        (CustomImportPack.stream_slot, CustomImportPack.pack_ordinal),
-        CustomImportPack,
-    )
-    _hash_models(
-        session,
-        request,
-        build_id,
-        (digest,),
-        "rejection",
-        select(CustomImportRejection).where(
-            CustomImportRejection.execution_id == request.execution_id,
-            CustomImportRejection.producing_fence == request.fence,
-            CustomImportRejection.producing_token_sha256 == lease_token_sha256(request.lease_token),
-        ),
-        (CustomImportRejection.rejection_ordinal,),
-        CustomImportRejection,
+        keys,
+        (row,),
     )
 
 
@@ -878,7 +1167,7 @@ def _frozen_materialization(session, request, registry, build_id, generation, pr
     with _read_transaction(session, request, build_id) as (build, _deadline):
         _proof_matches(build, generation, proof)
     source_digest = _source_digest(session, request, build_id, generation.capture_bundle_id)
-    candidate_digest, candidate_count = _candidate_digest(session, request, build_id)
+    candidate_digest, candidate_count = _candidate_digest(session, request, build_id, bounds=_ReadPage(physical=True))
     if (
         source_digest != bytes(generation.source_bundle_sha256)
         or candidate_digest != bytes(generation.candidate_sha256)
@@ -1058,6 +1347,25 @@ async def _replay(session_factory, request, build_id):
         )
 
 
+async def _freeze_output_snapshot(session_factory, request, build_id):
+    """Close candidate writes on normal completion and resumed verification."""
+
+    async with _page_session(session_factory, request, build_id) as (session, _build):
+        family_id = (
+            await _typed_call(
+                session,
+                "freeze_custom_import_snapshot_family",
+                (
+                    ("bigint", request.execution_id),
+                    ("bigint", request.fence),
+                    ("bytea", lease_token_sha256(request.lease_token)),
+                ),
+            )
+        ).scalar_one()
+        if type(family_id) is not int or not 0 < family_id < 2**63:
+            raise CandidateRunnerError("output snapshot freeze returned an invalid family identity")
+
+
 async def build_output(session_factory, request: SourceBuildRequest, build_id: int) -> BuildOutputResult:
     """Select all complete groups, _verify frozen content, and seal without activation."""
 
@@ -1074,10 +1382,13 @@ async def build_output(session_factory, request: SourceBuildRequest, build_id: i
             generation = await session.get(CustomImportGeneration, build.generation_id)
             session.expunge(generation)
         if build.phase == "output":
+            await _prepare_snapshot_indexes(session_factory, request, build_id, "output")
             await _attach_families(session_factory, request, build_id)
             await _write_winners(session_factory, request, registry, build_id, generation)
             async with _page_session(session_factory, request, build_id) as (session, _build):
                 await _call(session, "freeze_custom_import_build_output", (build_id,))
+        await _freeze_output_snapshot(session_factory, request, build_id)
+        await _prepare_snapshot_indexes(session_factory, request, build_id, "serving")
         while True:
             current = await _snapshot(session_factory, request, build_id)
             if current.phase == "verified":

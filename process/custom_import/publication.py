@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -63,6 +63,7 @@ from process.custom_import.execution import (
     lease_token_sha256,
     require_separate_publication_transaction,
 )
+from process.custom_import.storage_layout import snapshot_models
 
 PublicationKind = Literal["activated", "rolled_back", "no_change"]
 _GENERATION_SEAL_CONTRACT = "custom-import-generation-seal/v1"
@@ -91,6 +92,7 @@ class _FinalityScanWindow:
 
     expires_at: dt.datetime
     monotonic_deadline: float
+    statement_timeout: str = "0"
 
 
 @dataclass(frozen=True)
@@ -245,7 +247,9 @@ def _event_document(event_details: _PublicationEventDetails) -> tuple[str, bytes
     return canonical, bytes.fromhex(canonical_sha256(event_fields_by_name, domain="event"))
 
 
-def _event_details_from_event(event: CustomImportPublicationEvent) -> _PublicationEventDetails:
+def _event_details_from_event(
+    event: CustomImportPublicationEvent,
+) -> _PublicationEventDetails:
     return _PublicationEventDetails(
         dataset_id=event.dataset_id,
         definition_revision_id=event.definition_revision_id,
@@ -459,6 +463,7 @@ async def _finality_scan_window(
     session.info[_FINALITY_SCAN_WINDOW_KEY] = _FinalityScanWindow(
         expires_at=expires_at,
         monotonic_deadline=time.monotonic() + remaining_seconds,
+        statement_timeout=previous_statement_timeout,
     )
     has_operation_failed = False
     try:
@@ -491,15 +496,30 @@ def _current_finality_scan_window(session: AsyncSession) -> _FinalityScanWindow 
     return scan_window
 
 
-async def _prepare_bounded_materialization_statement(session: AsyncSession) -> None:
+async def _prepare_bounded_materialization_statement(
+    session: AsyncSession, *, reserve_for_authority: bool = False
+) -> None:
     """Set the remaining database statement budget before opening a stream."""
 
     scan_window = _current_finality_scan_window(session)
     if scan_window is None:
         return
     remaining_milliseconds = int((scan_window.monotonic_deadline - time.monotonic()) * 1_000)
+    if reserve_for_authority:
+        remaining_milliseconds //= 2
     if remaining_milliseconds <= 0:
         raise PublicationConflict("generation sealing exceeded its lease-bounded materialization window")
+    if reserve_for_authority:
+        await session.execute(
+            text(
+                "SELECT set_config('statement_timeout', "
+                "CAST(CAST(least(:remaining_milliseconds, "
+                "nullif(extract(epoch FROM CAST(CAST(:caller_timeout AS text) AS interval)) * 1000, 0)) "
+                "AS bigint) AS text), true)"
+            ),
+            {"remaining_milliseconds": remaining_milliseconds, "caller_timeout": scan_window.statement_timeout},
+        )
+        return
     await session.execute(select(func.set_config("statement_timeout", str(max(1, remaining_milliseconds)), True)))
 
 
@@ -651,7 +671,11 @@ _MATERIALIZATION_VOLATILE_COLUMNS = frozenset(
     }
 )
 _CAPTURE_MATERIALIZATION_COLUMNS = {
-    CustomImportCaptureBundle: ("canonical_manifest", "manifest_sha256", "stream_count"),
+    CustomImportCaptureBundle: (
+        "canonical_manifest",
+        "manifest_sha256",
+        "stream_count",
+    ),
     CustomImportCapture: (
         "stream_slot",
         "content_sha256",
@@ -698,7 +722,11 @@ def _new_digest(domain: str) -> hashlib._Hash:
 
 def _add_digest_record(digest: hashlib._Hash, section: str, document: dict[str, Any]) -> None:
     serialized = json.dumps(
-        document, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        document,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode("utf-8")
     digest.update(section.encode("ascii"))
     digest.update(b"\x00")
@@ -733,7 +761,10 @@ async def _capture_source_bundle_digest(
     _add_digest_record(
         digest,
         "bundle",
-        {"manifest_sha256": _json_value(bundle.manifest_sha256), "stream_count": bundle.stream_count},
+        {
+            "manifest_sha256": _json_value(bundle.manifest_sha256),
+            "stream_count": bundle.stream_count,
+        },
     )
     capture_stream_slots = await _add_capture_bundle_material(
         session,
@@ -850,22 +881,68 @@ def _require_exact_capture_coverage(
         raise PublicationConflict("capture bundle does not exactly cover the definition streams")
 
 
+def _materialization_model(models, canonical_model):
+    """Use an explicit frozen-family alias, or the existing standalone builder."""
+
+    return canonical_model if models is None else models[canonical_model]
+
+
+def _materialization_resolver(generation, sealed):
+    """Sealed rereads use immutable read authority, never a renewed writer lease."""
+
+    parameters_by_name = {
+        "generation_id": generation.generation_id,
+        "dataset_id": generation.dataset_id,
+        "definition_revision_id": generation.definition_revision_id,
+        "schema_revision_id": generation.schema_revision_id,
+    }
+    if sealed:
+        return "resolve_custom_import_generation_snapshot", parameters_by_name
+    parameters_by_name.update(
+        execution_id=generation.execution_id,
+        capture_bundle_id=generation.capture_bundle_id,
+        fence=generation.producing_fence,
+        token=generation.producing_token_sha256,
+    )
+    return "resolve_custom_import_generation_finality_snapshot", parameters_by_name
+
+
+async def _finality_materialization_models(session: AsyncSession, generation: CustomImportGeneration):
+    """Pin one exact frozen candidate before any materialization hot read."""
+
+    _require_transaction(session)
+    connection = await session.connection()
+    model_schema = CustomImportGeneration.__table__.schema
+    schema_map = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
+    schema = schema_map.get(model_schema, model_schema)
+    if not schema:
+        raise PublicationConflict("finality snapshot binding requires an explicit model schema")
+    quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+    seal = await session.get(CustomImportGenerationSeal, generation.generation_id)
+    resolver, parameters = _materialization_resolver(generation, seal is not None)
+    arguments = ", ".join(f"CAST(:{name} AS {'bytea' if name == 'token' else 'bigint'})" for name in parameters)
+    await _prepare_bounded_materialization_statement(session, reserve_for_authority=True)
+    family_id = (await session.execute(text(f"SELECT {quoted}.{resolver}({arguments})"), parameters)).scalar_one()
+    return None if family_id is None else snapshot_models(_positive_integer(family_id, "finality snapshot family id"))
+
+
 async def _materialization(session: AsyncSession, generation: CustomImportGeneration) -> _Materialization:
     """Recompute a canonical digest from precisely the rows serving a generation."""
 
+    models = await _finality_materialization_models(session, generation)
     source_bundle_sha256 = await _validated_source_bundle_digest(session, generation)
     digest = _new_digest(_MATERIALIZATION_DOMAIN)
     await _add_generation_identity_material(session, digest, generation)
     await _add_capture_material(session, digest, generation)
     profile_count = await _add_definition_shape_material(session, digest, generation)
 
-    await _add_execution_material(session, digest, generation)
+    await _add_execution_material(session, digest, generation, models=models)
 
-    family_count, family_child_count = await _add_family_material(session, digest, generation)
-    root_scalar_count = await _add_root_scalar_material(session, digest, generation)
-    child_scalar_count = await _add_child_scalar_material(session, digest, generation)
-    winner_count = await _add_winner_material(session, digest, generation)
-    effective_output_sha256 = await _effective_output_materialization(session, generation)
+    family_count, family_child_count = await _add_family_material(session, digest, generation, models=models)
+    root_scalar_count = await _add_root_scalar_material(session, digest, generation, models=models)
+    child_scalar_count = await _add_child_scalar_material(session, digest, generation, models=models)
+    winner_count = await _add_winner_material(session, digest, generation, models=models)
+    effective_output_sha256 = await _effective_output_materialization(session, generation, models=models)
     return _Materialization(
         source_bundle_sha256=source_bundle_sha256,
         materialization_sha256=digest.digest(),
@@ -884,6 +961,7 @@ async def _materialization(session: AsyncSession, generation: CustomImportGenera
 async def _effective_output_materialization(
     session: AsyncSession,
     generation: CustomImportGeneration,
+    models=None,
 ) -> bytes:
     """Hash served output independently of capture and execution evidence.
 
@@ -903,14 +981,16 @@ async def _effective_output_materialization(
         or schema_revision.dataset_id != generation.dataset_id
     ):
         raise PublicationConflict("generation definition or schema identity is missing")
+    if models is None:
+        models = await _finality_materialization_models(session, generation)
     digest = _new_digest(_EFFECTIVE_OUTPUT_DOMAIN)
     _add_digest_record(digest, "definition", _materialization_document(definition))
     _add_digest_record(digest, "schema", _materialization_document(schema_revision))
     await _add_definition_shape_material(session, digest, generation)
-    await _add_family_material(session, digest, generation, effective_output=True)
-    await _add_root_scalar_material(session, digest, generation)
-    await _add_child_scalar_material(session, digest, generation)
-    await _add_winner_material(session, digest, generation)
+    await _add_family_material(session, digest, generation, effective_output=True, models=models)
+    await _add_root_scalar_material(session, digest, generation, models=models)
+    await _add_child_scalar_material(session, digest, generation, models=models)
+    await _add_winner_material(session, digest, generation, models=models)
     return digest.digest()
 
 
@@ -992,7 +1072,9 @@ async def _stream_materialization_records(session: AsyncSession, statement: Any)
         await rows.close()
 
 
-def _generation_attempt_authority(generation: CustomImportGeneration) -> tuple[int, bytes]:
+def _generation_attempt_authority(
+    generation: CustomImportGeneration,
+) -> tuple[int, bytes]:
     """Return the immutable candidate's exact output-attempt fence/token."""
 
     if generation.producing_fence is None or generation.producing_token_sha256 is None:
@@ -1000,21 +1082,23 @@ def _generation_attempt_authority(generation: CustomImportGeneration) -> tuple[i
     return generation.producing_fence, bytes(generation.producing_token_sha256)
 
 
-def _pack_attempt_conditions(generation: CustomImportGeneration):
+def _pack_attempt_conditions(generation: CustomImportGeneration, *, models=None):
+    pack = _materialization_model(models, CustomImportPack)
     fence, token_sha256 = _generation_attempt_authority(generation)
     return (
-        CustomImportPack.execution_id == generation.execution_id,
-        CustomImportPack.producing_fence == fence,
-        CustomImportPack.producing_token_sha256 == token_sha256,
+        pack.execution_id == generation.execution_id,
+        pack.producing_fence == fence,
+        pack.producing_token_sha256 == token_sha256,
     )
 
 
-def _family_attempt_conditions(generation: CustomImportGeneration):
+def _family_attempt_conditions(generation: CustomImportGeneration, *, models=None):
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
     fence, token_sha256 = _generation_attempt_authority(generation)
     return (
-        CustomImportFamilyRevision.producing_execution_id == generation.execution_id,
-        CustomImportFamilyRevision.producing_fence == fence,
-        CustomImportFamilyRevision.producing_token_sha256 == token_sha256,
+        family_revision.producing_execution_id == generation.execution_id,
+        family_revision.producing_fence == fence,
+        family_revision.producing_token_sha256 == token_sha256,
     )
 
 
@@ -1144,160 +1228,191 @@ async def _add_execution_material(
     session: AsyncSession,
     digest: hashlib._Hash,
     generation: CustomImportGeneration,
+    models=None,
 ) -> None:
     """Add packs and rejection evidence bound to the producing execution."""
+
+    pack = _materialization_model(models, CustomImportPack)
+    rejection = _materialization_model(models, CustomImportRejection)
 
     await _add_materialization_rows(
         session,
         digest,
         "pack",
-        select(CustomImportPack)
+        select(pack)
         .where(
-            CustomImportPack.execution_id == generation.execution_id,
-            CustomImportPack.dataset_id == generation.dataset_id,
-            CustomImportPack.definition_revision_id == generation.definition_revision_id,
-            CustomImportPack.schema_revision_id == generation.schema_revision_id,
-            CustomImportPack.capture_bundle_id == generation.capture_bundle_id,
-            *_pack_attempt_conditions(generation),
+            pack.execution_id == generation.execution_id,
+            pack.dataset_id == generation.dataset_id,
+            pack.definition_revision_id == generation.definition_revision_id,
+            pack.schema_revision_id == generation.schema_revision_id,
+            pack.capture_bundle_id == generation.capture_bundle_id,
+            *_pack_attempt_conditions(generation, models=models),
         )
-        .order_by(CustomImportPack.stream_slot, CustomImportPack.pack_ordinal),
+        .order_by(pack.stream_slot, pack.pack_ordinal),
     )
     await _add_materialization_rows(
         session,
         digest,
         "rejection",
-        select(CustomImportRejection)
+        select(rejection)
         .where(
-            CustomImportRejection.execution_id == generation.execution_id,
-            CustomImportRejection.dataset_id == generation.dataset_id,
-            CustomImportRejection.definition_revision_id == generation.definition_revision_id,
-            CustomImportRejection.schema_revision_id == generation.schema_revision_id,
-            CustomImportRejection.producing_fence == generation.producing_fence,
-            CustomImportRejection.producing_token_sha256 == generation.producing_token_sha256,
+            rejection.execution_id == generation.execution_id,
+            rejection.dataset_id == generation.dataset_id,
+            rejection.definition_revision_id == generation.definition_revision_id,
+            rejection.schema_revision_id == generation.schema_revision_id,
+            rejection.producing_fence == generation.producing_fence,
+            rejection.producing_token_sha256 == generation.producing_token_sha256,
         )
-        .order_by(CustomImportRejection.rejection_ordinal),
+        .order_by(rejection.rejection_ordinal),
     )
 
 
-def _join_generation_family_revision(statement: Any) -> Any:
+def _join_generation_family_revision(statement: Any, *, models=None) -> Any:
     """Join a generation-family link to its immutable family revision."""
 
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+
     return statement.join(
-        CustomImportFamilyRevision,
+        family_revision,
         and_(
-            CustomImportFamilyRevision.family_revision_id == CustomImportGenerationFamily.family_revision_id,
-            CustomImportFamilyRevision.dataset_id == CustomImportGenerationFamily.dataset_id,
+            family_revision.family_revision_id == generation_family.family_revision_id,
+            family_revision.dataset_id == generation_family.dataset_id,
         ),
     )
 
 
-def _join_family_root_revision(statement: Any) -> Any:
+def _join_family_root_revision(statement: Any, *, models=None) -> Any:
     """Join a family revision to its root revision."""
 
+    root_revision = _materialization_model(models, CustomImportRootRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+
     return statement.join(
-        CustomImportRootRevision,
+        root_revision,
         and_(
-            CustomImportRootRevision.root_revision_id == CustomImportFamilyRevision.root_revision_id,
-            CustomImportRootRevision.dataset_id == CustomImportFamilyRevision.dataset_id,
+            root_revision.root_revision_id == family_revision.root_revision_id,
+            root_revision.dataset_id == family_revision.dataset_id,
         ),
     )
 
 
-def _join_root_revision_pack(statement: Any, root_pack: Any) -> Any:
+def _join_root_revision_pack(statement: Any, root_pack: Any, *, models=None) -> Any:
     """Join a root revision to the fenced pack that produced it."""
+
+    root_revision = _materialization_model(models, CustomImportRootRevision)
 
     return statement.join(
         root_pack,
         and_(
-            root_pack.pack_id == CustomImportRootRevision.pack_id,
-            root_pack.dataset_id == CustomImportRootRevision.dataset_id,
-            root_pack.definition_revision_id == CustomImportRootRevision.definition_revision_id,
-            root_pack.schema_revision_id == CustomImportRootRevision.schema_revision_id,
+            root_pack.pack_id == root_revision.pack_id,
+            root_pack.dataset_id == root_revision.dataset_id,
+            root_pack.definition_revision_id == root_revision.definition_revision_id,
+            root_pack.schema_revision_id == root_revision.schema_revision_id,
         ),
     )
 
 
-def _join_generation_family_root_record(statement: Any) -> Any:
+def _join_generation_family_root_record(statement: Any, *, models=None) -> Any:
     """Join a selected family link to its interned root identity."""
 
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+
     return statement.join(
-        CustomImportRootRecord,
+        root_record,
         and_(
-            CustomImportRootRecord.root_record_id == CustomImportGenerationFamily.root_record_id,
-            CustomImportRootRecord.dataset_id == CustomImportGenerationFamily.dataset_id,
+            root_record.root_record_id == generation_family.root_record_id,
+            root_record.dataset_id == generation_family.dataset_id,
         ),
     )
 
 
-def _join_family_root_record(statement: Any) -> Any:
+def _join_family_root_record(statement: Any, *, models=None) -> Any:
     """Join a family revision to its interned root identity."""
 
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+
     return statement.join(
-        CustomImportRootRecord,
+        root_record,
         and_(
-            CustomImportRootRecord.root_record_id == CustomImportFamilyRevision.root_record_id,
-            CustomImportRootRecord.dataset_id == CustomImportFamilyRevision.dataset_id,
+            root_record.root_record_id == family_revision.root_record_id,
+            root_record.dataset_id == family_revision.dataset_id,
         ),
     )
 
 
-def _join_family_entity_binding(statement: Any) -> Any:
+def _join_family_entity_binding(statement: Any, *, models=None) -> Any:
     """Join a family revision to its immutable entity binding."""
 
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
     return statement.join(
-        CustomImportEntityBinding,
+        entity_binding,
         and_(
-            CustomImportEntityBinding.entity_binding_id == CustomImportFamilyRevision.entity_binding_id,
-            CustomImportEntityBinding.dataset_id == CustomImportFamilyRevision.dataset_id,
+            entity_binding.entity_binding_id == family_revision.entity_binding_id,
+            entity_binding.dataset_id == family_revision.dataset_id,
         ),
     )
 
 
-def _join_family_child(statement: Any) -> Any:
+def _join_family_child(statement: Any, *, models=None) -> Any:
     """Join a family revision to its retained child link."""
 
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+
     return statement.join(
-        CustomImportFamilyChild,
+        family_child,
         and_(
-            CustomImportFamilyChild.family_revision_id == CustomImportGenerationFamily.family_revision_id,
-            CustomImportFamilyChild.dataset_id == CustomImportGenerationFamily.dataset_id,
+            family_child.family_revision_id == generation_family.family_revision_id,
+            family_child.dataset_id == generation_family.dataset_id,
         ),
     )
 
 
-def _join_family_child_revision(statement: Any) -> Any:
+def _join_family_child_revision(statement: Any, *, models=None) -> Any:
     """Join a family child link to its immutable child revision."""
 
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+
     return statement.join(
-        CustomImportChildRevision,
+        child_revision,
         and_(
-            CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id,
-            CustomImportChildRevision.dataset_id == CustomImportFamilyChild.dataset_id,
+            child_revision.child_revision_id == family_child.child_revision_id,
+            child_revision.dataset_id == family_child.dataset_id,
         ),
     )
 
 
-def _join_child_revision_pack(statement: Any, child_pack: Any) -> Any:
+def _join_child_revision_pack(statement: Any, child_pack: Any, *, models=None) -> Any:
     """Join a child revision to the fenced pack that produced it."""
+
+    child_revision = _materialization_model(models, CustomImportChildRevision)
 
     return statement.join(
         child_pack,
         and_(
-            child_pack.pack_id == CustomImportChildRevision.pack_id,
-            child_pack.dataset_id == CustomImportChildRevision.dataset_id,
-            child_pack.definition_revision_id == CustomImportChildRevision.definition_revision_id,
-            child_pack.schema_revision_id == CustomImportChildRevision.schema_revision_id,
+            child_pack.pack_id == child_revision.pack_id,
+            child_pack.dataset_id == child_revision.dataset_id,
+            child_pack.definition_revision_id == child_revision.definition_revision_id,
+            child_pack.schema_revision_id == child_revision.schema_revision_id,
         ),
     )
 
 
-def _where_generation_family_attempt(statement: Any, generation: CustomImportGeneration) -> Any:
+def _where_generation_family_attempt(statement: Any, generation: CustomImportGeneration, *, models=None) -> Any:
     """Keep a materialization relation within its selected producing attempt."""
 
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+
     return statement.where(
-        CustomImportGenerationFamily.generation_id == generation.generation_id,
-        CustomImportGenerationFamily.dataset_id == generation.dataset_id,
-        *_family_attempt_conditions(generation),
+        generation_family.generation_id == generation.generation_id,
+        generation_family.dataset_id == generation.dataset_id,
+        *_family_attempt_conditions(generation, models=models),
     )
 
 
@@ -1311,92 +1426,115 @@ def _where_pack_attempt(statement: Any, pack: Any, generation: CustomImportGener
     )
 
 
-def _root_identity_order() -> tuple[Any, ...]:
+def _root_identity_order(*, models=None) -> tuple[Any, ...]:
     """Return canonical root identity tie breakers shared by graph queries."""
 
+    root_record = _materialization_model(models, CustomImportRootRecord)
+
     return (
-        CustomImportRootRecord.key_contract_sha256,
-        CustomImportRootRecord.logical_key_sha256,
-        CustomImportRootRecord.canonical_logical_key,
+        root_record.key_contract_sha256,
+        root_record.logical_key_sha256,
+        root_record.canonical_logical_key,
     )
 
 
-def _family_material_order() -> tuple[Any, ...]:
+def _family_material_order(*, models=None) -> tuple[Any, ...]:
     """Return the total order for selected family material."""
 
+    root_revision = _materialization_model(models, CustomImportRootRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
     return (
-        *_root_identity_order(),
-        CustomImportFamilyRevision.family_sha256,
-        CustomImportFamilyRevision.child_count,
-        CustomImportRootRevision.source_ordinal,
-        CustomImportRootRevision.payload_sha256,
-        CustomImportRootRevision.canonical_payload,
-        CustomImportEntityBinding.adapter_id,
-        CustomImportEntityBinding.value_sha256,
-        CustomImportEntityBinding.canonical_value,
+        *_root_identity_order(models=models),
+        family_revision.family_sha256,
+        family_revision.child_count,
+        root_revision.source_ordinal,
+        root_revision.payload_sha256,
+        root_revision.canonical_payload,
+        entity_binding.adapter_id,
+        entity_binding.value_sha256,
+        entity_binding.canonical_value,
     )
 
 
-def _family_child_material_order() -> tuple[Any, ...]:
+def _family_child_material_order(*, models=None) -> tuple[Any, ...]:
     """Return the total order for selected family children."""
 
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+
     return (
-        *_root_identity_order(),
-        CustomImportFamilyRevision.family_sha256,
-        CustomImportFamilyRevision.child_count,
-        CustomImportFamilyChild.collection_slot,
-        CustomImportChildRevision.child_key_sha256,
-        CustomImportChildRevision.canonical_child_key,
-        CustomImportChildRevision.payload_sha256,
-        CustomImportChildRevision.canonical_payload,
-        CustomImportChildRevision.canonical_parent_key,
-        CustomImportChildRevision.parent_key_sha256,
-        CustomImportChildRevision.source_ordinal,
+        *_root_identity_order(models=models),
+        family_revision.family_sha256,
+        family_revision.child_count,
+        family_child.collection_slot,
+        child_revision.child_key_sha256,
+        child_revision.canonical_child_key,
+        child_revision.payload_sha256,
+        child_revision.canonical_payload,
+        child_revision.canonical_parent_key,
+        child_revision.parent_key_sha256,
+        child_revision.source_ordinal,
     )
 
 
-def _family_material_statement(generation: CustomImportGeneration):
+def _family_material_statement(generation: CustomImportGeneration, *, models=None):
     """Build the selected-root-family relation in canonical digest order."""
 
+    pack = _materialization_model(models, CustomImportPack)
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    root_revision = _materialization_model(models, CustomImportRootRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
     statement = select(
-        CustomImportGenerationFamily,
-        CustomImportFamilyRevision,
-        CustomImportRootRevision,
-        CustomImportRootRecord,
-        CustomImportEntityBinding,
-    ).select_from(CustomImportGenerationFamily)
-    statement = _join_generation_family_revision(statement)
-    statement = _join_family_root_revision(statement)
-    statement = _join_root_revision_pack(statement, CustomImportPack)
-    statement = _join_generation_family_root_record(statement)
-    statement = _join_family_entity_binding(statement)
-    statement = _where_generation_family_attempt(statement, generation)
-    statement = _where_pack_attempt(statement, CustomImportPack, generation)
-    return statement.order_by(*_family_material_order())
+        generation_family,
+        family_revision,
+        root_revision,
+        root_record,
+        entity_binding,
+    ).select_from(generation_family)
+    statement = _join_generation_family_revision(statement, models=models)
+    statement = _join_family_root_revision(statement, models=models)
+    statement = _join_root_revision_pack(statement, pack, models=models)
+    statement = _join_generation_family_root_record(statement, models=models)
+    statement = _join_family_entity_binding(statement, models=models)
+    statement = _where_generation_family_attempt(statement, generation, models=models)
+    statement = _where_pack_attempt(statement, pack, generation)
+    return statement.order_by(*_family_material_order(models=models))
 
 
-def _family_child_material_statement(generation: CustomImportGeneration):
+def _family_child_material_statement(generation: CustomImportGeneration, *, models=None):
     """Build selected family children in canonical collection and key order."""
 
-    root_pack = aliased(CustomImportPack)
-    child_pack = aliased(CustomImportPack)
+    pack = _materialization_model(models, CustomImportPack)
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+
+    root_pack = aliased(pack)
+    child_pack = aliased(pack)
     statement = select(
-        CustomImportGenerationFamily,
-        CustomImportFamilyChild,
-        CustomImportChildRevision,
-        CustomImportRootRecord,
-    ).select_from(CustomImportGenerationFamily)
-    statement = _join_generation_family_revision(statement)
-    statement = _join_family_child(statement)
-    statement = _join_family_root_revision(statement)
-    statement = _join_root_revision_pack(statement, root_pack)
-    statement = _join_family_child_revision(statement)
-    statement = _join_child_revision_pack(statement, child_pack)
-    statement = _join_generation_family_root_record(statement)
-    statement = _where_generation_family_attempt(statement, generation)
+        generation_family,
+        family_child,
+        child_revision,
+        root_record,
+    ).select_from(generation_family)
+    statement = _join_generation_family_revision(statement, models=models)
+    statement = _join_family_child(statement, models=models)
+    statement = _join_family_root_revision(statement, models=models)
+    statement = _join_root_revision_pack(statement, root_pack, models=models)
+    statement = _join_family_child_revision(statement, models=models)
+    statement = _join_child_revision_pack(statement, child_pack, models=models)
+    statement = _join_generation_family_root_record(statement, models=models)
+    statement = _where_generation_family_attempt(statement, generation, models=models)
     statement = _where_pack_attempt(statement, root_pack, generation)
     statement = _where_pack_attempt(statement, child_pack, generation)
-    return statement.order_by(*_family_child_material_order())
+    return statement.order_by(*_family_child_material_order(models=models))
 
 
 async def _add_family_material(
@@ -1405,12 +1543,15 @@ async def _add_family_material(
     generation: CustomImportGeneration,
     *,
     effective_output: bool = False,
+    models=None,
 ) -> tuple[int, int]:
     """Hash families and children while enforcing exact child-key membership."""
 
     expected_child_counts_by_family: dict[int, int] = {}
     family_count = 0
-    async for family_material_row in _stream_materialization_records(session, _family_material_statement(generation)):
+    async for family_material_row in _stream_materialization_records(
+        session, _family_material_statement(generation, models=models)
+    ):
         _add_family_revision_material(
             digest,
             family_material_row,
@@ -1423,7 +1564,7 @@ async def _add_family_material(
     seen_child_logical_keys: set[tuple[int, int, bytes]] = set()
     family_child_count = 0
     async for family_child_material_row in _stream_materialization_records(
-        session, _family_child_material_statement(generation)
+        session, _family_child_material_statement(generation, models=models)
     ):
         _validate_and_add_family_child(
             digest,
@@ -1485,7 +1626,8 @@ def _validate_and_add_family_child(
 
     generation_family, family_child, child_revision, root_record = family_child_material_row
     if child_revision.canonical_parent_key != root_record.canonical_logical_key or not hmac.compare_digest(
-        bytes(child_revision.parent_key_sha256), bytes(root_record.logical_key_sha256)
+        bytes(child_revision.parent_key_sha256),
+        bytes(root_record.logical_key_sha256),
     ):
         raise PublicationConflict("child parent identity does not match its selected root record")
     child_logical_key = (
@@ -1517,71 +1659,87 @@ def _validate_and_add_family_child(
     _add_digest_record(digest, "child_revision", revision_document)
 
 
-def _join_root_scalar(statement: Any) -> Any:
+def _join_root_scalar(statement: Any, *, models=None) -> Any:
     """Join the selected family root revision to one scalar projection."""
 
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    root_scalar = _materialization_model(models, CustomImportRootScalar)
+
     return statement.join(
-        CustomImportRootScalar,
+        root_scalar,
         and_(
-            CustomImportRootScalar.root_revision_id == CustomImportFamilyRevision.root_revision_id,
-            CustomImportRootScalar.dataset_id == CustomImportFamilyRevision.dataset_id,
+            root_scalar.root_revision_id == family_revision.root_revision_id,
+            root_scalar.dataset_id == family_revision.dataset_id,
         ),
     )
 
 
-def _root_scalar_material_order() -> tuple[Any, ...]:
+def _root_scalar_material_order(*, models=None) -> tuple[Any, ...]:
     """Return the total order for root scalar projections."""
 
+    root_revision = _materialization_model(models, CustomImportRootRevision)
+    root_scalar = _materialization_model(models, CustomImportRootScalar)
+
     return (
-        *_root_identity_order(),
-        CustomImportRootRevision.source_ordinal,
-        CustomImportRootRevision.payload_sha256,
-        CustomImportRootRevision.canonical_payload,
-        CustomImportRootScalar.field_collection_slot,
-        CustomImportRootScalar.field_slot,
-        CustomImportRootScalar.projection_slot,
-        CustomImportRootScalar.field_type,
-        CustomImportRootScalar.value_state,
-        CustomImportRootScalar.string_value,
-        CustomImportRootScalar.integer_value,
-        CustomImportRootScalar.decimal_value,
-        CustomImportRootScalar.boolean_value,
-        CustomImportRootScalar.date_value,
-        CustomImportRootScalar.timestamp_value,
+        *_root_identity_order(models=models),
+        root_revision.source_ordinal,
+        root_revision.payload_sha256,
+        root_revision.canonical_payload,
+        root_scalar.field_collection_slot,
+        root_scalar.field_slot,
+        root_scalar.projection_slot,
+        root_scalar.field_type,
+        root_scalar.value_state,
+        root_scalar.string_value,
+        root_scalar.integer_value,
+        root_scalar.decimal_value,
+        root_scalar.boolean_value,
+        root_scalar.date_value,
+        root_scalar.timestamp_value,
     )
 
 
-def _root_scalar_material_statement(generation: CustomImportGeneration):
+def _root_scalar_material_statement(generation: CustomImportGeneration, *, models=None):
     """Build root scalar projections in canonical root and field order."""
 
-    root_pack = aliased(CustomImportPack)
+    pack = _materialization_model(models, CustomImportPack)
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+    root_scalar = _materialization_model(models, CustomImportRootScalar)
+
+    root_pack = aliased(pack)
     statement = select(
-        CustomImportGenerationFamily,
-        CustomImportFamilyRevision,
-        CustomImportRootScalar,
-        CustomImportRootRecord,
-    ).select_from(CustomImportGenerationFamily)
-    statement = _join_generation_family_revision(statement)
-    statement = _join_family_root_revision(statement)
-    statement = _join_root_revision_pack(statement, root_pack)
-    statement = _join_root_scalar(statement)
-    statement = _join_generation_family_root_record(statement)
-    statement = _where_generation_family_attempt(statement, generation)
+        generation_family,
+        family_revision,
+        root_scalar,
+        root_record,
+    ).select_from(generation_family)
+    statement = _join_generation_family_revision(statement, models=models)
+    statement = _join_family_root_revision(statement, models=models)
+    statement = _join_root_revision_pack(statement, root_pack, models=models)
+    statement = _join_root_scalar(statement, models=models)
+    statement = _join_generation_family_root_record(statement, models=models)
+    statement = _where_generation_family_attempt(statement, generation, models=models)
     statement = _where_pack_attempt(statement, root_pack, generation)
-    return statement.order_by(*_root_scalar_material_order())
+    return statement.order_by(*_root_scalar_material_order(models=models))
 
 
 async def _add_root_scalar_material(
     session: AsyncSession,
     digest: hashlib._Hash,
     generation: CustomImportGeneration,
+    models=None,
 ) -> int:
     """Hash root scalar projections and return their exact retained count."""
 
     root_scalar_count = 0
-    async for _generation_family, _family, scalar, root_record in _stream_materialization_records(
-        session, _root_scalar_material_statement(generation)
-    ):
+    async for (
+        _generation_family,
+        _family,
+        scalar,
+        root_record,
+    ) in _stream_materialization_records(session, _root_scalar_material_statement(generation, models=models)):
         _add_digest_record(
             digest,
             "root_scalar",
@@ -1594,83 +1752,103 @@ async def _add_root_scalar_material(
     return root_scalar_count
 
 
-def _join_child_scalar(statement: Any) -> Any:
+def _join_child_scalar(statement: Any, *, models=None) -> Any:
     """Join a selected family child to one scalar projection."""
 
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+    child_scalar = _materialization_model(models, CustomImportChildScalar)
+
     return statement.join(
-        CustomImportChildScalar,
+        child_scalar,
         and_(
-            CustomImportChildScalar.child_revision_id == CustomImportFamilyChild.child_revision_id,
-            CustomImportChildScalar.dataset_id == CustomImportFamilyChild.dataset_id,
+            child_scalar.child_revision_id == family_child.child_revision_id,
+            child_scalar.dataset_id == family_child.dataset_id,
         ),
     )
 
 
-def _child_scalar_material_order() -> tuple[Any, ...]:
+def _child_scalar_material_order(*, models=None) -> tuple[Any, ...]:
     """Return the total order for child scalar projections."""
 
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+    child_scalar = _materialization_model(models, CustomImportChildScalar)
+
     return (
-        *_root_identity_order(),
-        CustomImportFamilyRevision.family_sha256,
-        CustomImportFamilyChild.collection_slot,
-        CustomImportChildRevision.child_key_sha256,
-        CustomImportChildRevision.canonical_child_key,
-        CustomImportChildRevision.payload_sha256,
-        CustomImportChildRevision.canonical_payload,
-        CustomImportChildRevision.canonical_parent_key,
-        CustomImportChildRevision.parent_key_sha256,
-        CustomImportChildRevision.source_ordinal,
-        CustomImportChildScalar.field_collection_slot,
-        CustomImportChildScalar.field_slot,
-        CustomImportChildScalar.projection_slot,
-        CustomImportChildScalar.field_type,
-        CustomImportChildScalar.value_state,
-        CustomImportChildScalar.string_value,
-        CustomImportChildScalar.integer_value,
-        CustomImportChildScalar.decimal_value,
-        CustomImportChildScalar.boolean_value,
-        CustomImportChildScalar.date_value,
-        CustomImportChildScalar.timestamp_value,
+        *_root_identity_order(models=models),
+        family_revision.family_sha256,
+        family_child.collection_slot,
+        child_revision.child_key_sha256,
+        child_revision.canonical_child_key,
+        child_revision.payload_sha256,
+        child_revision.canonical_payload,
+        child_revision.canonical_parent_key,
+        child_revision.parent_key_sha256,
+        child_revision.source_ordinal,
+        child_scalar.field_collection_slot,
+        child_scalar.field_slot,
+        child_scalar.projection_slot,
+        child_scalar.field_type,
+        child_scalar.value_state,
+        child_scalar.string_value,
+        child_scalar.integer_value,
+        child_scalar.decimal_value,
+        child_scalar.boolean_value,
+        child_scalar.date_value,
+        child_scalar.timestamp_value,
     )
 
 
-def _child_scalar_material_statement(generation: CustomImportGeneration):
+def _child_scalar_material_statement(generation: CustomImportGeneration, *, models=None):
     """Build child scalar projections in canonical root, collection, key, and field order."""
 
-    root_pack = aliased(CustomImportPack)
-    child_pack = aliased(CustomImportPack)
+    pack = _materialization_model(models, CustomImportPack)
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_child = _materialization_model(models, CustomImportFamilyChild)
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+    child_scalar = _materialization_model(models, CustomImportChildScalar)
+
+    root_pack = aliased(pack)
+    child_pack = aliased(pack)
     statement = select(
-        CustomImportGenerationFamily,
-        CustomImportFamilyChild,
-        CustomImportChildScalar,
-        CustomImportChildRevision,
-        CustomImportRootRecord,
-    ).select_from(CustomImportGenerationFamily)
-    statement = _join_generation_family_revision(statement)
-    statement = _join_family_child(statement)
-    statement = _join_family_root_revision(statement)
-    statement = _join_root_revision_pack(statement, root_pack)
-    statement = _join_family_child_revision(statement)
-    statement = _join_child_revision_pack(statement, child_pack)
-    statement = _join_child_scalar(statement)
-    statement = _join_generation_family_root_record(statement)
-    statement = _where_generation_family_attempt(statement, generation)
+        generation_family,
+        family_child,
+        child_scalar,
+        child_revision,
+        root_record,
+    ).select_from(generation_family)
+    statement = _join_generation_family_revision(statement, models=models)
+    statement = _join_family_child(statement, models=models)
+    statement = _join_family_root_revision(statement, models=models)
+    statement = _join_root_revision_pack(statement, root_pack, models=models)
+    statement = _join_family_child_revision(statement, models=models)
+    statement = _join_child_revision_pack(statement, child_pack, models=models)
+    statement = _join_child_scalar(statement, models=models)
+    statement = _join_generation_family_root_record(statement, models=models)
+    statement = _where_generation_family_attempt(statement, generation, models=models)
     statement = _where_pack_attempt(statement, root_pack, generation)
     statement = _where_pack_attempt(statement, child_pack, generation)
-    return statement.order_by(*_child_scalar_material_order())
+    return statement.order_by(*_child_scalar_material_order(models=models))
 
 
 async def _add_child_scalar_material(
     session: AsyncSession,
     digest: hashlib._Hash,
     generation: CustomImportGeneration,
+    models=None,
 ) -> int:
     """Hash child scalar projections and return their exact retained count."""
 
     child_scalar_count = 0
-    async for _generation_family, _family_child, scalar, child_revision, root_record in _stream_materialization_records(
-        session, _child_scalar_material_statement(generation)
-    ):
+    async for (
+        _generation_family,
+        _family_child,
+        scalar,
+        child_revision,
+        root_record,
+    ) in _stream_materialization_records(session, _child_scalar_material_statement(generation, models=models)):
         _add_digest_record(
             digest,
             "child_scalar",
@@ -1684,93 +1862,117 @@ async def _add_child_scalar_material(
     return child_scalar_count
 
 
-def _join_winner_generation_family(statement: Any) -> Any:
+def _join_winner_generation_family(statement: Any, *, models=None) -> Any:
     """Join a winner to its selected generation family."""
 
+    generation_family = _materialization_model(models, CustomImportGenerationFamily)
+    winner = _materialization_model(models, CustomImportWinner)
+
     return statement.join(
-        CustomImportGenerationFamily,
+        generation_family,
         and_(
-            CustomImportGenerationFamily.generation_id == CustomImportWinner.generation_id,
-            CustomImportGenerationFamily.dataset_id == CustomImportWinner.dataset_id,
-            CustomImportGenerationFamily.family_revision_id == CustomImportWinner.family_revision_id,
+            generation_family.generation_id == winner.generation_id,
+            generation_family.dataset_id == winner.dataset_id,
+            generation_family.family_revision_id == winner.family_revision_id,
         ),
     )
 
 
-def _join_winner_entity_binding(statement: Any) -> Any:
+def _join_winner_entity_binding(statement: Any, *, models=None) -> Any:
     """Join a winner to its immutable entity binding."""
 
+    winner = _materialization_model(models, CustomImportWinner)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
     return statement.join(
-        CustomImportEntityBinding,
+        entity_binding,
         and_(
-            CustomImportEntityBinding.entity_binding_id == CustomImportWinner.entity_binding_id,
-            CustomImportEntityBinding.dataset_id == CustomImportWinner.dataset_id,
+            entity_binding.entity_binding_id == winner.entity_binding_id,
+            entity_binding.dataset_id == winner.dataset_id,
         ),
     )
 
 
-def _join_winner_selection_profile(statement: Any) -> Any:
+def _join_winner_selection_profile(statement: Any, *, models=None) -> Any:
     """Join a winner to the selection profile that defines its context."""
+
+    winner = _materialization_model(models, CustomImportWinner)
 
     return statement.join(
         CustomImportSelectionProfile,
         and_(
-            CustomImportSelectionProfile.definition_revision_id == CustomImportWinner.definition_revision_id,
-            CustomImportSelectionProfile.dataset_id == CustomImportWinner.dataset_id,
-            CustomImportSelectionProfile.schema_revision_id == CustomImportWinner.schema_revision_id,
-            CustomImportSelectionProfile.profile_slot == CustomImportWinner.profile_slot,
+            CustomImportSelectionProfile.definition_revision_id == winner.definition_revision_id,
+            CustomImportSelectionProfile.dataset_id == winner.dataset_id,
+            CustomImportSelectionProfile.schema_revision_id == winner.schema_revision_id,
+            CustomImportSelectionProfile.profile_slot == winner.profile_slot,
         ),
     )
 
 
-def _join_winner_family_revision(statement: Any) -> Any:
+def _join_winner_family_revision(statement: Any, *, models=None) -> Any:
     """Join a winner to the family whose selection it records."""
 
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    winner = _materialization_model(models, CustomImportWinner)
+
     return statement.join(
-        CustomImportFamilyRevision,
+        family_revision,
         and_(
-            CustomImportFamilyRevision.family_revision_id == CustomImportWinner.family_revision_id,
-            CustomImportFamilyRevision.dataset_id == CustomImportWinner.dataset_id,
+            family_revision.family_revision_id == winner.family_revision_id,
+            family_revision.dataset_id == winner.dataset_id,
         ),
     )
 
 
-def _outerjoin_winner_context_child(statement: Any, context_pack: Any) -> Any:
+def _outerjoin_winner_context_child(statement: Any, context_pack: Any, *, models=None) -> Any:
     """Join an optional winner context child and the pack that produced it."""
 
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    winner = _materialization_model(models, CustomImportWinner)
+
     return statement.outerjoin(
-        CustomImportChildRevision,
+        child_revision,
         and_(
-            CustomImportChildRevision.child_revision_id == CustomImportWinner.context_child_revision_id,
-            CustomImportChildRevision.dataset_id == CustomImportWinner.dataset_id,
+            child_revision.child_revision_id == winner.context_child_revision_id,
+            child_revision.dataset_id == winner.dataset_id,
         ),
     ).outerjoin(
         context_pack,
         and_(
-            context_pack.pack_id == CustomImportChildRevision.pack_id,
-            context_pack.dataset_id == CustomImportChildRevision.dataset_id,
-            context_pack.definition_revision_id == CustomImportChildRevision.definition_revision_id,
-            context_pack.schema_revision_id == CustomImportChildRevision.schema_revision_id,
+            context_pack.pack_id == child_revision.pack_id,
+            context_pack.dataset_id == child_revision.dataset_id,
+            context_pack.definition_revision_id == child_revision.definition_revision_id,
+            context_pack.schema_revision_id == child_revision.schema_revision_id,
         ),
     )
 
 
-def _where_winner_generation_attempt(statement: Any, generation: CustomImportGeneration) -> Any:
+def _where_winner_generation_attempt(statement: Any, generation: CustomImportGeneration, *, models=None) -> Any:
     """Keep winner material within the generation and family producing attempt."""
 
+    winner = _materialization_model(models, CustomImportWinner)
+
     return statement.where(
-        CustomImportWinner.generation_id == generation.generation_id,
-        CustomImportWinner.dataset_id == generation.dataset_id,
-        *_family_attempt_conditions(generation),
+        winner.generation_id == generation.generation_id,
+        winner.dataset_id == generation.dataset_id,
+        *_family_attempt_conditions(generation, models=models),
     )
 
 
-def _where_winner_context_attempt(statement: Any, context_pack: Any, generation: CustomImportGeneration) -> Any:
+def _where_winner_context_attempt(
+    statement: Any,
+    context_pack: Any,
+    generation: CustomImportGeneration,
+    *,
+    models=None,
+) -> Any:
     """Require an optional winner context child to share the producing attempt."""
+
+    winner = _materialization_model(models, CustomImportWinner)
 
     return statement.where(
         or_(
-            CustomImportWinner.context_child_revision_id.is_(None),
+            winner.context_child_revision_id.is_(None),
             and_(
                 context_pack.execution_id == generation.execution_id,
                 context_pack.producing_fence == generation.producing_fence,
@@ -1780,63 +1982,81 @@ def _where_winner_context_attempt(statement: Any, context_pack: Any, generation:
     )
 
 
-def _winner_material_order() -> tuple[Any, ...]:
+def _winner_material_order(*, models=None) -> tuple[Any, ...]:
     """Return the total semantic order for winner selections."""
 
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    winner = _materialization_model(models, CustomImportWinner)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
     return (
-        CustomImportWinner.profile_slot,
-        CustomImportEntityBinding.adapter_id,
-        CustomImportEntityBinding.value_sha256,
-        CustomImportEntityBinding.canonical_value,
-        *_root_identity_order(),
-        CustomImportChildRevision.child_key_sha256,
-        CustomImportChildRevision.canonical_child_key,
-        CustomImportChildRevision.payload_sha256,
-        CustomImportChildRevision.canonical_payload,
-        CustomImportFamilyRevision.family_sha256,
-        CustomImportWinner.context_collection_slot,
-        CustomImportWinner.context_key_sha256,
+        winner.profile_slot,
+        entity_binding.adapter_id,
+        entity_binding.value_sha256,
+        entity_binding.canonical_value,
+        *_root_identity_order(models=models),
+        child_revision.child_key_sha256,
+        child_revision.canonical_child_key,
+        child_revision.payload_sha256,
+        child_revision.canonical_payload,
+        family_revision.family_sha256,
+        winner.context_collection_slot,
+        winner.context_key_sha256,
     )
 
 
-def _winner_material_statement(generation: CustomImportGeneration):
+def _winner_material_statement(generation: CustomImportGeneration, *, models=None):
     """Build winner rows in selection-profile and entity-context digest order."""
 
-    root_pack = aliased(CustomImportPack)
-    context_pack = aliased(CustomImportPack)
+    pack = _materialization_model(models, CustomImportPack)
+    root_record = _materialization_model(models, CustomImportRootRecord)
+    child_revision = _materialization_model(models, CustomImportChildRevision)
+    family_revision = _materialization_model(models, CustomImportFamilyRevision)
+    winner = _materialization_model(models, CustomImportWinner)
+    entity_binding = _materialization_model(models, CustomImportEntityBinding)
+
+    root_pack = aliased(pack)
+    context_pack = aliased(pack)
     statement = select(
-        CustomImportWinner,
-        CustomImportEntityBinding,
-        CustomImportFamilyRevision,
-        CustomImportRootRecord,
-        CustomImportChildRevision,
+        winner,
+        entity_binding,
+        family_revision,
+        root_record,
+        child_revision,
         CustomImportSelectionProfile,
-    ).select_from(CustomImportWinner)
-    statement = _join_winner_generation_family(statement)
-    statement = _join_winner_entity_binding(statement)
-    statement = _join_winner_selection_profile(statement)
-    statement = _join_winner_family_revision(statement)
-    statement = _join_family_root_revision(statement)
-    statement = _join_root_revision_pack(statement, root_pack)
-    statement = _join_family_root_record(statement)
-    statement = _outerjoin_winner_context_child(statement, context_pack)
-    statement = _where_winner_generation_attempt(statement, generation)
+    ).select_from(winner)
+    statement = _join_winner_generation_family(statement, models=models)
+    statement = _join_winner_entity_binding(statement, models=models)
+    statement = _join_winner_selection_profile(statement, models=models)
+    statement = _join_winner_family_revision(statement, models=models)
+    statement = _join_family_root_revision(statement, models=models)
+    statement = _join_root_revision_pack(statement, root_pack, models=models)
+    statement = _join_family_root_record(statement, models=models)
+    statement = _outerjoin_winner_context_child(statement, context_pack, models=models)
+    statement = _where_winner_generation_attempt(statement, generation, models=models)
     statement = _where_pack_attempt(statement, root_pack, generation)
-    statement = _where_winner_context_attempt(statement, context_pack, generation)
-    return statement.order_by(*_winner_material_order())
+    statement = _where_winner_context_attempt(statement, context_pack, generation, models=models)
+    return statement.order_by(*_winner_material_order(models=models))
 
 
 async def _add_winner_material(
     session: AsyncSession,
     digest: hashlib._Hash,
     generation: CustomImportGeneration,
+    models=None,
 ) -> int:
     """Hash winner selections and their entity binding evidence."""
 
     winner_count = 0
-    async for winner, entity_binding, family, root_record, context_child, profile in _stream_materialization_records(
-        session, _winner_material_statement(generation)
-    ):
+    async for (
+        winner,
+        entity_binding,
+        family,
+        root_record,
+        context_child,
+        profile,
+    ) in _stream_materialization_records(session, _winner_material_statement(generation, models=models)):
         expected_context_collection_slot = profile.context_collection_slot or 0
         if winner.context_collection_slot != expected_context_collection_slot:
             raise PublicationConflict("winner context collection does not match its selection profile")
@@ -2015,6 +2235,22 @@ async def _lock_generation_sealing_authority(
     return execution, lease, generation
 
 
+def _validate_generation_producing_authority(
+    execution: CustomImportExecution,
+    generation: CustomImportGeneration,
+    request: _GenerationSealRequest,
+) -> None:
+    """Reject a replaced producer before resolving its fenced snapshot."""
+
+    if (
+        generation.execution_id != execution.execution_id
+        or generation.producing_fence != request.lease_fence
+        or generation.producing_token_sha256 is None
+        or not hmac.compare_digest(bytes(generation.producing_token_sha256), request.token_sha256)
+    ):
+        raise PublicationConflict("generation producing authority is stale")
+
+
 def _validate_generation_sealing_authority(
     execution: CustomImportExecution,
     lease: CustomImportLease,
@@ -2032,13 +2268,7 @@ def _validate_generation_sealing_authority(
         now=now,
     ):
         raise PublicationConflict("generation sealing requires a current running lease")
-    if (
-        generation.execution_id != execution.execution_id
-        or generation.producing_fence != request.lease_fence
-        or generation.producing_token_sha256 is None
-        or not hmac.compare_digest(bytes(generation.producing_token_sha256), request.token_sha256)
-    ):
-        raise PublicationConflict("generation producing authority is stale")
+    _validate_generation_producing_authority(execution, generation, request)
     if generation.root_count != materialization.root_count or generation.family_count != materialization.family_count:
         raise PublicationConflict("generation root or family count does not match exact membership")
 
@@ -2121,13 +2351,15 @@ async def _seal_live_generation(
         conflict_message="generation sealing requires a current running lease",
     )
     async with _finality_scan_window(session, now=renewed_at, expires_at=lease.expires_at):
+        _validate_generation_producing_authority(execution, generation, request)
         materialization = await _materialization(session, generation)
         _require_materialization_budget(session)
-    now = await _database_now(session)
-    _validate_generation_sealing_authority(execution, lease, generation, materialization, request, now)
-    generation_seal = _new_generation_seal(generation, materialization, request)
-    session.add(generation_seal)
-    await session.flush()
+        now = await _database_now(session)
+        _validate_generation_sealing_authority(execution, lease, generation, materialization, request, now)
+        generation_seal = _new_generation_seal(generation, materialization, request)
+        session.add(generation_seal)
+        await _prepare_bounded_materialization_statement(session, reserve_for_authority=True)
+        await session.flush()
     await _complete_generation_sealing_execution(session, execution, request, now)
     return _seal_receipt(generation_seal, replayed=False)
 
@@ -2289,7 +2521,9 @@ async def _advance_generation_pointer(
         raise PublicationConflict("current generation changed during publication")
 
 
-def _new_publication_event(details: _PublicationEventDetails) -> CustomImportPublicationEvent:
+def _new_publication_event(
+    details: _PublicationEventDetails,
+) -> CustomImportPublicationEvent:
     canonical, digest = _event_document(details)
     return CustomImportPublicationEvent(
         dataset_id=details.dataset_id,
@@ -2507,14 +2741,22 @@ def _validate_no_change_seal(
         or seal.capture_bundle_id != execution.capture_bundle_id
         or seal.sealing_fence != request.lease_fence
         or not hmac.compare_digest(bytes(seal.sealing_token_sha256), request.token_sha256)
-        or not hmac.compare_digest(bytes(seal.base_source_bundle_sha256), bytes(base_generation.source_bundle_sha256))
         or not hmac.compare_digest(
-            bytes(seal.candidate_source_bundle_sha256), bytes(candidate_generation.source_bundle_sha256)
+            bytes(seal.base_source_bundle_sha256),
+            bytes(base_generation.source_bundle_sha256),
         )
         or not hmac.compare_digest(
-            bytes(base_seal.effective_output_sha256), bytes(candidate_seal.effective_output_sha256)
+            bytes(seal.candidate_source_bundle_sha256),
+            bytes(candidate_generation.source_bundle_sha256),
         )
-        or not hmac.compare_digest(bytes(seal.effective_output_sha256), bytes(candidate_seal.effective_output_sha256))
+        or not hmac.compare_digest(
+            bytes(base_seal.effective_output_sha256),
+            bytes(candidate_seal.effective_output_sha256),
+        )
+        or not hmac.compare_digest(
+            bytes(seal.effective_output_sha256),
+            bytes(candidate_seal.effective_output_sha256),
+        )
     ):
         raise PublicationConflict("no-change replay does not match its immutable receipt")
     canonical, receipt_sha256 = _no_change_receipt_document(
@@ -2702,14 +2944,15 @@ async def _seal_no_change_candidate(
         ):
             raise PublicationConflict("no-change candidate seal authority differs")
         return existing_seal
-    materialization = await _materialization(session, candidate_generation)
-    now = await _database_now(session)
     seal_request = _GenerationSealRequest(
         dataset_id=request.dataset_id,
         generation_id=candidate_generation.generation_id,
         lease_fence=request.lease_fence,
         token_sha256=request.token_sha256,
     )
+    _validate_generation_producing_authority(execution, candidate_generation, seal_request)
+    materialization = await _materialization(session, candidate_generation)
+    now = await _database_now(session)
     _validate_generation_sealing_authority(
         execution,
         lease,
@@ -2720,6 +2963,7 @@ async def _seal_no_change_candidate(
     )
     candidate_seal = _new_generation_seal(candidate_generation, materialization, seal_request)
     session.add(candidate_seal)
+    await _prepare_bounded_materialization_statement(session, reserve_for_authority=True)
     await session.flush()
     return candidate_seal
 
@@ -2790,9 +3034,12 @@ async def _record_new_no_change(
 ) -> PublicationReceipt:
     """Seal and terminalize a newly proven no-change execution."""
 
-    lease, base_generation, base_seal, candidate_generation = await _locked_no_change_candidate(
-        session, request, execution
-    )
+    (
+        lease,
+        base_generation,
+        base_seal,
+        candidate_generation,
+    ) = await _locked_no_change_candidate(session, request, execution)
     renewed_at = await _renew_finality_lease(
         session,
         execution,
@@ -2804,7 +3051,10 @@ async def _record_new_no_change(
     async with _finality_scan_window(session, now=renewed_at, expires_at=lease.expires_at):
         candidate_seal = await _seal_no_change_candidate(session, request, execution, lease, candidate_generation)
         _require_materialization_budget(session)
-    if not hmac.compare_digest(bytes(base_seal.effective_output_sha256), bytes(candidate_seal.effective_output_sha256)):
+    if not hmac.compare_digest(
+        bytes(base_seal.effective_output_sha256),
+        bytes(candidate_seal.effective_output_sha256),
+    ):
         raise PublicationConflict("no-change candidate effective output differs from the current generation")
     now = await _database_now(session)
     if not _has_live_lease_authority(

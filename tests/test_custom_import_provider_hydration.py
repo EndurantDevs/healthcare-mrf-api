@@ -109,7 +109,7 @@ async def test_provider_hydration_selects_one_winner_per_npi_before_single_batch
     authorization = ExtensionReadAuthorization("synthetic")
     prepared = await service.prepare_npi_entity_relation(session, authorization=authorization, target=context.target)
 
-    result = await service.hydrate_npi_page(
+    hydrated_by_entity = await service.hydrate_npi_page(
         session,
         authorization=authorization,
         pinned_target=context.target,
@@ -117,8 +117,10 @@ async def test_provider_hydration_selects_one_winner_per_npi_before_single_batch
         entity_values=("1000000001", "1000000000"),
     )
 
-    assert result == {"1000000001": hydrated}
-    batch.assert_awaited_once_with(session, context, (selected_values,), read_core._scope_digest(service._authorize(authorization, context.target)))
+    assert hydrated_by_entity == {"1000000001": hydrated}
+    batch.assert_awaited_once_with(
+        session, context, (selected_values,), read_core._scope_digest(service._authorize(authorization, context.target))
+    )
     statement = session.execute.await_args.args[0]
     compiled = str(statement.compile(dialect=postgresql.dialect()))
     assert "DISTINCT ON (" in compiled
@@ -151,8 +153,8 @@ async def test_complete_family_children_are_correlated_and_batched():
     note = SimpleNamespace(
         field_id="note", field_slot=2, projection_slot=2, collection="notes", value_type="string", nullable=True
     )
-    context = SimpleNamespace(
-        target=query_fixture._target(),
+    context = replace(
+        query_fixture._context(),
         definition=SimpleNamespace(root_fields=(), child_fields=(field, note)),
         collection_slots_by_name={"facts": 1, "notes": 2},
         collection_names_by_slot={1: "facts", 2: "notes"},
@@ -186,7 +188,10 @@ async def test_complete_family_children_are_correlated_and_batched():
     details = await read_core._hydrate_selected_families(session, context, _selected_family_rows(families), "a" * 64)
     children_by_family = {detail.winner.family_revision_id: detail.children for detail in details}
 
-    assert [(child.collection, child.child_revision_id) for child in children_by_family[11]] == [("facts", 101), ("notes", 102)]
+    assert [(child.collection, child.child_revision_id) for child in children_by_family[11]] == [
+        ("facts", 101),
+        ("notes", 102),
+    ]
     assert children_by_family[11][0].fields[0].value == Decimal("2.5")
     assert children_by_family[11][1].fields[0].state == "null"
     assert children_by_family[12][0].child_revision_id == 103 and children_by_family[12][0].fields[0].state == "missing"
@@ -280,7 +285,9 @@ def _ordinary_family_projection(selected_row):
         for child in range(42)
     )
     return SimpleNamespace(
-        winner=SimpleNamespace(family_revision_id=selected_row[1].family_revision_id), root_fields=(), children=child_projections
+        winner=SimpleNamespace(family_revision_id=selected_row[1].family_revision_id),
+        root_fields=(),
+        children=child_projections,
     )
 
 
@@ -313,8 +320,13 @@ async def test_complete_ordinary_page_batches_per_family_without_dropping_childr
         selected_row[1].family_revision_id for selected_row in selected_rows
     )
     assert len(batches) == (2 if family_count == 25 else 3)
-    assert [provider_item.winner for provider_item in hydrated_items] == [provider_item.winner for provider_item in provider_items]
-    assert all(len(provider_item.children) == 42 and provider_item.children[-1].child_revision_id == 42 for provider_item in hydrated_items)
+    assert [provider_item.winner for provider_item in hydrated_items] == [
+        provider_item.winner for provider_item in provider_items
+    ]
+    assert all(
+        len(provider_item.children) == 42 and provider_item.children[-1].child_revision_id == 42
+        for provider_item in hydrated_items
+    )
 
 
 @pytest.mark.asyncio
@@ -379,8 +391,8 @@ async def test_child_page_bound_is_inclusive(counts):
         for child_index in range(count)
     )
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: membership_rows)))
-    context = SimpleNamespace(
-        target=query_fixture._target(),
+    context = replace(
+        query_fixture._context(),
         definition=SimpleNamespace(root_fields=(), child_fields=()),
         collection_slots_by_name={"facts": 1},
         collection_names_by_slot={1: "facts"},

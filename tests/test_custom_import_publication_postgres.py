@@ -1658,9 +1658,9 @@ async def _assert_application_winner_context_guard(
 
 @pytest.mark.asyncio
 async def test_winner_context_collection_must_match_its_profile_in_app_and_database():
-    """The selection profile is the sole authority for a winner context slot."""
+    """The historical row guard and materializer reject a mismatched context slot."""
 
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(migration_through="20261005070000") as case:
         graph, attempt, family = await _seed_winner_context_candidate(case)
         winner_fields_by_name = _invalid_winner_fields_by_name(graph, attempt, family)
         await _assert_database_winner_context_rejected(case, winner_fields_by_name)
@@ -3053,12 +3053,22 @@ def _replace_append_plans(sync_connection, schema_name: str, *, downgrade: bool 
 
 
 @asynccontextmanager
+async def _original_append_case():
+    """Keep real canonical guards and restore the pre-optimization function body."""
+
+    async with isolated_publication_case(migration_through="20261005030000") as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_replace_append_plans, case.schema_name, downgrade=True)
+        yield case
+
+
+@asynccontextmanager
 async def _append_plans_case(mode: str):
     """Exercise the installed function on its own tables or a second owned schema."""
 
     async with AsyncExitStack() as stack:
-        function_case = await stack.enter_async_context(isolated_publication_case()) if mode == "cross_schema" else None
-        case = await stack.enter_async_context(isolated_publication_case())
+        function_case = await stack.enter_async_context(_original_append_case()) if mode == "cross_schema" else None
+        case = await stack.enter_async_context(_original_append_case())
         function_schema = (function_case or case).schema_name
         if mode == "original":
             yield case, function_schema
@@ -3101,7 +3111,7 @@ async def _append_function_identity(connection, schema: str):
 
 @pytest.mark.asyncio
 async def test_sealed_append_plans_preserve_catalog_identity_and_refuse_missing_function():
-    async with isolated_publication_case() as case:
+    async with _original_append_case() as case:
         async with case.engine.begin() as connection:
             before = await _append_function_identity(connection, case.schema_name)
             assert len(before[1]) == len(_finality_migration()._APPEND_GUARD_TABLES)
@@ -3126,7 +3136,7 @@ async def test_sealed_append_plans_preserve_catalog_identity_and_refuse_missing_
 
 @pytest.mark.asyncio
 async def test_sealed_append_plans_compile_quoted_schema_without_changing_its_name():
-    async with isolated_publication_case() as case:
+    async with _original_append_case() as case:
         schema = case.schema_name + "'\"\\$1$function$"
         legacy = _finality_migration()
         quoted = legacy._quote(schema)

@@ -30,7 +30,6 @@ from process.custom_import.snowflake_source_binding import register_snowflake_so
 from tests.test_custom_import_build_source_postgres import _source_case
 from tests.test_custom_import_snowflake_capture import _policy as _capture_policy
 from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
-from tests.test_custom_import_snowflake_source_binding import _processing_policy_migration
 
 _ROWS = (_shared_row("1003000126", key="a"), _shared_row("1234567893", key="b"))
 
@@ -76,8 +75,6 @@ def _binding(statement, policy):
 
 
 async def _registered_runtime(case, monkeypatch):
-    async with case.engine.begin() as connection:
-        await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).upgrade())
     policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(8, 65_536, 2000, 120, 300))
     connector, bundle, adapter, cursor, connection = _runtime(
         monkeypatch, _ROWS, partition_rows=1, processing_policy=policy

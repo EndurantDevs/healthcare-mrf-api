@@ -8,7 +8,7 @@ import datetime as dt
 import hmac
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,7 +29,7 @@ from db.models.custom_import import (
     CustomImportSourceStream,
 )
 from process.custom_import.definition import canonical_json
-from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, lease_token_sha256
+from process.custom_import.execution import MAX_LEASE_SECONDS, LeaseGrant, _root_transaction_context, lease_token_sha256
 from process.custom_import.materialization import (
     DefinitionIdentity,
     persist_selection_profiles,
@@ -59,6 +59,8 @@ class _MaterializationLeaseWindow:
 
     expires_at: dt.datetime
     monotonic_deadline: float
+    authority: tuple[int, int, int, int, int, int, bytes] | None = field(default=None, repr=False)
+    transaction: object | None = field(default=None, repr=False, compare=False)
 
 
 async def locked_candidate_context(
@@ -176,8 +178,12 @@ async def establish_materialization_authority(
         raise LeaseAuthorityLost("candidate execution lease is no longer current")
     if _MATERIALIZATION_WINDOW_KEY in session.info:
         raise CandidateRunnerError("candidate materialization authority is already bound to this transaction")
+    transaction, _ = await _root_transaction_context(session)
+    if transaction is None or not session.in_transaction():
+        raise CandidateRunnerError("candidate materialization requires an active transaction")
     token_sha256 = lease_token_sha256(request.lease_token)
     expires_at = now + dt.timedelta(seconds=_MATERIALIZATION_LEASE_WINDOW_SECONDS)
+    started_at = time.monotonic()
     with session.no_autoflush:
         renewed = await session.execute(
             update(CustomImportLease)
@@ -198,7 +204,17 @@ async def establish_materialization_authority(
     set_committed_value(lease, "expires_at", expires_at)
     session.info[_MATERIALIZATION_WINDOW_KEY] = _MaterializationLeaseWindow(
         expires_at=expires_at,
-        monotonic_deadline=time.monotonic() + _MATERIALIZATION_LEASE_WINDOW_SECONDS,
+        monotonic_deadline=started_at + _MATERIALIZATION_LEASE_WINDOW_SECONDS,
+        authority=(
+            request.dataset_id,
+            request.definition_revision_id,
+            request.schema_revision_id,
+            execution.execution_id,
+            execution.capture_bundle_id,
+            grant.fence,
+            token_sha256,
+        ),
+        transaction=transaction,
     )
 
 
@@ -214,10 +230,10 @@ async def prepare_materialization_statement(session: AsyncSession) -> None:
     if not isinstance(window, _MaterializationLeaseWindow):
         raise CandidateRunnerError("candidate materialization authority is not bound to this transaction")
     remaining_milliseconds = int((window.monotonic_deadline - time.monotonic()) * 1_000)
-    if remaining_milliseconds <= 0:
+    if remaining_milliseconds < 2:
         raise LeaseAuthorityLost("candidate materialization lease window expired")
     with session.no_autoflush:
-        await session.execute(select(func.set_config("statement_timeout", str(max(1, remaining_milliseconds)), True)))
+        await session.execute(select(func.set_config("statement_timeout", str(remaining_milliseconds // 2), True)))
 
 
 def clear_materialization_authority(session: AsyncSession) -> None:

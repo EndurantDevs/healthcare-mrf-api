@@ -7,8 +7,7 @@ from __future__ import annotations
 import hmac
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Iterator
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +25,7 @@ from db.models.custom_import import (
     CustomImportRootRecord,
     CustomImportRootRevision,
 )
-from process.custom_import.definition import Field, canonical_json
+from process.custom_import.definition import canonical_json
 from process.custom_import.execution import LeaseGrant, lease_token_sha256
 from process.custom_import.family import FamilyBuildResult, FamilyRejection, RootFamily, has_child_membership
 from process.custom_import.materialization import (
@@ -51,10 +50,8 @@ from process.custom_import.runner_codec import (
     digest_text,
     family_child_payload_hashes,
     fields_by_collection,
-    new_family_hash,
     pack_hash,
     payload_values,
-    record_payload,
     root_key_contract_hash,
     root_key_document,
     root_key_evidence_from_tuple,
@@ -83,28 +80,62 @@ from process.custom_import.runner_types import (
 _MATERIALIZATION_BATCH_SIZE = 256
 
 
-@dataclass(frozen=True)
-class ChildRevisionContext:
-    """Current family and stream identities needed to append one child row."""
-
-    request: CandidateRunRequest
-    registry: CandidateRegistry
-    child_pack: CustomImportPack
-    root_record: CustomImportRootRecord
-    family_revision: CustomImportFamilyRevision
-    collection: str
-
-
 async def materialize_candidate(
     session_factory: SessionFactory,
     request: CandidateRunRequest,
     grant: LeaseGrant,
     admitted: FamilyBuildResult,
 ) -> MaterializedCandidate:
-    """Commit one complete immutable candidate graph in its own transaction."""
+    """Commit the immutable graph, then prepare its isolated serving indexes."""
 
     async with session_factory() as session, session.begin():
-        return await build_candidate_graph(session, request, grant, admitted)
+        materialized = await build_candidate_graph(session, request, grant, admitted)
+    await prepare_legacy_snapshot_indexes(session_factory, request, grant, materialized.generation_id)
+    return materialized
+
+
+async def prepare_legacy_snapshot_indexes(session_factory, request, grant, generation_id):
+    """Prepare one frozen-candidate index per freshly fenced transaction."""
+
+    is_complete = False
+    while not is_complete:
+        async with session_factory() as session, session.begin():
+            is_complete = await prepare_legacy_serving_step(session, request, grant, generation_id)
+
+
+async def prepare_legacy_serving_step(session, request, grant, generation_id):
+    """Resolve the full producer again; never index canonical or BASE storage."""
+
+    from process.custom_import.materialization_store import _call
+
+    try:
+        _, execution, _ = await locked_candidate_context(session, request, grant)
+        family_id = await _call(
+            session,
+            "resolve_custom_import_generation_finality_snapshot",
+            (
+                ("bigint", generation_id),
+                ("bigint", request.dataset_id),
+                ("bigint", request.definition_revision_id),
+                ("bigint", request.schema_revision_id),
+                ("bigint", request.execution_id),
+                ("bigint", execution.capture_bundle_id),
+                ("bigint", grant.fence),
+                ("bytea", lease_token_sha256(request.lease_token)),
+            ),
+        )
+        if type(family_id) is not int or not 0 < family_id < 2**63:
+            raise CandidateRunnerError("legacy serving snapshot binding is malformed")
+        complete = await _call(
+            session,
+            "prepare_custom_import_snapshot_indexes",
+            (("bigint", family_id), ("text", "serving")),
+        )
+        if type(complete) is not bool:
+            raise CandidateRunnerError("legacy snapshot index preparation result is malformed")
+        return complete
+    finally:
+        clear_materialization_authority(session)
 
 
 async def build_candidate_graph(
@@ -121,9 +152,6 @@ async def build_candidate_graph(
         await ensure_selection_profiles(session, request, registry)
         selected_families = await select_candidate_families(session, request, admitted, pointer)
         source_bundle_sha256 = await source_bundle_digest(session, request, execution.capture_bundle_id)
-        packs_by_collection = await create_packs(
-            session, request, grant, registry, selected_families, execution.capture_bundle_id
-        )
         generation = await create_generation(
             session,
             request,
@@ -132,6 +160,9 @@ async def build_candidate_graph(
             source_bundle_sha256,
             selected_families,
             execution.capture_bundle_id,
+        )
+        packs_by_collection = await create_packs(
+            session, request, grant, registry, selected_families, execution.capture_bundle_id
         )
         published_families = await publish_families(
             session,
@@ -144,6 +175,10 @@ async def build_candidate_graph(
         await attach_generation_families(session, request, generation, published_families)
         await persist_projections_and_winners(session, request, registry, generation, published_families)
         await persist_rejections(session, request, grant, admitted)
+        from process.custom_import.materialization_store import verify_materialization_authority
+
+        await verify_materialization_authority(session)
+        await freeze_legacy_snapshot(session, request, grant)
         return MaterializedCandidate(
             generation_id=generation.generation_id,
             pointer=pointer,
@@ -260,43 +295,61 @@ async def load_selected_family_rows(
 ]:
     """Load current generation memberships with their root and entity records."""
 
+    models = await previous_snapshot_models(session, request, pointer)
     await prepare_materialization_statement(session)
-    return list(
-        (
-            await session.execute(
-                select(
-                    CustomImportGenerationFamily,
-                    CustomImportFamilyRevision,
-                    CustomImportRootRevision,
-                    CustomImportRootRecord,
-                    CustomImportEntityBinding,
-                )
-                .join(
-                    CustomImportFamilyRevision,
-                    (CustomImportFamilyRevision.family_revision_id == CustomImportGenerationFamily.family_revision_id)
-                    & (CustomImportFamilyRevision.dataset_id == CustomImportGenerationFamily.dataset_id),
-                )
-                .join(
-                    CustomImportRootRevision,
-                    (CustomImportRootRevision.root_revision_id == CustomImportFamilyRevision.root_revision_id)
-                    & (CustomImportRootRevision.dataset_id == CustomImportFamilyRevision.dataset_id),
-                )
-                .join(
-                    CustomImportRootRecord,
-                    (CustomImportRootRecord.root_record_id == CustomImportGenerationFamily.root_record_id)
-                    & (CustomImportRootRecord.dataset_id == CustomImportGenerationFamily.dataset_id),
-                )
-                .join(
-                    CustomImportEntityBinding,
-                    (CustomImportEntityBinding.entity_binding_id == CustomImportFamilyRevision.entity_binding_id)
-                    & (CustomImportEntityBinding.dataset_id == CustomImportFamilyRevision.dataset_id),
-                )
-                .where(
-                    CustomImportGenerationFamily.generation_id == pointer.generation_id,
-                    CustomImportGenerationFamily.dataset_id == request.dataset_id,
-                )
-            )
-        ).all()
+    return list((await session.execute(selected_family_statement(request, pointer, models=models))).all())
+
+
+async def previous_snapshot_models(session, request, pointer):
+    """Pin the exact sealed base; only verified legacy storage returns no map."""
+
+    from process.custom_import.read_contracts import PinnedReadTarget
+    from process.custom_import.read_identity import resolve_generation_snapshot
+    from process.custom_import.storage_layout import snapshot_models
+
+    await prepare_materialization_statement(session)
+    family_id = await resolve_generation_snapshot(
+        session,
+        PinnedReadTarget(
+            request.dataset_id,
+            pointer.generation_id,
+            pointer.definition_revision_id,
+            pointer.schema_revision_id,
+            "default",
+        ),
+    )
+    return None if family_id is None else snapshot_models(family_id)
+
+
+def selected_family_statement(request, pointer, *, models=None):
+    """Compile every retained hot relation against one resolved storage family."""
+
+    membership = CustomImportGenerationFamily if models is None else models[CustomImportGenerationFamily]
+    family = CustomImportFamilyRevision if models is None else models[CustomImportFamilyRevision]
+    root_revision = CustomImportRootRevision if models is None else models[CustomImportRootRevision]
+    root_record = CustomImportRootRecord if models is None else models[CustomImportRootRecord]
+    binding = CustomImportEntityBinding if models is None else models[CustomImportEntityBinding]
+    return (
+        select(membership, family, root_revision, root_record, binding)
+        .join(
+            family,
+            (family.family_revision_id == membership.family_revision_id) & (family.dataset_id == membership.dataset_id),
+        )
+        .join(
+            root_revision,
+            (root_revision.root_revision_id == family.root_revision_id)
+            & (root_revision.dataset_id == family.dataset_id),
+        )
+        .join(
+            root_record,
+            (root_record.root_record_id == membership.root_record_id)
+            & (root_record.dataset_id == membership.dataset_id),
+        )
+        .join(
+            binding,
+            (binding.entity_binding_id == family.entity_binding_id) & (binding.dataset_id == family.dataset_id),
+        )
+        .where(membership.generation_id == pointer.generation_id, membership.dataset_id == request.dataset_id)
     )
 
 
@@ -312,8 +365,9 @@ async def load_previous_children(
     expanding ``IN`` predicate.
     """
 
+    models = await previous_snapshot_models(session, request, pointer)
     await prepare_materialization_statement(session)
-    child_rows = list((await session.execute(previous_children_statement(request, pointer))).all())
+    child_rows = list((await session.execute(previous_children_statement(request, pointer, models=models))).all())
     children_by_family: dict[int, list[tuple[str, CustomImportChildRevision]]] = defaultdict(list)
     for family_child, child_model, collection_name in child_rows:
         children_by_family[family_child.family_revision_id].append((collection_name, child_model))
@@ -323,31 +377,33 @@ async def load_previous_children(
     }
 
 
-def previous_children_statement(request: CandidateRunRequest, pointer: CurrentGenerationPointer):
+def previous_children_statement(request: CandidateRunRequest, pointer: CurrentGenerationPointer, *, models=None):
     """Build the fixed-parameter retained-child query for one generation."""
 
+    family_child = CustomImportFamilyChild if models is None else models[CustomImportFamilyChild]
+    child = CustomImportChildRevision if models is None else models[CustomImportChildRevision]
+    membership = CustomImportGenerationFamily if models is None else models[CustomImportGenerationFamily]
     return (
-        select(CustomImportFamilyChild, CustomImportChildRevision, CustomImportChildCollection.collection_name)
+        select(family_child, child, CustomImportChildCollection.collection_name)
         .join(
-            CustomImportGenerationFamily,
-            (CustomImportGenerationFamily.family_revision_id == CustomImportFamilyChild.family_revision_id)
-            & (CustomImportGenerationFamily.dataset_id == CustomImportFamilyChild.dataset_id),
+            membership,
+            (membership.family_revision_id == family_child.family_revision_id)
+            & (membership.dataset_id == family_child.dataset_id),
         )
         .join(
-            CustomImportChildRevision,
-            (CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id)
-            & (CustomImportChildRevision.dataset_id == CustomImportFamilyChild.dataset_id),
+            child,
+            (child.child_revision_id == family_child.child_revision_id) & (child.dataset_id == family_child.dataset_id),
         )
         .join(
             CustomImportChildCollection,
-            (CustomImportChildCollection.schema_revision_id == CustomImportFamilyChild.schema_revision_id)
-            & (CustomImportChildCollection.dataset_id == CustomImportFamilyChild.dataset_id)
-            & (CustomImportChildCollection.collection_slot == CustomImportFamilyChild.collection_slot),
+            (CustomImportChildCollection.schema_revision_id == family_child.schema_revision_id)
+            & (CustomImportChildCollection.dataset_id == family_child.dataset_id)
+            & (CustomImportChildCollection.collection_slot == family_child.collection_slot),
         )
         .where(
-            CustomImportFamilyChild.dataset_id == request.dataset_id,
-            CustomImportGenerationFamily.generation_id == pointer.generation_id,
-            CustomImportGenerationFamily.dataset_id == request.dataset_id,
+            family_child.dataset_id == request.dataset_id,
+            membership.generation_id == pointer.generation_id,
+            membership.dataset_id == request.dataset_id,
         )
     )
 
@@ -502,8 +558,9 @@ async def create_packs(
         root_hashes,
         child_hashes_by_collection,
     )
-    session.add_all(tuple(packs_by_collection.values()))
-    await flush_materialization(session)
+    from process.custom_import.legacy_graph_store import persist_pack_models
+
+    await persist_pack_models(session, packs_by_collection)
     return packs_by_collection
 
 
@@ -596,7 +653,34 @@ async def create_generation(
     )
     session.add(generation)
     await flush_materialization(session)
+    from process.custom_import.materialization_store import _call
+
+    family_id = await _call(
+        session,
+        "resolve_custom_import_legacy_generation_snapshot",
+        (("bigint", generation.generation_id),),
+    )
+    if type(family_id) is not int or not 0 < family_id < 2**63:
+        raise CandidateRunnerError("legacy generation snapshot binding is malformed")
     return generation
+
+
+async def freeze_legacy_snapshot(session, request, grant):
+    """Close candidate writes before publication scans or a caller can commit."""
+
+    from process.custom_import.materialization_store import _call
+
+    family_id = await _call(
+        session,
+        "freeze_custom_import_snapshot_family",
+        (
+            ("bigint", request.execution_id),
+            ("bigint", grant.fence),
+            ("bytea", lease_token_sha256(request.lease_token)),
+        ),
+    )
+    if type(family_id) is not int or not 0 < family_id < 2**63:
+        raise CandidateRunnerError("legacy snapshot freeze binding is malformed")
 
 
 async def publish_families(
@@ -607,460 +691,11 @@ async def publish_families(
     packs_by_collection: Mapping[str | None, CustomImportPack],
     selected_families: Sequence[RootFamily | StoredCandidateFamily],
 ) -> tuple[PublishedCandidateFamily, ...]:
-    """Append each selected family under the current execution fence."""
+    """Append fresh and retained families through bounded protected set pages."""
 
-    published_families: list[PublishedCandidateFamily] = []
-    child_ordinals_by_collection: dict[str, int] = defaultdict(int)
-    for root_ordinal, family in enumerate(selected_families):
-        if isinstance(family, RootFamily):
-            published_family = await publish_new_family(
-                session,
-                request,
-                grant,
-                registry,
-                packs_by_collection,
-                family,
-                root_ordinal,
-                child_ordinals_by_collection,
-            )
-        else:
-            published_family = await copy_stored_family(
-                session,
-                request,
-                grant,
-                registry,
-                packs_by_collection,
-                family,
-                root_ordinal,
-                child_ordinals_by_collection,
-            )
-        published_families.append(published_family)
-    return tuple(published_families)
+    from process.custom_import.legacy_family_store import persist_families
 
-
-async def publish_new_family(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    grant: LeaseGrant,
-    registry: CandidateRegistry,
-    packs_by_collection: Mapping[str | None, CustomImportPack],
-    family: RootFamily,
-    root_ordinal: int,
-    child_ordinals_by_collection: dict[str, int],
-) -> PublishedCandidateFamily:
-    """Append one freshly accepted root family and all of its children."""
-
-    root_record = await root_record_for_values(session, request, family.root)
-    entity_binding = await entity_binding_for_values(session, request, family.root)
-    root_revision = await create_root_revision(
-        session,
-        request,
-        root_record,
-        packs_by_collection[None],
-        family.root,
-        root_ordinal,
-    )
-    family_sha256 = new_family_hash(request.definition, family)
-    family_revision = await create_family_revision(
-        session,
-        request,
-        grant,
-        root_record.root_record_id,
-        root_revision.root_revision_id,
-        entity_binding.entity_binding_id,
-        family_sha256,
-        sum(len(children) for children in family.children.values()),
-    )
-    published_child_rows = await publish_new_children(
-        session,
-        request,
-        registry,
-        packs_by_collection,
-        family,
-        root_record,
-        family_revision,
-        child_ordinals_by_collection,
-    )
-    return PublishedCandidateFamily(
-        root_record_id=root_record.root_record_id,
-        root_revision_id=root_revision.root_revision_id,
-        family_revision_id=family_revision.family_revision_id,
-        entity_binding_id=entity_binding.entity_binding_id,
-        family_sha256=family_sha256,
-        root_values_by_field=dict(family.root),
-        children=published_child_rows,
-    )
-
-
-async def create_root_revision(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    root_record: CustomImportRootRecord,
-    root_pack: CustomImportPack,
-    root_values_by_field: Mapping[str, Any],
-    source_ordinal: int,
-) -> CustomImportRootRevision:
-    """Append one typed root payload under its current pack provenance."""
-
-    canonical_payload = record_payload(request.definition.root_fields, root_values_by_field)
-    root_revision = CustomImportRootRevision(
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        root_record_id=root_record.root_record_id,
-        pack_id=root_pack.pack_id,
-        source_ordinal=source_ordinal,
-        canonical_payload=canonical_payload,
-        payload_sha256=digest_text("root-payload", canonical_payload),
-    )
-    session.add(root_revision)
-    await flush_materialization(session)
-    return root_revision
-
-
-async def create_family_revision(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    grant: LeaseGrant,
-    root_record_id: int,
-    root_revision_id: int,
-    entity_binding_id: int,
-    family_sha256: bytes,
-    child_count: int,
-) -> CustomImportFamilyRevision:
-    """Append one fenced family header after its root revision exists."""
-
-    family_revision = CustomImportFamilyRevision(
-        dataset_id=request.dataset_id,
-        schema_revision_id=request.schema_revision_id,
-        root_record_id=root_record_id,
-        root_revision_id=root_revision_id,
-        entity_binding_id=entity_binding_id,
-        family_sha256=family_sha256,
-        child_count=child_count,
-        producing_execution_id=request.execution_id,
-        producing_fence=grant.fence,
-        producing_token_sha256=lease_token_sha256(request.lease_token),
-    )
-    session.add(family_revision)
-    await flush_materialization(session)
-    return family_revision
-
-
-async def publish_new_children(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    registry: CandidateRegistry,
-    packs_by_collection: Mapping[str | None, CustomImportPack],
-    family: RootFamily,
-    root_record: CustomImportRootRecord,
-    family_revision: CustomImportFamilyRevision,
-    child_ordinals_by_collection: dict[str, int],
-) -> tuple[PublishedCandidateChild, ...]:
-    """Append each fresh child in deterministic collection and logical-key order."""
-
-    published_child_rows: list[PublishedCandidateChild] = []
-    fields_by_name = fields_by_collection(request.definition)
-    for collection in request.definition.child_collections:
-        ordered_children = sorted(
-            family.children[collection.name],
-            key=lambda child_values: child_key_hash(request.definition, collection.name, child_values),
-        )
-        for child_values in ordered_children:
-            source_ordinal = child_ordinals_by_collection[collection.name]
-            child_context = ChildRevisionContext(
-                request=request,
-                registry=registry,
-                child_pack=packs_by_collection[collection.name],
-                root_record=root_record,
-                family_revision=family_revision,
-                collection=collection.name,
-            )
-            published_child = await create_child_revision(
-                session,
-                child_context,
-                fields_by_name[collection.name],
-                child_values,
-                source_ordinal,
-            )
-            child_ordinals_by_collection[collection.name] += 1
-            published_child_rows.append(published_child)
-    return tuple(published_child_rows)
-
-
-async def create_child_revision(
-    session: AsyncSession,
-    child_context: ChildRevisionContext,
-    collection_fields: Sequence[Field],
-    child_values_by_field: Mapping[str, Any],
-    source_ordinal: int,
-) -> PublishedCandidateChild:
-    """Append one child revision and its immutable family membership edge."""
-
-    request = child_context.request
-    collection = child_context.collection
-    canonical_child_key = child_key_document(request.definition, collection, child_values_by_field)
-    canonical_payload = record_payload(collection_fields, child_values_by_field)
-    child_revision = CustomImportChildRevision(
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        root_record_id=child_context.root_record.root_record_id,
-        collection_slot=child_context.registry.child_collection_slots[collection],
-        pack_id=child_context.child_pack.pack_id,
-        source_ordinal=source_ordinal,
-        canonical_parent_key=child_context.root_record.canonical_logical_key,
-        parent_key_sha256=child_context.root_record.logical_key_sha256,
-        canonical_child_key=canonical_child_key,
-        child_key_sha256=child_key_hash(request.definition, collection, child_values_by_field),
-        canonical_payload=canonical_payload,
-        payload_sha256=digest_text("child-payload", canonical_payload),
-    )
-    session.add(child_revision)
-    await flush_materialization(session)
-    await add_family_child_membership(session, child_context, child_revision.child_revision_id)
-    return PublishedCandidateChild(
-        collection=collection,
-        child_revision_id=child_revision.child_revision_id,
-        child_key_sha256=bytes(child_revision.child_key_sha256),
-        values_by_field=dict(child_values_by_field),
-    )
-
-
-async def add_family_child_membership(
-    session: AsyncSession,
-    child_context: ChildRevisionContext,
-    child_revision_id: int,
-) -> None:
-    """Attach a child revision to the current family under its collection slot."""
-
-    request = child_context.request
-    session.add(
-        CustomImportFamilyChild(
-            family_revision_id=child_context.family_revision.family_revision_id,
-            dataset_id=request.dataset_id,
-            schema_revision_id=request.schema_revision_id,
-            root_record_id=child_context.root_record.root_record_id,
-            collection_slot=child_context.registry.child_collection_slots[child_context.collection],
-            child_revision_id=child_revision_id,
-        )
-    )
-    await flush_materialization(session)
-
-
-async def copy_stored_family(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    grant: LeaseGrant,
-    registry: CandidateRegistry,
-    packs_by_collection: Mapping[str | None, CustomImportPack],
-    stored_family: StoredCandidateFamily,
-    root_ordinal: int,
-    child_ordinals_by_collection: dict[str, int],
-) -> PublishedCandidateFamily:
-    """Clone one retained family into fresh current-fence revisions and edges."""
-
-    root_revision = await copy_root_revision(
-        session,
-        request,
-        stored_family,
-        packs_by_collection[None],
-        root_ordinal,
-    )
-    family_revision = await create_family_revision(
-        session,
-        request,
-        grant,
-        stored_family.root_record.root_record_id,
-        root_revision.root_revision_id,
-        stored_family.entity_binding.entity_binding_id,
-        bytes(stored_family.family.family_sha256),
-        len(stored_family.children),
-    )
-    copied_child_rows = await copy_stored_children(
-        session,
-        request,
-        registry,
-        packs_by_collection,
-        stored_family,
-        family_revision,
-        child_ordinals_by_collection,
-    )
-    return PublishedCandidateFamily(
-        root_record_id=stored_family.root_record.root_record_id,
-        root_revision_id=root_revision.root_revision_id,
-        family_revision_id=family_revision.family_revision_id,
-        entity_binding_id=stored_family.entity_binding.entity_binding_id,
-        family_sha256=bytes(family_revision.family_sha256),
-        root_values_by_field=stored_family.root_values_by_field,
-        children=copied_child_rows,
-    )
-
-
-async def copy_root_revision(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    stored_family: StoredCandidateFamily,
-    root_pack: CustomImportPack,
-    source_ordinal: int,
-) -> CustomImportRootRevision:
-    """Copy a retained root payload under the fresh root pack provenance."""
-
-    root_revision = CustomImportRootRevision(
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        root_record_id=stored_family.root_record.root_record_id,
-        pack_id=root_pack.pack_id,
-        source_ordinal=source_ordinal,
-        canonical_payload=stored_family.root_revision.canonical_payload,
-        payload_sha256=stored_family.root_revision.payload_sha256,
-    )
-    session.add(root_revision)
-    await flush_materialization(session)
-    return root_revision
-
-
-async def copy_stored_children(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    registry: CandidateRegistry,
-    packs_by_collection: Mapping[str | None, CustomImportPack],
-    stored_family: StoredCandidateFamily,
-    family_revision: CustomImportFamilyRevision,
-    child_ordinals_by_collection: dict[str, int],
-) -> tuple[PublishedCandidateChild, ...]:
-    """Copy each retained child payload and attach it to the cloned family."""
-
-    copied_child_rows: list[PublishedCandidateChild] = []
-    for stored_child in stored_family.children:
-        collection = stored_child.collection
-        child_context = ChildRevisionContext(
-            request=request,
-            registry=registry,
-            child_pack=packs_by_collection[collection],
-            root_record=stored_family.root_record,
-            family_revision=family_revision,
-            collection=collection,
-        )
-        child_revision = await copy_child_revision(
-            session,
-            child_context,
-            stored_child,
-            child_ordinals_by_collection[collection],
-        )
-        child_ordinals_by_collection[collection] += 1
-        copied_child_rows.append(child_revision)
-    return tuple(copied_child_rows)
-
-
-async def copy_child_revision(
-    session: AsyncSession,
-    child_context: ChildRevisionContext,
-    stored_child: StoredCandidateChild,
-    source_ordinal: int,
-) -> PublishedCandidateChild:
-    """Copy one retained child payload and attach its fresh membership edge."""
-
-    request = child_context.request
-    source_child = stored_child.child
-    child_revision = CustomImportChildRevision(
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        root_record_id=child_context.root_record.root_record_id,
-        collection_slot=child_context.registry.child_collection_slots[stored_child.collection],
-        pack_id=child_context.child_pack.pack_id,
-        source_ordinal=source_ordinal,
-        canonical_parent_key=child_context.root_record.canonical_logical_key,
-        parent_key_sha256=child_context.root_record.logical_key_sha256,
-        canonical_child_key=source_child.canonical_child_key,
-        child_key_sha256=source_child.child_key_sha256,
-        canonical_payload=source_child.canonical_payload,
-        payload_sha256=source_child.payload_sha256,
-    )
-    session.add(child_revision)
-    await flush_materialization(session)
-    await add_family_child_membership(session, child_context, child_revision.child_revision_id)
-    return PublishedCandidateChild(
-        collection=stored_child.collection,
-        child_revision_id=child_revision.child_revision_id,
-        child_key_sha256=bytes(child_revision.child_key_sha256),
-        values_by_field=stored_child.values_by_field,
-    )
-
-
-async def root_record_for_values(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    root_values_by_field: Mapping[str, Any],
-) -> CustomImportRootRecord:
-    """Load or append the stable dataset-local root logical identity."""
-
-    canonical_root_key = root_key_document(request.definition, root_values_by_field)
-    logical_key_sha256 = root_key_hash(request.definition, root_values_by_field)
-    key_contract_sha256 = root_key_contract_hash(request.definition)
-    root_record = (
-        await session.execute(
-            select(CustomImportRootRecord)
-            .where(
-                CustomImportRootRecord.dataset_id == request.dataset_id,
-                CustomImportRootRecord.key_contract_sha256 == key_contract_sha256,
-                CustomImportRootRecord.logical_key_sha256 == logical_key_sha256,
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if root_record is not None:
-        if root_record.canonical_logical_key != canonical_root_key:
-            raise CandidateRunnerError("root-key digest collision")
-        return root_record
-    root_record = CustomImportRootRecord(
-        dataset_id=request.dataset_id,
-        key_contract_sha256=key_contract_sha256,
-        canonical_logical_key=canonical_root_key,
-        logical_key_sha256=logical_key_sha256,
-    )
-    session.add(root_record)
-    await flush_materialization(session)
-    return root_record
-
-
-async def entity_binding_for_values(
-    session: AsyncSession,
-    request: CandidateRunRequest,
-    root_values_by_field: Mapping[str, Any],
-) -> CustomImportEntityBinding:
-    """Load or append the stable generic NPI binding for an accepted family."""
-
-    entity_value = root_values_by_field.get(request.definition.entity_field)
-    if not isinstance(entity_value, str):
-        raise CandidateRunnerError("accepted family has no string entity value")
-    value_sha256 = entity_value_digest(entity_value)
-    entity_binding = (
-        await session.execute(
-            select(CustomImportEntityBinding)
-            .where(
-                CustomImportEntityBinding.dataset_id == request.dataset_id,
-                CustomImportEntityBinding.adapter_id == "npi",
-                CustomImportEntityBinding.canonical_value == entity_value,
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if entity_binding is not None:
-        if not hmac.compare_digest(bytes(entity_binding.value_sha256), value_sha256):
-            raise CandidateRunnerError("entity binding digest does not match its value")
-        return entity_binding
-    entity_binding = CustomImportEntityBinding(
-        dataset_id=request.dataset_id,
-        adapter_id="npi",
-        canonical_value=entity_value,
-        value_sha256=value_sha256,
-    )
-    session.add(entity_binding)
-    await flush_materialization(session)
-    return entity_binding
+    return await persist_families(session, request, grant, registry, packs_by_collection, selected_families)
 
 
 async def attach_generation_families(
@@ -1069,22 +704,11 @@ async def attach_generation_families(
     generation: CustomImportGeneration,
     published_families: Sequence[PublishedCandidateFamily],
 ) -> None:
-    """Attach every current-fence family to the current candidate generation."""
+    """Attach current-fence families through bounded protected set writes."""
 
-    session.add_all(
-        tuple(
-            CustomImportGenerationFamily(
-                generation_id=generation.generation_id,
-                dataset_id=request.dataset_id,
-                definition_revision_id=request.definition_revision_id,
-                schema_revision_id=request.schema_revision_id,
-                root_record_id=family.root_record_id,
-                family_revision_id=family.family_revision_id,
-            )
-            for family in published_families
-        )
-    )
-    await flush_materialization(session)
+    from process.custom_import.legacy_generation_store import persist_generation_families
+
+    await persist_generation_families(session, request, generation, published_families)
 
 
 async def persist_projections_and_winners(
@@ -1329,9 +953,9 @@ async def persist_rejections(
             sorted(admitted.rejections, key=lambda item: (repr(item.root_key), item.code))
         )
     ]
-    if rejection_models:
-        session.add_all(tuple(rejection_models))
-        await flush_materialization(session)
+    from process.custom_import.legacy_graph_store import persist_rejection_models
+
+    await persist_rejection_models(session, rejection_models)
 
 
 def rejection_model(

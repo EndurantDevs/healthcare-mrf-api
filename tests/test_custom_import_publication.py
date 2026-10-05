@@ -28,6 +28,46 @@ from process.custom_import.publication import (
 )
 
 
+@pytest.mark.parametrize("caller_timeout", ["0", "1s", "250ms"])
+async def test_reserved_finality_timeout_binds_postgres_setting_as_text(monkeypatch, caller_timeout):
+    """The async driver must not try to encode a setting string as an interval."""
+
+    session = SimpleNamespace(info={}, execute=AsyncMock())
+    session.info[publication._FINALITY_SCAN_WINDOW_KEY] = publication._FinalityScanWindow(
+        expires_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        monotonic_deadline=20,
+        statement_timeout=caller_timeout,
+    )
+    monkeypatch.setattr(publication.time, "monotonic", lambda: 10)
+    await publication._prepare_bounded_materialization_statement(session, reserve_for_authority=True)
+    statement, parameters = session.execute.await_args.args
+    assert parameters == {"remaining_milliseconds": 5000, "caller_timeout": caller_timeout}
+    assert "CAST(CAST(:caller_timeout AS text) AS interval)" in str(statement)
+    assert "least(:remaining_milliseconds," in str(statement)
+
+
+@pytest.mark.parametrize("sealed", (False, True))
+def test_materialization_resolver_separates_live_finality_from_sealed_reads(sealed):
+    generation = SimpleNamespace(
+        generation_id=1,
+        dataset_id=2,
+        definition_revision_id=3,
+        schema_revision_id=4,
+        execution_id=5,
+        capture_bundle_id=6,
+        producing_fence=7,
+        producing_token_sha256=b"t" * 32,
+    )
+    resolver, parameters = publication._materialization_resolver(generation, sealed)
+    assert tuple(parameters.values())[:4] == (1, 2, 3, 4)
+    if sealed:
+        assert resolver == "resolve_custom_import_generation_snapshot"
+        assert len(parameters) == 4
+    else:
+        assert resolver == "resolve_custom_import_generation_finality_snapshot"
+        assert tuple(parameters.values())[4:] == (5, 6, 7, b"t" * 32)
+
+
 @pytest.mark.parametrize(
     ("revision", "source_ordinal"),
     (
@@ -770,6 +810,20 @@ def test_no_change_candidate_must_belong_to_the_running_execution():
 
 
 @pytest.mark.asyncio
+async def test_no_change_rejects_stale_producer_before_materialization(monkeypatch):
+    request, execution, _base, candidate, *_rest = _no_change_fixtures()
+    candidate.producing_fence = request.lease_fence - 1
+    candidate.producing_token_sha256 = request.token_sha256
+    materialization = AsyncMock()
+    monkeypatch.setattr(publication, "_locked_generation_seal", AsyncMock(return_value=None))
+    monkeypatch.setattr(publication, "_materialization", materialization)
+
+    with pytest.raises(PublicationConflict, match="generation producing authority is stale"):
+        await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
+    materialization.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_existing_no_change_candidate_seal_requires_exact_authority(monkeypatch):
     request, execution, _base, candidate, _base_seal, _candidate_seal, seal = _no_change_fixtures()
     seal.sealing_fence = request.lease_fence
@@ -873,7 +927,7 @@ async def test_root_scalar_materialization_hashes_each_retained_projection(monke
     async def _records(_session, _statement):
         yield SimpleNamespace(), SimpleNamespace(), scalar, root_record
 
-    monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation: object())
+    monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation, **_kwargs: object())
     monkeypatch.setattr(publication, "_stream_materialization_records", _records)
     digest = publication._new_digest("test-root-scalars")
     digest_before_materialization = digest.digest()
