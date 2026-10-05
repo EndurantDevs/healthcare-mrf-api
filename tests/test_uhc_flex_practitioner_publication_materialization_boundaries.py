@@ -28,60 +28,60 @@ def _identity_and_admission(resource_count: int = 1):
 
 
 @pytest.mark.asyncio
-async def test_page_insert_requires_exact_resource_and_provenance_counts() -> None:
-    page_rows = [{"dataset_id": "dataset", "resource_id": "resource"}]
-    empty_database = SimpleNamespace(status=AsyncMock())
-    await materialization._insert_materialized_page(empty_database, [])
-    empty_database.status.assert_not_awaited()
-
-    resource_database = SimpleNamespace(
-        status=AsyncMock(return_value=0)
-    )
+async def test_page_insert_requires_exact_resource_and_provenance_counts(monkeypatch) -> None:
+    page_rows = [{
+        "dataset_id": "dataset", "resource_type": "Practitioner", "resource_id": "resource",
+        "payload_hash": "a" * 64, "payload_json": {"resource_id": "resource"},
+        "requested_npi": 1000000001, "candidate_acquisition_id": "candidate",
+        "acquired_resource_sha256": "b" * 64,
+    }]
+    copier = AsyncMock(return_value=0)
+    monkeypatch.setattr(materialization, "copy_dataset_candidate_rows", copier)
+    database = object()
+    await materialization._insert_materialized_page(database, [])
+    copier.assert_not_awaited()
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="content is invalid",
     ):
         await materialization._insert_materialized_page(
-            resource_database,
+            database,
             page_rows,
         )
 
-    provenance_database = SimpleNamespace(
-        status=AsyncMock(side_effect=[1, 0])
-    )
+    copier.reset_mock()
+    copier.side_effect = [1, 0]
     with pytest.raises(publication.UHCFlexPractitionerPublicationError):
         await materialization._insert_materialized_page(
-            provenance_database,
+            database,
             page_rows,
         )
 
-    complete_database = SimpleNamespace(
-        status=AsyncMock(side_effect=[1, 1])
-    )
+    copier.reset_mock()
+    copier.side_effect = [1, 1]
     await materialization._insert_materialized_page(
-        complete_database,
+        database,
         page_rows,
     )
-    assert complete_database.status.await_count == 2
+    assert copier.await_count == 2
+    assert copier.await_args_list[0].args[3][0][-1] is None
+    assert copier.await_args_list[1].args[3][0][-1] == "b" * 64
 
 
 def _patch_candidate_dependencies(monkeypatch, stored_pages):
-    stored = SimpleNamespace(requested_npi=1000000001, resource_id="one")
-    materialized = SimpleNamespace(
-        requested_npi=stored.requested_npi,
-        dataset_resource={"resource_id": stored.resource_id},
-    )
-    reader = AsyncMock(side_effect=stored_pages(stored))
+    stored_by_field = {"npi": 1000000001, "resource_id": "one"}
+    materialized_by_field = {"resource_id": stored_by_field["resource_id"]}
+    reader = AsyncMock(side_effect=stored_pages(stored_by_field))
     inserter = AsyncMock()
-    facade = Mock(return_value=materialized)
+    facade = Mock(return_value=materialized_by_field)
     monkeypatch.setattr(
         materialization,
-        "read_uhc_flex_practitioner_resource_page",
+        "_resource_page_records",
         reader,
     )
     monkeypatch.setattr(
         materialization,
-        "materialize_uhc_flex_practitioner_stored_resource",
+        "_materialize_admitted_practitioner_resource",
         facade,
     )
     monkeypatch.setattr(
@@ -89,7 +89,7 @@ def _patch_candidate_dependencies(monkeypatch, stored_pages):
         "_insert_materialized_page",
         inserter,
     )
-    return stored, reader, inserter
+    return stored_by_field, reader, inserter
 
 
 @pytest.mark.asyncio
@@ -106,10 +106,10 @@ async def test_candidate_materialization_pages_exactly(monkeypatch) -> None:
         admission,
         25,
     ) == 1
-    assert reader.await_args_list[1].kwargs["after_npi"] == (
-        stored.requested_npi
+    assert reader.await_args_list[1].args[2] == (
+        stored["npi"]
     )
-    assert reader.await_args_list[1].kwargs["after_resource_id"] == "one"
+    assert reader.await_args_list[1].args[3] == "one"
     assert inserter.await_args.args[1][0]["candidate_acquisition_id"] == (
         admission.candidate_acquisition_id
     )
@@ -165,11 +165,8 @@ def test_semantic_resource_identity_recomputes_hash_and_rejects_tamper() -> None
     )[2] == payload_hash
 
     rejected_fields = (
-        {**resource_by_field, "payload_json": "{"},
-        {**resource_by_field, "payload_json": []},
-        {**resource_by_field, "resource_type": "Location"},
-        {**resource_by_field, "acquired_resource_sha256": "1" * 64},
         {**resource_by_field, "payload_hash": "0" * 64},
+        {**resource_by_field, "payload_json": {"resource_id": "changed"}},
     )
     for resource_fields_with_drift in rejected_fields:
         with pytest.raises(

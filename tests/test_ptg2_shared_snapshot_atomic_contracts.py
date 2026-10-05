@@ -73,6 +73,9 @@ async def test_v4_source_projection_shares_atomic_graph_transaction(
             tax_identity_source_artifacts=({},),
         )
 
+    assert atomic_fixture.session.candidate_read_calls == [{"snapshot": 44, "token": "exact-build"}]
+    assert atomic_fixture.session.info == {}
+    shared_snapshot_publish.attach_snapshot_candidates.assert_not_awaited()
     assert atomic_fixture.publication_events == [
         ("begin", atomic_fixture.session),
         ("commit", atomic_fixture.session),
@@ -88,7 +91,7 @@ async def test_v4_source_projection_shares_atomic_graph_transaction(
 
 @pytest.mark.asyncio
 async def test_v4_tax_group_lookup_is_bounded_and_heartbeated(monkeypatch):
-    """Tax completeness uses a bounded indexed join and completed counters."""
+    """The candidate COPY lane keeps heartbeats without per-row database reads."""
 
     clock_seconds = [0.0]
     snapshots = []
@@ -115,74 +118,29 @@ async def test_v4_tax_group_lookup_is_bounded_and_heartbeated(monkeypatch):
         await_statement,
     )
 
-    tax_group_records, elapsed_seconds = (
-        await shared_snapshot_publish._v4_tax_group_rows_batch(
-            session,
-            schema='"mrf"',
-            group_tax_stage='"group_tax_stage"',
-            graph_group_stage='"group_stage"',
-            previous_group_id=b"",
-            batch_rows=100_000,
-            heartbeat_callback=progress.heartbeat,
-        )
+    copy_mock = AsyncMock(return_value=4)
+    monkeypatch.setattr(shared_snapshot_publish, "copy_snapshot_candidate", copy_mock)
+    await shared_snapshot_publish._publish_v4_tax_group_ranges(
+        session, schema='"mrf"', snapshot_key=7, stage_table="group_tax_stage",
+        expected_count=4, build_token="owned", progress_callback=None,
+        heartbeat_callback=progress.heartbeat,
     )
-
-    statement = str(session.execute.await_args.args[0])
-    assert tax_group_records == ()
-    assert elapsed_seconds == 5.0
-    assert "LEFT JOIN" in statement
-    assert "ORDER BY sidecar.provider_group_global_id_128" in statement
-    assert "LIMIT :batch_rows" in statement
-    assert "COUNT(DISTINCT" not in statement
-    assert "NOT EXISTS" not in statement
+    copy_mock.assert_awaited_once()
+    assert copy_mock.await_args.kwargs["expected_count"] == 4
+    session.execute.assert_not_awaited()
     assert snapshots == [
         {"validated_dictionary_rows": 4},
         {"validated_dictionary_rows": 4},
     ]
 
 
-def test_v4_tax_group_reference_bitset_is_exact_and_group_bound():
-    """Duplicate references count once and every sidecar must bind a group."""
-
-    contract = _tax_stage_contract()
+def test_v4_tax_group_digest_preserves_canonical_encoding():
+    """Canonical digest bytes remain unchanged after moving semantics to SQL."""
     digest = hashlib.sha256()
-    count_by_state = {
-        name: 0
-        for name in (
-            "matched_ein",
-            "missing",
-            "malformed",
-            "unsupported_type",
-        )
-    }
-    group_rows = (
-        (b"\x01" * 16, "matched_ein", 0, b"\x01", True),
-        (b"\x02" * 16, "matched_ein", 0, b"\x01", True),
-    )
-
-    latest_group_id, new_reference_count = (
-        shared_snapshot_publish._consume_v4_tax_group_rows(
-            group_rows,
-            previous_group_id=b"",
-            contract=contract,
-            content_digest=digest,
-            count_by_state=count_by_state,
-            referenced_token_bits=bytearray(1),
-        )
-    )
-
-    assert latest_group_id == b"\x02" * 16
-    assert new_reference_count == 1
-    assert count_by_state["matched_ein"] == 2
-    with pytest.raises(
-        RuntimeError,
-        match="provider-group tax identity changed",
-    ):
-        shared_snapshot_publish._validated_v4_tax_group_row(
-            (b"\x03" * 16, "missing", None, b"\x01", False),
-            previous_group_id=b"\x02" * 16,
-            contract=contract,
-        )
+    shared_snapshot_publish._append_v4_tax_group_digest(digest,
+        group_id=b"g"*16, tax_state="matched_ein", tin_key=0, source_bitmap=b"\x01")
+    expected = b"g"*16 + b"\x01\x01" + struct.pack(">I",0) + struct.pack(">I",1) + b"\x01"
+    assert digest.digest() == hashlib.sha256(expected).digest()
 
 
 @pytest.mark.asyncio

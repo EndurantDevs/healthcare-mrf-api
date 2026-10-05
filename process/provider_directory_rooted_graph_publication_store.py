@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_dataset_candidate import prepare_dataset_candidate
 from process.provider_directory_dataset_scoped_publication import (
     exact_current_matches_root,
     exact_uhc_dataset_pair,
@@ -414,20 +415,21 @@ async def _materialize_and_publish(
         admission,
         count_by_resource_type,
     )
-    materialized = await materialize_provider_directory_rooted_graph_dataset(
-        database,
-        identity,
-        publication_run_id=admission.publication_run_id,
-        batch_size=batch_size,
-    )
-    if materialized.resource_counts != count_by_resource_type:
-        raise ProviderDirectoryRootedGraphPublicationError("content")
-    await build_provider_directory_dataset_serving_relations(
-        database,
-        identity.dataset_id,
-        build_run_id=admission.publication_run_id,
-        expected_acquisition_root_run_id=identity.acquisition_root_run_id,
-    )
+    async with prepare_dataset_candidate(database, identity.dataset_id, kind="rooted"):
+        materialized = await materialize_provider_directory_rooted_graph_dataset(
+            database,
+            identity,
+            publication_run_id=admission.publication_run_id,
+            batch_size=batch_size,
+        )
+        if materialized.resource_counts != count_by_resource_type:
+            raise ProviderDirectoryRootedGraphPublicationError("content")
+        await build_provider_directory_dataset_serving_relations(
+            database,
+            identity.dataset_id,
+            build_run_id=admission.publication_run_id,
+            expected_acquisition_root_run_id=identity.acquisition_root_run_id,
+        )
     await _validate_and_publish(database, identity, current)
     readiness = await load_dataset_readiness(
         identity.dataset_id,

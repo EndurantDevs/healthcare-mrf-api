@@ -23,7 +23,9 @@ def publication_table(name: str) -> str:
     schema = runtime_schema or legacy_schema or "mrf"
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema) is None:
         raise ProviderDirectoryRootedGraphPublicationError("state")
-    return f'"{schema}"."{name}"'
+    from importlib import import_module
+
+    return import_module("process.provider_directory_fhir")._qt(schema, name)
 
 
 def publication_row_fields(database_row: Any) -> dict[str, Any]:

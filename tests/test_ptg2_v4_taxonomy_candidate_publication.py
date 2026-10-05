@@ -482,3 +482,14 @@ async def test_pattern_publication_empty_evidence_is_explicit(
     assert {
         stored_row["representation"] for stored_row in empty_session.stored_rows
     } == {"direct_v1"}
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_builder_reads_detached_npi_dictionary(monkeypatch):
+    """Catalog intersection uses the frozen candidate before family attachment."""
+    monkeypatch.setattr(snapshot_maps, "lock_v4_shared_layout_for_map_write", _noop_map_write_lock)
+    session = _PublicationSession()
+    session.info = {"ptg_snapshot_candidate_reads": {'"mrf"': {"ptg2_v4_npi_scope": "detached_npi"}}}
+    publication = await _publish_candidate_projection(session, representation="direct_v1", pattern_count=0)
+    assert 'FROM "mrf"."detached_npi" AS scoped' in session.catalog_sql
+    _assert_direct_publication_contract(publication, session)

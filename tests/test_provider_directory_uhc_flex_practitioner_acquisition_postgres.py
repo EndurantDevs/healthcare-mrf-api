@@ -143,7 +143,7 @@ async def _expire_claim(connection, schema_name: str, acquisition_id: str) -> No
         )
 
 
-async def _prepare_schema(engine, url, schema_name: str) -> tuple[object, object]:
+async def _prepare_schema(engine, url, schema_name: str, *, latest=True) -> tuple[object, object]:
     cohort_migration = load_migration(COHORT_PATH, "flex_store_cohort")
     acquisition_migration = load_migration(
         ACQUISITION_PATH,
@@ -166,6 +166,11 @@ async def _prepare_schema(engine, url, schema_name: str) -> tuple[object, object
     finally:
         await connection.close()
     await run_migration(engine, acquisition_migration, "upgrade")
+    if latest:
+        await run_migration(engine, load_migration(
+            VERSIONS / "20261005120000_practitioner_set_validation.py",
+            "flex_store_set_validation",
+        ), "upgrade")
     return cohort_migration, acquisition_migration
 
 

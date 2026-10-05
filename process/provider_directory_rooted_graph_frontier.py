@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from process.provider_directory_rooted_graph_bulk import admit_work_specs
 from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_TYPES,
 )
@@ -24,7 +25,6 @@ from process.provider_directory_rooted_graph_store_contract import (
 from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
     ENDPOINT_TABLE,
-    insert_work_spec,
     row_fields,
     set_store_action,
     table_ref,
@@ -129,8 +129,7 @@ async def register_rooted_graph_frontier(
     if not specs:
         return
     await set_store_action(database, "derive", claim.acquisition_id, claim.lease_token)
-    for spec in specs:
-        await insert_work_spec(database, claim.acquisition_id, spec)
+    await admit_work_specs(database, claim.acquisition_id, specs, action="derive")
 
 
 __all__ = ("register_rooted_graph_frontier",)

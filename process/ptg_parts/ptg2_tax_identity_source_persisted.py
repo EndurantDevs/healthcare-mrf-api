@@ -7,6 +7,7 @@ import hmac
 from typing import Any
 
 from db.connection import db
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_relation
 from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
     tax_identity_source_binding_vector_digest,
 )
@@ -108,7 +109,7 @@ async def validate_source_observation_counts(
                        COUNT(*) FILTER (
                            WHERE tax_identity_state = 'unsupported_type'
                        )::bigint
-                  FROM {schema}.ptg2_provider_group_tax_identity_source
+                  FROM {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity_source")}
                  WHERE snapshot_key = :snapshot_key
                 """),
             {"snapshot_key": _strict_int(snapshot_key)},

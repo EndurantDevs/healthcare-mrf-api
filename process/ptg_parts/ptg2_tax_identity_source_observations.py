@@ -1,159 +1,69 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Publish bounded ranges of source-local tax-identity observations."""
-
+"""COPY source-local observations into an isolated snapshot candidate."""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import tempfile
+from collections.abc import Callable
 from typing import Any
 
 from db.connection import db
+from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_snapshot_candidates import (
+    COPY_MAX_BYTES, COPY_MAX_ROWS, begin_snapshot_candidate, candidate_driver,
+    finish_snapshot_candidate, snapshot_candidate_relation,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
-    PreparedTaxIdentitySourceProjection,
-    _fail,
-    _strict_int,
+    PreparedTaxIdentitySourceProjection, _fail,
 )
 
-_OBSERVATION_BATCH_ROWS = 10_000
+
+async def _observation_boundary(session, stage, cursor):
+    """Bound binary COPY by both source-order rows and exact encoded bytes."""
+    records = (await session.execute(db.text(f"""
+        SELECT source_key,source_record_ordinal,
+               2+4*6+8+4+octet_length(provider_group_global_id_128)+8+
+               octet_length(tax_identity_state)+4 AS byte_count
+          FROM {stage}
+         WHERE (source_key,source_record_ordinal)>(:source,:ordinal)
+         ORDER BY source_key,source_record_ordinal LIMIT :rows
+    """), {"source": cursor[0], "ordinal": cursor[1], "rows": COPY_MAX_ROWS})).all()
+    byte_count, count, boundary = 21, 0, None
+    for source, ordinal, size in records:
+        if byte_count+size>COPY_MAX_BYTES:
+            break
+        byte_count += size
+        count += 1
+        boundary = (int(source),int(ordinal))
+    if records and not count:
+        raise _fail()
+    return boundary,count
 
 
-def _range_predicate(table_alias: str) -> str:
-    return f"""
-        ({table_alias}.source_key > :previous_source_key OR
-         ({table_alias}.source_key = :previous_source_key AND
-          {table_alias}.source_record_ordinal > :previous_ordinal))
-        AND
-        ({table_alias}.source_key < :last_source_key OR
-         ({table_alias}.source_key = :last_source_key AND
-          {table_alias}.source_record_ordinal <= :last_ordinal))
-    """
-
-
-async def _observation_boundary(
-    session: Any,
-    *,
-    stage: str,
-    previous_source_key: int,
-    previous_ordinal: int,
-) -> tuple[int, int, int] | None:
-    observation_rows = (
-        await session.execute(
-            db.text(f"""
-                SELECT source_key, source_record_ordinal
-                  FROM {stage}
-                 WHERE source_key > :previous_source_key
-                    OR (source_key = :previous_source_key
-                        AND source_record_ordinal > :previous_ordinal)
-                 ORDER BY source_key, source_record_ordinal
-                 LIMIT :batch_rows
-                """),
-            {
-                "previous_source_key": previous_source_key,
-                "previous_ordinal": previous_ordinal,
-                "batch_rows": _OBSERVATION_BATCH_ROWS,
-            },
-        )
-    ).all()
-    if not observation_rows:
-        return None
-    return (
-        len(observation_rows),
-        int(observation_rows[-1][0]),
-        int(observation_rows[-1][1]),
-    )
-
-
-async def _count_unresolved_identities(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    snapshot_key: int,
-    range_parameters_by_name: Mapping[str, int],
-) -> int:
-    unresolved_count = await session.scalar(
-        db.text(f"""
-            SELECT COUNT(*)::bigint
-              FROM {stage} AS staged
-              LEFT JOIN {schema}.ptg2_provider_tax_identity AS identity
-                ON identity.snapshot_key = :snapshot_key
-               AND identity.tin_id_128 = staged.tin_id_128
-               AND identity.tin_hmac_sha256 = staged.tin_hmac_sha256
-             WHERE {_range_predicate("staged")}
-               AND staged.tax_identity_state = 'matched_ein'
-               AND identity.tin_key IS NULL
-            """),
-        {
-            "snapshot_key": _strict_int(snapshot_key),
-            **dict(range_parameters_by_name),
-        },
-    )
-    return int(unresolved_count or 0)
-
-
-async def _insert_observation_range(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    snapshot_key: int,
-    range_parameters_by_name: Mapping[str, int],
-) -> None:
-    await session.execute(
-        db.text(f"""
-            INSERT INTO {schema}.ptg2_provider_group_tax_identity_source
-                (snapshot_key, source_key, provider_group_global_id_128,
-                 source_record_ordinal, tax_identity_state, tin_key)
-            SELECT :snapshot_key, staged.source_key,
-                   staged.provider_group_global_id_128,
-                   staged.source_record_ordinal, staged.tax_identity_state,
-                   identity.tin_key
-              FROM {stage} AS staged
-              LEFT JOIN {schema}.ptg2_provider_tax_identity AS identity
-                ON identity.snapshot_key = :snapshot_key
-               AND identity.tin_id_128 = staged.tin_id_128
-               AND identity.tin_hmac_sha256 = staged.tin_hmac_sha256
-             WHERE {_range_predicate("staged")}
-            ON CONFLICT DO NOTHING
-            """),
-        {
-            "snapshot_key": _strict_int(snapshot_key),
-            **dict(range_parameters_by_name),
-        },
-    )
-
-
-async def _count_matching_observations(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    snapshot_key: int,
-    range_parameters_by_name: Mapping[str, int],
-) -> int:
-    matching_count = await session.scalar(
-        db.text(f"""
-            SELECT COUNT(*)::bigint
-              FROM {stage} AS staged
-              JOIN {schema}.ptg2_provider_group_tax_identity_source AS stored
-                ON stored.snapshot_key = :snapshot_key
-               AND stored.source_key = staged.source_key
-               AND stored.provider_group_global_id_128 =
-                       staged.provider_group_global_id_128
-               AND stored.source_record_ordinal = staged.source_record_ordinal
-               AND stored.tax_identity_state = staged.tax_identity_state
-              LEFT JOIN {schema}.ptg2_provider_tax_identity AS identity
-                ON identity.snapshot_key = :snapshot_key
-               AND identity.tin_id_128 = staged.tin_id_128
-               AND identity.tin_hmac_sha256 = staged.tin_hmac_sha256
-             WHERE {_range_predicate("staged")}
-               AND stored.tin_key IS NOT DISTINCT FROM identity.tin_key
-            """),
-        {
-            "snapshot_key": _strict_int(snapshot_key),
-            **dict(range_parameters_by_name),
-        },
-    )
-    return int(matching_count or 0)
+async def _copy_observation_batch(session, *, schema_name, stage, candidate, snapshot_key, bounds):
+    """Resolve the indexed dictionary and transfer one bounded native buffer."""
+    cursor,boundary,count=bounds
+    identity=snapshot_candidate_relation(session,_quote_ident(schema_name),"ptg2_provider_tax_identity")
+    driver=await candidate_driver(session)
+    with tempfile.TemporaryFile() as payload:
+        copied=await driver.copy_from_query(f"""
+            SELECT $1::bigint,staged.source_key,staged.provider_group_global_id_128,
+                   staged.source_record_ordinal,staged.tax_identity_state,identity.tin_key
+              FROM {stage} staged LEFT JOIN {identity} identity
+                ON identity.snapshot_key=$1 AND identity.tin_id_128=staged.tin_id_128
+               AND identity.tin_hmac_sha256=staged.tin_hmac_sha256
+             WHERE (staged.source_key,staged.source_record_ordinal)>($2::integer,$3::bigint)
+               AND (staged.source_key,staged.source_record_ordinal)<=($4::integer,$5::bigint)
+             ORDER BY staged.source_key,staged.source_record_ordinal
+        """, snapshot_key,*cursor,*boundary,output=payload,format="binary")
+        if copied!=f"COPY {count}" or payload.tell()>COPY_MAX_BYTES:
+            raise _fail()
+        payload.seek(0)
+        copied=await driver.copy_to_table(candidate,schema_name=schema_name,
+            columns=("snapshot_key","source_key","provider_group_global_id_128",
+                     "source_record_ordinal","tax_identity_state","tin_key"),
+            source=payload,format="binary")
+        if copied!=f"COPY {count}":
+            raise _fail()
 
 
 async def _count_witness_mismatches(
@@ -162,21 +72,20 @@ async def _count_witness_mismatches(
     schema: str,
     stage: str,
     snapshot_key: int,
-    range_parameters_by_name: Mapping[str, int],
 ) -> int:
     mismatch_count = await session.scalar(
         db.text(f"""
             SELECT COUNT(*)::bigint
               FROM {stage} AS staged
-              LEFT JOIN {schema}.ptg2_provider_group_tax_identity AS merged
+              LEFT JOIN {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity")} AS merged
                 ON merged.snapshot_key = :snapshot_key
                AND merged.provider_group_global_id_128 =
                        staged.provider_group_global_id_128
-              LEFT JOIN {schema}.ptg2_provider_tax_identity AS identity
+              LEFT JOIN {snapshot_candidate_relation(session, schema, "ptg2_provider_tax_identity")} AS identity
                 ON identity.snapshot_key = :snapshot_key
                AND identity.tin_id_128 = staged.tin_id_128
                AND identity.tin_hmac_sha256 = staged.tin_hmac_sha256
-             WHERE {_range_predicate("staged")}
+             WHERE TRUE
                AND (
                     merged.snapshot_key IS NULL
                     OR (get_byte(merged.source_bitmap,
@@ -192,98 +101,37 @@ async def _count_witness_mismatches(
                )
             """),
         {
-            "snapshot_key": _strict_int(snapshot_key),
-            **dict(range_parameters_by_name),
+            "snapshot_key": int(snapshot_key),
         },
     )
     return int(mismatch_count or 0)
 
 
-async def _publish_observation_batch(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    snapshot_key: int,
-    range_parameters_by_name: Mapping[str, int],
-    expected_count: int,
-) -> None:
-    """Publish and prove one bounded source-order observation range."""
-
-    if await _count_unresolved_identities(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        range_parameters_by_name=range_parameters_by_name,
-    ):
-        raise _fail()
-    await _insert_observation_range(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        range_parameters_by_name=range_parameters_by_name,
-    )
-    matching_count = await _count_matching_observations(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        range_parameters_by_name=range_parameters_by_name,
-    )
-    mismatch_count = await _count_witness_mismatches(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        range_parameters_by_name=range_parameters_by_name,
-    )
-    if matching_count != expected_count or mismatch_count:
-        raise _fail()
-
 
 async def _publish_observations(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    snapshot_key: int,
+    session: Any, *, schema: str, stage: str, snapshot_key: int,
     prepared: PreparedTaxIdentitySourceProjection,
     heartbeat_callback: Callable[[], None] | None,
 ) -> None:
-    """Publish all observations through bounded source-order ranges."""
-
-    previous_source_key = -1
-    previous_ordinal = -1
-    published_count = 0
-    while boundary := await _observation_boundary(
-        session,
-        stage=stage,
-        previous_source_key=previous_source_key,
-        previous_ordinal=previous_ordinal,
-    ):
-        batch_count, last_source_key, last_ordinal = boundary
-        range_parameters_by_name = {
-            "previous_source_key": previous_source_key,
-            "previous_ordinal": previous_ordinal,
-            "last_source_key": last_source_key,
-            "last_ordinal": last_ordinal,
-        }
-        await _publish_observation_batch(
-            session,
-            schema=schema,
-            stage=stage,
-            snapshot_key=snapshot_key,
-            range_parameters_by_name=range_parameters_by_name,
-            expected_count=batch_count,
-        )
-        published_count += batch_count
-        previous_source_key = last_source_key
-        previous_ordinal = last_ordinal
+    """Load all bounded buffers before indexes, set checks and aggregate accounting."""
+    schema_name=schema[1:-1].replace('""','"')
+    build_token=await session.scalar(db.text(f"SELECT build_token FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key=:snapshot"), {"snapshot":snapshot_key})
+    candidate=await begin_snapshot_candidate(session,schema_name,"ptg2_provider_group_tax_identity_source",snapshot_key,build_token)
+    cursor,total=(-1,-1),0
+    while True:
+        boundary,count=await _observation_boundary(session,stage,cursor)
+        if boundary is None:
+            break
+        await _copy_observation_batch(session,schema_name=schema_name,stage=stage,candidate=candidate,
+            snapshot_key=snapshot_key,bounds=(cursor,boundary,count))
+        total+=count
+        cursor=boundary
         if heartbeat_callback is not None:
             heartbeat_callback()
-    if published_count != prepared.provider_group_occurrence_count:
+    if total!=prepared.provider_group_occurrence_count:
+        raise _fail()
+    await finish_snapshot_candidate(session,schema_name,candidate,total)
+    if await _count_witness_mismatches(session,schema=schema,stage=stage,snapshot_key=snapshot_key):
         raise _fail()
 
 

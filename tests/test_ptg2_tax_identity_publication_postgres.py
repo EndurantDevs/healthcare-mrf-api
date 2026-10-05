@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from process.ptg_parts import ptg2_shared_snapshot_publish as publisher
 from tests.ptg2_provider_tax_identity_postgres_support import (
     async_database_url,
+    assert_layout_cascade,
     create_prerequisites,
     drop_disposable_schema,
     load_migration,
@@ -167,6 +168,7 @@ async def _publish_relational_rows(connection, schema_name: str) -> None:
         snapshot_key=11,
         stage=token_stage,
         progress_callback=None,
+        build_token="publication",
     )
     await publisher._publish_v4_tax_group_ranges(
         connection,
@@ -175,7 +177,11 @@ async def _publish_relational_rows(connection, schema_name: str) -> None:
         stage_table="group_tax_stage",
         expected_count=4,
         progress_callback=None,
+        build_token="publication",
     )
+
+    from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates
+    await attach_snapshot_candidates(connection,schema_name,11,"publication")
 
 
 async def _validate_staged_tax_content(connection, schema_name: str) -> None:
@@ -283,13 +289,45 @@ async def _assert_published_row_counts(engine, schema_name: str) -> None:
                 )
             )
         ).one()
-        await connection.execute(
-            sa.text(
-                f"UPDATE {schema}.ptg2_v4_snapshot_map_root "
-                "SET state = 'complete' WHERE snapshot_key = 11"
-            )
-        )
+        await connection.execute(sa.text(f"SELECT {schema}.validate_ptg_snapshot_tax_completion(root,'publication') FROM {schema}.ptg2_v4_snapshot_map_root root WHERE snapshot_key=11"))
     assert tuple(counts) == (1, 4)
+
+
+async def _reject_invalid_tax_stages(engine, schema_name):
+    """Check relational, state, bitmap, token, and content failures on staged sets."""
+    schema = quoted(schema_name)
+    mutations = (
+        "UPDATE {schema}.tax_dictionary_stage SET tin_key=2",
+        "UPDATE {schema}.tax_dictionary_stage SET tin_id_128=decode(repeat('ff',16),'hex')",
+        "UPDATE {schema}.tax_dictionary_stage SET tin_id_128=decode(repeat('66',16),'hex'),tin_hmac_sha256=decode(repeat('66',32),'hex')",
+        "UPDATE {schema}.group_tax_stage SET source_bitmap=decode('80','hex')",
+        "UPDATE {schema}.group_tax_stage SET source_bitmap=decode('00','hex')",
+        "UPDATE {schema}.group_tax_stage SET tin_key=9 WHERE tax_identity_state='matched_ein'",
+        "UPDATE {schema}.group_tax_stage SET tin_key=0 WHERE tax_identity_state='missing'",
+        "DELETE FROM {schema}.graph_group_stage WHERE provider_group_key=2",
+    )
+    async with engine.begin() as connection:
+        for mutation in mutations:
+            with pytest.raises(RuntimeError, match="tax identity.*changed"):
+                async with connection.begin_nested():
+                    await connection.exec_driver_sql(mutation.format(schema=schema))
+                    await _validate_staged_tax_content(connection, schema_name)
+
+
+async def _install_tax_candidates(engine, schema_name):
+    """Migrate tax tables before reserving the publication's fresh snapshot."""
+    from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+
+    schema = quoted(schema_name)
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(f"ALTER TABLE {schema}.ptg2_v3_snapshot_layout ADD COLUMN build_token text DEFAULT 'publication'")
+        await connection.exec_driver_sql(f"CREATE TEMP TABLE fresh_tax_groups ON COMMIT DROP AS SELECT * FROM {schema}.ptg2_v3_provider_group WHERE snapshot_key=11")
+        await connection.exec_driver_sql(f"DELETE FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key=11")
+        await apply_candidate_migration(connection,schema_name,
+            ("ptg2_provider_tax_identity","ptg2_provider_group_tax_identity"))
+        await connection.exec_driver_sql(f"INSERT INTO {schema}.ptg2_v3_snapshot_layout(snapshot_key,generation,state) VALUES(11,'shared_blocks_v4','building')")
+        await connection.exec_driver_sql(f"INSERT INTO {schema}.ptg2_v4_snapshot_map_root VALUES(11,'building')")
+        await connection.exec_driver_sql(f"INSERT INTO {schema}.ptg2_v3_provider_group SELECT * FROM fresh_tax_groups")
 
 
 @pytest.mark.asyncio
@@ -312,9 +350,11 @@ async def test_v4_tax_identity_publication_is_atomic_and_replay_safe(
         await create_prerequisites(engine, schema_name)
         is_schema_created = True
         await run_migration_action(engine, migration, "upgrade")
+        await _install_tax_candidates(engine,schema_name)
         async with engine.begin() as connection:
             await _create_publication_stages(connection, schema_name)
             await _populate_group_tax_stage(connection, schema_name)
+        await _reject_invalid_tax_stages(engine, schema_name)
         await _assert_interrupted_publication_rolls_back(
             engine,
             schema_name,
@@ -329,6 +369,9 @@ async def test_v4_tax_identity_publication_is_atomic_and_replay_safe(
             manifest,
         )
         await _assert_published_row_counts(engine, schema_name)
+        await assert_layout_cascade(engine, schema_name)
+        async with engine.connect() as connection:
+            assert await connection.scalar(sa.text(f"SELECT count(*) FROM {quoted(schema_name)}.ptg2_snapshot_candidate")) == 0
     finally:
         if is_schema_created:
             await drop_disposable_schema(engine, schema_name)

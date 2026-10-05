@@ -106,7 +106,7 @@ async def _publish(
             stage_table=staged.table_name,
             expected_row_count=prepared.provider_group_occurrence_count,
         )
-        return await source_publish.publish_staged_tax_identity_source_projection(
+        published = await source_publish.publish_staged_tax_identity_source_projection(
             session,
             schema_name=schema_name,
             logical_snapshot_id=_SNAPSHOT_ID,
@@ -115,6 +115,10 @@ async def _publish(
             prepared=prepared,
             heartbeat_callback=heartbeat_callback,
         )
+
+        from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates
+        await attach_snapshot_candidates(session,schema_name,18,"source-proof")
+        return published
 
 
 async def _prove_post_source_rollback(
@@ -423,10 +427,27 @@ def _configure_projector_database(monkeypatch, database, schema_name: str) -> No
         validation,
     ):
         monkeypatch.setattr(module, "db", database)
-    monkeypatch.setattr(observations, "_OBSERVATION_BATCH_ROWS", 2)
+    monkeypatch.setattr(observations, "COPY_MAX_ROWS", 2)
     monkeypatch.setattr(validation, "_VALIDATION_BATCH_ROWS", 2)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
+
+
+async def _install_source_candidates(engine, schema_name):
+    """Reserve fixture builds after migration; retain the fixture's tax-only root contract."""
+    from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+    schema=quoted(schema_name)
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(f"ALTER TABLE {schema}.ptg2_v3_snapshot_layout ADD COLUMN build_token text DEFAULT 'source-proof'")
+        old_guard=await connection.scalar(sa.text(f"SELECT pg_get_functiondef('{schema}.guard_ptg2_provider_tax_identity_completion()'::regprocedure)"))
+        for table in ("ptg2_v3_snapshot_layout","ptg2_v4_snapshot_map_root","ptg2_v3_provider_group"):
+            await connection.exec_driver_sql(f"CREATE TEMP TABLE fresh_{table} ON COMMIT DROP AS SELECT * FROM {schema}.{table} WHERE snapshot_key IN (18,19,20)")
+        await connection.exec_driver_sql(f"DELETE FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key IN (18,19,20)")
+        await apply_candidate_migration(connection,schema_name,("ptg2_provider_group_tax_identity_source",))
+        # This narrow source fixture has a two-column root, not the complete graph root.
+        await connection.exec_driver_sql(old_guard)
+        for table in ("ptg2_v3_snapshot_layout","ptg2_v4_snapshot_map_root","ptg2_v3_provider_group"):
+            await connection.exec_driver_sql(f"INSERT INTO {schema}.{table} SELECT * FROM fresh_{table}")
 
 
 @pytest.mark.asyncio
@@ -448,8 +469,9 @@ async def test_projector_publishes_replays_rolls_back_and_validates_reuse(
         await create_prerequisites(engine, schema_name)
         has_created_schema = True
         await run_migration_action(engine, load_parent_migration(), "upgrade")
-        await _insert_aggregate(engine, schema_name)
         await run_migration_action(engine, _load_source_migration(), "upgrade")
+        await _install_source_candidates(engine, schema_name)
+        await _insert_aggregate(engine, schema_name)
         prepare_projection = partial(_prepare_source_projection, tmp_path)
         published = await _verify_replay_and_conflict(
             database,
