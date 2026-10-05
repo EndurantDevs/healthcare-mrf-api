@@ -425,9 +425,72 @@ async def _native_guard_proof(engine):
         await _assert_guard_catalog(engine)
 
 
-def test_native_initial_receipt_guards(monkeypatch):
+@pytest.mark.parametrize("checkpoint_state", ("original", "restored", "predicate", "unvalidated", "no_inherit"))
+def test_native_initial_receipt_guards(monkeypatch, checkpoint_state):
+    if checkpoint_state == "restored":
+        _prove_restored_checkpoint_upgrade(monkeypatch)
+        return
+    if checkpoint_state != "original":
+        _assert_checkpoint_drift_rollback(monkeypatch, checkpoint_state)
+        return
+
     async def exercise():
         async with _database(monkeypatch) as engine:
             await _native_guard_proof(engine)
+
+    asyncio.run(exercise())
+
+
+def _prove_restored_checkpoint_upgrade(monkeypatch):
+    """Restoring an equivalent CHECK must not mistake explicit cast nodes for drift."""
+
+    async def exercise():
+        async with _database(monkeypatch) as engine:
+            table = migration._qt(_SCHEMA, migration._CHECKPOINT)
+            constraint = migration._q(migration._CHECKPOINT_CHECK)
+            query = sa.text("""SELECT conbin::text, pg_get_expr(conbin, conrelid), pg_get_constraintdef(oid)
+                FROM pg_constraint WHERE conrelid=CAST(:table AS regclass) AND conname=:name""")
+            values_by_name = {"table": table, "name": migration._CHECKPOINT_CHECK}
+            async with engine.begin() as connection:
+                before = (await connection.execute(query, values_by_name)).one()
+                await connection.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+                await connection.execute(sa.text(f"ALTER TABLE {table} ADD CONSTRAINT {constraint} {before[2]}"))
+                restored = (await connection.execute(query, values_by_name)).one()
+                assert restored[0] != before[0]
+                assert restored[1:] == before[1:]
+            await _native_guard_proof(engine)
+
+    asyncio.run(exercise())
+
+
+def _assert_checkpoint_drift_rollback(monkeypatch, drift):
+    """Predicate and constraint flags remain authoritative after cast normalization."""
+
+    async def exercise():
+        async with _database(monkeypatch) as engine:
+            table = migration._qt(_SCHEMA, migration._CHECKPOINT)
+            constraint = migration._q(migration._CHECKPOINT_CHECK)
+            predicate = "TRUE" if drift == "predicate" else migration._CHECKPOINT_PREDECESSOR
+            suffix_by_drift = {"predicate": "", "unvalidated": " NOT VALID", "no_inherit": " NO INHERIT"}
+            query = sa.text("""SELECT oid, conrelid, conname, conbin::text, convalidated, connoinherit
+                FROM pg_constraint WHERE connamespace=CAST(:schema AS regnamespace) ORDER BY oid""")
+            async with engine.begin() as connection:
+                await connection.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+                await connection.execute(
+                    sa.text(
+                        f"ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({predicate}){suffix_by_drift[drift]}"
+                    )
+                )
+                before = (await connection.execute(query, {"schema": _SCHEMA})).all()
+            with pytest.raises(DBAPIError, match="profile_initial_checkpoint_constraint_drift"):
+                await _upgrade(engine)
+            async with engine.connect() as connection:
+                assert (await connection.execute(query, {"schema": _SCHEMA})).all() == before
+                assert (
+                    await connection.scalar(
+                        sa.text("SELECT to_regclass(:table)"), {"table": migration._qt(_SCHEMA, migration._TABLE)}
+                    )
+                    is None
+                )
 
     asyncio.run(exercise())
