@@ -79,6 +79,8 @@ Configure these values before starting an import:
 The required budgets have no defaults. Size worker memory and storage for the registry snapshot, metadata inventory, serialization overhead, and retained history. The worker timeout covers the configured deadline plus five minutes; an external job deadline must also allow startup and cleanup. Budget exhaustion, cancellation, or incomplete acquisition leaves the previous publication in place. Provider limits and partial-source parameters are rejected.
 
 ## Shared Operational Rules
+
+- New or changed high-volume paths must follow [bulk loading and snapshot publication](./bulk-loading.md): replace per-row database validation with equivalent set-based checks, prepare indexes off the serving snapshot, and publish atomically with retained rollback.
 - Use `--test` where supported before large imports.
 - Publish style is importer-specific: direct load, validated direct replace, `_old` swap rollback, or snapshot pointer update.
 - Keep `_old` tables only for importers whose runbook documents them as rollback assets.

@@ -123,6 +123,13 @@ acknowledged as canceled. The command never automatically retries.
 
 ## Bounded segmented Snowflake execution
 
+The [bulk-loading design requirement](./imports/bulk-loading.md) applies to
+changes to this pipeline: set-based validation must replace old per-row database
+validation, and snapshot/index preparation must not interrupt serving reads.
+The current retained page limits below describe the existing execution contract,
+not a claim that larger COPY transport alone meets that requirement. Immutable
+binding limits are not changed implicitly by a writer migration.
+
 An immutable `custom-import/source-binding/v2` binding opts into segmented
 capture and bounded family builds. It retains the existing binding fields and
 requires a complete `processing_policy` object. A v1 binding keeps its existing
