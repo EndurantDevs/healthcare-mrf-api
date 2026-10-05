@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import importlib.util
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from db.models.custom_import import (
     CustomImportCapture,
     CustomImportCaptureBundle,
     CustomImportCurrentGeneration,
+    CustomImportDataset,
     CustomImportEntityBinding,
     CustomImportExecution,
     CustomImportGeneration,
@@ -1046,11 +1048,12 @@ async def _seal_second_fence_without_stale_material(
             assert recovered.effective_output_sha256 == bytes(baseline.effective_output_sha256).hex()
 
 
+@pytest.mark.parametrize("append_guard", ("original", "static", "cross_schema"))
 @pytest.mark.asyncio
-async def test_takeover_fences_stale_output_and_second_seal():
+async def test_takeover_fences_stale_output_and_second_seal(append_guard):
     """Post-takeover output is fenced at every graph entry and seal materialization boundary."""
 
-    async with isolated_publication_case() as case:
+    async with _append_plans_case(append_guard) as (case, _):
         graph = await _seed_committed_publication_graph(case)
         attempt, family, root_pack_id = await _seed_fence_one_output(case, graph)
         takeover = await _take_over_attempt(case, attempt)
@@ -1159,11 +1162,12 @@ async def _run_dataset_first_worker(case, graph: PublicationGraph, attempt: Gene
         await worker_session.close()
 
 
+@pytest.mark.parametrize("append_guard", ("original", "static"))
 @pytest.mark.asyncio
-async def test_shared_identity_inserts_lock_dataset_before_output_and_finality():
+async def test_shared_identity_inserts_lock_dataset_before_output_and_finality(append_guard):
     """Direct-dataset rows cannot cause an FK-share-to-update deadlock."""
 
-    async with isolated_publication_case() as case:
+    async with _append_plans_case(append_guard) as (case, _):
         graph = await _seed_committed_publication_graph(case)
         attempt = await _seed_dataset_first_attempt(case, graph)
         committed_pointer_version = await _run_dataset_first_worker(case, graph, attempt)
@@ -1730,6 +1734,21 @@ def _family_append_rows(graph: PublicationGraph, attempt, family):
     child_revision_id = family.child_revision_ids[0]
     return (
         (
+            "custom_import_root_revision",
+            "root_revision_id, dataset_id",
+            {"root_revision_id": family.root_revision_id, "dataset_id": graph.dataset_id},
+        ),
+        (
+            "custom_import_child_revision",
+            "child_revision_id, dataset_id",
+            {"child_revision_id": child_revision_id, "dataset_id": graph.dataset_id},
+        ),
+        (
+            "custom_import_family_revision",
+            "family_revision_id, dataset_id",
+            {"family_revision_id": family.family_revision_id, "dataset_id": graph.dataset_id},
+        ),
+        (
             "custom_import_winner",
             "generation_id, dataset_id",
             {"generation_id": attempt.generation_id, "dataset_id": graph.dataset_id},
@@ -1877,11 +1896,12 @@ async def _assert_post_seal_changes_rejected(case, graph: PublicationGraph, atte
                 await _assert_sealed_append_rejected(session, case, table_name, columns, parameters)
 
 
+@pytest.mark.parametrize("append_guard", ("original", "static", "cross_schema"))
 @pytest.mark.asyncio
-async def test_sealed_generation_counts_material_and_rejects_changes():
+async def test_sealed_generation_counts_material_and_rejects_changes(append_guard):
     """A seal records prepared material and freezes all protected dependencies."""
 
-    async with isolated_publication_case() as case:
+    async with _append_plans_case(append_guard) as (case, _):
         graph = await _seed_committed_publication_graph(case)
         attempt, family = await _seed_counted_family(case, graph)
         await _assert_post_seal_changes_rejected(case, graph, attempt, family)
@@ -3011,14 +3031,217 @@ _FINALITY_MIGRATION_ROOT = Path(__file__).resolve().parents[1]
 _FINALITY_MIGRATION_PATH = (
     _FINALITY_MIGRATION_ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
 )
+_APPEND_PLANS_MIGRATION_PATH = (
+    _FINALITY_MIGRATION_ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
+)
 
 
-def _finality_migration():
-    spec = importlib.util.spec_from_file_location("custom_import_finality_downgrade_probe", _FINALITY_MIGRATION_PATH)
+def _finality_migration(path: Path = _FINALITY_MIGRATION_PATH):
+    spec = importlib.util.spec_from_file_location("custom_import_finality_downgrade_probe", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _replace_append_plans(sync_connection, schema_name: str, *, downgrade: bool = False) -> None:
+    migration = _finality_migration(_APPEND_PLANS_MIGRATION_PATH)
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    sync_connection.execute(text("SET LOCAL statement_timeout = '5s'"))
+    (migration.downgrade if downgrade else migration.upgrade)()
+
+
+@asynccontextmanager
+async def _append_plans_case(mode: str):
+    """Exercise the installed function on its own tables or a second owned schema."""
+
+    async with AsyncExitStack() as stack:
+        function_case = await stack.enter_async_context(isolated_publication_case()) if mode == "cross_schema" else None
+        case = await stack.enter_async_context(isolated_publication_case())
+        function_schema = (function_case or case).schema_name
+        if mode == "original":
+            yield case, function_schema
+            return
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_replace_append_plans, function_schema)
+            if function_case is not None:
+                legacy = _finality_migration()
+                for table in legacy._APPEND_GUARD_TABLES:
+                    trigger = table + "_sealed_append_guard"
+                    await connection.execute(text(legacy._drop_trigger_sql(case.schema_name, trigger, table)))
+                    statement = legacy._trigger_sql(
+                        case.schema_name, trigger, table, "guard_custom_import_sealed_append"
+                    ).replace(
+                        legacy._qualified(case.schema_name, "guard_custom_import_sealed_append"),
+                        legacy._qualified(function_schema, "guard_custom_import_sealed_append"),
+                    )
+                    await connection.execute(text(statement))
+        yield case, function_schema
+
+
+async def _append_function_identity(connection, schema: str):
+    function = (
+        await connection.execute(
+            text("""SELECT p.oid, p.proowner, p.proacl::text, p.prosecdef, p.proconfig::text,
+                p.prolang, p.prorettype, p.proargtypes::text, p.provolatile, p.proisstrict, p.proparallel
+                FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                WHERE n.nspname=:schema AND p.proname='guard_custom_import_sealed_append' AND p.pronargs=0"""),
+            {"schema": schema},
+        )
+    ).one()
+    triggers = (
+        await connection.execute(
+            text("SELECT oid, tgfoid, tgtype, tgenabled, tgargs::text FROM pg_trigger WHERE tgfoid=:oid ORDER BY oid"),
+            {"oid": function.oid},
+        )
+    ).all()
+    return function, triggers
+
+
+@pytest.mark.asyncio
+async def test_sealed_append_plans_preserve_catalog_identity_and_refuse_missing_function():
+    async with isolated_publication_case() as case:
+        async with case.engine.begin() as connection:
+            before = await _append_function_identity(connection, case.schema_name)
+            assert len(before[1]) == len(_finality_migration()._APPEND_GUARD_TABLES)
+            body_query = text("SELECT prosrc FROM pg_proc WHERE oid=:oid")
+            original_body = await connection.scalar(body_query, {"oid": before[0].oid})
+            await connection.run_sync(_replace_append_plans, case.schema_name)
+            assert await _append_function_identity(connection, case.schema_name) == before
+            assert await connection.scalar(body_query, {"oid": before[0].oid}) != original_body
+            await connection.run_sync(_replace_append_plans, case.schema_name, downgrade=True)
+            assert await _append_function_identity(connection, case.schema_name) == before
+            assert await connection.scalar(body_query, {"oid": before[0].oid}) == original_body
+            qualified = _finality_migration()._qualified(case.schema_name, "guard_custom_import_sealed_append")
+            await connection.execute(text(f"ALTER FUNCTION {qualified}() RENAME TO saved_append_guard"))
+            with pytest.raises(DBAPIError, match="custom_import_sealed_append_function_missing"):
+                async with connection.begin_nested():
+                    await connection.run_sync(_replace_append_plans, case.schema_name)
+            assert await connection.scalar(text("SELECT to_regprocedure(:name)"), {"name": qualified + "()"}) is None
+            saved = _finality_migration()._qualified(case.schema_name, "saved_append_guard")
+            await connection.execute(text(f"ALTER FUNCTION {saved}() RENAME TO guard_custom_import_sealed_append"))
+            assert await _append_function_identity(connection, case.schema_name) == before
+
+
+@pytest.mark.asyncio
+async def test_sealed_append_plans_compile_quoted_schema_without_changing_its_name():
+    async with isolated_publication_case() as case:
+        schema = case.schema_name + "'\"\\$1$function$"
+        legacy = _finality_migration()
+        quoted = legacy._quote(schema)
+        is_schema_created = False
+        try:
+            async with case.engine.begin() as connection:
+                await connection.execute(text(f"CREATE SCHEMA {quoted}"))
+                is_schema_created = True
+                await connection.execute(text(legacy._append_guard_function_sql(schema)))
+                before = await _append_function_identity(connection, schema)
+                await connection.run_sync(_replace_append_plans, schema)
+                assert await _append_function_identity(connection, schema) == before
+                body = await connection.scalar(
+                    text("SELECT prosrc FROM pg_proc WHERE oid=:oid"), {"oid": before[0].oid}
+                )
+                assert f"FROM {quoted}.custom_import_dataset" in body
+                await connection.run_sync(_replace_append_plans, schema, downgrade=True)
+                assert await _append_function_identity(connection, schema) == before
+        finally:
+            if is_schema_created:
+                async with case.engine.begin() as connection:
+                    await connection.execute(text(f"DROP SCHEMA IF EXISTS {quoted} CASCADE"))
+
+
+@pytest.mark.parametrize("append_guard", ("static", "cross_schema"))
+@pytest.mark.asyncio
+async def test_sealed_append_plans_reject_unknown_tables_and_direct_repeatable_read(append_guard):
+    async with _append_plans_case(append_guard) as (case, function_schema):
+        graph = await _seed_committed_publication_graph(case)
+        table = _table(case, "custom_import_unknown_append")
+        function = _finality_migration()._qualified(function_schema, "guard_custom_import_sealed_append")
+        async with case.engine.begin() as connection:
+            await connection.execute(text(f"CREATE TABLE {table} (dataset_id bigint)"))
+            await connection.execute(
+                text(f"CREATE TRIGGER append_guard BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")
+            )
+        for isolation, error in (
+            ("READ COMMITTED", "custom_import_finality_unknown_append_table"),
+            ("REPEATABLE READ", "custom_import_finality_requires_read_committed"),
+        ):
+            async with case.sessions() as session:
+                async with session.begin():
+                    await session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation}"))
+                    await _assert_nested_statement_rejected(
+                        session, text(f"INSERT INTO {table} VALUES (:id)"), {"id": graph.dataset_id}, error
+                    )
+
+
+async def _contending_append(case, graph, attempt, ready):
+    async with case.sessions() as session:
+        async with session.begin():
+            await session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            row = (await session.execute(text("SELECT pg_backend_pid(), transaction_timestamp()"))).one()
+            ready.set_result(row)
+            await _append_dataset_first_pack(session, graph, attempt)
+
+
+async def _invalidate_waiting_append(session, attempt, authority_case: str, writer_started):
+    if authority_case == "cancellation":
+        result = await request_cancellation(session, execution_id=attempt.execution_id)
+        assert result.state == "canceling"
+    else:
+        values = {"expires_at": func.clock_timestamp()} if authority_case == "expiry" else {"fence": attempt.fence + 1}
+        expired_at = await session.scalar(
+            update(CustomImportLease)
+            .where(CustomImportLease.execution_id == attempt.execution_id)
+            .values(**values)
+            .returning(CustomImportLease.expires_at)
+        )
+        if authority_case == "expiry":
+            assert expired_at > writer_started
+
+
+@pytest.mark.parametrize("append_guard", ("static", "cross_schema"))
+@pytest.mark.parametrize("authority_case", ("expiry", "cancellation", "takeover"))
+@pytest.mark.asyncio
+async def test_sealed_append_plans_recheck_authority_after_lock_wait(append_guard, authority_case):
+    async with _append_plans_case(append_guard) as (case, _):
+        graph = await _seed_committed_publication_graph(case)
+        attempt = await _seed_dataset_first_attempt(case, graph)
+        blocker = case.sessions()
+        transaction = await blocker.begin()
+        contender = None
+        try:
+            await blocker.execute(text("SET LOCAL statement_timeout = '5s'"))
+            if authority_case == "cancellation":
+                await blocker.execute(
+                    select(CustomImportDataset)
+                    .where(CustomImportDataset.dataset_id == graph.dataset_id)
+                    .with_for_update()
+                )
+            model = CustomImportExecution if authority_case == "cancellation" else CustomImportLease
+            await blocker.execute(select(model).where(model.execution_id == attempt.execution_id).with_for_update())
+            ready = asyncio.get_running_loop().create_future()
+            contender = asyncio.create_task(_contending_append(case, graph, attempt, ready))
+            backend_pid, writer_started = await asyncio.wait_for(ready, timeout=2)
+            await asyncio.wait_for(_wait_for_backend_lock(case, backend_pid), timeout=3)
+            await _invalidate_waiting_append(blocker, attempt, authority_case, writer_started)
+            await transaction.commit()
+            with pytest.raises(DBAPIError, match="custom_import_output_producing_lease_lost"):
+                await asyncio.wait_for(contender, timeout=5)
+        finally:
+            if transaction.is_active:
+                await transaction.rollback()
+            await _cancel_pending_task(contender)
+            await blocker.close()
+        async with case.sessions() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CustomImportPack)
+                    .where(CustomImportPack.execution_id == attempt.execution_id)
+                )
+                == 0
+            )
 
 
 def _downgrade_finality_schema(sync_connection, schema_name: str) -> None:

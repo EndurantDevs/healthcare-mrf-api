@@ -5,10 +5,16 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
+
+import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
+PLANS_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
 
 
 def _migration():
@@ -102,3 +108,141 @@ def test_finality_downgrade_removes_references_before_finality_tables(monkeypatc
     assert "DROP COLUMN IF EXISTS rejection_id" in normalized
     assert "code ~ '^[a-z][a-z0-9_]{0,62}$'" in normalized
     assert "{{0,62}}" not in normalized
+
+
+def _plans_migration():
+    spec = importlib.util.spec_from_file_location("custom_import_sealed_append_plans", PLANS_MIGRATION_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _append_body():
+    legacy = _migration()
+    return legacy._with_read_committed_guard(legacy._APPEND_GUARD_FUNCTION_BODY)
+
+
+@pytest.mark.parametrize("operation", ("upgrade", "downgrade"))
+def test_sealed_append_plans_replace_only_an_existing_function(monkeypatch, operation):
+    migration = _plans_migration()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "synthetic_append")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    statements = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    getattr(migration, operation)()
+
+    assert migration.revision == "20261005020000_custom_import_sealed_append_plans"
+    assert migration.down_revision == "20261001110000_profile_initial_publication"
+    assert len(statements) == 2
+    assert statements[0].startswith("DO $function$")
+    assert "pg_catalog.to_regprocedure" in statements[0]
+    assert "custom_import_sealed_append_function_missing" in statements[0]
+    assert 'E\'"synthetic_append"."guard_custom_import_sealed_append"()\'' in statements[0]
+    assert (
+        statements[1]
+        .lstrip()
+        .startswith('CREATE OR REPLACE FUNCTION "synthetic_append"."guard_custom_import_sealed_append"()')
+    )
+    for declaration in ("RETURNS trigger", "LANGUAGE plpgsql", "SECURITY DEFINER", "SET search_path = pg_catalog"):
+        assert statements[1].count(declaration) == 1
+    for forbidden in ("DROP ", "GRANT ", "REVOKE ", "CREATE TABLE", "CREATE TRIGGER", "ALTER TABLE", "CREATE INDEX"):
+        assert forbidden not in "\n".join(statements)
+    if operation == "downgrade":
+        original = _migration()._append_guard_function_sql("synthetic_append")
+        assert statements[1] == original.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
+
+
+def test_sealed_append_plans_extend_the_single_installed_migration_head():
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    revision = _plans_migration().revision
+    assert script.get_heads() == [revision]
+    assert tuple(
+        step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
+    ) == (revision,)
+
+
+def test_sealed_append_plans_preserve_query_order_bindings_and_exact_dynamic_fallback():
+    migration = _plans_migration()
+    body = _append_body()
+    static = migration._static_body(body)
+    matches = list(migration._EXECUTE.finditer(body))
+    assert len(matches) == 27
+    restored = static
+    for match in matches:
+        query = "".join(re.findall(r"'([^']*)'", match["strings"]))
+        bindings = [binding.strip() for binding in match["using"].split(",")]
+        receivers = ", ".join(receiver.strip() for receiver in match["into"].split(","))
+        query = re.sub(r"\$(\d+)", lambda placeholder: f"({bindings[int(placeholder[1]) - 1]})", query)
+        query = query.replace("%I", migration._STATIC_SCHEMA)
+        if query.startswith("SELECT EXISTS ("):
+            query += f" INTO {receivers}"
+        else:
+            query = query.replace(" FROM ", f" INTO {receivers} FROM ", 1)
+        assert query + ";" in restored
+        restored = restored.replace(query + ";", match[0], 1)
+    assert restored == body
+    assert static.count("FOR UPDATE") == 3
+    assert static.count("clock_timestamp()") == 1
+    assert (
+        static.index("INTO locked_dataset_id")
+        < static.index("INTO authority_state")
+        < static.index("INTO authority_expires_at")
+    )
+    assert static.index("INTO authority_expires_at") < static.index("authority_expires_at <= clock_timestamp()")
+    planned = migration._planned_body(_migration(), body, "synthetic_append")
+    original_statements = body.split("    BEGIN\n", 1)[1].removesuffix("    END;\n")
+    assert "        ELSE\n" + original_statements + "        END IF;\n" in planned
+    assert planned.count(_migration()._read_committed_guard()) == 2
+
+
+@pytest.mark.parametrize("schema", ("mrf", 'synthetic"quoted', "synthetic'$1\\$function$__SEALED_APPEND_SCHEMA__"))
+def test_sealed_append_plans_quote_schema_only_after_rewriting(schema):
+    migration = _plans_migration()
+    legacy = _migration()
+    body = migration._planned_body(legacy, _append_body(), schema)
+    literal = "E'" + schema.replace("\\", "\\\\").replace("'", "''") + "'"
+    assert f"IF TG_TABLE_SCHEMA = {literal} THEN\n" in body
+    assert f"FROM {legacy._quote(schema)}.custom_import_dataset WHERE dataset_id = (NEW.dataset_id) FOR UPDATE;" in body
+    definition = migration._definition(legacy._qualified(schema, migration._FUNCTION_NAME), body)
+    delimiter = migration._delimiter(body)
+    assert delimiter not in body
+    assert f"    AS {delimiter}\n    {body}\n    {delimiter}" in definition
+    if "$function$" in schema:
+        assert delimiter != "$function$"
+    guard = migration._existing_function_guard(legacy._qualified(schema, migration._FUNCTION_NAME))
+    assert guard.startswith("DO " + migration._delimiter(guard.split("\n", 1)[1].rsplit("\n", 1)[0]))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("TG_TABLE_SCHEMA", "TG_TABLE_NAME"),
+        ("%I.custom_import_dataset", "%L.custom_import_dataset"),
+        ("NEW.dataset_id", "NEW.dataset_id + 1"),
+        ("WHERE dataset_id = $1 FOR UPDATE", "WHERE dataset_id = $9 FOR UPDATE"),
+        ("RETURN NEW;", "IF FOUND THEN RETURN NEW; END IF;"),
+        ("RETURN NEW;", "GET DIAGNOSTICS locked_dataset_id = ROW_COUNT; RETURN NEW;"),
+        ("clock_timestamp()", "now()"),
+    ),
+)
+def test_sealed_append_plans_reject_unrecognized_source_shapes(old, new):
+    migration = _plans_migration()
+    with pytest.raises(RuntimeError, match="source differs"):
+        migration._static_body(_append_body().replace(old, new, 1))
+
+
+@pytest.mark.parametrize("operation", ("upgrade", "downgrade"))
+def test_sealed_append_plans_reject_historical_source_drift_before_ddl(monkeypatch, operation):
+    migration = _plans_migration()
+    original_read = Path.read_bytes
+    statements = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda path: original_read(path) + (b"\n" if path == MIGRATION_PATH else b"")
+    )
+    with pytest.raises(RuntimeError, match="source differs"):
+        getattr(migration, operation)()
+    assert statements == []
