@@ -15,7 +15,11 @@ from process import massachusetts_profile_store
 from process import provider_profile_source_store as shared
 from process import source_profile_result_archive as archive
 from tests.source_profile_archive_support import _seed
-from tests.test_source_profile_result_archive_postgres import _assert_reference_free_read, _prepared_case
+from tests.test_source_profile_result_archive_postgres import (
+    _assert_reference_free_read,
+    _drop_prepared_stage,
+    _prepared_case,
+)
 
 IMPORTER = "massachusetts-borim-profile"
 
@@ -46,12 +50,8 @@ async def _assert_root_only_activation(case, monkeypatch, tmp_path):
 async def _exercise_shared_ancestry(case):
     prepared = None
     try:
-        async with case.sessions() as session, session.begin():
-            descendant = await _seed(session, case.source_schema, IMPORTER, parent_run_id=case.incoming)
-        async with case.sessions() as session, session.begin():
-            prepared = await archive.prepare_source(
-                session, importer_id=IMPORTER, schema=case.source_schema, run_id=descendant, dataset_id=uuid4()
-            )
+        prepared = await _prepare_descendant(case)
+        descendant = prepared.manifest["run_id"]
         activation_by_field = {
             **case.activation_by_field,
             "prepared": prepared,
@@ -82,7 +82,7 @@ async def _exercise_shared_ancestry(case):
     finally:
         if prepared is not None:
             async with case.sessions() as session, session.begin():
-                await archive.cleanup_stage(session, prepared.ownership)
+                await _drop_prepared_stage(session, prepared, case.destination_schema)
                 await archive.release_source_pin(
                     session,
                     schema=case.source_schema,
@@ -90,6 +90,86 @@ async def _exercise_shared_ancestry(case):
                     run_id=descendant,
                     pin_id=prepared.ownership.dataset_id,
                 )
+
+
+@pytest.mark.asyncio
+async def test_set_validated_ancestry_reuses_only_equal_indexed_local_rows(monkeypatch, tmp_path):
+    async def forbidden_row_validation(*_args, **_kwargs):
+        raise AssertionError("v2 ancestry must not hash payload rows")
+
+    monkeypatch.setattr(archive, "_projected_row_identity", forbidden_row_validation)
+    async with _prepared_case(IMPORTER, with_ancestry=True, contract=archive.CONTRACT) as case:
+        await _assert_root_only_activation(case, monkeypatch, tmp_path)
+        await _exercise_set_validated_descendant(case)
+
+
+async def _exercise_set_validated_descendant(case):
+    """Publish only novel physical runs while retaining identical indexed ancestors once."""
+    prepared = None
+    try:
+        prepared = await _prepare_descendant(case)
+        descendant = prepared.manifest["run_id"]
+        activation_by_field = {
+            **case.activation_by_field,
+            "prepared": prepared,
+            "expected_current_run_id": case.incoming,
+            "pin_id": uuid4(),
+        }
+        async with case.sessions() as session, session.begin():
+            validation = await archive.prepare_activation(session, **activation_by_field)
+            assert await archive._run(session, case.destination_schema, descendant) is None
+            assert await archive._pin_group(session, case.destination_schema, activation_by_field["pin_id"]) == []
+        with pytest.raises(archive.SourceProfileArchiveError, match="content differs"):
+            async with case.sessions() as session, session.begin():
+                await session.execute(
+                    text(
+                        f'UPDATE "{prepared.ownership.schema_name}".provider_profile_fact SET display=:value WHERE run_id=:run'
+                    ),
+                    {"run": case.incoming, "value": "same-count-corruption"},
+                )
+                await archive.activate_validated_result(session, validation=validation, **activation_by_field)
+        async with case.sessions() as session, session.begin():
+            assert await archive._run(session, case.destination_schema, descendant) is None
+            assert await archive._pin_group(session, case.destination_schema, activation_by_field["pin_id"]) == []
+            assert (await archive._pointer(session, case.destination_schema, IMPORTER))[
+                "current_run_id"
+            ] == case.incoming
+            await archive.activate_validated_result(session, validation=validation, **activation_by_field)
+            pins = await archive._pin_group(session, case.destination_schema, activation_by_field["pin_id"])
+            assert [pin["run_id"] for pin in pins if pin["authority_json"]["created_here"]] == [descendant]
+            for table in archive.TABLES:
+                assert await session.scalar(
+                    text(
+                        f'SELECT count(*) FROM "{case.destination_schema}".{table} WHERE run_id=ANY(CAST(:runs AS text[]))'
+                    ),
+                    {"runs": prepared.manifest["run_ids"]},
+                ) == len(prepared.manifest["run_ids"])
+    finally:
+        if prepared is not None:
+            async with case.sessions() as session, session.begin():
+                await _drop_prepared_stage(session, prepared, case.destination_schema)
+                await archive.release_source_pin(
+                    session,
+                    schema=case.source_schema,
+                    importer_id=IMPORTER,
+                    run_id=prepared.manifest["run_id"],
+                    pin_id=prepared.ownership.dataset_id,
+                )
+
+
+async def _prepare_descendant(case):
+    """Seed and separately capture the same reprocessed fixture in its original contract."""
+    async with case.sessions() as session, session.begin():
+        descendant = await _seed(session, case.source_schema, IMPORTER, parent_run_id=case.incoming)
+    async with case.sessions() as session, session.begin():
+        return await archive.prepare_source(
+            session,
+            importer_id=IMPORTER,
+            schema=case.source_schema,
+            run_id=descendant,
+            dataset_id=uuid4(),
+            contract=case.prepared.manifest["contract"],
+        )
 
 
 @pytest.mark.asyncio

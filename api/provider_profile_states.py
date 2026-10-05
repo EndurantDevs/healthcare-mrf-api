@@ -30,7 +30,20 @@ RI_SOURCE_KEY = "rhode-island-doh"
 NYPP_SOURCE_KEY = "new-york-nypp"
 NYSED_SOURCE_KEY = "new-york-nysed"
 STATE_SOURCE_KEYS = (
-    MASSACHUSETTS_SOURCE_KEY, KENTUCKY_SOURCE_KEY, TN_SOURCE_KEY, RI_SOURCE_KEY, NYPP_SOURCE_KEY, NYSED_SOURCE_KEY,
+    MASSACHUSETTS_SOURCE_KEY,
+    KENTUCKY_SOURCE_KEY,
+    TN_SOURCE_KEY,
+    RI_SOURCE_KEY,
+    NYPP_SOURCE_KEY,
+    NYSED_SOURCE_KEY,
+)
+SOURCE_FIELDS = (
+    "source_key",
+    "source_kind",
+    "agency",
+    "jurisdiction",
+    "coverage_scope",
+    "registry_generation",
 )
 KENTUCKY_SCHEMA_VERSION = "ky-kbml-profile/v1"
 TN_SCHEMA_VERSION = "tn-tdh-profile/v1"
@@ -39,14 +52,41 @@ NEW_YORK_SOURCES = {
     NYPP_SOURCE_KEY: {
         "schema_version": "ny-nypp-education/v1",
         "agency": "New York State Department of Health",
-        "fact_types": {"education": "education_history", "training": "postgraduate_training",
-                       "certifications": "board_certification"},
+        "fact_types": {
+            "education": "education_history",
+            "training": "postgraduate_training",
+            "certifications": "board_certification",
+        },
     },
     NYSED_SOURCE_KEY: {
         "schema_version": "ny-nysed-physician/v1",
         "agency": "New York State Education Department",
         "fact_types": {"education": "education_history", "licenses": "state_licensure_record"},
     },
+}
+STATE_FACT_TYPES = {
+    KENTUCKY_SOURCE_KEY: frozenset(
+        {
+            ("education", "education_history"),
+            ("specialties", "specialty"),
+            ("services", "practice_type"),
+        }
+    ),
+    TN_SOURCE_KEY: frozenset(
+        {
+            ("education", "education_history"),
+            ("training", "other_training"),
+            ("specialties", "specialty"),
+        }
+    ),
+    RI_SOURCE_KEY: frozenset(
+        {
+            ("education", "education_history"),
+            ("specialties", "specialty"),
+            ("privileges", "staff_privilege"),
+        }
+    ),
+    **{source_key: frozenset(source["fact_types"].items()) for source_key, source in NEW_YORK_SOURCES.items()},
 }
 SOURCE_CONTEXT = {
     MASSACHUSETTS_SOURCE_KEY: (
@@ -88,25 +128,32 @@ async def fetch_additional_state_profile_projections(npi: int) -> list[dict]:
         "run": f"{schema}.{ProviderProfileImportRun.__tablename__}",
         "fact": f"{schema}.{ProviderProfileFact.__tablename__}",
     }
-    if not await db.scalar(text(
-        "SELECT to_regclass(:publication) IS NOT NULL "
-        "AND to_regclass(:run) IS NOT NULL AND to_regclass(:fact) IS NOT NULL"
-    ), **table_by_role):
+    if not await db.scalar(
+        text(
+            "SELECT to_regclass(:publication) IS NOT NULL "
+            "AND to_regclass(:run) IS NOT NULL AND to_regclass(:fact) IS NOT NULL"
+        ),
+        **table_by_role,
+    ):
         return []
-    fact_rows = await db.all(text(f"""
+    fact_rows = await db.all(
+        text(f"""
         SELECT publication.source_key AS publication_source_key,
                publication.current_run_id AS generation_id,
                publication.published_at AS source_published_at,
                run.status AS run_status, run.schema_version AS run_schema_version, run.jurisdiction AS run_jurisdiction,
                run.source_manifest, fact.*
-          FROM {table_by_role['publication']} publication
-          JOIN {table_by_role['run']} run ON run.run_id = publication.current_run_id
+          FROM {table_by_role["publication"]} publication
+          JOIN {table_by_role["run"]} run ON run.run_id = publication.current_run_id
                                   AND run.source_key = publication.source_key
-          LEFT JOIN {table_by_role['fact']} fact ON fact.run_id = publication.current_run_id
+          LEFT JOIN {table_by_role["fact"]} fact ON fact.run_id = publication.current_run_id
                                          AND fact.npi = :npi
          WHERE publication.source_key = ANY(CAST(:source_keys AS text[]))
          ORDER BY publication.source_key, fact.fact_id
-    """), npi=npi, source_keys=list(STATE_SOURCE_KEYS))
+    """),
+        npi=npi,
+        source_keys=list(STATE_SOURCE_KEYS),
+    )
     rows_by_source = defaultdict(list)
     for fact_row in fact_rows:
         rows_by_source[fact_row._mapping["publication_source_key"]].append(fact_row._mapping)
@@ -127,31 +174,29 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
     generation_id = next(iter(generation_ids))
     manifest = fact_rows[0]["source_manifest"]
     descriptor = manifest["source"]
-    if source_key not in STATE_SOURCE_KEYS or descriptor["source_key"] != source_key or descriptor["source_kind"] != "state_regulator":
+    if (
+        source_key not in STATE_SOURCE_KEYS
+        or descriptor["source_key"] != source_key
+        or descriptor["source_kind"] != "state_regulator"
+    ):
         raise RuntimeError("state_profile_source_mismatch")
     loaded_categories = set(manifest["categories"])
     _validate_state_publication(fact_rows, descriptor, manifest["categories"])
-    source_by_field = {field: descriptor[field] for field in (
-        "source_key", "source_kind", "agency", "jurisdiction", "coverage_scope", "registry_generation",
-    )}
+    source_by_field = {field: descriptor[field] for field in SOURCE_FIELDS}
     grouped = defaultdict(dict)
     evidence_records = []
     for fact in fact_rows:
-        if not fact.get("fact_id") or fact["sensitive"] or not fact["public_default"] or fact["availability"] != "available":
+        if (
+            not fact.get("fact_id")
+            or fact["sensitive"]
+            or not fact["public_default"]
+            or fact["availability"] != "available"
+        ):
             continue
         if fact["category"] not in loaded_categories:
             raise RuntimeError("state_profile_categories_invalid")
+        _validate_state_fact(npi, generation_id, source_key, fact)
         evidence = fact["source_json"]
-        if evidence["source_key"] != source_by_field["source_key"] or evidence["source_record_id"] != fact["source_record_id"]:
-            raise RuntimeError("state_profile_source_mismatch")
-        if source_key in NEW_YORK_SOURCES:
-            _validate_new_york_fact(npi, generation_id, fact, source_key)
-        if source_key == KENTUCKY_SOURCE_KEY:
-            _validate_kentucky_fact(npi, generation_id, fact)
-        elif source_key == TN_SOURCE_KEY:
-            _validate_tennessee_fact(npi, generation_id, fact)
-        elif source_key == RI_SOURCE_KEY:
-            _validate_rhode_island_fact(npi, generation_id, fact)
         # A profile contains many facts; page evidence must identify each assertion.
         public_record_id = f"{source_by_field['source_key']}:{fact['fact_id']}"
         profile_item = _profile_item({**fact, "source_record_id": public_record_id})
@@ -159,12 +204,14 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
         profile_item["quality_flags"] = list(evidence.get("quality_flags") or [])
         profile_item = _source_assertions(profile_item)
         grouped[fact["category"]][fact["fact_id"]] = profile_item
-        evidence_records.append({
-            **copy.deepcopy(evidence),
-            "source_record_id": public_record_id,
-            "profile_source_record_id": fact["source_record_id"],
-            "fact_id": fact["fact_id"],
-        })
+        evidence_records.append(
+            {
+                **copy.deepcopy(evidence),
+                "source_record_id": public_record_id,
+                "profile_source_record_id": fact["source_record_id"],
+                "fact_id": fact["fact_id"],
+            }
+        )
     if not evidence_records:
         return None
     return {
@@ -178,6 +225,21 @@ def _state_projection(npi: int, fact_rows: list[Mapping], *, source_key: str = M
             "records": evidence_records,
         },
     }
+
+
+def _validate_state_fact(npi: int, generation_id: str, source_key: str, fact: Mapping) -> None:
+    """Bind one served assertion to its source and existing source-specific policy."""
+    evidence = fact["source_json"]
+    if evidence["source_key"] != source_key or evidence["source_record_id"] != fact["source_record_id"]:
+        raise RuntimeError("state_profile_source_mismatch")
+    if source_key in NEW_YORK_SOURCES:
+        _validate_new_york_fact(npi, generation_id, fact, source_key)
+    if source_key == KENTUCKY_SOURCE_KEY:
+        _validate_kentucky_fact(npi, generation_id, fact)
+    elif source_key == TN_SOURCE_KEY:
+        _validate_tennessee_fact(npi, generation_id, fact)
+    elif source_key == RI_SOURCE_KEY:
+        _validate_rhode_island_fact(npi, generation_id, fact)
 
 
 def _validate_state_publication(fact_rows: list[Mapping], descriptor: Mapping, categories: list) -> None:
@@ -201,7 +263,8 @@ def _validate_kentucky_publication(fact_rows: list[Mapping], descriptor: Mapping
     if categories not in (["education"], ["education", "specialties", "services"]):
         raise RuntimeError("state_profile_categories_invalid")
     if (
-        descriptor.get("agency") != "Kentucky Board of Medical Licensure" or descriptor.get("jurisdiction") != "KY"
+        descriptor.get("agency") != "Kentucky Board of Medical Licensure"
+        or descriptor.get("jurisdiction") != "KY"
         or any(fact_row.get("run_schema_version") != KENTUCKY_SCHEMA_VERSION for fact_row in fact_rows)
         or any(fact_row.get("run_jurisdiction") != "KY" for fact_row in fact_rows)
     ):
@@ -210,16 +273,16 @@ def _validate_kentucky_publication(fact_rows: list[Mapping], descriptor: Mapping
 
 def _validate_kentucky_fact(npi: int, generation_id: str, fact: Mapping) -> None:
     """Keep Kentucky evidence attached to the selected provider, generation and fact type."""
-    if (fact["category"], fact["fact_type"]) not in {
-        ("education", "education_history"), ("specialties", "specialty"), ("services", "practice_type"),
-    }:
+    if (fact["category"], fact["fact_type"]) not in STATE_FACT_TYPES[KENTUCKY_SOURCE_KEY]:
         raise RuntimeError("state_profile_categories_invalid")
     if fact["run_id"] != generation_id or fact["npi"] != npi:
         raise RuntimeError("state_profile_publication_invalid")
     evidence = fact["source_json"]
     if (
-        evidence.get("schema_version") != KENTUCKY_SCHEMA_VERSION or evidence.get("run_id") != generation_id
-        or evidence.get("agency") != "Kentucky Board of Medical Licensure" or evidence.get("jurisdiction") != "KY"
+        evidence.get("schema_version") != KENTUCKY_SCHEMA_VERSION
+        or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != "Kentucky Board of Medical Licensure"
+        or evidence.get("jurisdiction") != "KY"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 
@@ -230,9 +293,11 @@ def _validate_tennessee_publication(fact_rows: list[Mapping], descriptor: Mappin
         raise RuntimeError("state_profile_categories_invalid")
     snapshot_sha256 = fact_rows[0]["source_manifest"].get("snapshot_sha256")
     if (
-        descriptor.get("agency") != "Tennessee Department of Health" or descriptor.get("jurisdiction") != "TN"
+        descriptor.get("agency") != "Tennessee Department of Health"
+        or descriptor.get("jurisdiction") != "TN"
         or descriptor.get("coverage_scope") != "regular_md_do_all_ranks_statuses_locations"
-        or not isinstance(snapshot_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+        or not isinstance(snapshot_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
         or descriptor.get("registry_generation") != snapshot_sha256
         or any(fact_row.get("publication_source_key") != TN_SOURCE_KEY for fact_row in fact_rows)
         or any(fact_row.get("run_schema_version") != TN_SCHEMA_VERSION for fact_row in fact_rows)
@@ -243,16 +308,16 @@ def _validate_tennessee_publication(fact_rows: list[Mapping], descriptor: Mappin
 
 def _validate_tennessee_fact(npi: int, generation_id: str, fact: Mapping) -> None:
     """Keep each Tennessee assertion attached to its provider and published generation."""
-    if (fact["category"], fact["fact_type"]) not in {
-        ("education", "education_history"), ("training", "other_training"), ("specialties", "specialty"),
-    }:
+    if (fact["category"], fact["fact_type"]) not in STATE_FACT_TYPES[TN_SOURCE_KEY]:
         raise RuntimeError("state_profile_categories_invalid")
     if fact["run_id"] != generation_id or fact["npi"] != npi:
         raise RuntimeError("state_profile_publication_invalid")
     evidence = fact["source_json"]
     if (
-        evidence.get("schema_version") != TN_SCHEMA_VERSION or evidence.get("run_id") != generation_id
-        or evidence.get("agency") != "Tennessee Department of Health" or evidence.get("jurisdiction") != "TN"
+        evidence.get("schema_version") != TN_SCHEMA_VERSION
+        or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != "Tennessee Department of Health"
+        or evidence.get("jurisdiction") != "TN"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 
@@ -264,12 +329,15 @@ def _validate_rhode_island_publication(fact_rows: list[Mapping], descriptor: Map
     manifest = fact_rows[0]["source_manifest"]
     snapshot_sha256 = manifest.get("snapshot_sha256")
     if (
-        descriptor.get("agency") != "Rhode Island Department of Health" or descriptor.get("jurisdiction") != "RI"
+        descriptor.get("agency") != "Rhode Island Department of Health"
+        or descriptor.get("jurisdiction") != "RI"
         or descriptor.get("coverage_scope") != "active_md_do_excluding_limited_volunteer"
-        or not isinstance(snapshot_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+        or not isinstance(snapshot_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
         or descriptor.get("registry_generation") != snapshot_sha256
         or manifest.get("license_types") != ["MD", "DO"]
-        or manifest.get("max_providers", "missing") is not None or manifest.get("resume_from", "missing") is not None
+        or manifest.get("max_providers", "missing") is not None
+        or manifest.get("resume_from", "missing") is not None
         or any(fact_row.get("publication_source_key") != RI_SOURCE_KEY for fact_row in fact_rows)
         or any(fact_row.get("run_schema_version") != RI_SCHEMA_VERSION for fact_row in fact_rows)
         or any(fact_row.get("run_jurisdiction") != "RI" for fact_row in fact_rows)
@@ -279,22 +347,25 @@ def _validate_rhode_island_publication(fact_rows: list[Mapping], descriptor: Map
 
 def _validate_rhode_island_fact(npi: int, generation_id: str, fact: Mapping) -> None:
     """Keep each Rhode Island fact attached to its provider and published generation."""
-    if (fact["category"], fact["fact_type"]) not in {
-        ("education", "education_history"), ("specialties", "specialty"), ("privileges", "staff_privilege"),
-    }:
+    if (fact["category"], fact["fact_type"]) not in STATE_FACT_TYPES[RI_SOURCE_KEY]:
         raise RuntimeError("state_profile_categories_invalid")
     if fact["run_id"] != generation_id or fact["npi"] != npi:
         raise RuntimeError("state_profile_publication_invalid")
     evidence = fact["source_json"]
     if (
-        evidence.get("schema_version") != RI_SCHEMA_VERSION or evidence.get("run_id") != generation_id
-        or evidence.get("agency") != "Rhode Island Department of Health" or evidence.get("jurisdiction") != "RI"
+        evidence.get("schema_version") != RI_SCHEMA_VERSION
+        or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != "Rhode Island Department of Health"
+        or evidence.get("jurisdiction") != "RI"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 
 
 def _validate_new_york_publication(
-    fact_rows: list[Mapping], descriptor: Mapping, categories: list, source_key: str,
+    fact_rows: list[Mapping],
+    descriptor: Mapping,
+    categories: list,
+    source_key: str,
 ) -> None:
     """Keep each New York publication within its declared registry-derived cohort."""
     source = NEW_YORK_SOURCES[source_key]
@@ -302,9 +373,11 @@ def _validate_new_york_publication(
         raise RuntimeError("state_profile_categories_invalid")
     snapshot_sha256 = fact_rows[0]["source_manifest"].get("snapshot_sha256")
     if (
-        descriptor.get("agency") != source["agency"] or descriptor.get("jurisdiction") != "NY"
+        descriptor.get("agency") != source["agency"]
+        or descriptor.get("jurisdiction") != "NY"
         or descriptor.get("coverage_scope") != "supported_nppes_derived_ny_physician_license_roots"
-        or not isinstance(snapshot_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
+        or not isinstance(snapshot_sha256, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", snapshot_sha256)
         or descriptor.get("registry_generation") != snapshot_sha256
         or any(fact_row.get("publication_source_key") != source_key for fact_row in fact_rows)
         or any(fact_row.get("run_schema_version") != source["schema_version"] for fact_row in fact_rows)
@@ -322,13 +395,17 @@ def _validate_new_york_fact(npi: int, generation_id: str, fact: Mapping, source_
         raise RuntimeError("state_profile_publication_invalid")
     evidence = fact["source_json"]
     if (
-        evidence.get("schema_version") != source["schema_version"] or evidence.get("run_id") != generation_id
-        or evidence.get("agency") != source["agency"] or evidence.get("jurisdiction") != "NY"
+        evidence.get("schema_version") != source["schema_version"]
+        or evidence.get("run_id") != generation_id
+        or evidence.get("agency") != source["agency"]
+        or evidence.get("jurisdiction") != "NY"
     ):
         raise RuntimeError("state_profile_source_mismatch")
 
 
-def merge_state_profile_projection(npi: int, projection: Mapping | None, state_projection: Mapping | None) -> dict | None:
+def merge_state_profile_projection(
+    npi: int, projection: Mapping | None, state_projection: Mapping | None
+) -> dict | None:
     """Append one source under its actual identity, preserving legacy evidence."""
     if state_projection is None:
         return projection
@@ -346,8 +423,9 @@ def merge_state_profile_projection(npi: int, projection: Mapping | None, state_p
     profile.setdefault("sources", []).append(copy.deepcopy(state_projection["source"]))
     source_key = state_projection["source"]["source_key"]
     profile.setdefault("important_context", []).append(SOURCE_CONTEXT[source_key])
-    if (source_key == MASSACHUSETTS_SOURCE_KEY
-            and any(state_projection["categories"][category]["items"] for category in ("certifications", "specialties"))):
+    if source_key == MASSACHUSETTS_SOURCE_KEY and any(
+        state_projection["categories"][category]["items"] for category in ("certifications", "specialties")
+    ):
         profile["important_context"].append(
             "Massachusetts board certifications and practice specialties are source-reported. "
             "Certification validity, expiration and taxonomy codes are not inferred."
@@ -371,8 +449,12 @@ def canonicalize_exact_category(group: dict) -> None:
     """Union support only for equal fact types and values with equal visibility."""
     exact_groups = defaultdict(list)
     for fact in group.get("items", []):
-        key = (fact.get("type"), json.dumps(fact.get("value"), sort_keys=True, default=str),
-               bool(fact.get("sensitive")), bool(fact.get("public_default")))
+        key = (
+            fact.get("type"),
+            json.dumps(fact.get("value"), sort_keys=True, default=str),
+            bool(fact.get("sensitive")),
+            bool(fact.get("public_default")),
+        )
         exact_groups[key].append(_source_assertions(fact))
     items = []
     for facts in exact_groups.values():

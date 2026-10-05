@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from api.endpoint import npi as npi_module
 from db.connection import Database
 from db.models import ProviderProfileSourcePin
-from process.source_profile_result_pins import pin_guard_statements
+from process.source_profile_result_pins import statement_pin_guard_statements
 
 florida = importlib.import_module("process.florida_mqa_profile")
 
@@ -190,7 +190,7 @@ async def _retention_database(monkeypatch):
         is_schema_created = True
         async with engine.begin() as connection:
             await connection.run_sync(metadata.create_all)
-            for statement in pin_guard_statements(schema):
+            for statement in statement_pin_guard_statements(schema):
                 await connection.exec_driver_sql(statement)
         monkeypatch.setattr(florida, "db", database)
         yield database, metadata
