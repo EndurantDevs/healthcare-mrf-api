@@ -33,7 +33,7 @@ async def _migrated_tables(resources, monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", _SCHEMA)
         await _upgrade_disposable_schema_to_head(url.render_as_string(hide_password=False), _SCHEMA)
         assert await database.scalar(f'SELECT version_num FROM "{_SCHEMA}".alembic_version') == (
-            "20261005020000_custom_import_sealed_append_plans"
+            "20261005030000_source_profile_statement_pins"
         )
         metadata = MetaData(schema=_SCHEMA)
         for model in preparation.destination.restore._models():

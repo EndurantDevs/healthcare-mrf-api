@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import text
-from sqlalchemy.schema import CreateIndex
 
 from db import models
 from process import reference_family_archive as native
@@ -324,11 +323,9 @@ async def precreate_restore(session, dataset_id):
 async def complete_restore(session, ownership):
     """Build model indexes only after archive rows have been restored."""
     await verify_ownership(session, ownership)
-    metadata = native.MetaData(schema=ownership.schema_name)
-    for model in MODELS:
-        table = model.__table__.to_metadata(metadata, schema=ownership.schema_name)
-        for index in sorted(table.indexes, key=lambda item: item.name):
-            await session.execute(CreateIndex(index))
+    await native._create_model_indexes(
+        session, native.ReferenceFamilySpec(IMPORTER_ID, MODELS), ownership.schema_name, create_constraints=True
+    )
 
 
 async def validate_stage(session, ownership, manifest):

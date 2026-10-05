@@ -20,9 +20,19 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import DefaultClause, Sequence, text
+from sqlalchemy import (
+    JSON,
+    Column,
+    DefaultClause,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    Sequence,
+    Table,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateSequence, CreateTable, MetaData
+from sqlalchemy.schema import AddConstraint, CreateIndex, CreateSequence, CreateTable, MetaData
 
 from db import models
 from db.tiger_models import Zip_zcta5, ZipState
@@ -822,7 +832,10 @@ def _validate_source_capture_contract(manifest_value: Mapping[str, Any]) -> None
     if manifest_value["source_capture_contract"] == CAPTURED_TIGER_CONTRACT:
         from process.tiger_captured_epoch import validate_captured_origin
 
-        if manifest_value.get("publication_authority") != "captured-epoch" or manifest_value.get("importer_id") != "tiger":
+        if (
+            manifest_value.get("publication_authority") != "captured-epoch"
+            or manifest_value.get("importer_id") != "tiger"
+        ):
             raise ReferenceFamilyArchiveError("captured epoch requires the TIGER family")
         validate_captured_origin(manifest_value.get("source_metadata"))
     elif (
@@ -859,10 +872,7 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         _validate_source_capture_contract(manifest_value)
     if set(manifest_value) - {"dependencies"} != expected_fields:
         raise ReferenceFamilyArchiveError("reference family manifest is invalid")
-    if manifest_value["contract"] != CONTRACT or authority not in {"manual-only", "tracked-generation", "captured-epoch"}:
-        raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
-    if authority == "captured-epoch" and manifest_value.get("source_capture_contract") != CAPTURED_TIGER_CONTRACT:
-        raise ReferenceFamilyArchiveError("captured epoch contract is required")
+    _validate_manifest_authority(manifest_value, authority)
     spec = _manifest_family_spec(manifest_value)
     if spec.importer_id == "label" and authority != "tracked-generation":
         raise ReferenceFamilyArchiveError("label source generation is required")
@@ -893,6 +903,18 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         source_serving_generation,
         manifest_value.get("source_capture_contract"),
     )
+
+
+def _validate_manifest_authority(manifest_value: Mapping[str, Any], authority: object) -> None:
+    """Reject unsupported publication authority before deriving trusted model membership."""
+    if manifest_value["contract"] != CONTRACT or authority not in {
+        "manual-only",
+        "tracked-generation",
+        "captured-epoch",
+    }:
+        raise ReferenceFamilyArchiveError("reference family manifest authority is invalid")
+    if authority == "captured-epoch" and manifest_value.get("source_capture_contract") != CAPTURED_TIGER_CONTRACT:
+        raise ReferenceFamilyArchiveError("captured epoch contract is required")
 
 
 def _validation_digest(payload: Mapping[str, Any]) -> str:
@@ -1088,14 +1110,54 @@ async def _source_serving_generation(session, spec, schema):
         raise ReferenceFamilyArchiveError("reference family source generation is unavailable or drifted") from error
 
 
+async def _defer_empty_clone_indexes(session: Any, schema_name: str, table_name: str) -> tuple[list[str], list[str]]:
+    """Capture and remove only freshly created local backing indexes before loading."""
+    stage_ref = f"{_quoted(schema_name)}.{_quoted(table_name)}"
+    backing_objects = (
+        (
+            await session.execute(
+                text("""
+                    SELECT conname AS name, 'constraint' AS kind, pg_get_constraintdef(oid) AS definition,
+                           contype::text AS constraint_type
+                    FROM pg_constraint WHERE conrelid=CAST(:relation AS regclass) AND contype IN ('p','u','x','c','f')
+                    UNION ALL
+                    SELECT c.relname, 'index', pg_get_indexdef(i.indexrelid), NULL::text
+                    FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                    WHERE i.indrelid=CAST(:relation AS regclass)
+                      AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=i.indexrelid)
+                    ORDER BY kind, name
+                """),
+                {"relation": stage_ref},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    replay_statements, check_statements = [], []
+    connection = await session.connection()
+    for backing_object in backing_objects:
+        if backing_object.get("constraint_type") == "f":
+            raise ReferenceFamilyArchiveError("snapshot clone contains an unsupported foreign key")
+        name = postgresql.dialect().identifier_preparer.quote_identifier(backing_object["name"])
+        if backing_object["kind"] == "constraint":
+            statements = check_statements if backing_object.get("constraint_type") == "c" else replay_statements
+            statements.append(f"ALTER TABLE {stage_ref} ADD CONSTRAINT {name} {backing_object['definition']}")
+            await connection.exec_driver_sql(f"ALTER TABLE {stage_ref} DROP CONSTRAINT {name} RESTRICT")
+        else:
+            replay_statements.append(backing_object["definition"])
+            await connection.exec_driver_sql(f"DROP INDEX {_quoted(schema_name)}.{name} RESTRICT")
+    return replay_statements, check_statements
+
+
 async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, stage_schema: str) -> None:
     if _SNAPSHOT.fullmatch(capture.postgres_snapshot) is None:
         raise ReferenceFamilyArchiveError("reference family source snapshot is invalid")
     await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     await session.execute(text(f"SET TRANSACTION SNAPSHOT '{capture.postgres_snapshot}'"))
     spec = reference_family_spec(capture.manifest.importer_id)
+    deferred_statements, deferred_checks = [], []
     if spec.importer_id in _OWNED_SEQUENCES:
-        await _create_model_family(session, spec, stage_schema)
+        await _create_model_family(session, spec, stage_schema, create_indexes=False)
     else:
         await session.execute(text(f"CREATE SCHEMA {_quoted(stage_schema)}"))
     models_by_table = {model.__tablename__: model for model in spec.model_types}
@@ -1104,6 +1166,11 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
         stage_ref = f"{_quoted(stage_schema)}.{_quoted(table.table_name)}"
         if spec.importer_id not in _OWNED_SEQUENCES:
             await session.execute(text(f"CREATE TABLE {stage_ref} (LIKE {source_ref} INCLUDING ALL)"))
+            index_statements, check_statements = await _defer_empty_clone_indexes(
+                session, stage_schema, table.table_name
+            )
+            deferred_statements.extend(index_statements)
+            deferred_checks.extend(check_statements)
         columns = ", ".join(_quoted(column.name) for column in models_by_table[table.table_name].__table__.columns)
         await session.execute(text(f"INSERT INTO {stage_ref} ({columns}) SELECT {columns} FROM {source_ref}"))
     if spec.importer_id == "mrf":
@@ -1120,6 +1187,14 @@ async def _clone_source(session: Any, capture: ReferenceFamilySourceCapture, sta
                 f"SELECT canonical.address_key, to_jsonb(canonical) FROM {source_archive} AS canonical {address_filter}"
             )
         )
+    if spec.importer_id in _OWNED_SEQUENCES:
+        await _create_model_indexes(session, spec, stage_schema, create_constraints=True)
+    else:
+        connection = await session.connection()
+        for statement in deferred_statements:
+            await connection.exec_driver_sql(statement)
+        for statement in deferred_checks:
+            await connection.exec_driver_sql(statement)
     await _rebase_owned_sequences(session, stage_schema, spec.importer_id)
 
 
@@ -1509,8 +1584,11 @@ async def _validate_stage_manifest(
         auxiliary=validated.auxiliary,
         source_serving_generation=validated.source_serving_generation,
     )
-    observed = replace(observed, source_capture_contract=validated.source_capture_contract,
-                       publication_authority=validated.publication_authority)
+    observed = replace(
+        observed,
+        source_capture_contract=validated.source_capture_contract,
+        publication_authority=validated.publication_authority,
+    )
     if _is_legacy_cms_manifest(validated):
         if not _has_matching_manifest_stage_tables(validated, observed.tables):
             raise ReferenceFamilyArchiveError("reference family restored stage differs")
@@ -1772,7 +1850,7 @@ async def precreate_reference_family_restore(
     importer_id: str,
     dataset_id: UUID,
 ) -> ReferenceFamilyStageOwnership:
-    """Create model tables, constraints and sequences for a native data-only restore."""
+    """Create model heaps and sequences for a native data-only restore."""
 
     _require_transaction(session)
     spec = reference_family_spec(importer_id)
@@ -1783,6 +1861,51 @@ async def precreate_reference_family_restore(
         importer_id=importer_id,
         dataset_id=dataset_id,
     )
+
+
+async def _is_model_table_equal(
+    session: Any,
+    model_type: type,
+    *,
+    left_schema: str,
+    left_name: str,
+    right_schema: str,
+    right_name: str,
+    scope: tuple[str, tuple[str, ...]] | None = None,
+) -> bool:
+    """Compare indexed, isolated model tables exactly without row serialization or hashes."""
+    _require_transaction(session)
+    table = model_type.__table__
+    keys = tuple(table.primary_key.columns)
+    if not keys:
+        raise ReferenceFamilyArchiveError("set comparison requires a model primary key")
+    join = " AND ".join(f"l.{_quoted(column.name)}=r.{_quoted(column.name)}" for column in keys)
+    differences = []
+    for column in table.columns:
+        name = _quoted(column.name)
+        cast = "::jsonb" if isinstance(column.type, JSON) else ""
+        differences.append(f"l.{name}{cast} IS DISTINCT FROM r.{name}{cast}")
+    key = _quoted(keys[0].name)
+    parameters_by_field = {}
+    left = f"{_quoted(left_schema)}.{_quoted(left_name)}"
+    right = f"{_quoted(right_schema)}.{_quoted(right_name)}"
+    if scope is not None:
+        scope_column, scope_values = scope
+        if scope_column not in table.c or not isinstance(scope_values, tuple):
+            raise ReferenceFamilyArchiveError("set comparison scope differs from the installed model")
+        parameters_by_field["scope_values"] = list(scope_values)
+        predicate = f"{_quoted(scope_column)}=ANY(CAST(:scope_values AS text[]))"
+        left = f"(SELECT * FROM {left} WHERE {predicate})"
+        right = f"(SELECT * FROM {right} WHERE {predicate})"
+    equal = await session.scalar(
+        text(
+            f"SELECT NOT EXISTS(SELECT 1 FROM {left} l "
+            f"FULL OUTER JOIN {right} r ON {join} "
+            f"WHERE l.{key} IS NULL OR r.{key} IS NULL OR " + " OR ".join(differences) + ")"
+        ),
+        parameters_by_field,
+    )
+    return equal is True
 
 
 async def _create_model_family(
@@ -1797,7 +1920,7 @@ async def _create_model_family(
         await session.execute(
             text(
                 f"CREATE TABLE {_quoted(schema_name)}.{_quoted(STAGE_TABLE)} "
-                "(address_key uuid PRIMARY KEY, payload jsonb NOT NULL)"
+                f"(address_key uuid {'PRIMARY KEY' if create_indexes else 'NOT NULL'}, payload jsonb NOT NULL)"
             )
         )
     metadata = MetaData(schema=schema_name)
@@ -1824,6 +1947,13 @@ async def _create_model_family(
             address_key_column = table.c.address_key
             table._columns.remove(address_key_column)
             table.append_column(address_key_column)
+        if not create_indexes:
+            for column in table.columns:
+                for constraint in tuple(column.constraints):
+                    column.constraints.remove(constraint)
+                    table.append_constraint(constraint)
+            for constraint in table.constraints:
+                constraint.ddl_if(callable_=lambda *_args, **_kwargs: False)
         statement = str(CreateTable(table).compile(dialect=postgresql.dialect()))
         await session.execute(text(statement))
         for sequence_name, column_name in explicit_sequences:
@@ -1837,8 +1967,44 @@ async def _create_model_family(
         await _create_model_indexes(session, spec, schema_name)
 
 
-async def _create_model_indexes(session: Any, spec: ReferenceFamilySpec, schema_name: str) -> None:
+async def _create_table_constraints(session: Any, table: Table, *, backing_indexes: bool = True) -> None:
+    """Finish model keys or checks; relationships use indexed set checks instead."""
+    if not backing_indexes:
+        for column in table.columns:
+            for constraint in tuple(column.constraints):
+                column.constraints.remove(constraint)
+                table.append_constraint(constraint)
+    constraints = (
+        constraint
+        for constraint in table.constraints
+        if not isinstance(constraint, ForeignKeyConstraint)
+        and isinstance(constraint, (PrimaryKeyConstraint, UniqueConstraint)) == backing_indexes
+        and (not isinstance(constraint, PrimaryKeyConstraint) or constraint.columns)
+    )
+    for constraint in sorted(
+        constraints, key=lambda item: (type(item).__name__, str(item.name or ""), tuple(item.columns.keys()))
+    ):
+        await session.execute(AddConstraint(constraint))
+
+
+async def _create_model_indexes(
+    session: Any, spec: ReferenceFamilySpec, schema_name: str, *, create_constraints: bool = False
+) -> None:
+    metadata = MetaData(schema=schema_name)
+    if create_constraints and spec.importer_id == "mrf":
+        await _create_table_constraints(
+            session, Table(STAGE_TABLE, metadata, Column("address_key", postgresql.UUID, primary_key=True))
+        )
     for model_type in spec.model_types:
+        model_type.__table__.to_metadata(metadata, schema=schema_name)
+    for model_type in spec.model_types:
+        table = metadata.tables[f"{schema_name}.{model_type.__tablename__}"]
+        if create_constraints:
+            if spec.importer_id == "provider-quality" and table.primary_key.columns:
+                table.primary_key.name = _index_name_for_table(table.name, f"{schema_name}_{table.name}_pkey")
+            await _create_table_constraints(session, table)
+        for index in sorted(table.indexes, key=lambda item: item.name):
+            await session.execute(CreateIndex(index))
         if spec.importer_id == "provider-quality":
             primary_elements = tuple(getattr(model_type, "__my_index_elements__", ()) or ())
             if primary_elements:
@@ -1865,6 +2031,35 @@ async def _create_model_indexes(session: Any, spec: ReferenceFamilySpec, schema_
             )
         for index in indexes:
             await session.execute(text(_additional_index_sql(schema_name, model_type, index)))
+    if create_constraints:
+        for table in metadata.tables.values():
+            await _create_table_constraints(session, table, backing_indexes=False)
+        await _validate_model_foreign_keys(session, metadata)
+
+
+async def _validate_model_foreign_keys(session: Any, metadata: MetaData) -> None:
+    """Check model relationships once on indexed isolated sets; install no foreign keys."""
+    for table in metadata.tables.values():
+        for constraint in sorted(table.foreign_key_constraints, key=lambda item: str(item.name or "")):
+            elements = tuple(constraint.elements)
+            parent = elements[0].column.table
+            if constraint.match not in {None, "SIMPLE", "FULL"} or any(
+                element.column.table is not parent for element in elements
+            ):
+                raise ReferenceFamilyArchiveError("model relationship match is unsupported")
+            join = " AND ".join(
+                f"p.{_quoted(element.column.name)}=c.{_quoted(element.parent.name)}" for element in elements
+            )
+            present = " AND ".join(f"c.{_quoted(element.parent.name)} IS NOT NULL" for element in elements)
+            invalid = f"({present}) AND NOT EXISTS(SELECT 1 FROM {_quoted(parent.schema)}.{_quoted(parent.name)} p WHERE {join})"
+            if constraint.match == "FULL":
+                any_present = " OR ".join(f"c.{_quoted(element.parent.name)} IS NOT NULL" for element in elements)
+                invalid = f"(({any_present}) AND NOT({present})) OR ({invalid})"
+            violates = await session.scalar(
+                text(f"SELECT EXISTS(SELECT 1 FROM {_quoted(table.schema)}.{_quoted(table.name)} c WHERE {invalid})")
+            )
+            if violates is not False:
+                raise ReferenceFamilyArchiveError("staged model relationship differs")
 
 
 async def complete_reference_family_restore(session: Any, ownership: ReferenceFamilyStageOwnership) -> None:
@@ -1872,7 +2067,9 @@ async def complete_reference_family_restore(session: Any, ownership: ReferenceFa
 
     _require_transaction(session)
     await verify_reference_family_stage_ownership(session, ownership)
-    await _create_model_indexes(session, reference_family_spec(ownership.importer_id), ownership.schema_name)
+    await _create_model_indexes(
+        session, reference_family_spec(ownership.importer_id), ownership.schema_name, create_constraints=True
+    )
 
 
 async def validate_reference_family_stage(
@@ -2064,7 +2261,9 @@ async def _lock_and_verify_activation(
                 lambda sql: session.execute(text(sql)), expected_incumbent.schema_name, incumbent_names
             )
         elif incumbent_names:
-            await _lock_family(session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE", nowait=True)
+            await _lock_family(
+                session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE", nowait=True
+            )
         await verify_reference_family_stage_ownership(session, ownership)
         await _verify_incumbent(session, expected_incumbent)
 
@@ -2371,7 +2570,11 @@ async def activate_validated_reference_family_stage(
     _require_validated_cutover_binding(ownership, expected_incumbent, validated_manifest, validation, cutover)
     spec = reference_family_spec(ownership.importer_id)
     await _lock_and_verify_activation(
-        session, spec, ownership, expected_incumbent, wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"}
+        session,
+        spec,
+        ownership,
+        expected_incumbent,
+        wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"},
     )
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
     incoming_generation = _activation_source_generation(validated_manifest, cutover)

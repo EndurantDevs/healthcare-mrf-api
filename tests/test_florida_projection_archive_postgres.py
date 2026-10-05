@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db import models
 from process import florida_projection_archive as archive
-from process.source_profile_result_pins import pin_guard_statements
+from process.source_profile_result_pins import statement_pin_guard_statements
 
 
 async def _seed_published_run(session, run_id, when):
@@ -100,7 +100,7 @@ async def _assert_destination_adoption(session, prepared, ownership, run_id):
             "authority_json json NOT NULL, PRIMARY KEY (pin_id,run_id))"
         )
     )
-    for statement in pin_guard_statements("dest"):
+    for statement in statement_pin_guard_statements("dest"):
         await session.execute(text(statement))
     expected = await archive.current_identity(session, "dest")
     owner_oid = await session.scalar(
@@ -249,7 +249,7 @@ async def test_published_projection_stage_and_atomic_swap():
                 == 2
             )
             await connection.execute(text("DROP TABLE mrf.acl_probe"))
-            for statement in pin_guard_statements("mrf"):
+            for statement in statement_pin_guard_statements("mrf"):
                 await connection.execute(text(statement))
         is_source_schema_committed = True
         async with sessions() as session, session.begin():
