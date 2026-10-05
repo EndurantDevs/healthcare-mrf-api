@@ -15,6 +15,11 @@ output materialization, and legacy import paths, not only initial SOURCE loading
 - Replace per-record database queries, authority lookups, counter updates and
   row-based custom validation triggers with set-based batch/snapshot checks.
   Do not introduce new row-based custom triggers on high-volume import relations.
+  This includes custom UPDATE guards and accounting, not just INSERT guards.
+- Refresh native planner statistics on the isolated bulk-loaded candidate before
+  its indexed set checks. Index presence alone does not prove an efficient plan;
+  inspect representative plans and include sampled analysis in pipeline timings.
+  Do not analyze or rebuild unrelated live/history storage for a candidate.
 - Preserve the validation rules: types, canonical bytes and hashes, key
   uniqueness/collisions, source ordinals, counts/bytes, parent-child references,
   complete-family rejection, provenance and source-bundle consistency. Parsing,
@@ -24,16 +29,28 @@ output materialization, and legacy import paths, not only initial SOURCE loading
   write transaction, with a fresh check after waits and before commit. Persist
   the batch and its durable cursor atomically. A stale or failed batch rolls
   back; uncertain commit results use the existing durable-prefix resume path.
-- Finish serving projections, deferred indexes and constraint validation before
+  Coalescing SOURCE packs must also flush within the live lease window; row and
+  byte caps alone are not a heartbeat. Keep the immutable build deadline fixed.
+- Finish serving projections, deferred indexes and relationship validation before
   publication. Never drop or rebuild shared live/history indexes to speed up a
-  candidate. Native integrity constraints are not permission to retain repeated
-  custom validation; every deferred invariant needs equivalent completed proof.
-- Preserve native PK/UNIQUE/FK/NOT NULL/CHECK guarantees. Complete permitted
-  deferred native validation before publication; do not weaken shared canonical
-  constraints.
+  candidate. Every deferred invariant needs equivalent completed proof.
+- Validate immutable snapshot relationships with indexed, set-based anti-joins
+  on the isolated candidate instead of per-record foreign-key checks. Check the
+  complete parent/child, revision, family, projection and winner identities,
+  including their dataset, schema and producer scope; an ID existing elsewhere
+  is not sufficient. Keep essential native PK/UNIQUE/NOT NULL/CHECK constraints.
+  Low-volume ownership, lease and batch-control constraints are a separate
+  boundary, not a reason to retain foreign keys on every snapshot record.
+- Close candidate writes before complete snapshot validation and keep them
+  closed through publication. Failed checks leave the incumbent untouched;
+  successful checks are invalid if the candidate can change afterward. Reuse
+  candidate-only indexes for these checks and serving, and verify native query
+  plans do not scan unrelated snapshots or history.
 - Migrate every affected writer before retiring its old validation triggers.
   Restrict canonical writes to protected batch/promotion entry points; workers
   must not retain direct write access that bypasses their checks.
+  Temporary COPY transport grants end with the last authorized batch in their
+  transaction, not only when the entire candidate eventually freezes.
   Do not use caller-controlled bypass flags or disable/re-enable triggers as a
   substitute for validation: reenabling a trigger does not validate skipped rows.
 
@@ -41,6 +58,17 @@ Custom imports use generic, migration-managed storage with explicit dataset,
 build and generation identities, not per-client tables or arbitrary runtime DDL.
 The storage layout must provide candidate isolation and the intended index
 lifecycle; an atomic publication pointer alone does not eliminate loading costs.
+
+Use a fixed, model-defined table family in an engine-generated namespace. Keep
+canonical row shapes and stable logical/entity IDs; do not add a snapshot column
+to existing composite payload types or allocate replacement identity dictionaries.
+Register exact relation OIDs against the existing producer identity, then bind
+that family immutably to its generation. Prepare processing indexes only when
+their phase needs them, and typed serving indexes after candidate writes close.
+Neither readers nor validation may resolve a family from caller-supplied names.
+Do not copy redundant UNIQUE indexes whose columns contain the primary key:
+without snapshot FKs the primary key already proves their uniqueness. Preserve
+genuine natural-key, content, position, membership and context uniqueness.
 
 ## Interchangeable snapshots
 
@@ -60,7 +88,7 @@ published or empty-data interval.
 
 Compare the old and new complete pipeline on identical representative data and
 native hardware. Include mapping, COPY, set validation, promotion, index and
-constraint work, admission, graph/output construction, verification and cutover;
+relationship checks, admission, graph/output construction, verification and cutover;
 report WAL, index/history/capture storage and cleanup as well as elapsed time.
 COPY-only timings do not establish end-to-end capacity.
 

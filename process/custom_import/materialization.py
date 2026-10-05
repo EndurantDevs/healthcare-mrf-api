@@ -8,11 +8,15 @@ reads, then chooses the one winning family/context for each declared profile.
 It does not accept query predicates: selection happens here, before a later
 read path can apply a threshold or result filter.
 
-The caller owns the surrounding transaction.  It must persist the immutable
-definition profile rows before candidate work and call :func:`seal_generation`
-only after the projection and winner helpers below have flushed.  P3 finality
-then recomputes its receipt from the P1 scalar and winner tables; this module
-never writes a second materialization seal.
+The caller owns the surrounding transaction. The persistence helpers validate
+their entire input before flushing pending work, then append protected native
+pages without committing. SQL derives current producer authority from immutable
+lineage; an actual runner binding adds an expectation but is not required. Empty
+inputs still flush and return zero. The caller must persist immutable definition
+profiles before candidate work and seal only after these helpers return. For a
+segmented build, its existing page-completion calls remain required in that same
+transaction. Finality recomputes its receipt from the scalar and winner tables;
+this module never writes a second materialization seal.
 """
 
 from __future__ import annotations
@@ -432,9 +436,9 @@ async def persist_scalar_projections(
         child_scalars=child_scalars,
         child_collection_slots=child_collection_slots,
     )
-    _add_models(session, models, "scalar projection")
-    await _flush(session, "scalar projection")
-    return len(models)
+    from process.custom_import.materialization_store import persist_scalar_models
+
+    return await persist_scalar_models(session, models)
 
 
 def selection_profile_models(
@@ -686,9 +690,9 @@ async def persist_winner_materialization(session: Any, materialization: WinnerMa
     """
 
     models = winner_materialization_models(materialization)
-    _add_models(session, models, "winner materialization")
-    await _flush(session, "winner materialization")
-    return len(models)
+    from process.custom_import.materialization_store import persist_winner_models
+
+    return await persist_winner_models(session, materialization, models)
 
 
 def _validated_definition(value: object) -> CustomImportDefinition:

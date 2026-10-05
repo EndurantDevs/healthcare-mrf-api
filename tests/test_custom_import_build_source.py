@@ -280,7 +280,7 @@ async def test_part_resume_compares_committed_prefix_then_appends_bounded_suffix
     records = [_root(score=Decimal(index)) for index in range(5)]
     comparison, append = AsyncMock(), AsyncMock()
     monkeypatch.setattr(staging, "_compare_committed_page", comparison)
-    monkeypatch.setattr(staging, "_store_page", append)
+    monkeypatch.setattr(staging, "_store_single_page", append)
     monkeypatch.setattr(staging, "_validate_replay_partition_schema", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(staging, "_aggregate_parquet_arrow_bytes", lambda *_args, **_kwargs: 30)
     monkeypatch.setattr(
@@ -328,7 +328,7 @@ async def test_nullable_arrow_allocation_can_differ_from_bounded_replay(monkeypa
     actual = staging._aggregate_parquet_arrow_bytes(part.capture, limits=policy.part_limits, decoded_bytes=0)
     assert actual == 24 and actual != part.arrow_byte_count
     append = AsyncMock()
-    monkeypatch.setattr(staging, "_store_page", append)
+    monkeypatch.setattr(staging, "_store_single_page", append)
     context = staging._StreamContext(request, registry, 5, definition.source_streams[0])
     assert await staging._replay_part(None, context, part, policy, (1, 0, 0)) == 1
     append.assert_awaited_once()
@@ -340,7 +340,7 @@ async def test_actual_arrow_replay_over_cap_closes_without_stream_eof(monkeypatc
     registry = CandidateRegistry({"details": 1}, {"root_source": 1, "detail_source": 2}, 1)
     closed_contexts = []
     finish = AsyncMock()
-    monkeypatch.setattr(staging, "_store_page", AsyncMock())
+    monkeypatch.setattr(staging, "_store_single_page", AsyncMock())
     monkeypatch.setattr(staging, "_finish_part", finish)
     monkeypatch.setattr(staging, "_set_timeout", AsyncMock())
 

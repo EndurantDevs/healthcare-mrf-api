@@ -30,12 +30,9 @@ from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_segmented_runner_postgres import _binding
 from tests.test_custom_import_snowflake_capture import _policy
 from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
-from tests.test_custom_import_snowflake_source_binding import _processing_policy_migration
 
 
 async def _registered_statement(case, connector, bundle, policy):
-    async with case.engine.begin() as connection:
-        await connection.run_sync(lambda conn: _processing_policy_migration(conn, case.schema_name).upgrade())
     binding = _binding(connector.build_statement(bundle), policy)
     async with case.sessions() as session, session.begin():
         registered = await register_snowflake_source_binding(

@@ -59,6 +59,7 @@ from process.custom_import.publication import (
     _capture_source_bundle_digest,
     seal_generation,
 )
+from process.custom_import.storage_layout import snapshot_schema
 
 POSTGRES_DSN_ENV = "HLTHPRT_CUSTOM_IMPORT_POSTGRES_DSN"
 _TEST_DATABASE = re.compile(r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))", re.IGNORECASE)
@@ -73,6 +74,19 @@ _EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
 )
 _SOURCE_BINDING_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260923030000_custom_import_source_binding.py"
 _SEGMENTED_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261002000000_custom_import_segmented_capture.py"
+_SNAPSHOT_MIGRATION_NAMES = (
+    "20261002010000_custom_import_bounded_build",
+    "20261002020000_custom_import_processing_policy",
+    "20261002030000_custom_import_identical_children",
+    "20261002040000_custom_import_child_memberships",
+    "20261005020000_custom_import_sealed_append_plans",
+    "20261005030000_custom_import_snapshot_storage",
+    "20261005040000_custom_import_bulk_snapshot_writers",
+    "20261005050000_custom_import_legacy_snapshot_writers",
+    "20261005060000_custom_import_snapshot_finality",
+    "20261005070000_custom_import_materialization_storage",
+    "20261005080000_custom_import_writer_cutover",
+)
 
 
 def digest(label: str) -> bytes:
@@ -111,8 +125,25 @@ def _migration(path: Path, module_name: str):
     return module
 
 
-def _install_custom_import_migrations(sync_connection, schema_name: str, is_segmented_capture_enabled: bool) -> None:
+def _install_custom_import_migrations(
+    sync_connection,
+    schema_name: str,
+    is_segmented_capture_enabled: bool,
+    is_snapshot_storage_enabled: bool = True,
+    migration_through: str | None = None,
+) -> None:
     """Install the exact custom-import DDL needed by the focused PostgreSQL proofs."""
+
+    migration_names = ()
+    if is_segmented_capture_enabled and is_snapshot_storage_enabled:
+        migration_names = _SNAPSHOT_MIGRATION_NAMES
+        if migration_through is not None:
+            revisions = tuple(name.split("_", 1)[0] for name in migration_names)
+            if migration_through not in revisions:
+                raise ValueError("unknown custom-import fixture migration stop")
+            migration_names = migration_names[: revisions.index(migration_through) + 1]
+    elif migration_through is not None:
+        raise ValueError("custom-import fixture migration stop requires the snapshot chain")
 
     for path, module_name in (
         (_BASE_MIGRATION_PATH, "custom_import_v1_test_migration"),
@@ -127,6 +158,11 @@ def _install_custom_import_migrations(sync_connection, schema_name: str, is_segm
         migration.upgrade()
     if is_segmented_capture_enabled:
         install_segmented_capture_migration(sync_connection, schema_name)
+        for name in migration_names:
+            migration = _migration(_ROOT / "alembic" / "versions" / f"{name}.py", f"{name}_test_migration")
+            migration._schema = lambda: schema_name
+            migration.op = Operations(MigrationContext.configure(sync_connection))
+            migration.upgrade()
 
 
 def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
@@ -171,11 +207,27 @@ def _quoted_publication_schema(schema_name: str) -> str:
     return f'"{schema_name}"'
 
 
+async def _drop_snapshot_families(connection, schema_name: str) -> None:
+    """Drop only leaves recorded by this exact disposable control schema."""
+
+    quoted_schema = _quoted_publication_schema(schema_name)
+    registry = f"{quoted_schema}.custom_import_snapshot_family"
+    if await connection.scalar(text("SELECT to_regclass(:registry)"), {"registry": registry}) is None:
+        return
+    family_ids = await connection.scalars(text(f"SELECT family_id FROM {registry}"))
+    for family_id in family_ids:
+        namespace = snapshot_schema(family_id)
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE'))
+
+
 @asynccontextmanager
 async def isolated_publication_case(
-    *, is_segmented_capture_enabled: bool = True
+    *,
+    is_segmented_capture_enabled: bool = True,
+    is_snapshot_storage_enabled: bool = True,
+    migration_through: str | None = None,
 ) -> AsyncIterator[IsolatedPublicationCase]:
-    """Create an exact disposable schema for committed multi-session races."""
+    """Use current DDL by default; historical migration proofs name an inclusive stop."""
 
     raw_engine = create_async_engine(_database_url(), pool_pre_ping=True)
     schema_name = f"custom_import_publication_{uuid.uuid4().hex[:16]}"
@@ -188,17 +240,26 @@ async def isolated_publication_case(
             await connection.execute(text(f"CREATE SCHEMA {quoted_schema}"))
         is_schema_created = True
         async with raw_engine.begin() as connection:
-            await connection.run_sync(_install_custom_import_migrations, schema_name, is_segmented_capture_enabled)
+            await connection.run_sync(
+                _install_custom_import_migrations,
+                schema_name,
+                is_segmented_capture_enabled,
+                is_snapshot_storage_enabled,
+                migration_through,
+            )
         yield IsolatedPublicationCase(
             engine=engine,
             sessions=sessions,
             schema_name=schema_name,
         )
     finally:
-        if is_schema_created:
-            async with raw_engine.begin() as connection:
-                await connection.execute(text(f"DROP SCHEMA {quoted_schema} CASCADE"))
-        await raw_engine.dispose()
+        try:
+            if is_schema_created:
+                async with raw_engine.begin() as connection:
+                    await _drop_snapshot_families(connection, schema_name)
+                    await connection.execute(text(f"DROP SCHEMA {quoted_schema} CASCADE"))
+        finally:
+            await raw_engine.dispose()
 
 
 @dataclass(frozen=True)

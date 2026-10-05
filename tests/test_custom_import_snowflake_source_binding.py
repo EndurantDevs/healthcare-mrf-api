@@ -904,7 +904,7 @@ async def _register_and_load_policy_binding(case, binding):
 
 
 async def test_v2_native_registration_preserves_immutable_policy_choices():
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(migration_through="20261002010000") as case:
         legacy = _binding(_definition())
         first, before = await _register_and_load_policy_binding(case, legacy)
         async with case.engine.begin() as connection:
@@ -938,7 +938,7 @@ async def test_v2_native_registration_preserves_immutable_policy_choices():
 
 
 async def test_binding_allowlist_downgrade_preserves_legacy_and_rejects_v2():
-    async with isolated_publication_case() as case:
+    async with isolated_publication_case(migration_through="20261002010000") as case:
         legacy = _binding(_definition())
         first, original = await _register_and_load_policy_binding(case, legacy)
         async with case.engine.begin() as connection:

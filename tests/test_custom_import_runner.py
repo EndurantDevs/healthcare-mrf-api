@@ -959,6 +959,9 @@ class _RegistrySession:
         self.rows = ()
         self.clock = None
         self.info = {}
+        self.transaction = object()
+        self.in_transaction = lambda: True
+        self.connection = AsyncMock(return_value=SimpleNamespace(get_transaction=lambda: self.transaction, info={}))
         self.no_autoflush = nullcontext()
         self.scalars = AsyncMock(side_effect=lambda _statement: SimpleNamespace(all=lambda: list(self.rows)))
 

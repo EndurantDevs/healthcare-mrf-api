@@ -156,6 +156,8 @@ def _profile_context_digest(context, profile_id, scalar_values):
 def _selected_value_relation(context):
     """Address the helper's empty-context winner without panel or metric filters."""
 
+    winner_model = context.model(CustomImportWinner)
+
     selection = context.definition.query.entity_selection
     helper = replace(
         context,
@@ -165,9 +167,9 @@ def _selected_value_relation(context):
     field = context.definition.fields_by_id[selection.field_id]
     return (
         core._filtered_npi_winner_statement(helper, ())
-        .where(CustomImportWinner.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {}))
+        .where(winner_model.context_key_sha256 == _profile_context_digest(context, selection.default_profile, {}))
         .with_only_columns(
-            CustomImportWinner.entity_binding_id.label("entity_binding_id"),
+            winner_model.entity_binding_id.label("entity_binding_id"),
             core._order_scalar_expression(field, helper).label("selected_value"),
             maintain_column_froms=True,
         )
@@ -178,6 +180,9 @@ def _selected_value_relation(context):
 def selected_family_statement(context, plan):
     """Retain all configured groups at one independently resolved entity value."""
 
+    winner_model = context.model(CustomImportWinner)
+    entity_model = context.model(CustomImportEntityBinding)
+
     selection = context.definition.query.entity_selection
     fields = context.definition.fields_by_id
     value_expression = core._order_scalar_expression(fields[selection.field_id], context)
@@ -186,12 +191,12 @@ def selected_family_statement(context, plan):
     selected_value = literal(plan.selected_value)
     if plan.selected_value is None:
         latest = _selected_value_relation(context)
-        statement = statement.join(latest, latest.c.entity_binding_id == CustomImportWinner.entity_binding_id)
+        statement = statement.join(latest, latest.c.entity_binding_id == winner_model.entity_binding_id)
         selected_value = latest.c.selected_value
     return statement.where(
         value_expression == selected_value, group_expression.in_(selection.group_values)
     ).add_columns(
-        CustomImportEntityBinding.canonical_value.label("entity_value"),
+        entity_model.canonical_value.label("entity_value"),
         value_expression.label("selected_value"),
         group_expression.label("group_value"),
     )
@@ -219,8 +224,10 @@ def _child_predicates(plan):
 def prepare_relation(context, query, scope):
     """Return one deduplicated NPI and one explicit-group ordering tuple."""
 
+    entity_model = context.model(CustomImportEntityBinding)
+
     plan = normalize_plan(context, query, scope)
-    columns = [CustomImportEntityBinding.canonical_value.label("entity_value")]
+    columns = [entity_model.canonical_value.label("entity_value")]
     for ordinal, term in enumerate(plan.order_terms):
         field = context.definition.fields_by_id[term.field_id]
         expression = (
@@ -238,11 +245,11 @@ def prepare_relation(context, query, scope):
 async def _selected_family_rows(session, context, plan, entity_values):
     """Batch retained families for already eligible native-page identities."""
 
+    entity_model = context.model(CustomImportEntityBinding)
+
     if not entity_values:
         return ()
-    statement = selected_family_statement(context, plan).where(
-        CustomImportEntityBinding.canonical_value.in_(entity_values)
-    )
+    statement = selected_family_statement(context, plan).where(entity_model.canonical_value.in_(entity_values))
     selected_rows = (await session.execute(statement.limit(len(entity_values) * 2 + 1))).all()
     if len(selected_rows) > len(entity_values) * 2:
         raise core.CustomImportReadUnavailableError("grouped family count exceeds its bound")
@@ -314,6 +321,8 @@ def _family_sets(context, plan, selected_rows, projections, scope, *, projection
 async def hydrate_page(session, context, query, prepared, entity_values, scope):
     """Hydrate both selected groups after deduplicated matching and paging."""
 
+    entity_model = context.model(CustomImportEntityBinding)
+
     plan = normalize_plan(context, query, scope)
     if plan.projection == "full_family" and len(entity_values) > MAX_FULL_FAMILY_PAGE_SIZE:
         raise core.CustomImportReadRequestError("full-family provider page exceeds its bound")
@@ -325,8 +334,8 @@ async def hydrate_page(session, context, query, prepared, entity_values, scope):
         raise core.CustomImportReadUnavailableError("provider page query identity is unavailable")
     matching = (
         matching_family_statement(context, plan)
-        .with_only_columns(CustomImportEntityBinding.canonical_value, maintain_column_froms=True)
-        .where(CustomImportEntityBinding.canonical_value.in_(entity_values))
+        .with_only_columns(entity_model.canonical_value, maintain_column_froms=True)
+        .where(entity_model.canonical_value.in_(entity_values))
         .distinct()
     )
     eligible = tuple((await session.execute(matching)).scalars().all()) if entity_values else ()
@@ -361,6 +370,8 @@ async def _hydrate_complete_families(session, context, selected_rows, scope, *, 
 async def hydrate_detail(session, context, request, scope):
     """Apply entity eligibility then hydrate the bounded complete family set."""
 
+    entity_model = context.model(CustomImportEntityBinding)
+
     if request.entity.adapter_id != "npi":
         raise core.CustomImportReadRequestError("grouped entity selection requires the NPI adapter")
     core._validate_npi_page((request.entity.value,))
@@ -370,9 +381,7 @@ async def hydrate_detail(session, context, request, scope):
         grouped_child_query=request.grouped_child_query,
     )
     plan = normalize_plan(context, query, scope, projection="full_family")
-    matching = matching_family_statement(context, plan).where(
-        CustomImportEntityBinding.canonical_value == request.entity.value
-    )
+    matching = matching_family_statement(context, plan).where(entity_model.canonical_value == request.entity.value)
     exists = await session.scalar(matching.with_only_columns(literal(1), maintain_column_froms=True).limit(1))
     if exists is None:
         await core.verify_published_generation(session, context.target)

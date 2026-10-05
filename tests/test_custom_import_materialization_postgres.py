@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import uuid
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import select
@@ -39,7 +40,6 @@ from process.custom_import.materialization import (
     persist_winner_materialization,
     project_child_scalars,
     project_root_scalars,
-    scalar_projection_models,
 )
 from process.custom_import.publication import seal_generation
 from tests.custom_import_postgres_support import (
@@ -414,12 +414,12 @@ async def _assert_ownership_and_binding_guards(
     root_scalar_rows,
     suffix: str,
 ) -> None:
-    wrong_root_scalar = scalar_projection_models(definition, root_scalars=root_scalar_rows)[0]
-    wrong_root_scalar.root_record_id = family.root_record_id + 1_000_000
-    with pytest.raises(DBAPIError, match="custom_import_output_missing_producing_authority"):
+    root_projection = root_scalar_rows[0]
+    wrong_root_target = replace(root_projection.target, root_record_id=family.root_record_id + 1_000_000)
+    wrong_root_projection = replace(root_projection, target=wrong_root_target)
+    with pytest.raises(DBAPIError, match="custom_import_scalar_set_scope_or_finality"):
         async with session.begin_nested():
-            session.add(wrong_root_scalar)
-            await session.flush()
+            await persist_scalar_projections(session, definition, root_scalars=(wrong_root_projection,))
 
     foreign_binding = CustomImportEntityBinding(
         dataset_id=graph.dataset_id,

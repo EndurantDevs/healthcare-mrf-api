@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from itertools import count
 
-from sqlalchemy import LargeBinary, String, func, or_, select, tuple_
+from sqlalchemy import LargeBinary, String, func, or_, select, text, tuple_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import aliased
 
@@ -20,7 +20,6 @@ from db.models.custom_import import (
     CustomImportBuildCandidateContext,
     CustomImportBuildFamily,
     CustomImportBuildOccurrence,
-    CustomImportBuildStream,
     CustomImportCapture,
     CustomImportCaptureBundle,
     CustomImportChildRevision,
@@ -37,6 +36,7 @@ from db.models.custom_import import (
 )
 from process.custom_import import materialization as material
 from process.custom_import import publication
+from process.custom_import.build_graph_source_page import append_source_child_page
 from process.custom_import.build_source import (
     SourceBuildRequest,
     _assert_build_identity,
@@ -44,11 +44,13 @@ from process.custom_import.build_source import (
     _enter_context,
     _flush_page,
     _page_session,
+    _prepare_snapshot_indexes,
     _prepare_statement,
 )
 from process.custom_import.build_source import (
     _call as _source_call,
 )
+from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import (
     candidate_hash_ordered,
@@ -67,6 +69,7 @@ from process.custom_import.runner_types import (
     LeaseAuthorityLost,
     StoredCandidateChild,
 )
+from process.custom_import.storage_layout import snapshot_models
 
 
 def _require_budget(deadline):
@@ -167,22 +170,69 @@ class _ReadPage:
     row_limit: int | None = None
     variable_columns: tuple | None = None
     single_page: bool = False
+    physical: bool = False
 
 
 def _read_rows(session, request, build_id, statement, keys, models, *, after=None, bounds=_ReadPage()):
+    yield from _read_query_pages(
+        session, request, build_id, lambda _session: (statement, keys, models), after=after, bounds=bounds
+    )
+
+
+def _build_storage_models(session, build_id):
+    """Resolve both immutable bindings in the same transaction as their reads."""
+
+    connection = session.connection()
+    model_schema = CustomImportBuildAttempt.__table__.schema
+    schema_map = connection.get_execution_options().get("schema_translate_map") or {}
+    control_schema = schema_map.get(model_schema, model_schema)
+    if not control_schema:
+        raise CandidateRunnerError("build snapshot resolvers require an explicit control schema")
+    quoted = connection.dialect.identifier_preparer.quote_schema(control_schema)
+    candidate_id, base_id = session.execute(
+        text(
+            f"SELECT {quoted}.resolve_custom_import_build_snapshot(CAST(:build_id AS bigint)), "
+            f"{quoted}.resolve_custom_import_build_base_snapshot(CAST(:build_id AS bigint))"
+        ),
+        {"build_id": build_id},
+    ).one()
+    if type(candidate_id) is not int or not 0 < candidate_id < 2**63:
+        raise CandidateRunnerError("build candidate snapshot identity is invalid")
+    if base_id is not None and (type(base_id) is not int or not 0 < base_id < 2**63):
+        raise CandidateRunnerError("build base snapshot identity is invalid")
+    return snapshot_models(candidate_id), None if base_id is None else snapshot_models(base_id)
+
+
+def _read_snapshot_rows(session, request, build_id, query, *, after=None, bounds=_ReadPage()):
+    """Bind hot tables afresh before each metadata/payload page, never by raw IDs."""
+
+    def bound_query(current_session):
+        """Verify registered relation bindings before constructing this page."""
+        candidate_models, base_models = _build_storage_models(current_session, build_id)
+        return query(candidate_models, base_models)
+
+    yield from _read_query_pages(session, request, build_id, bound_query, after=after, bounds=bounds)
+
+
+def _read_query_pages(session, request, build_id, query_factory, *, after=None, bounds=_ReadPage()):
     """Metadata-first keyset pages, closed before the consumer hashes a page_record."""
 
+    if bounds.physical:
+        yield from _read_physical_pages(session, request, build_id, query_factory, after=after, bounds=bounds)
+        return
     limit = min(bounds.row_limit or request.page_row_limit, request.page_row_limit)
     byte_limit = request.page_byte_limit - bounds.reserve_bytes
     if byte_limit < 0:
         raise CandidateRunnerError("build page has no remaining payload budget")
-    variable_bytes = (
-        _variable_bytes(*models)
-        if bounds.variable_columns is None
-        else sum((func.coalesce(func.octet_length(column), 0) for column in bounds.variable_columns), 0)
-    )
     while True:
         with _read_transaction(session, request, build_id) as (_build, deadline):
+            statement, keys, models = query_factory(session)
+            variable_bytes = (
+                _variable_bytes(*models)
+                if bounds.variable_columns is None
+                else sum((func.coalesce(func.octet_length(column), 0) for column in bounds.variable_columns), 0)
+            )
+            _prepare_read(session, request, deadline)
             page = statement.order_by(None)
             if after is not None:
                 page = page.where(tuple_(*keys) > tuple(after))
@@ -207,8 +257,115 @@ def _read_rows(session, request, build_id, statement, keys, models, *, after=Non
             return
 
 
+def _physical_key_bytes(keys):
+    """Bound metadata before fetching it, including maximum UTF-8 key widths."""
+    size = 64 + 16 * (len(keys) + 1)
+    for key in keys:
+        if isinstance(key.type, (String, LargeBinary)):
+            if key.type.length is None:
+                raise CandidateRunnerError("physical build reads require bounded key columns")
+            size += key.type.length * (4 if isinstance(key.type, String) else 1)
+    return size
+
+
+def _physical_keys(metadata, request, available_bytes, fixed_bytes):
+    admitted, used_bytes = [], 0
+    for *identity, payload_bytes in metadata:
+        if type(payload_bytes) is not int or payload_bytes < 0:
+            raise CandidateRunnerError("build record has invalid byte metadata")
+        if payload_bytes > request.page_byte_limit:
+            raise CandidateRunnerError("one build record exceeds the admitted byte page")
+        size = payload_bytes + fixed_bytes
+        if used_bytes + size > available_bytes:
+            if not admitted:
+                raise CandidateRunnerError("one build record exceeds the admitted byte page")
+            break
+        admitted.append(tuple(identity))
+        used_bytes += size
+    if len(set(admitted)) != len(admitted):
+        raise CandidateRunnerError("frozen build page contains duplicate keys")
+    return admitted
+
+
+def _read_physical_payload(session, request, deadline, page, keys, admitted):
+    """Check the complete prefix count without fetching an unbudgeted extra payload."""
+    prefix = page.where(tuple_(*keys) <= admitted[-1])
+    prefix_count = (
+        prefix.with_only_columns(func.count(), maintain_column_froms=True)
+        .order_by(None)
+        .correlate(None)
+        .scalar_subquery()
+    )
+    _prepare_read(session, request, deadline)
+    page_records = session.execute(prefix.add_columns(*keys, prefix_count).order_by(*keys).limit(len(admitted))).all()
+    if len(page_records) != len(admitted) or any(
+        page_record[-1] != len(admitted) or tuple(page_record[-len(keys) - 1 : -1]) != identity
+        for page_record, identity in zip(page_records, admitted)
+    ):
+        raise CandidateRunnerError("frozen build page changed during its read")
+    return page_records
+
+
+def _read_physical_pages(session, request, build_id, query_factory, *, after, bounds):
+    """Coalesce immutable verification reads; keep logical record and live lease limits."""
+    available_bytes = MAX_BATCH_BYTES - bounds.reserve_bytes
+    if available_bytes < 0:
+        raise CandidateRunnerError("build page has no remaining payload budget")
+    carry_bytes = 0
+    while True:
+        with _read_transaction(session, request, build_id) as (_build, deadline):
+            statement, keys, models = query_factory(session)
+            variable_bytes = (
+                _variable_bytes(*models)
+                if bounds.variable_columns is None
+                else sum((func.coalesce(func.octet_length(column), 0) for column in bounds.variable_columns), 0)
+            )
+            metadata_bytes = _physical_key_bytes(keys)
+            fixed_bytes = metadata_bytes + 64 + 16 * (len(statement.selected_columns) + 1)
+            page_bytes = available_bytes - carry_bytes
+            limit = max(
+                1,
+                min(
+                    bounds.row_limit or MAX_BATCH_ROWS,
+                    (MAX_BATCH_ROWS - 1) // 2,
+                    page_bytes // (2 * metadata_bytes + fixed_bytes),
+                ),
+            )
+            page = statement.order_by(None)
+            if after is not None:
+                page = page.where(tuple_(*keys) > tuple(after))
+            _prepare_read(session, request, deadline)
+            metadata = session.execute(
+                page.with_only_columns(*keys, variable_bytes, maintain_column_froms=True).order_by(*keys).limit(limit)
+            ).all()
+            if len(metadata) > limit:
+                raise CandidateRunnerError("build metadata exceeds its physical page")
+            admitted = _physical_keys(metadata, request, page_bytes - 2 * len(metadata) * metadata_bytes, fixed_bytes)
+            if not admitted:
+                return
+            # A consumer may retain the last child document to validate order.
+            # Reserve that actual record, not the potentially much larger policy cap.
+            carry_bytes = metadata[len(admitted) - 1][-1] + fixed_bytes
+            page_records = _read_physical_payload(session, request, deadline, page, keys, admitted)
+            after = admitted[-1]
+            del metadata, admitted
+        for page_record in page_records:
+            _require_budget(session.info["custom_import_build_read_deadline"])
+            yield tuple(page_record[: -len(keys) - 1])
+            _require_budget(session.info["custom_import_build_read_deadline"])
+        del page_records, page_record
+        if bounds.single_page:
+            return
+
+
 def _one_row(session, request, build_id, statement, keys, models):
-    rows = _read_rows(session, request, build_id, statement, keys, models, bounds=_ReadPage(row_limit=1))
+    return _one_query_row(session, request, build_id, lambda _session: (statement, keys, models))
+
+
+def _one_query_row(session, request, build_id, query_factory):
+    """Close a factory-bound keyset stream after its first row, including failures."""
+
+    rows = _read_query_pages(session, request, build_id, query_factory, bounds=_ReadPage(row_limit=1))
     try:
         return next(rows, None)
     finally:
@@ -393,16 +550,17 @@ class _FamilyInput:
     entity_binding_id: int | None
 
 
-def _child_statement(plan, definition, *, canonical=False, collection_slot=None):
-    child = CustomImportChildRevision
-    occurrence = CustomImportBuildOccurrence
+def _child_statement(plan, definition, *, canonical=False, collection_slot=None, models=None):
+    child = CustomImportChildRevision if models is None else models[CustomImportChildRevision]
+    occurrence = CustomImportBuildOccurrence if models is None else models[CustomImportBuildOccurrence]
+    edge = CustomImportFamilyChild if models is None else models[CustomImportFamilyChild]
     if plan.selection_kind == "retained" and not canonical:
         statement = (
             select(child)
-            .join(CustomImportFamilyChild, CustomImportFamilyChild.child_revision_id == child.child_revision_id)
-            .where(CustomImportFamilyChild.family_revision_id == plan.base_family_revision_id)
+            .join(edge, edge.child_revision_id == child.child_revision_id)
+            .where(edge.family_revision_id == plan.base_family_revision_id)
         )
-        keys = (CustomImportFamilyChild.collection_slot, CustomImportFamilyChild.child_revision_id)
+        keys = (edge.collection_slot, edge.child_revision_id)
     else:
         statement = (
             select(child)
@@ -421,7 +579,7 @@ def _child_statement(plan, definition, *, canonical=False, collection_slot=None)
             if stream.duplicate_policy == "collapse_identical"
         )
         if plan.selection_kind == "source" and collapse_slots:
-            later = aliased(CustomImportBuildOccurrence)
+            later = aliased(occurrence)
             statement = statement.where(
                 or_(
                     occurrence.stream_slot.not_in(collapse_slots),
@@ -550,38 +708,6 @@ def _family_input(session, request, registry, build_id, root_id):
     return _FamilyInput(plan, root, root_record, root_values, digest, child_count, None)
 
 
-async def _copy_pack(session, request, registry, build, retained_revision, collection):
-    stream_slot = (
-        registry.root_stream_slot
-        if collection is None
-        else registry.stream_slots[
-            next(
-                stream.stream_id
-                for stream in request.definition.source_streams
-                if stream.child_collection == collection
-            )
-        ]
-    )
-    await _prepare_statement(session)
-    stream = await session.get(CustomImportBuildStream, (build.build_id, stream_slot), with_for_update=True)
-    pack = CustomImportPack(
-        execution_id=request.execution_id,
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        stream_slot=stream_slot,
-        pack_ordinal=stream.next_pack_ordinal,
-        capture_bundle_id=build.capture_bundle_id,
-        record_count=1,
-        pack_sha256=pack_hash(collection or "root", [bytes(retained_revision.payload_sha256)]),
-        producing_fence=request.fence,
-        producing_token_sha256=lease_token_sha256(request.lease_token),
-    )
-    session.add(pack)
-    await _flush_page(session)
-    return pack
-
-
 def _copy_record(request, family_input, retained_revision, pack, collection):
     revision_fields_by_name = dict(
         dataset_id=request.dataset_id,
@@ -623,102 +749,251 @@ def _copy_occurrence(build, plan, retained_revision, revision, pack, collection)
     )
 
 
-async def _copy_revision(session, request, registry, build, family_input, retained_revision, collection):
-    pack = await _copy_pack(session, request, registry, build, retained_revision, collection)
-    revision = _copy_record(request, family_input, retained_revision, pack, collection)
-    session.add(revision)
-    await _flush_page(session)
-    occurrence = _copy_occurrence(build, family_input.plan, retained_revision, revision, pack, collection)
-    session.add(occurrence)
-    return revision, [pack, revision, occurrence]
+def _retained_page_scope(request, registry, current, children):
+    """Require one collection and a strictly increasing retained-child cursor."""
+
+    names_by_slot = {slot: name for name, slot in registry.child_collection_slots.items()}
+    previous = (current.last_child_collection_slot, current.last_input_child_revision_id)
+    if (previous[0] is None) != (previous[1] is None) or current.last_child_key_sha256 is not None:
+        raise CandidateRunnerError("retained child order differs")
+    seen_child_ids = set()
+    collection_slot = None
+    for child in children:
+        position = (child.collection_slot, child.child_revision_id)
+        if (
+            type(child.child_revision_id) is not int
+            or not 1 <= child.child_revision_id < 2**63
+            or child.child_revision_id in seen_child_ids
+            or type(child.collection_slot) is not int
+            or child.collection_slot not in names_by_slot
+            or (previous[0] is not None and position <= previous)
+        ):
+            raise CandidateRunnerError("retained child order differs")
+        previous = position
+        seen_child_ids.add(child.child_revision_id)
+        if collection_slot is not None and child.collection_slot != collection_slot:
+            raise CandidateRunnerError("retained page crosses a collection or stream boundary")
+        collection_slot = child.collection_slot
+    if collection_slot is None:
+        return None, None
+    collection = names_by_slot[collection_slot]
+    stream = next(stream for stream in request.definition.source_streams if stream.child_collection == collection)
+    return collection, registry.stream_slots[stream.stream_id]
 
 
-async def _commit_family(session, build_id, root_id, family_id):
-    await _flush_page(session)
-    return await _call(
-        session,
-        "commit_custom_import_build_family_page",
-        (build_id, root_id, family_id),
-        (
-            "attached_child_count",
-            "complete",
-            "last_child_collection_slot",
-            "last_child_key_sha256",
-            "last_input_child_revision_id",
-        ),
+def _retained_page_models(request, registry, family_input, current, family, children):
+    """Reuse canonical child validation and account for one retained pack."""
+
+    collection, stream_slot = _retained_page_scope(request, registry, current, children)
+    token_hash = lease_token_sha256(request.lease_token)
+    pack = CustomImportPack(stream_slot=stream_slot, producing_token_sha256=token_hash)
+    fields = fields_by_collection(request.definition).get(collection)
+    child_ids, context_child_ids, profile_slots, context_keys, copied_models, payload_hashes = [], [], [], [], [], []
+    for child in children:
+        child_values = payload_values(fields, child.canonical_payload, label="retained child payload")
+        verify_stored_child(request, family_input.record, StoredCandidateChild(collection, child, child_values))
+        if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
+            raise CandidateRunnerError("retained child payload digest differs")
+        payload_hashes.append(bytes(child.payload_sha256))
+        revision = _copy_record(request, family_input, child, pack, collection)
+        occurrence = _copy_occurrence(current, family_input.plan, child, revision, pack, collection)
+        projections = _child_models(
+            request, registry, current.build_id, family, family_input.values, child, child_values, collection
+        )
+        child_ids.append(child.child_revision_id)
+        for context in projections:
+            if isinstance(context, CustomImportBuildCandidateContext):
+                context_child_ids.append(child.child_revision_id)
+                profile_slots.append(context.profile_slot)
+                context_keys.append(context.canonical_context_key)
+        copied_models.extend((revision, occurrence, *projections))
+    if children:
+        pack.pack_sha256 = pack_hash(collection, payload_hashes)
+        copied_models.append(pack)
+    _page_cost(request, copied_models)
+    return child_ids, context_child_ids, profile_slots, context_keys
+
+
+def _retained_array_arguments(request, registry, family_input, current, family, children):
+    """Return the explicitly typed arguments accepted by build_source._call."""
+
+    plan = family_input.plan
+    if (
+        plan.selection_kind != "retained"
+        or current.complete_at is not None
+        or (current.build_id, current.root_record_id, current.family_revision_id)
+        != (plan.build_id, plan.root_record_id, family.family_revision_id)
+        or (family.root_record_id, family.entity_binding_id) != (plan.root_record_id, family_input.entity_binding_id)
+    ):
+        raise CandidateRunnerError("retained page identity differs")
+    if len(children) > min(256, request.page_row_limit):
+        raise CandidateRunnerError("record projection fanout exceeds the admitted row page")
+    child_ids, context_child_ids, profile_slots, context_keys = _retained_page_models(
+        request, registry, family_input, current, family, children
+    )
+    return (
+        ("bigint", plan.build_id),
+        ("bigint", request.execution_id),
+        ("bigint", request.fence),
+        ("bytea", lease_token_sha256(request.lease_token)),
+        ("bigint", plan.root_record_id),
+        ("bigint", family.family_revision_id),
+        ("bigint", current.attached_child_count),
+        ("smallint", current.last_child_collection_slot),
+        ("bigint", current.last_input_child_revision_id),
+        ("bigint[]", tuple(child_ids)),
+        ("bigint[]", tuple(context_child_ids)),
+        ("smallint[]", tuple(profile_slots)),
+        ("text[]", tuple(context_keys)),
     )
 
 
-async def _family_binding(session, request, family_input):
-    if family_input.entity_binding_id is not None:
-        return family_input.entity_binding_id, []
-    entity_value = family_input.values[request.definition.entity_field]
-    await _prepare_statement(session)
-    binding = (
-        await session.execute(
-            select(CustomImportEntityBinding).where(
-                CustomImportEntityBinding.dataset_id == request.dataset_id,
-                CustomImportEntityBinding.adapter_id == "npi",
-                CustomImportEntityBinding.canonical_value == entity_value,
-            )
-        )
-    ).scalar_one_or_none()
-    if binding is None:
-        binding = CustomImportEntityBinding(
-            dataset_id=request.dataset_id,
-            adapter_id="npi",
-            canonical_value=entity_value,
-            value_sha256=entity_value_digest(entity_value),
-        )
-        session.add(binding)
-        await _flush_page(session)
-        return binding.entity_binding_id, [binding]
-    if bytes(binding.value_sha256) != entity_value_digest(entity_value):
-        raise CandidateRunnerError("build entity binding digest differs")
-    return binding.entity_binding_id, []
+def _root_identity_models(request, family_input):
+    """Charge exact immutable dictionary bytes without another database read."""
+
+    value = family_input.values[request.definition.entity_field]
+    return family_input.record, CustomImportEntityBinding(
+        dataset_id=request.dataset_id,
+        adapter_id="npi",
+        canonical_value=value,
+        value_sha256=entity_value_digest(value),
+    )
+
+
+def _retained_root_arguments(request, registry, family_input):
+    """Preflight root copy cost and regenerate only current-definition contexts."""
+    plan = family_input.plan
+    root = family_input.root
+    token_hash = lease_token_sha256(request.lease_token)
+    family = CustomImportFamilyRevision(
+        family_revision_id=plan.base_family_revision_id,
+        dataset_id=request.dataset_id,
+        schema_revision_id=request.schema_revision_id,
+        root_record_id=plan.root_record_id,
+        root_revision_id=root.root_revision_id,
+        entity_binding_id=family_input.entity_binding_id,
+        family_sha256=family_input.family_sha256,
+        child_count=family_input.child_count,
+        producing_execution_id=request.execution_id,
+        producing_fence=request.fence,
+        producing_token_sha256=token_hash,
+    )
+    pack = CustomImportPack(
+        stream_slot=registry.root_stream_slot,
+        producing_token_sha256=token_hash,
+        pack_sha256=pack_hash("root", [bytes(root.payload_sha256)]),
+    )
+    revision = _copy_record(request, family_input, root, pack, None)
+    occurrence = _copy_occurrence(plan, plan, root, revision, pack, None)
+    projections = _root_models(request, registry, plan.build_id, family, family_input.values)
+    _page_cost(
+        request, [pack, revision, occurrence, family, *_root_identity_models(request, family_input), *projections]
+    )
+    contexts = [projection for projection in projections if isinstance(projection, CustomImportBuildCandidateContext)]
+    return (
+        ("bigint", plan.build_id),
+        ("bigint", request.execution_id),
+        ("bigint", request.fence),
+        ("bytea", token_hash),
+        ("bigint", plan.root_record_id),
+        ("bigint", plan.base_family_revision_id),
+        ("bigint", root.root_revision_id),
+        ("bigint", family_input.entity_binding_id),
+        ("bytea", family_input.family_sha256),
+        ("bigint", family_input.child_count),
+        ("smallint[]", tuple(context.profile_slot for context in contexts)),
+        ("text[]", tuple(context.canonical_context_key for context in contexts)),
+    )
+
+
+def _source_root_models(request, registry, family_input):
+    """Validate canonical SOURCE values before deriving current projections."""
+
+    plan, root = family_input.plan, family_input.root
+    if plan.selection_kind != "source" or family_input.entity_binding_id is not None:
+        raise CandidateRunnerError("source root selection differs")
+    root_values = payload_values(request.definition.root_fields, root.canonical_payload, label="build root payload")
+    if (
+        root_values != family_input.values
+        or record_payload(request.definition.root_fields, root_values) != root.canonical_payload
+    ):
+        raise CandidateRunnerError("build root payload is not canonical")
+    if digest_text("root-payload", root.canonical_payload) != bytes(root.payload_sha256):
+        raise CandidateRunnerError("build root payload is not canonical")
+    token_hash = lease_token_sha256(request.lease_token)
+    # Provisional positive IDs validate the existing context contract. SQL derives
+    # permanent entity/family IDs; neither provisional ID enters context bytes.
+    family = CustomImportFamilyRevision(
+        family_revision_id=1,
+        entity_binding_id=1,
+        dataset_id=request.dataset_id,
+        schema_revision_id=request.schema_revision_id,
+        root_record_id=plan.root_record_id,
+        root_revision_id=root.root_revision_id,
+        family_sha256=family_input.family_sha256,
+        child_count=family_input.child_count,
+        producing_execution_id=request.execution_id,
+        producing_fence=request.fence,
+        producing_token_sha256=token_hash,
+    )
+    projections = _root_models(request, registry, plan.build_id, family, root_values)
+    root_record, entity = _root_identity_models(request, family_input)
+    # Reserve a possible canonical interner INSERT as well as both snapshot copies.
+    _page_cost(request, [family, root_record, entity, entity, *projections], reserved_rows=2)
+    return projections, root_values[request.definition.entity_field]
+
+
+def _source_root_arguments(request, registry, family_input):
+    """Encode native projection arrays for one protected SOURCE root call."""
+
+    plan, root = family_input.plan, family_input.root
+    projections, entity_value = _source_root_models(request, registry, family_input)
+    scalars = [
+        projection for projection in projections if not isinstance(projection, CustomImportBuildCandidateContext)
+    ]
+    contexts = [projection for projection in projections if isinstance(projection, CustomImportBuildCandidateContext)]
+    columns = (
+        ("smallint[]", "field_slot"),
+        ("text[]", "field_type"),
+        ("text[]", "value_state"),
+        ("text[]", "string_value"),
+        ("bigint[]", "integer_value"),
+        ("numeric[]", "decimal_value"),
+        ("boolean[]", "boolean_value"),
+        ("date[]", "date_value"),
+        ("timestamptz[]", "timestamp_value"),
+    )
+    return (
+        ("bigint", plan.build_id),
+        ("bigint", request.execution_id),
+        ("bigint", request.fence),
+        ("bytea", lease_token_sha256(request.lease_token)),
+        ("bigint", plan.root_record_id),
+        ("bigint", plan.source_root_occurrence_id),
+        ("bigint", root.root_revision_id),
+        ("bytea", bytes(root.payload_sha256)),
+        ("bytea", family_input.family_sha256),
+        ("bigint", family_input.child_count),
+        ("text", entity_value),
+        ("bytea", entity_value_digest(entity_value)),
+        *((kind, tuple(getattr(scalar, column) for scalar in scalars)) for kind, column in columns),
+        ("smallint[]", tuple(context.profile_slot for context in contexts)),
+        ("text[]", tuple(context.canonical_context_key for context in contexts)),
+    )
 
 
 async def _start_family(session_factory, request, registry, family_input):
     plan = family_input.plan
-    async with _page_session(session_factory, request, plan.build_id) as (session, build):
-        await _prepare_statement(session)
-        current = await session.get(CustomImportBuildFamily, (plan.build_id, plan.root_record_id), with_for_update=True)
-        if current.family_revision_id is not None:
-            await _prepare_statement(session)
-            family = await session.get(CustomImportFamilyRevision, current.family_revision_id)
-            if (
-                family.child_count != family_input.child_count
-                or bytes(family.family_sha256) != family_input.family_sha256
-            ):
-                raise CandidateRunnerError("family retry differs from its selected input")
-            return
-        copied_models = []
-        root = family_input.root
+    async with _page_session(session_factory, request, plan.build_id) as (session, _build):
         if plan.selection_kind == "retained":
-            root, copied_models = await _copy_revision(session, request, registry, build, family_input, root, None)
-        entity_id, binding_models = await _family_binding(session, request, family_input)
-        family = CustomImportFamilyRevision(
-            dataset_id=request.dataset_id,
-            schema_revision_id=request.schema_revision_id,
-            root_record_id=plan.root_record_id,
-            root_revision_id=root.root_revision_id,
-            entity_binding_id=entity_id,
-            family_sha256=family_input.family_sha256,
-            child_count=family_input.child_count,
-            producing_execution_id=request.execution_id,
-            producing_fence=request.fence,
-            producing_token_sha256=lease_token_sha256(request.lease_token),
-        )
-        session.add(family)
-        await _flush_page(session)
-        projections = _root_models(request, registry, plan.build_id, family, family_input.values)
-        _page_cost(
-            request,
-            [*copied_models, *binding_models, family, *projections],
-            reserved_rows=2 if plan.selection_kind == "source" else 0,
-        )
-        session.add_all(projections)
-        await _commit_family(session, plan.build_id, plan.root_record_id, family.family_revision_id)
+            arguments = _retained_root_arguments(request, registry, family_input)
+            name = "retained_root_finalize"
+        elif plan.selection_kind == "source":
+            arguments = _source_root_arguments(request, registry, family_input)
+            name = "source_root_start"
+        else:
+            raise CandidateRunnerError("family selection differs")
+        (await _source_call(session, name, arguments)).scalar_one()
 
 
 def _child_ranges(registry, current):
@@ -743,8 +1018,6 @@ def _child_ranges(registry, current):
 def _child_page_limit(request, registry, plan):
     """Reserve revision, occurrence and membership rows before scalar/context fanout."""
 
-    if plan.selection_kind == "retained":
-        return 1
     scopes = material._profile_scopes(request.definition, registry.child_collection_slots)
     maximum_work = max(
         (
@@ -755,7 +1028,8 @@ def _child_page_limit(request, registry, plan):
         ),
         default=1,
     )
-    return max(1, request.page_row_limit // maximum_work)
+    reserved_pack = int(plan.selection_kind == "retained")
+    return max(1, (request.page_row_limit - reserved_pack) // maximum_work)
 
 
 def _next_children(session, request, registry, family_input, row_limit):
@@ -790,7 +1064,15 @@ def _next_children(session, request, registry, family_input, row_limit):
             ),
         )
         try:
-            child_revisions = [child for (child,) in children]
+            child_revisions = []
+            for (child,) in children:
+                if (
+                    current.selection_kind == "retained"
+                    and child_revisions
+                    and child.collection_slot != child_revisions[0].collection_slot
+                ):
+                    break
+                child_revisions.append(child)
             if child_revisions:
                 return current, child_revisions
         finally:
@@ -806,13 +1088,9 @@ async def _child_page_models(session, request, registry, build, family_input, ch
     verify_stored_child(request, family_input.record, StoredCandidateChild(collection, child, child_values))
     if digest_text("child-payload", child.canonical_payload) != bytes(child.payload_sha256):
         raise CandidateRunnerError("build child payload digest differs")
-    projections = []
-    if family_input.plan.selection_kind == "retained":
-        child, projections = await _copy_revision(session, request, registry, build, family_input, child, collection)
-    projections.extend(
-        _child_models(request, registry, build.build_id, family, family_input.values, child, child_values, collection)
+    return _child_models(
+        request, registry, build.build_id, family, family_input.values, child, child_values, collection
     )
-    return projections
 
 
 async def _append_child_batch(session_factory, request, registry, family_input, current, children):
@@ -824,16 +1102,25 @@ async def _append_child_batch(session_factory, request, registry, family_input, 
         )
         if progress.attached_child_count != current.attached_child_count or progress.complete_at is not None:
             return
+        if plan.selection_kind == "retained" and (
+            progress.family_revision_id,
+            progress.last_child_collection_slot,
+            progress.last_input_child_revision_id,
+        ) != (current.family_revision_id, current.last_child_collection_slot, current.last_input_child_revision_id):
+            return
         await _prepare_statement(session)
         family = await session.get(CustomImportFamilyRevision, progress.family_revision_id)
+        if plan.selection_kind == "retained":
+            arguments = _retained_array_arguments(request, registry, family_input, progress, family, children)
+            receipt = (await _source_call(session, "retained_array_finalize", arguments)).one()
+            if not children and not receipt.complete:
+                raise CandidateRunnerError("family input ended before SQL completion")
+            return
         projections = []
         for child in children:
             projections.extend(await _child_page_models(session, request, registry, build, family_input, child, family))
         _page_cost(request, projections, reserved_rows=2 * len(children) if plan.selection_kind == "source" else 0)
-        session.add_all(model for model in projections if not isinstance(model, CustomImportBuildCandidateContext))
-        await _flush_page(session)
-        session.add_all(model for model in projections if isinstance(model, CustomImportBuildCandidateContext))
-        progress_receipt = await _commit_family(session, plan.build_id, plan.root_record_id, family.family_revision_id)
+        progress_receipt = await append_source_child_page(session, plan, progress, family, children, projections)
         if not children and not progress_receipt.complete:
             raise CandidateRunnerError("family input ended before SQL completion")
 
@@ -874,23 +1161,22 @@ async def _append_children(session_factory, request, registry, family_input):
         await _heartbeat(session_factory, request)
 
 
-def _candidate_digest(session, request, build_id):
+def _candidate_digest(session, request, build_id, *, bounds=_ReadPage()):
     family_counter = count()
 
+    def pending_families(candidate_models, _base_models):
+        """Scan candidate plan hashes under the current registered binding."""
+        plan = candidate_models[CustomImportBuildFamily]
+        statement = select(plan).where(plan.build_id == build_id)
+        return statement, (plan.root_key_sha256, plan.root_record_id), (plan,)
+
     def _hashes():
-        statement = select(CustomImportBuildFamily).where(CustomImportBuildFamily.build_id == build_id)
-        for (family,) in _read_rows(
-            session,
-            request,
-            build_id,
-            statement,
-            (CustomImportBuildFamily.root_key_sha256, CustomImportBuildFamily.root_record_id),
-            (CustomImportBuildFamily,),
-        ):
+        for (family,) in _read_snapshot_rows(session, request, build_id, pending_families, bounds=bounds):
             if family.complete_at is None:
                 raise CandidateRunnerError("candidate fingerprint requires completed families")
             next(family_counter)
             yield bytes(family.root_key_sha256)
+            del family
 
     digest = candidate_hash_ordered(
         execution_id=request.execution_id,
@@ -961,24 +1247,18 @@ def _source_digest(session, request, build_id, capture_bundle_id):
     return digest.digest()
 
 
-def _next_family_input(session, request, registry, build_id, after_root_id):
-    plan = CustomImportBuildFamily
-    plans = _read_rows(
-        session,
-        request,
-        build_id,
-        select(plan.root_record_id, plan.complete_at).where(plan.build_id == build_id),
-        (plan.root_record_id,),
-        (),
-        after=(after_root_id,),
-    )
-    try:
-        for root_id, completed_at in plans:
-            if completed_at is None:
-                return _family_input(session, request, registry, build_id, root_id)
-    finally:
-        plans.close()
-    return None
+def _next_family_inputs(session, request, registry, build_id, after_root_id):
+    # Keep shared read primitives in this module; import the preparation leaf
+    # only after module initialization to avoid an import cycle.
+    from process.custom_import.build_graph_prepare_page import prepare_family_page
+
+    return prepare_family_page(session, request, registry, build_id, after_root_id, physical=True)
+
+
+async def _consume_family_page(session_factory, request, registry, family_inputs):
+    from process.custom_import.build_graph_sets import consume_family_page
+
+    await consume_family_page(session_factory, request, registry, family_inputs)
 
 
 async def _build_graph(session_factory, request: SourceBuildRequest, build_id: int) -> int | None:
@@ -991,6 +1271,7 @@ async def _build_graph(session_factory, request: SourceBuildRequest, build_id: i
         return build.generation_id
     if build.phase != "graph":
         raise CandidateRunnerError("graph construction requires completed source admission")
+    await _prepare_snapshot_indexes(session_factory, request, build_id, "graph")
     async with _page_session(session_factory, request, build_id) as (session, _build):
         registry = await load_registry(session, request)
     while build.plan_complete_at is None:
@@ -1006,14 +1287,13 @@ async def _build_graph(session_factory, request: SourceBuildRequest, build_id: i
     after_root_id = 0
     while True:
         async with _session(session_factory) as session:
-            family_input = await session.run_sync(
-                lambda sync: _next_family_input(sync, request, registry, build_id, after_root_id)
+            family_inputs = await session.run_sync(
+                lambda sync: _next_family_inputs(sync, request, registry, build_id, after_root_id)
             )
-        if family_input is None:
+        if not family_inputs:
             break
-        await _start_family(session_factory, request, registry, family_input)
-        await _append_children(session_factory, request, registry, family_input)
-        after_root_id = family_input.plan.root_record_id
+        await _consume_family_page(session_factory, request, registry, family_inputs)
+        after_root_id = family_inputs[-1].plan.root_record_id
         await _heartbeat(session_factory, request)
     return await _open_output(session_factory, request, build_id, build.capture_bundle_id)
 
