@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from dataclasses import fields
 from datetime import date
 import json
@@ -261,6 +263,11 @@ async def _no_op(*_arguments, **_keywords) -> None:
     return None
 
 
+@asynccontextmanager
+async def _candidate_scope(*_arguments, **_keywords):
+    yield {}
+
+
 @pytest.mark.asyncio
 async def test_materialize_publish_pipeline_proves_counts_and_readiness(
     monkeypatch,
@@ -273,6 +280,7 @@ async def test_materialize_publish_pipeline_proves_counts_and_readiness(
     ready = readiness()
     monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
     monkeypatch.setattr(store, "_insert_headers", _no_op)
+    monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
     monkeypatch.setattr(
         store, "build_provider_directory_dataset_serving_relations", _no_op
     )
@@ -315,6 +323,7 @@ async def test_materialize_publish_pipeline_rejects_unproved_outputs(
     counts_by_resource_type = resource_counts()
     monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
     monkeypatch.setattr(store, "_insert_headers", _no_op)
+    monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
     monkeypatch.setattr(
         store, "build_provider_directory_dataset_serving_relations", _no_op
     )

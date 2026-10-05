@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from typing import Any, Awaitable, Callable
 
+import asyncpg
 import pytest
 
 from db.connection import Database
@@ -118,16 +119,10 @@ def _rotated_official_metadata_json() -> str:
 
 async def _replace_official_parent(context) -> None:
     await context.connection.execute(
-        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
-        "SET status = 'superseded', is_current = false, "
-        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
-        OFFICIAL_DATASET_ID,
-    )
-    await context.connection.execute(
         f"INSERT INTO {context.schema}.provider_directory_endpoint_dataset "
         "(dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash, "
         "status, is_current, resource_count, publication_metadata_json) "
-        "VALUES ($1, $2, $3, $4, 'published', true, 4, $5::jsonb)",
+        "VALUES ($1, $2, $3, $4, 'building', false, 4, $5::jsonb)",
         _ROTATED_OFFICIAL_DATASET_ID,
         OFFICIAL_ENDPOINT_ID,
         _ROTATED_OFFICIAL_ROOT_RUN_ID,
@@ -144,6 +139,28 @@ async def _replace_official_parent(context) -> None:
         _ROTATED_OFFICIAL_DATASET_ID,
         OFFICIAL_DATASET_ID,
     )
+    await context.connection.execute(
+        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
+        "SET status = 'superseded', is_current = false, "
+        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
+        OFFICIAL_DATASET_ID,
+    )
+    await context.connection.execute(
+        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
+        "SET status = 'published', is_current = true WHERE dataset_id = $1",
+        _ROTATED_OFFICIAL_DATASET_ID,
+    )
+
+
+async def _assert_official_snapshots_immutable(context) -> None:
+    for dataset_id in (OFFICIAL_DATASET_ID, _ROTATED_OFFICIAL_DATASET_ID):
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+            async with context.connection.transaction():
+                await context.connection.execute(
+                    f"UPDATE {context.schema}.provider_directory_dataset_resource "
+                    "SET payload_hash = payload_hash WHERE dataset_id = $1",
+                    dataset_id,
+                )
 
 
 async def _insert_rotated_cohort(context, cohort) -> None:
@@ -187,6 +204,7 @@ async def rotate_official_dataset(context):
     async with context.connection.transaction():
         await _replace_official_parent(context)
         await _insert_rotated_cohort(context, cohort)
+    await _assert_official_snapshots_immutable(context)
     return cohort
 
 

@@ -7,6 +7,7 @@ from datetime import date
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_dataset_candidate import prepare_dataset_candidate
 from process.provider_directory_dataset_scoped_publication import (
     ExactCurrentDataset,
     exact_uhc_dataset_pair,
@@ -455,7 +456,8 @@ async def _publish_admitted_dataset(
         previous_dataset_id,
         retry_exhausted_count,
     )
-    await _materialize_candidate(database, identity, admission, batch_size)
+    async with prepare_dataset_candidate(database, identity.dataset_id, kind="practitioner"):
+        await _materialize_candidate(database, identity, admission, batch_size)
     await _validate_candidate(database, identity, admission, batch_size)
     await _supersede_previous(database, previous_dataset)
     await _publish_candidate(database, identity.dataset_id)

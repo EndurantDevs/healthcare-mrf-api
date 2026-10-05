@@ -8,12 +8,7 @@ import secrets
 from typing import Any
 
 from db.connection import db
-from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_IDENTITY_CONTRACT_ID,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_QUERY_PAGE_SIZE,
-)
 from process.provider_directory_rooted_graph_persistence_sql import (
-    initial_root_work_sql,
     root_closure_sql,
 )
 from process.provider_directory_rooted_graph_query import (
@@ -29,6 +24,7 @@ from process.provider_directory_rooted_graph_result_contract import (
     ProviderDirectoryRootedGraphAcquisitionSummary,
     ProviderDirectoryRootedGraphQueryResult,
 )
+from process.provider_directory_rooted_graph_bulk import copy_initial_root_work
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
     ROOTED_GRAPH_QUERY_PATTERN,
@@ -42,11 +38,10 @@ from process.provider_directory_rooted_graph_store_contract import (
 )
 from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
-    EDGE_TABLE,
-    RESOURCE_TABLE,
     WORK_TABLE,
     assert_identity_row,
     identity_fields,
+    function_ref,
     insert_work_spec,
     row_fields,
     set_store_action,
@@ -101,14 +96,7 @@ async def _insert_initial_root_work(
     database: Any,
     identity: ProviderDirectoryRootedGraphAcquisitionIdentity,
 ) -> int:
-    return await database.status(
-        initial_root_work_sql(),
-        acquisition_id=identity.acquisition_id,
-        scope_id=identity.scope_id,
-        root_dataset_id=identity.root_dataset_id,
-        identity_contract=PROVIDER_DIRECTORY_ROOTED_GRAPH_IDENTITY_CONTRACT_ID,
-        page_size=str(PROVIDER_DIRECTORY_ROOTED_GRAPH_QUERY_PAGE_SIZE),
-    )
+    return await copy_initial_root_work(database, identity.acquisition_id)
 
 
 async def _initial_work_census(
@@ -126,8 +114,9 @@ async def _initial_work_census(
                    count(*) FILTER (
                        WHERE kind = 'full_insurance_plan_census'
                    )::bigint AS plan_count
-              FROM {table_ref(WORK_TABLE)}
-             WHERE acquisition_id = :acquisition_id;
+              FROM {table_ref('pdrgw_' + identity.acquisition_id[6:])}
+             WHERE acquisition_id = :acquisition_id
+               AND kind = 'exact_reference_search' AND resource_type = 'PractitionerRole';
             """,
             acquisition_id=identity.acquisition_id,
         )
@@ -160,6 +149,11 @@ async def initialize_provider_directory_rooted_graph_acquisition(
         )
         if header["status"] == "sealed":
             return created_count
+        await database.scalar(
+            f"SELECT {function_ref('prepare_provider_directory_rooted_graph_storage')}("
+            ":acquisition_id);",
+            acquisition_id=identity.acquisition_id,
+        )
         await set_store_action(database, "initialize", identity.acquisition_id)
         await _insert_initial_root_work(database, identity)
         census = await _initial_work_census(database, identity)
@@ -169,6 +163,10 @@ async def initialize_provider_directory_rooted_graph_acquisition(
             "plan_count": 0,
         }:
             raise ProviderDirectoryRootedGraphStoreError("state")
+        await database.scalar(
+            f"SELECT {function_ref('attach_provider_directory_rooted_graph_storage')}(:acquisition_id)",
+            acquisition_id=identity.acquisition_id,
+        )
         initialized_count = created_count
     return initialized_count
 
@@ -260,10 +258,6 @@ async def _root_closure_fields(
             "WHERE acquisition_id = :acquisition_id FOR SHARE;",
             acquisition_id=identity.acquisition_id,
         ),
-    )
-    await database.status(
-        f"LOCK TABLE {table_ref(WORK_TABLE)}, {table_ref(RESOURCE_TABLE)}, "
-        f"{table_ref(EDGE_TABLE)} IN SHARE MODE;"
     )
     closure_fields = row_fields(
         await database.first(

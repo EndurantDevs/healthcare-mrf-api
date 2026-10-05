@@ -350,48 +350,6 @@ def test_compiler_copy_reader_fails_closed_on_structural_corruption(
         tuple(compiler._iter_pg_binary_rows(path, expected_field_count=1))
 
 
-@pytest.mark.parametrize(
-    ("row", "message"),
-    (
-        ((None, b"matched_ein", struct.pack(">i", 0), b"\x01"), "NULL fields"),
-        (
-            (bytes(16), b"\xff", struct.pack(">i", 0), b"\x01"),
-            "state is invalid",
-        ),
-        (
-            (bytes(15), b"matched_ein", struct.pack(">i", 0), b"\x01"),
-            "not canonical",
-        ),
-        (
-            (bytes(16), b"matched_ein", struct.pack(">i", 0), b"\x80"),
-            "out-of-range bits",
-        ),
-        (
-            (bytes(16), b"matched_ein", None, b"\x01"),
-            "matched tax identity key is invalid",
-        ),
-        (
-            (bytes(16), b"missing", struct.pack(">i", 0), b"\x01"),
-            "unavailable tax identity has a key",
-        ),
-    ),
-)
-def test_compiler_group_tax_rows_reject_noncanonical_state_bindings(
-    row: tuple[bytes | None, ...],
-    message: str,
-) -> None:
-    with pytest.raises(RuntimeError, match=message):
-        compiler._validated_tax_group_copy_fields(
-            row,
-            previous_group=None,
-            summary={
-                "source_shard_count": 1,
-                "source_bitmap_bytes": 1,
-                "tax_identity_count": 1,
-            },
-        )
-
-
 def _publisher_compilation() -> SimpleNamespace:
     tax_summary = _valid_tax_summary()
     return SimpleNamespace(
@@ -445,28 +403,23 @@ def test_publisher_tax_contract_requires_summary_and_both_artifacts() -> None:
         publisher._v4_tax_artifact_byte_count(compilation)
 
 
-@pytest.mark.parametrize(
-    ("row", "message"),
-    (
-        ((bytes(15), "matched_ein", 0, b"\x01", True), "tax identity changed"),
-        ((bytes(16), "invalid", None, b"\x01", True), "tax identity changed"),
-        ((bytes(16), "matched_ein", None, b"\x01", True), "tax identity changed"),
-        ((bytes(16), "missing", 0, b"\x01", True), "tax identity changed"),
-        ((bytes(16), "missing", None, b"\x01", False), "tax identity changed"),
-        ((bytes(16), "missing", None, b"\x80", True), "source bitmap changed"),
-    ),
-)
-def test_publisher_group_tax_rows_reject_invalid_identity_and_bitmap(
-    row: tuple[object, ...],
-    message: str,
-) -> None:
+@pytest.mark.asyncio
+async def test_publisher_group_tax_set_rejects_invalid_summary() -> None:
+    """Reject relational or bitmap failure reported by the complete set check."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
     contract = publisher._validated_v4_tax_identity_contract(_publisher_compilation())
-    with pytest.raises(RuntimeError, match=message):
-        publisher._validated_v4_tax_group_row(
-            row,
-            previous_group_id=b"",
-            contract=contract,
-        )
+    token_count = contract.tax_identity_count
+    token_result = SimpleNamespace(one=lambda: (token_count, token_count, 0, token_count - 1, True))
+    group_result = SimpleNamespace(one=lambda: (contract.provider_group_count,
+        contract.provider_group_count, contract.matched_ein_count, contract.missing_count,
+        contract.malformed_count, contract.unsupported_type_count, token_count, False))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, token_result, group_result]))
+    with pytest.raises(RuntimeError, match="provider-group tax identity changed"):
+        await publisher._validate_v4_tax_identity_stages(session, schema='"mrf"',
+            group_dictionary_stage="groups", tax_identity_stage="tokens", group_tax_identity_stage="sidecars",
+            contract=contract, progress_callback=None)
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from api import ptg2_v4_intersection as intersection
 from api import ptg2_serving
 from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api.ptg2_types import PTG2ServingTables
+from process.ptg_parts.ptg2_snapshot_candidates import CANDIDATE_TABLES
 
 
 def test_v4_locator_and_member_pages_decode_fixed_width_contract() -> None:
@@ -2282,3 +2283,62 @@ async def test_v4_explicit_npi_defers_requested_code_to_serving_read(
     assert graph_calls[0]["max_members"] == 64
     assert events == ["graph"]
     rate_scope.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "loader, parameters, table_name",
+    [
+        (graph._query_v4_heavy_owner_rows, {"relation": "npi_groups_exact", "owner_keys": [7]}, "ptg2_v4_heavy_owner"),
+        (graph._query_v4_map_packs, {"object_kind": "member", "missing_pairs": [(0, 0)]}, "ptg2_v4_snapshot_map_pack"),
+        (graph.v4_npi_keys_for_values, {"npis": [1000000001]}, "ptg2_v4_npi_scope"),
+        (graph.v4_npi_values_for_keys, {"npi_keys": [0]}, "ptg2_v4_npi_scope"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_builder_reads_use_only_the_bound_candidate(loader, parameters, table_name):
+    """A scoped build reads its frozen heap; an ordinary request uses canonical storage."""
+    session = SimpleNamespace(execute=AsyncMock(return_value=[]), info={})
+    session.info["ptg_snapshot_candidate_reads"] = {'"fixture"': {table_name: "detached_candidate"}}
+    await loader(session, schema_name="fixture", snapshot_key=17, **parameters)
+    assert 'FROM "fixture"."detached_candidate"' in str(session.execute.call_args.args[0])
+    session.info.clear()
+    await loader(session, schema_name="fixture", snapshot_key=17, **parameters)
+    assert f'FROM "fixture"."{table_name}"' in str(session.execute.call_args.args[0])
+
+
+@pytest.mark.parametrize("candidate_table", sorted(CANDIDATE_TABLES))
+@pytest.mark.parametrize("has_candidate_owner", (True, False))
+@pytest.mark.asyncio
+async def test_builder_cache_isolated_from_retry_and_serving(monkeypatch, candidate_table, has_candidate_owner):
+    """Failed candidate metadata cannot satisfy a retry or canonical serving lookup."""
+    monkeypatch.setattr(graph, "_HEAVY_OWNER_CACHE", OrderedDict())
+    monkeypatch.setattr(graph, "_HEAVY_OWNER_NEGATIVE_CACHE", OrderedDict())
+    session = SimpleNamespace(execute=AsyncMock(), info={})
+    for candidate_name, member_base in (("first_candidate", 100), ("retry_candidate", 200), (None, 300)):
+        session.info.clear()
+        if candidate_name:
+            session.info["ptg_snapshot_candidate_reads"] = {
+                '"fixture"': {candidate_table: candidate_name}
+            }
+        has_owner = has_candidate_owner or candidate_name is None
+        session.execute.return_value = (_heavy_owner_row(7, member_base=member_base),) if has_owner else ()
+        loaded = await graph.load_v4_heavy_owners(
+            session, schema_name="fixture", snapshot_key=17, relation="npi_groups_exact", owner_keys=(7,),
+        )
+        assert {key: owner.member_base for key, owner in loaded.items()} == ({7: member_base} if has_owner else {})
+    assert session.execute.await_count == 3
+
+
+@pytest.mark.parametrize("schema_name", ("fixture", 'fixture", relation=other'))
+def test_builder_cache_scope_includes_all_relations_in_stable_order(schema_name):
+    """Equal bindings reuse a scope; changing any relation isolates the entire family."""
+    relations_by_table = {"ptg2_v4_snapshot_map_pack": "same_map", "ptg2_v4_heavy_owner": "first_heavy"}
+    quoted_schema = graph._quote_ident(schema_name)
+    bindings_by_schema = {quoted_schema: relations_by_table}
+    session = SimpleNamespace(info={"ptg_snapshot_candidate_reads": bindings_by_schema})
+    first_scope = graph._graph_cache_scope(session, schema_name)
+    bindings_by_schema[quoted_schema] = dict(reversed(list(relations_by_table.items())))
+    assert graph._graph_cache_scope(session, schema_name) == first_scope
+    bindings_by_schema[quoted_schema]["ptg2_v4_heavy_owner"] = "retry_heavy"
+    assert graph._graph_cache_scope(session, schema_name) != first_scope
+    assert graph._graph_cache_scope(session, "unbound") == "unbound"

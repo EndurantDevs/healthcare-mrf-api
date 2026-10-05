@@ -83,6 +83,7 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
 )
+from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1735,6 +1736,7 @@ async def _install_selective_v4_map_schema(
         )
         """
     )
+    await _install_selective_map_candidates(schema_name)
     await db.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_layout
@@ -1744,6 +1746,17 @@ async def _install_selective_v4_map_schema(
         snapshot_key=int(snapshot_key),
         build_token=build_token,
     )
+
+
+async def _install_selective_map_candidates(schema_name):
+    """Convert the synthetic map relation through the actual candidate migration."""
+    from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+
+    schema = '"' + schema_name + '"'
+    await db.execute_ddl(f"CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_pack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN COALESCE(NEW,OLD); END $$")
+    await db.execute_ddl(f"CREATE TRIGGER ptg2_v4_snapshot_map_pack_guard BEFORE INSERT OR UPDATE OR DELETE ON {schema}.ptg2_v4_snapshot_map_pack FOR EACH ROW EXECUTE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_pack()")
+    async with db.transaction() as session:
+        await apply_candidate_migration(await session.connection(),schema_name,("ptg2_v4_snapshot_map_pack",))
 
 
 async def _stage_selective_v4_reuse(
@@ -1948,6 +1961,7 @@ async def _publish_v4_fixture_in_session(session, request: _V4FixtureRequest):
         pin_token="block_stage",
     )
     assert deleted_pin_count == cas_publication.unique_block_count
+    await attach_snapshot_candidates(session, request.schema_name, request.snapshot_key, request.build_token)
     return cas_publication, map_summary
 
 
@@ -2012,15 +2026,15 @@ def _observe_v4_map_pack_publication(monkeypatch) -> list[bytes]:
     """Record map blocks written before a later transactional failure."""
 
     published_map_blocks: list[bytes] = []
-    original_publish = ptg2_v4_snapshot_maps._publish_v4_map_pack
+    original_publish = ptg2_v4_snapshot_maps._copy_v4_map_batch
 
     async def publish_and_record(session, **kwargs):
         await original_publish(session, **kwargs)
-        published_map_blocks.append(bytes(kwargs["pack"].map_block.block_hash))
+        published_map_blocks.extend(bytes(pack.map_block.block_hash) for pack in kwargs["packs"])
 
     monkeypatch.setattr(
         ptg2_v4_snapshot_maps,
-        "_publish_v4_map_pack",
+        "_copy_v4_map_batch",
         publish_and_record,
     )
     return published_map_blocks
@@ -2033,7 +2047,7 @@ def _observe_candidate_cancellation_before_map_validation(
     """Prove map validation runs after CAS candidate cancellation."""
 
     cancellation_observed = asyncio.Event()
-    original_verify = ptg2_v4_snapshot_maps._verify_target_blocks
+    original_verify = ptg2_v4_snapshot_maps._copy_v4_map_batch
 
     async def verify_after_cancellation(session, **kwargs):
         candidate_count = await session.scalar(
@@ -2048,7 +2062,7 @@ def _observe_candidate_cancellation_before_map_validation(
 
     monkeypatch.setattr(
         ptg2_v4_snapshot_maps,
-        "_verify_target_blocks",
+        "_copy_v4_map_batch",
         verify_after_cancellation,
     )
     return cancellation_observed
@@ -2730,10 +2744,7 @@ async def test_real_postgres_v4_manifest_auth_failure_rolls_back_atomic_publish(
                 manifest_proof=manifest_proof,
             )
 
-        expected_published_packs = (
-            1 if manifest_case == "same_row_count_drift" else 0
-        )
-        assert len(published_map_blocks) == expected_published_packs
+        assert published_map_blocks == []
         await _assert_v4_failed_map_pins(
             quoted_schema,
             new_block_hash=new_hash,

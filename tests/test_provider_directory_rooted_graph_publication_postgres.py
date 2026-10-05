@@ -73,8 +73,25 @@ from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres im
 )
 
 
+async def _install_candidate_migrations(engine, set_validation, dataset_candidates):
+    """Install current storage APIs after the original schema contract."""
+    if set_validation:
+        bulk = load_migration(
+            MIGRATION_PATH.with_name("20261005100000_rooted_graph_set_validation.py"),
+            "rooted_graph_set_validation",
+        )
+        await run_migration(engine, bulk, "upgrade")
+    if dataset_candidates:
+        publication_candidates = load_migration(
+            MIGRATION_PATH.with_name("20261005130000_provider_dataset_candidates.py"),
+            "rooted_graph_publication_candidates",
+        )
+        await run_migration(engine, publication_candidates, "upgrade")
+
+
+
 @asynccontextmanager
-async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True):
+async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_validation=True, dataset_candidates=True):
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
     schema = quoted(schema_name)
@@ -102,6 +119,7 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True):
         assert registration.endpoint_created and registration.source_created
         await run_migration(engine, migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
+        await _install_candidate_migrations(engine, set_validation, dataset_candidates)
         if request_failure_budget:
             from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
 

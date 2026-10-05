@@ -104,6 +104,11 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
 )
+from process.ptg_parts.ptg2_snapshot_candidates import (
+    attach_snapshot_candidates,
+    snapshot_candidate_reads,
+    snapshot_candidate_relation,
+)
 from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names
 from process.ptg_parts.source_snapshot_control import remove_ptg2_source_snapshot
@@ -113,7 +118,6 @@ from process.ptg_parts.ptg2_v4_graph_compiler import (
     compile_provider_graph_v4_rust,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
-    PTG2_V4_SHARED_GENERATION,
     publish_v4_snapshot_maps,
     reserve_v4_shared_layout,
     seal_v4_shared_layout,
@@ -1225,6 +1229,9 @@ async def _install_v4_source_evidence_schema(
 ) -> None:
     """Install the source-local evidence schema for one focused V4 proof."""
 
+    if await database.scalar("SELECT to_regclass(:relation)", relation=f"{schema_name}.ptg2_provider_group_tax_identity_source"):
+        return
+
     recorder = _OpRecorder()
     migration = _load_v4_source_evidence_migration()
     monkeypatch.setattr(migration, "op", recorder)
@@ -1254,6 +1261,12 @@ async def _create_v4_test_schema(
         schema_name=schema_name,
         monkeypatch=monkeypatch,
     )
+    await _install_v4_source_evidence_schema(database, schema_name=schema_name, monkeypatch=monkeypatch)
+    from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+    from tests.test_ptg_snapshot_candidates_postgres import _migration
+
+    async with database.transaction() as session:
+        await apply_candidate_migration(await session.connection(), schema_name, _migration().TABLES)
 
 
 async def _install_frozen_candidate_test_schema(
@@ -2135,14 +2148,16 @@ def _recovery_block(object_kind: str, payload: bytes) -> SharedBlock:
     return SharedBlock(object_kind, 0, 0, 1, "none", len(payload), payload)
 
 
-async def _insert_recovery_blocks(
+async def _insert_recovery_rows(
     session,
     *,
-    schema: str,
+    schema_name: str,
     snapshot_key: int,
     mapped_block: SharedBlock,
     target_block: SharedBlock,
 ) -> None:
+    """Seed the payload, V3 mapping, and provider set owned by failed recovery."""
+    schema = _quoted(schema_name)
     for physical_block in (mapped_block, target_block):
         await session.execute(
             sa.text(
@@ -2174,6 +2189,12 @@ async def _insert_recovery_blocks(
             "object_kind": mapped_block.object_kind,
             "block_hash": mapped_block.block_hash,
         },
+    )
+    await _insert_provider_set_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        provider_sets_by_key={1: _global(1, 1)},
     )
 
 
@@ -2253,18 +2274,12 @@ async def _seed_failed_recovery(
             semantic_fingerprint=semantic_fingerprint,
             build_token=build_token,
         )
-        await _insert_recovery_blocks(
-            session,
-            schema=schema,
-            snapshot_key=reservation.snapshot_key,
-            mapped_block=mapped_block,
-            target_block=target_block,
-        )
-        await _insert_provider_set_rows(
+        await _insert_recovery_rows(
             session,
             schema_name=schema_name,
             snapshot_key=reservation.snapshot_key,
-            provider_sets_by_key={1: _global(1, 1)},
+            mapped_block=mapped_block,
+            target_block=target_block,
         )
         await publish_v4_snapshot_maps(
             session,
@@ -2283,6 +2298,7 @@ async def _seed_failed_recovery(
             snapshot_key=reservation.snapshot_key,
             semantic_fingerprint=semantic_fingerprint,
         )
+        await attach_snapshot_candidates(session, schema_name, reservation.snapshot_key, build_token)
     return _FailedRecoverySeed(
         schema_name=schema_name,
         schema=schema,
@@ -3547,13 +3563,14 @@ async def _assert_aggregate_tax_rows(
     snapshot_key: int,
     groups: tuple[bytes, bytes],
 ) -> None:
+    relation = snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity")
     aggregate_rows = (
         await session.execute(
             sa.text(
                 f"""
                 SELECT provider_group_global_id_128, tax_identity_state,
                        tin_key, source_bitmap
-                  FROM {schema}.ptg2_provider_group_tax_identity
+                  FROM {relation}
                  WHERE snapshot_key = :snapshot_key
                  ORDER BY provider_group_global_id_128
                 """
@@ -3577,13 +3594,14 @@ async def _assert_source_local_tax_rows(
     snapshot_key: int,
     groups: tuple[bytes, bytes],
 ) -> None:
+    relation = snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity_source")
     source_rows = (
         await session.execute(
             sa.text(
                 f"""
                 SELECT source_key, provider_group_global_id_128,
                        tax_identity_state, tin_key
-                  FROM {schema}.ptg2_provider_group_tax_identity_source
+                  FROM {relation}
                  WHERE snapshot_key = :snapshot_key
                  ORDER BY source_key, provider_group_global_id_128
                 """
@@ -3666,6 +3684,7 @@ def _install_post_source_failure(
     *,
     schema: str,
     snapshot_key: int,
+    build_token: str,
     groups,
     publication_events: list[str],
 ) -> None:
@@ -3682,12 +3701,18 @@ def _install_post_source_failure(
         )
         publication_events.append("aggregate")
         await real_source_publish(session, **kwargs)
-        await _assert_source_local_tax_rows(
-            session,
-            schema=schema,
-            snapshot_key=snapshot_key,
-            groups=groups,
-        )
+        async with snapshot_candidate_reads(session, kwargs["schema_name"], snapshot_key, build_token):
+            await _assert_source_local_tax_rows(
+                session,
+                schema=schema,
+                snapshot_key=snapshot_key,
+                groups=groups,
+            )
+        for table in ("ptg2_provider_group_tax_identity", "ptg2_provider_group_tax_identity_source"):
+            assert await session.scalar(
+                sa.text(f"SELECT COUNT(*) FROM {schema}.{table} WHERE snapshot_key = :snapshot_key"),
+                {"snapshot_key": snapshot_key},
+            ) == 0
         publication_events.append("source")
         publication_events.append("later")
         raise _PostSourcePublicationFailure("synthetic post-source failure")
@@ -3720,6 +3745,10 @@ async def _assert_source_local_rollback(
         snapshot_key=snapshot_key,
     )
     assert provider_set_count == 1
+    assert await database.scalar(
+        f"SELECT COUNT(*) FROM {schema}.ptg2_snapshot_candidate WHERE snapshot_key = :snapshot_key",
+        snapshot_key=snapshot_key,
+    ) == 0
 
 
 async def _seed_source_local_logical_sources(
@@ -3856,6 +3885,7 @@ async def test_v4_source_local_tax_publication_is_atomic_on_postgres(
             monkeypatch,
             schema=schema,
             snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
             groups=fixture.groups,
             publication_events=publication_events,
         )

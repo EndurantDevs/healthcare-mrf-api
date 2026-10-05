@@ -291,6 +291,49 @@ def _materialization_context(
     )
 
 
+def _parse_practitioner_resource(context, resource_id, resource_by_field):
+    """Share the canonical parser for external and admitted source records."""
+    resource_url = f"{UHC_FLEX_PRACTITIONER_API_BASE}/Practitioner/" + urllib.parse.quote(
+        resource_id, safe="")
+    return parse_fhir_resource(
+        context.source_id,
+        resource_by_field,
+        resource_url=resource_url,
+        acquisition=FHIRAcquisitionContext(
+            self_url=resource_url,
+            fetch_url=context.fetch_url,
+            fetch_mode="rest_bundle",
+            semantic_projection_as_of=context.projection_date,
+        ),
+        run_id=context.run_id,
+    )
+
+
+def _materialize_admitted_practitioner_resource(
+    fields: dict[str, Any], *, dataset_id: str, source_id: str,
+    run_id: str, projection_date: datetime.date,
+) -> dict[str, Any]:
+    """Encode a persisted witness after the whole sealed source passed its proof."""
+    context = _MaterializationContext(
+        dataset_id=dataset_id, source_id=source_id, run_id=run_id,
+        projection_date=projection_date,
+        fetch_url=uhc_flex_practitioner_query_url(fields["npi"]),
+    )
+    _, parsed_by_field = _parse_practitioner_resource(
+        context, fields["resource_id"], json.loads(fields["payload_json_text"]),
+    )
+    payload_by_field = _normalized_payload(parsed_by_field)
+    return {
+        "dataset_id": dataset_id, "resource_type": "Practitioner",
+        "resource_id": parsed_by_field["resource_id"], "payload_json": payload_by_field,
+        "payload_hash": resource_payload_sha256_for_contract(
+            payload_by_field, SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        ),
+        "requested_npi": fields["npi"],
+        "acquired_resource_sha256": fields["payload_sha256"],
+    }
+
+
 def _normalized_result_payload(
     query_result: UHCFlexPractitionerQueryResult,
     context: _MaterializationContext,
@@ -309,20 +352,7 @@ def _normalized_result_payload(
         or acquired_resource_sha256 != _raw_resource_sha256(resource_by_field)
     ):
         raise UHCFlexPractitionerMaterializationError("raw_content_drift")
-    resource_url = f"{UHC_FLEX_PRACTITIONER_API_BASE}/Practitioner/" + urllib.parse.quote(
-        expected_resource_id, safe="")
-    parsed_resource = parse_fhir_resource(
-        context.source_id,
-        resource_by_field,
-        resource_url=resource_url,
-        acquisition=FHIRAcquisitionContext(
-            self_url=resource_url,
-            fetch_url=context.fetch_url,
-            fetch_mode="rest_bundle",
-            semantic_projection_as_of=context.projection_date,
-        ),
-        run_id=context.run_id,
-    )
+    parsed_resource = _parse_practitioner_resource(context, expected_resource_id, resource_by_field)
     if parsed_resource is None or type(parsed_resource) is not tuple or len(
         parsed_resource) != 2:
         raise UHCFlexPractitionerMaterializationError("resource_model_drift")

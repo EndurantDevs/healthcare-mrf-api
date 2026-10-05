@@ -4,6 +4,7 @@ import asyncio
 import io
 from pathlib import Path
 import struct
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -201,6 +202,8 @@ async def test_progress_consumer_accepts_monotonic_events_and_logs_malformed_lin
 ) -> None:
     stream = asyncio.StreamReader()
     stream.feed_data(b"compiler diagnostic\n")
+    oversized_diagnostic = b"x" * compiler.PTG2_V4_PROGRESS_MAX_LINE_BYTES + b"\n"
+    stream.feed_data(oversized_diagnostic)
     stream.feed_data(_progress_event(1, "resource_admission", 0, 1))
     stream.feed_data(compiler.PTG2_V4_PROGRESS_PREFIX + b"{broken-json}\n")
     stream.feed_data(_progress_event(99, "resource_admission", 1, 1))
@@ -244,6 +247,7 @@ async def test_progress_consumer_accepts_monotonic_events_and_logs_malformed_lin
     assert state.terminal is True
     logged = diagnostics.getvalue()
     assert b"compiler diagnostic" in logged
+    assert oversized_diagnostic in logged
     assert b"broken-json" in logged
     assert b'"seq":99' in logged
 
@@ -344,9 +348,11 @@ async def test_wrapper_heartbeat_reports_current_compiler_progress(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stderr_stalls", [False, True])
 async def test_wrapper_cancellation_terminates_child_and_drains_progress(
     tmp_path: Path,
     monkeypatch,
+    stderr_stalls: bool,
 ) -> None:
     """Cancel the native child, drain progress, and remove partial outputs."""
 
@@ -357,6 +363,18 @@ async def test_wrapper_cancellation_terminates_child_and_drains_progress(
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
     binary.chmod(0o755)
     fake_process = _PendingCompilerProcess()
+    if stderr_stalls:
+        monkeypatch.setattr(fake_process.stderr, "feed_eof", lambda: None)
+    stderr_finished = asyncio.Event()
+    consume = compiler._consume_compiler_stderr
+
+    async def consume_until_finished(*args, **kwargs):
+        try:
+            await consume(*args, **kwargs)
+        finally:
+            stderr_finished.set()
+
+    monkeypatch.setattr(compiler, "_consume_compiler_stderr", consume_until_finished)
     monkeypatch.setattr(
         compiler.asyncio,
         "create_subprocess_exec",
@@ -383,4 +401,198 @@ async def test_wrapper_cancellation_terminates_child_and_drains_progress(
         await task
 
     assert fake_process.terminated.is_set()
+    assert stderr_finished.is_set()
     assert not output.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["stderr", "terminal", "wait"])
+async def test_wrapper_failed_child_contract_cleans_owned_output(tmp_path, monkeypatch, failure):
+    """A child protocol or wait failure cannot leave outputs eligible for reuse."""
+    artifacts, provider_map = _fixture(tmp_path)
+    npi_scope, inferred_taxonomy = await _compiler_inputs(tmp_path, artifacts)
+    output = tmp_path / "compiled"
+    binary = tmp_path / "fake-compiler"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    binary.chmod(0o755)
+    process = _PendingCompilerProcess()
+    if failure == "stderr":
+        process.stderr = None
+    elif failure == "terminal":
+        process.returncode = 0
+        process.stderr.feed_eof()
+        process.finished.set()
+    else:
+        process.wait = AsyncMock(side_effect=OSError("synthetic child wait failure"))
+    terminated = AsyncMock()
+
+    async def terminate(child):
+        assert child is process
+        process.returncode = -15
+        await terminated()
+
+    monkeypatch.setattr(compiler.asyncio, "create_subprocess_exec", process.create_subprocess)
+    monkeypatch.setattr(compiler, "_terminate_process", terminate)
+    expected_message = {
+        "stderr": "did not expose its progress stream",
+        "terminal": "without a terminal progress event",
+        "wait": "synthetic child wait failure",
+    }[failure]
+    with pytest.raises((RuntimeError, OSError), match=expected_message):
+        await compile_provider_graph_v4_rust(
+            graph_artifact_entries=artifacts, provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope, inferred_taxonomy=inferred_taxonomy,
+            output_directory=output, binary_path=binary,
+        )
+    assert terminated.await_count == int(failure != "terminal")
+    assert not output.exists()
+    assert not list(tmp_path.glob("compiled.*"))
+
+
+@pytest.mark.parametrize("failure", ["absent", "removed", "replaced"])
+def test_reciprocal_descriptor_authentication_rejects_path_changes(tmp_path, failure):
+    """An opened reciprocal stays authenticated through the final read."""
+    artifacts, _provider_map = _fixture(tmp_path)
+    reciprocal = next(artifact for artifact in artifacts if artifact["name"] == "provider_npi_group")
+    path = Path(str(reciprocal["path"]))
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(path.read_bytes())
+    if failure == "absent":
+        path.unlink()
+    with pytest.raises(RuntimeError, match="unavailable|changed during extraction"):
+        with compiler._open_authenticated_reciprocal({"path": path, "metadata": reciprocal}) as stream:
+            assert stream.read(8) == b"PTG2MNDS"
+            path.unlink()
+            if failure == "replaced":
+                replacement.rename(path)
+    if failure == "replaced":
+        assert path.read_bytes().startswith(b"PTG2MNDS")
+
+
+def test_scratch_owner_fsync_failure_removes_only_new_output(tmp_path, monkeypatch):
+    output = tmp_path / "compiled"
+    sentinel = tmp_path / "unrelated"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(compiler.os, "fsync", Mock(side_effect=OSError("synthetic fsync failure")))
+    with pytest.raises(OSError, match="synthetic fsync failure"):
+        compiler._create_compiler_output(output)
+    assert not output.exists()
+    assert sentinel.read_bytes() == b"preserve"
+
+
+@pytest.mark.asyncio
+async def test_progress_sink_failure_does_not_fail_compilation(monkeypatch):
+    sink = Mock(side_effect=OSError("synthetic progress failure"))
+    monkeypatch.setattr(compiler, "write_live_progress", sink)
+    await compiler._emit_compile_progress(done=1, total=2)
+    sink.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["format", "existing", "header", "members"])
+def test_scope_extraction_preserves_existing_output_and_rejects_metadata_drift(tmp_path, failure):
+    artifacts, _provider_map = _fixture(tmp_path)
+    reciprocal = next(artifact for artifact in artifacts if artifact["name"] == "provider_npi_group")
+    output = tmp_path / "scope.copy"
+    if failure == "format":
+        reciprocal["record_format"] = "unknown"
+    elif failure == "existing":
+        output.write_bytes(b"preserve")
+    elif failure == "header":
+        reciprocal["owner_count"] += 1
+    else:
+        reciprocal["member_count"] += 1
+    with pytest.raises(RuntimeError, match="dense format|already exists|header changed|member count changed"):
+        compiler._write_npi_scope_from_reciprocal(
+            output, reciprocal={"path": reciprocal["path"], "metadata": reciprocal}
+        )
+    assert not output.with_suffix(".copy.partial").exists()
+    if failure == "existing":
+        assert output.read_bytes() == b"preserve"
+    else:
+        assert not output.exists()
+
+
+def test_scope_link_cleanup_failure_removes_both_owned_files(tmp_path, monkeypatch):
+    """Failure after publishing a hard link rolls back the whole owned output."""
+    artifacts, _provider_map = _fixture(tmp_path)
+    reciprocal = next(artifact for artifact in artifacts if artifact["name"] == "provider_npi_group")
+    output = tmp_path / "scope.copy"
+    partial = output.with_suffix(".copy.partial")
+    unlink = Path.unlink
+    failed_paths = set()
+
+    def fail_first_partial_unlink(path, *args, **kwargs):
+        if path == partial and path not in failed_paths:
+            failed_paths.add(path)
+            raise OSError("synthetic partial cleanup failure")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_partial_unlink)
+    with pytest.raises(OSError, match="synthetic partial cleanup failure"):
+        compiler._write_npi_scope_from_reciprocal(
+            output, reciprocal={"path": reciprocal["path"], "metadata": reciprocal}
+        )
+    assert failed_paths == {partial}
+    assert not partial.exists()
+    assert not output.exists()
+    assert Path(str(reciprocal["path"])).is_file()
+
+
+def test_binary_copy_iterator_preserves_nullable_and_empty_fields(tmp_path):
+    path = tmp_path / "canonical.copy"
+    record = struct.pack(">hi", 3, 8) + struct.pack(">qii", 7, -1, 0)
+    path.write_bytes(compiler._PG_COPY_HEADER + record + struct.pack(">h", -1))
+    assert list(compiler._iter_pg_binary_rows(
+        path, expected_field_count=3, nullable_field_indices=frozenset({1})
+    )) == [(struct.pack(">q", 7), None, b"")]
+    with pytest.raises(RuntimeError, match="invalid NULL COPY field"):
+        list(compiler._iter_pg_binary_rows(path, expected_field_count=3))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,message",
+    [
+        ("binary", "requires ptg2_provider_graph_v4"),
+        ("parent", "parent is not private"),
+        ("owner", "scratch ownership changed"),
+        ("file", "not a safe directory"),
+    ],
+)
+async def test_compiler_rejects_unsafe_launch_paths_without_touching_files(
+    tmp_path, monkeypatch, failure, message
+):
+    """Trust checks precede subprocess creation and any scratch replacement."""
+    binary = tmp_path / "compiler"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    binary.chmod(0o644 if failure == "binary" else 0o755)
+    output = tmp_path / "compiled"
+    if failure == "parent":
+        parent = tmp_path / "shared"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+        output = parent / "compiled"
+    elif failure == "owner":
+        compiler._create_compiler_output(output)
+        compiler._compiler_output_owner_path(output).write_bytes(b"changed")
+    elif failure == "file":
+        output.write_bytes(b"preserve")
+    contents_by_path = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    start = AsyncMock()
+    monkeypatch.setattr(compiler.asyncio, "create_subprocess_exec", start)
+    with pytest.raises(RuntimeError, match=message):
+        await compile_provider_graph_v4_rust(
+            graph_artifact_entries=(), provider_set_key_map_path=tmp_path / "map",
+            npi_scope=None, inferred_taxonomy={}, output_directory=output, binary_path=binary,
+        )
+    start.assert_not_awaited()
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == contents_by_path
+
+
+def test_artifact_manifest_requires_explicit_record_format(tmp_path):
+    artifacts, _provider_map = _fixture(tmp_path)
+    artifact = artifacts[0]
+    manifest, _byte_count = compiler._artifact_manifest(artifact)
+    assert manifest["metadata"]["record_format"] == artifact["record_format"]
+    with pytest.raises(RuntimeError, match="invalid record_format"):
+        compiler._artifact_manifest({**artifact, "record_format": ""})

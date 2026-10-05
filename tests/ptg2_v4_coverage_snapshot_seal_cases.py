@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 from tests.ptg2_v4_coverage_support import (
     PTG2_V3_SHARED_FORMAT_VERSION,
@@ -21,8 +24,8 @@ async def _publish_snapshot_map(monkeypatch):
     async def no_op(*_args, **_kwargs):
         return None
 
-    async def capture_pack(_session, *, pack, **_kwargs):
-        published_packs.append(pack)
+    async def capture_pack(_session, *, packs, **_kwargs):
+        published_packs.extend(packs)
 
     monkeypatch.setattr(
         snapshot_maps,
@@ -34,9 +37,12 @@ async def _publish_snapshot_map(monkeypatch):
         "_initialize_v4_snapshot_map_root",
         no_op,
     )
-    monkeypatch.setattr(snapshot_maps, "_publish_v4_map_pack", capture_pack)
+    monkeypatch.setattr(snapshot_maps, "_copy_v4_map_batch", capture_pack)
+    monkeypatch.setattr(snapshot_maps, "begin_snapshot_candidate", AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(snapshot_maps, "finish_snapshot_candidate", AsyncMock())
+    monkeypatch.setattr(snapshot_maps, "candidate_driver", AsyncMock(return_value=SimpleNamespace(copy_records_to_table=AsyncMock())))
     expected_summary = await snapshot_maps.publish_v4_snapshot_maps(
-        object(),
+        SimpleNamespace(execute=AsyncMock()),
         schema_name="mrf",
         snapshot_key=17,
         build_token="token",
@@ -212,11 +218,14 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
     _install_new_layout_seal_mocks(monkeypatch, expected_summary)
     new_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
+        _Result(scalar={"ptg2_v4_snapshot_map_pack": "candidate_map"}),
         _Result(rows=((None, None, None),)),
+        _Result(),
         _Result(scalar=17),
         _Result(),
         _Result(scalar=17),
         _Result(rows=({},)),
+        _Result(scalar=1),
     )
     sealed = await snapshot_maps.seal_v4_shared_layout(
         new_session,
@@ -235,7 +244,32 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
         },
     )
     assert (sealed.snapshot_key, sealed.reused) == (17, False)
+    _assert_candidate_seal_calls(new_session, expected_summary, is_attached=True)
     return owner_by_field
+
+
+def _assert_candidate_seal_calls(session, expected_summary, *, is_attached):
+    """Require authenticated candidate reads and proof before the final state switch."""
+    read_calls = [(index, parameters) for index, (statement, parameters) in enumerate(session.calls)
+                  if "read_ptg_snapshot_candidates(" in statement]
+    proof_calls = [(index, parameters) for index, (statement, parameters) in enumerate(session.calls)
+                   if "prepare_ptg_snapshot_completion(" in statement]
+    completion_calls = [(index, parameters) for index, (statement, parameters) in enumerate(session.calls)
+                        if 'UPDATE "mrf".ptg2_v4_snapshot_map_root' in statement]
+    attach_calls = [(index, parameters) for index, (statement, parameters) in enumerate(session.calls)
+                    if "attach_ptg_snapshot_candidates(" in statement]
+    assert len(read_calls) == len(proof_calls) == len(completion_calls) == 1
+    assert read_calls[0][1] == {"snapshot": 17, "token": "token"}
+    assert read_calls[0][0] < proof_calls[0][0] < completion_calls[0][0]
+    proven_fields = json.loads(proof_calls[0][1]["fields"])
+    assert proven_fields["state"] == "complete"
+    assert proven_fields["map_digest"] == "\\x" + expected_summary.map_digest.hex()
+    assert proven_fields["completed_at"] == completion_calls[0][1]["completed_at"].isoformat()
+    assert len(attach_calls) == int(is_attached)
+    if is_attached:
+        assert attach_calls[0][0] == len(session.calls) - 1
+        assert attach_calls[0][1] == {"snapshot": 17, "token": "token"}
+    assert session.info == {}
 
 
 def _install_new_layout_seal_mocks(monkeypatch, expected_summary) -> None:
@@ -330,6 +364,7 @@ async def _assert_reused_layout_seal(
     expected_summary,
     owner_by_field,
 ) -> None:
+    """Reuse the sealed root without attaching its redundant candidate family."""
     reusable_layout_by_field = _reusable_layout_row(expected_summary)
     deferred_cleanup_pairs: list[tuple[int, int]] = []
 
@@ -349,7 +384,9 @@ async def _assert_reused_layout_seal(
     )
     reused_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
+        _Result(scalar={"ptg2_v4_snapshot_map_pack": "candidate_map"}),
         _Result(rows=((None, None, None),)),
+        _Result(),
         _Result(scalar=17),
         _Result(rows=(reusable_layout_by_field,)),
         _Result(),
@@ -373,7 +410,13 @@ async def _assert_reused_layout_seal(
         },
     )
     assert (reused.snapshot_key, reused.reused) == (18, True)
+    _assert_candidate_seal_calls(reused_session, expected_summary, is_attached=False)
     assert deferred_cleanup_pairs == [(17, 18)]
+    await _assert_short_support_digest_rejected(expected_summary)
+
+
+async def _assert_short_support_digest_rejected(expected_summary):
+    """Reject an invalid digest before any publication database work."""
     with pytest.raises(ValueError, match="support digest"):
         await snapshot_maps.seal_v4_shared_layout(
             object(),

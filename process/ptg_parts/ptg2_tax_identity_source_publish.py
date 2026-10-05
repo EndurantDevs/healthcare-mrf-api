@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from db.connection import db
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_reads
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_tax_identity_source_observations import (
     _publish_observations,
@@ -295,21 +296,23 @@ async def _publish_and_validate_source_rows(
         prepared=prepared,
         heartbeat_callback=heartbeat_callback,
     )
-    await validate_stored_tax_identity_source_counts(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        prepared=prepared,
-    )
-    await validate_merged_tax_identity_source_reduction(
-        session,
-        schema=schema,
-        stage=stage,
-        snapshot_key=snapshot_key,
-        heartbeat_callback=heartbeat_callback,
-    )
-
+    schema_name = schema[1:-1].replace('""', '"')
+    build_token = await session.scalar(db.text(f"SELECT build_token FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key=:snapshot"), {"snapshot": snapshot_key})
+    async with snapshot_candidate_reads(session, schema_name, snapshot_key, build_token):
+        await validate_stored_tax_identity_source_counts(
+            session,
+            schema=schema,
+            stage=stage,
+            snapshot_key=snapshot_key,
+            prepared=prepared,
+        )
+        await validate_merged_tax_identity_source_reduction(
+            session,
+            schema=schema,
+            stage=stage,
+            snapshot_key=snapshot_key,
+            heartbeat_callback=heartbeat_callback,
+        )
 
 async def publish_staged_tax_identity_source_projection(
     session: Any,

@@ -82,6 +82,7 @@ SINGLE_ROOT_PATH = VERSIONS / (
 RETRY_EXHAUSTION_PATH = VERSIONS / (
     "20260830090000_uhc_flex_retry_exhaustion.py"
 )
+DATASET_CANDIDATES_PATH = VERSIONS / "20261005130000_provider_dataset_candidates.py"
 PROJECTION_DATE = "2026-08-10"
 SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
 ENDPOINT_ID = "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
@@ -205,6 +206,10 @@ async def _prepare_publication_schema(
     finally:
         await connection.close()
     await run_migration(engine, migrations[1], "upgrade")
+    await run_migration(engine, load_migration(
+        VERSIONS / "20261005120000_practitioner_set_validation.py",
+        "flex_publication_set_validation",
+    ), "upgrade")
     await run_migration(engine, migrations[2], "upgrade")
     connection = await connect(url)
     try:
@@ -246,10 +251,7 @@ async def _publication_test_scope(monkeypatch):
         SINGLE_ROOT_PATH,
         "flex_publication_single_root",
     )
-    retry_exhaustion_migration = load_migration(
-        RETRY_EXHAUSTION_PATH,
-        "flex_publication_retry_exhaustion",
-    )
+    retry_exhaustion_migration = load_migration(RETRY_EXHAUSTION_PATH, "flex_publication_retry_exhaustion")
     try:
         await _prepare_publication_schema(
             engine,
@@ -267,6 +269,7 @@ async def _publication_test_scope(monkeypatch):
         await run_migration(engine, rooted_migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
         await run_migration(engine, retry_exhaustion_migration, "upgrade")
+        await run_migration(engine, load_migration(DATASET_CANDIDATES_PATH, "flex_dataset_candidates"), "upgrade")
         from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
 
         await install_request_failure_budget(engine, schema_name)

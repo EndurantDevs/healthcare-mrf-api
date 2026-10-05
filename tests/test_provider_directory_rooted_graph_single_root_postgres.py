@@ -62,6 +62,12 @@ async def _install_single_root_schema(context: SimpleNamespace) -> None:
     await register_provider_directory_rooted_graph_source(database=context.database)
     await run_migration(context.engine, context.base_migration, "upgrade")
     await run_migration(context.engine, context.single_root_migration, "upgrade")
+    for filename in (
+        "20261005100000_rooted_graph_set_validation.py",
+        "20261005130000_provider_dataset_candidates.py",
+    ):
+        migration = load_migration(VERSIONS / filename, filename.removesuffix(".py"))
+        await run_migration(context.engine, migration, "upgrade")
     from tests.provider_directory_fhir_failure_pg_support import install_request_failure_budget
 
     await install_request_failure_budget(context.engine, context.schema_name)
