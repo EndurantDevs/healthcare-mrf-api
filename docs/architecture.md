@@ -23,6 +23,15 @@ For importer commands, see [imports/README.md](./imports/README.md). For source
 ownership, see [data-sources.md](./data-sources.md). For deeper design notes,
 start with [../specs/base_arch_prompt.md](../specs/base_arch_prompt.md).
 
+## High-volume Import Design
+
+Follow [bulk loading and snapshot publication](./imports/bulk-loading.md):
+isolated candidate snapshots, large bounded COPY batches, set-based validation
+instead of per-row database validation, and completed indexes before atomic
+publication. Keep the incumbent API snapshot readable throughout. This is the
+required direction for changed import paths, not a statement that legacy costs
+have already been removed.
+
 ## Main Boundaries
 
 - `api/` owns served HTTP contracts and should keep route handlers focused on
