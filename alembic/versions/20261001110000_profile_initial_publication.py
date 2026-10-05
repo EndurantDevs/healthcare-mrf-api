@@ -223,7 +223,9 @@ def _replace_checkpoint_check(schema):
             SELECT * INTO STRICT probe_row FROM pg_constraint
                 WHERE conrelid=live_row.conrelid AND conname={_literal(probe)};
             IF live_row.contype<>'c' OR NOT live_row.convalidated OR live_row.condeferrable
-              OR live_row.condeferred OR live_row.connoinherit OR live_row.conbin IS DISTINCT FROM probe_row.conbin
+              OR live_row.condeferred OR live_row.connoinherit
+              OR pg_get_expr(live_row.conbin, live_row.conrelid)
+                 IS DISTINCT FROM pg_get_expr(probe_row.conbin, probe_row.conrelid)
             THEN RAISE EXCEPTION 'profile_initial_checkpoint_constraint_drift'; END IF;
         END $$""")
     op.execute(f"ALTER TABLE {table} DROP CONSTRAINT {_q(probe)}")
