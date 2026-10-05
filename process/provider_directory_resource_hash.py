@@ -8,8 +8,11 @@ import copy
 import datetime
 import hashlib
 import json
+import re
 from typing import Any, Mapping
 
+
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 RESOURCE_TRANSPORT_PAYLOAD_FIELDS = frozenset(
     {
@@ -252,10 +255,10 @@ def composed_practitioner_semantic_sha256(
 
     if (
         len(base_hash) != 64
-        or any(character not in "0123456789abcdef" for character in base_hash)
+        or _SHA256_HEX_RE.fullmatch(base_hash) is None
         or any(
             len(name_hash) != 64
-            or any(character not in "0123456789abcdef" for character in name_hash)
+            or _SHA256_HEX_RE.fullmatch(name_hash) is None
             for name_hash in name_hashes
         )
     ):
