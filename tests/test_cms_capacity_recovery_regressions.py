@@ -1092,8 +1092,10 @@ async def test_identity_replay_flushes_complete_bounded_batches_without_losing_r
         batches.append((kind, deepcopy(resources)))
 
     complete = AsyncMock()
+    refresh = AsyncMock()
     monkeypatch.setattr(cms, "_write_identity_batch", write)
     monkeypatch.setattr(cms, "_assert_identity_evidence", complete)
+    monkeypatch.setattr(cms, "_refresh_identity_statistics", refresh)
     ctx, task = {}, {}
     await cms._materialize_identity_evidence(case.fhir, tmp_path, case.candidate, case.identity, ctx, task)
     organization_resources = [resources for kind, resources in batches if kind == "Organization"]
@@ -1106,6 +1108,7 @@ async def test_identity_replay_flushes_complete_bounded_batches_without_losing_r
     case.fhir._raise_if_resource_import_cancelled.assert_awaited_once_with(ctx, task)
     assert case.fhir._raise_if_resource_import_cancelled.await_args.args[0] is ctx
     assert case.fhir._raise_if_resource_import_cancelled.await_args.args[1] is task
+    refresh.assert_awaited_once_with(case.fhir, ctx, task)
     complete.assert_awaited_once_with(case.fhir, case.candidate, case.identity)
 
 
