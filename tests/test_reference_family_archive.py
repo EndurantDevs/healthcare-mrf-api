@@ -11,8 +11,22 @@ from unittest.mock import ANY, AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    UniqueConstraint,
+    func,
+)
 
+from process import florida_projection_archive as florida_archive
 from process import reference_family_archive as archive
+from process import source_profile_result_archive as profile_archive
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import ReferenceFamilyServingGeneration
 
@@ -1003,23 +1017,347 @@ def test_provider_quality_archive_index_names_reuse_collision_safe_staging_ident
 
 
 @pytest.mark.asyncio
+async def test_model_index_completion_preserves_expressions_predicates_and_legacy_indexes():
+    table = Table(
+        "synthetic_table",
+        MetaData(schema="source_schema"),
+        Column("id", Integer, primary_key=True),
+        Column("label", String),
+    )
+    Index("synthetic_label_idx", func.lower(table.c.label), unique=True, postgresql_where=table.c.label.is_not(None))
+    model = SimpleNamespace(
+        __tablename__=table.name,
+        __table__=table,
+        __my_initial_indexes__=({"index_elements": ("id",)},),
+        __my_additional_indexes__=({"index_elements": ("label",)},),
+    )
+    session = SimpleNamespace(execute=AsyncMock())
+
+    await archive._create_model_indexes(
+        session, archive.ReferenceFamilySpec("synthetic", (model,)), "destination_schema"
+    )
+
+    assert [
+        str(call.args[0].compile(dialect=archive.postgresql.dialect())) for call in session.execute.await_args_list
+    ] == [
+        "CREATE UNIQUE INDEX synthetic_label_idx ON destination_schema.synthetic_table (lower(label)) "
+        "WHERE label IS NOT NULL",
+        'CREATE INDEX "destination_schema_synthetic_table_idx_id" ON "destination_schema"."synthetic_table" (id)',
+        'CREATE INDEX "destination_schema_synthetic_table_idx_label" ON "destination_schema"."synthetic_table" (label)',
+    ]
+    assert table.schema == "source_schema"
+
+
+@pytest.mark.asyncio
+async def test_restore_defers_constraints_preserving_model_column_semantics():
+    table = Table(
+        "synthetic_table",
+        MetaData(schema="source_schema"),
+        Column("id", Integer, primary_key=True),
+        Column("label", String, CheckConstraint("length(label) > 0", name="synthetic_label_check"), nullable=False),
+        UniqueConstraint("label", name="synthetic_label_key"),
+        CheckConstraint("id > 0", name="synthetic_id_check"),
+    )
+    model = SimpleNamespace(__tablename__=table.name, __table__=table)
+    session = SimpleNamespace(execute=AsyncMock())
+    spec = archive.ReferenceFamilySpec("synthetic", (model,))
+    original = str(archive.CreateTable(table).compile(dialect=archive.postgresql.dialect()))
+    await archive._create_model_family(session, spec, "synthetic_stage", create_indexes=False)
+    statements = _model_ddl(session)
+    assert (
+        statements[1] == "CREATE TABLE synthetic_stage.synthetic_table ( id SERIAL NOT NULL, label VARCHAR NOT NULL )"
+    )
+    session.execute.reset_mock()
+    await archive._create_model_indexes(session, spec, "synthetic_stage", create_constraints=True)
+    assert _model_ddl(session) == [
+        "ALTER TABLE synthetic_stage.synthetic_table ADD PRIMARY KEY (id)",
+        "ALTER TABLE synthetic_stage.synthetic_table ADD CONSTRAINT synthetic_label_key UNIQUE (label)",
+        "ALTER TABLE synthetic_stage.synthetic_table ADD CONSTRAINT synthetic_id_check CHECK (id > 0)",
+        "ALTER TABLE synthetic_stage.synthetic_table ADD CONSTRAINT synthetic_label_check CHECK (length(label) > 0)",
+    ]
+    assert str(archive.CreateTable(table).compile(dialect=archive.postgresql.dialect())) == original
+
+
+def _model_ddl(session):
+    return [
+        " ".join(str(call.args[0].compile(dialect=archive.postgresql.dialect())).replace('"', "").split())
+        for call in session.execute.await_args_list
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restore_checks_relationship_sets_after_indexes_without_foreign_keys():
+    metadata = MetaData(schema="source_schema")
+    parent = Table("parent", metadata, Column("id", Integer, primary_key=True))
+    child = Table(
+        "child",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("parent_id", Integer, ForeignKey("source_schema.parent.id")),
+    )
+    models = tuple(SimpleNamespace(__tablename__=table.name, __table__=table) for table in (child, parent))
+    spec = archive.ReferenceFamilySpec("synthetic", models)
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=False))
+    await archive._create_model_family(session, spec, "synthetic_stage", create_indexes=False)
+    assert all("FOREIGN KEY" not in statement and "PRIMARY KEY" not in statement for statement in _model_ddl(session))
+    session.execute.reset_mock()
+    await archive._create_model_indexes(session, spec, "synthetic_stage", create_constraints=True)
+    assert _model_ddl(session) == [
+        "ALTER TABLE synthetic_stage.child ADD PRIMARY KEY (id)",
+        "ALTER TABLE synthetic_stage.parent ADD PRIMARY KEY (id)",
+    ]
+    assert "FOREIGN KEY" not in " ".join(_model_ddl(session))
+    assert str(session.scalar.await_args.args[0]) == (
+        'SELECT EXISTS(SELECT 1 FROM "synthetic_stage"."child" c WHERE (c."parent_id" IS NOT NULL) '
+        'AND NOT EXISTS(SELECT 1 FROM "synthetic_stage"."parent" p WHERE p."id"=c."parent_id"))'
+    )
+    session.scalar.return_value = True
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="relationship differs"):
+        await archive._create_model_indexes(session, spec, "synthetic_stage", create_constraints=True)
+
+
+def _assert_restore_ddl_parity(spec, ordinary, heaps, completed):
+    assert not any("PRIMARY KEY" in statement or "UNIQUE" in statement for statement in heaps)
+    assert not any(statement.startswith("CREATE INDEX") for statement in heaps)
+    constraints = [statement for statement in completed if statement.startswith("ALTER TABLE")]
+    expected_count = sum(
+        isinstance(constraint, (archive.PrimaryKeyConstraint, UniqueConstraint)) and bool(constraint.columns)
+        for model in spec.model_types
+        for constraint in model.__table__.constraints
+    ) + (spec.importer_id == "mrf")
+    assert len(constraints) == expected_count
+    ordinary_tables = [statement for statement in ordinary if statement.startswith("CREATE TABLE")]
+    for statement in constraints:
+        table_name, definition = statement.removeprefix("ALTER TABLE ").split(" ADD ", 1)
+        if spec.importer_id == "mrf" and table_name.endswith("." + archive.STAGE_TABLE):
+            assert definition == "PRIMARY KEY (address_key)"
+            assert any(
+                creation.startswith("CREATE TABLE " + table_name + " (") and "address_key uuid PRIMARY KEY" in creation
+                for creation in ordinary_tables
+            )
+            continue
+        assert any(
+            creation.startswith("CREATE TABLE " + table_name + " (") and definition in creation
+            for creation in ordinary_tables
+        )
+    assert [
+        statement for statement in heaps + completed if not statement.startswith(("CREATE TABLE", "ALTER TABLE"))
+    ] == [statement for statement in ordinary if not statement.startswith("CREATE TABLE")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("importer_id", archive._SPECS)
-async def test_restore_defers_only_separate_model_indexes(monkeypatch, importer_id):
+async def test_restore_defers_all_index_backing_constraints_with_family_ddl_parity(monkeypatch, importer_id):
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
     ownership = SimpleNamespace(importer_id=importer_id, schema_name="synthetic_stage")
     spec = archive.reference_family_spec(importer_id)
     await archive._create_model_family(session, spec, ownership.schema_name)
-    complete_statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    complete_statements = _model_ddl(session)
     session.execute.reset_mock()
     monkeypatch.setattr(archive, "capture_reference_family_stage_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(archive, "reference_family_stage_schema", lambda _identity: ownership.schema_name)
     monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
     await archive.precreate_reference_family_restore(session, importer_id=importer_id, dataset_id=UUID(int=1))
-    table_statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert not any(statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX")) for statement in table_statements)
-    assert any("PRIMARY KEY" in statement for statement in table_statements)
+    table_statements = _model_ddl(session)
+    session.execute.reset_mock()
     await archive.complete_reference_family_restore(session, ownership)
-    assert [str(call.args[0]) for call in session.execute.await_args_list] == complete_statements
+    _assert_restore_ddl_parity(spec, complete_statements, table_statements, _model_ddl(session))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer_id", (*profile_archive.SOURCES, florida_archive.IMPORTER_ID))
+async def test_profile_restore_completes_every_deferred_model_index(monkeypatch, importer_id):
+    subject = florida_archive if importer_id == florida_archive.IMPORTER_ID else profile_archive
+    spec = archive.ReferenceFamilySpec(importer_id, subject.MODELS)
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    ownership = SimpleNamespace(importer_id=importer_id, schema_name="synthetic_stage")
+    await archive._create_model_family(session, spec, ownership.schema_name)
+    ordinary = _model_ddl(session)
+    session.execute.reset_mock()
+    monkeypatch.setattr(subject, "capture_ownership", AsyncMock(return_value=ownership))
+    monkeypatch.setattr(subject, "stage_schema", lambda _identity: ownership.schema_name)
+    monkeypatch.setattr(subject, "verify_ownership", AsyncMock())
+    if subject is florida_archive:
+        await subject.precreate_restore(session, UUID(int=1))
+    else:
+        await subject.precreate_restore(session, importer_id, UUID(int=1))
+    heaps = _model_ddl(session)
+    session.execute.reset_mock()
+    await subject.complete_restore(session, ownership)
+    _assert_restore_ddl_parity(spec, ordinary, heaps, _model_ddl(session))
+
+
+def _empty_clone_index_catalog(relation, key_name, replayed):
+    index_ddl = f"CREATE INDEX \"expression index\" ON {relation} USING btree (lower('Mixed Case')) WHERE true"
+    definition = f"UNIQUE NULLS NOT DISTINCT ({archive._quoted(key_name)}) DEFERRABLE"
+    replayed.extend((f'ALTER TABLE {relation} ADD CONSTRAINT "retained key" {definition}', index_ddl))
+    return SimpleNamespace(
+        mappings=lambda: SimpleNamespace(
+            all=lambda: [
+                {"name": "retained key", "kind": "constraint", "definition": definition},
+                {"name": "expression index", "kind": "index", "definition": index_ddl},
+            ]
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_clone_keeps_native_ddl_literals_verbatim():
+    index_ddl = (
+        'CREATE INDEX "native:index" ON "synthetic_stage"."pricing_places_zcta" '
+        'USING btree ((\'{"flag":true,"n":123}\'::jsonb)) '
+        r"WHERE ':value:123%' <> E'\\path'"
+    )
+    objects = [
+        {"name": 'native:key"', "kind": "constraint", "definition": 'UNIQUE ("zip_code") DEFERRABLE'},
+        {"name": "native:index", "kind": "index", "definition": index_ddl},
+    ]
+    connection = SimpleNamespace(exec_driver_sql=AsyncMock())
+    session = SimpleNamespace(
+        connection=AsyncMock(return_value=connection),
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: objects))),
+    )
+    capture = archive.ReferenceFamilySourceCapture(
+        SimpleNamespace(importer_id="places-zcta", tables=[SimpleNamespace(table_name="pricing_places_zcta")]),
+        "synthetic_source",
+        "00000001-00000001-1",
+    )
+    await archive._clone_source(session, capture, "synthetic_stage")
+    assert [call.args[0] for call in connection.exec_driver_sql.await_args_list] == [
+        'ALTER TABLE "synthetic_stage"."pricing_places_zcta" DROP CONSTRAINT "native:key""" RESTRICT',
+        'DROP INDEX "synthetic_stage"."native:index" RESTRICT',
+        'ALTER TABLE "synthetic_stage"."pricing_places_zcta" ADD CONSTRAINT "native:key""" '
+        'UNIQUE ("zip_code") DEFERRABLE',
+        index_ddl,
+    ]
+    assert all("native:" not in str(call.args[0]) for call in session.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer_id", archive._SPECS)
+async def test_source_clone_loads_all_family_heaps_before_finishing_indexes(importer_id):
+    spec = archive.reference_family_spec(importer_id)
+    replayed, statements = [], []
+
+    async def execute(statement, parameters=None):
+        statements.append(str(statement.compile(dialect=archive.postgresql.dialect())))
+        if "pg_get_constraintdef" in str(statement):
+            relation = parameters["relation"]
+            model = next(model for model in spec.model_types if relation.endswith(archive._quoted(model.__tablename__)))
+            key_name = next(iter(model.__table__.primary_key.columns)).name
+            return _empty_clone_index_catalog(relation, key_name, replayed)
+
+    connection = SimpleNamespace(exec_driver_sql=AsyncMock(side_effect=lambda statement: statements.append(statement)))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=1))
+    session.connection = AsyncMock(return_value=connection)
+    capture = archive.ReferenceFamilySourceCapture(
+        SimpleNamespace(
+            importer_id=importer_id, tables=[SimpleNamespace(table_name=name) for name in spec.table_names]
+        ),
+        "synthetic_source",
+        "00000001-00000001-1",
+    )
+    await archive._clone_source(session, capture, "synthetic_stage")
+    loads = [index for index, statement in enumerate(statements) if statement.startswith("INSERT INTO")]
+    assert len(loads) == len(spec.archive_names)
+    completion_positions = [
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX"))
+        or statement.startswith("ALTER TABLE")
+        and " ADD " in statement
+    ]
+    assert completion_positions and min(completion_positions) > max(loads)
+    if importer_id in archive._OWNED_SEQUENCES:
+        assert not replayed
+        assert all("PRIMARY KEY" not in statement for statement in statements[: max(loads)])
+        sequence_updates = [
+            index for index, statement in enumerate(statements) if statement.startswith("SELECT pg_catalog.setval")
+        ]
+        assert len(sequence_updates) == len(archive._OWNED_SEQUENCES[importer_id])
+        assert min(sequence_updates) > max(completion_positions)
+    else:
+        assert statements[max(loads) + 1 :] == replayed
+        for load_index in loads:
+            assert statements[load_index - 2].endswith('DROP CONSTRAINT "retained key" RESTRICT')
+            assert statements[load_index - 1] == 'DROP INDEX "synthetic_stage"."expression index" RESTRICT'
+        catalog_calls = [
+            call for call in session.execute.await_args_list if "pg_get_constraintdef" in str(call.args[0])
+        ]
+        assert len(catalog_calls) == len(spec.table_names)
+        assert all(
+            "contype IN ('p','u','x','c','f')" in str(call.args[0])
+            and "k.conindid=i.indexrelid" in str(call.args[0])
+            and call.args[1]["relation"].startswith('"synthetic_stage".')
+            for call in catalog_calls
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["load", "finish"])
+async def test_source_clone_failure_never_rebases_or_returns_incomplete_heap(monkeypatch, failure):
+    capture = archive.ReferenceFamilySourceCapture(
+        SimpleNamespace(
+            importer_id="tiger",
+            tables=[SimpleNamespace(table_name=name) for name in archive._SPECS["tiger"].table_names],
+        ),
+        "synthetic_source",
+        "00000001-00000001-1",
+    )
+
+    async def execute(statement):
+        if failure == "load" and str(statement).startswith("INSERT INTO"):
+            raise RuntimeError("load")
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
+    completion = AsyncMock(side_effect=RuntimeError("finish") if failure == "finish" else None)
+    rebase = AsyncMock()
+    monkeypatch.setattr(archive, "_create_model_indexes", completion)
+    monkeypatch.setattr(archive, "_rebase_owned_sequences", rebase)
+    with pytest.raises(RuntimeError, match=failure):
+        await archive._clone_source(session, capture, "synthetic_stage")
+    rebase.assert_not_awaited()
+    if failure == "load":
+        completion.assert_not_awaited()
+    else:
+        completion.assert_awaited_once_with(
+            session, archive._SPECS["tiger"], "synthetic_stage", create_constraints=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_source_clone_finishes_all_indexes_before_alphabetically_first_checks():
+    spec = archive.reference_family_spec("cms-doctors")
+    statements = []
+
+    async def execute(statement, parameters=None):
+        statements.append(str(statement))
+        if "pg_get_constraintdef" in str(statement):
+            relation = parameters["relation"]
+            objects = [
+                {"name": "a_check", "kind": "constraint", "definition": "CHECK (true)", "constraint_type": "c"},
+                {"name": "z_key", "kind": "constraint", "definition": "UNIQUE (id)", "constraint_type": "u"},
+                {"name": "index", "kind": "index", "definition": f"CREATE INDEX ix ON {relation} (id)"},
+            ]
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: objects))
+
+    connection = SimpleNamespace(exec_driver_sql=AsyncMock(side_effect=lambda value: statements.append(value)))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), connection=AsyncMock(return_value=connection))
+    capture = archive.ReferenceFamilySourceCapture(
+        SimpleNamespace(
+            importer_id="cms-doctors", tables=[SimpleNamespace(table_name=name) for name in spec.table_names]
+        ),
+        "synthetic_source",
+        "00000001-00000001-1",
+    )
+    await archive._clone_source(session, capture, "synthetic_stage")
+    indexes = [
+        position
+        for position, statement in enumerate(statements)
+        if statement.startswith("CREATE INDEX") or 'ADD CONSTRAINT "z_key"' in statement
+    ]
+    checks = [position for position, statement in enumerate(statements) if 'ADD CONSTRAINT "a_check"' in statement]
+    assert len(checks) == len(spec.table_names) and min(checks) > max(indexes)
 
 
 @pytest.mark.asyncio

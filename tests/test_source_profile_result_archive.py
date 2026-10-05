@@ -1,10 +1,24 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Only completed self-contained assertion graphs cross the archive boundary."""
 
+import hashlib
+
 import pytest
 
 from process import source_profile_result_archive as archive
 from tests.source_profile_archive_support import retained_run
+
+
+def test_historical_pin_guard_ddl_is_unchanged():
+    statements = "\n".join(archive.pins.pin_guard_statements("fixture"))
+    assert (
+        hashlib.sha256(statements.encode()).hexdigest()
+        == "d8c97782387576c62ac6e45a391a7c1d057f2bb8592531171ba8ec9ee0f389f4"
+    )
+    current = "\n".join(archive.pins.statement_pin_guard_statements("fixture"))
+    assert "FOR EACH ROW" not in current
+    assert current.count("FOR EACH STATEMENT") == 19
+    assert "OLD TABLE AS profile_guard_old NEW TABLE AS profile_guard_new" in current
 
 
 @pytest.mark.parametrize("importer", archive.SOURCES)
@@ -62,3 +76,45 @@ def test_registry_bound_publication_scope_is_preserved(importer, field):
     run["source_manifest"]["source"][field] = "different"
     with pytest.raises(archive.SourceProfileArchiveError, match="serving scope differs"):
         archive._validate_run(importer, run)
+
+
+def _versioned_manifest(contract):
+    return {
+        "contract": contract,
+        "importer_id": "massachusetts-borim-profile",
+        "source_key": "massachusetts-borim",
+        "run_id": "a" * 32,
+        "run_ids": ["a" * 32],
+        "source_completed_at": "2026-01-02T00:00:00+00:00",
+        "source_manifest_sha256": "b" * 64,
+        "dependencies": {},
+        "tables": [
+            {
+                "table_name": name,
+                "row_count": 1,
+                "schema_sha256": "c" * 64,
+                **({"content_sha256": "d" * 64} if contract == archive.LEGACY_CONTRACT else {}),
+            }
+            for name in archive.TABLES
+        ],
+    }
+
+
+@pytest.mark.parametrize("contract", (archive.CONTRACT, archive.LEGACY_CONTRACT))
+def test_versioned_receipts_preserve_exact_original_meaning(contract):
+    manifest = _versioned_manifest(contract)
+    assert archive.validate_manifest(manifest) == manifest
+    assert archive._validation_contract(manifest) == (
+        archive.VALIDATION_CONTRACT if contract == archive.CONTRACT else archive.LEGACY_VALIDATION_CONTRACT
+    )
+    manifest["contract"] = archive.LEGACY_CONTRACT if contract == archive.CONTRACT else archive.CONTRACT
+    with pytest.raises(archive.SourceProfileArchiveError, match="table receipt"):
+        archive.validate_manifest(manifest)
+
+
+def test_set_validated_receipt_rejects_legacy_hash_and_unknown_fields():
+    for field in ("content_sha256", "approved_by_peer", "payload_sha256"):
+        manifest = _versioned_manifest(archive.CONTRACT)
+        manifest["tables"][0][field] = "d" * 64
+        with pytest.raises(archive.SourceProfileArchiveError, match="table receipt"):
+            archive.validate_manifest(manifest)

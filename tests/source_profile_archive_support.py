@@ -11,7 +11,6 @@ from sqlalchemy import insert, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.schema import CreateIndex
 
 from db import models
 from process import source_profile_result_archive as archive
@@ -33,12 +32,8 @@ async def _create_family(session, schema):
         (*archive.MODELS, models.ProviderProfileSourcePublication, models.ProviderProfileSourcePin),
     )
     await archive.native._create_model_family(session, spec, schema, create_indexes=False)
-    metadata = archive.native.MetaData(schema=schema)
-    for model in (*archive.MODELS, models.ProviderProfileSourcePin):
-        table = model.__table__.to_metadata(metadata, schema=schema)
-        for index in table.indexes:
-            await session.execute(CreateIndex(index))
-    for statement in archive.pins.pin_guard_statements(schema):
+    await archive.native._create_model_indexes(session, spec, schema, create_constraints=True)
+    for statement in archive.pins.statement_pin_guard_statements(schema):
         await session.execute(text(statement))
     for statement in archive.pins.pin_policy_statements(schema):
         await session.execute(text(statement))
@@ -164,6 +159,7 @@ async def _drop_family(session, schema):
     await session.execute(text("DROP TABLE " + ", ".join(archive._table(schema, name) for name in names) + " RESTRICT"))
     await session.execute(text(f'DROP FUNCTION "{schema}".provider_profile_pinned_run_guard() RESTRICT'))
     await session.execute(text(f'DROP FUNCTION "{schema}".provider_profile_pinned_truncate_guard() RESTRICT'))
+    await session.execute(text(f'DROP FUNCTION "{schema}".provider_profile_attached_pin_guard() RESTRICT'))
     await session.execute(text(f'DROP SCHEMA "{schema}" RESTRICT'))
 
 
