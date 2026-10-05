@@ -742,8 +742,10 @@ async def test_finalized_replay_checks_identity_without_rewriting_entire_release
 ):
     check = AsyncMock()
     backfill = AsyncMock()
+    refresh = AsyncMock()
     monkeypatch.setattr(cms, "_assert_identity_evidence", check)
     monkeypatch.setattr(cms, "_backfill_network_roles", backfill)
+    monkeypatch.setattr(cms, "_refresh_identity_statistics", refresh)
     candidate = SimpleNamespace(dataset_id="finalized", already_validated=validated, already_published=published)
     identity = cms.release_identity(_receipt())
     fake_fhir = object()
@@ -751,7 +753,83 @@ async def test_finalized_replay_checks_identity_without_rewriting_entire_release
     await cms._materialize_identity_evidence(fake_fhir, tmp_path, candidate, identity, ctx_by_field, {})
     backfill.assert_awaited_once_with(fake_fhir, identity, ctx_by_field, {})
     check.assert_awaited_once_with(fake_fhir, candidate, identity)
+    refresh.assert_not_awaited()
     assert ctx_by_field["context"]["audit"]["cms_intake"]["phase"] == "identity_validation"
+
+
+def _identity_statistics_fixture(monkeypatch, directory: Path, failure=None):
+    _, compressed_by_file = _source()
+    for name, compressed in compressed_by_file.items():
+        (directory / f"{name}.zst").write_bytes(compressed)
+    events = []
+    refresh_calls = count(1)
+
+    def refresh_table(statement):
+        events.append(("analyze", statement))
+        if next(refresh_calls) == 2 and failure is not None:
+            raise failure
+
+    check = AsyncMock(side_effect=lambda *_args: events.append(("validate", None)))
+    monkeypatch.setattr(cms, "_assert_identity_evidence", check)
+    monkeypatch.setattr(
+        cms, "_write_identity_batch", AsyncMock(side_effect=lambda *args: events.append(("write", args[4])))
+    )
+    fake_fhir = SimpleNamespace(
+        db=SimpleNamespace(status=AsyncMock(side_effect=refresh_table)),
+        _schema=lambda: "synthetic",
+        _qt=lambda schema, table: f'"{schema}"."{table}"',
+        _raise_if_resource_import_cancelled=AsyncMock(side_effect=lambda *_args: events.append(("cancel", None))),
+    )
+    return SimpleNamespace(
+        fhir=fake_fhir,
+        candidate=SimpleNamespace(dataset_id="synthetic", already_validated=False, already_published=False),
+        identity=cms.release_identity(_receipt()),
+        check=check,
+        events=events,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_identity_refreshes_before_validation(monkeypatch, tmp_path: Path):
+    fixture = _identity_statistics_fixture(monkeypatch, tmp_path)
+    await cms._materialize_identity_evidence(fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {})
+    assert fixture.events == [
+        ("write", "Organization"),
+        ("write", "Location"),
+        ("write", "InsurancePlan"),
+        ("write", "PractitionerRole"),
+        ("cancel", None),
+        ("analyze", 'ANALYZE "synthetic"."provider_directory_resource_identity";'),
+        ("cancel", None),
+        ("analyze", 'ANALYZE "synthetic"."provider_directory_entity_source_binding";'),
+        ("cancel", None),
+        ("analyze", 'ANALYZE "synthetic"."provider_directory_entity_release_evidence";'),
+        ("cancel", None),
+        ("validate", None),
+    ]
+    fixture.check.assert_awaited_once_with(fixture.fhir, fixture.candidate, fixture.identity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_cancelled", (False, True))
+async def test_identity_refresh_failure_preserves_writes(monkeypatch, tmp_path: Path, is_cancelled: bool):
+    failure = asyncio.CancelledError() if is_cancelled else RuntimeError("synthetic_refresh_failure")
+    fixture = _identity_statistics_fixture(monkeypatch, tmp_path, failure)
+    with pytest.raises(type(failure)) as caught:
+        await cms._materialize_identity_evidence(fixture.fhir, tmp_path, fixture.candidate, fixture.identity, {}, {})
+    assert caught.value is failure
+    assert fixture.events == [
+        ("write", "Organization"),
+        ("write", "Location"),
+        ("write", "InsurancePlan"),
+        ("write", "PractitionerRole"),
+        ("cancel", None),
+        ("analyze", 'ANALYZE "synthetic"."provider_directory_resource_identity";'),
+        ("cancel", None),
+        ("analyze", 'ANALYZE "synthetic"."provider_directory_entity_source_binding";'),
+    ]
+    assert fixture.fhir.db.status.await_count == 2
+    fixture.check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
