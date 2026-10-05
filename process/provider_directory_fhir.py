@@ -70208,9 +70208,7 @@ async def _endpoint_dataset_content_proof(
     """Hash an ordered dataset and each resource family with bounded pages."""
     content_hash = hashlib.sha256()
     resource_count = 0
-    resource_hasher_by_type = {
-        resource_type: hashlib.sha256() for resource_type in resource_types
-    }
+    resource_hasher_by_type = {resource_type: hashlib.sha256() for resource_type in resource_types}
     resource_count_by_type = dict.fromkeys(resource_types, 0)
     after_resource_type: str | None = None
     after_resource_id: str | None = None
@@ -70239,18 +70237,14 @@ async def _endpoint_dataset_content_proof(
             content_hash.update(identity_bytes)
             resource_count += 1
             resource_type = identity[0]
-            resource_hasher = resource_hasher_by_type.setdefault(
-                resource_type, hashlib.sha256()
-            )
+            resource_hasher = resource_hasher_by_type.setdefault(resource_type, hashlib.sha256())
             if resource_count_by_type.get(resource_type, 0):
                 resource_hasher.update(b"\n")
             resource_hasher.update(identity_bytes)
-            resource_count_by_type[resource_type] = (
-                resource_count_by_type.get(resource_type, 0) + 1
-            )
-        after_resource_type, after_resource_id, _payload_hash = (
-            _endpoint_dataset_hash_identity(resource_rows[-1])
-        )
+            resource_count_by_type[resource_type] = resource_count_by_type.get(resource_type, 0) + 1
+            if resource_count % 1_000 == 0:
+                await asyncio.sleep(0)
+        after_resource_type, after_resource_id, _payload_hash = _endpoint_dataset_hash_identity(resource_rows[-1])
         if len(resource_rows) < batch_size:
             break
     return _completed_endpoint_dataset_content_proof(

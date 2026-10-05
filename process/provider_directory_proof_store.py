@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 import datetime
 import hashlib
@@ -12,7 +14,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
-from typing import Any, Iterable, Mapping
+from typing import Any, Generator, Iterable, Mapping
 import zlib
 
 from process.provider_directory_organization_hash import (
@@ -57,6 +59,7 @@ PROVIDER_DIRECTORY_PROOF_SHARD_TABLE = (
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SPOOL_ROWS = 65_536
 _MERGE_FAN_IN = 32
+_PROOF_CHECKPOINT_ROWS = 1_000
 _NPI_RESOURCE_TYPES = {
     "HealthcareService",
     "Organization",
@@ -840,6 +843,31 @@ async def persist_dataset_proof_shard(
     return descriptor_by_field
 
 
+def _drain_proof_steps(steps: Generator[None, None, Any]) -> Any:
+    """Finish the shared proof algorithm for synchronous callers."""
+
+    try:
+        while True:
+            next(steps)
+    except StopIteration as completed:
+        return completed.value
+    finally:
+        steps.close()
+
+
+async def _drain_proof_steps_async(steps: Generator[None, None, Any]) -> Any:
+    """Run bounded proof work while allowing ownership and cancellation checks."""
+
+    try:
+        while True:
+            next(steps)
+            await asyncio.sleep(0)
+    except StopIteration as completed:
+        return completed.value
+    finally:
+        steps.close()
+
+
 class _RecordSpool:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
@@ -880,6 +908,11 @@ class _RecordSpool:
     def bounded_paths(self) -> list[Path]:
         """Compact sorted runs until the final merge has bounded fan-in."""
 
+        return _drain_proof_steps(self.bounded_path_steps())
+
+    def bounded_path_steps(self) -> Generator[None, None, list[Path]]:
+        """Compact the same sorted runs with bounded scheduling checkpoints."""
+
         self.flush()
         paths = list(self.paths)
         merge_ordinal = 0
@@ -887,9 +920,8 @@ class _RecordSpool:
             next_paths: list[Path] = []
             for offset in range(0, len(paths), _MERGE_FAN_IN):
                 selected_paths = paths[offset : offset + _MERGE_FAN_IN]
-                next_paths.append(
-                    self._merge_paths(selected_paths, merge_ordinal)
-                )
+                merged_path = yield from self._merge_path_steps(selected_paths, merge_ordinal)
+                next_paths.append(merged_path)
                 merge_ordinal += 1
             paths = next_paths
         return paths
@@ -901,15 +933,23 @@ class _RecordSpool:
     ) -> Path:
         """Merge and retire one bounded group of sorted spool runs."""
 
+        return _drain_proof_steps(self._merge_path_steps(selected_paths, merge_ordinal))
+
+    def _merge_path_steps(
+        self,
+        selected_paths: list[Path],
+        merge_ordinal: int,
+    ) -> Generator[None, None, Path]:
+        """Close every stream before cancellation can dispose the spool."""
+
         output_path = self.directory / f"merge-{merge_ordinal:06d}.ndjson"
-        input_streams = [path.open("rb") for path in selected_paths]
-        try:
-            with output_path.open("wb") as output:
-                for line in heapq.merge(*input_streams):
-                    output.write(line)
-        finally:
-            for input_stream in input_streams:
-                input_stream.close()
+        with ExitStack() as streams:
+            input_streams = [streams.enter_context(path.open("rb")) for path in selected_paths]
+            output = streams.enter_context(output_path.open("wb"))
+            for row_count, line in enumerate(heapq.merge(*input_streams), 1):
+                output.write(line)
+                if row_count % _PROOF_CHECKPOINT_ROWS == 0:
+                    yield
         for selected_path in selected_paths:
             selected_path.unlink()
         return output_path
@@ -1402,33 +1442,64 @@ class _ResourceProofAccumulator:
         )
 
 
+@contextmanager
+def _merged_spool_lines(
+    spool: _RecordSpool,
+    paths: list[Path],
+) -> Generator[Iterable[bytes], None, None]:
+    """Keep sorted-run readers owned until completion or cancellation."""
+
+    with ExitStack() as streams:
+        readers = []
+        for path in paths:
+            reader = iter(spool.lines(path))
+            close = getattr(reader, "close", None)
+            if close is not None:
+                streams.callback(close)
+            readers.append(reader)
+        yield heapq.merge(*readers)
+
+
 def _merged_resource_proof_summary(
     record_spool: _RecordSpool,
     npi_spool: _RecordSpool,
 ) -> _MergedResourceSummary:
     """Merge exact identities and composable v3 Practitioner observations."""
 
+    return _drain_proof_steps(_merged_resource_proof_steps(
+        record_spool, npi_spool, record_spool.bounded_paths()
+    ))
+
+
+def _merged_resource_proof_steps(
+    record_spool: _RecordSpool,
+    npi_spool: _RecordSpool,
+    paths: list[Path],
+) -> Generator[None, None, _MergedResourceSummary]:
+    """Reduce identities without splitting a group at scheduling boundaries."""
+
     proof_accumulator = _ResourceProofAccumulator()
     current_key: tuple[str, str] | None = None
     current_proof_records: list[list[Any]] = []
 
-    for record_line in heapq.merge(
-        *(record_spool.lines(path) for path in record_spool.bounded_paths())
-    ):
-        proof_record_fields = _decoded_record(record_line)
-        resource_key = proof_record_fields[0], proof_record_fields[1]
-        if current_key is not None and resource_key < current_key:
-            raise ProviderDirectoryProofStoreError(
-                "provider directory proof merge order changed"
-            )
-        if current_key is not None and resource_key != current_key:
-            proof_accumulator.add_record_group(
-                current_proof_records,
-                npi_spool,
-            )
-            current_proof_records = []
-        current_key = resource_key
-        current_proof_records.append(proof_record_fields)
+    with _merged_spool_lines(record_spool, paths) as record_lines:
+        for row_count, record_line in enumerate(record_lines, 1):
+            proof_record_fields = _decoded_record(record_line)
+            resource_key = proof_record_fields[0], proof_record_fields[1]
+            if current_key is not None and resource_key < current_key:
+                raise ProviderDirectoryProofStoreError(
+                    "provider directory proof merge order changed"
+                )
+            if current_key is not None and resource_key != current_key:
+                proof_accumulator.add_record_group(
+                    current_proof_records,
+                    npi_spool,
+                )
+                current_proof_records = []
+            current_key = resource_key
+            current_proof_records.append(proof_record_fields)
+            if row_count % _PROOF_CHECKPOINT_ROWS == 0:
+                yield
     proof_accumulator.add_record_group(
         current_proof_records,
         npi_spool,
@@ -1455,19 +1526,29 @@ def _merged_resource_proof(
 def _merged_npi_proof(npi_spool: _RecordSpool) -> tuple[int, str]:
     """Merge the NPI spool into an exact distinct count and set hash."""
 
+    return _drain_proof_steps(_merged_npi_proof_steps(npi_spool, npi_spool.bounded_paths()))
+
+
+def _merged_npi_proof_steps(
+    npi_spool: _RecordSpool,
+    paths: list[Path],
+) -> Generator[None, None, tuple[int, str]]:
+    """Count every input toward checkpoints, including duplicate NPIs."""
+
     distinct_npis = 0
     npi_digest = hashlib.sha256()
     previous_npi: bytes | None = None
-    for npi_bytes in heapq.merge(
-        *(npi_spool.lines(path) for path in npi_spool.bounded_paths())
-    ):
-        if npi_bytes == previous_npi:
-            continue
-        if distinct_npis:
-            npi_digest.update(b"\n")
-        npi_digest.update(npi_bytes)
-        previous_npi = npi_bytes
-        distinct_npis += 1
+    with _merged_spool_lines(npi_spool, paths) as npi_lines:
+        for row_count, npi_bytes in enumerate(npi_lines, 1):
+            if row_count % _PROOF_CHECKPOINT_ROWS == 0:
+                yield
+            if npi_bytes == previous_npi:
+                continue
+            if distinct_npis:
+                npi_digest.update(b"\n")
+            npi_digest.update(npi_bytes)
+            previous_npi = npi_bytes
+            distinct_npis += 1
     return distinct_npis, npi_digest.hexdigest()
 
 
@@ -1486,8 +1567,19 @@ def _complete_spools(
 ]:
     """Merge resource identities and exact source metrics once."""
 
-    merged = _merged_resource_proof_summary(record_spool, npi_spool)
-    distinct_npis, npi_sha256 = _merged_npi_proof(npi_spool)
+    return _drain_proof_steps(_complete_spool_steps(record_spool, npi_spool))
+
+
+def _complete_spool_steps(
+    record_spool: _RecordSpool,
+    npi_spool: _RecordSpool,
+) -> Generator[None, None, Any]:
+    """Share ordered compaction, identity reduction and NPI proof work."""
+
+    paths = yield from record_spool.bounded_path_steps()
+    merged = yield from _merged_resource_proof_steps(record_spool, npi_spool, paths)
+    npi_paths = yield from npi_spool.bounded_path_steps()
+    distinct_npis, npi_sha256 = yield from _merged_npi_proof_steps(npi_spool, npi_paths)
     metrics_by_name = dict(merged.source_metrics_by_name)
     metrics_by_name["distinct_npis"] = distinct_npis
     return (
@@ -1546,6 +1638,7 @@ async def _load_shards(
             }
             public_descriptor_by_field["dataset_id"] = dataset_id
             shard_descriptors.append(public_descriptor_by_field)
+            await asyncio.sleep(0)
         after_shard_id = str(
             _row_mapping(shard_rows[-1])["shard_id"]
         )
@@ -1646,7 +1739,7 @@ async def _merged_stored_dataset_proof(
             raise ProviderDirectoryProofStoreError(
                 "provider directory durable proof shards are missing"
             )
-        merged_fields = _complete_spools(record_spool, npi_spool)
+        merged_fields = await _drain_proof_steps_async(_complete_spool_steps(record_spool, npi_spool))
     resource_hash_by_type = merged_fields[2]
     resource_count_by_type = merged_fields[3]
     for resource_type in _lineage_resource_scope(lineage):
