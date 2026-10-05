@@ -12,18 +12,25 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from db.models.custom_import import (
     CustomImportBuildAttempt,
+    CustomImportBuildCandidateContext,
     CustomImportBuildVerification,
+    CustomImportChildRevision,
+    CustomImportFamilyRevision,
     CustomImportGeneration,
+    CustomImportRootRevision,
     CustomImportRootScalar,
 )
+from process.custom_import import build_graph as graph
 from process.custom_import import build_output as output
 from process.custom_import import materialization as material
 from process.custom_import.execution import lease_token_sha256
-from process.custom_import.runner_types import CandidateRegistry, CandidateRunnerError
-from tests.test_custom_import_build_graph import _request
+from process.custom_import.runner_types import CandidateRegistry, CandidateRunnerError, LeaseAuthorityLost
+from tests.test_custom_import_build_graph import _read_session, _request
+from tests.test_custom_import_definition import _root
 from tests.test_custom_import_materialization import _child_candidate
 
 
@@ -137,6 +144,160 @@ def test_late_group_failure_cannot_produce_a_winner(monkeypatch):
     with pytest.raises(CandidateRunnerError, match="late candidate"):
         output._reduce_group(None, request, registry, 7, _generation(request), group)
     lookup.assert_not_called()
+
+
+def _context_row(request, candidate, stored=None):
+    registry, group = _group(request, candidate)
+    contract = material._winner_candidate_contract(
+        request.definition, material._profile_scopes(request.definition, registry.child_collection_slots)
+    )
+    canonical, digest = material._context_key(
+        request.definition.selection_profiles[0],
+        material._normalize_winner_candidate(candidate, contract),
+        contract.fields_by_id,
+    )
+    context = CustomImportBuildCandidateContext(
+        candidate_context_id=candidate.context_child_revision_id,
+        profile_slot=group[0],
+        entity_binding_id=candidate.entity_binding_id,
+        context_collection_slot=candidate.context_collection_slot,
+        canonical_context_key=canonical,
+        context_key_sha256=digest,
+    )
+    family = CustomImportFamilyRevision(
+        family_revision_id=candidate.family_revision_id,
+        family_sha256=candidate.family_sha256,
+        entity_binding_id=candidate.entity_binding_id,
+    )
+    root = CustomImportRootRevision(canonical_payload=output.record_payload(request.definition.root_fields, _root()))
+    child = CustomImportChildRevision(
+        child_revision_id=candidate.context_child_revision_id,
+        collection_slot=candidate.context_collection_slot,
+        child_key_sha256=candidate.context_child_key_sha256,
+        canonical_payload=output.record_payload(
+            output.fields_by_collection(request.definition)["rates"],
+            {"rate_npi": "1234567893", **candidate.values_by_field},
+        ),
+    )
+    return (context, family, root, child, *(stored or (None, None, None)))
+
+
+def _context_session(monkeypatch, rows, page_rows=2):
+    pages = []
+    for start in range(0, len(rows), page_rows):
+        page = rows[start : start + page_rows]
+        pages.extend(
+            (
+                [
+                    (*output._group_key(row[0]), row[0].candidate_context_id, output._model_bytes(row[:4]))
+                    for row in page
+                ],
+                page,
+            )
+        )
+    return _read_session(monkeypatch, [*pages, []])
+
+
+def test_ordered_verification_reads_pages_across_complete_groups(monkeypatch):
+    request = _request(page_row_limit=2)
+    first = _candidate()
+    best = _candidate(32, 42, b"\x00" * 32)
+    later_candidates = [replace(_candidate(40 + index, 50 + index), entity_binding_id=42 + index) for index in range(3)]
+    stored = (best.family_revision_id, 7, best.context_child_revision_id)
+    rows = [_context_row(request, candidate, stored) for candidate in (first, _candidate(31, 41), best)]
+    rows.extend(
+        _context_row(request, candidate, (candidate.family_revision_id, 7, candidate.context_child_revision_id))
+        for candidate in later_candidates
+    )
+    session = _context_session(monkeypatch, rows)
+    lookup = Mock(side_effect=AssertionError("winner verification must not query individual groups"))
+    monkeypatch.setattr(output, "_one_row", lookup)
+    registry, _ = _group(request, first)
+    assert output._verify_winner_groups(session, request, registry, 7, _generation(request)) == 4
+    assert session.execute.call_count == 7
+    metadata, payload = [
+        call.args[0].compile(dialect=postgresql.dialect()) for call in session.execute.call_args_list[:2]
+    ]
+    assert metadata.params["param_1"] == 2 and "octet_length" in str(metadata)
+    assert "LEFT OUTER JOIN mrf.custom_import_winner" in str(payload)
+    assert "custom_import_winner.generation_id" in str(payload)
+    assert "custom_import_winner.context_key_sha256" in str(payload)
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("stored", [(None, None, None), (99, 7, 40), (30, 0, None), (30, 7, 99)])
+def test_ordered_verification_rejects_missing_or_changed_winner(monkeypatch, stored):
+    request, candidate = _request(), _candidate()
+    session = _context_session(monkeypatch, [_context_row(request, candidate, stored)])
+    registry, _ = _group(request, candidate)
+    with pytest.raises(CandidateRunnerError, match="surviving-tie reduction"):
+        output._verify_winner_groups(session, request, registry, 7, _generation(request))
+
+
+@pytest.mark.parametrize("has_better", [False, True])
+def test_ordered_groups_preserve_surviving_tie_conflicts(monkeypatch, has_better):
+    request, first = _request(page_row_limit=2), _candidate()
+    candidates = [first, _candidate(31, 41)]
+    if has_better:
+        candidates.append(_candidate(32, 42, b"\x00" * 32))
+    session = _context_session(monkeypatch, [_context_row(request, candidate) for candidate in candidates])
+    registry, _ = _group(request, first)
+    winners = output._ordered_winners(session, request, registry, 7, _generation(request))
+    if not has_better:
+        with pytest.raises(material.WinnerMaterializationError, match="conflicting physical identity"):
+            next(winners)
+    else:
+        assert [winner.family_revision_id for winner in winners] == [32]
+
+
+@pytest.mark.parametrize("failure", ["collision", "payload"])
+def test_ordered_group_rechecks_losers_before_yield(monkeypatch, failure):
+    request, first = _request(), _candidate()
+    other = _candidate(31, 41)
+    if failure == "collision":
+        context_key = material._context_key
+        monkeypatch.setattr(material, "_context_key", lambda *args: (context_key(*args)[0], b"c" * 32))
+        other = replace(other, values_by_field={"service_code": "B200", "amount": Decimal("99")})
+    rows = [_context_row(request, candidate) for candidate in (first, other)]
+    if failure == "payload":
+        rows[1][3].canonical_payload = "{}"
+    session = _context_session(monkeypatch, rows, page_rows=1)
+    registry, _ = _group(request, first)
+    failure_type = material.WinnerMaterializationError if failure == "collision" else CandidateRunnerError
+    with pytest.raises(failure_type):
+        next(output._ordered_winners(session, request, registry, 7, _generation(request)))
+
+
+def test_ordered_group_resume_uses_fresh_read_and_complete_cursor(monkeypatch):
+    request, first = _request(page_row_limit=2), _candidate()
+    later = replace(_candidate(31, 41), entity_binding_id=42)
+    rows = [_context_row(request, candidate) for candidate in (first, later)]
+    registry, _ = _group(request, first)
+    session = _context_session(monkeypatch, rows)
+    winners = output._ordered_winners(session, request, registry, 7, _generation(request))
+    winner = next(winners)
+    monkeypatch.setattr(graph.time, "monotonic", lambda: 21)
+    with pytest.raises(LeaseAuthorityLost):
+        next(winners)
+    resumed = _context_session(monkeypatch, rows[1:])
+    after = (winner.profile_slot, winner.entity_binding_id, winner.context_key_sha256)
+    assert [
+        winner.family_revision_id
+        for winner in output._ordered_winners(resumed, request, registry, 7, _generation(request), after=after)
+    ] == [31]
+    parameters = resumed.execute.call_args_list[0].args[0].compile().params
+    assert all(value in parameters.values() for value in after)
+    assert " > " in str(resumed.execute.call_args_list[0].args[0])
+
+
+def test_ordered_context_metadata_rejects_oversized_payload_before_read(monkeypatch):
+    request, candidate = _request(page_byte_limit=1), _candidate()
+    row = _context_row(request, candidate)
+    session = _context_session(monkeypatch, [row])
+    registry, _ = _group(request, candidate)
+    with pytest.raises(CandidateRunnerError, match="byte page"):
+        next(output._ordered_winners(session, request, registry, 7, _generation(request)))
+    assert session.execute.call_count == 1
 
 
 def _proof_tuple():
