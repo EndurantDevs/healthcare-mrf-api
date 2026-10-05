@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -293,6 +293,8 @@ async def test_new_publication_runs_full_sequence_before_readiness(
     identity, admission = _identity_and_admission()
     previous_dataset = _legacy_current()
     database = object()
+    candidate_scope = Mock(side_effect=lambda *_args, **_kwargs: _transaction())
+    monkeypatch.setattr(store, "prepare_dataset_candidate", candidate_scope)
     monkeypatch.setattr(
         store,
         "_locked_existing_dataset",
@@ -334,6 +336,7 @@ async def test_new_publication_runs_full_sequence_before_readiness(
         10,
     )
     assert publication_result.replayed is False
+    candidate_scope.assert_called_with(database, identity.dataset_id, kind="practitioner")
     store._supersede_previous.assert_awaited_with(
         database,
         previous_dataset,

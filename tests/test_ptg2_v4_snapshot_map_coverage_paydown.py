@@ -372,19 +372,11 @@ async def test_relation_and_owner_publication_reject_bad_batches_and_conflicts(
             build_token="token",
             entries=(_relation_row(),),
         )
-    monkeypatch.setattr(snapshot_maps, "_insert_heavy_owner_rows", AsyncMock())
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_load_heavy_owner_rows",
-        AsyncMock(return_value=[]),
-    )
-    with pytest.raises(RuntimeError, match="heavy-owner manifest conflicts"):
+    monkeypatch.setattr(snapshot_maps, "publish_snapshot_records", AsyncMock(side_effect=RuntimeError("candidate replay differs")))
+    with pytest.raises(RuntimeError, match="candidate replay differs"):
         await snapshot_maps.publish_v4_heavy_owners(
-            object(),
-            schema_name="mrf",
-            snapshot_key=1,
-            build_token="token",
-            entries=(_owner_row(),),
+            object(), schema_name="mrf", snapshot_key=1,
+            build_token="token", entries=(_owner_row(),),
         )
 
 
@@ -399,15 +391,20 @@ async def test_seal_database_compare_and_swap_failures(monkeypatch) -> None:
             snapshot_key=1,
             build_token="token",
         )
+    completion_session = _ScriptedSession(_Result(), _Result(scalar=None))
     with pytest.raises(RuntimeError, match="could not be completed"):
         await snapshot_maps._complete_v4_map_root(
-            _ScriptedSession(_Result(scalar=None)),
+            completion_session,
             schema='"mrf"',
             snapshot_key=1,
+            build_token="token",
             representation="direct_v1",
             summary=_summary(),
             metadata=_metadata(),
         )
+    assert "prepare_ptg_snapshot_completion" in completion_session.calls[0][0]
+    assert completion_session.calls[0][1]["token"] == "token"
+    assert "UPDATE" in completion_session.calls[1][0]
     cleanup_pending = AsyncMock()
     monkeypatch.setattr(
         snapshot_maps,
@@ -465,6 +462,6 @@ async def test_pattern_seal_requires_pattern_metadata(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="no pattern metadata"):
         await snapshot_maps._prepare_v4_seal_state(
-            _ScriptedSession(_Result(rows=((None, None, None),))),
+            _ScriptedSession(_Result(scalar={}), _Result(rows=((None, None, None),))),
             request,
         )

@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_rooted_graph_bulk import admit_result_witnesses
 from process.provider_directory_rooted_graph_frontier import (
     register_rooted_graph_frontier,
 )
@@ -67,74 +68,6 @@ def _complete_missing_sql() -> str:
     """
 
 
-async def _insert_resources(
-    database: Any,
-    claim: ProviderDirectoryRootedGraphWorkClaim,
-    query_result: ProviderDirectoryRootedGraphQueryResult,
-) -> None:
-    for resource in query_result.resources:
-        count = await database.status(
-            f"""
-            INSERT INTO {table_ref(RESOURCE_TABLE)} (
-                acquisition_id, scope_id, query_id, attempt,
-                resource_type, resource_id, payload_sha256,
-                payload_json_text, closure_scope
-            ) VALUES (
-                :acquisition_id, :scope_id, :query_id, :attempt,
-                :resource_type, :resource_id, :payload_sha256,
-                :payload_json_text, :closure_scope
-            );
-            """,
-            acquisition_id=claim.acquisition_id,
-            scope_id=claim.scope_id,
-            query_id=claim.query_id,
-            attempt=claim.attempt,
-            resource_type=resource.resource_type,
-            resource_id=resource.resource_id,
-            payload_sha256=resource.payload_sha256,
-            payload_json_text=resource.payload_json_text,
-            closure_scope=resource.closure_scope,
-        )
-        if count != 1:
-            raise ProviderDirectoryRootedGraphStoreError("state")
-
-
-async def _insert_edges(
-    database: Any,
-    claim: ProviderDirectoryRootedGraphWorkClaim,
-    query_result: ProviderDirectoryRootedGraphQueryResult,
-) -> None:
-    for edge in query_result.edges:
-        count = await database.status(
-            f"""
-            INSERT INTO {table_ref(EDGE_TABLE)} (
-                acquisition_id, scope_id, query_id, attempt,
-                source_resource_type, source_resource_id, field_path,
-                target_resource_type, target_resource_id, edge_sha256,
-                closure_scope
-            ) VALUES (
-                :acquisition_id, :scope_id, :query_id, :attempt,
-                :source_resource_type, :source_resource_id, :field_path,
-                :target_resource_type, :target_resource_id, :edge_sha256,
-                :closure_scope
-            );
-            """,
-            acquisition_id=claim.acquisition_id,
-            scope_id=claim.scope_id,
-            query_id=claim.query_id,
-            attempt=claim.attempt,
-            source_resource_type=edge.source_resource_type,
-            source_resource_id=edge.source_resource_id,
-            field_path=edge.field_path,
-            target_resource_type=edge.target_resource_type,
-            target_resource_id=edge.target_resource_id,
-            edge_sha256=edge.edge_sha256,
-            closure_scope=edge.closure_scope,
-        )
-        if count != 1:
-            raise ProviderDirectoryRootedGraphStoreError("state")
-
-
 async def complete_provider_directory_rooted_graph_result(
     claim: ProviderDirectoryRootedGraphWorkClaim,
     query_result: ProviderDirectoryRootedGraphQueryResult,
@@ -144,12 +77,8 @@ async def complete_provider_directory_rooted_graph_result(
     """Atomically retain witnesses and terminalize one live query lease."""
 
     validate_provider_directory_rooted_graph_query_result(claim, query_result)
-    async with database.transaction():
-        await set_store_action(
-            database, "witness", claim.acquisition_id, claim.lease_token
-        )
-        await _insert_resources(database, claim, query_result)
-        await _insert_edges(database, claim, query_result)
+    async with database.transaction() as transaction:
+        await admit_result_witnesses(database, transaction, claim, query_result)
         await set_store_action(
             database, "terminal", claim.acquisition_id, claim.lease_token
         )
@@ -392,7 +321,7 @@ def _seal_update_sql() -> str:
 
 
 async def _seal_header(database: Any, acquisition_id: str) -> Any:
-    """Apply counts and comparison roots under the caller's table locks."""
+    """Apply counts and comparison roots under exact acquisition storage locks."""
 
     return await database.first(
         _seal_census_sql() + _seal_update_sql(),
@@ -425,9 +354,10 @@ async def seal_provider_directory_rooted_graph_acquisition(
         )
         if header["status"] == "sealed":
             return _summary_from_row(header)
-        await database.status(
-            f"LOCK TABLE {table_ref(WORK_TABLE)}, {table_ref(RESOURCE_TABLE)}, "
-            f"{table_ref(EDGE_TABLE)} IN SHARE MODE;"
+        await database.scalar(
+            f"SELECT {function_ref('finish_provider_directory_rooted_graph_storage')}("
+            ":acquisition_id);",
+            acquisition_id=identity.acquisition_id,
         )
         sealed = await _seal_header(database, identity.acquisition_id)
         if sealed is None:

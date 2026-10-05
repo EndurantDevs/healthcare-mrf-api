@@ -33,6 +33,7 @@ from tests.formulary_fhir_twin_admission_pg_support import assert_sqlstate
 from tests.formulary_fhir_twin_admission_pg_support import connect
 from tests.formulary_fhir_twin_admission_pg_support import quoted
 from tests.formulary_fhir_twin_admission_pg_support import run_migration
+from tests.formulary_fhir_twin_admission_pg_support import load_migration, VERSIONS
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     cohort_fixture,
     create_provider_foundation,
@@ -194,6 +195,10 @@ async def prepare_schema(
     finally:
         await connection.close()
     await run_migration(engine, acquisition_migration, "upgrade")
+    await run_migration(engine, load_migration(
+        VERSIONS / "20261005120000_practitioner_set_validation.py",
+        "flex_twin_set_validation",
+    ), "upgrade")
     await run_migration(engine, twin_migration, "upgrade")
 
 

@@ -36,8 +36,8 @@ from process.uhc_flex_practitioner_store_contract import (
 from process.uhc_flex_practitioner_store_support import (
     ACQUISITION_TABLE,
     assert_identity_row,
+    function_ref,
     identity_fields,
-    MEMBER_TABLE,
     row_fields,
     set_store_action,
     table_ref,
@@ -75,51 +75,17 @@ async def _insert_acquisition_header(
 async def _insert_pending_workset(
     database: Any,
     identity: UHCFlexPractitionerAcquisitionIdentity,
+    transaction: Any,
 ) -> None:
-    await set_store_action(database, "initialize", identity.acquisition_id)
-    await database.status(
-        f"""
-        INSERT INTO {table_ref(WORK_TABLE)} (
-            acquisition_id, cohort_id, npi, status, attempt_count
-        )
-        SELECT :acquisition_id, member.cohort_id, member.npi, 'pending', 0
-          FROM {table_ref(MEMBER_TABLE)} AS member
-         WHERE member.cohort_id = :cohort_id
-         ORDER BY member.npi
-        ON CONFLICT (acquisition_id, npi) DO NOTHING;
-        """,
+    from process.uhc_flex_practitioner_stage import copy_work_candidate
+
+    if await copy_work_candidate(database, transaction, identity) is None:
+        return
+    await database.scalar(
+        f"SELECT {function_ref('initialize_pd_uhc_flex_practitioner_work')}(:acquisition_id, :cohort_id);",
         acquisition_id=identity.acquisition_id,
         cohort_id=identity.cohort_id,
     )
-
-
-async def _exact_workset_census(
-    database: Any,
-    identity: UHCFlexPractitionerAcquisitionIdentity,
-) -> dict[str, Any]:
-    database_row = await database.first(
-        f"""
-        SELECT count(*)::bigint AS work_count,
-               NOT EXISTS (
-                   SELECT member.npi FROM {table_ref(MEMBER_TABLE)} AS member
-                    WHERE member.cohort_id = :cohort_id
-                   EXCEPT
-                   SELECT work.npi FROM {table_ref(WORK_TABLE)} AS work
-                    WHERE work.acquisition_id = :acquisition_id
-               ) AND NOT EXISTS (
-                   SELECT work.npi FROM {table_ref(WORK_TABLE)} AS work
-                    WHERE work.acquisition_id = :acquisition_id
-                   EXCEPT
-                   SELECT member.npi FROM {table_ref(MEMBER_TABLE)} AS member
-                    WHERE member.cohort_id = :cohort_id
-               ) AS exact_members
-          FROM {table_ref(WORK_TABLE)} AS work
-         WHERE work.acquisition_id = :acquisition_id;
-        """,
-        acquisition_id=identity.acquisition_id,
-        cohort_id=identity.cohort_id,
-    )
-    return row_fields(database_row)
 
 
 async def initialize_uhc_flex_practitioner_acquisition(
@@ -131,26 +97,18 @@ async def initialize_uhc_flex_practitioner_acquisition(
 
     if type(identity) is not UHCFlexPractitionerAcquisitionIdentity:
         raise ValueError("Flex Practitioner acquisition identity is invalid")
-    async with database.transaction():
+    async with database.transaction() as transaction:
         await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:identity, 0));",
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:identity, 0));",
             identity=identity.acquisition_id,
         )
         created_count = await _insert_acquisition_header(database, identity)
         header = await database.first(
-            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} "
-            "WHERE acquisition_id = :acquisition_id FOR SHARE;",
+            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} WHERE acquisition_id = :acquisition_id FOR SHARE;",
             acquisition_id=identity.acquisition_id,
         )
         assert_identity_row(identity, header)
-        await _insert_pending_workset(database, identity)
-        census = await _exact_workset_census(database, identity)
-        if (
-            census.get("work_count") != identity.expected_npi_count
-            or census.get("exact_members") is not True
-        ):
-            raise UHCFlexPractitionerStoreError("state")
+        await _insert_pending_workset(database, identity, transaction)
     return created_count
 
 
@@ -181,9 +139,12 @@ def _validate_claim_selection(
         type(excluded_npis) is not tuple
         or len(excluded_npis) > UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY
         or len(set(excluded_npis)) != len(excluded_npis)
-        or requested_npi is not None and excluded_npis
-        or fresh_only is not None and type(fresh_only) is not bool
-        or requested_npi is not None and fresh_only is not None
+        or requested_npi is not None
+        and excluded_npis
+        or fresh_only is not None
+        and type(fresh_only) is not bool
+        or requested_npi is not None
+        and fresh_only is not None
     ):
         raise ValueError("Flex Practitioner claim selection is invalid")
     for excluded_npi in excluded_npis:
@@ -255,11 +216,7 @@ async def claim_uhc_flex_practitioner_work(
         fresh_filters = ("AND work.attempt_count = 0",)
     else:
         fresh_filters = ("AND work.attempt_count = 0", "")
-    excluded_filter = (
-        "AND work.npi <> ALL(CAST(:excluded_npis AS bigint[]))"
-        if excluded_npis
-        else ""
-    )
+    excluded_filter = "AND work.npi <> ALL(CAST(:excluded_npis AS bigint[]))" if excluded_npis else ""
     claim_parameter_by_name: dict[str, Any] = {
         "acquisition_id": acquisition_id,
         "requested_npi": requested_npi,

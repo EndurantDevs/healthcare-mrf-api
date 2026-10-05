@@ -66,6 +66,10 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261001110000_profile_initial_publication",
     "20261005020000_custom_import_sealed_append_plans",
     "20261005030000_source_profile_statement_pins",
+    "20261005100000_rooted_graph_set_validation",
+    "20261005110000_ptg_set_validation",
+    "20261005120000_practitioner_set_validation",
+    "20261005130000_provider_dataset_candidates",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -99,7 +103,7 @@ def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
     request_identity_revision = "20260922010000_custom_import_execution_request_identity"
     source_binding_revision = "20260923030000_custom_import_source_binding"
     doctors_revision = "20260929000000_cms_doctor_group_site"
-    assert script.get_heads() == ["20261005030000_source_profile_statement_pins"]
+    assert script.get_heads() == ["20261005130000_provider_dataset_candidates"]
     assert script.get_revision("20260930080000_cms_npd_coverage_version").down_revision == (
         "20260930070000_provider_directory_entity_redirect"
     )
@@ -151,6 +155,10 @@ def test_profile_migrations_follow_custom_import_processing_policy() -> None:
         "20261001110000_profile_initial_publication",
         "20261005020000_custom_import_sealed_append_plans",
         "20261005030000_source_profile_statement_pins",
+        "20261005100000_rooted_graph_set_validation",
+        "20261005110000_ptg_set_validation",
+        "20261005120000_practitioner_set_validation",
+        "20261005130000_provider_dataset_candidates",
     )
 
 

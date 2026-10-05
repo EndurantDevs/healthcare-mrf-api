@@ -23,6 +23,14 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_snapshot_candidates import (
+    snapshot_candidate_reads,
+    CANDIDATE_TABLES,
+    COPY_MAX_ROWS,
+    begin_snapshot_candidate,
+    copy_candidate_records,
+    finish_snapshot_candidate,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
     _initialize_v4_snapshot_map_root,
@@ -274,6 +282,7 @@ async def _copy_rekeyed_table(
     table_name: str,
     source_snapshot_key: int,
     destination_snapshot_key: int,
+    build_token: str | None = None,
 ) -> None:
     destination_columns = await _table_columns(session, schema_name=schema_name, table_name=table_name)
     staging_columns = await _table_columns(session, schema_name=staging_schema_name, table_name=table_name)
@@ -284,6 +293,14 @@ async def _copy_rekeyed_table(
     table = _quote_ident(table_name)
     quoted_columns = ", ".join(_quote_ident(column) for column in destination_columns)
     non_key_columns = tuple(column for column in destination_columns if column != "snapshot_key")
+    if table_name in CANDIDATE_TABLES:
+        await _copy_rekeyed_candidate(
+            session, schema_name=schema_name, staging_schema_name=staging_schema_name,
+            table_name=table_name, source_snapshot_key=source_snapshot_key,
+            destination_snapshot_key=destination_snapshot_key, build_token=build_token,
+            columns=destination_columns,
+        )
+        return
     copied_expression = ", ".join(
         ":destination_snapshot_key" if column == "snapshot_key" else _quote_ident(column)
         for column in destination_columns
@@ -309,6 +326,26 @@ async def _copy_rekeyed_table(
         destination_snapshot_key=destination_snapshot_key,
         non_key_columns=non_key_columns,
     )
+
+
+async def _copy_rekeyed_candidate(
+    session, *, schema_name, staging_schema_name, table_name,
+    source_snapshot_key, destination_snapshot_key, build_token, columns,
+):
+    """Stream one exact archived set through bounded native COPY into a candidate."""
+    candidate = await begin_snapshot_candidate(session, schema_name, table_name, destination_snapshot_key, build_token)
+    selected = ",".join("CAST(:destination_snapshot_key AS bigint)" if column == "snapshot_key" else _quote_ident(column) for column in columns)
+    result = await session.stream(text(
+        f"SELECT {selected} FROM {_quote_ident(staging_schema_name)}.{_quote_ident(table_name)} "
+        "WHERE snapshot_key=:source_snapshot_key"
+    ), {"destination_snapshot_key": int(destination_snapshot_key), "source_snapshot_key": int(source_snapshot_key)})
+    count = 0
+    try:
+        async for records in result.partitions(COPY_MAX_ROWS):
+            count += await copy_candidate_records(session, schema_name, candidate, columns, records)
+    finally:
+        await result.close()
+    await finish_snapshot_candidate(session, schema_name, candidate, count)
 
 
 async def _assert_rekeyed_table_matches(
@@ -472,6 +509,7 @@ async def _copy_staged_layout_rows(
     staging_schema_name: str,
     source_snapshot_key: int,
     destination_snapshot_key: int,
+    build_token: str | None = None,
 ) -> None:
     try:
         finalizer_indexes = tuple(_REKEYED_TABLES.index(table_name) for table_name in _FINALIZER_MAP_TABLES)
@@ -489,6 +527,7 @@ async def _copy_staged_layout_rows(
             table_name=table_name,
             source_snapshot_key=source_snapshot_key,
             destination_snapshot_key=destination_snapshot_key,
+            build_token=build_token,
         )
     await _copy_finalizer_map_rows(
         session,
@@ -505,6 +544,7 @@ async def _copy_staged_layout_rows(
             table_name=table_name,
             source_snapshot_key=source_snapshot_key,
             destination_snapshot_key=destination_snapshot_key,
+            build_token=build_token,
         )
 
 
@@ -827,18 +867,19 @@ async def _seal_destination_layout(
     support_digest: bytes,
     layout_manifest: Mapping[str, Any],
 ) -> tuple[int, bytes]:
-    expected_summary = await summarize_persisted_v4_snapshot_maps(
-        session, schema_name=schema_name, snapshot_key=snapshot_key
-    )
-    sealed = await seal_v4_shared_layout(
-        session,
-        schema_name=schema_name,
-        snapshot_key=snapshot_key,
-        build_token=build_token,
-        expected_summary=expected_summary,
-        support_digest=support_digest,
-        layout_manifest=layout_manifest,
-    )
+    async with snapshot_candidate_reads(session, schema_name, snapshot_key, build_token):
+        expected_summary = await summarize_persisted_v4_snapshot_maps(
+            session, schema_name=schema_name, snapshot_key=snapshot_key
+        )
+        sealed = await seal_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            expected_summary=expected_summary,
+            support_digest=support_digest,
+            layout_manifest=layout_manifest,
+        )
     return sealed.snapshot_key, sealed.mapping_digest
 
 
@@ -924,6 +965,7 @@ async def _prepare_new_destination_layout(
         staging_schema_name=preparation.staging_schema_name,
         source_snapshot_key=preparation.source_snapshot_key,
         destination_snapshot_key=preparation.destination_snapshot_key,
+        build_token=preparation.build_token,
     )
     return await _seal_destination_layout(
         session,

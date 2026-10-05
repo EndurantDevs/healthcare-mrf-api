@@ -378,28 +378,15 @@ def test_publication_helper_type_and_schema_boundaries(monkeypatch) -> None:
             function()
 
 
-def test_materialization_rejects_normalizer_identity_drift(monkeypatch) -> None:
-    """Normalized resource identity must equal the sealed graph key."""
-
-    monkeypatch.setattr(
-        materialization,
-        "_raw_graph_resource",
-        lambda _fields, _key: {
-            "resourceType": "Organization",
-            "id": "org.synthetic-1",
-        },
-    )
+def test_materialization_preserves_source_identity_for_set_proof(monkeypatch) -> None:
+    """Normalizer drift cannot replace the sealed identity used by set validation."""
     monkeypatch.setattr(
         materialization,
         "materialize_provider_directory_dataset_fhir_resource",
-        lambda **_keywords: object(),
-    )
-    monkeypatch.setattr(
-        materialization,
-        "_resource_record",
-        lambda *_arguments: {
+        lambda **_keywords: {
             "resource_type": "Location",
             "resource_id": "org.synthetic-1",
+            "payload_hash": "b" * 64,
         },
     )
     identity = SimpleNamespace(
@@ -412,14 +399,21 @@ def test_materialization_rejects_normalizer_identity_drift(monkeypatch) -> None:
     field_by_name = {
         "resource_type": "Organization",
         "resource_id": "org.synthetic-1",
+        "payload_json_text": '{"resourceType":"Organization","id":"org.synthetic-1"}',
+        "query_id": "synthetic-query",
+        "attempt": 1,
+        "closure_scope": "root",
+        "payload_sha256": "c" * 64,
     }
 
-    with pytest.raises(materialization.ProviderDirectoryRootedGraphPublicationError):
-        materialization._materialized_graph_pair(
-            field_by_name,
-            identity,
-            "synthetic-publication-run",
-        )
+    resource, evidence = materialization._materialized_graph_pair(
+        field_by_name, identity, "synthetic-publication-run"
+    )
+    assert resource["resource_type"] == "Location"
+    assert evidence["resource_type"] == "Organization"
+    assert evidence["resource_id"] == field_by_name["resource_id"]
+    assert evidence["source_payload_sha256"] == field_by_name["payload_sha256"]
+    assert evidence["published_payload_hash"] == resource["payload_hash"]
 
 
 def test_result_contract_and_claim_binding_reject_advertised_total_drift() -> None:

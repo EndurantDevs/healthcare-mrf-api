@@ -33,10 +33,6 @@ def test_summary_and_dense_row_identity_rejections() -> None:
     with pytest.raises(ValueError, match="strictly ordered"):
         accumulator.add_pack(pack)
 
-    with pytest.raises(ValueError, match="component keys"):
-        snapshot_maps._normalized_component_row((1, b"c" * 16), 0)
-    with pytest.raises(ValueError, match="pattern keys"):
-        snapshot_maps._normalized_pattern_row((1, b"p" * 32, 0), 0)
 
 
 @pytest.mark.asyncio
@@ -144,18 +140,6 @@ async def test_graph_diagnostic_and_prefix_guards() -> None:
 
 @pytest.mark.asyncio
 async def test_map_pack_and_reusable_root_conflicts() -> None:
-    with pytest.raises(RuntimeError, match="conflicts with stored"):
-        await snapshot_maps._verify_map_pack_row(
-            _ScriptedSession(_Result()),
-            schema='"mrf"',
-            row_by_field={
-                "snapshot_key": 1,
-                "object_kind": "kind",
-                "pack_no": 0,
-                "coordinate_count": 1,
-            },
-        )
-
     summary = _summary()
     manifest, metadata = snapshot_manifest_fixture(summary)
     reusable_by_field = {

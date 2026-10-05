@@ -29,10 +29,6 @@ PUBLICATION_STORE_PATH = (
     / "process"
     / ("uhc_flex_practitioner_publication_store.py")
 )
-PUBLICATION_MATERIALIZATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "process/uhc_flex_practitioner_publication_materialization.py"
-)
 
 
 def _migration():
@@ -75,13 +71,11 @@ def test_publication_uses_companion_provenance_without_replacing_generic_guards(
 def test_generic_guard_markers_remain_compatible_with_exact_cohort_rows() -> None:
     generic_guard_source = GENERIC_GUARD_PATH.read_text()
     store_source = PUBLICATION_STORE_PATH.read_text()
-    materialization_source = PUBLICATION_MATERIALIZATION_PATH.read_text()
 
     assert "dataset.completion_proof_required_version = 3" in generic_guard_source
     assert "resource.acquired_resource_sha256 IS NOT NULL" in generic_guard_source
     assert "completion_proof_required_version, completion_proof_json" in store_source
     assert "CAST(:metadata_json AS jsonb), NULL, NULL, NULL" in store_source
-    assert "input.payload_hash, input.payload_json, NULL" in materialization_source
 
 
 def test_readiness_binds_admission_source_content_and_subset_semantics() -> None:

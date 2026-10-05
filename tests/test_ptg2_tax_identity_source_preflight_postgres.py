@@ -42,6 +42,7 @@ from tests.test_ptg2_tax_identity_source_projection_postgres import (
     _database_url,
     _fresh_projection,
     _load_source_migration,
+    _install_source_candidates,
     _prepare_source_projection,
 )
 
@@ -60,8 +61,9 @@ async def _prepared_projection_database(monkeypatch, tmp_path: Path):
         await create_prerequisites(engine, schema_name)
         has_created_schema = True
         await run_migration_action(engine, load_parent_migration(), "upgrade")
-        await insert_source_projection_targets(engine, schema_name)
         await run_migration_action(engine, _load_source_migration(), "upgrade")
+        await _install_source_candidates(engine, schema_name)
+        await insert_source_projection_targets(engine, schema_name)
         yield database, schema_name, partial(_prepare_source_projection, tmp_path)
     finally:
         if has_created_schema:

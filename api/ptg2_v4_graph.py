@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import operator
 import os
 import struct
@@ -21,6 +22,7 @@ from api.ptg2_shared_blocks import (
     _validated_physical_block,
 )
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_relation
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_MAP_FORMAT,
@@ -1148,6 +1150,14 @@ def _validate_relation_manifest_fields(
         raise PTG2SharedBlockError("PTG V4 relation manifest is inconsistent")
 
 
+def _graph_cache_scope(session: Any, schema_name: str) -> str:
+    """Keep detached build results out of retry and published snapshot caches."""
+    info = getattr(session, "info", None)
+    bindings = info.get("ptg_snapshot_candidate_reads", {}) if isinstance(info, dict) else {}
+    bound_relations = bindings.get(_quote_ident(schema_name), {})
+    return json.dumps((schema_name, bound_relations), sort_keys=True) if bound_relations else str(schema_name)
+
+
 async def load_v4_relation_manifest(
     session: Any,
     *,
@@ -1159,7 +1169,7 @@ async def load_v4_relation_manifest(
 
     normalized_relation = str(relation or "").strip().lower()
     locator_kind, member_kind = _relation_kinds(normalized_relation)
-    cache_key = (str(schema_name), int(snapshot_key), normalized_relation)
+    cache_key = (_graph_cache_scope(session, schema_name), int(snapshot_key), normalized_relation)
     cached = _RELATION_CACHE.get(cache_key)
     if cached is not None:
         _RELATION_CACHE.move_to_end(cache_key)
@@ -1210,7 +1220,7 @@ async def load_v4_heavy_owners(
     requested = _normalized_owner_keys(owner_keys)
     if not requested:
         return {}
-    cache_prefix = (str(schema_name), int(snapshot_key), normalized_relation)
+    cache_prefix = (_graph_cache_scope(session, schema_name), int(snapshot_key), normalized_relation)
     heavy_by_owner, missing_owner_keys = _cached_v4_heavy_owners(
         cache_prefix,
         requested,
@@ -1252,7 +1262,7 @@ async def _query_v4_heavy_owner_rows(
             f"""
             SELECT snapshot_key, relation, owner_key, object_kind, member_count,
                    member_base, member_span, fragment_count
-              FROM {_quote_ident(schema_name)}.ptg2_v4_heavy_owner
+              FROM {snapshot_candidate_relation(session, _quote_ident(schema_name), "ptg2_v4_heavy_owner")}
              WHERE snapshot_key = :snapshot_key
                AND relation = :relation
                AND owner_key = ANY(CAST(:owner_keys AS bigint[]))
@@ -1404,9 +1414,10 @@ async def _load_map_coordinate_pairs(
 ) -> dict[tuple[int, int], Any]:
     """Load exact packed-map coordinates with bounded immutable caching."""
 
+    cache_scope = _graph_cache_scope(session, schema_name)
     requested_pairs = _normalized_map_coordinate_pairs(coordinate_pairs)
     coordinates_by_pair, missing_pairs = _cached_map_coordinate_pairs(
-        schema_name=schema_name,
+        schema_name=cache_scope,
         snapshot_key=int(snapshot_key),
         object_kind=object_kind,
         requested_pairs=requested_pairs,
@@ -1432,7 +1443,7 @@ async def _load_map_coordinate_pairs(
         observed_pack_nos.add(pack_no)
         _retain_map_pack_coordinates(
             map_pack_row,
-            schema_name=schema_name,
+            schema_name=cache_scope,
             snapshot_key=int(snapshot_key),
             object_kind=object_kind,
             missing_pairs=missing_pair_set,
@@ -1506,7 +1517,7 @@ async def _query_v4_map_packs(
                    block.format_version, block.object_kind, block.codec,
                    block.entry_count AS block_entry_count,
                    block.raw_byte_count, block.stored_byte_count, block.payload
-              FROM {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_pack AS pack
+              FROM {snapshot_candidate_relation(session, _quote_ident(schema_name), "ptg2_v4_snapshot_map_pack")} AS pack
               JOIN {_quote_ident(schema_name)}.ptg2_v3_block AS block
                 ON block.block_hash = pack.map_block_hash
              WHERE pack.snapshot_key = :snapshot_key
@@ -3157,7 +3168,7 @@ async def v4_npi_keys_for_values(
         text(
             f"""
             SELECT npi_key, npi
-              FROM {schema}.{PTG2_V4_NPI_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_TABLE)}
              WHERE snapshot_key = :snapshot_key
                AND npi = ANY(CAST(:npis AS bigint[]))
             """
@@ -3197,7 +3208,7 @@ async def v4_npi_values_for_keys(
         text(
             f"""
             SELECT npi_key, npi
-              FROM {schema}.{PTG2_V4_NPI_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_TABLE)}
              WHERE snapshot_key = :snapshot_key
                AND npi_key = ANY(CAST(:npi_keys AS integer[]))
             """

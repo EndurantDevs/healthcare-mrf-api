@@ -39,6 +39,15 @@ from process.ptg_parts.ptg2_shared_blocks import (
     SharedLayoutReservation,
     shared_block_hash,
 )
+from process.ptg_parts.ptg2_snapshot_candidates import (
+    attach_snapshot_candidates,
+    begin_snapshot_candidate,
+    candidate_driver,
+    finish_snapshot_candidate,
+    publish_snapshot_records,
+    snapshot_candidate_reads,
+    snapshot_candidate_relation,
+)
 from process.ptg_parts.ptg2_tax_identity_source_seal_validation import (
     validate_building_tax_identity_source_projection,
     validate_source_projection_absence,
@@ -968,7 +977,7 @@ async def _load_persisted_map_rows(
                    block.raw_byte_count AS map_raw_byte_count,
                    block.stored_byte_count AS map_stored_byte_count,
                    block.payload AS map_payload
-              FROM {schema}.ptg2_v4_snapshot_map_pack AS mapping
+              FROM {snapshot_candidate_relation(session, schema, 'ptg2_v4_snapshot_map_pack')} AS mapping
               JOIN {schema}.ptg2_v3_block AS block
                 ON block.block_hash = mapping.map_block_hash
              WHERE mapping.snapshot_key = :snapshot_key
@@ -1284,7 +1293,7 @@ async def _load_locator_coordinates(
         text(
             f"""
             SELECT mapping.object_kind, block.payload
-              FROM {schema}.ptg2_v4_snapshot_map_pack AS mapping
+              FROM {snapshot_candidate_relation(session, schema, 'ptg2_v4_snapshot_map_pack')} AS mapping
               JOIN {schema}.ptg2_v3_block AS block
                 ON block.block_hash = mapping.map_block_hash
              WHERE mapping.snapshot_key = :snapshot_key
@@ -1458,11 +1467,11 @@ async def _load_dense_metadata_count(
 ) -> int:
     """Count one dense dictionary through bounded indexed key ranges."""
 
-    table = _quote_ident(table_name)
+    table = snapshot_candidate_relation(session, schema, table_name)
     key = _quote_ident(key_name)
     maximum_key = await session.scalar(
         text(
-            f"SELECT MAX({key}) FROM {schema}.{table} "
+            f"SELECT MAX({key}) FROM {table} "
             "WHERE snapshot_key = :snapshot_key"
         ),
         {"snapshot_key": int(snapshot_key)},
@@ -1475,7 +1484,7 @@ async def _load_dense_metadata_count(
         )
         observed_count = await session.scalar(
             text(
-                f"SELECT COUNT(*)::bigint FROM {schema}.{table} "
+                f"SELECT COUNT(*)::bigint FROM {table} "
                 "WHERE snapshot_key = :snapshot_key "
                 f"AND {key} >= :range_start AND {key} < :range_end"
             ),
@@ -1613,7 +1622,7 @@ async def _load_entry_counts_by_kind(
         text(
             f"""
             SELECT object_kind, COALESCE(SUM(entry_count), 0)::bigint AS entry_count
-              FROM {schema}.ptg2_v4_snapshot_map_pack
+              FROM {snapshot_candidate_relation(session, schema, 'ptg2_v4_snapshot_map_pack')}
              WHERE snapshot_key = :snapshot_key
              GROUP BY object_kind
             """
@@ -1656,8 +1665,8 @@ async def _load_heavy_owners(
             SELECT owner.relation, owner.owner_key, owner.object_kind,
                    owner.member_count, owner.member_base, owner.member_span,
                    owner.fragment_count, mapping.map_block_hash, block.payload
-              FROM {schema}.{PTG2_V4_HEAVY_OWNER_TABLE} AS owner
-              LEFT JOIN {schema}.ptg2_v4_snapshot_map_pack AS mapping
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_HEAVY_OWNER_TABLE)} AS owner
+              LEFT JOIN {snapshot_candidate_relation(session, schema, 'ptg2_v4_snapshot_map_pack')} AS mapping
                 ON mapping.snapshot_key = owner.snapshot_key
                AND mapping.object_kind = owner.object_kind
                AND mapping.first_block_key <= owner.owner_key
@@ -1788,7 +1797,7 @@ async def _validate_prefix_aggregate(
                        member_count BETWEEN 0 AND :prefix_target
                        AND octet_length(member_digest) = 32
                    ), TRUE) AS valid
-              FROM {schema}.{PTG2_V4_NPI_PREFIX_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_PREFIX_TABLE)}
              WHERE snapshot_key = :snapshot_key
             """
         ),
@@ -1829,7 +1838,7 @@ async def _load_canary_prefixes(
         text(
             f"""
             SELECT provider_set_key, member_count, member_digest
-              FROM {schema}.{PTG2_V4_NPI_PREFIX_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_PREFIX_TABLE)}
              WHERE snapshot_key = :snapshot_key
                AND (
                    provider_set_key = :worst_provider_set_key
@@ -2605,6 +2614,9 @@ async def lock_v4_layout_map_write(
 ) -> None:
     """Fence V4 map writes to the caller's building generation."""
 
+    await acquire_ptg2_source_lifecycle_lock(
+        session, source_key=f"layout_{build_token}", statement_timeout="0",
+    )
     schema = _quote_ident(schema_name)
     ownership_result = await session.execute(
         text(
@@ -2666,170 +2678,24 @@ async def touch_v4_shared_layout_build(
         raise RuntimeError("PTG V4 build heartbeat lost ownership")
 
 
-async def _verify_dense_table_keys(
-    session: Any,
-    *,
-    schema_name: str,
-    table_name: str,
-    key_column: str,
-    snapshot_key: int,
-    expected_count: int,
-    context: str,
-) -> int:
-    schema = _quote_ident(schema_name)
-    table = _quote_ident(table_name)
-    key = _quote_ident(key_column)
-    aggregate_result = await session.execute(
-        text(
-            f"""
-            SELECT COUNT(*)::bigint, MIN({key}), MAX({key})
-              FROM {schema}.{table}
-             WHERE snapshot_key = :snapshot_key
-            """
-        ),
-        {"snapshot_key": int(snapshot_key)},
-    )
-    aggregate_row = aggregate_result.one()
-    observed_count = int(aggregate_row[0])
-    expected_first = 0 if expected_count else None
-    expected_last = expected_count - 1 if expected_count else None
-    if (
-        observed_count != expected_count
-        or aggregate_row[1] != expected_first
-        or aggregate_row[2] != expected_last
-    ):
-        raise RuntimeError(f"PTG V4 {context} is not a complete dense keyspace")
-    return observed_count
-
-
-def _npi_pairs(npi_rows: Iterable[Mapping[str, Any]]) -> list[tuple[int, int]]:
-    return [(int(npi_row["npi_key"]), int(npi_row["npi"])) for npi_row in npi_rows]
-
-
-def _normalized_npi_row(
-    raw_entry: tuple[int, int] | Mapping[str, int],
-    expected_key: int,
-) -> dict[str, int]:
-    if isinstance(raw_entry, Mapping):
-        npi_key = int(raw_entry["npi_key"])
-        npi = int(raw_entry["npi"])
-    else:
-        npi_key = int(raw_entry[0])
-        npi = int(raw_entry[1])
-    if npi_key != expected_key:
-        raise ValueError("PTG V4 NPI keys must be contiguous from zero")
-    if not 1_000_000_000 <= npi <= 9_999_999_999:
-        raise ValueError("PTG V4 NPI dictionary contains an invalid NPI")
-    return {"npi_key": npi_key, "npi": npi}
-
-
-async def _publish_v4_npi_batch(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    npi_rows: Sequence[Mapping[str, int]],
-) -> None:
-    """Insert and verify one bounded NPI dictionary batch."""
-
-    if not npi_rows:
-        return
-    schema = _quote_ident(schema_name)
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.{PTG2_V4_NPI_TABLE}
-                (snapshot_key, npi_key, npi)
-            VALUES
-                (:snapshot_key, :npi_key, :npi)
-            ON CONFLICT DO NOTHING
-            """
-        ),
-        [
-            {
-                "snapshot_key": int(snapshot_key),
-                "npi_key": int(npi_row["npi_key"]),
-                "npi": int(npi_row["npi"]),
-            }
-            for npi_row in npi_rows
-        ],
-    )
-    first_key = int(npi_rows[0]["npi_key"])
-    last_key = int(npi_rows[-1]["npi_key"])
-    stored_result = await session.execute(
-        text(
-            f"""
-            SELECT npi_key, npi
-              FROM {schema}.{PTG2_V4_NPI_TABLE}
-             WHERE snapshot_key = :snapshot_key
-               AND npi_key BETWEEN :first_key AND :last_key
-             ORDER BY npi_key
-            """
-        ),
-        {
-            "snapshot_key": int(snapshot_key),
-            "first_key": first_key,
-            "last_key": last_key,
-        },
-    )
-    observed_pairs = _npi_pairs(
-        _row_mapping(stored_row) for stored_row in stored_result
-    )
-    expected_pairs = _npi_pairs(npi_rows)
-    if observed_pairs != expected_pairs:
-        raise RuntimeError("PTG V4 NPI dictionary conflicts with stored dense keys")
-
-
 async def publish_v4_npi_dictionary(
     session: Any,
     *,
     schema_name: str,
     snapshot_key: int,
     build_token: str,
-    entries: Iterable[tuple[int, int] | Mapping[str, int]],
-    batch_rows: int = 10_000,
+    entries: Iterable,
+    batch_rows: int = 4096,
 ) -> V4NPIDictionaryPublication:
-    """Publish a contiguous snapshot-local NPI keyspace with bounded memory."""
-
-    normalized_batch_rows = int(batch_rows)
-    if normalized_batch_rows <= 0:
+    """Copy NPI dictionary into an isolated heap and validate the complete set."""
+    if batch_rows <= 0:
         raise ValueError("PTG V4 NPI dictionary batch size must be positive")
-    await lock_v4_shared_layout_for_map_write(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
+    count = await publish_snapshot_records(
+        session, schema_name=schema_name, table=PTG2_V4_NPI_TABLE,
+        snapshot_key=snapshot_key, build_token=build_token,
+        columns=('npi_key', 'npi'), entries=entries, batch_rows=batch_rows,
     )
-    pending_rows: list[dict[str, int]] = []
-    expected_key = 0
-    for raw_entry in entries:
-        pending_rows.append(_normalized_npi_row(raw_entry, expected_key))
-        expected_key += 1
-        if len(pending_rows) >= normalized_batch_rows:
-            await _publish_v4_npi_batch(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                npi_rows=pending_rows,
-            )
-            pending_rows = []
-    await _publish_v4_npi_batch(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        npi_rows=pending_rows,
-    )
-
-    observed_count = await _verify_dense_table_keys(
-        session,
-        schema_name=schema_name,
-        table_name=PTG2_V4_NPI_TABLE,
-        key_column="npi_key",
-        snapshot_key=int(snapshot_key),
-        expected_count=expected_key,
-        context="NPI dictionary",
-    )
-    return V4NPIDictionaryPublication(row_count=observed_count)
+    return V4NPIDictionaryPublication(row_count=count)
 
 
 def _validated_v4_name(value: Any, *, field_name: str, max_bytes: int) -> str:
@@ -2842,238 +2708,24 @@ def _validated_v4_name(value: Any, *, field_name: str, max_bytes: int) -> str:
     return normalized
 
 
-def _component_pairs(
-    component_rows: Iterable[Mapping[str, Any]],
-) -> list[tuple[int, bytes]]:
-    return [
-        (
-            int(component_row["component_key"]),
-            bytes(component_row["component_global_id_128"]),
-        )
-        for component_row in component_rows
-    ]
-
-
-def _normalized_component_row(
-    raw_entry: tuple[int, bytes] | Mapping[str, Any],
-    expected_key: int,
-) -> dict[str, Any]:
-    if isinstance(raw_entry, Mapping):
-        component_key = int(raw_entry["component_key"])
-        component_id = bytes(raw_entry["component_global_id_128"])
-    else:
-        component_key = int(raw_entry[0])
-        component_id = bytes(raw_entry[1])
-    if component_key != expected_key:
-        raise ValueError("PTG V4 component keys must be contiguous from zero")
-    if len(component_id) != 16:
-        raise ValueError("PTG V4 component ID must contain 16 bytes")
-    return {
-        "component_key": component_key,
-        "component_global_id_128": component_id,
-    }
-
-
-async def _publish_v4_component_batch(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    component_rows: Sequence[Mapping[str, Any]],
-) -> None:
-    """Insert and verify one bounded provider-component batch."""
-
-    if not component_rows:
-        return
-    schema = _quote_ident(schema_name)
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.{PTG2_V4_COMPONENT_TABLE}
-                (snapshot_key, component_key, component_global_id_128)
-            VALUES
-                (:snapshot_key, :component_key, :component_global_id_128)
-            ON CONFLICT (snapshot_key, component_key) DO NOTHING
-            """
-        ),
-        [
-            {
-                "snapshot_key": int(snapshot_key),
-                "component_key": int(component_row["component_key"]),
-                "component_global_id_128": bytes(
-                    component_row["component_global_id_128"]
-                ),
-            }
-            for component_row in component_rows
-        ],
-    )
-    stored_result = await session.execute(
-        text(
-            f"""
-            SELECT component_key, component_global_id_128
-              FROM {schema}.{PTG2_V4_COMPONENT_TABLE}
-             WHERE snapshot_key = :snapshot_key
-               AND component_key BETWEEN :first_key AND :last_key
-             ORDER BY component_key
-            """
-        ),
-        {
-            "snapshot_key": int(snapshot_key),
-            "first_key": int(component_rows[0]["component_key"]),
-            "last_key": int(component_rows[-1]["component_key"]),
-        },
-    )
-    observed_pairs = _component_pairs(
-        _row_mapping(stored_row) for stored_row in stored_result
-    )
-    expected_pairs = _component_pairs(component_rows)
-    if observed_pairs != expected_pairs:
-        raise RuntimeError("PTG V4 component dictionary conflicts with stored keys")
-
-
 async def publish_v4_provider_components(
     session: Any,
     *,
     schema_name: str,
     snapshot_key: int,
     build_token: str,
-    entries: Iterable[tuple[int, bytes] | Mapping[str, Any]],
-    batch_rows: int = 10_000,
+    entries: Iterable,
+    batch_rows: int = 4096,
 ) -> V4MetadataTablePublication:
-    """Publish source-stable provider components with dense snapshot keys."""
-
-    normalized_batch_rows = int(batch_rows)
-    if normalized_batch_rows <= 0:
+    """Copy component into an isolated heap and validate the complete set."""
+    if batch_rows <= 0:
         raise ValueError("PTG V4 component batch size must be positive")
-    await lock_v4_shared_layout_for_map_write(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
+    count = await publish_snapshot_records(
+        session, schema_name=schema_name, table=PTG2_V4_COMPONENT_TABLE,
+        snapshot_key=snapshot_key, build_token=build_token,
+        columns=('component_key', 'component_global_id_128'), entries=entries, batch_rows=batch_rows,
     )
-    expected_key = 0
-    pending_rows: list[dict[str, Any]] = []
-    for raw_entry in entries:
-        pending_rows.append(_normalized_component_row(raw_entry, expected_key))
-        expected_key += 1
-        if len(pending_rows) >= normalized_batch_rows:
-            await _publish_v4_component_batch(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                component_rows=pending_rows,
-            )
-            pending_rows = []
-    await _publish_v4_component_batch(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        component_rows=pending_rows,
-    )
-    await _verify_dense_table_keys(
-        session,
-        schema_name=schema_name,
-        table_name=PTG2_V4_COMPONENT_TABLE,
-        key_column="component_key",
-        snapshot_key=int(snapshot_key),
-        expected_count=expected_key,
-        context="component dictionary",
-    )
-    return V4MetadataTablePublication(row_count=expected_key)
-
-
-def _pattern_tuples(
-    pattern_rows: Iterable[Mapping[str, Any]],
-) -> list[tuple[int, bytes, int]]:
-    return [
-        (
-            int(pattern_row["pattern_key"]),
-            bytes(pattern_row["pattern_digest"]),
-            int(pattern_row["set_count"]),
-        )
-        for pattern_row in pattern_rows
-    ]
-
-
-def _normalized_pattern_row(
-    raw_entry: tuple[int, bytes, int] | Mapping[str, Any],
-    expected_key: int,
-) -> dict[str, Any]:
-    if isinstance(raw_entry, Mapping):
-        pattern_key = int(raw_entry["pattern_key"])
-        pattern_digest = bytes(raw_entry["pattern_digest"])
-        set_count = int(raw_entry["set_count"])
-    else:
-        pattern_key = int(raw_entry[0])
-        pattern_digest = bytes(raw_entry[1])
-        set_count = int(raw_entry[2])
-    if pattern_key != expected_key:
-        raise ValueError("PTG V4 pattern keys must be contiguous from zero")
-    if len(pattern_digest) != 32:
-        raise ValueError("PTG V4 pattern digest must contain 32 bytes")
-    if set_count < 0:
-        raise ValueError("PTG V4 pattern set count must be non-negative")
-    return {
-        "pattern_key": pattern_key,
-        "pattern_digest": pattern_digest,
-        "set_count": set_count,
-    }
-
-
-async def _publish_v4_pattern_batch(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    pattern_rows: Sequence[Mapping[str, Any]],
-) -> None:
-    """Insert and verify one bounded pattern-metadata batch."""
-
-    if not pattern_rows:
-        return
-    schema = _quote_ident(schema_name)
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.{PTG2_V4_PATTERN_TABLE}
-                (snapshot_key, pattern_key, pattern_digest, set_count)
-            VALUES
-                (:snapshot_key, :pattern_key, :pattern_digest, :set_count)
-            ON CONFLICT (snapshot_key, pattern_key) DO NOTHING
-            """
-        ),
-        [
-            {
-                "snapshot_key": int(snapshot_key),
-                "pattern_key": int(pattern_row["pattern_key"]),
-                "pattern_digest": bytes(pattern_row["pattern_digest"]),
-                "set_count": int(pattern_row["set_count"]),
-            }
-            for pattern_row in pattern_rows
-        ],
-    )
-    stored_result = await session.execute(
-        text(
-            f"""
-            SELECT pattern_key, pattern_digest, set_count
-              FROM {schema}.{PTG2_V4_PATTERN_TABLE}
-             WHERE snapshot_key = :snapshot_key
-               AND pattern_key BETWEEN :first_key AND :last_key
-             ORDER BY pattern_key
-            """
-        ),
-        {
-            "snapshot_key": int(snapshot_key),
-            "first_key": int(pattern_rows[0]["pattern_key"]),
-            "last_key": int(pattern_rows[-1]["pattern_key"]),
-        },
-    )
-    observed_tuples = _pattern_tuples(
-        _row_mapping(stored_row) for stored_row in stored_result
-    )
-    expected_tuples = _pattern_tuples(pattern_rows)
-    if observed_tuples != expected_tuples:
-        raise RuntimeError("PTG V4 pattern metadata conflicts with stored keys")
+    return V4MetadataTablePublication(row_count=count)
 
 
 async def publish_v4_patterns(
@@ -3082,49 +2734,18 @@ async def publish_v4_patterns(
     schema_name: str,
     snapshot_key: int,
     build_token: str,
-    entries: Iterable[tuple[int, bytes, int] | Mapping[str, Any]],
-    batch_rows: int = 10_000,
+    entries: Iterable,
+    batch_rows: int = 4096,
 ) -> V4MetadataTablePublication:
-    """Publish snapshot-local pattern audit metadata with dense keys."""
-
-    normalized_batch_rows = int(batch_rows)
-    if normalized_batch_rows <= 0:
+    """Copy pattern into an isolated heap and validate the complete set."""
+    if batch_rows <= 0:
         raise ValueError("PTG V4 pattern batch size must be positive")
-    await lock_v4_shared_layout_for_map_write(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
+    count = await publish_snapshot_records(
+        session, schema_name=schema_name, table=PTG2_V4_PATTERN_TABLE,
+        snapshot_key=snapshot_key, build_token=build_token,
+        columns=('pattern_key', 'pattern_digest', 'set_count'), entries=entries, batch_rows=batch_rows,
     )
-    expected_key = 0
-    pending_rows: list[dict[str, Any]] = []
-    for raw_entry in entries:
-        pending_rows.append(_normalized_pattern_row(raw_entry, expected_key))
-        expected_key += 1
-        if len(pending_rows) >= normalized_batch_rows:
-            await _publish_v4_pattern_batch(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                pattern_rows=pending_rows,
-            )
-            pending_rows = []
-    await _publish_v4_pattern_batch(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        pattern_rows=pending_rows,
-    )
-    await _verify_dense_table_keys(
-        session,
-        schema_name=schema_name,
-        table_name=PTG2_V4_PATTERN_TABLE,
-        key_column="pattern_key",
-        snapshot_key=int(snapshot_key),
-        expected_count=expected_key,
-        context="pattern metadata",
-    )
-    return V4MetadataTablePublication(row_count=expected_key)
+    return V4MetadataTablePublication(row_count=count)
 
 
 def _relation_manifest_row(raw_entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -3316,153 +2937,24 @@ async def publish_v4_relation_manifests(
     return V4MetadataTablePublication(row_count=len(expected_rows))
 
 
-def _heavy_owner_row(raw_entry: Mapping[str, Any]) -> dict[str, Any]:
-    owner_row_by_field = {
-        "relation": _validated_v4_name(
-            raw_entry["relation"], field_name="relation", max_bytes=32
-        ),
-        "owner_key": int(raw_entry["owner_key"]),
-        "object_kind": _validated_v4_name(
-            raw_entry["object_kind"],
-            field_name="heavy-owner object kind",
-            max_bytes=64,
-        ),
-        "member_count": int(raw_entry["member_count"]),
-        "member_base": int(raw_entry["member_base"]),
-        "member_span": int(raw_entry["member_span"]),
-        "fragment_count": int(raw_entry["fragment_count"]),
-    }
-    if (
-        min(
-            owner_row_by_field["owner_key"],
-            owner_row_by_field["member_count"],
-            owner_row_by_field["member_base"],
-        )
-        < 0
-        or owner_row_by_field["member_span"] <= 0
-        or owner_row_by_field["fragment_count"] <= 0
-    ):
-        raise ValueError("PTG V4 heavy owner has invalid bitmap metadata")
-    return owner_row_by_field
-
-
-def _normalized_heavy_owner_rows(
-    entries: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    owner_rows: list[dict[str, Any]] = []
-    previous_key: tuple[str, int] | None = None
-    for raw_entry in entries:
-        owner_row = _heavy_owner_row(raw_entry)
-        row_key = (str(owner_row["relation"]), int(owner_row["owner_key"]))
-        if previous_key is not None and row_key <= previous_key:
-            raise ValueError("PTG V4 heavy owners must be strictly ordered")
-        previous_key = row_key
-        owner_rows.append(owner_row)
-    return owner_rows
-
-
-async def _insert_heavy_owner_rows(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    owner_rows: Sequence[Mapping[str, Any]],
-    batch_size: int,
-) -> None:
-    schema = _quote_ident(schema_name)
-    for offset in range(0, len(owner_rows), batch_size):
-        pending_rows = owner_rows[offset : offset + batch_size]
-        await session.execute(
-            text(
-                f"""
-                INSERT INTO {schema}.{PTG2_V4_HEAVY_OWNER_TABLE}
-                    (snapshot_key, relation, owner_key, object_kind,
-                     member_count, member_base, member_span, fragment_count)
-                VALUES
-                    (:snapshot_key, :relation, :owner_key, :object_kind,
-                     :member_count, :member_base, :member_span, :fragment_count)
-                ON CONFLICT (snapshot_key, relation, owner_key) DO NOTHING
-                """
-            ),
-            [
-                {"snapshot_key": int(snapshot_key), **owner_row}
-                for owner_row in pending_rows
-            ],
-        )
-
-
-async def _load_heavy_owner_rows(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-) -> list[dict[str, Any]]:
-    schema = _quote_ident(schema_name)
-    stored_result = await session.execute(
-        text(
-            f"""
-            SELECT relation, owner_key, object_kind, member_count,
-                   member_base, member_span, fragment_count
-              FROM {schema}.{PTG2_V4_HEAVY_OWNER_TABLE}
-             WHERE snapshot_key = :snapshot_key
-             ORDER BY relation, owner_key
-            """
-        ),
-        {"snapshot_key": int(snapshot_key)},
-    )
-    owner_rows: list[dict[str, Any]] = []
-    for stored_row in stored_result:
-        owner_row = _row_mapping(stored_row)
-        owner_rows.append(
-            {
-                "relation": str(owner_row["relation"]),
-                "owner_key": int(owner_row["owner_key"]),
-                "object_kind": str(owner_row["object_kind"]),
-                "member_count": int(owner_row["member_count"]),
-                "member_base": int(owner_row["member_base"]),
-                "member_span": int(owner_row["member_span"]),
-                "fragment_count": int(owner_row["fragment_count"]),
-            }
-        )
-    return owner_rows
-
-
 async def publish_v4_heavy_owners(
     session: Any,
     *,
     schema_name: str,
     snapshot_key: int,
     build_token: str,
-    entries: Iterable[Mapping[str, Any]],
-    batch_rows: int = 1_000,
+    entries: Iterable,
+    batch_rows: int = 4096,
 ) -> V4MetadataTablePublication:
-    """Publish only manifest-qualified bitmap owners for direct lookup."""
-
-    normalized_batch_rows = int(batch_rows)
-    if normalized_batch_rows <= 0:
+    """Copy heavy-owner into an isolated heap and validate the complete set."""
+    if batch_rows <= 0:
         raise ValueError("PTG V4 heavy-owner batch size must be positive")
-    await lock_v4_shared_layout_for_map_write(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
+    count = await publish_snapshot_records(
+        session, schema_name=schema_name, table=PTG2_V4_HEAVY_OWNER_TABLE,
+        snapshot_key=snapshot_key, build_token=build_token,
+        columns=('relation', 'owner_key', 'object_kind', 'member_count', 'member_base', 'member_span', 'fragment_count'), entries=entries, batch_rows=batch_rows,
     )
-    expected_rows = _normalized_heavy_owner_rows(entries)
-    await _insert_heavy_owner_rows(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        owner_rows=expected_rows,
-        batch_size=normalized_batch_rows,
-    )
-    observed_rows = await _load_heavy_owner_rows(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-    )
-    if observed_rows != expected_rows:
-        raise RuntimeError("PTG V4 heavy-owner manifest conflicts with stored rows")
-    return V4MetadataTablePublication(row_count=len(expected_rows))
+    return V4MetadataTablePublication(row_count=count)
 
 
 async def _initialize_v4_snapshot_map_root(
@@ -3547,105 +3039,6 @@ def _target_metadata_by_hash(
     return metadata_by_hash
 
 
-async def _verify_target_blocks(
-    session: Any,
-    *,
-    schema: str,
-    metadata_by_hash: Mapping[bytes, tuple[int, str, str, int, int, int]],
-) -> None:
-    target_result = await session.execute(
-        text(
-            f"""
-            SELECT block_hash, format_version, object_kind, codec,
-                   entry_count, raw_byte_count, stored_byte_count
-              FROM {schema}.ptg2_v3_block
-             WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
-             FOR KEY SHARE
-            """
-        ),
-        {"block_hashes": list(metadata_by_hash)},
-    )
-    observed_by_hash: dict[bytes, tuple[int, str, str, int, int, int]] = {}
-    for target_row in target_result:
-        target_fields = _row_mapping(target_row)
-        observed_by_hash[bytes(target_fields["block_hash"])] = (
-            int(target_fields["format_version"]),
-            str(target_fields["object_kind"]),
-            str(target_fields["codec"]),
-            int(target_fields["entry_count"]),
-            int(target_fields["raw_byte_count"]),
-            int(target_fields["stored_byte_count"]),
-        )
-    if observed_by_hash != metadata_by_hash:
-        raise RuntimeError("PTG V4 map pack could not resolve every target CAS block")
-
-
-async def _publish_map_block(
-    session: Any,
-    *,
-    schema: str,
-    map_block: SharedBlock,
-) -> None:
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.ptg2_v3_block
-                (block_hash, format_version, object_kind, codec, entry_count,
-                 raw_byte_count, stored_byte_count, payload, created_at)
-            VALUES
-                (:block_hash, :format_version, :object_kind, :codec, :entry_count,
-                 :raw_byte_count, :stored_byte_count, :payload, :created_at)
-            ON CONFLICT (block_hash) DO NOTHING
-            """
-        ),
-        {
-            "block_hash": map_block.block_hash,
-            "format_version": int(map_block.format_version),
-            "object_kind": map_block.object_kind,
-            "codec": map_block.codec,
-            "entry_count": int(map_block.entry_count),
-            "raw_byte_count": int(map_block.raw_byte_count),
-            "stored_byte_count": int(map_block.stored_byte_count),
-            "payload": map_block.payload,
-            "created_at": _utcnow(),
-        },
-    )
-
-
-async def _verify_map_block(
-    session: Any,
-    *,
-    schema: str,
-    map_block: SharedBlock,
-) -> None:
-    map_block_result = await session.execute(
-        text(
-            f"""
-            SELECT format_version, object_kind, codec, entry_count,
-                   raw_byte_count, stored_byte_count
-              FROM {schema}.ptg2_v3_block
-             WHERE block_hash = :block_hash
-            """
-        ),
-        {"block_hash": map_block.block_hash},
-    )
-    map_block_row = map_block_result.first()
-    observed_by_field = _row_mapping(map_block_row) if map_block_row is not None else {}
-    expected_by_field = {
-        "format_version": int(map_block.format_version),
-        "object_kind": map_block.object_kind,
-        "codec": map_block.codec,
-        "entry_count": int(map_block.entry_count),
-        "raw_byte_count": int(map_block.raw_byte_count),
-        "stored_byte_count": int(map_block.stored_byte_count),
-    }
-    if any(
-        observed_by_field.get(field_name) != expected_value
-        for field_name, expected_value in expected_by_field.items()
-    ):
-        raise RuntimeError("PTG V4 map block conflicts with stored CAS metadata")
-
-
 def _map_pack_row(
     pack: V4SnapshotMapPack,
     snapshot_key: int,
@@ -3667,74 +3060,6 @@ def _map_pack_row(
     }
 
 
-async def _insert_map_pack_row(
-    session: Any,
-    *,
-    schema: str,
-    row_by_field: Mapping[str, Any],
-) -> None:
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.ptg2_v4_snapshot_map_pack
-                (snapshot_key, object_kind, pack_no,
-                 first_block_key, first_fragment_no,
-                 last_block_key, last_fragment_no,
-                 coordinate_count, entry_count, logical_byte_count,
-                 map_block_hash)
-            VALUES
-                (:snapshot_key, :object_kind, :pack_no,
-                 :first_block_key, :first_fragment_no,
-                 :last_block_key, :last_fragment_no,
-                 :coordinate_count, :entry_count, :logical_byte_count,
-                 :map_block_hash)
-            ON CONFLICT (snapshot_key, object_kind, pack_no) DO NOTHING
-            """
-        ),
-        dict(row_by_field),
-    )
-
-
-async def _verify_map_pack_row(
-    session: Any,
-    *,
-    schema: str,
-    row_by_field: Mapping[str, Any],
-) -> None:
-    stored_pack_result = await session.execute(
-        text(
-            f"""
-            SELECT object_kind, pack_no,
-                   first_block_key, first_fragment_no,
-                   last_block_key, last_fragment_no,
-                   coordinate_count, entry_count, logical_byte_count,
-                   map_block_hash
-              FROM {schema}.ptg2_v4_snapshot_map_pack
-             WHERE snapshot_key = :snapshot_key
-               AND object_kind = :object_kind
-               AND pack_no = :pack_no
-            """
-        ),
-        {
-            "snapshot_key": int(row_by_field["snapshot_key"]),
-            "object_kind": row_by_field["object_kind"],
-            "pack_no": int(row_by_field["pack_no"]),
-        },
-    )
-    stored_pack_row = stored_pack_result.first()
-    stored_by_field = (
-        _row_mapping(stored_pack_row) if stored_pack_row is not None else {}
-    )
-    comparable_fields = tuple(
-        field_name for field_name in row_by_field if field_name != "snapshot_key"
-    )
-    if any(
-        stored_by_field.get(field_name) != row_by_field[field_name]
-        for field_name in comparable_fields
-    ):
-        raise RuntimeError("PTG V4 snapshot map pack conflicts with stored coordinates")
-
-
 async def _cancel_map_gc_candidates(
     session: Any,
     *,
@@ -3752,36 +3077,44 @@ async def _cancel_map_gc_candidates(
     )
 
 
-async def _publish_v4_map_pack(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    pack: V4SnapshotMapPack,
-) -> None:
-    """Publish and verify one map pack plus its exact CAS references."""
-
+async def _copy_v4_map_batch(session, *, schema_name, packs):
+    """COPY one bounded group, checking CAS metadata with joins over the group."""
     schema = _quote_ident(schema_name)
-    metadata_by_hash = _target_metadata_by_hash(pack)
-    await _verify_target_blocks(
-        session,
-        schema=schema,
-        metadata_by_hash=metadata_by_hash,
-    )
-    map_block = pack.map_block
-    await _publish_map_block(session, schema=schema, map_block=map_block)
-    await _verify_map_block(session, schema=schema, map_block=map_block)
-    row_by_field = _map_pack_row(pack, int(snapshot_key))
-    await _insert_map_pack_row(session, schema=schema, row_by_field=row_by_field)
-    await _verify_map_pack_row(session, schema=schema, row_by_field=row_by_field)
-    # A V4 sweep must also consult decoded map-pack target hashes.  Removing an
-    # already queued candidate here closes the publication race until that
-    # generation-dispatched sweep performs its exact reachability check.
-    await _cancel_map_gc_candidates(
-        session,
-        schema=schema,
-        block_hashes=[*metadata_by_hash, map_block.block_hash],
-    )
+    driver = await candidate_driver(session)
+    await session.execute(text("TRUNCATE pg_temp.ptg_map_blocks, pg_temp.ptg_map_targets"))
+    block_columns = ("block_hash", "format_version", "object_kind", "codec", "entry_count",
+                     "raw_byte_count", "stored_byte_count", "payload")
+    blocks = [pack.map_block for pack in packs]
+    await driver.copy_records_to_table("ptg_map_blocks", schema_name="pg_temp", columns=block_columns,
+        records=[tuple(getattr(block, name) for name in block_columns) for block in blocks])
+    target_metadata_rows = [(block_hash, *metadata) for pack in packs
+               for block_hash, metadata in _target_metadata_by_hash(pack).items()]
+    await driver.copy_records_to_table("ptg_map_targets", schema_name="pg_temp",
+        columns=block_columns[:-1], records=target_metadata_rows)
+    missing = await session.scalar(text(f"""
+        WITH locked AS MATERIALIZED (
+            SELECT b.* FROM {schema}.ptg2_v3_block b
+             WHERE b.block_hash IN(SELECT block_hash FROM pg_temp.ptg_map_targets)
+        )
+        SELECT EXISTS(SELECT 1 FROM pg_temp.ptg_map_targets t
+            LEFT JOIN locked b USING(block_hash)
+          WHERE b.block_hash IS NULL OR
+            ROW(b.format_version,b.object_kind,b.codec,b.entry_count,b.raw_byte_count,b.stored_byte_count)
+            IS DISTINCT FROM ROW(t.format_version,t.object_kind,t.codec,t.entry_count,t.raw_byte_count,t.stored_byte_count))
+    """))
+    if missing:
+        raise RuntimeError("PTG V4 map pack could not resolve every target CAS block")
+    columns = ", ".join(block_columns)
+    await session.execute(text(f"""INSERT INTO {schema}.ptg2_v3_block ({columns},created_at)
+        SELECT DISTINCT {columns},transaction_timestamp() FROM pg_temp.ptg_map_blocks ON CONFLICT(block_hash) DO NOTHING"""))
+    changed = await session.scalar(text(f"""SELECT EXISTS(
+        SELECT 1 FROM pg_temp.ptg_map_blocks t JOIN {schema}.ptg2_v3_block b USING(block_hash)
+        WHERE ROW(b.format_version,b.object_kind,b.codec,b.entry_count,b.raw_byte_count,b.stored_byte_count,b.payload)
+        IS DISTINCT FROM ROW(t.format_version,t.object_kind,t.codec,t.entry_count,t.raw_byte_count,t.stored_byte_count,t.payload))"""))
+    if changed:
+        raise RuntimeError("PTG V4 map block conflicts with stored CAS metadata")
+    await session.execute(text(f"""DELETE FROM {schema}.ptg2_v3_gc_candidate
+        WHERE block_hash IN(SELECT block_hash FROM pg_temp.ptg_map_targets UNION SELECT block_hash FROM pg_temp.ptg_map_blocks)"""))
 
 
 async def publish_v4_snapshot_maps(
@@ -3795,39 +3128,48 @@ async def publish_v4_snapshot_maps(
     max_coordinates_per_pack: int = PTG2_V4_DEFAULT_COORDINATES_PER_PACK,
     progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4SnapshotMapSummary:
-    """Publish one exact packed map root from a bounded ordered stream."""
-
-    await lock_v4_shared_layout_for_map_write(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
-    )
-    await _initialize_v4_snapshot_map_root(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        representation=representation,
-    )
+    """COPY isolated maps, validate complete sets, then attach completed indexes."""
+    await lock_v4_shared_layout_for_map_write(session, schema_name=schema_name,
+        snapshot_key=int(snapshot_key), build_token=build_token)
+    await _initialize_v4_snapshot_map_root(session, schema_name=schema_name,
+        snapshot_key=int(snapshot_key), representation=representation)
+    candidate = await begin_snapshot_candidate(session, schema_name,
+        "ptg2_v4_snapshot_map_pack", int(snapshot_key), build_token)
+    schema = _quote_ident(schema_name)
+    await session.execute(text(f"""CREATE TEMP TABLE ptg_map_blocks ON COMMIT DROP AS
+        SELECT block_hash,format_version,object_kind,codec,entry_count,raw_byte_count,stored_byte_count,payload
+          FROM {schema}.ptg2_v3_block WITH NO DATA"""))
+    await session.execute(text("CREATE TEMP TABLE ptg_map_targets (LIKE pg_temp.ptg_map_blocks) ON COMMIT DROP"))
+    driver = await candidate_driver(session)
     accumulator = _V4SnapshotMapSummaryAccumulator()
-    for pack in iter_v4_snapshot_map_packs(
-        references,
-        max_coordinates_per_pack=max_coordinates_per_pack,
-    ):
-        await _publish_v4_map_pack(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            pack=pack,
-        )
+    pending_packs = []
+    pending_packs_bytes = 0
+
+    async def flush():
+        """Write the bounded CAS receipt group and its candidate map rows."""
+        await _copy_v4_map_batch(session, schema_name=schema_name, packs=pending_packs)
+        rows = [_map_pack_row(pack, int(snapshot_key)) for pack in pending_packs]
+        fields = tuple(rows[0])
+        await driver.copy_records_to_table(candidate, schema_name=schema_name, columns=fields,
+            records=[tuple(row[name] for name in fields) for row in rows])
+        pending_packs.clear()
+
+    for pack in iter_v4_snapshot_map_packs(references, max_coordinates_per_pack=max_coordinates_per_pack):
+        if pending_packs and pending_packs_bytes + pack.map_block.stored_byte_count > 4 * 1024 * 1024:
+            await flush()
+            pending_packs_bytes = 0
+        pending_packs.append(pack)
+        pending_packs_bytes += pack.map_block.stored_byte_count
         accumulator.add_pack(pack)
         if progress_callback is not None:
             progress_callback("map_packs", 1)
             progress_callback("map_coordinates", len(pack.references))
-    # The root remains building so component/pattern/relation metadata can be
-    # inserted under the same root fence. Seal performs the authoritative
-    # reread and the only transition to complete.
-    return accumulator.finish()
+    if pending_packs:
+        await flush()
+    summary = accumulator.finish()
+    await finish_snapshot_candidate(session, schema_name, candidate, summary.map_pack_count)
+    await session.execute(text("DROP TABLE pg_temp.ptg_map_blocks, pg_temp.ptg_map_targets"))
+    return summary
 
 
 def _v4_seal_options(
@@ -3933,15 +3275,57 @@ async def _summarize_v4_seal_state(
     return observed_summary, observed_metadata
 
 
+def _v4_root_completion_values(snapshot_key, representation, summary, metadata):
+    """Use identical native values for isolated proof and the metadata transition."""
+    return {
+            "snapshot_key": snapshot_key,
+            "map_digest": summary.map_digest,
+            "object_kind_count": summary.object_kind_count,
+            "map_pack_count": summary.map_pack_count,
+            "coordinate_count": summary.coordinate_count,
+            "entry_count": summary.entry_count,
+            "logical_byte_count": summary.logical_byte_count,
+            "stored_map_byte_count": summary.stored_map_byte_count,
+            "npi_count": metadata.npi_count,
+            "component_count": metadata.component_count,
+            "pattern_count": metadata.pattern_count,
+            "relation_count": metadata.relation_count,
+            "heavy_owner_count": metadata.heavy_owner_count,
+            "completed_at": _utcnow(),
+            "format_version": PTG2_V4_MAP_FORMAT_VERSION,
+            "map_format": PTG2_V4_MAP_FORMAT,
+            "representation": representation,
+            "projection_id_scope": PTG2_V4_PROJECTION_ID_SCOPE,
+        }
+
+
+async def _prepare_root_completion(session, schema, build_token, parameters_by_name):
+    """Validate explicit root values against the authenticated frozen family."""
+    root_by_field = {
+        field_name: ("\\x" + field_value.hex() if isinstance(field_value, bytes)
+                     else field_value.isoformat() if isinstance(field_value, datetime) else field_value)
+        for field_name, field_value in parameters_by_name.items()
+    }
+    root_by_field["state"] = "complete"
+    await session.execute(
+        text(f"SELECT {schema}.prepare_ptg_snapshot_completion(:snapshot,:token,CAST(:fields AS jsonb))"),
+        {"snapshot": parameters_by_name["snapshot_key"], "token": build_token, "fields": json.dumps(root_by_field)},
+    )
+
+
 async def _complete_v4_map_root(
     session: Any,
     *,
     schema: str,
     snapshot_key: int,
+    build_token: str,
     representation: str,
     summary: V4SnapshotMapSummary,
     metadata: V4SnapshotMetadataSummary,
 ) -> None:
+    """Complete the root only after the indexed isolated family passes all checks."""
+    parameters_by_name = _v4_root_completion_values(snapshot_key, representation, summary, metadata)
+    await _prepare_root_completion(session, schema, build_token, parameters_by_name)
     completion_result = await session.execute(
         text(
             f"""
@@ -3969,26 +3353,7 @@ async def _complete_v4_map_root(
             RETURNING snapshot_key
             """
         ),
-        {
-            "snapshot_key": snapshot_key,
-            "map_digest": summary.map_digest,
-            "object_kind_count": summary.object_kind_count,
-            "map_pack_count": summary.map_pack_count,
-            "coordinate_count": summary.coordinate_count,
-            "entry_count": summary.entry_count,
-            "logical_byte_count": summary.logical_byte_count,
-            "stored_map_byte_count": summary.stored_map_byte_count,
-            "npi_count": metadata.npi_count,
-            "component_count": metadata.component_count,
-            "pattern_count": metadata.pattern_count,
-            "relation_count": metadata.relation_count,
-            "heavy_owner_count": metadata.heavy_owner_count,
-            "completed_at": _utcnow(),
-            "format_version": PTG2_V4_MAP_FORMAT_VERSION,
-            "map_format": PTG2_V4_MAP_FORMAT,
-            "representation": representation,
-            "projection_id_scope": PTG2_V4_PROJECTION_ID_SCOPE,
-        },
+        parameters_by_name,
     )
     if completion_result.scalar() is None:
         raise RuntimeError("PTG V4 map root could not be completed during seal")
@@ -4261,25 +3626,27 @@ async def _prepare_v4_seal_state(
         snapshot_key=request.snapshot_key,
         build_token=request.build_token,
     )
-    await _validate_v4_source_seal_state(session, request)
-    summary, metadata = await _summarize_v4_seal_state(
-        session,
-        schema_name=request.schema_name,
-        snapshot_key=request.snapshot_key,
-        expected_summary=request.expected_summary,
-        summary_batch_rows=request.summary_batch_rows,
-        progress_callback=request.progress_callback,
-    )
-    if representation == "pattern_v1" and metadata.pattern_count <= 0:
-        raise RuntimeError("PTG V4 pattern representation has no pattern metadata")
-    await _complete_v4_map_root(
-        session,
-        schema=request.schema,
-        snapshot_key=request.snapshot_key,
-        representation=representation,
-        summary=summary,
-        metadata=metadata,
-    )
+    async with snapshot_candidate_reads(session, request.schema_name, request.snapshot_key, request.build_token):
+        await _validate_v4_source_seal_state(session, request)
+        summary, metadata = await _summarize_v4_seal_state(
+            session,
+            schema_name=request.schema_name,
+            snapshot_key=request.snapshot_key,
+            expected_summary=request.expected_summary,
+            summary_batch_rows=request.summary_batch_rows,
+            progress_callback=request.progress_callback,
+        )
+        if representation == "pattern_v1" and metadata.pattern_count <= 0:
+            raise RuntimeError("PTG V4 pattern representation has no pattern metadata")
+        await _complete_v4_map_root(
+            session,
+            schema=request.schema,
+            snapshot_key=request.snapshot_key,
+            build_token=request.build_token,
+            representation=representation,
+            summary=summary,
+            metadata=metadata,
+        )
     return _V4SealState(
         schema_name=request.schema_name,
         schema=request.schema,
@@ -4395,6 +3762,7 @@ async def seal_v4_shared_layout(
     await acquire_ptg2_source_lifecycle_lock(
         session,
         source_key=f"layout_{request.build_token}",
+        statement_timeout="0",
     )
     state = await _prepare_v4_seal_state(session, request)
     reusable_snapshot_key = await _reuse_v4_layout_if_available(
@@ -4408,7 +3776,9 @@ async def seal_v4_shared_layout(
             True,
         )
 
-    return await _seal_and_publish_v4_layout(session, state)
+    sealed = await _seal_and_publish_v4_layout(session, state)
+    await attach_snapshot_candidates(session, schema_name, request.snapshot_key, request.build_token)
+    return sealed
 
 
 async def _seal_and_publish_v4_layout(

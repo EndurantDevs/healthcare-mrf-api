@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_rooted_graph_bulk as bulk
 from process.provider_directory_rooted_graph_query import (
     build_provider_directory_organization_affiliation_query,
     build_provider_directory_practitioner_role_query,
@@ -105,6 +108,39 @@ def _discovered_direct_spec(identity):
         discovered_source_id="role.synthetic-boundary",
         discovered_edge_sha256=organization_edge.edge_sha256,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inserted_count", (None, True, -1, 2))
+async def test_work_admission_rejects_invalid_native_count(monkeypatch, inserted_count):
+    """A malformed admission count escapes the transaction as an error."""
+    identity = _identity()
+    database = _Database()
+    database.scalar = AsyncMock(side_effect=[None, inserted_count])
+    driver = SimpleNamespace(copy_records_to_table=AsyncMock(return_value="COPY 1"))
+    monkeypatch.setattr(bulk, "_copy_driver", AsyncMock(return_value=driver))
+    with pytest.raises(ProviderDirectoryRootedGraphStoreError, match="state"):
+        await bulk.admit_work_specs(database, identity.acquisition_id, [_discovered_direct_spec(identity)], action="frontier")
+    assert database.transaction_count == 1
+    assert database.scalar.await_count == 2
+    assert "admit_provider_directory_rooted_graph_work" in database.scalar.call_args.args[0]
+    driver.copy_records_to_table.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_work_short_second_copy_stops_before_admission(monkeypatch):
+    """A truncated later batch neither admits the prefix nor copies subsequent rows."""
+    identity = _identity()
+    database = _Database()
+    database.scalar = AsyncMock()
+    driver = SimpleNamespace(copy_records_to_table=AsyncMock(side_effect=["COPY 1", "COPY 0"]))
+    monkeypatch.setattr(bulk, "_copy_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(bulk, "_COPY_ROWS", 1)
+    with pytest.raises(ProviderDirectoryRootedGraphStoreError, match="state"):
+        await bulk.admit_work_specs(database, identity.acquisition_id, [_discovered_direct_spec(identity)] * 3, action="frontier")
+    database.scalar.assert_awaited_once()
+    assert "prepare_provider_directory_rooted_graph_work_stage" in database.scalar.call_args.args[0]
+    assert driver.copy_records_to_table.await_count == 2
 
 
 def _sealed_row(identity):
@@ -314,14 +350,14 @@ async def test_result_storage_is_count_fenced_and_frontier_is_atomic() -> None:
         await complete_provider_directory_rooted_graph_result(
             claim,
             query_result,
-            database=_Database(status_counts=(0,)),
+            database=_Database(admit_counts=(0, len(query_result.edges))),
         )
     assert resource_error.value.code == "state"
     with pytest.raises(ProviderDirectoryRootedGraphStoreError) as edge_error:
         await complete_provider_directory_rooted_graph_result(
             claim,
             query_result,
-            database=_Database(status_counts=(1, 0)),
+            database=_Database(admit_counts=(len(query_result.resources), 0)),
         )
     assert edge_error.value.code == "state"
     success_database = _Database(
@@ -341,10 +377,10 @@ async def test_result_storage_is_count_fenced_and_frontier_is_atomic() -> None:
     derived_index = next(
         index
         for index, (statement, parameters) in enumerate(success_database.statements)
-        if "INSERT INTO" in statement and parameters.get("kind") == "direct_read"
+        if "admit_provider_directory_rooted_graph_work" in statement and parameters.get("action") == "derive"
     )
     assert terminal_index < derived_index
-    assert success_database.transaction_count == 1
+    assert success_database.transaction_count == 2
     assert any(
         parameters.get("action") == "derive"
         for _, parameters in success_database.statements

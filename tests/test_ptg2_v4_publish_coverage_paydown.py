@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from copy import deepcopy
 import asyncio
-import hashlib
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,13 +76,6 @@ def test_publication_scalar_guards_cover_dictionary_and_tax_rows() -> None:
             (0, None, None, False, 0),
             range_start=0,
             range_end=1,
-        )
-    digest = hashlib.sha256()
-    with pytest.raises(RuntimeError, match="tax identity dictionary changed"):
-        publication._append_v4_tax_token_rows(
-            ((0, b"x" * 16, b"y" * 32),),
-            range_start=0,
-            content_digest=digest,
         )
     progress_events = []
     reader = publication._V4MeasuredCopyReader(
@@ -165,12 +157,14 @@ async def test_dense_and_sparse_publication_detect_persisted_drift(
     """Reject target rows that differ after either bounded publication path."""
 
     session = _ScalarSession(scalars=(0,), results=(None,))
+    monkeypatch.setattr(publication, "copy_snapshot_candidate", AsyncMock(side_effect=RuntimeError("persisted dictionary rows changed")))
     with pytest.raises(RuntimeError, match="persisted dictionary rows changed"):
         await publication._publish_v4_dictionary_stage_ranges(
             session,
             schema='"mrf"',
             snapshot_key=7,
             stage=_dictionary_stage(),
+            build_token="owned",
             progress_callback=None,
         )
 
@@ -198,53 +192,20 @@ async def test_dense_and_sparse_publication_detect_persisted_drift(
 async def test_tax_token_validation_covers_progress_and_count_guards(
     monkeypatch,
 ) -> None:
-    """Authenticate a token batch, then reject short and undercounted batches."""
-
+    """Count the complete staged set once and reject an incomplete dictionary."""
     contract = _tax_stage_contract()
-    token = b"t" * 32
-    events = []
-    monkeypatch.setattr(
-        publication,
-        "_v4_tax_token_batch",
-        AsyncMock(return_value=(((0, token[:16], token),), 0.01)),
-    )
-    await publication._validate_v4_tax_token_rows(
-        object(),
-        schema='"mrf"',
-        tax_identity_stage="tax_stage",
-        contract=contract,
-        content_digest=hashlib.sha256(),
-        progress_callback=lambda name, amount: events.append((name, amount)),
-    )
-    assert events == [
-        ("validated_dictionary_rows", 1),
-        ("publish_batches", 1),
-    ]
-
-    publication._v4_tax_token_batch.return_value = ((), 0.01)
+    progress_events = []
+    monkeypatch.setattr(publication, "_verify_v4_tax_stage_digest", AsyncMock())
+    session = _ScalarSession(results=(None, _OneResult((1,1,0,0,True)), _OneResult((4,4,1,1,1,1,1,True))))
+    await publication._validate_v4_tax_identity_stages(session, schema='"mrf"',
+        group_dictionary_stage="groups", tax_identity_stage="tax_stage", group_tax_identity_stage="group_tax",
+        contract=contract, progress_callback=lambda name, amount: progress_events.append((name,amount)))
+    assert progress_events == [("validated_dictionary_rows",5)]
     with pytest.raises(RuntimeError, match="tax identity dictionary changed"):
-        await publication._validate_v4_tax_token_rows(
-            object(),
-            schema='"mrf"',
-            tax_identity_stage="tax_stage",
-            contract=contract,
-            content_digest=hashlib.sha256(),
-            progress_callback=None,
-        )
-    publication._v4_tax_token_batch.return_value = (
-        ((0, token[:16], token),),
-        0.01,
-    )
-    monkeypatch.setattr(publication, "_append_v4_tax_token_rows", lambda *_a, **_k: 0)
-    with pytest.raises(RuntimeError, match="tax identity dictionary changed"):
-        await publication._validate_v4_tax_token_rows(
-            object(),
-            schema='"mrf"',
-            tax_identity_stage="tax_stage",
-            contract=contract,
-            content_digest=hashlib.sha256(),
-            progress_callback=None,
-        )
+        await publication._validate_v4_tax_identity_stages(
+            _ScalarSession(results=(None,_OneResult((0,0,0,-1,True)))), schema='"mrf"',
+            group_dictionary_stage="groups", tax_identity_stage="tax_stage", group_tax_identity_stage="group_tax",
+            contract=contract, progress_callback=None)
 
 
 def test_tax_contract_rejects_duplicate_source_map_and_shape_drift() -> None:
@@ -409,3 +370,37 @@ async def test_graph_wait_heartbeats_and_resource_guards(monkeypatch) -> None:
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=-1,
         )
+
+
+@pytest.mark.asyncio
+async def test_tax_set_validation_keeps_heartbeat_and_cancellation(monkeypatch):
+    """A long set scan retains its lease and cancels its outstanding query."""
+    scan_started = asyncio.Event()
+    scan_finished = asyncio.Event()
+    heartbeat = asyncio.Event()
+
+    async def pending_scan(*_args, **_kwargs):
+        scan_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            scan_finished.set()
+
+    native_await = publication._await_v4_dictionary_statement
+
+    async def short_heartbeat(statement, *, heartbeat_callback):
+        return await native_await(statement, heartbeat_callback=heartbeat_callback, heartbeat_seconds=0.001)
+
+    monkeypatch.setattr(publication, "_validate_v4_tax_identity_set", pending_scan)
+    monkeypatch.setattr(publication, "_await_v4_dictionary_statement", short_heartbeat)
+    task = asyncio.create_task(publication._validate_v4_tax_identity_stages(
+        object(), schema='"mrf"', group_dictionary_stage="groups", tax_identity_stage="tax",
+        group_tax_identity_stage="group_tax", contract=_tax_stage_contract(),
+        progress_callback=None, heartbeat_callback=heartbeat.set,
+    ))
+    await asyncio.wait_for(scan_started.wait(), 1)
+    await asyncio.wait_for(heartbeat.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert scan_finished.is_set()

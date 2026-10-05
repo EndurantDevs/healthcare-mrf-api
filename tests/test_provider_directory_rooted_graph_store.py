@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from process.provider_directory_rooted_graph_bulk import _WORK_COLUMNS
 from process.provider_directory_rooted_graph_identity import (
     build_provider_directory_rooted_graph_scope,
 )
@@ -44,12 +45,14 @@ from tests.test_provider_directory_rooted_graph_store_contract import (
 
 
 class _Database:
-    def __init__(self, *, first_rows=(), all_rows=(), status_counts=()) -> None:
+    def __init__(self, *, first_rows=(), all_rows=(), status_counts=(), admit_counts=None) -> None:
         self.first_rows = iter(first_rows)
         self.all_rows = list(all_rows)
         self.status_counts = iter(status_counts)
         self.statements: list[tuple[str, dict[str, object]]] = []
         self.transaction_count = 0
+        self.admit_counts = admit_counts
+        self.copied_rows = {}
 
     @asynccontextmanager
     async def transaction(self):
@@ -58,7 +61,20 @@ class _Database:
 
     async def scalar(self, statement, **parameters):
         self.statements.append((statement, parameters))
+        if "initialize_provider_directory_rooted_graph_work" in statement:
+            return 1
+        if "admit_provider_directory_rooted_graph_witnesses" in statement:
+            return self.admit_counts or [len(self.copied_rows.get(name, ())) for name in (
+                "pdrg_resource_stage", "pdrg_edge_stage",
+            )]
+        if "admit_provider_directory_rooted_graph_work" in statement:
+            return len(self.copied_rows.get("pdrg_work_stage", ()))
         return ""
+
+    async def copy_records_to_table(self, name, *, schema_name, columns, records):
+        assert schema_name == "pg_temp"
+        self.copied_rows.setdefault(name, []).extend(records)
+        return f"COPY {len(records)}"
 
     async def status(self, statement, **parameters):
         self.statements.append((statement, parameters))
@@ -141,17 +157,16 @@ async def test_initialize_builds_root_queries_set_wise_and_delays_plan_census() 
         == 1
     )
     sql = "\n".join(statement for statement, _parameters in database.statements)
-    assert "member.resource_type = 'Practitioner'" in sql
     assert "WHERE NOT EXISTS" in sql
-    assert sql.count("ON CONFLICT (acquisition_id, query_id) DO NOTHING") == 1
     assert "INSERT INTO" in sql and "SELECT" in sql
-    assert "canonical_root_identity" in sql
+    assert "initialize_provider_directory_rooted_graph_work" in sql
     assert "database.all" not in sql
     assert "full_insurance_plan_census" in sql
 
 
 @pytest.mark.asyncio
-async def test_million_root_initialization_never_materializes_ids_in_python() -> None:
+async def test_large_root_initialization_requests_bounded_pages() -> None:
+    """Large root counts retain bounded page requests instead of one Python workset."""
     root_count = 1_014_311
     root = _scope()
     scope = build_provider_directory_rooted_graph_scope(
@@ -180,11 +195,15 @@ async def test_million_root_initialization_never_materializes_ids_in_python() ->
         dataset_intent_id="pdrgi_" + "8" * 48,
     )
 
-    class NoMaterializationDatabase(_Database):
+    class BoundedPageDatabase(_Database):
         async def all(self, statement, **parameters):
-            raise AssertionError("root IDs must stay inside INSERT..SELECT")
+            assert "read_provider_directory_rooted_graph_initial_work" in statement
+            assert 1 <= parameters["limit"] <= 1024
+            if parameters["after_id"]:
+                return []
+            return [{**dict.fromkeys(_WORK_COLUMNS), "reference_id": "synthetic"}]
 
-    database = NoMaterializationDatabase(
+    database = BoundedPageDatabase(
         first_rows=(
             _header(identity),
             {
@@ -199,13 +218,9 @@ async def test_million_root_initialization_never_materializes_ids_in_python() ->
         database=database,
     )
 
-    work_inserts = [
-        statement
-        for statement, _ in database.statements
-        if "canonical_root_identity" in statement
-    ]
-    assert len(work_inserts) == 1
-    assert "INSERT INTO" in work_inserts[0] and "SELECT" in work_inserts[0]
+    assert sum("initialize_provider_directory_rooted_graph_work" in statement
+               for statement, _parameters in database.statements) == 1
+    assert len(database.copied_rows["pdrg_work_stage"]) == 1
 
 
 @pytest.mark.asyncio
@@ -261,7 +276,7 @@ async def test_dedicated_census_claim_returns_db_sorted_root_network_anchors() -
         == closure_by_field["root_network_references"]
     )
     sql = "\n".join(statement for statement, _ in database.statements)
-    assert "LOCK TABLE" in sql
+    assert "FOR SHARE" in sql
     assert "root_frontier_drained" in sql
     assert "full_insurance_plan_census" in sql
     assert "claim_census" in str(database.statements)
@@ -296,7 +311,7 @@ async def test_release_and_terminalization_are_exact_token_fenced() -> None:
             }
         ],
     )
-    stale_database = _Database(status_counts=(1, 1, 0))
+    stale_database = _Database(status_counts=(0,))
     with pytest.raises(ProviderDirectoryRootedGraphStoreError) as error:
         await complete_provider_directory_rooted_graph_result(
             claim,

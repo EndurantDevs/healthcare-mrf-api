@@ -94,7 +94,9 @@ def _schema_name() -> str:
 
 
 def _table(table_name: str) -> str:
-    return f'"{_schema_name()}"."{table_name}"'
+    from importlib import import_module
+
+    return import_module("process.provider_directory_fhir")._qt(_schema_name(), table_name)
 
 
 def _function(function_name: str) -> str:

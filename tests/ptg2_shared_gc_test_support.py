@@ -63,6 +63,7 @@ def _patch_v4_abandonment_pipeline(
     """Replace the bounded pipeline and return its observable async mocks."""
 
     pipeline_mock_by_name = {
+        "lifecycle_fence": AsyncMock(),
         "shared_tables": AsyncMock(return_value=True),
         "map_tables": AsyncMock(return_value=True),
         "finalizer_map_tables": AsyncMock(return_value=True),
@@ -80,6 +81,7 @@ def _patch_v4_abandonment_pipeline(
         "finalize": AsyncMock(return_value=final_stats),
     }
     for attribute, mock_name in (
+        ("acquire_ptg2_source_lifecycle_lock", "lifecycle_fence"),
         ("_has_shared_tables", "shared_tables"),
         ("_has_v4_map_tables", "map_tables"),
         ("_has_v4_finalizer_map_tables", "finalizer_map_tables"),
@@ -192,6 +194,8 @@ class _SharedGCExecutor:
         }
 
     def _metadata_rows(self, statement: str, _params: dict[str, object]):
+        if "to_regclass(:relation) IS NOT NULL AS installed" in statement:
+            return [{"installed": str(_params["relation"]).rsplit(".", 1)[-1] in self.present_tables}]
         if "FROM information_schema.tables" in statement:
             return [{"table_name": table_name} for table_name in sorted(self.present_tables)]
         if "FROM \"mrf\".ptg2_snapshot" in statement and "AS involved" in statement:
