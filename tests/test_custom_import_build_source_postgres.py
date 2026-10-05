@@ -7,14 +7,11 @@ from __future__ import annotations
 import datetime as dt
 from contextlib import asynccontextmanager
 from io import BytesIO
-from pathlib import Path
 from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
 from sqlalchemy import func, select, update
 
 import process.custom_import.build_source as staging
@@ -30,18 +27,37 @@ from db.models.custom_import import (
     CustomImportRejection,
     CustomImportRootRevision,
 )
+from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import execution as lifecycle
 from process.custom_import.capture import capture_stream
 from process.custom_import.capture_pending import seal_pending_parquet_bundle
 from process.custom_import.definition_store import register_definition
 from process.custom_import.runner_codec import digest_text, pack_hash
 from process.custom_import.runner_types import CancellationRequested, LeaseAuthorityLost
-from tests.custom_import_postgres_support import _migration, isolated_publication_case
+from process.custom_import.storage_layout import snapshot_models
+from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_capture_pending_postgres import _receipt, _retain, _start_attempt
 from tests.test_custom_import_snowflake_bundle import _definition
 
 _FIRST_NPI = "1003000126"
 _SECOND_NPI = "1234567893"
+
+
+def _candidate_models(session, request):
+    family_id = session.execute(
+        select(CustomImportSnapshotFamily.family_id)
+        .join(CustomImportExecution, CustomImportExecution.execution_id == CustomImportSnapshotFamily.execution_id)
+        .where(
+            CustomImportSnapshotFamily.dataset_id == request.dataset_id,
+            CustomImportSnapshotFamily.definition_revision_id == request.definition_revision_id,
+            CustomImportSnapshotFamily.schema_revision_id == request.schema_revision_id,
+            CustomImportSnapshotFamily.execution_id == request.execution_id,
+            CustomImportSnapshotFamily.capture_bundle_id == CustomImportExecution.capture_bundle_id,
+            CustomImportSnapshotFamily.producing_fence == request.fence,
+            CustomImportSnapshotFamily.producing_token_sha256 == lifecycle.lease_token_sha256(request.lease_token),
+        )
+    ).scalar_one()
+    return snapshot_models(family_id)
 
 
 def _root(npi=_FIRST_NPI, score=7):
@@ -52,19 +68,9 @@ def _child(npi=_FIRST_NPI, key="a", amount="2.0"):
     return dict(detail_npi=npi, detail_id=key, amount=amount)
 
 
-def _install_build_schema(connection, schema_name):
-    path = Path(__file__).resolve().parents[1] / "alembic/versions/20261002010000_custom_import_bounded_build.py"
-    migration = _migration(path, "custom_import_build_source_test_migration")
-    migration._schema = lambda: schema_name
-    migration.op = Operations(MigrationContext.configure(connection))
-    migration.upgrade()
-
-
 @asynccontextmanager
 async def _source_case():
     async with isolated_publication_case() as case:
-        async with case.engine.begin() as connection:
-            await connection.run_sync(_install_build_schema, case.schema_name)
         yield case
 
 
@@ -142,6 +148,7 @@ async def _assert_unpublished(session, request):
 async def _assert_graph_staged(case, request, result):
     assert result.phase == "graph" and result.source_occurrence_count == 4 and result.candidate_error_count == 0
     async with case.sessions() as session, session.begin():
+        models = await session.run_sync(_candidate_models, request)
         build = await session.get(CustomImportBuildAttempt, result.build_id)
         assert build.phase == "graph" and build.source_frozen_at is not None and build.generation_id is None
         cursors = (
@@ -152,10 +159,10 @@ async def _assert_graph_staged(case, request, result):
         assert len(cursors) == 2
         assert all(cursor.next_part_ordinal == 3 and cursor.replay_verified_at is not None for cursor in cursors)
         assert all(cursor.next_source_ordinal == 2 and cursor.next_pack_ordinal == 2 for cursor in cursors)
-        roots = (await session.scalars(select(CustomImportRootRevision))).all()
-        children = (await session.scalars(select(CustomImportChildRevision))).all()
+        roots = (await session.scalars(select(models[CustomImportRootRevision]))).all()
+        children = (await session.scalars(select(models[CustomImportChildRevision]))).all()
         assert len(roots) == len(children) == 2
-        packs = (await session.scalars(select(CustomImportPack))).all()
+        packs = (await session.scalars(select(models[CustomImportPack]))).all()
         assert len(packs) == 4 and all(pack.record_count == 1 for pack in packs)
         for revision, label, domain in [(root, "root", "root-payload") for root in roots] + [
             (child, "details", "child-payload") for child in children
@@ -177,7 +184,7 @@ async def test_multipart_pages_stage_without_generation_and_repeat_exactly():
 
 
 async def test_uncertain_page_commit_reloads_and_compares_before_append(monkeypatch):
-    original = staging._store_page
+    original = staging._store_pages
     acknowledgement = SimpleNamespace(has_failed=False)
 
     async def lost_acknowledgement(*args, **kwargs):
@@ -186,16 +193,17 @@ async def test_uncertain_page_commit_reloads_and_compares_before_append(monkeypa
             acknowledgement.has_failed = True
             raise ConnectionError("synthetic lost page commit acknowledgement")
 
-    monkeypatch.setattr(staging, "_store_page", lost_acknowledgement)
+    monkeypatch.setattr(staging, "_store_pages", lost_acknowledgement)
     async with _source_case() as case:
         request = await _retained_request(case)
         with pytest.raises(ConnectionError, match="acknowledgement"):
             await staging.stage_segmented_source(case.sessions, request)
         async with case.sessions() as session, session.begin():
+            models = await session.run_sync(_candidate_models, request)
             build = (await session.scalars(select(CustomImportBuildAttempt))).one()
-            assert build.phase == "source" and build.source_occurrence_count == 1
+            assert build.phase == "source" and build.source_occurrence_count == 2
             assert build.source_frozen_at is None
-            assert (await session.execute(select(func.count()).select_from(CustomImportPack))).scalar_one() == 1
+            assert (await session.execute(select(func.count()).select_from(models[CustomImportPack]))).scalar_one() == 2
         result = await staging.stage_segmented_source(case.sessions, request)
         await _assert_graph_staged(case, request, result)
 
@@ -216,6 +224,7 @@ async def test_partial_final_eof_retries_without_duplicate_rows(monkeypatch):
         with pytest.raises(ConnectionError, match="first-stream final"):
             await staging.stage_segmented_source(case.sessions, request)
         async with case.sessions() as session, session.begin():
+            models = await session.run_sync(_candidate_models, request)
             build = (await session.scalars(select(CustomImportBuildAttempt))).one()
             cursors = (
                 await session.scalars(select(CustomImportBuildStream).order_by(CustomImportBuildStream.stream_slot))
@@ -223,14 +232,14 @@ async def test_partial_final_eof_retries_without_duplicate_rows(monkeypatch):
             assert build.phase == "source" and build.source_occurrence_count == 4 and build.source_frozen_at is None
             assert cursors[0].next_part_ordinal == 3 and cursors[0].replay_verified_at is not None
             assert cursors[1].next_part_ordinal == 2 and cursors[1].replay_verified_at is None
-            assert (await session.execute(select(func.count()).select_from(CustomImportPack))).scalar_one() == 4
+            assert (await session.execute(select(func.count()).select_from(models[CustomImportPack]))).scalar_one() == 4
         outcome = await staging.stage_segmented_source(case.sessions, request)
         await _assert_graph_staged(case, request, outcome)
 
 
 @pytest.mark.parametrize("authority_loss", ["cancellation", "new_fence"])
 async def test_live_authority_loss_stops_after_last_committed_page(monkeypatch, authority_loss):
-    original = staging._store_page
+    original = staging._store_pages
     async with _source_case() as case:
         request = await _retained_request(case)
 
@@ -250,12 +259,12 @@ async def test_live_authority_loss_stops_after_last_committed_page(monkeypatch, 
                     )
                     assert grant.fence == request.fence + 1
 
-        monkeypatch.setattr(staging, "_store_page", revoke_after_commit)
+        monkeypatch.setattr(staging, "_store_pages", revoke_after_commit)
         with pytest.raises((CancellationRequested, LeaseAuthorityLost)):
             await staging.stage_segmented_source(case.sessions, request)
         async with case.sessions() as session, session.begin():
             build = (await session.scalars(select(CustomImportBuildAttempt))).one()
-            assert build.phase == "source" and build.source_occurrence_count == 1 and build.source_frozen_at is None
+            assert build.phase == "source" and build.source_occurrence_count == 2 and build.source_frozen_at is None
             assert all(
                 cursor.replay_verified_at is None
                 for cursor in (await session.scalars(select(CustomImportBuildStream))).all()
@@ -278,14 +287,14 @@ async def test_global_admission_handles_duplicates_invalid_presence_and_orphan_p
             outcome.phase == "rejected" and outcome.source_occurrence_count == 7 and outcome.candidate_error_count == 1
         )
         async with case.sessions() as session, session.begin():
+            models = await session.run_sync(_candidate_models, request)
+            occurrence_model = models[CustomImportBuildOccurrence]
             occurrences = (
-                await session.scalars(
-                    select(CustomImportBuildOccurrence).order_by(CustomImportBuildOccurrence.occurrence_id)
-                )
+                await session.scalars(select(occurrence_model).order_by(occurrence_model.occurrence_id))
             ).all()
             rejections_by_id = {
                 rejection.rejection_id: rejection
-                for rejection in (await session.scalars(select(CustomImportRejection))).all()
+                for rejection in (await session.scalars(select(models[CustomImportRejection]))).all()
             }
             codes = [rejections_by_id[occurrence.resolved_rejection_id].code for occurrence in occurrences]
             assert codes == [
@@ -320,10 +329,23 @@ async def test_late_reader_close_failure_cannot_freeze_source(monkeypatch):
         with pytest.raises(RuntimeError, match="late durable cursor"):
             await staging.stage_segmented_source(case.sessions, request)
         async with case.sessions() as session, session.begin():
+            models = await session.run_sync(_candidate_models, request)
             build = (await session.scalars(select(CustomImportBuildAttempt))).one()
-            assert build.phase == "source" and build.source_occurrence_count == 4 and build.source_frozen_at is None
-            assert all(
-                cursor.replay_verified_at is None
-                for cursor in (await session.scalars(select(CustomImportBuildStream))).all()
-            )
+            assert build.phase == "source" and build.source_occurrence_count == 2 and build.source_frozen_at is None
+            occurrences = (await session.scalars(select(models[CustomImportBuildOccurrence]))).all()
+            packs = (await session.scalars(select(models[CustomImportPack]))).all()
+            assert len(occurrences) == sum(pack.record_count for pack in packs) == build.source_occurrence_count
+            assert all(occurrence.record_kind == "root" for occurrence in occurrences)
+            assert len(packs) == 2 and all(pack.record_count == 1 for pack in packs)
+            assert (
+                await session.execute(select(func.count()).select_from(models[CustomImportRootRevision]))
+            ).scalar_one() == 2
+            assert (
+                await session.execute(select(func.count()).select_from(models[CustomImportChildRevision]))
+            ).scalar_one() == 0
+            cursors = (
+                await session.scalars(select(CustomImportBuildStream).order_by(CustomImportBuildStream.stream_slot))
+            ).all()
+            assert [cursor.next_source_ordinal for cursor in cursors] == [2, 0]
+            assert all(cursor.replay_verified_at is None for cursor in cursors)
             await _assert_unpublished(session, request)

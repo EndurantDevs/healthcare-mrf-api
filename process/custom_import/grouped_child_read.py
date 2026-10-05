@@ -66,37 +66,39 @@ def verify_child_selectors(selectors, child_key):
 def matching_child_statement(context, predicates):
     """Correlate every child comparison to one exact selected-family member."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    family_child_model = context.model(CustomImportFamilyChild)
+    child_model = context.model(CustomImportChildRevision)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     collection_slot = context.collection_slots_by_name[context.definition.query.child_collection]
     statement = (
-        select(CustomImportChildRevision.child_revision_id)
-        .select_from(CustomImportFamilyChild)
+        select(child_model.child_revision_id)
+        .select_from(family_child_model)
         .join(
-            CustomImportChildRevision,
+            child_model,
             and_(
-                CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id,
-                CustomImportChildRevision.dataset_id == CustomImportFamilyChild.dataset_id,
-                CustomImportChildRevision.schema_revision_id == CustomImportFamilyChild.schema_revision_id,
-                CustomImportChildRevision.root_record_id == CustomImportFamilyChild.root_record_id,
-                CustomImportChildRevision.collection_slot == CustomImportFamilyChild.collection_slot,
+                child_model.child_revision_id == family_child_model.child_revision_id,
+                child_model.dataset_id == family_child_model.dataset_id,
+                child_model.schema_revision_id == family_child_model.schema_revision_id,
+                child_model.root_record_id == family_child_model.root_record_id,
+                child_model.collection_slot == family_child_model.collection_slot,
             ),
         )
         .where(
-            CustomImportFamilyChild.family_revision_id == CustomImportWinner.family_revision_id,
-            CustomImportFamilyChild.dataset_id == context.target.dataset_id,
-            CustomImportFamilyChild.schema_revision_id == context.target.schema_revision_id,
-            CustomImportFamilyChild.root_record_id == CustomImportFamilyRevision.root_record_id,
-            CustomImportFamilyChild.collection_slot == collection_slot,
+            family_child_model.family_revision_id == winner_model.family_revision_id,
+            family_child_model.dataset_id == context.target.dataset_id,
+            family_child_model.schema_revision_id == context.target.schema_revision_id,
+            family_child_model.root_record_id == family_model.root_record_id,
+            family_child_model.collection_slot == collection_slot,
         )
-        .correlate(CustomImportWinner, CustomImportFamilyRevision)
+        .correlate(winner_model, family_model)
     )
     for predicate in predicates:
-        conditions = core._child_scalar_conditions(
-            predicate.field, CustomImportChildRevision.child_revision_id, context
-        )
+        conditions = core._child_scalar_conditions(predicate.field, child_model.child_revision_id, context)
         statement = statement.where(
-            core._scalar_predicate(CustomImportChildScalar, predicate, conditions).correlate(
-                CustomImportChildRevision, CustomImportFamilyRevision
-            )
+            core._scalar_predicate(child_scalar_model, predicate, conditions).correlate(child_model, family_model)
         )
     return statement
 
@@ -104,12 +106,16 @@ def matching_child_statement(context, predicates):
 def child_order_expression(context, predicates, field):
     """Read one complete-key child's scalar; ambiguous identity fails closed."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     child_revision_id = matching_child_statement(context, predicates).scalar_subquery()
     conditions = core._child_scalar_conditions(field, child_revision_id, context)
-    value_column = getattr(CustomImportChildScalar, core._SCALAR_COLUMNS[field.value_type])
+    value_column = getattr(child_scalar_model, core._SCALAR_COLUMNS[field.value_type])
     return (
         select(value_column)
-        .where(*conditions, CustomImportChildScalar.value_state == "value")
-        .correlate(CustomImportWinner, CustomImportFamilyRevision)
+        .where(*conditions, child_scalar_model.value_state == "value")
+        .correlate(winner_model, family_model)
         .scalar_subquery()
     )

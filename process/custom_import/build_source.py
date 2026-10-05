@@ -12,8 +12,9 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from uuid import UUID
 
-from sqlalchemy import case, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -23,12 +24,12 @@ from db.models.custom_import import (
     CustomImportCaptureBundle,
     CustomImportChildRevision,
     CustomImportLease,
-    CustomImportPack,
     CustomImportRejection,
     CustomImportRootRecord,
     CustomImportRootRevision,
     CustomImportSelectionProfile,
 )
+from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS, encode_landing_batch
 from process.custom_import.capture import iter_records
 from process.custom_import.capture_store import open_segmented_parquet_parts
 from process.custom_import.definition import CustomImportDefinition, SourceStream
@@ -39,9 +40,7 @@ from process.custom_import.materialization import DefinitionIdentity, selection_
 from process.custom_import.runner_codec import (
     child_key_document,
     digest_text,
-    pack_hash,
     record_payload,
-    root_key_contract_hash,
     root_key_evidence_from_tuple,
 )
 from process.custom_import.runner_graph import rejection_model
@@ -66,6 +65,7 @@ from process.custom_import.snowflake_bundle_replay import (
     _stream_fields,
     _validate_replay_partition_schema,
 )
+from process.custom_import.storage_layout import snapshot_models, snapshot_schema
 
 _WINDOW = "custom_import_build_page_window"
 
@@ -316,6 +316,8 @@ async def _call(session: AsyncSession, name: str, arguments: tuple[tuple[str, ob
 
 
 async def _begin_build(session_factory, request):
+    """Begin or reload a build and bind its complete snapshot before commit."""
+
     async with _page_session(session_factory, request) as (session, _):
         await _prepare_statement(session)
         registry = await load_registry(session, request)
@@ -361,7 +363,34 @@ async def _begin_build(session_factory, request):
                 ),
             )
         ).scalar_one()
+        await _resolve_build_snapshot(session, build_id)
     return build_id, registry
+
+
+async def _resolve_build_snapshot(session, build_id):
+    """Resolve this transaction's real writable or frozen-finality binding."""
+
+    family_id = (await _call(session, "resolve_custom_import_build_snapshot", (("bigint", build_id),))).scalar_one()
+    if type(family_id) is not int or not 0 < family_id < 2**63:
+        raise CandidateRunnerError("build snapshot binding is malformed")
+    return family_id
+
+
+async def _prepare_snapshot_indexes(session_factory, request, build_id, phase):
+    """Prepare one isolated index per fenced transaction, renewing between them."""
+
+    while True:
+        async with _page_session(session_factory, request, build_id) as (session, build):
+            if phase != "serving" and build.phase != phase:
+                return
+            family_id = await _resolve_build_snapshot(session, build_id)
+            complete = (
+                await _call(session, "prepare_custom_import_snapshot_indexes", (("bigint", family_id), ("text", phase)))
+            ).scalar_one()
+            if type(complete) is not bool:
+                raise CandidateRunnerError("index preparation returned an invalid completion state")
+        if complete:
+            return
 
 
 @dataclass(frozen=True)
@@ -429,58 +458,6 @@ def _prepare_row(request: SourceBuildRequest, stream: SourceStream, record_value
     return _PreparedRow(raw, typed, canonical_payload, payload_hash, child_key, child_hash, rejection, byte_count)
 
 
-async def _intern_roots(session, request, prepared_records):
-    """Resolve one bounded page under its dataset lock without loading stored key text."""
-
-    canonical_by_digest = {}
-    for prepared in prepared_records:
-        if prepared.typed_key is not None:
-            canonical, digest = prepared.typed_key
-            if canonical_by_digest.setdefault(digest, canonical) != canonical:
-                raise CandidateRunnerError("root logical-key digest collision")
-    if not canonical_by_digest:
-        return {}
-    key_contract = root_key_contract_hash(request.definition)
-    expected_key = case(canonical_by_digest, value=CustomImportRootRecord.logical_key_sha256)
-    await _prepare_statement(session)
-    stored_roots = (
-        await session.execute(
-            select(
-                CustomImportRootRecord.root_record_id,
-                CustomImportRootRecord.logical_key_sha256,
-                func.convert_to(CustomImportRootRecord.canonical_logical_key, "UTF8")
-                == func.convert_to(expected_key, "UTF8"),
-            )
-            .where(
-                CustomImportRootRecord.dataset_id == request.dataset_id,
-                CustomImportRootRecord.key_contract_sha256 == key_contract,
-                CustomImportRootRecord.logical_key_sha256.in_(canonical_by_digest),
-            )
-            .with_for_update()
-        )
-    ).all()
-    root_id_by_digest = {}
-    for root_id, digest, canonical_matches in stored_roots:
-        if not canonical_matches:
-            raise CandidateRunnerError("root logical-key digest collision")
-        root_id_by_digest[bytes(digest)] = root_id
-    missing_roots = [
-        CustomImportRootRecord(
-            dataset_id=request.dataset_id,
-            key_contract_sha256=key_contract,
-            canonical_logical_key=canonical,
-            logical_key_sha256=digest,
-        )
-        for digest, canonical in canonical_by_digest.items()
-        if digest not in root_id_by_digest
-    ]
-    if missing_roots:
-        session.add_all(missing_roots)
-        await _flush_page(session)
-        root_id_by_digest.update((root.logical_key_sha256, root.root_record_id) for root in missing_roots)
-    return root_id_by_digest
-
-
 @dataclass(frozen=True)
 class _StreamContext:
     request: SourceBuildRequest
@@ -507,108 +484,75 @@ class _SourcePage:
     records: tuple[_PreparedRow, ...]
 
 
-def _revision_model(context, pack, prepared, root_id, source_ordinal):
-    request = context.request
-    owner_by_field = dict(
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        pack_id=pack.pack_id,
-        source_ordinal=source_ordinal,
-        root_record_id=root_id,
-        canonical_payload=prepared.payload,
-        payload_sha256=prepared.payload_hash,
-    )
-    if context.stream.record_kind == "root":
-        return CustomImportRootRevision(**owner_by_field)
-    return CustomImportChildRevision(
-        **owner_by_field,
-        collection_slot=context.collection_slot,
-        canonical_parent_key=prepared.typed_key[0],
-        parent_key_sha256=prepared.typed_key[1],
-        canonical_child_key=prepared.child_key,
-        child_key_sha256=prepared.child_hash,
-    )
+_SOURCE_COPY_COLUMNS = (
+    "batch_id",
+    "landing_ordinal",
+    "pack_ordinal",
+    "pack_sha256",
+    "part_ordinal",
+    "part_row_ordinal",
+    "source_ordinal",
+    "raw_key",
+    "raw_hash",
+    "typed_key",
+    "typed_hash",
+    "payload",
+    "payload_hash",
+    "child_key",
+    "child_hash",
+    "rejection_code",
+    "rejection_key",
+    "rejection_hash",
+    "rejection_evidence",
+)
 
 
-def _occurrence_model(context, pack, page, offset, root_id, outcome):
-    """Link each outcome back to its unchanged position after the outcomes flush."""
+async def _copy_source_landing(session, landing_rows):
+    """COPY only to the native snapshot pinned by this transaction's batch."""
 
-    prepared = page.records[offset]
-    root_revision_id = child_revision_id = rejection_id = None
-    if prepared.rejection is not None:
-        rejection_id = outcome.rejection_id
-    elif context.stream.record_kind == "root":
-        root_revision_id = outcome.root_revision_id
-    else:
-        child_revision_id = outcome.child_revision_id
-    return CustomImportBuildOccurrence(
-        build_id=context.build_id,
-        stream_slot=pack.stream_slot,
-        pack_id=pack.pack_id,
-        origin="source",
-        source_part_ordinal=page.part_ordinal,
-        part_row_ordinal=page.first_row + offset,
-        source_ordinal=page.first_source + offset,
-        record_kind=context.stream.record_kind,
-        collection_slot=context.collection_slot,
-        raw_parent_key_canonical=None if prepared.raw_key is None else prepared.raw_key[0],
-        raw_parent_key_sha256=None if prepared.raw_key is None else prepared.raw_key[1],
-        root_record_id=root_id,
-        child_key_sha256=prepared.child_hash,
-        root_revision_id=root_revision_id,
-        child_revision_id=child_revision_id,
-        rejection_id=rejection_id,
+    if not landing_rows:
+        raise CandidateRunnerError("source COPY requires an authorized nonempty batch")
+    family_id = (
+        await _call(session, "resolve_custom_import_source_batch_snapshot", (("uuid", landing_rows[0][0]),))
+    ).scalar_one()
+    try:
+        schema = snapshot_schema(family_id)
+    except ValueError as exc:
+        raise CandidateRunnerError("source batch snapshot binding is malformed") from exc
+    await _prepare_statement(session)
+    connection = await session.connection()
+    raw = await connection.get_raw_connection()
+    await raw.driver_connection.copy_records_to_table(
+        "source_bulk_landing",
+        schema_name=schema,
+        columns=_SOURCE_COPY_COLUMNS,
+        records=landing_rows,
     )
 
 
-async def _append_page(session, context, pack, page, rejection_ordinal):
-    """Flush dependency-ordered batches while keeping occurrence and rejection order."""
-
-    root_id_by_digest = await _intern_roots(session, context.request, page.records)
-    outcomes = []
-    for offset, prepared in enumerate(page.records):
-        root_id = None if prepared.typed_key is None else root_id_by_digest[prepared.typed_key[1]]
-        if prepared.rejection is not None:
-            outcome = prepared.rejection
-            outcome.pack_id = pack.pack_id
-            outcome.source_ordinal = page.first_source + offset
-            outcome.collection_slot = context.collection_slot or None
-            outcome.rejection_ordinal = rejection_ordinal
-            rejection_ordinal += 1
-        else:
-            outcome = _revision_model(context, pack, prepared, root_id, page.first_source + offset)
-        outcomes.append((root_id, outcome))
-    session.add_all(outcome for _, outcome in outcomes)
-    await _flush_page(session)
-    session.add_all(
-        _occurrence_model(context, pack, page, offset, root_id, outcome)
-        for offset, (root_id, outcome) in enumerate(outcomes)
+def _source_closed_prefix(context, cursor, pages, verified_parts):
+    """Bind the first durable position and exact earlier reader-close metadata."""
+    first = pages[0]
+    if (
+        first.first_source != cursor.next_source_ordinal
+        or first.part_ordinal < cursor.next_part_ordinal
+        or first.first_row != (cursor.next_part_row_ordinal if first.part_ordinal == cursor.next_part_ordinal else 0)
+    ):
+        raise CandidateRunnerError("source cursor changed; reload before retry")
+    earlier_parts = sorted(
+        part
+        for slot, part in verified_parts
+        if slot == context.stream_slot and cursor.next_part_ordinal <= part < pages[-1].part_ordinal
     )
-    await _flush_page(session)
+    if len(earlier_parts) != pages[-1].part_ordinal - cursor.next_part_ordinal or any(
+        part != cursor.next_part_ordinal + offset for offset, part in enumerate(earlier_parts)
+    ):
+        raise CandidateRunnerError("earlier source parts lack verified reader close")
+    return earlier_parts
 
 
-def _pack_model(context, build, cursor, prepared_records):
-    request = context.request
-    hashes = [prepared.payload_hash for prepared in prepared_records if prepared.payload_hash is not None]
-    return CustomImportPack(
-        execution_id=request.execution_id,
-        dataset_id=request.dataset_id,
-        definition_revision_id=request.definition_revision_id,
-        schema_revision_id=request.schema_revision_id,
-        stream_slot=context.stream_slot,
-        pack_ordinal=cursor.next_pack_ordinal,
-        capture_bundle_id=build.capture_bundle_id,
-        record_count=len(hashes),
-        pack_sha256=pack_hash(context.stream.child_collection or "root", hashes),
-        producing_fence=request.fence,
-        producing_token_sha256=lease_token_sha256(request.lease_token),
-    )
-
-
-async def _store_page(session_factory, context, page):
-    """Commit pack, outcomes, and their cursor advance in the same short transaction."""
-
+async def _store_pages(session_factory, context, pages, *, verified_parts=()):
+    """COPY native page packs and promote one bounded set in the owned transaction."""
     async with _page_session(session_factory, context.request, context.build_id) as (session, build):
         if build.phase != "source":
             raise CandidateRunnerError("source build is already frozen")
@@ -624,65 +568,139 @@ async def _store_page(session_factory, context, page):
                 .execution_options(populate_existing=True)
             )
         ).one()
-        if (cursor.next_part_ordinal, cursor.next_part_row_ordinal, cursor.next_source_ordinal) != (
-            page.part_ordinal,
-            page.first_row,
-            page.first_source,
-        ):
-            raise CandidateRunnerError("source cursor changed; reload before retry")
-        pack = _pack_model(context, build, cursor, page.records)
-        session.add(pack)
-        await _flush_page(session)
-        await _append_page(session, context, pack, page, build.next_rejection_ordinal)
-        next_source = (
+        preview = encode_landing_batch(
+            context, pages, batch_id=UUID(int=0), first_pack_ordinal=cursor.next_pack_ordinal
+        )
+        earlier_parts = _source_closed_prefix(context, cursor, pages, verified_parts)
+        batch_id = (
             await _call(
                 session,
-                "commit_custom_import_build_source_page",
+                "source_bulk_authorize",
                 (
                     ("bigint", context.build_id),
-                    ("bigint", pack.pack_id),
+                    ("smallint", context.stream_slot),
+                    ("bigint", context.request.fence),
+                    ("bytea", lease_token_sha256(context.request.lease_token)),
+                    ("integer", len(preview.records)),
+                    ("bigint", preview.byte_count),
                 ),
             )
         ).scalar_one()
-        if next_source != page.first_source + len(page.records):
-            raise CandidateRunnerError("source page did not advance its exact cursor")
+        landing_rows = tuple((batch_id, ordinal, *landing[1:]) for ordinal, landing in enumerate(preview.records))
+        await _copy_source_landing(session, landing_rows)
+        completed = (
+            await _call(session, "source_set_finalize", (("uuid", batch_id), ("integer[]", earlier_parts)))
+        ).scalar_one()
+        if completed != len(landing_rows):
+            raise CandidateRunnerError("completed source count differs from attempted rows")
+    return completed
 
 
-def _committed_prefix_statement(context, page):
+async def _store_single_page(session_factory, context, page):
+    """Keep the single-page internal entry point on the same COPY/set boundary."""
+    return await _store_pages(session_factory, context, (page,))
+
+
+class _SourceBatch:
+    """Replay-local buffering; durable cursors remain the only retry authority."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+        self.pages, self.context, self.rows, self.bytes = [], None, 0, 0
+        self.verified_parts = set()
+        self.last_flush_at = time.monotonic()
+
+    def clear(self):
+        """Discard replay-local state, including an uncertain prior attempt."""
+        self.pages.clear()
+        self.context, self.rows, self.bytes = None, 0, 0
+        self.verified_parts.clear()
+
+    async def flush(self):
+        """Promote buffered packs, then finish only a verified non-final reader."""
+        if not self.pages:
+            return
+        context, last_part = self.context, self.pages[-1].part_ordinal
+        await _store_pages(self.session_factory, context, tuple(self.pages), verified_parts=self.verified_parts)
+        self.pages.clear()
+        self.context, self.rows, self.bytes = None, 0, 0
+        if (context.stream_slot, last_part) in self.verified_parts:
+            await _finish_part(self.session_factory, context.request, context.build_id, context.stream_slot, last_part)
+        self.verified_parts = {
+            (slot, part) for slot, part in self.verified_parts if slot != context.stream_slot or part > last_part
+        }
+        self.last_flush_at = time.monotonic()
+
+    async def store(self, session_factory, context, page):
+        """Buffer intact packs within row, byte, stream and live-lease bounds."""
+        page_bytes = sum(row.byte_count for row in page.records)
+        if self.pages and (
+            context != self.context
+            or self.rows + len(page.records) > MAX_BATCH_ROWS
+            or self.bytes + page_bytes > MAX_BATCH_BYTES
+        ):
+            await self.flush()
+        self.context = context
+        self.pages.append(page)
+        self.rows += len(page.records)
+        self.bytes += page_bytes
+        if time.monotonic() - self.last_flush_at >= context.request.lease_seconds / 3:
+            await self.flush()
+
+    async def finish(self, request, build_id, slot, ordinal, *, final=False):
+        """Record actual reader close; final calls require outer EOF and cleanup."""
+        # Non-final readers have already completed decode, Arrow accounting and
+        # close. Final finish is invoked only after genuine outer EOF and cleanup.
+        if final:
+            await self.flush()
+            await _finish_part(self.session_factory, request, build_id, slot, ordinal)
+            return
+        self.verified_parts.add((slot, ordinal))
+        if not self.pages:
+            await _finish_part(self.session_factory, request, build_id, slot, ordinal)
+            self.verified_parts.discard((slot, ordinal))
+        elif self.context.stream_slot != slot or self.pages[-1].part_ordinal < ordinal:
+            await self.flush()
+            await _finish_part(self.session_factory, request, build_id, slot, ordinal)
+            self.verified_parts.discard((slot, ordinal))
+        elif time.monotonic() - self.last_flush_at >= request.lease_seconds / 3:
+            await self.flush()
+        if not self.pages:
+            self.last_flush_at = time.monotonic()
+
+
+def _committed_prefix_statement(context, page, *, models=None):
+    """Compile exact replay joins from explicit transaction-bound hot aliases."""
+
+    occurrence = CustomImportBuildOccurrence if models is None else models[CustomImportBuildOccurrence]
+    root_record = CustomImportRootRecord if models is None else models[CustomImportRootRecord]
+    root_revision = CustomImportRootRevision if models is None else models[CustomImportRootRevision]
+    child_revision = CustomImportChildRevision if models is None else models[CustomImportChildRevision]
+    rejection = CustomImportRejection if models is None else models[CustomImportRejection]
     return (
         select(
-            CustomImportBuildOccurrence,
-            CustomImportRootRecord.canonical_logical_key,
-            CustomImportRootRevision.canonical_payload,
-            CustomImportChildRevision.canonical_payload,
-            CustomImportChildRevision.canonical_child_key,
-            CustomImportRejection.code,
-            CustomImportRejection.canonical_root_key,
-            CustomImportRejection.canonical_evidence,
+            occurrence,
+            root_record.canonical_logical_key,
+            root_revision.canonical_payload,
+            child_revision.canonical_payload,
+            child_revision.canonical_child_key,
+            rejection.code,
+            rejection.canonical_root_key,
+            rejection.canonical_evidence,
         )
-        .outerjoin(
-            CustomImportRootRecord, CustomImportRootRecord.root_record_id == CustomImportBuildOccurrence.root_record_id
-        )
-        .outerjoin(
-            CustomImportRootRevision,
-            CustomImportRootRevision.root_revision_id == CustomImportBuildOccurrence.root_revision_id,
-        )
-        .outerjoin(
-            CustomImportChildRevision,
-            CustomImportChildRevision.child_revision_id == CustomImportBuildOccurrence.child_revision_id,
-        )
-        .outerjoin(
-            CustomImportRejection, CustomImportRejection.rejection_id == CustomImportBuildOccurrence.rejection_id
-        )
+        .outerjoin(root_record, root_record.root_record_id == occurrence.root_record_id)
+        .outerjoin(root_revision, root_revision.root_revision_id == occurrence.root_revision_id)
+        .outerjoin(child_revision, child_revision.child_revision_id == occurrence.child_revision_id)
+        .outerjoin(rejection, rejection.rejection_id == occurrence.rejection_id)
         .where(
-            CustomImportBuildOccurrence.build_id == context.build_id,
-            CustomImportBuildOccurrence.stream_slot == context.stream_slot,
-            CustomImportBuildOccurrence.origin == "source",
-            CustomImportBuildOccurrence.source_part_ordinal == page.part_ordinal,
-            CustomImportBuildOccurrence.part_row_ordinal >= page.first_row,
-            CustomImportBuildOccurrence.part_row_ordinal < page.first_row + len(page.records),
+            occurrence.build_id == context.build_id,
+            occurrence.stream_slot == context.stream_slot,
+            occurrence.origin == "source",
+            occurrence.source_part_ordinal == page.part_ordinal,
+            occurrence.part_row_ordinal >= page.first_row,
+            occurrence.part_row_ordinal < page.first_row + len(page.records),
         )
-        .order_by(CustomImportBuildOccurrence.part_row_ordinal)
+        .order_by(occurrence.part_row_ordinal)
         .limit(context.request.page_row_limit)
     )
 
@@ -720,9 +738,14 @@ def _prepared_fingerprint(page, offset):
 
 
 async def _compare_committed_page(session_factory, context, page):
+    """Pin the exact snapshot anew before comparing a durable source prefix."""
+
     async with _page_session(session_factory, context.request, context.build_id) as (session, _):
+        family_id = await _resolve_build_snapshot(session, context.build_id)
         await _prepare_statement(session)
-        stored_records = (await session.execute(_committed_prefix_statement(context, page))).all()
+        stored_records = (
+            await session.execute(_committed_prefix_statement(context, page, models=snapshot_models(family_id)))
+        ).all()
         if len(stored_records) != len(page.records):
             raise CandidateRunnerError("committed source prefix has incomplete coverage")
         if any(
@@ -730,6 +753,21 @@ async def _compare_committed_page(session_factory, context, page):
             for offset, stored in enumerate(stored_records)
         ):
             raise CandidateRunnerError("committed source prefix differs from sealed replay")
+        checked = (
+            await _call(
+                session,
+                "check_custom_import_source_replay_homes",
+                (
+                    ("bigint", context.build_id),
+                    ("smallint", context.stream_slot),
+                    ("integer", page.part_ordinal),
+                    ("bigint", page.first_row),
+                    ("integer", len(page.records)),
+                ),
+            )
+        ).scalar_one()
+        if checked != len(page.records):
+            raise CandidateRunnerError("committed source revision homes have incomplete coverage")
 
 
 async def _finish_part(session_factory, request, build_id, slot, ordinal):
@@ -791,7 +829,7 @@ def _close_iterator(iterator, primary):
     return primary
 
 
-async def _replay_part(session_factory, context, part, policy, cursor):
+async def _replay_part(session_factory, context, part, policy, cursor, *, store_page=None):
     """Compare committed prefixes before appending, then verify genuine part EOF."""
 
     fields = _stream_fields(context.request.definition, context.stream)
@@ -801,7 +839,9 @@ async def _replay_part(session_factory, context, part, policy, cursor):
     primary = None
     try:
         for page in pages:
-            operation = _compare_committed_page if page.first_row < committed_rows else _store_page
+            operation = (
+                _compare_committed_page if page.first_row < committed_rows else (store_page or _store_single_page)
+            )
             await operation(session_factory, context, page)
     except BaseException as exc:
         primary = exc
@@ -863,6 +903,7 @@ async def _close_contexts(contexts, primary):
 
 
 async def _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursors):
+    batch = _SourceBatch(session_factory)
     contexts = []
     primary = None
     final_part_by_slot = {}
@@ -892,25 +933,29 @@ async def _replay_source(session_factory, request, registry, build_id, bundle_id
                 part,
                 policy,
                 (cursor[0], cursor[1], source_starts[stream_id]),
+                store_page=batch.store,
             )
             source_starts[stream_id] += count
             part_count = json.loads(part.receipt.canonical_manifest)["part_count"]
             if part.ordinal == part_count:
                 final_part_by_slot[slot] = part.ordinal
             elif part.ordinal >= cursor[0]:
-                await _finish_part(session_factory, request, build_id, slot, part.ordinal)
+                await batch.finish(request, build_id, slot, part.ordinal)
     except BaseException as exc:
         primary = exc
     primary = await _close_contexts(contexts, primary)
-    if primary is not None:
-        raise primary
-    if set(final_part_by_slot) != set(registry.stream_slots.values()):
-        raise CandidateRunnerError("source replay lacks complete stream EOF")
-    # Only genuine outer EOF plus successful cursor/session close grants final EOF.
-    for slot, ordinal in sorted(final_part_by_slot.items()):
-        await _finish_part(session_factory, request, build_id, slot, ordinal)
-    async with _page_session(session_factory, request, build_id) as (session, _):
-        await _call(session, "freeze_custom_import_build_source", (("bigint", build_id),))
+    try:
+        if primary is not None:
+            raise primary
+        if set(final_part_by_slot) != set(registry.stream_slots.values()):
+            raise CandidateRunnerError("source replay lacks complete stream EOF")
+        # Only genuine outer EOF plus successful cursor/session close grants final EOF.
+        for slot, ordinal in sorted(final_part_by_slot.items()):
+            await batch.finish(request, build_id, slot, ordinal, final=True)
+        async with _page_session(session_factory, request, build_id) as (session, _):
+            await _call(session, "freeze_custom_import_build_source", (("bigint", build_id),))
+    finally:
+        batch.clear()
 
 
 async def stage_segmented_source(session_factory: SessionFactory, request: SourceBuildRequest) -> SourceBuildResult:
@@ -942,6 +987,7 @@ async def stage_segmented_source(session_factory: SessionFactory, request: Sourc
         }
     if phase == "source":
         await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
+    await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
     while True:
         async with _page_session(session_factory, request, build_id) as (session, build):
             if build.phase in ("graph", "rejected", "output", "verifying", "verified"):

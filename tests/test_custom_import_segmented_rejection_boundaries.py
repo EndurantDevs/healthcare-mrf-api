@@ -24,7 +24,7 @@ from process.custom_import.capture_store import CaptureBundleConflict, CaptureSt
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_types import CandidateRunnerError, LeaseAuthorityLost
 from tests.test_custom_import_build_graph import _request as _graph_request
-from tests.test_custom_import_build_output import _candidate, _generation, _group
+from tests.test_custom_import_build_output import _candidate, _context_row, _generation, _group, _output_read_session
 from tests.test_custom_import_build_source import _request as _source_request
 from tests.test_custom_import_capture_pending import (
     _PART_IDS,
@@ -268,16 +268,25 @@ def test_output_requires_retained_winner(monkeypatch, damage):
 
     request = _graph_request()
     candidate = _candidate()
-    registry, group = _group(request, candidate)
+    registry, _group_key = _group(request, candidate)
     monkeypatch.setattr(
-        output, "_context_candidates", lambda *_arguments: iter(()) if damage == "empty" else iter((candidate,))
+        output,
+        "_context_rows",
+        lambda *_arguments, **kwargs: (row for row in (_context_row(request, candidate),)),
     )
-    context_lookup = Mock(return_value=None)
-    monkeypatch.setattr(output, "_one_row", context_lookup)
-    message = "produce one winner" if damage == "empty" else "no retained candidate context"
+    monkeypatch.setattr(
+        output,
+        "_context_candidates",
+        lambda *_arguments, **kwargs: iter(()) if damage == "empty" else iter((candidate,)),
+    )
+    session = _output_read_session(monkeypatch, [[]])
+    context_lookup = session.execute
+    message = "produce one winner" if damage == "empty" else "no unique retained candidate context"
     with pytest.raises(CandidateRunnerError, match=message):
-        output._reduce_group(None, request, registry, 7, _generation(request), group)
+        output._winner_batch(session, request, registry, 7, _generation(request), None)
     assert context_lookup.call_count == int(damage == "missing_context")
+    if damage == "missing_context":
+        assert "unnest" in str(context_lookup.call_args.args[0])
 
 
 @pytest.mark.parametrize(
@@ -450,7 +459,7 @@ def test_graph_fingerprint_requires_complete_families(monkeypatch):
     """A partial retained family cannot be included in a candidate fingerprint."""
 
     family = SimpleNamespace(complete_at=None, root_key_sha256=b"r" * 32)
-    monkeypatch.setattr(graph, "_read_rows", lambda *_arguments: iter(((family,),)))
+    monkeypatch.setattr(graph, "_read_snapshot_rows", lambda *_arguments, bounds: iter(((family,),)))
     with pytest.raises(CandidateRunnerError, match="completed families"):
         graph._candidate_digest(None, _source_request(), 7)
 

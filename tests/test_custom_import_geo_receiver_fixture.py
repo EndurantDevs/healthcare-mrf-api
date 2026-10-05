@@ -43,9 +43,10 @@ assert len({row[1].root_record_id for row in rows}) == len(_NPIS)
 assert len({row[2].root_revision_id for row in rows}) == len(_NPIS)
 assert len({row[3].child_revision_id for row in rows}) == len(_NPIS)
 
-context = SimpleNamespace(
+context = read_core._ReadContext(
     target=SimpleNamespace(dataset_id=11, schema_revision_id=21),
     definition=_DEFINITION,
+    profile_slot=1,
     profile_context_slot=1,
     collection_slots_by_name={"rates": 1},
     collection_names_by_slot={1: "rates"},

@@ -3,6 +3,7 @@
 from db.connection import Base, db
 from db.models._legacy import *
 from db.models.custom_import import *
+from db.models.custom_import_storage import *
 from db.models.facility_address_contribution import *
 from db.models.formulary_fhir import *
 from db.models.formulary_fhir_admission import *

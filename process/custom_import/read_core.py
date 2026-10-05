@@ -103,9 +103,11 @@ from process.custom_import.read_cursor import (
     ReadCursorState,
 )
 from process.custom_import.read_identity import (
+    resolve_generation_snapshot,
     verified_definition,
     verify_published_generation,
 )
+from process.custom_import.storage_layout import snapshot_models
 
 _VALUE_STATES = frozenset({"value", "null", "missing"})
 _FILTER_OPERATORS = frozenset({"eq", "neq", "gt", "gte", "lt", "lte", "is_null", "is_missing"})
@@ -413,6 +415,12 @@ class _ReadContext:
     collection_slots_by_name: Mapping[str, int]
     collection_names_by_slot: Mapping[int, str]
     default_profile_slot: int | None = None
+    storage_models: Mapping | None = None
+
+    def model(self, canonical_model):
+        """Bind hot reads to this verified family without redirecting control rows."""
+
+        return canonical_model if self.storage_models is None else self.storage_models[canonical_model]
 
 
 class CustomImportReadService:
@@ -601,6 +609,8 @@ class CustomImportReadService:
     async def _hydrate_single_family_page(self, session, context, query, prepared, entity_values, authorization_scope):
         """Retain the legacy single-family page selection and fingerprint."""
 
+        entity_model = context.model(CustomImportEntityBinding)
+
         normalized_context_filters, normalized_filters, normalized_order = _normalized_npi_query(
             context,
             query.context_filters,
@@ -625,10 +635,10 @@ class CustomImportReadService:
                 normalized_filters,
                 context_filters=normalized_context_filters,
             )
-            .add_columns(CustomImportEntityBinding.canonical_value)
-            .where(CustomImportEntityBinding.canonical_value.in_(entity_values))
-            .distinct(CustomImportEntityBinding.canonical_value)
-            .order_by(CustomImportEntityBinding.canonical_value, *_winner_order_terms(context, ()))
+            .add_columns(entity_model.canonical_value)
+            .where(entity_model.canonical_value.in_(entity_values))
+            .distinct(entity_model.canonical_value)
+            .order_by(entity_model.canonical_value, *_winner_order_terms(context, ()))
         )
         selected_rows = (await session.execute(statement)).all() if entity_values else ()
         winners = tuple(
@@ -979,6 +989,7 @@ async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) ->
     profile = await _exact_profile(session, target)
     profile_slot, profile_context_slot = _verified_profile(profile, definition, collection_slots)
     await _verified_field_rows(session, target, definition, collection_slots)
+    snapshot_family_id = await resolve_generation_snapshot(session, target)
     context = _ReadContext(
         target=target,
         definition=definition,
@@ -986,6 +997,7 @@ async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) ->
         profile_context_slot=profile_context_slot,
         collection_slots_by_name=collection_slots,
         collection_names_by_slot={slot: name for name, slot in collection_slots.items()},
+        storage_models=None if snapshot_family_id is None else snapshot_models(snapshot_family_id),
     )
     if definition.query.entity_selection is not None:
         from process.custom_import.grouped_read import bind_default_profile
@@ -1644,8 +1656,10 @@ def _npi_entity_relation_statement(
 ) -> Select:
     """Project exact NPI bindings and optional winner-local typed sort values."""
 
+    entity_model = context.model(CustomImportEntityBinding)
+
     statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
-    columns: list[object] = [CustomImportEntityBinding.canonical_value.label("entity_value")]
+    columns: list[object] = [entity_model.canonical_value.label("entity_value")]
     for ordinal, term in enumerate(order_terms):
         field = context.definition.fields_by_id[term.field_id]
         columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
@@ -1660,18 +1674,21 @@ def _filtered_npi_winner_statement(
 ) -> Select:
     """Apply metric predicates only after one selected winner and context relation."""
 
+    winner_model = context.model(CustomImportWinner)
+    entity_model = context.model(CustomImportEntityBinding)
+
     statement = (
         _filtered_winner_statement(context, context_filters)
         .join(
-            CustomImportEntityBinding,
+            entity_model,
             and_(
-                CustomImportEntityBinding.entity_binding_id == CustomImportWinner.entity_binding_id,
-                CustomImportEntityBinding.dataset_id == CustomImportWinner.dataset_id,
+                entity_model.entity_binding_id == winner_model.entity_binding_id,
+                entity_model.dataset_id == winner_model.dataset_id,
             ),
         )
         .where(
-            CustomImportEntityBinding.dataset_id == context.target.dataset_id,
-            CustomImportEntityBinding.adapter_id == "npi",
+            entity_model.dataset_id == context.target.dataset_id,
+            entity_model.adapter_id == "npi",
         )
     )
     for predicate in filters:
@@ -1682,46 +1699,53 @@ def _filtered_npi_winner_statement(
 def _winner_statement(context: _ReadContext):
     """Return only winners eligible for this pinned profile and context shape."""
 
-    winner_statement = _winner_identity_statement()
+    winner_model = context.model(CustomImportWinner)
+
+    winner_statement = _winner_identity_statement(context)
     winner_statement = _pinned_generation_winner_statement(winner_statement, context)
     if context.profile_context_slot == 0:
         return winner_statement.where(
-            CustomImportWinner.context_collection_slot == 0,
-            CustomImportWinner.context_child_revision_id.is_(None),
+            winner_model.context_collection_slot == 0,
+            winner_model.context_child_revision_id.is_(None),
         )
     return _context_child_winner_statement(winner_statement, context)
 
 
-def _winner_identity_statement():
+def _winner_identity_statement(context: _ReadContext):
     """Join each persisted winner to its exact generated family and root revision."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_model = context.model(CustomImportRootRevision)
+    generation_family_model = context.model(CustomImportGenerationFamily)
+
     return (
-        select(CustomImportWinner, CustomImportFamilyRevision, CustomImportRootRevision)
-        .select_from(CustomImportWinner)
+        select(winner_model, family_model, root_model)
+        .select_from(winner_model)
         .join(
-            CustomImportGenerationFamily,
+            generation_family_model,
             and_(
-                CustomImportGenerationFamily.generation_id == CustomImportWinner.generation_id,
-                CustomImportGenerationFamily.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportGenerationFamily.family_revision_id == CustomImportWinner.family_revision_id,
+                generation_family_model.generation_id == winner_model.generation_id,
+                generation_family_model.dataset_id == winner_model.dataset_id,
+                generation_family_model.family_revision_id == winner_model.family_revision_id,
             ),
         )
         .join(
-            CustomImportFamilyRevision,
+            family_model,
             and_(
-                CustomImportFamilyRevision.family_revision_id == CustomImportWinner.family_revision_id,
-                CustomImportFamilyRevision.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportFamilyRevision.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportFamilyRevision.root_record_id == CustomImportGenerationFamily.root_record_id,
+                family_model.family_revision_id == winner_model.family_revision_id,
+                family_model.dataset_id == winner_model.dataset_id,
+                family_model.schema_revision_id == winner_model.schema_revision_id,
+                family_model.root_record_id == generation_family_model.root_record_id,
             ),
         )
         .join(
-            CustomImportRootRevision,
+            root_model,
             and_(
-                CustomImportRootRevision.root_revision_id == CustomImportFamilyRevision.root_revision_id,
-                CustomImportRootRevision.dataset_id == CustomImportFamilyRevision.dataset_id,
-                CustomImportRootRevision.schema_revision_id == CustomImportFamilyRevision.schema_revision_id,
-                CustomImportRootRevision.root_record_id == CustomImportFamilyRevision.root_record_id,
+                root_model.root_revision_id == family_model.root_revision_id,
+                root_model.dataset_id == family_model.dataset_id,
+                root_model.schema_revision_id == family_model.schema_revision_id,
+                root_model.root_record_id == family_model.root_record_id,
             ),
         )
     )
@@ -1730,32 +1754,34 @@ def _winner_identity_statement():
 def _pinned_generation_winner_statement(winner_statement, context: _ReadContext):
     """Restrict winner rows to the exact sealed pinned generation."""
 
+    winner_model = context.model(CustomImportWinner)
+
     pinned_target = context.target
     return (
         winner_statement.join(
             CustomImportGeneration,
             and_(
-                CustomImportGeneration.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportGeneration.generation_id == CustomImportWinner.generation_id,
-                CustomImportGeneration.definition_revision_id == CustomImportWinner.definition_revision_id,
-                CustomImportGeneration.schema_revision_id == CustomImportWinner.schema_revision_id,
+                CustomImportGeneration.dataset_id == winner_model.dataset_id,
+                CustomImportGeneration.generation_id == winner_model.generation_id,
+                CustomImportGeneration.definition_revision_id == winner_model.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == winner_model.schema_revision_id,
             ),
         )
         .join(
             CustomImportGenerationSeal,
             and_(
-                CustomImportGenerationSeal.generation_id == CustomImportWinner.generation_id,
-                CustomImportGenerationSeal.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportGenerationSeal.definition_revision_id == CustomImportWinner.definition_revision_id,
-                CustomImportGenerationSeal.schema_revision_id == CustomImportWinner.schema_revision_id,
+                CustomImportGenerationSeal.generation_id == winner_model.generation_id,
+                CustomImportGenerationSeal.dataset_id == winner_model.dataset_id,
+                CustomImportGenerationSeal.definition_revision_id == winner_model.definition_revision_id,
+                CustomImportGenerationSeal.schema_revision_id == winner_model.schema_revision_id,
             ),
         )
         .where(
-            CustomImportWinner.dataset_id == pinned_target.dataset_id,
-            CustomImportWinner.generation_id == pinned_target.generation_id,
-            CustomImportWinner.definition_revision_id == pinned_target.definition_revision_id,
-            CustomImportWinner.schema_revision_id == pinned_target.schema_revision_id,
-            CustomImportWinner.profile_slot == context.profile_slot,
+            winner_model.dataset_id == pinned_target.dataset_id,
+            winner_model.generation_id == pinned_target.generation_id,
+            winner_model.definition_revision_id == pinned_target.definition_revision_id,
+            winner_model.schema_revision_id == pinned_target.schema_revision_id,
+            winner_model.profile_slot == context.profile_slot,
             CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
         )
     )
@@ -1764,44 +1790,54 @@ def _pinned_generation_winner_statement(winner_statement, context: _ReadContext)
 def _context_child_winner_statement(winner_statement, context: _ReadContext):
     """Join the one winner-selected context child, never an arbitrary sibling."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    family_child_model = context.model(CustomImportFamilyChild)
+    child_model = context.model(CustomImportChildRevision)
+
     return (
-        winner_statement.add_columns(CustomImportChildRevision)
+        winner_statement.add_columns(child_model)
         .join(
-            CustomImportFamilyChild,
+            family_child_model,
             and_(
-                CustomImportFamilyChild.family_revision_id == CustomImportWinner.family_revision_id,
-                CustomImportFamilyChild.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportFamilyChild.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportFamilyChild.root_record_id == CustomImportFamilyRevision.root_record_id,
-                CustomImportFamilyChild.collection_slot == CustomImportWinner.context_collection_slot,
-                CustomImportFamilyChild.child_revision_id == CustomImportWinner.context_child_revision_id,
+                family_child_model.family_revision_id == winner_model.family_revision_id,
+                family_child_model.dataset_id == winner_model.dataset_id,
+                family_child_model.schema_revision_id == winner_model.schema_revision_id,
+                family_child_model.root_record_id == family_model.root_record_id,
+                family_child_model.collection_slot == winner_model.context_collection_slot,
+                family_child_model.child_revision_id == winner_model.context_child_revision_id,
             ),
         )
         .join(
-            CustomImportChildRevision,
+            child_model,
             and_(
-                CustomImportChildRevision.child_revision_id == CustomImportWinner.context_child_revision_id,
-                CustomImportChildRevision.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportChildRevision.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportChildRevision.root_record_id == CustomImportFamilyRevision.root_record_id,
-                CustomImportChildRevision.collection_slot == CustomImportWinner.context_collection_slot,
+                child_model.child_revision_id == winner_model.context_child_revision_id,
+                child_model.dataset_id == winner_model.dataset_id,
+                child_model.schema_revision_id == winner_model.schema_revision_id,
+                child_model.root_record_id == family_model.root_record_id,
+                child_model.collection_slot == winner_model.context_collection_slot,
             ),
         )
-        .where(CustomImportWinner.context_collection_slot == context.profile_context_slot)
+        .where(winner_model.context_collection_slot == context.profile_context_slot)
     )
 
 
 def _predicate_condition(predicate: _NormalizedFilter, context: _ReadContext):
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if predicate.field.collection is None:
         return _scalar_predicate(
-            CustomImportRootScalar,
+            root_scalar_model,
             predicate,
-            _root_scalar_conditions(predicate.field, CustomImportFamilyRevision.root_revision_id, context),
+            _root_scalar_conditions(predicate.field, family_model.root_revision_id, context),
         )
     return _scalar_predicate(
-        CustomImportChildScalar,
+        child_scalar_model,
         predicate,
-        _child_scalar_conditions(predicate.field, CustomImportWinner.context_child_revision_id, context),
+        _child_scalar_conditions(predicate.field, winner_model.context_child_revision_id, context),
     )
 
 
@@ -1838,25 +1874,31 @@ def _has_scalar_comparison(column, operator: str, value: object | None):
 
 
 def _root_scalar_conditions(field: Field, root_revision_id, context: _ReadContext) -> tuple[object, ...]:
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+
     return (
-        CustomImportRootScalar.root_revision_id == root_revision_id,
-        CustomImportRootScalar.dataset_id == context.target.dataset_id,
-        CustomImportRootScalar.schema_revision_id == context.target.schema_revision_id,
-        CustomImportRootScalar.root_record_id == CustomImportFamilyRevision.root_record_id,
-        CustomImportRootScalar.field_slot == field.field_slot,
+        root_scalar_model.root_revision_id == root_revision_id,
+        root_scalar_model.dataset_id == context.target.dataset_id,
+        root_scalar_model.schema_revision_id == context.target.schema_revision_id,
+        root_scalar_model.root_record_id == family_model.root_record_id,
+        root_scalar_model.field_slot == field.field_slot,
     )
 
 
 def _child_scalar_conditions(field: Field, child_revision_id, context: _ReadContext) -> tuple[object, ...]:
+    family_model = context.model(CustomImportFamilyRevision)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     assert field.collection is not None
     collection_slot = context.collection_slots_by_name[field.collection]
     return (
-        CustomImportChildScalar.child_revision_id == child_revision_id,
-        CustomImportChildScalar.dataset_id == context.target.dataset_id,
-        CustomImportChildScalar.schema_revision_id == context.target.schema_revision_id,
-        CustomImportChildScalar.root_record_id == CustomImportFamilyRevision.root_record_id,
-        CustomImportChildScalar.collection_slot == collection_slot,
-        CustomImportChildScalar.field_slot == field.field_slot,
+        child_scalar_model.child_revision_id == child_revision_id,
+        child_scalar_model.dataset_id == context.target.dataset_id,
+        child_scalar_model.schema_revision_id == context.target.schema_revision_id,
+        child_scalar_model.root_record_id == family_model.root_record_id,
+        child_scalar_model.collection_slot == collection_slot,
+        child_scalar_model.field_slot == field.field_slot,
     )
 
 
@@ -1886,6 +1928,9 @@ async def _page_winner_rows(
 
 
 def _winner_order_terms(context: _ReadContext, order_terms: tuple[ReadOrderTerm, ...]) -> tuple[object, ...]:
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+
     expressions: list[object] = []
     for term in order_terms:
         field = context.definition.fields_by_id[term.field_id]
@@ -1896,21 +1941,26 @@ def _winner_order_terms(context: _ReadContext, order_terms: tuple[ReadOrderTerm,
         )
     expressions.extend(
         (
-            CustomImportFamilyRevision.root_record_id.asc(),
-            CustomImportWinner.entity_binding_id.asc(),
-            CustomImportWinner.context_key_sha256.asc(),
+            family_model.root_record_id.asc(),
+            winner_model.entity_binding_id.asc(),
+            winner_model.context_key_sha256.asc(),
         )
     )
     return tuple(expressions)
 
 
 def _order_scalar_expression(field: Field, context: _ReadContext):
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if field.collection is None:
-        scalar_model = CustomImportRootScalar
-        conditions = _root_scalar_conditions(field, CustomImportFamilyRevision.root_revision_id, context)
+        scalar_model = root_scalar_model
+        conditions = _root_scalar_conditions(field, family_model.root_revision_id, context)
     else:
-        scalar_model = CustomImportChildScalar
-        conditions = _child_scalar_conditions(field, CustomImportWinner.context_child_revision_id, context)
+        scalar_model = child_scalar_model
+        conditions = _child_scalar_conditions(field, winner_model.context_child_revision_id, context)
     value_column = getattr(scalar_model, _SCALAR_COLUMNS[field.value_type])
     return select(value_column).where(*conditions, scalar_model.value_state == "value").scalar_subquery()
 
@@ -1990,16 +2040,18 @@ async def _root_scalar_rows(
     root_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
 ) -> dict[tuple[int, int], CustomImportRootScalar]:
+    root_scalar_model = context.model(CustomImportRootScalar)
+
     if not fields:
         return {}
     rows = (
         (
             await session.execute(
-                select(CustomImportRootScalar).where(
-                    CustomImportRootScalar.dataset_id == context.target.dataset_id,
-                    CustomImportRootScalar.schema_revision_id == context.target.schema_revision_id,
-                    CustomImportRootScalar.root_revision_id.in_(root_revision_ids),
-                    CustomImportRootScalar.field_slot.in_(tuple(field.field_slot for field in fields)),
+                select(root_scalar_model).where(
+                    root_scalar_model.dataset_id == context.target.dataset_id,
+                    root_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                    root_scalar_model.root_revision_id.in_(root_revision_ids),
+                    root_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
                 )
             )
         )
@@ -2015,16 +2067,18 @@ async def _child_scalar_rows(
     child_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
 ) -> dict[tuple[int, int], CustomImportChildScalar]:
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if not fields or not child_revision_ids:
         return {}
     rows = (
         (
             await session.execute(
-                select(CustomImportChildScalar).where(
-                    CustomImportChildScalar.dataset_id == context.target.dataset_id,
-                    CustomImportChildScalar.schema_revision_id == context.target.schema_revision_id,
-                    CustomImportChildScalar.child_revision_id.in_(child_revision_ids),
-                    CustomImportChildScalar.field_slot.in_(tuple(field.field_slot for field in fields)),
+                select(child_scalar_model).where(
+                    child_scalar_model.dataset_id == context.target.dataset_id,
+                    child_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                    child_scalar_model.child_revision_id.in_(child_revision_ids),
+                    child_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
                 )
             )
         )
@@ -2097,11 +2151,14 @@ async def _selected_winner_row(
     context: _ReadContext,
     locator: WinnerLocator,
 ) -> tuple[CustomImportWinner, CustomImportFamilyRevision, CustomImportRootRevision, CustomImportChildRevision | None]:
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+
     statement = _winner_statement(context).where(
-        CustomImportWinner.entity_binding_id == locator.entity_binding_id,
-        CustomImportWinner.family_revision_id == locator.family_revision_id,
-        CustomImportFamilyRevision.root_record_id == locator.root_record_id,
-        CustomImportWinner.context_key_sha256 == locator.context_key_sha256,
+        winner_model.entity_binding_id == locator.entity_binding_id,
+        winner_model.family_revision_id == locator.family_revision_id,
+        family_model.root_record_id == locator.root_record_id,
+        winner_model.context_key_sha256 == locator.context_key_sha256,
     )
     row = (await session.execute(statement)).one_or_none()
     if row is None:
@@ -2116,26 +2173,30 @@ async def _entity_winner_locator(
 ) -> WinnerLocator:
     """Resolve one entity only when its pinned profile has one root family."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    entity_model = context.model(CustomImportEntityBinding)
+
     entity_statement = (
         _winner_statement(context)
         .join(
-            CustomImportEntityBinding,
+            entity_model,
             and_(
-                CustomImportEntityBinding.entity_binding_id == CustomImportWinner.entity_binding_id,
-                CustomImportEntityBinding.dataset_id == CustomImportWinner.dataset_id,
+                entity_model.entity_binding_id == winner_model.entity_binding_id,
+                entity_model.dataset_id == winner_model.dataset_id,
             ),
         )
         .where(
-            CustomImportEntityBinding.adapter_id == entity.adapter_id,
-            CustomImportEntityBinding.canonical_value == entity.value,
+            entity_model.adapter_id == entity.adapter_id,
+            entity_model.canonical_value == entity.value,
         )
     )
     family_rows = (
         await session.execute(
             entity_statement.with_only_columns(
-                CustomImportFamilyRevision.root_record_id,
-                CustomImportWinner.family_revision_id,
-                CustomImportWinner.entity_binding_id,
+                family_model.root_record_id,
+                winner_model.family_revision_id,
+                winner_model.entity_binding_id,
                 maintain_column_froms=True,
             )
             .distinct()
@@ -2151,11 +2212,11 @@ async def _entity_winner_locator(
     selected_row = (
         await session.execute(
             entity_statement.where(
-                CustomImportFamilyRevision.root_record_id == root_record_id,
-                CustomImportWinner.family_revision_id == family_revision_id,
-                CustomImportWinner.entity_binding_id == entity_binding_id,
+                family_model.root_record_id == root_record_id,
+                winner_model.family_revision_id == family_revision_id,
+                winner_model.entity_binding_id == entity_binding_id,
             )
-            .order_by(CustomImportWinner.context_key_sha256)
+            .order_by(winner_model.context_key_sha256)
             .limit(1)
         )
     ).one_or_none()
@@ -2310,32 +2371,35 @@ async def _family_child_rows(
     context: _ReadContext,
     *families: CustomImportFamilyRevision,
 ) -> tuple[tuple[CustomImportFamilyChild, CustomImportChildRevision], ...]:
+    family_child_model = context.model(CustomImportFamilyChild)
+    child_model = context.model(CustomImportChildRevision)
+
     family_keys = tuple((family.family_revision_id, family.root_record_id) for family in families if family.child_count)
     if not family_keys:
         return ()
     statement = (
-        select(CustomImportFamilyChild, CustomImportChildRevision)
-        .select_from(CustomImportFamilyChild)
+        select(family_child_model, child_model)
+        .select_from(family_child_model)
         .join(
-            CustomImportChildRevision,
+            child_model,
             and_(
-                CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id,
-                CustomImportChildRevision.dataset_id == CustomImportFamilyChild.dataset_id,
-                CustomImportChildRevision.schema_revision_id == CustomImportFamilyChild.schema_revision_id,
-                CustomImportChildRevision.root_record_id == CustomImportFamilyChild.root_record_id,
-                CustomImportChildRevision.collection_slot == CustomImportFamilyChild.collection_slot,
+                child_model.child_revision_id == family_child_model.child_revision_id,
+                child_model.dataset_id == family_child_model.dataset_id,
+                child_model.schema_revision_id == family_child_model.schema_revision_id,
+                child_model.root_record_id == family_child_model.root_record_id,
+                child_model.collection_slot == family_child_model.collection_slot,
             ),
         )
         .where(
-            tuple_(CustomImportFamilyChild.family_revision_id, CustomImportFamilyChild.root_record_id).in_(family_keys),
-            CustomImportFamilyChild.dataset_id == context.target.dataset_id,
-            CustomImportFamilyChild.schema_revision_id == context.target.schema_revision_id,
+            tuple_(family_child_model.family_revision_id, family_child_model.root_record_id).in_(family_keys),
+            family_child_model.dataset_id == context.target.dataset_id,
+            family_child_model.schema_revision_id == context.target.schema_revision_id,
         )
         .order_by(
-            CustomImportFamilyChild.family_revision_id,
-            CustomImportFamilyChild.collection_slot,
-            CustomImportChildRevision.source_ordinal,
-            CustomImportChildRevision.child_revision_id,
+            family_child_model.family_revision_id,
+            family_child_model.collection_slot,
+            child_model.source_ordinal,
+            child_model.child_revision_id,
         )
     )
     return tuple((family_child, child) for family_child, child in (await session.execute(statement)).all())
