@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import hmac
+from contextlib import closing
 from dataclasses import dataclass
-from itertools import count, zip_longest
+from itertools import chain, count, groupby, zip_longest
 
 from sqlalchemy import BigInteger, cast, exists, func, select, tuple_
 
@@ -114,7 +115,7 @@ def _group_key(context):
     return context.profile_slot, context.entity_binding_id, bytes(context.context_key_sha256)
 
 
-def _context_candidates(session, request, registry, build_id, group):
+def _context_rows(session, request, build_id, *, group=None, after=None, generation=None):
     context = CustomImportBuildCandidateContext
     family = CustomImportFamilyRevision
     root = CustomImportRootRevision
@@ -124,18 +125,43 @@ def _context_candidates(session, request, registry, build_id, group):
         .join(family, family.family_revision_id == context.family_revision_id)
         .join(root, root.root_revision_id == family.root_revision_id)
         .outerjoin(child, child.child_revision_id == context.context_child_revision_id)
-        .where(
-            context.build_id == build_id,
-            tuple_(context.profile_slot, context.entity_binding_id, context.context_key_sha256) == group,
-        )
+        .where(context.build_id == build_id)
     )
+    group_columns = (context.profile_slot, context.entity_binding_id, context.context_key_sha256)
+    if group is not None:
+        statement = statement.where(tuple_(*group_columns) == group)
+    if after is not None:
+        statement = statement.where(tuple_(*group_columns) > after)
+    if generation is not None:
+        winner = CustomImportWinner
+        statement = statement.add_columns(
+            winner.family_revision_id, winner.context_collection_slot, winner.context_child_revision_id
+        ).outerjoin(
+            winner,
+            (winner.generation_id == generation.generation_id)
+            & (winner.profile_slot == context.profile_slot)
+            & (winner.entity_binding_id == context.entity_binding_id)
+            & (winner.context_key_sha256 == context.context_key_sha256),
+        )
+    return _read_rows(
+        session,
+        request,
+        build_id,
+        statement,
+        (*group_columns, context.candidate_context_id),
+        (context, family, root, child),
+    )
+
+
+def _context_candidates(session, request, registry, build_id, group, *, context_records=None):
     contract = material._winner_candidate_contract(
         request.definition, material._profile_scopes(request.definition, registry.child_collection_slots)
     )
     profile = request.definition.selection_profiles[group[0] - 1]
-    for context_row, family_row, root_row, child_row in _read_rows(
-        session, request, build_id, statement, (context.candidate_context_id,), (context, family, root, child)
-    ):
+    if context_records is None:
+        context_records = _context_rows(session, request, build_id, group=group)
+    for context_record in context_records:
+        context_row, family_row, root_row, child_row = context_record[:4]
         root_values = payload_values(
             request.definition.root_fields, root_row.canonical_payload, label="winner root payload"
         )
@@ -163,20 +189,48 @@ def _context_candidates(session, request, registry, build_id, group):
         yield candidate
 
 
-def _reduce_group(session, request, registry, build_id, generation, group):
+def _complete_group_winner(request, registry, generation, group, candidates):
     identity = _generation_identity(generation)
     winners = material.iter_ordered_profile_winners(
         request.definition,
         generation=identity,
         profile_slot=group[0],
-        candidates=material.ValidatedWinnerCandidateStream(
-            identity, _context_candidates(session, request, registry, build_id, group)
-        ),
+        candidates=material.ValidatedWinnerCandidateStream(identity, candidates),
         child_collection_slots=registry.child_collection_slots,
     )
     winner = next(winners, None)
     if winner is None or next(winners, None) is not None:
         raise CandidateRunnerError("one complete candidate group must produce one winner")
+    return winner
+
+
+def _ordered_winners(session, request, registry, build_id, generation, *, after=None, verify=False):
+    """Reduce complete groups in one bounded scan; restart after writes from the committed group cursor."""
+
+    with closing(
+        _context_rows(session, request, build_id, after=after, generation=generation if verify else None)
+    ) as rows:
+        for group, group_rows in groupby(rows, key=lambda row: _group_key(row[0])):
+            first = next(group_rows)
+            stored_identity = first[4:]
+            candidates = _context_candidates(
+                session, request, registry, build_id, group, context_records=chain((first,), group_rows)
+            )
+            del first
+            winner = _complete_group_winner(request, registry, generation, group, candidates)
+            if verify and tuple(stored_identity) != (
+                winner.family_revision_id,
+                winner.context_collection_slot,
+                winner.context_child_revision_id,
+            ):
+                raise CandidateRunnerError("frozen winner differs from complete surviving-tie reduction")
+            yield winner
+
+
+def _reduce_group(session, request, registry, build_id, generation, group):
+    winner = _complete_group_winner(
+        request, registry, generation, group, _context_candidates(session, request, registry, build_id, group)
+    )
     context = CustomImportBuildCandidateContext
     statement = select(context).where(
         context.build_id == build_id,
@@ -705,58 +759,7 @@ def _graph_material(session, request, registry, build_id, generation, material_d
 
 
 def _verify_winner_groups(session, request, registry, build_id, generation):
-    context = CustomImportBuildCandidateContext
-    previous = None
-    count = 0
-    while True:
-        statement = select(context).where(context.build_id == build_id)
-        if previous is not None:
-            statement = statement.where(
-                tuple_(context.profile_slot, context.entity_binding_id, context.context_key_sha256) > previous
-            )
-        group_context = _one_row(
-            session,
-            request,
-            build_id,
-            statement,
-            (context.profile_slot, context.entity_binding_id, context.context_key_sha256, context.candidate_context_id),
-            (context,),
-        )
-        if group_context is None:
-            return count
-        group = _group_key(group_context[0])
-        winner, _context_id = _reduce_group(session, request, registry, build_id, generation, group)
-        stored = _one_row(
-            session,
-            request,
-            build_id,
-            select(CustomImportWinner).where(
-                CustomImportWinner.generation_id == generation.generation_id,
-                CustomImportWinner.profile_slot == winner.profile_slot,
-                CustomImportWinner.entity_binding_id == winner.entity_binding_id,
-                CustomImportWinner.context_key_sha256 == winner.context_key_sha256,
-            ),
-            (
-                CustomImportWinner.profile_slot,
-                CustomImportWinner.entity_binding_id,
-                CustomImportWinner.context_key_sha256,
-            ),
-            (CustomImportWinner,),
-        )
-        if stored is None or any(
-            getattr(stored[0], name) != getattr(winner, name)
-            for name in (
-                "family_revision_id",
-                "context_collection_slot",
-                "context_child_revision_id",
-                "entity_binding_id",
-                "profile_slot",
-                "context_key_sha256",
-            )
-        ):
-            raise CandidateRunnerError("frozen winner differs from complete surviving-tie reduction")
-        previous = group
-        count += 1
+    return sum(1 for _ in _ordered_winners(session, request, registry, build_id, generation, verify=True))
 
 
 def _winner_material(session, request, build_id, generation, digests):
