@@ -14,6 +14,7 @@ from io import BytesIO
 from typing import Any, BinaryIO
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 with warnings.catch_warnings():
@@ -34,7 +35,6 @@ from process.custom_import.capture import (
     _decoded_record,
     _iter_parquet_batch_records,
     _open_parquet_reader,
-    _scalar_size,
     _validate_parquet_envelope,
     _validate_parquet_page_preflight,
     _validated_parquet_metadata,
@@ -1268,22 +1268,38 @@ def _validate_generated_landing_records(table: pa.Table, limits: CaptureLimits) 
     ordinal = logical_bytes = 0
     label_bytes = sum(len(label.encode("utf-8")) + 4 for label in table.column_names)
     for batch in table.to_batches(max_chunksize=min(_FETCH_ROWS, limits.maximum_records)):
+        if not batch.num_rows:
+            continue
+        record_sizes = pa.repeat(pa.scalar(label_bytes, type=pa.int64()), batch.num_rows)
+        decoded_sizes = pa.repeat(pa.scalar(0, type=pa.int64()), batch.num_rows)
         # The single-row reader omits a non-integer validity bitmap when that
         # row is present, even when a larger decoded batch has null neighbors.
-        bitmap_labels = tuple(
-            field.name
-            for field, column in zip(batch.schema, batch.columns, strict=True)
-            if not pa.types.is_integer(field.type) and column.buffers()[0] is not None
-        )
-        for row_index, values in enumerate(batch.to_pylist()):
-            ordinal += 1
-            logical_bytes += batch.slice(row_index, 1).nbytes - sum(
-                values[label] is not None for label in bitmap_labels
-            )
-            if logical_bytes > limits.maximum_decoded_bytes:
+        for column in batch.columns:
+            is_text = pa.types.is_string(column.type) or pa.types.is_large_string(column.type)
+            text = column if is_text else pc.cast(column, pa.string())
+            sizes = pc.binary_length(text)
+            record_sizes = pc.add(record_sizes, pc.fill_null(sizes, 4))
+            if is_text:
+                decoded_sizes = pc.add(decoded_sizes, pc.fill_null(sizes, 0))
+                fixed_bytes = 8 if pa.types.is_large_string(column.type) else 4
+            else:
+                fixed_bytes = 0 if pa.types.is_null(column.type) else (column.type.bit_width + 7) // 8
+            if column.buffers()[0] is not None:
+                if pa.types.is_integer(column.type):
+                    fixed_bytes += 1
+                else:
+                    decoded_sizes = pc.add(decoded_sizes, pc.cast(pc.is_null(column), pa.int64()))
+            decoded_sizes = pc.add(decoded_sizes, fixed_bytes)
+        cumulative_bytes = pc.cumulative_sum(decoded_sizes)
+        decoded_over = pc.greater(cumulative_bytes, min(limits.maximum_decoded_bytes - logical_bytes, _MAX_INT64))
+        record_over = pc.greater(record_sizes, min(limits.maximum_record_bytes, _MAX_INT64))
+        first_error = pc.index(pc.or_(decoded_over, record_over), True).as_py()
+        if first_error >= 0:
+            if decoded_over[first_error].as_py():
                 raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
-            if label_bytes + sum(_scalar_size(value) for value in values.values()) > limits.maximum_record_bytes:
-                raise CaptureError(f"record {ordinal} exceeds the byte limit")
+            raise CaptureError(f"record {ordinal + first_error + 1} exceeds the byte limit")
+        logical_bytes += cumulative_bytes[-1].as_py()
+        ordinal += batch.num_rows
 
 
 def _validate_landing_limits(part_limits: CaptureLimits, maximum_arrow_bytes: int) -> None:
