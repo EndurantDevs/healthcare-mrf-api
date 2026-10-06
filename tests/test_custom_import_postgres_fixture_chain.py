@@ -72,14 +72,15 @@ def test_fixture_loads_the_actual_snapshot_read_and_write_functions():
     assert "FOR UPDATE" in module._WRITE_BINDING_BODY
 
 
-def test_fixture_current_chain_ends_at_all_writer_cutover():
-    assert support._SNAPSHOT_MIGRATION_NAMES[-6:] == (
+def test_fixture_current_chain_ends_at_scalar_fastpath():
+    assert support._SNAPSHOT_MIGRATION_NAMES[-7:] == (
         "20261005030000_custom_import_snapshot_storage",
         "20261005040000_custom_import_bulk_snapshot_writers",
         "20261005050000_custom_import_legacy_snapshot_writers",
         "20261005060000_custom_import_snapshot_finality",
         "20261005070000_custom_import_materialization_storage",
         "20261005080000_custom_import_writer_cutover",
+        "20261006010000_custom_import_canonical_scalar_fastpath",
     )
 
 

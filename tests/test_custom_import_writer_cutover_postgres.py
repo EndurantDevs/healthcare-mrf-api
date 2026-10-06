@@ -19,6 +19,9 @@ from sqlalchemy.exc import DBAPIError
 from process.custom_import.execution import lease_token_sha256
 from tests.custom_import_postgres_support import POSTGRES_DSN_ENV, _migration, isolated_publication_case
 from tests.test_custom_import_build_source_postgres import _retained_request
+from tests.test_custom_import_canonical_scalar_postgres import (
+    test_canonical_upgrade_downgrade_preserves_completions as _canonical_scalar_parity,
+)
 from tests.test_custom_import_materialization_set_postgres import _seed
 
 pytestmark = [
@@ -503,3 +506,8 @@ async def test_native_cutover_refuses_preexisting_unregistered_build_progress():
                 async with connection.begin_nested():
                     await connection.run_sync(_install, case.schema_name)
             assert await _guards(connection, case.schema_name) == before
+
+
+async def test_native_canonical_scalar_fastpath_preserves_completions():
+    """Run canonical-byte parity in the existing native cutover CI lane."""
+    await _canonical_scalar_parity()

@@ -158,7 +158,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     revision = _plans_migration().revision
-    assert script.get_heads() == ["20261005080000_custom_import_writer_cutover"]
+    assert script.get_heads() == ["20261006010000_custom_import_canonical_scalar_fastpath"]
     assert tuple(
         step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
     ) == (
@@ -174,6 +174,7 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
         "20261005060000_custom_import_snapshot_finality",
         "20261005070000_custom_import_materialization_storage",
         "20261005080000_custom_import_writer_cutover",
+        "20261006010000_custom_import_canonical_scalar_fastpath",
     )
 
 
