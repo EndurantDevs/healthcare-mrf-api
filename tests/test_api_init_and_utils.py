@@ -79,6 +79,7 @@ def test_init_api_registers_group(monkeypatch):
     assert app.registered is not None
     assert app.registered_middleware == [
         (init_api.__globals__["_capacity_process_request_guard"], "request"),
+        (init_api.__globals__["require_internal_plan_release_read"], "request"),
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
     ]
     assert hasattr(app.registered, "blueprints")

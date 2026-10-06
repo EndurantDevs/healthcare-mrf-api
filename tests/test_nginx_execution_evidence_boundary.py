@@ -5,6 +5,7 @@ import socket
 import subprocess
 import time
 from http.client import HTTPConnection
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -33,13 +34,15 @@ def _request(port, path):
         connection.close()
 
 
-def _configuration(tmp_path, public_port, upstream_port):
+def _configuration(tmp_path, public_port, upstream_port, *, external_port=None):
     configuration = (ROOT / "service/nginx.conf").read_text()
     for original, replacement in (
         ("user nobody nogroup;", ""),
         ("pid /run/nginx.pid;", f"pid {tmp_path}/nginx.pid;"),
         ("include /etc/nginx/mime.types;", "types {}"),
         ("listen       8080 default;", f"listen 127.0.0.1:{public_port} default;"),
+        ("listen       8082;", f"listen 127.0.0.1:{external_port or _unused_port()};"),
+        ("8080 internal;", f"{public_port} internal;"),
         ("http://127.0.0.1:8081", f"http://127.0.0.1:{upstream_port}"),
         ("/etc/nginx/private/*.conf", f"{tmp_path}/private/*.conf"),
     ):
@@ -55,6 +58,7 @@ def _configuration(tmp_path, public_port, upstream_port):
             server {{
                 listen 127.0.0.1:{upstream_port};
                 add_header X-Synthetic-Authorization $http_authorization always;
+                add_header X-Synthetic-Read-Boundary $http_x_plan_release_read_boundary always;
                 return 204;
             }}""",
     )
@@ -121,6 +125,54 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
                 for private_path in PRIVATE_PATHS:
                     assert _request(private_port, private_path) == (204, "Bearer synthetic")
                 assert _request(private_port, "/api/v1/healthcheck/live") == (404, None)
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+def _read_boundary(port, path, forged_values):
+    """Inspect the upstream boundary after arbitrary caller headers."""
+    connection = HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        connection.putrequest("GET", path + "?%70lan_release_id=example", skip_host=True)
+        connection.putheader("Host", "internal.invalid:8080")
+        for value in forged_values:
+            connection.putheader("X-Plan-Release-Read-Boundary", value)
+        connection.endheaders()
+        reply = connection.getresponse()
+        reply.read()
+        return reply.status, reply.getheader("X-Synthetic-Read-Boundary")
+    finally:
+        connection.close()
+
+
+def test_listener_overwrites_forged_read_boundary_and_keeps_native_paths(tmp_path):
+    nginx = shutil.which("nginx")
+    if nginx is None:
+        pytest.skip("native Nginx is required for the routing check")
+    internal_port = _unused_port()
+    external_port = _unused_port()
+    upstream_port = _unused_port()
+    config_path = tmp_path / "nginx.conf"
+    config_path.write_text(
+        _configuration(
+            tmp_path,
+            internal_port,
+            upstream_port,
+            external_port=external_port,
+        )
+    )
+    command_parts = [nginx, "-p", str(tmp_path), "-c", str(config_path)]
+    subprocess.run([*command_parts, "-t"], check=True, capture_output=True, text=True)
+    with subprocess.Popen([*command_parts, "-g", "daemon off;"], stderr=subprocess.PIPE, text=True) as process:
+        try:
+            _wait_for_listener(process, external_port)
+            for (port, expected), path, forged_values in product(
+                ((external_port, "external"), (internal_port, "internal")),
+                ("/api/v1/npi/all", "/api/v1/npi/near/", "/api/v1/pricing/providers/by-procedure"),
+                ((), ("internal",), ("external",), ("internal", "external")),
+            ):
+                assert _read_boundary(port, path, forged_values) == (204, expected)
         finally:
             process.terminate()
             process.wait(timeout=5)
