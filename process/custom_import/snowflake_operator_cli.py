@@ -799,6 +799,7 @@ def _retained_bundle_request(connector, loaded):
         processing_policy=getattr(loaded.binding, "processing_policy", None),
         snapshot_token_mode=getattr(loaded.binding, "snapshot_token_mode", None),
         decimal_conversions=getattr(loaded.binding, "decimal_conversions", None),
+        entity_limit=getattr(loaded.binding, "entity_limit", None),
     )
 
 

@@ -168,6 +168,7 @@ def _rebuilt_bundle_statement(
         processing_policy=supplied_request.processing_policy,
         snapshot_token_mode=supplied_request.snapshot_token_mode,
         decimal_conversions=supplied_request.decimal_conversions,
+        entity_limit=supplied_request.entity_limit,
     )
     statement = SnowflakeBundleStatement(
         request=request,

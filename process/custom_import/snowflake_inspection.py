@@ -31,6 +31,7 @@ from process.custom_import.snowflake_preflight_schema import (
     _source_type,
     _supports_preflight_field_type,
 )
+from process.custom_import.snowflake_bundle_scope import _cohort_cte, _cohort_parameters
 
 INSPECTION_ERROR_CODES = frozenset({"byte_limit", "query_timeout", "query_unavailable", "result_invalid"})
 _COUNT_COLUMNS = ("__ci_estimate_stream_ordinal", "__ci_estimate_rows")
@@ -64,14 +65,14 @@ class SnowflakeInspectionStatement:
             columns = bundle.selected_columns_by_stream[self.stream_ordinal]
             selected = ", ".join(f'"{column.column_identifier}" AS "{column.field_id}"' for column in columns)
             binding = bindings[self.stream_ordinal]
-            sql = f"SELECT {selected} FROM {_filtered_relation_sql(binding, columns)} LIMIT 0"
+            sql = f"SELECT {selected} FROM {_filtered_relation_sql(binding, columns, request=bundle.request)} LIMIT 0"
             parameters = _row_filter_parameters(binding, columns)
             column_ids = tuple(column.field_id for column in columns)
         elif self.operation == "estimate" and self.stream_ordinal is None:
             sql = (
                 " UNION ALL ".join(
                     f'SELECT {ordinal} AS "{_COUNT_COLUMNS[0]}", COUNT(*) AS "{_COUNT_COLUMNS[1]}" '
-                    f"FROM {_filtered_relation_sql(binding, bundle.selected_columns_by_stream[ordinal])}"
+                    f"FROM {_filtered_relation_sql(binding, bundle.selected_columns_by_stream[ordinal], request=bundle.request)}"
                     for ordinal, binding in enumerate(bindings)
                 )
                 + f' ORDER BY "{_COUNT_COLUMNS[0]}"'
@@ -84,6 +85,10 @@ class SnowflakeInspectionStatement:
             )
         else:
             raise SnowflakeInspectionError("result_invalid")
+        cohort = _cohort_cte(bundle.request, bundle.selected_columns_by_stream)
+        if cohort:
+            sql = f"WITH {cohort} {sql}"
+            parameters = _cohort_parameters(bundle.request, bundle.selected_columns_by_stream) + parameters
         object.__setattr__(self, "sql", sql)
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "column_ids", column_ids)

@@ -40,6 +40,15 @@ from process.custom_import.snowflake_preflight_schema import (
     normalize_decimal_conversions,
     validate_decimal_conversion_sources,
 )
+from process.custom_import.snowflake_bundle_scope import (
+    _bundle_parameters,
+    _bundle_source_key,
+    _cohort_cte,
+    _entity_limit,
+    _filtered_relation_sql,
+    _row_filter_parameters as _row_filter_parameters,
+    _row_filter_sql as _row_filter_sql,
+)
 
 if TYPE_CHECKING:
     from process.custom_import.capture import CaptureManifest, SealedCapture
@@ -427,6 +436,7 @@ class SnowflakeBundleRequest:
     processing_policy: ProcessingPolicy | None = field(default=None, repr=False)
     snapshot_token_mode: str | None = None
     decimal_conversions: Mapping[str, str] | None = None
+    entity_limit: int | None = None
     canonical_request: str = field(init=False, repr=False)
     request_sha256: str = field(init=False)
 
@@ -440,6 +450,10 @@ class SnowflakeBundleRequest:
             raise SnowflakeBundleError("bundle bindings must use the declared binding type")
         if not isinstance(self.encoding, SnowflakeBundleEncoding):
             raise SnowflakeBundleError("bundle encoding must use the declared encoding type")
+        try:
+            _entity_limit(self.entity_limit, self.definition)
+        except ValueError as exc:
+            raise SnowflakeBundleError("bundle entity limit is invalid") from exc
         capture_limits = _capture_limits(self.capture_limits)
         if self.processing_policy is not None:
             if not isinstance(self.processing_policy, ProcessingPolicy):
@@ -475,6 +489,8 @@ class SnowflakeBundleRequest:
             request_identity_by_key["snapshot_token_mode"] = self.snapshot_token_mode
         if conversions is not None:
             request_identity_by_key["decimal_conversions"] = dict(conversions)
+        if self.entity_limit is not None:
+            request_identity_by_key["entity_limit"] = self.entity_limit
         canonical, digest = _canonical_identity("request", request_identity_by_key, contract=self.contract)
         object.__setattr__(self, "bindings", bindings)
         object.__setattr__(self, "capture_limits", capture_limits)
@@ -582,6 +598,7 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
             processing_policy=request.processing_policy,
             snapshot_token_mode=request.snapshot_token_mode,
             decimal_conversions=request.decimal_conversions,
+            entity_limit=request.entity_limit,
         )
     except (AttributeError, TypeError) as exc:
         raise SnowflakeBundleError("bundle request seal is invalid") from exc
@@ -762,62 +779,6 @@ def _snapshot_token_expression(
     )
 
 
-def _resolved_row_filters(
-    binding: SnowflakeBundleBinding, columns: tuple[SnowflakeDeclaredColumn, ...]
-) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
-    """Use physical predicates for both SQL ordering and shared-source identity."""
-
-    columns_by_field = {column.field_id: column.column_identifier for column in columns}
-    try:
-        return tuple(
-            sorted(
-                (columns_by_field[item.field_id], item.operator, (item.value,) if item.operator == "eq" else item.value)
-                for item in binding.row_filters
-            )
-        )
-    except KeyError as exc:
-        raise SnowflakeBundleError("source filter field has no approved column") from exc
-
-
-def _row_filter_sql(
-    binding: SnowflakeBundleBinding, columns: tuple[SnowflakeDeclaredColumn, ...], *, alias: str = ""
-) -> str:
-    prefix = f"{alias}." if alias else ""
-    return " AND ".join(
-        f"{prefix}{_quoted_identifier(column)} "
-        + ("= %s" if operator == "eq" else f"IN ({', '.join('%s' for _ in operands)})")
-        for column, operator, operands in _resolved_row_filters(binding, columns)
-    )
-
-
-def _row_filter_parameters(binding, columns) -> tuple[str, ...]:
-    return tuple(
-        value for _column, _operator, operands in _resolved_row_filters(binding, columns) for value in operands
-    )
-
-
-def _bundle_source_key(request, binding, columns):
-    if request.processing_policy is None:
-        return binding.stream_id
-    return binding.relation, _resolved_row_filters(binding, columns)
-
-
-def _filtered_relation_sql(binding, columns) -> str:
-    predicate = _row_filter_sql(binding, columns)
-    return binding.relation.quoted_sql + (f" WHERE {predicate}" if predicate else "")
-
-
-def _bundle_parameters(request, selected_columns_by_stream) -> tuple[str, ...]:
-    seen_sources = set()
-    parameters = []
-    for binding, columns in zip(request.bindings, selected_columns_by_stream, strict=True):
-        key = _bundle_source_key(request, binding, columns)
-        if key not in seen_sources:
-            seen_sources.add(key)
-            parameters.extend(_row_filter_parameters(binding, columns))
-    return tuple(parameters)
-
-
 def _bundle_source_field_ids(
     request: SnowflakeBundleRequest,
     selected_columns_by_stream: tuple[tuple[SnowflakeDeclaredColumn, ...], ...],
@@ -890,7 +851,7 @@ def _bundle_sql_branches(
             for field in fields
         )
         data_branches.append(
-            f"SELECT {', '.join(data_values)} FROM {_filtered_relation_sql(binding, selected_columns)}"
+            f"SELECT {', '.join(data_values)} FROM {_filtered_relation_sql(binding, selected_columns, request=request)}"
         )
     return metadata_branches, data_branches
 
@@ -924,8 +885,10 @@ def _bundle_sql(
             *(_quoted_identifier(field.field_id) + " NULLS FIRST" for field in fields),
         )
     )
+    cohort = _cohort_cte(request, selected_columns_by_stream)
     return (
-        f"SELECT {projected} FROM ({' UNION ALL '.join((*metadata_branches, *data_branches))}) "
+        (f"WITH {cohort} " if cohort else "")
+        + f"SELECT {projected} FROM ({' UNION ALL '.join((*metadata_branches, *data_branches))}) "
         f'AS "__ci_bundle" ORDER BY {order}'
     )
 
@@ -1240,6 +1203,7 @@ class SnowflakeBundleStatementBuilder:
         processing_policy: ProcessingPolicy | None = None,
         snapshot_token_mode: str | None = None,
         decimal_conversions: Mapping[str, str] | None = None,
+        entity_limit: int | None = None,
     ) -> SnowflakeBundleRequest:
         """Validate definition-owned stream configuration before generating SQL."""
 
@@ -1251,6 +1215,7 @@ class SnowflakeBundleStatementBuilder:
             processing_policy=processing_policy,
             snapshot_token_mode=snapshot_token_mode,
             decimal_conversions=decimal_conversions,
+            entity_limit=entity_limit,
         )
 
     def build_statement(self, request: SnowflakeBundleRequest) -> SnowflakeBundleStatement:

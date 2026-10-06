@@ -289,6 +289,7 @@ _MODULE_NAMES = (
     "custom_import_preflight.processing_policy",
     "custom_import_preflight.snowflake",
     "custom_import_preflight.snowflake_bundle",
+    "custom_import_preflight.snowflake_bundle_scope",
     "custom_import_preflight.snowflake_binding",
     "custom_import_preflight.snowflake_preflight",
     "custom_import_preflight.snowflake_preflight_schema",
