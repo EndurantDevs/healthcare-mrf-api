@@ -14,6 +14,7 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import jwt
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -21,7 +22,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from snowflake.connector.auth.keypair import AuthByKeyPair
 
 import process.custom_import.snowflake_python as snowflake_python
-from process.custom_import.capture import capture_stream, iter_records, verify_capture
+from process.custom_import.capture import CaptureError, capture_stream, iter_records, verify_capture
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.snowflake import (
     SnowflakeConnectorError,
@@ -244,11 +246,16 @@ def test_connector_import_accepts_the_project_pyarrow_version():
             ("1234567893", False, -7, Decimal("-12.500000000000")),
             ("1999999999", None, None, None),
         ),
+        (
+            ("1003000126", True, 7, Decimal("123456789012345678.123456789012")),
+            ("1234567893", False, -7, Decimal("-12.500000000000")),
+        ),
         (),
     ),
-    ids=("scalar-null-values", "empty-schema"),
+    ids=("scalar-null-values", "scalar-values", "empty-schema"),
 )
-def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows):
+@pytest.mark.parametrize("record_limits", [None, CaptureLimits()])
+def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows, record_limits):
     """Real encoder and sealed replay preserve scalar types, nulls and cleanup."""
 
     result_schema = (
@@ -258,7 +265,9 @@ def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows):
         SnowflakeResultColumn(field_id="amount", source_type="FIXED(38,12)", nullable=True),
     )
     stream = _definition().source_streams[0]
-    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(result_rows, result_schema)
+    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(
+        result_rows, result_schema, record_limits=record_limits
+    )
     with reader:
         captured = capture_stream(reader, stream, source_snapshot_token="synthetic-snapshot")
         assert not reader.closed
@@ -289,8 +298,82 @@ def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows):
         assert replayed.column_names == [column.field_id for column in result_schema]
         assert replayed.schema.types == [snowflake_python._arrow_type(column) for column in result_schema]
         assert [field.nullable for field in replayed.schema] == [column.nullable for column in result_schema]
-        assert replayed.nbytes == arrow_bytes
+        encoded_table = pa.Table.from_arrays(
+            [
+                pa.array([result_row[index] for result_row in result_rows], type=snowflake_python._arrow_type(column))
+                for index, column in enumerate(result_schema)
+            ],
+            names=[column.field_id for column in result_schema],
+        )
+        assert encoded_table.nbytes == arrow_bytes
     assert replay_source.closed and parquet_file.closed
+
+
+@pytest.mark.parametrize("record_count", [7, 8, 9, 33])
+@pytest.mark.parametrize("null_mode", ["none", "all", "mixed"])
+@pytest.mark.parametrize("row_group_size", [1, 3, 16])
+def test_generated_landing_one_row_bytes_match_generic_replay(record_count, null_mode, row_group_size):
+    scalar_values = (True, 7, "åλ中", Decimal("0.000000000001"))
+    scalar_types = (pa.bool_(), pa.int64(), pa.string(), pa.decimal128(30, 12))
+    columns = [
+        pa.array(
+            [
+                None if null_mode == "all" or (null_mode == "mixed" and index % 2) else value
+                for index in range(record_count)
+            ],
+            type=scalar_type,
+        )
+        for value, scalar_type in zip(scalar_values, scalar_types, strict=True)
+    ]
+    table = pa.Table.from_arrays(columns, names=["flag", "count", "text", "amount"])
+    with BytesIO() as reader:
+        pq.write_table(table, reader, row_group_size=row_group_size)
+        with pq.ParquetFile(reader) as parquet:
+            logical_bytes = sum(batch.nbytes for batch in parquet.iter_batches(batch_size=1, use_threads=False))
+            decoded = parquet.read(use_threads=False)
+    limits = CaptureLimits(maximum_decoded_bytes=logical_bytes, maximum_record_bytes=64)
+    snowflake_python._validate_generated_landing_records(decoded, limits)
+    with pytest.raises(CaptureError, match="decoded-byte limit"):
+        snowflake_python._validate_generated_landing_records(
+            decoded, replace(limits, maximum_decoded_bytes=logical_bytes - 1)
+        )
+
+
+def test_generated_landing_falls_back_before_unbudgeted_full_table_read(monkeypatch):
+    def reject_full_table(*args, **kwargs):
+        raise AssertionError("full-table replay must not run without a memory reservation")
+
+    monkeypatch.setattr(pq.ParquetFile, "read", reject_full_table)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    records = [("x" * 4096,) for _ in range(32)]
+    limits = CaptureLimits(maximum_decoded_bytes=262_144, maximum_record_bytes=8192)
+    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(records, schema, record_limits=limits)
+    with reader:
+        assert arrow_bytes == 32 * 4100
+        assert reader.read(4) == b"PAR1"
+    assert reader.closed
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("drift", ["values", "schema"])
+def test_generated_landing_rejects_encoded_drift_and_closes_reader(monkeypatch, fallback, drift):
+    write_table = pq.write_table
+    destinations = []
+
+    def altered_write(table, destination, **options):
+        destinations.append(destination)
+        altered = table.set_column(0, table.schema.field(0), pa.array(["changed"] * table.num_rows, type=pa.string()))
+        if drift == "schema":
+            altered = table.cast(pa.schema([pa.field("text", pa.string(), nullable=True)]))
+        write_table(altered, destination, **options)
+
+    monkeypatch.setattr(pq, "write_table", altered_write)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    records = [("x" * 4096,)] * 32 if fallback else [("original",)]
+    limits = CaptureLimits(maximum_decoded_bytes=262_144, maximum_record_bytes=8192) if fallback else CaptureLimits()
+    with pytest.raises(CaptureError, match="encoded values" if drift == "values" else "schema or record count"):
+        snowflake_python._parquet_reader_with_metrics(records, schema, record_limits=limits)
+    assert len(destinations) == 1 and destinations[0].closed
 
 
 def test_key_pair_authentication_signs_a_verifiable_token():

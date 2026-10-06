@@ -12,16 +12,19 @@ import struct
 import threading
 import weakref
 from dataclasses import asdict, replace
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from process.custom_import import snowflake_capture as capture
+from process.custom_import.capture import CaptureError
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import ExecutionSubmission, LeaseGrant
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
+from process.custom_import.snowflake import SnowflakeConnectorError
 from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest
 from process.custom_import.snowflake_python import SnowflakeLandingEOF, SnowflakeLandingPart
 from tests.test_custom_import_snowflake_bundle import _Credentials
@@ -212,6 +215,21 @@ async def test_capture_seals_only_source_with_compact_framed_receipts(monkeypatc
         assert document["record_count"] == len(rows)
         assert "captures" not in document and "parts" not in document
         _assert_framing(receipt, harness.parts)
+
+
+@pytest.mark.asyncio
+async def test_capture_rejects_decimal_scale_expansion_before_retaining_a_part(monkeypatch):
+    """Encoded Decimal scale must still satisfy the decoded record byte limit."""
+
+    policy = _policy(part_limits=replace(_policy().part_limits, maximum_record_bytes=40))
+    harness = _Harness(monkeypatch, (_shared_row("a", key="a", amount=Decimal("1")),), capture_policy=policy)
+    with pytest.raises(SnowflakeConnectorError, match="landing fetch failed") as caught:
+        await harness.run()
+    assert isinstance(caught.value.__cause__, CaptureError)
+    assert "exceeds the byte limit" in str(caught.value.__cause__)
+    assert not harness.parts and not harness.receipts
+    assert harness.cursor.closed and harness.connection.closed
+    assert harness.finishes[0]["terminal_state"] == "failed"
 
 
 def _assert_framing(receipt, parts):

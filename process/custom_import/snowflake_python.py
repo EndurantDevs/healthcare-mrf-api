@@ -28,7 +28,19 @@ with warnings.catch_warnings():
 from cryptography.hazmat.primitives import serialization
 from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
 
-from process.custom_import.capture import SealedCapture, _decoded_record, capture_stream, iter_records
+from process.custom_import.capture import (
+    CaptureError,
+    SealedCapture,
+    _decoded_record,
+    _iter_parquet_batch_records,
+    _open_parquet_reader,
+    _scalar_size,
+    _validate_parquet_envelope,
+    _validate_parquet_page_preflight,
+    _validated_parquet_metadata,
+    _validated_parquet_schema,
+    capture_stream,
+)
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.family import (
     SourceSnapshotError,
@@ -962,16 +974,14 @@ class _SnowflakeBundlePartitionSources:
             projected_rows,
             self._schemas[stream_index],
             maximum_arrow_bytes=self._maximum_part_arrow_bytes,
+            record_limits=self._landing_limits,
         )
         has_primary_failure = False
         try:
             stream_id = self._stream_ids[stream_index]
             stream = self._streams[stream_id]
             capture = capture_stream(reader, stream, source_snapshot_token=token, limits=self._landing_limits)
-            record_count = sum(1 for _record in iter_records(capture, stream, limits=self._landing_limits))
-            if record_count != len(rows):
-                raise SnowflakeConnectorError("Snowflake landing record count does not match the source batch")
-            return SnowflakeLandingPart(stream_id, ordinal, capture, record_count, arrow_bytes)
+            return SnowflakeLandingPart(stream_id, ordinal, capture, len(rows), arrow_bytes)
         except BaseException:
             has_primary_failure = True
             raise
@@ -1154,6 +1164,7 @@ def _parquet_reader_with_metrics(
     result_schema: tuple[SnowflakeResultColumn, ...],
     *,
     maximum_arrow_bytes: int = MAX_RESULT_PARTITION_BYTES,
+    record_limits: CaptureLimits | None = None,
 ) -> tuple[BytesIO, int]:
     """Encode with the existing codec and report actual Arrow, not encoded bytes."""
 
@@ -1179,9 +1190,18 @@ def _parquet_reader_with_metrics(
         )
         if table.nbytes > min(maximum_arrow_bytes, MAX_RESULT_PARTITION_BYTES):
             raise SnowflakeConnectorError("Snowflake result batch exceeds the decoded-byte limit")
+        arrow_bytes = table.nbytes
+        expected_schema = table.schema if record_limits is not None else None
         destination = BytesIO()
         pq.write_table(table, destination, compression="zstd")
-    except SnowflakeConnectorError:
+        if destination.tell() > MAX_RESULT_PARTITION_BYTES:
+            raise SnowflakeConnectorError("Snowflake Parquet partition exceeds the byte limit")
+        if record_limits is not None and not _is_generated_landing_table_verified(
+            destination, table, result_rows, expected_schema, record_limits
+        ):
+            table = None
+            _is_generated_landing_table_verified(destination, None, result_rows, expected_schema, record_limits)
+    except SnowflakeConnectorError, CaptureError:
         _best_effort_close(destination)
         raise
     except (pa.ArrowException, OverflowError, TypeError, ValueError) as exc:
@@ -1190,11 +1210,80 @@ def _parquet_reader_with_metrics(
     except BaseException:
         _best_effort_close(destination)
         raise
-    if destination.tell() > MAX_RESULT_PARTITION_BYTES:
-        destination.close()
-        raise SnowflakeConnectorError("Snowflake Parquet partition exceeds the byte limit")
     destination.seek(0)
-    return destination, table.nbytes
+    return destination, arrow_bytes
+
+
+def _is_generated_landing_table_verified(
+    reader: BytesIO,
+    table: pa.Table | None,
+    expected_rows: Sequence[Sequence[object]],
+    expected_schema: pa.Schema,
+    limits: CaptureLimits,
+) -> bool:
+    """Verify only bytes just written here; retained/external Parquet uses generic replay."""
+
+    encoded_bytes = reader.getvalue()
+    if len(encoded_bytes) > limits.maximum_compressed_bytes:
+        raise CaptureError("source stream exceeds the compressed-byte limit")
+    if len(encoded_bytes) > limits.maximum_decoded_bytes:
+        raise CaptureError("source stream exceeds the decoded-byte limit")
+    # Native replay can add validity bitmaps; preflight already reserves each
+    # column's fixed buffers. Retain the original table inside the same budget.
+    output_bound = 0 if table is None else table.nbytes + ((table.num_rows + 7) // 8) * table.num_columns
+    working_budget = limits.maximum_decoded_bytes - output_bound - (0 if table is None else table.nbytes)
+    if working_budget <= 0:
+        return False
+    _validate_parquet_envelope(encoded_bytes)
+    with _open_parquet_reader(encoded_bytes, limits) as parquet:
+        labels = _validated_parquet_schema(parquet.schema_arrow, limits)
+        record_count = _validated_parquet_metadata(parquet.metadata, expected_columns=len(labels), limits=limits)
+        if record_count != len(expected_rows) or not parquet.schema_arrow.equals(expected_schema):
+            raise CaptureError("Snowflake landing schema or record count does not match the source batch")
+        try:
+            _validate_parquet_page_preflight(
+                encoded_bytes, parquet.metadata, parquet.schema_arrow, maximum_decoded_bytes=working_budget
+            )
+        except CaptureError:
+            if table is not None:
+                return False
+            raise
+        if table is None:
+            for decoded_record, expected in zip(
+                _iter_parquet_batch_records(parquet, labels, record_count, limits), expected_rows, strict=True
+            ):
+                if tuple(decoded_record.values.values()) != tuple(expected):
+                    raise CaptureError("Snowflake landing encoded values do not match the source batch")
+        else:
+            decoded = parquet.read(use_threads=False, use_pandas_metadata=False)
+            if decoded.nbytes > output_bound or not decoded.equals(table):
+                raise CaptureError("Snowflake landing encoded values do not match the source batch")
+            _validate_generated_landing_records(decoded, limits)
+    return True
+
+
+def _validate_generated_landing_records(table: pa.Table, limits: CaptureLimits) -> None:
+    """Apply canonical sizes to verified scalar columns, retaining one-row accounting."""
+
+    ordinal = logical_bytes = 0
+    label_bytes = sum(len(label.encode("utf-8")) + 4 for label in table.column_names)
+    for batch in table.to_batches(max_chunksize=min(_FETCH_ROWS, limits.maximum_records)):
+        # The single-row reader omits a non-integer validity bitmap when that
+        # row is present, even when a larger decoded batch has null neighbors.
+        bitmap_labels = tuple(
+            field.name
+            for field, column in zip(batch.schema, batch.columns, strict=True)
+            if not pa.types.is_integer(field.type) and column.buffers()[0] is not None
+        )
+        for row_index, values in enumerate(batch.to_pylist()):
+            ordinal += 1
+            logical_bytes += batch.slice(row_index, 1).nbytes - sum(
+                values[label] is not None for label in bitmap_labels
+            )
+            if logical_bytes > limits.maximum_decoded_bytes:
+                raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+            if label_bytes + sum(_scalar_size(value) for value in values.values()) > limits.maximum_record_bytes:
+                raise CaptureError(f"record {ordinal} exceeds the byte limit")
 
 
 def _validate_landing_limits(part_limits: CaptureLimits, maximum_arrow_bytes: int) -> None:
