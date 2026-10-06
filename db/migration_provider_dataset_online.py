@@ -23,6 +23,7 @@ from db.migration_provider_directory_dataset_candidates import (
 
 PLAN_TABLE = "pd_dataset_migration_plan"
 FENCE = "pd_dataset_migration_fence"
+HEADERS = ("provider_directory_endpoint_dataset", *(table.removesuffix("_resource") for table in TABLES[4:]))
 
 
 @contextmanager
@@ -30,6 +31,7 @@ def _phase(op, *, validation=False):
     """Bound lock waits and release every phase's locks before the next scan."""
     op.execute("BEGIN")
     try:
+        op.execute("SET LOCAL standard_conforming_strings='on'")
         op.execute("SET LOCAL lock_timeout='1s'")
         if not validation:
             op.execute("SET LOCAL statement_timeout='10s'")
@@ -42,6 +44,19 @@ def _phase(op, *, validation=False):
 
 def _relation(schema, table):
     return f"{quote(schema)}.{quote(table)}"
+
+
+def _dataset_keys(connection, schema, table):
+    header = HEADERS[0] if table in TABLES[:4] else table.removesuffix("_resource")
+    return list(connection.scalars(sa.text(f"SELECT dataset_id FROM {_relation(schema, header)} ORDER BY dataset_id")))
+
+
+def _history_bound(keys):
+    return "dataset_id IN (" + ",".join(literal(key) for key in keys) + ")" if keys else "false"
+
+
+def _table_keys(plan, table):
+    return plan["tables"][table].get("keys", plan["keys"])
 
 
 def _save_plan(op, schema, plan):
@@ -173,6 +188,7 @@ def _capture_plan(op, schema, relation_names):
                     sa.text("SELECT CAST(:relation AS regclass)::oid"), {"relation": _relation(schema, table)}
                 ),
                 "parent_oid": None,
+                "keys": _dataset_keys(connection, schema, table),
             }
             for table in TABLES
         },
@@ -194,10 +210,13 @@ def _prepare(op, schema):
     connection = op.get_bind()
     plan_relation = _relation(schema, PLAN_TABLE)
     if connection.scalar(sa.text("SELECT to_regclass(:relation)"), {"relation": plan_relation}):
-        return connection.scalar(sa.text(f"SELECT plan FROM {plan_relation} WHERE singleton"))
+        plan = connection.scalar(sa.text(f"SELECT plan FROM {plan_relation} WHERE singleton"))
+        if not plan["complete"] and any("keys" not in identity for identity in plan["tables"].values()):
+            _resume_legacy_bounds(op, schema, plan)
+        return plan
     targets = [_relation(schema, table) for table in TABLES]
-    header = _relation(schema, "provider_directory_endpoint_dataset")
-    op.execute("LOCK TABLE " + ",".join([header, *targets]) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
+    headers = [_relation(schema, header) for header in HEADERS]
+    op.execute("LOCK TABLE " + ",".join([*headers, *targets]) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
     plan = _capture_plan(op, schema, targets)
     op.execute(f"CREATE TABLE {plan_relation}(singleton boolean PRIMARY KEY CHECK(singleton), plan jsonb NOT NULL)")
     _normalize_relation_grants(op, plan_relation)
@@ -211,11 +230,36 @@ def _prepare(op, schema):
         f"FOR EACH STATEMENT EXECUTE FUNCTION {quote(schema)}.guard_pd_dataset_migration_owner()"
     )
     op.execute(f"ALTER TABLE {plan_relation} ENABLE ALWAYS TRIGGER pd_dataset_plan_owner")
-    _install_fence(op, schema, [header, *targets])
-    bound = "dataset_id IN (" + ",".join(literal(key) for key in plan["keys"]) + ")" if plan["keys"] else "false"
-    for target in targets:
+    _install_fence(op, schema, [*headers, *targets])
+    for table, target in zip(TABLES, targets, strict=True):
+        bound = _history_bound(_table_keys(plan, table))
         op.execute(f"ALTER TABLE {target} ADD CONSTRAINT pd_dataset_history_bound CHECK ({bound}) NOT VALID")
     return plan
+
+
+def _resume_legacy_bounds(op, schema, plan):
+    """Keep committed bounds; freeze family keys only for unfinished conversions."""
+    if any("keys" in identity for identity in plan["tables"].values()):
+        raise RuntimeError("provider_dataset_migration_partial_key_plan")
+    pending_tables = [table for table in TABLES if not plan["tables"][table]["parent_oid"]]
+    headers = [_relation(schema, header) for header in HEADERS[1:]]
+    targets = [_relation(schema, table) for table in pending_tables]
+    op.execute("LOCK TABLE " + ",".join([*headers, *targets]) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
+    for table in TABLES:
+        _verify_relation(op, schema, table, plan)
+        identity = plan["tables"][table]
+        if table in pending_tables:
+            identity["keys"] = _dataset_keys(op.get_bind(), schema, table)
+            target = _relation(schema, table)
+            op.execute(f"ALTER TABLE {target} DROP CONSTRAINT pd_dataset_history_bound")
+            op.execute(
+                f"ALTER TABLE {target} ADD CONSTRAINT pd_dataset_history_bound CHECK ({_history_bound(identity['keys'])}) NOT VALID"
+            )
+        else:
+            identity["keys"] = plan["keys"]
+    for header in headers:
+        _fence(op, schema, header)
+    _save_plan(op, schema, plan)
 
 
 def _install_fence(op, schema, relations):
@@ -242,21 +286,37 @@ def _install_fence(op, schema, relations):
 
 
 def _verify_relation(op, schema, table, plan):
-    target = _relation(schema, table)
+    canonical_relation = _relation(schema, table)
     identity = plan["tables"][table]
-    canonical_oid = op.get_bind().scalar(sa.text("SELECT to_regclass(:target)::oid"), {"target": target})
+    canonical_oid = op.get_bind().scalar(sa.text("SELECT to_regclass(:target)::oid"), {"target": canonical_relation})
     expected_oid = identity["parent_oid"] or identity["original_oid"]
     if canonical_oid != expected_oid:
         raise RuntimeError("provider_dataset_migration_relation_drift")
     if identity["parent_oid"]:
         history = _relation(schema, "pd_dataset_history_" + str(identity["original_oid"]))
         history_oid = op.get_bind().scalar(sa.text("SELECT to_regclass(:history)::oid"), {"history": history})
-        attached = op.get_bind().scalar(
-            sa.text("SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=:history AND inhparent=:parent)"),
-            {"history": identity["original_oid"], "parent": canonical_oid},
+        parent_oid = op.get_bind().scalar(
+            sa.text("SELECT inhparent FROM pg_inherits WHERE inhrelid=:history"),
+            {"history": identity["original_oid"]},
         )
-        if history_oid != identity["original_oid"] or attached != bool(plan["keys"]):
+        keys = _table_keys(plan, table)
+        if history_oid != identity["original_oid"] or parent_oid != (canonical_oid if keys else None):
             raise RuntimeError("provider_dataset_migration_relation_drift")
+        if keys and not op.get_bind().scalar(
+            sa.text("""
+            SELECT pg_get_expr(relpartbound,oid) = (
+                -- The deparser uses ordinary literals, never quote_literal's E prefix.
+                SELECT 'FOR VALUES IN (' || string_agg(
+                    chr(39) || replace(
+                        CASE current_setting('standard_conforming_strings') WHEN 'on' THEN key
+                            ELSE replace(key, chr(92), chr(92) || chr(92)) END,
+                        chr(39), chr(39) || chr(39)) || chr(39), ', ' ORDER BY position) || ')'
+                  FROM unnest(CAST(:keys AS text[])) WITH ORDINALITY AS bounds(key,position)
+            ) FROM pg_class WHERE oid=:history
+        """),
+            {"history": history_oid, "keys": keys},
+        ):
+            raise RuntimeError("provider_dataset_migration_bound_drift")
 
 
 def _convert_one(op, schema, table, plan):
@@ -270,7 +330,7 @@ def _convert_one(op, schema, table, plan):
         op.execute(f"LOCK TABLE {target} IN ACCESS EXCLUSIVE MODE NOWAIT")
         _verify_relation(op, schema, table, plan)
         op.execute(f"DROP TRIGGER {FENCE} ON {target}")
-        history = _convert_relation(op, schema, table, plan["keys"])
+        history = _convert_relation(op, schema, table, _table_keys(plan, table))
         _fence(op, schema, target)
         _fence(op, schema, history)
         plan["tables"][table]["parent_oid"] = op.get_bind().scalar(

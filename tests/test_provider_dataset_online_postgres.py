@@ -9,12 +9,14 @@ from unittest.mock import AsyncMock
 import asyncpg
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.util.concurrency import await_only
 
 from db import migration_provider_dataset_online as online
 from db.migration_provider_directory_dataset_candidates import TABLES
 from process.provider_directory_rooted_graph_result_store import complete_provider_directory_rooted_graph_result
 from tests import test_provider_directory_uhc_flex_practitioner_publication_postgres as publication_fixture
+from tests import test_provider_dataset_candidates_postgres as candidate_fixture
 from tests.formulary_fhir_twin_admission_pg_support import run_migration
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import insert_valid_cohort, seed_official_dataset
 from tests.test_provider_dataset_candidates_postgres import _candidate_migration
@@ -443,3 +445,223 @@ async def test_empty_history_accepts_first_provider_publication(monkeypatch, int
                 [f"{schema}.{table}" for table in TABLES],
                 schema,
             )
+
+
+async def _seed_mixed_dataset_families(context, monkeypatch):
+    """Retain a real practitioner publication beside a longer generic key."""
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            candidate_fixture.practitioner_store,
+            "prepare_dataset_candidate",
+            candidate_fixture._historical_dataset_storage,
+        )
+        patch.setattr(
+            candidate_fixture.practitioner_materialization,
+            "copy_dataset_candidate_rows",
+            candidate_fixture._copy_historical_dataset,
+        )
+        practitioner = await candidate_fixture._publish_legacy_root(context.database)
+    assert len(practitioner.dataset_id) == 55
+    long_dataset_id = "synthetic-long-generic-" + "g" * 43 + "\\'é"
+    assert len(long_dataset_id) == 69
+    await context.connection.execute(
+        f"INSERT INTO {context.schema}.provider_directory_endpoint_dataset"
+        "(dataset_id,endpoint_id,status,is_current,resource_count,publication_metadata_json) "
+        "VALUES($1,'endpoint-official','building',false,1,'{}')",
+        long_dataset_id,
+    )
+    await context.connection.execute(
+        f"INSERT INTO {context.schema}.{TABLES[0]}"
+        "(dataset_id,resource_type,resource_id,payload_hash,payload_json) "
+        "VALUES($1,'Organization','synthetic-long-resource',repeat('a',64),'{}')",
+        long_dataset_id,
+    )
+    return practitioner.dataset_id, long_dataset_id
+
+
+async def _dataset_storage_catalog(connection, relation_oids):
+    """Capture physical heap and index identities without scanning their rows."""
+    heaps = await connection.fetch(
+        "SELECT oid,relfilenode FROM pg_class WHERE oid=ANY($1::oid[]) ORDER BY oid", relation_oids
+    )
+    indexes = await connection.fetch(
+        "SELECT indexrelid,indrelid,relfilenode,indisvalid,indisready "
+        "FROM pg_index JOIN pg_class ON oid=indexrelid WHERE indrelid=ANY($1::oid[]) ORDER BY indexrelid",
+        relation_oids,
+    )
+    return heaps, indexes
+
+
+def _restore_legacy_shared_bounds(op, schema, plan):
+    """Recreate the persisted predecessor plan before any conversion commits."""
+    with online._phase(op):
+        for header in (
+            "provider_directory_uhc_flex_practitioner_dataset",
+            "provider_directory_rooted_graph_dataset",
+        ):
+            op.execute(f"DROP TRIGGER {online.FENCE} ON {online._relation(schema, header)}")
+        bound = "dataset_id IN (" + ",".join(online.literal(key) for key in plan["keys"]) + ")"
+        for table in TABLES:
+            plan["tables"][table].pop("keys")
+            relation = online._relation(schema, table)
+            op.execute(f"ALTER TABLE {relation} DROP CONSTRAINT pd_dataset_history_bound")
+            op.execute(f"ALTER TABLE {relation} ADD CONSTRAINT pd_dataset_history_bound CHECK ({bound}) NOT VALID")
+        online._save_plan(op, schema, plan)
+
+
+async def _fail_legacy_provenance_attach(context, monkeypatch):
+    """Commit four old conversions and reproduce the narrow-key attach error."""
+    convert_one = online._convert_one
+
+    def convert_legacy(op, schema, table, plan):
+        if table == TABLES[0]:
+            _restore_legacy_shared_bounds(op, schema, plan)
+        return convert_one(op, schema, table, plan)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(online, "_convert_one", convert_legacy)
+        with pytest.raises(DBAPIError) as failure:
+            await run_migration(context.engine, _candidate_migration(), "upgrade")
+    assert failure.value.orig.sqlstate == "22001"
+    plan = json.loads(await context.connection.fetchval(f"SELECT plan FROM {context.schema}.{online.PLAN_TABLE}"))
+    assert not plan["complete"]
+    assert all("keys" not in identity for identity in plan["tables"].values())
+    assert [bool(plan["tables"][table]["parent_oid"]) for table in TABLES] == [True] * 4 + [False] * 2
+    await _assert_fenced(context)
+    return plan
+
+
+async def _assert_family_history_bounds(context, practitioner_id, long_dataset_id):
+    """Only a family's frozen identities may route to its preserved heap."""
+    connection, schema = context.connection, context.schema
+    plan = json.loads(await connection.fetchval(f"SELECT plan FROM {schema}.{online.PLAN_TABLE}"))
+    assert plan["complete"]
+    generic_keys = await connection.fetchval(
+        f"SELECT array_agg(dataset_id ORDER BY dataset_id) FROM {schema}.provider_directory_endpoint_dataset"
+    )
+    assert long_dataset_id in generic_keys
+    for table in TABLES:
+        identity = plan["tables"][table]
+        expected_keys = generic_keys if table in TABLES[:4] else [practitioner_id] if table == TABLES[4] else []
+        assert identity["keys"] == expected_keys
+        assert await connection.fetchval("SELECT $1::regclass::oid", f"{schema}.{table}") == identity["parent_oid"]
+        assert await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=$1 AND inhparent=$2)",
+            identity["original_oid"],
+            identity["parent_oid"],
+        ) == bool(expected_keys)
+    assert not await connection.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+        "WHERE c.relnamespace=$1::regnamespace AND t.tgname=$2)",
+        schema,
+        online.FENCE,
+    )
+    return plan
+
+
+async def _assert_family_headers_fenced(context):
+    """Every dataset family remains write-fenced until the migration completes."""
+    for header in (
+        "provider_directory_endpoint_dataset",
+        "provider_directory_uhc_flex_practitioner_dataset",
+        "provider_directory_rooted_graph_dataset",
+    ):
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="migration_incomplete_rerun_migration"):
+            await context.connection.execute(f"DELETE FROM {context.schema}.{header} WHERE false")
+
+
+async def _interrupt_family_conversion(context, monkeypatch, *, convert_generic=False):
+    """Stop after committed preparation or all four generic cutovers."""
+    convert_one = online._convert_one
+
+    def interrupt(op, schema, table, plan):
+        if convert_generic and table in TABLES[:4]:
+            return convert_one(op, schema, table, plan)
+        raise RuntimeError("injected_family_conversion_failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(online, "_convert_one", interrupt)
+        with pytest.raises(RuntimeError, match="injected_family_conversion_failure"):
+            await run_migration(context.engine, _candidate_migration(), "upgrade")
+    await _assert_family_headers_fenced(context)
+    plan = json.loads(await context.connection.fetchval(f"SELECT plan FROM {context.schema}.{online.PLAN_TABLE}"))
+    assert not plan["complete"] and all("keys" in identity for identity in plan["tables"].values())
+    return plan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_partial", (False, True))
+@pytest.mark.parametrize("string_setting", ("on", "off"))
+async def test_dataset_family_bounds_preserve_storage(monkeypatch, legacy_partial, string_setting):
+    """Fresh and retried bounds preserve wide quoted keys and narrow provenance."""
+    async with _lifecycle_scope(monkeypatch, dataset_candidates=False) as context:
+        practitioner_id, long_dataset_id = await _seed_mixed_dataset_families(context, monkeypatch)
+        connection, schema = context.connection, context.schema
+        relation_oids = [await connection.fetchval("SELECT $1::regclass::oid", f"{schema}.{table}") for table in TABLES]
+        original_storage = await _dataset_storage_catalog(connection, relation_oids)
+        original_rows_by_table = {
+            table: await connection.fetch(
+                f"SELECT tableoid,* FROM {schema}.{table} ORDER BY dataset_id,resource_type,resource_id"
+            )
+            for table in (TABLES[0], TABLES[4], TABLES[5])
+        }
+
+        def set_literal_setting(dbapi_connection, _record, _proxy):
+            cursor = dbapi_connection.cursor()
+            cursor.execute(f"SET standard_conforming_strings='{string_setting}'")
+            cursor.close()
+
+        event.listen(context.engine.sync_engine, "checkout", set_literal_setting)
+        _watch_cutover_scans(monkeypatch, relation_oids)
+        partial = await _fail_legacy_provenance_attach(context, monkeypatch) if legacy_partial else None
+        committed_parents = [partial["tables"][table]["parent_oid"] for table in TABLES[:4]] if partial else []
+        committed_storage = await _dataset_storage_catalog(connection, committed_parents)
+        if partial:
+            repaired = await _interrupt_family_conversion(context, monkeypatch)
+            assert repaired["tables"][TABLES[4]]["keys"] == [practitioner_id]
+            assert repaired["tables"][TABLES[5]]["keys"] == []
+        await run_migration(context.engine, _candidate_migration(), "upgrade")
+        plan = await _assert_family_history_bounds(context, practitioner_id, long_dataset_id)
+        assert await _dataset_storage_catalog(connection, relation_oids) == original_storage
+        assert await _dataset_storage_catalog(connection, committed_parents) == committed_storage
+        if partial:
+            assert [plan["tables"][table]["parent_oid"] for table in TABLES[:4]] == committed_parents
+        for table, retained_rows in original_rows_by_table.items():
+            assert (
+                await connection.fetch(
+                    f"SELECT tableoid,* FROM {schema}.{table} ORDER BY dataset_id,resource_type,resource_id"
+                )
+                == retained_rows
+            )
+        await run_migration(context.engine, _candidate_migration(), "upgrade")
+        assert json.loads(await connection.fetchval(f"SELECT plan FROM {schema}.{online.PLAN_TABLE}")) == plan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ("partial_key_plan", "bound_drift"))
+async def test_dataset_family_retry_refuses_drift(monkeypatch, drift):
+    """An ambiguous plan or changed same-OID partition bound cannot resume."""
+    async with _lifecycle_scope(monkeypatch, dataset_candidates=False) as context:
+        await _seed_mixed_dataset_families(context, monkeypatch)
+        connection, schema = context.connection, context.schema
+        plan = await _interrupt_family_conversion(context, monkeypatch, convert_generic=drift == "bound_drift")
+        relation_oids = [identity["original_oid"] for identity in plan["tables"].values()]
+        original_storage = await _dataset_storage_catalog(connection, relation_oids)
+        if drift == "partial_key_plan":
+            plan["tables"][TABLES[4]].pop("keys")
+            await connection.execute(f"UPDATE {schema}.{online.PLAN_TABLE} SET plan=$1::jsonb", json.dumps(plan))
+        else:
+            identity = plan["tables"][TABLES[2]]
+            history = f"{schema}.pd_dataset_history_{identity['original_oid']}"
+            assert await connection.fetchval(f"SELECT count(*) FROM {history}") == 0
+            assert len(identity["keys"]) > 1
+            await connection.execute(f"ALTER TABLE {schema}.{TABLES[2]} DETACH PARTITION {history}")
+            await connection.execute(
+                f"ALTER TABLE {schema}.{TABLES[2]} ATTACH PARTITION {history} "
+                f"FOR VALUES IN ({online.literal(identity['keys'][0])})"
+            )
+        with pytest.raises(RuntimeError, match="provider_dataset_migration_" + drift):
+            await run_migration(context.engine, _candidate_migration(), "upgrade")
+        assert await _dataset_storage_catalog(connection, relation_oids) == original_storage
+        assert json.loads(await connection.fetchval(f"SELECT plan FROM {schema}.{online.PLAN_TABLE}")) == plan
+        await _assert_family_headers_fenced(context)
