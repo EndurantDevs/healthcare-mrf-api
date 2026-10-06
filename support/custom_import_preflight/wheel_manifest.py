@@ -15,6 +15,7 @@ CANONICAL_MODULES = (
     "process/custom_import/processing_policy.py",
     "process/custom_import/snowflake.py",
     "process/custom_import/snowflake_bundle.py",
+    "process/custom_import/snowflake_bundle_scope.py",
     "process/custom_import/snowflake_binding.py",
     "process/custom_import/snowflake_preflight.py",
     "process/custom_import/snowflake_preflight_schema.py",

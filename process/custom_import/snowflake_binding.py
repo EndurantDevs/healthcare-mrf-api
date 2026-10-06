@@ -37,6 +37,7 @@ from process.custom_import.snowflake_bundle import (
     _snapshot_token_mode,
 )
 from process.custom_import.snowflake_preflight_schema import normalize_decimal_conversions
+from process.custom_import.snowflake_bundle_scope import _entity_limit
 
 __all__ = (
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
@@ -272,6 +273,7 @@ class SnowflakeSourceBinding:
     processing_policy: ProcessingPolicy | None = None
     snapshot_token_mode: str | None = None
     decimal_conversions: Mapping[str, str] | None = None
+    entity_limit: int | None = None
     canonical: str = field(init=False)
     digest: str = field(init=False)
 
@@ -296,6 +298,10 @@ class SnowflakeSourceBinding:
         object.__setattr__(self, "role", role)
         object.__setattr__(self, "warehouse", warehouse)
         object.__setattr__(self, "processing_policy", _validated_processing_policy(self.processing_policy))
+        try:
+            _entity_limit(self.entity_limit)
+        except ValueError as exc:
+            raise SnowflakeSourceBindingError("source binding entity limit is invalid") from exc
         try:
             conversions = normalize_decimal_conversions(self.decimal_conversions)
         except SnowflakeConnectorError as exc:
@@ -353,6 +359,10 @@ class SnowflakeSourceBinding:
             keys = keys | {"snapshot_token_mode"}
             if mapping["snapshot_token_mode"] is None:
                 raise SnowflakeSourceBindingError("source binding snapshot token mode must not be null")
+        if "entity_limit" in mapping:
+            keys = keys | {"entity_limit"}
+            if mapping["entity_limit"] is None:
+                raise SnowflakeSourceBindingError("source binding entity limit must not be null")
         document = _exact_mapping(mapping, keys)
         if (
             not isinstance(contract, str)
@@ -377,6 +387,7 @@ class SnowflakeSourceBinding:
             processing_policy=_processing_policy(document),
             snapshot_token_mode=document.get("snapshot_token_mode"),
             decimal_conversions=document.get("decimal_conversions"),
+            entity_limit=document.get("entity_limit"),
         )
 
     def _document(self) -> dict[str, object]:
@@ -415,6 +426,8 @@ class SnowflakeSourceBinding:
             document_by_field["snapshot_token_mode"] = self.snapshot_token_mode
         if self.decimal_conversions is not None:
             document_by_field["decimal_conversions"] = dict(self.decimal_conversions)
+        if self.entity_limit is not None:
+            document_by_field["entity_limit"] = self.entity_limit
         return document_by_field
 
     def bundle_components(
@@ -443,6 +456,7 @@ class SnowflakeSourceBinding:
                 processing_policy=self.processing_policy,
                 snapshot_token_mode=self.snapshot_token_mode,
                 decimal_conversions=self.decimal_conversions,
+                entity_limit=self.entity_limit,
             )
             approved_relations = tuple(
                 SnowflakeApprovedRelation(

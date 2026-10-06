@@ -47,6 +47,7 @@ from process.custom_import.snowflake_bundle import (
     _validated_bundle_statement,
 )
 from process.custom_import.snowflake_preflight_schema import convert_snowflake_float
+from process.custom_import.snowflake_bundle_scope import _cohort_cte, _cohort_parameters
 
 DEFAULT_MAX_ROOT_KEYS = 32
 DEFAULT_MAX_CHILD_ROWS = 256
@@ -247,12 +248,7 @@ class SnowflakePreflightStatement:
                 )
             }
             root_binding = binding_by_stream[root_stream.stream_id]
-            ctes = _root_key_ctes(
-                definition,
-                _filtered_relation_sql(root_binding, tuple(columns_by_stream[root_stream.stream_id].values())),
-                columns_by_stream[root_stream.stream_id],
-                limits,
-            )
+            ctes = _scoped_key_ctes(bundle_statement, root_binding, columns_by_stream[root_stream.stream_id], limits)
             columns = _output_columns(fields)
             sql = _preview_sql(
                 ctes,
@@ -279,8 +275,20 @@ class SnowflakePreflightStatement:
         object.__setattr__(
             self,
             "parameters",
-            _preflight_parameters((root_binding, *bundle_statement.request.bindings), columns_by_stream),
+            _cohort_parameters(bundle_statement.request, bundle_statement.selected_columns_by_stream)
+            + _preflight_parameters((root_binding, *bundle_statement.request.bindings), columns_by_stream),
         )
+
+
+def _scoped_key_ctes(bundle, root_binding, columns_by_field, limits):
+    ctes = _root_key_ctes(
+        bundle.request.definition,
+        _filtered_relation_sql(root_binding, tuple(columns_by_field.values()), request=bundle.request),
+        columns_by_field,
+        limits,
+    )
+    cohort = _cohort_cte(bundle.request, bundle.selected_columns_by_stream)
+    return (cohort + ", ", *ctes) if cohort else ctes
 
 
 def _preflight_parameters(bindings, columns_by_stream) -> tuple[str, ...]:
@@ -373,6 +381,7 @@ def _prepare_preflight(
             processing_policy=binding.processing_policy,
             snapshot_token_mode=binding.snapshot_token_mode,
             decimal_conversions=binding.decimal_conversions,
+            entity_limit=binding.entity_limit,
         )
         if not isinstance(request, SnowflakeBundleRequest):
             raise TypeError
@@ -384,6 +393,7 @@ def _prepare_preflight(
             processing_policy=binding.processing_policy,
             snapshot_token_mode=binding.snapshot_token_mode,
             decimal_conversions=binding.decimal_conversions,
+            entity_limit=binding.entity_limit,
         )
         bundle_statement = builder.build_statement(request)
         if not isinstance(bundle_statement, SnowflakeBundleStatement):
