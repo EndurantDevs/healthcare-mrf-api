@@ -263,6 +263,27 @@ def test_landing_encoding_failure_closes_untransferred_destination(monkeypatch, 
     assert cursor.closed and connection.closed
 
 
+@pytest.mark.parametrize("failure", [CaptureError("synthetic seal failure"), CancelledError()])
+def test_landing_seal_failure_preserves_primary_and_closes_reader(monkeypatch, failure):
+    readers = []
+
+    def fail_capture(reader, *_arguments, **_options):
+        readers.append(reader)
+        assert not reader.closed and reader.tell() == 0
+        raise failure
+
+    monkeypatch.setattr(snowflake_python, "capture_stream", fail_capture)
+    result, cursor, connection = _shared_open(monkeypatch, (_shared_row(),))
+    with result:
+        with pytest.raises(
+            CancelledError if isinstance(failure, CancelledError) else SnowflakeConnectorError
+        ) as caught:
+            next(result.consume_events())
+    assert caught.value is failure or caught.value.__cause__ is failure
+    assert len(readers) == 1 and readers[0].closed
+    assert cursor.closed and connection.closed
+
+
 def test_landing_splits_by_explicit_part_record_count(monkeypatch):
     connector, request, adapter, cursor, connection = _runtime(
         monkeypatch,
