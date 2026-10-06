@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from process.ptg_parts.result_archive_source_authority import (
     PtgResultArchiveSourceAuthority,
     PtgResultArchiveSourceAuthorityError,
+    _authority_row,
     capture_ptg_result_archive_source_authority,
     validate_ptg_result_archive_source_authority,
 )
@@ -56,3 +60,16 @@ async def test_source_authority_requires_transaction_before_any_database_work() 
             operation_id="a" * 64,
             snapshot_id="snapshot-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_source_authority_locks_only_the_mutable_snapshot() -> None:
+    """Reading immutable binding metadata must not require UPDATE authority."""
+
+    row_by_name = {"snapshot_id": "snapshot-1"}
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: [row_by_name])))
+    assert await _authority_row(session, schema='"mrf"', snapshot_id="snapshot-1") == row_by_name
+    statement, parameters = session.execute.await_args.args
+    assert str(statement).rstrip().endswith("FOR KEY SHARE OF snapshot")
+    assert 'JOIN "mrf".ptg2_frozen_source_file_binding AS frozen' in str(statement)
+    assert parameters == {"snapshot_id": "snapshot-1"}
