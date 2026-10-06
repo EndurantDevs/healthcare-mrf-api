@@ -97,6 +97,25 @@ one generic rejection code for each selected root key. Those bounded keys and
 codes are repr-suppressed and never logged by the core. They are selected-scope
 diagnostics, not a complete source-wide rejection report.
 
+## Whole-entity acquisition limit
+
+A retained Snowflake binding may set `"entity_limit": 100000` to select at most
+100,000 distinct, non-null source entity IDs. The option accepts an integer from
+1 through 1,000,000; omitting it preserves unrestricted acquisition and existing
+binding bytes. The entity field must belong to the root logical key.
+
+One ordered cohort is selected from the filtered root source in the same bundle
+statement. Each stream uses its declared entity/parent-key mapping to retain all
+matching rows under its configured filters. The limit never truncates a child
+collection or counts root versions as different entities. Invalid source IDs or
+rejected families can reduce the admitted entity count.
+
+The option is retained in binding, request, statement, capture and replay
+identities. Discovery, estimates and bounded previews use the same declared
+scope; a preview still has its own statement identity and sampling limits.
+A limited acquisition is not evidence of unrestricted source completeness.
+Normal snapshot validation and publication requirements still apply.
+
 ## Sampling rules
 
 The preview query has one deterministic root-key CTE:
