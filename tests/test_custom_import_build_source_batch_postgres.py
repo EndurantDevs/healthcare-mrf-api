@@ -10,9 +10,10 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import DBAPIError
 
+import process.custom_import.admission_sql as admission
 import process.custom_import.build_source as staging
 from db.models.custom_import import (
     CustomImportBuildAttempt,
@@ -25,6 +26,7 @@ from db.models.custom_import import (
     CustomImportRootRevision,
 )
 from process.custom_import.family import _is_valid_npi
+from tests.test_custom_import_build_output_postgres import _records, _request_for
 from tests.test_custom_import_build_source_postgres import (
     _candidate_models,
     _child,
@@ -37,6 +39,57 @@ from tests.test_custom_import_build_source_postgres import (
 def _synthetic_npi(index):
     prefix = f"199999{index:03d}"
     return next(prefix + str(digit) for digit in range(10) if _is_valid_npi(prefix + str(digit)))
+
+
+async def test_owner_selection_uses_current_user_without_granting_authority():
+    async with _source_case() as case:
+        request = await _request_for(case, _records(1), page_rows=2)
+        build_id, _ = await staging._begin_build(case.sessions, request)
+        async with staging._page_session(case.sessions, request, build_id) as (session, _):
+            assert await admission._has_admission_owner(session) is True
+            await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
+            try:
+                assert await admission._has_admission_owner(session) is False
+            finally:
+                await session.execute(text("RESET ROLE"))
+
+
+async def test_staging_routes_the_existing_owner_through_ordinary_admission(monkeypatch):
+    async with _source_case() as case:
+        request = await _request_for(case, _records(3), page_rows=2)
+        admitted = AsyncMock(wraps=admission._admit_locked)
+        monkeypatch.setattr(admission, "_admit_locked", admitted)
+        result = await staging.stage_segmented_source(case.sessions, request)
+        assert result.phase == "graph" and result.candidate_error_count == 0
+        assert result.source_occurrence_count == 6
+        admitted.assert_awaited_once()
+        assert (await staging.stage_segmented_source(case.sessions, request)) == result
+        admitted.assert_awaited_once()
+
+
+async def test_timeout_retries_one_logical_group(monkeypatch):
+    async with _source_case() as case:
+        request = await _request_for(case, _records(1), page_rows=2)
+        statements, pages = admission._statements, []
+
+        async def timeout_first_decision(session, family_id):
+            queries, relations = await statements(session, family_id)
+            if not pages:
+                queries = (queries[0], text("SELECT pg_catalog.pg_sleep(3)"), *queries[2:])
+            else:
+                assert session is not pages[0] and not pages[0].in_transaction()
+            pages.append(session)
+            return queries, relations
+
+        monkeypatch.setattr(admission, "_statements", timeout_first_decision)
+        admitted = AsyncMock(wraps=admission._admit_locked)
+        monkeypatch.setattr(admission, "_admit_locked", admitted)
+        result = await staging.stage_segmented_source(case.sessions, request)
+        assert result.phase == "graph" and result.source_occurrence_count == 2 and result.candidate_error_count == 0
+        assert admitted.await_count == len(pages) == 2
+        assert admitted.await_args_list[0].kwargs == {}
+        assert admitted.await_args_list[1].kwargs == {"physical_row_cap": 2}
+        assert [arguments.args[2] for arguments in admitted.await_args_list] == [0, 0]
 
 
 async def _root_page(case, records):

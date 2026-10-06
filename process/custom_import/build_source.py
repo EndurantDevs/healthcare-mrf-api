@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from uuid import UUID
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -966,6 +967,8 @@ async def stage_segmented_source(session_factory: SessionFactory, request: Sourc
     transport status. A new fence must start its own build.
     """
 
+    from process.custom_import import admission_sql as admission
+
     if not isinstance(request, SourceBuildRequest):
         raise TypeError("source staging requires SourceBuildRequest")
     build_id, registry = await _begin_build(session_factory, request)
@@ -985,23 +988,31 @@ async def stage_segmented_source(session_factory: SessionFactory, request: Sourc
                 )
             ).all()
         }
+        direct_admission = await admission._has_admission_owner(session)
     if phase == "source":
         await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
     await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
     while True:
-        async with _page_session(session_factory, request, build_id) as (session, build):
-            if build.phase in ("graph", "rejected", "output", "verifying", "verified"):
-                return SourceBuildResult(
-                    build_id,
-                    request.execution_id,
-                    build.phase,
-                    build.source_occurrence_count,
-                    build.candidate_error_count,
-                )
-            if build.phase != "admission":
-                raise CandidateRunnerError("source build is not ready for global admission")
-            await _call(
-                session,
-                "admit_custom_import_build_page",
-                (("bigint", build_id), ("bigint", build.admission_after_occurrence_id)),
-            )
+        try:
+            async with _page_session(session_factory, request, build_id) as (session, build):
+                if build.phase in ("graph", "rejected", "output", "verifying", "verified"):
+                    return SourceBuildResult(
+                        build_id,
+                        request.execution_id,
+                        build.phase,
+                        build.source_occurrence_count,
+                        build.candidate_error_count,
+                    )
+                if build.phase != "admission":
+                    raise CandidateRunnerError("source build is not ready for global admission")
+                if direct_admission:
+                    await admission._admit_locked(session, build, build.admission_after_occurrence_id)
+                else:
+                    # Restricted principals retain their existing fenced dispatcher until authority is migrated.
+                    await _call(
+                        session,
+                        "admit_custom_import_build_page",
+                        (("bigint", build_id), ("bigint", build.admission_after_occurrence_id)),
+                    )
+        except DBAPIError as error:
+            await admission._retry_admission_timeout(session_factory, request, build_id, error)

@@ -32,6 +32,7 @@ from db.models.custom_import import (
 )
 from process.custom_import import build_graph, build_output, build_source
 from process.custom_import import execution as lifecycle
+from process.custom_import.admission_sql import AdmissionError
 from process.custom_import.build_counts import count_source_outcomes
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import assemble_root_families
@@ -220,7 +221,7 @@ async def test_payload_comparison_respects_page_byte_bound(enabled):
         prepared = build_source._prepare_row(request, definition.source_streams[1], source_records["rates"][0][0])
         request = replace(request, page_byte_limit=prepared.byte_count)
         if enabled:
-            with pytest.raises(DBAPIError, match="custom_import_build_page_too_large"):
+            with pytest.raises(AdmissionError, match="custom_import_build_page_too_large"):
                 await build_source.stage_segmented_source(case.sessions, request)
             async with case.sessions() as session:
                 models = await session.run_sync(_candidate_models, request)
