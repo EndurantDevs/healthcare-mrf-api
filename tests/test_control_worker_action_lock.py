@@ -35,6 +35,7 @@ def test_exact_worker_presence_queries_job_and_pod_for_same_run(monkeypatch):
         "enabled": True,
         "job_count": 1,
         "pod_count": 1,
+        "stopped": False,
     }
     assert requests == [
         ("GET", f"/apis/batch/v1/namespaces/dev/jobs?{query}"),

@@ -409,7 +409,7 @@ def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def exact_worker_presence(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return exact-run Kubernetes Job and Pod counts without mutation."""
+    """Return exact-run Job and Pod counts and terminal-stop proof without mutation."""
 
     spec = _exact_worker_spec(payload)
     if _launcher_mode() != "kubernetes" or not _is_kubernetes_configured():
@@ -417,32 +417,46 @@ def exact_worker_presence(payload: dict[str, Any]) -> dict[str, Any]:
     namespace = _kubernetes_namespace()
     selector = _kubernetes_label_selector(spec, payload)
     query = urllib.parse.urlencode({"labelSelector": selector})
-    jobs = _kubernetes_job_records(
-        _kubernetes_request(
-            "GET",
-            f"/apis/batch/v1/namespaces/{namespace}/jobs?{query}",
-        )
-    )
-    pods = _kubernetes_pod_records(
-        _kubernetes_request(
-            "GET",
-            f"/api/v1/namespaces/{namespace}/pods?{query}",
-        )
-    )
+    jobs = _exact_worker_records(f"/apis/batch/v1/namespaces/{namespace}/jobs?{query}")
+    pods = _exact_worker_records(f"/api/v1/namespaces/{namespace}/pods?{query}")
     return {
         "enabled": True,
         "job_count": len(jobs),
         "pod_count": len(pods),
+        "stopped": all(_is_terminal_worker_job(job) for job in jobs)
+        and all((pod.get("status") or {}).get("phase") in {"Succeeded", "Failed"} for pod in pods),
     }
+
+
+def _exact_worker_records(path: str) -> list[dict[str, Any]]:
+    """Keep malformed API responses from being mistaken for worker absence."""
+    response = _kubernetes_request("GET", path)
+    records = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+        raise RuntimeError("exact worker inventory is unavailable")
+    return records
+
+
+def _is_terminal_worker_job(job: dict[str, Any]) -> bool:
+    """Require a terminal Job condition, including after failed retries."""
+    status = job.get("status") or {}
+    active = status.get("active", 0)
+    conditions = status.get("conditions")
+    if type(active) is not int or active != 0 or not isinstance(conditions, list):
+        return False
+    return all(isinstance(condition, dict) for condition in conditions) and any(
+        condition.get("type") in {"Complete", "Failed"} and condition.get("status") == "True"
+        for condition in conditions
+    )
 
 
 def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
     run_id = str(payload.get("run_id") or "").strip()
     importer = str(payload.get("importer") or "").strip()
-    spec = _BY_IMPORTER_ROLE.get((importer, "start"))
-    if not run_id or spec is None:
-        raise RuntimeError("exact worker identity is unavailable")
     queue = str(payload.get("queue") or "").strip()
+    spec = _BY_QUEUE.get(queue) if importer == "ptg" and queue else _BY_IMPORTER_ROLE.get((importer, "start"))
+    if not run_id or spec is None or importer not in spec.importers or spec.role != "start":
+        raise RuntimeError("exact worker identity is unavailable")
     worker_class = str(payload.get("worker_class") or "").strip()
     if (queue and queue != spec.queue) or (
         worker_class and worker_class != spec.worker_class
