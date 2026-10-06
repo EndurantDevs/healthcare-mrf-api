@@ -165,7 +165,7 @@ def _row_mapping(row: Any) -> dict[str, Any]:
 
 
 async def _authority_row(session: Any, *, schema: str, snapshot_id: str) -> dict[str, Any]:
-    """Lock the exact snapshot and immutable frozen binding after fencing GC."""
+    """Lock the snapshot and read its immutable binding after fencing GC."""
 
     result = await session.execute(
         text(
@@ -183,7 +183,7 @@ async def _authority_row(session: Any, *, schema: str, snapshot_id: str) -> dict
               JOIN {schema}.ptg2_frozen_source_file_binding AS frozen
                 ON frozen.internal_run_id = snapshot.import_run_id
              WHERE snapshot.snapshot_id = :snapshot_id
-             FOR KEY SHARE OF snapshot, frozen
+             FOR KEY SHARE OF snapshot
             """
         ),
         {"snapshot_id": snapshot_id},
@@ -548,9 +548,10 @@ async def lock_ptg_result_archive_for_clone(
 
     Capture and terminal release take the bounded operation/source advisory
     fences.  A clone can be long-running, so it instead holds only the exact
-    snapshot, frozen binding, and owner pin rows in its existing transaction.
-    The durable FK-backed pin prevents retention cleanup while this row lock is
-    held; no lifecycle advisory lock escapes into the clone lifetime.
+    snapshot and owner pin rows in its existing transaction. Frozen bindings
+    reject mutation and need only a read, not a lock requiring UPDATE authority.
+    The durable FK-backed pin prevents retention cleanup while these row locks
+    are held; no lifecycle advisory lock escapes into the clone lifetime.
     """
 
     _require_transaction(session)
