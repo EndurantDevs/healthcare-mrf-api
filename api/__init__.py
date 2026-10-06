@@ -30,6 +30,7 @@ from api.endpoint.provider_directory_entities import blueprint as v1_provider_di
 from api.endpoint.reports import blueprint as v1_reports
 from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
 from api.metrics import blueprint as metrics_blueprint
+from api.plan_release_read_boundary import require_internal_plan_release_read
 from api.provider_directory_profile_capacity_preflight import (
     register_profile_capacity_preflight_route,
 )
@@ -67,6 +68,7 @@ def init_api(api):
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")
+    api.register_middleware(require_internal_plan_release_read, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)
     api.blueprint(execution_evidence_blueprint)
