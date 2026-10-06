@@ -339,19 +339,63 @@ def test_generated_landing_one_row_bytes_match_generic_replay(record_count, null
         )
 
 
-def test_generated_landing_falls_back_before_unbudgeted_full_table_read(monkeypatch):
+@pytest.mark.parametrize("maximum_decoded_bytes", [262_144, 300_000], ids=("table-budget", "page-budget"))
+def test_generated_landing_falls_back_before_unbudgeted_full_table_read(monkeypatch, maximum_decoded_bytes):
     def reject_full_table(*args, **kwargs):
         raise AssertionError("full-table replay must not run without a memory reservation")
 
     monkeypatch.setattr(pq.ParquetFile, "read", reject_full_table)
     schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
     records = [("x" * 4096,) for _ in range(32)]
-    limits = CaptureLimits(maximum_decoded_bytes=262_144, maximum_record_bytes=8192)
+    limits = CaptureLimits(maximum_decoded_bytes=maximum_decoded_bytes, maximum_record_bytes=8192)
     reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(records, schema, record_limits=limits)
     with reader:
         assert arrow_bytes == 32 * 4100
         assert reader.read(4) == b"PAR1"
     assert reader.closed
+
+
+@pytest.mark.parametrize(
+    ("maximum_decoded_bytes", "expected_error"),
+    [
+        (64, "source stream exceeds the decoded-byte limit"),
+        (65_536, "Parquet source payload exceeds the decoded-byte limit"),
+    ],
+    ids=("encoded-part-budget", "fallback-page-budget"),
+)
+def test_generated_landing_budget_failure_closes_reader_before_decode(
+    monkeypatch, maximum_decoded_bytes, expected_error
+):
+    write_table = pq.write_table
+    preflight = snowflake_python._validate_parquet_page_preflight
+    destinations = []
+    preflight_budgets = []
+
+    def tracked_write(table, destination, **options):
+        destinations.append(destination)
+        write_table(table, destination, **options)
+
+    def tracked_preflight(*arguments, maximum_decoded_bytes):
+        preflight_budgets.append(maximum_decoded_bytes)
+        preflight(*arguments, maximum_decoded_bytes=maximum_decoded_bytes)
+
+    def reject_decode(*args, **kwargs):
+        raise AssertionError("decoding must not run after a failed memory preflight")
+
+    monkeypatch.setattr(pq, "write_table", tracked_write)
+    monkeypatch.setattr(pq.ParquetFile, "read", reject_decode)
+    monkeypatch.setattr(snowflake_python, "_iter_parquet_batch_records", reject_decode)
+    monkeypatch.setattr(snowflake_python, "_validate_parquet_page_preflight", tracked_preflight)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    limits = CaptureLimits(maximum_decoded_bytes=maximum_decoded_bytes, maximum_record_bytes=64)
+    with pytest.raises(CaptureError, match=expected_error):
+        snowflake_python._parquet_reader_with_metrics([("original",)], schema, record_limits=limits)
+    assert len(destinations) == 1 and destinations[0].closed
+    if maximum_decoded_bytes == 64:
+        assert preflight_budgets == []
+    else:
+        assert len(preflight_budgets) == 2
+        assert 0 < preflight_budgets[0] < preflight_budgets[1] == maximum_decoded_bytes
 
 
 @pytest.mark.parametrize("fallback", [False, True])
