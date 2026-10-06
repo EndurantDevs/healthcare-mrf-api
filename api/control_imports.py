@@ -4330,6 +4330,8 @@ async def _cancel_signal_for_run(
     queued_signal_by_name = await _remove_queued_job(current_run)
     kubernetes_signal_by_name = await _delete_active_worker_jobs(current_run)
     if is_queued_arq:
+        if queued_signal_by_name.get("payload_absent"):
+            queued_signal_by_name["worker_stopped"] = await _is_canceled_worker_stopped(current_run)
         queued_signal_by_name["cancel_flag"] = cancel_flag_by_name
         queued_signal_by_name["kubernetes"] = kubernetes_signal_by_name
         return queued_signal_by_name
@@ -4338,6 +4340,15 @@ async def _cancel_signal_for_run(
         "arq_cleanup": queued_signal_by_name,
         "kubernetes": kubernetes_signal_by_name,
     }
+
+
+async def _is_canceled_worker_stopped(run: dict[str, Any]) -> bool:
+    """Require fresh Job and Pod stop proof after asynchronous worker deletion."""
+    try:
+        presence = await asyncio.to_thread(exact_worker_presence, _reconciliation_worker_payload(run))
+    except Exception:
+        return False
+    return presence.get("enabled") is True and presence.get("stopped") is True
 
 
 def _cancel_progress_by_name(
@@ -4409,6 +4420,13 @@ def _is_queued_arq_cancel_completed(cancel_signal: dict[str, Any]) -> bool:
         "identity_unavailable"
     ):
         return False
+    if cancel_signal.get("payload_absent"):
+        cancel_flag = cancel_signal.get("cancel_flag")
+        return (
+            isinstance(cancel_flag, dict)
+            and cancel_flag.get("redis") is True
+            and cancel_signal.get("worker_stopped") is True
+        )
     if cancel_signal.get("removed"):
         return True
     if _has_terminalized_active_worker_cancel_signal(cancel_signal):
@@ -4589,12 +4607,7 @@ async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
             await pipe.watch(job_key)
             raw_job_bytes = await pipe.get(job_key)
             if raw_job_bytes is None:
-                return _arq_cleanup_refusal(
-                    queue,
-                    job_id,
-                    "identity_unavailable",
-                    "ARQ job payload is unavailable",
-                )
+                return await _reconcile_cancel_queue_residue(pipe, run, queue, job_id)
             if not _is_arq_job_owned_by_run(
                 raw_job_bytes,
                 adapter=adapter,
@@ -4623,10 +4636,42 @@ async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
             "queue": queue,
             "job_id": job_id,
             "removed": False,
+            "identity_unavailable": True,
             "reason": "ARQ job changed during cleanup",
         }
     except Exception as exc:
-        return {"redis": False, "removed": False, "error": str(exc), "queue": queue, "job_id": job_id}
+        return {
+            "redis": False, "removed": False, "identity_unavailable": True,
+            "error": str(exc), "queue": queue, "job_id": job_id,
+        }
+
+
+async def _reconcile_cancel_queue_residue(
+    pipe: Any,
+    run: dict[str, Any],
+    queue: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """Remove inert queue residue only when the durable run proves its identity."""
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    refusal = _arq_cleanup_refusal(queue, job_id, "identity_unavailable", "ARQ job payload is unavailable")
+    if not _is_queued_arq_cancel(run, metrics):
+        return refusal
+    try:
+        _run_id, _importer, expected_queue, expected_job_id = _reconciliation_arq_identity(run)
+        persisted_queue = str(metrics.get("queue") or "").strip()
+        if (queue, job_id) != (expected_queue, expected_job_id) or (persisted_queue and persisted_queue != queue):
+            return refusal
+        receipt = await _reconcile_terminal_queue_member(pipe, run, queue, job_id, _arq_evidence_keys(job_id))
+    except Exception:
+        return {**refusal, "redis": False}
+    return {
+        "redis": True,
+        "queue": queue,
+        "job_id": job_id,
+        "removed": receipt["removed"],
+        "payload_absent": True,
+    }
 
 
 def _retry_child_params(
