@@ -306,7 +306,7 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
     monkeypatch.setattr(
         control_workers,
         "_worker_job_secret_env",
-        lambda _worker_class: [],
+        lambda _worker_class, *, launch_request: [],
     )
     monkeypatch.setattr(control_workers, "_worker_job_env_from", lambda: [])
     monkeypatch.setattr(
