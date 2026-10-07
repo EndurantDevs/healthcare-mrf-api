@@ -26,6 +26,7 @@ pytestmark = [
     pytest.mark.skipif(not os.getenv(POSTGRES_DSN_ENV), reason="native PostgreSQL test DSN not allocated"),
 ]
 _PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20261005080000_custom_import_writer_cutover.py"
+_REFRESH_PATH = _PATH.with_name("20261007000000_custom_import_rejection_anti_joins.py")
 
 
 def _record_role(name, schema, phase):
@@ -38,6 +39,13 @@ def _record_role(name, schema, phase):
 
 def _install(connection, schema):
     migration = _migration(_PATH, "writer_cutover_native")
+    migration._schema = lambda: schema
+    migration.op = Operations(MigrationContext.configure(connection))
+    migration.upgrade()
+
+
+def _refresh(connection, schema):
+    migration = _migration(_REFRESH_PATH, "rejection_anti_join_native")
     migration._schema = lambda: schema
     migration.op = Operations(MigrationContext.configure(connection))
     migration.upgrade()
@@ -247,7 +255,7 @@ async def test_native_cutover_denies_obsolete_roots_and_actual_definer_caller():
             await _assert_denied(connection, f"SELECT {indirect_callers[-1]}")
 
 
-async def _independent_surface(connection, control_schema, independent_schema):
+async def _independent_surface(connection, control_schema, independent_schema, *, corrected=False):
     """Retain local collisions beside real cross-schema callers, not a schema exemption."""
     local_caller = f'"{independent_schema}".synthetic_local_caller()'
     writer = f'"{independent_schema}".synthetic_local_writer()'
@@ -282,12 +290,24 @@ async def _independent_surface(connection, control_schema, independent_schema):
         )
     )
     migration = _migration(_PATH, "independent_cutover_receipts")
+    obsolete_identities = [f'"{independent_schema}".{signature}' for signature in migration._OBSOLETE]
+    if corrected:
+        obsolete_identities = list(
+            await connection.scalars(
+                text(
+                    "SELECT identity FROM unnest(CAST(:identities AS text[])) AS inputs(identity) "
+                    "WHERE to_regprocedure(identity) IS NOT NULL"
+                ),
+                {"identities": obsolete_identities},
+            )
+        )
     preserved = (
         local_caller,
         writer,
         reader,
         f'"{independent_schema}".source_set_finalize(uuid,integer[])',
-        *(f'"{independent_schema}".{signature}' for signature in migration._OBSOLETE),
+        f'"{independent_schema}".verify_custom_import_build_structure(bigint)',
+        *obsolete_identities,
     )
     return preserved, (caller, uppercase, *indirect, changed)
 
@@ -368,10 +388,16 @@ async def _assert_cross_schema_writers_rejected(connection, control_schema, inde
         assert await _function_acls(connection, independent_schema) == previous_acls
 
 
-async def test_native_cutover_preserves_independent_schema_and_closes_cross_schema_callers():
+@pytest.mark.parametrize("corrected", (False, True), ids=("historical", "corrected"))
+async def test_native_cutover_preserves_independent_schema_and_closes_cross_schema_callers(corrected):
     async with _before_cutover(roles=True) as (case, (independent_owner, worker)), _before_cutover() as (other, _roles):
         async with case.engine.begin() as connection:
-            preserved, blocked = await _independent_surface(connection, case.schema_name, other.schema_name)
+            if corrected:
+                await connection.run_sync(_install, other.schema_name)
+                await connection.run_sync(_refresh, other.schema_name)
+            preserved, blocked = await _independent_surface(
+                connection, case.schema_name, other.schema_name, corrected=corrected
+            )
             await _assign_independent_owner(connection, case.schema_name, other.schema_name, independent_owner)
             await connection.execute(text(f'GRANT USAGE ON SCHEMA "{other.schema_name}" TO "{worker}"'))
             for identity in (*preserved, *blocked):
@@ -398,6 +424,57 @@ async def test_native_cutover_preserves_independent_schema_and_closes_cross_sche
             )
             for identity in blocked:
                 await _assert_denied(connection, f"SELECT {identity.replace('(bigint)', '(1)')}")
+
+
+async def _validator_state(connection, identity):
+    return (
+        await connection.execute(
+            text(
+                "SELECT oid,proowner,proacl::text,prosrc,prosecdef,proconfig,prolang,prorettype,"
+                "proisstrict,provolatile,proparallel,proleakproof,procost "
+                "FROM pg_proc WHERE oid=to_regprocedure(:identity)"
+            ),
+            {"identity": identity},
+        )
+    ).one()
+
+
+async def _assert_refresh_drift_rejected(connection, schema, statement):
+    with pytest.raises(RuntimeError, match="custom_import_rejection_validator_identity_mismatch"):
+        async with connection.begin_nested():
+            await connection.execute(text(statement))
+            await connection.run_sync(_refresh, schema)
+
+
+async def test_native_rejection_validator_refresh_preserves_identity_and_rejects_drift():
+    async with _before_cutover(roles=True) as (case, (other_owner, worker)):
+        identity = f'"{case.schema_name}".verify_custom_import_snapshot_structure(bigint)'
+        migration = _migration(_REFRESH_PATH, "rejection_anti_join_expected")
+        corrected = " " + migration._body(migration._finality(), case.schema_name, corrected=True) + " "
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_install, case.schema_name)
+            before = await _validator_state(connection, identity)
+            assert before.prosrc != corrected
+            await connection.run_sync(_refresh, case.schema_name)
+            refreshed = await _validator_state(connection, identity)
+            assert refreshed[:3] == before[:3] and refreshed[4:] == before[4:]
+            assert refreshed.prosrc == corrected
+            await connection.run_sync(_refresh, case.schema_name)
+            assert await _validator_state(connection, identity) == refreshed
+            for statement in (
+                f"ALTER FUNCTION {identity} SECURITY INVOKER",
+                f"ALTER FUNCTION {identity} SET search_path=public",
+                f'ALTER FUNCTION {identity} OWNER TO "{other_owner}"',
+                f"ALTER FUNCTION {identity} STRICT",
+                f"ALTER FUNCTION {identity} STABLE",
+                f"ALTER FUNCTION {identity} PARALLEL SAFE",
+                f"ALTER FUNCTION {identity} LEAKPROOF",
+                f"ALTER FUNCTION {identity} COST 101",
+                f"GRANT EXECUTE ON FUNCTION {identity} TO PUBLIC",
+                f'GRANT EXECUTE ON FUNCTION {identity} TO "{worker}"',
+            ):
+                await _assert_refresh_drift_rejected(connection, case.schema_name, statement)
+                assert await _validator_state(connection, identity) == refreshed
 
 
 async def test_native_cutover_reports_unknown_direct_and_indirect_callable_definers():

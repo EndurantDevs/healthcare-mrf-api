@@ -213,11 +213,19 @@ def _independent_reviewed_functions(schema: str) -> list[dict]:
         ),
         {"schema": schema},
     )
-    return [
-        receipt
-        for namespace in namespaces.scalars()
-        for receipt in _reviewed_functions(namespace, include_obsolete=True)
-    ]
+    receipts = []
+    correction = _previous("20261007000000_custom_import_rejection_anti_joins")
+    for namespace in namespaces.scalars():
+        previous = _reviewed_functions(namespace, include_obsolete=True)
+        receipts.extend(previous)
+        validator = next(
+            receipt
+            for receipt in previous
+            if receipt["identity"].endswith(".verify_custom_import_snapshot_structure(bigint)")
+        )
+        body = " " + correction._body(correction._finality(), namespace, corrected=True) + " "
+        receipts.append({**validator, "body_sha256": hashlib.sha256(body.encode()).hexdigest()})
+    return receipts
 
 
 def _render(schema: str, statement: str, reviewed: list[dict], independent: list[dict]) -> str:

@@ -76,12 +76,14 @@ def _loaded_binding_with_source_options(configured, source_options):
     if source_options == "legacy":
         return loaded
     definition, binding = _decimal_binding(opted_in=source_options != "statement", version=2 if configured else 1)
-    if source_options in {"statement", "combined"}:
+    if source_options in {"statement", "combined", "cohort"}:
         document = json.loads(binding.canonical)
         document["snapshot_token_mode"] = "statement_query_id"
         for stream in document["streams"]:
             stream["source_snapshot_token_relation"] = None
             stream["source_snapshot_token_column_identifier"] = None
+        if source_options == "cohort":
+            document["entity_limit"] = 100_000
         binding = SnowflakeSourceBinding.from_mapping(document)
     approved_relations, bundle_bindings = binding.bundle_components(definition)
     return replace(
@@ -230,7 +232,7 @@ async def test_stop_reconstructs_the_worker_request_digest_without_source_access
 
 
 @pytest.mark.parametrize("configured", (False, True))
-@pytest.mark.parametrize("source_options", ("legacy", "decimal", "statement", "combined"))
+@pytest.mark.parametrize("source_options", ("legacy", "decimal", "statement", "combined", "cohort"))
 async def test_execute_resume_and_stop_share_the_exact_retained_source_identity(
     monkeypatch, configured, source_options
 ):
@@ -262,6 +264,8 @@ async def test_execute_resume_and_stop_share_the_exact_retained_source_identity(
     assert candidate.bundle_request.processing_policy == loaded.binding.processing_policy
     assert candidate.bundle_request.snapshot_token_mode == loaded.binding.snapshot_token_mode
     assert candidate.bundle_request.decimal_conversions == loaded.binding.decimal_conversions
+    assert candidate.bundle_request.entity_limit == (100_000 if source_options == "cohort" else None)
+    assert ("entity_limit" in json.loads(candidate.bundle_request.canonical_request)) is (source_options == "cohort")
     assert candidate.source_binding_sha256 == resumed.source_binding_sha256 == loaded.source_binding_sha256
     legacy = bundle_request_identity_sha256(
         candidate.bundle_request, statement, source_binding_sha256=loaded.source_binding_sha256
