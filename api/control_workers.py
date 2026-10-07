@@ -6,9 +6,9 @@ import asyncio
 import hashlib
 import json
 import os
+import ssl
 import subprocess
 import sys
-import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,14 +18,6 @@ from typing import Any
 
 from db.models import db
 from process.control_lifecycle import acquire_control_run_worker_action_lock
-from process.ptg_parts.ptg_wave_admission_fence import (
-    PTG_WAVE_FENCED_IMPORTERS,
-    PTGWaveCapacityConflict,
-    PTGWaveOwnershipConflict,
-    acquire_ptg_admission_lock,
-    require_no_capacity_owning_wave,
-    require_not_wave_owned_run,
-)
 from process.ptg_parts.ptg_source_attempt_actions import (
     PTGSourceAttemptIdentityError,
     PTGWorkerActionSelection,
@@ -35,6 +27,14 @@ from process.ptg_parts.ptg_source_attempt_guard import (
     PTGSourceAttemptTerminalError,
     source_file_import_id_from_payload,
 )
+from process.ptg_parts.ptg_wave_admission_fence import (
+    PTG_WAVE_FENCED_IMPORTERS,
+    PTGWaveCapacityConflict,
+    PTGWaveOwnershipConflict,
+    acquire_ptg_admission_lock,
+    require_no_capacity_owning_wave,
+    require_not_wave_owned_run,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,12 @@ class WorkerSpec:
     worker_class: str
     importers: tuple[str, ...]
     role: str = "start"
+
+
+class _AdmittedWorkerRequest(dict[str, Any]):
+    """Carry an observed queue identity outside the serialized launch request."""
+
+    admitted_job: tuple[str, str, str, str, str] | None = None
 
 
 _PROVIDER_DIRECTORY_WORKER_CLASS = "process.ProviderDirectoryFHIR"
@@ -266,7 +272,23 @@ async def _admit_worker_ensure(
             worker_payload,
             "source-attempt identity requires a PTG import",
         )
+    _bind_admitted_job(worker_payload, admitted_run)
     return None
+
+
+def _bind_admitted_job(payload: dict[str, Any], admitted_run: dict[str, Any]) -> None:
+    """Retain only real admission coordinates for scoped secret selection."""
+
+    if not isinstance(payload, _AdmittedWorkerRequest):
+        return
+    metrics = admitted_run.get("metrics")
+    if not isinstance(metrics, dict):
+        return
+    identity = tuple(
+        admitted_run.get(name) for name in ("run_id", "importer")
+    ) + tuple(metrics.get(name) for name in ("queue", "function", "job_id"))
+    if all(isinstance(value, str) and value and value == value.strip() for value in identity):
+        payload.admitted_job = identity
 
 
 async def guarded_ensure_worker(
@@ -335,6 +357,7 @@ async def _guarded_ptg_family_ensure(
 ) -> dict[str, Any]:
     """Hold the shared capacity lock through PTG admission and worker launch."""
 
+    worker_payload = _AdmittedWorkerRequest(worker_payload)
     async with db.acquire() as connection:
         await acquire_ptg_admission_lock(connection)
         await acquire_control_run_worker_action_lock(connection, run_id)
@@ -608,6 +631,7 @@ def _ensure_kubernetes_job(
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
+    job = _worker_job_manifest(spec, payload, image)
     namespace = _kubernetes_namespace()
     if state.get("job_status") in {"succeeded", "failed"}:
         try:
@@ -616,7 +640,6 @@ def _ensure_kubernetes_job(
             if exc.status != 404:
                 return {**state, "status": "failed", "message": str(exc)}
 
-    job = _worker_job_manifest(spec, payload, image)
     try:
         _kubernetes_request("POST", f"/apis/batch/v1/namespaces/{namespace}/jobs", job)
     except _KubernetesApiError as exc:
@@ -948,7 +971,7 @@ def _worker_job_environment(
                 ),
             }
         )
-    env_list.extend(_worker_job_secret_env(spec.worker_class))
+    env_list.extend(_worker_job_secret_env(spec.worker_class, launch_request=launch_request))
     return env_list, run_id
 
 
@@ -1100,6 +1123,8 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
 
 def _worker_job_secret_env(
     worker_class: str | None = None,
+    *,
+    launch_request: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build explicitly named worker environment values from secret keys."""
 
@@ -1118,6 +1143,8 @@ def _worker_job_secret_env(
         if not isinstance(secret_env_spec, dict):
             continue
         if not _is_worker_class_selected(secret_env_spec, worker_class):
+            continue
+        if not _is_admitted_importer_selected(secret_env_spec, worker_class, launch_request):
             continue
         environment_name = str(secret_env_spec.get("name") or "").strip()
         secret_name = str(
@@ -1141,6 +1168,50 @@ def _worker_job_secret_env(
             },
         }
     return list(environment_by_name.values())
+
+
+def _is_admitted_importer_selected(selection_spec, worker_class, launch_request) -> bool:
+    """Require exact single-job admission before selecting importer-scoped secrets."""
+
+    if "importers" not in selection_spec:
+        return True
+    selected = selection_spec["importers"]
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(name, str) or not name or name != name.strip() for name in selected)
+        or not ("workerClasses" in selection_spec or "worker_classes" in selection_spec)
+    ):
+        raise ValueError("importer-scoped worker secret selector is invalid")
+    if launch_request is None:
+        return False
+    admission = (
+        launch_request.admitted_job
+        if isinstance(launch_request, _AdmittedWorkerRequest)
+        else None
+    )
+    importer = admission[1] if admission else launch_request.get("importer")
+    if importer not in selected:
+        return False
+    from api.control_imports import _SINGLE_JOB_ADAPTERS, _enqueue_job_options
+
+    spec = _BY_WORKER_CLASS.get(worker_class)
+    adapter = _SINGLE_JOB_ADAPTERS.get(importer, {})
+    if (
+        admission is None
+        or spec is None
+        or spec.role != "start"
+        or not _uses_single_job_worker(spec)
+        or importer not in spec.importers
+        or launch_request.get("importer", importer) != importer
+        or admission[:4] != (launch_request.get("run_id"), importer, spec.queue, "control_single_job_start")
+        or admission[4] != _single_job_worker_target(spec, launch_request)
+        or adapter.get("queue") != spec.queue
+        or not adapter.get("job_prefix")
+        or admission[4] != _enqueue_job_options(adapter, {"run_id": admission[0]})["_job_id"]
+    ):
+        raise ValueError("importer-scoped worker secret requires exact admitted job")
+    return True
 
 
 def _worker_job_container_security_context() -> dict[str, Any]:
