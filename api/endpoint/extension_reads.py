@@ -7,6 +7,7 @@ from typing import Any
 
 from sanic import Blueprint
 
+from api.custom_import_detail_batch import serve_custom_import_detail_batch
 from api.custom_import_provider_geo import serve_custom_import_provider_geo
 from api.custom_import_provider_http import serve_custom_import_providers
 from api.custom_import_provider_service_http import serve_custom_import_provider_service
@@ -31,6 +32,13 @@ async def detail(request: Any):
     """Forward one full-family detail read through the closed signed boundary."""
 
     return await serve_custom_import_detail(request, _session(request))
+
+
+@blueprint.post("/detail/batch", name="custom_import.detail_batch")
+async def detail_batch(request: Any):
+    """Hydrate exact identities from one previously selected provider page."""
+
+    return await serve_custom_import_detail_batch(request, _session(request))
 
 
 @blueprint.post("/providers", name="custom_import.providers")

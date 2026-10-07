@@ -11,12 +11,14 @@ import pytest
 from sanic import response
 from sqlalchemy import func, literal, select, text
 
+from api import custom_import_detail_batch as batch_http
 from api import custom_import_provider_geo as geo_http
 from api import custom_import_provider_http as provider_http
 from api import custom_import_provider_service_http as service_http
 from api import custom_import_read_http as transport
 from api.custom_import_provider_sql import compile_npi_entity_relation
 from process.custom_import import read_core
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.read_core import (
     CustomImportReadEntityAbsentError,
     CustomImportReadRequestError,
@@ -207,14 +209,191 @@ async def _page(session, target, query):
     )
 
 
-def _external_target(target):
+@pytest.mark.asyncio
+async def test_signed_exact_batch_hydrates_full_families_without_membership_filtering(monkeypatch):
+    http_fixture._install_keyring(monkeypatch)
+    async with _case() as (case, pinned_target):
+        external_target_map = transport._target_document(_external_target(pinned_target))
+        npi_values = [_B, "1999999999", _A]
+        body = transport._canonical_json_bytes(
+            {
+                "target": external_target_map,
+                "entities": {"adapter_id": "npi", "values": npi_values},
+                "family_entitlement": "full_family",
+                "grouped_entity_selection": fixture.selection_document(),
+            }
+        )
+        request = http_fixture._Request(
+            body,
+            http_fixture._resigned_headers(
+                body=body, path=batch_http.CUSTOM_IMPORT_DETAIL_BATCH_PATH, target=external_target_map
+            ),
+            path=batch_http.CUSTOM_IMPORT_DETAIL_BATCH_PATH,
+        )
+        async with case.sessions() as session:
+            reply = await batch_http.serve_custom_import_detail_batch(request, session)
+        assert reply.status == 200, reply.body
+        provider_items = json.loads(reply.body)["items"]
+        assert [provider["npi"] for provider in provider_items] == npi_values
+        assert provider_items[1]["custom_import"] is None
+        assert provider_items[0]["custom_import"]["selection"]["value"] == 2025
+        imported = provider_items[2]["custom_import"]
+        assert imported["projection"] == "full_family" and imported["selection"]["value"] == 2024
+        assert [family["group_value"] for family in imported["families"]] == ["segment_a", "segment_b"]
+        assert sum(len(family["children"]) for family in imported["families"]) == 2
+
+
+@asynccontextmanager
+async def _ordinary_root_case():
+    """Publish a family whose complete root projection exceeds its query fields."""
+
+    ordinary_definition_map = json.loads(runner_fixture._definition().canonical)
+    ordinary_definition_map["query"]["root_fields"] = ["npi"]
+    ordinary_definition = CustomImportDefinition.from_mapping(ordinary_definition_map)
+    async with isolated_publication_case() as ordinary_case:
+        ordinary_seed = await runner_fixture._seed_case(ordinary_case, "batch_ordinary", ordinary_definition)
+        execution_id, lease_token = await runner_fixture._new_execution(ordinary_case, ordinary_seed, "batch_ordinary")
+        run_result = await run_candidate(
+            ordinary_case.sessions,
+            runner_fixture._request(
+                ordinary_seed,
+                execution_id,
+                lease_token,
+                [{"npi": _A, "display_name": "Synthetic Complete"}],
+                [
+                    {"rate_npi": _A, "service_code": "first", "amount": Decimal("2")},
+                    {"rate_npi": _A, "service_code": "second", "amount": None},
+                ],
+            ),
+        )
+        assert run_result.status == "activated", run_result
+        pinned_target = PinnedReadTarget(
+            ordinary_seed.dataset_id,
+            run_result.generation_id,
+            ordinary_seed.definition_revision_id,
+            ordinary_seed.schema_revision_id,
+            "default",
+        )
+        yield ordinary_case, pinned_target
+
+
+@pytest.mark.asyncio
+async def test_signed_ordinary_batch_matches_full_detail_without_expanding_provider_projection(monkeypatch):
+    """Keep batch detail complete without widening legacy provider projections."""
+
+    http_fixture._install_keyring(monkeypatch)
+    async with _ordinary_root_case() as (ordinary_case, pinned_target):
+        external_target = _external_target(pinned_target, "synthetic_runner_batch_ordinary")
+        target_map = transport._target_document(external_target)
+        requested_npis = [_A, "1999999999"]
+        response_documents = []
+        for path, entity_document, detail_endpoint in (
+            (
+                batch_http.CUSTOM_IMPORT_DETAIL_BATCH_PATH,
+                {"entities": {"adapter_id": "npi", "values": requested_npis}},
+                batch_http.serve_custom_import_detail_batch,
+            ),
+            (
+                transport.CUSTOM_IMPORT_DETAIL_PATH,
+                {"entity": {"adapter_id": "npi", "value": _A}},
+                transport.serve_custom_import_detail,
+            ),
+        ):
+            canonical_body = transport._canonical_json_bytes(
+                {"target": target_map, "family_entitlement": "full_family", **entity_document}
+            )
+            signed_headers = http_fixture._resigned_headers(body=canonical_body, path=path, target=target_map)
+            signed_request = http_fixture._Request(canonical_body, signed_headers, path=path)
+            async with ordinary_case.sessions() as session:
+                http_reply = await detail_endpoint(signed_request, session)
+            assert http_reply.status == 200, http_reply.body
+            response_documents.append(json.loads(http_reply.body))
+        batch_document, detail_document = response_documents
+        assert [provider_item["npi"] for provider_item in batch_document["items"]] == requested_npis
+        assert batch_document["items"][1]["custom_import"] is None
+        assert batch_document["items"][0]["custom_import"] == detail_document
+        assert [field["field_id"] for field in detail_document["root_fields"]] == ["npi", "display_name"]
+        assert detail_document["root_fields"][1]["value"] == "Synthetic Complete"
+        assert len(detail_document["children"]) == 2
+        child_values = [
+            {field["field_id"]: field["value"] for field in child["fields"]} for child in detail_document["children"]
+        ]
+        assert {child["service_code"]: child["amount"] for child in child_values} == {
+            "first": "2.000000000000",
+            "second": None,
+        }
+
+        async with ordinary_case.sessions() as session:
+            projected = await _page(
+                session,
+                pinned_target,
+                NpiEntityRelationQuery(context_filters=(ReadFilter("service_code", "eq", "first"),)),
+            )
+        assert set(projected) == {_A}
+        assert [field.field_id for field in projected[_A].root_fields] == ["npi"]
+
+
+def _external_target(
+    target: PinnedReadTarget, attachment_id: str = "synthetic_runner_grouped"
+) -> transport._TransportTarget:
     return transport._TransportTarget(
-        "synthetic_runner_grouped",
+        attachment_id,
         target.generation_id,
         target.definition_revision_id,
         target.schema_revision_id,
         target.profile_id,
     )
+
+
+@asynccontextmanager
+async def _ordinary_ambiguous_case():
+    """Materialize two valid ordinary roots sharing one canonical NPI."""
+
+    definition_map = fixture.definition_document()
+    definition_map["query"].pop("entity_selection")
+    definition = CustomImportDefinition.from_mapping(definition_map)
+    async with isolated_publication_case() as case:
+        seed = await runner_fixture._seed_case(case, "ordinary_ambiguous", definition)
+        execution_id, token = await runner_fixture._new_execution(case, seed, "ordinary_ambiguous")
+        result = await run_candidate(
+            case.sessions,
+            runner_fixture._request(seed, execution_id, token, _roots()[:2], _children()[:2]),
+        )
+        assert result.status == "activated"
+        assert result.accepted_family_count == 2 and result.rejection_count == 0
+        target = PinnedReadTarget(
+            seed.dataset_id,
+            result.generation_id,
+            seed.definition_revision_id,
+            seed.schema_revision_id,
+            "families_by_period",
+        )
+        yield case, target
+
+
+@pytest.mark.asyncio
+async def test_ordinary_full_family_batch_rejects_ambiguous_npi_like_scalar_detail():
+    """Separate root families fail closed without changing provider search projection."""
+
+    async with _ordinary_ambiguous_case() as (case, target), case.sessions() as session:
+        service = _service(target)
+        prepared = await service.prepare_npi_entity_relation(session, authorization=_AUTHORIZATION, target=target)
+        with pytest.raises(read_core.CustomImportReadUnavailableError, match="selected entity is not eligible"):
+            await service.root_detail_for_entity(
+                session,
+                authorization=_AUTHORIZATION,
+                request=RootDetailRequest(target, EntityLocator("npi", _A), "full_family"),
+            )
+        hydration_map = {
+            "authorization": _AUTHORIZATION,
+            "pinned_target": target,
+            "prepared": prepared,
+            "entity_values": (_A,),
+        }
+        with pytest.raises(read_core.CustomImportReadUnavailableError, match="selected entity is not eligible"):
+            await service.hydrate_npi_page(session, **hydration_map, full_family=True)
+        projected = await service.hydrate_npi_page(session, **hydration_map)
+        assert set(projected) == {_A}
 
 
 def _detail_request(target, npi=_A, *, selectors=()):

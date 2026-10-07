@@ -149,6 +149,42 @@ each serialized occurrence counts toward the page bound. Neither children nor
 rows are truncated; exact totals, native ordering, and pagination are unchanged.
 Legacy/query-projection pages and detail responses keep the 256 KiB bound.
 
+## Exact native-page hydration
+
+`POST /api/v1/extensions/custom-import/detail/batch` hydrates an already selected
+native page without choosing providers, filtering membership, ordering results,
+or creating a cursor. It uses the generic detail-v1 signing contract, bound to
+the exact batch route, target, authorization scope, and canonical body bytes:
+
+```json
+{
+  "target": {
+    "dataset_key": "synthetic_dataset",
+    "generation_id": 101,
+    "definition_revision_id": 11,
+    "schema_revision_id": 11,
+    "profile_id": "default"
+  },
+  "entities": {"adapter_id": "npi", "values": ["1000000000", "1000000001"]},
+  "family_entitlement": "full_family"
+}
+```
+
+The body accepts 1–50 unique canonical ten-digit NPI strings. Grouped requests
+use the same optional selection, child-query, and context descriptors as detail
+reads. Native queries, metric filters, ordering, and URL query parameters are
+rejected. Hosts deduplicate identities and split larger native pages into finite
+batches, then attach each returned family to the original rows.
+
+The response contains `target` and ordered `items`, each with the requested
+`npi` and nullable `custom_import`. Every requested identity appears exactly
+once, including absent families. Ordinary imports use the detail shape
+`target`, `root_fields`, and complete `children`, without `context_fields`.
+Grouped imports use the existing full-family set shape. Each family retains
+the 256 KiB limit; the batch envelope is bounded by `(requested identities + 1)
+* 256 KiB`. Reads use one bounded read-only snapshot and fail closed without
+partial results when authorization, hydration, finality, or a limit fails.
+
 ## Geo pages
 
 `POST /api/v1/extensions/custom-import/providers/geo` uses the same six-property
