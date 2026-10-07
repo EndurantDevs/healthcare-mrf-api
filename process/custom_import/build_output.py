@@ -947,6 +947,8 @@ def _projection_query(models, generation, *, child):
 
 
 def _expected_projections(request, registry, revision, *, child):
+    """Validate and order every projection without constructing scalar models."""
+
     if child:
         collection = next(
             name for name, slot in registry.child_collection_slots.items() if slot == revision.collection_slot
@@ -969,9 +971,7 @@ def _expected_projections(request, registry, revision, *, child):
             child_values=values_by_field,
             child_collection_slots=registry.child_collection_slots,
         )
-        expected = material.scalar_projection_models(
-            request.definition, child_scalars=projections, child_collection_slots=registry.child_collection_slots
-        )
+        material._validate_scalar_projection_rows(request.definition, (), projections, registry.child_collection_slots)
     else:
         values_by_field = payload_values(
             request.definition.root_fields, revision.canonical_payload, label="frozen root payload"
@@ -983,44 +983,54 @@ def _expected_projections(request, registry, revision, *, child):
             ),
             root_values=values_by_field,
         )
-        expected = material.scalar_projection_models(request.definition, root_scalars=projections)
-    return sorted(expected, key=lambda scalar: scalar.field_slot)
+        material._validate_scalar_projection_rows(request.definition, projections, (), {})
+    return sorted(projections, key=lambda projection: projection.field_slot)
 
 
 def _verified_projection_rows(session, request, registry, build_id, generation, *, child):
     """Compare the bounded scalar stream without retaining payloads across pages."""
 
     model = CustomImportChildScalar if child else CustomImportRootScalar
+    to_model = material._child_scalar_model if child else material._root_scalar_model
     previous_id, seen, expected_count = None, 0, 0
-    with closing(
-        _output_rows(session, request, build_id, lambda models: _projection_query(models, generation, child=child))
-    ) as projection_records:
-        for scalar, revision, root_key in projection_records:
-            revision_id = revision.child_revision_id if child else revision.root_revision_id
-            if revision_id != previous_id:
-                if seen != expected_count:
+    projections = []
+
+    def query(models):
+        """Drop prepared values before reading each physical metadata/payload page."""
+        projections.clear()
+        return _projection_query(models, generation, child=child)
+
+    try:
+        with closing(_output_rows(session, request, build_id, query)) as projection_records:
+            for scalar, revision, root_key in projection_records:
+                revision_id = revision.child_revision_id if child else revision.root_revision_id
+                if revision_id != previous_id and seen != expected_count:
                     raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
-                previous_id, seen = revision_id, 0
-            # Recompute the at-most-20 hot fields within this admitted tuple;
-            # do not retain a projection page while the next page is read.
-            expected = _expected_projections(request, registry, revision, child=child)
-            expected_count = len(expected)
-            if scalar is None and not expected:
-                del expected, scalar, revision, root_key
-                continue
-            if (
-                scalar is None
-                or seen >= expected_count
-                or any(
-                    getattr(scalar, column.name) != getattr(expected[seen], column.name)
-                    for column in model.__table__.columns
-                )
-            ):
-                raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
-            seen += 1
-            del expected
-            yield scalar, revision, root_key
-            del scalar, revision, root_key
+                if revision_id != previous_id:
+                    previous_id, seen = revision_id, 0
+                    projections.clear()
+                if not projections:
+                    projections.extend(_expected_projections(request, registry, revision, child=child))
+                    expected_count = len(projections)
+                expected = to_model(projections[seen]) if seen < expected_count else None
+                if scalar is None and not expected_count:
+                    del expected, scalar, revision, root_key
+                    continue
+                if (
+                    scalar is None
+                    or seen >= expected_count
+                    or any(
+                        getattr(scalar, column.name) != getattr(expected, column.name)
+                        for column in model.__table__.columns
+                    )
+                ):
+                    raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
+                seen += 1
+                del expected
+                yield scalar, revision, root_key
+                del scalar, revision, root_key
+    finally:
+        projections.clear()
     if seen != expected_count:
         raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
 

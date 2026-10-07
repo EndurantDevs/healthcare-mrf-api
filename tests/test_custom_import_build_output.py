@@ -644,7 +644,8 @@ def test_scalar_validation_rejects_missing_extra_or_changed_rows(monkeypatch):
     expected = CustomImportRootScalar(root_revision_id=1, field_slot=2, value_state="value", string_value="one")
     changed = CustomImportRootScalar(root_revision_id=1, field_slot=2, value_state="value", string_value="two")
     revision = CustomImportRootRevision(root_revision_id=1)
-    monkeypatch.setattr(output, "_expected_projections", lambda *_args, **_kwargs: [expected])
+    monkeypatch.setattr(output, "_expected_projections", lambda *_args, **_kwargs: (expected,))
+    monkeypatch.setattr(output.material, "_root_scalar_model", lambda projection: projection)
     for actual in ((None,), (expected, expected), (changed,)):
         monkeypatch.setattr(
             output, "_output_rows", lambda *_args, **_kwargs: iter((row, revision, b"k" * 32) for row in actual)
@@ -665,7 +666,8 @@ def test_scalar_validation_compares_typed_decimal_values_not_storage_scale(monke
         decimal_value=Decimal("12.000000000000"),
     )
     revision = CustomImportRootRevision(root_revision_id=1)
-    monkeypatch.setattr(output, "_expected_projections", lambda *_args, **_kwargs: [expected])
+    monkeypatch.setattr(output, "_expected_projections", lambda *_args, **_kwargs: (expected,))
+    monkeypatch.setattr(output.material, "_root_scalar_model", lambda projection: projection)
     monkeypatch.setattr(
         output, "_output_rows", lambda *_args, **_kwargs: (row for row in ((actual, revision, b"k" * 32),))
     )
@@ -817,8 +819,9 @@ def test_projection_revision_transition_cannot_hide_missing_scalar(monkeypatch):
     first = CustomImportRootRevision(root_revision_id=1)
     second = CustomImportRootRevision(root_revision_id=2)
     scalars = [CustomImportRootScalar(root_revision_id=1, field_slot=slot) for slot in (1, 2)]
-    expected = Mock(return_value=scalars)
+    expected = Mock(return_value=tuple(scalars))
     monkeypatch.setattr(output, "_expected_projections", expected)
+    monkeypatch.setattr(output.material, "_root_scalar_model", lambda projection: projection)
     monkeypatch.setattr(
         output,
         "_output_rows",
