@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from dataclasses import replace
@@ -27,6 +28,7 @@ from db.models.custom_import import (
     CustomImportRootRevision,
 )
 from process.custom_import import source_finalize_sql as finalizer
+from process.custom_import.bulk_page_codec import encode_landing_batch
 from process.custom_import.family import _is_valid_npi
 from tests.custom_import_postgres_support import transaction_session
 from tests.test_custom_import_build_output_postgres import _records, _request_for
@@ -217,6 +219,69 @@ async def test_source_page_client_statements_are_batched(monkeypatch, record_cou
             )
         )
         await _assert_source_page_outcomes(case, context, record_count)
+
+
+def _completion_digest(context, page):
+    batch = encode_landing_batch(context, (page,), batch_id=UUID(int=0), first_pack_ordinal=0)
+    documents = []
+    for landing in batch.records:
+        scalars = [value.hex() if isinstance(value, bytes) else value for value in landing[1:]]
+        assert len(scalars) == 17 and all(value is None or type(value) in (int, str) for value in scalars)
+        documents.append(json.dumps(scalars, ensure_ascii=False, separators=(",", ":")))
+    return hashlib.sha256("\n".join(documents).encode("utf-8")).digest()
+
+
+@pytest.mark.parametrize("owner_route", [True, False])
+async def test_completion_digests_match_canonical_scalars(monkeypatch, owner_route):
+    """Both finalizers preserve ordered scalar bytes, including embedded JSON text."""
+
+    records_by_stream = {
+        "root_source": [[_root(), _root(score=None), _root(npi=None)]],
+        "detail_source": [[_child(key='é水😀e\u0301"\\\n\t'), _child(amount=None), _child(npi=None)]],
+    }
+    ordinary = AsyncMock(wraps=finalizer.finalize_source_batch)
+    monkeypatch.setattr(finalizer, "finalize_source_batch", ordinary)
+    original_gate = staging._is_source_writer_owner
+
+    async def checked_gate(session):
+        assert await original_gate(session), "the fixture must actually own both SOURCE entry points"
+        return owner_route
+
+    owner_gate = AsyncMock(wraps=checked_gate)
+    monkeypatch.setattr(staging, "_is_source_writer_owner", owner_gate)
+    async with _source_case() as case:
+        request = replace(await _retained_request(case, records_by_stream=records_by_stream), page_row_limit=32)
+        build_id, registry = await staging._begin_build(case.sessions, request)
+        calls = AsyncMock(wraps=staging._call)
+        monkeypatch.setattr(staging, "_call", calls)
+        expected_completions = []
+        for stream in request.definition.source_streams:
+            context = staging._StreamContext(request, registry, build_id, stream)
+            prepared_rows = tuple(
+                staging._prepare_row(request, stream, raw_record)
+                for raw_record in records_by_stream[stream.stream_id][0]
+            )
+            assert [prepared_row.rejection is not None for prepared_row in prepared_rows] == [False, True, True]
+            page = staging._SourcePage(1, 0, 0, prepared_rows)
+            expected_completions.append(
+                (context.stream_slot, len(prepared_rows), 0, len(prepared_rows), _completion_digest(context, page))
+            )
+            assert await staging._store_single_page(case.sessions, context, page) == len(prepared_rows)
+        async with case.sessions() as session:
+            completions = (
+                await session.execute(
+                    text(
+                        "SELECT stream_slot,attempted_count,first_source,after_source,input_sha256 "
+                        f'FROM "{case.schema_name}".source_bulk_completion '
+                        "WHERE build_id=:build_id ORDER BY stream_slot,first_source"
+                    ),
+                    {"build_id": build_id},
+                )
+            ).all()
+        assert [tuple(completion) for completion in completions] == expected_completions
+        assert owner_gate.await_count == 2
+        assert ordinary.await_count == (2 if owner_route else 0)
+        assert sum(call.args[1] == "source_set_finalize" for call in calls.await_args_list) == (0 if owner_route else 2)
 
 
 async def test_mixed_outcomes_keep_rejection_ordinals_and_retry_prefix():

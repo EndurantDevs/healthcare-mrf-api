@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from dataclasses import asdict, replace
+from decimal import Decimal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -23,7 +25,16 @@ from db.models.custom_import import (
 )
 from process.custom_import import snowflake_candidate
 from process.custom_import import snowflake_segmented_runner as runner
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.processing_policy import BuildPolicy, ProcessingPolicy
+from process.custom_import.read_core import (
+    CustomImportReadAuthorizationError,
+    CustomImportReadService,
+    ExtensionReadAuthorization,
+    ExtensionReadScope,
+    PinnedReadTarget,
+    SearchRequest,
+)
 from process.custom_import.snowflake_binding import SOURCE_BINDING_V2_CONTRACT, SnowflakeSourceBinding
 from process.custom_import.snowflake_candidate import SnowflakeBundleCandidateRequest
 from process.custom_import.snowflake_source_binding import register_snowflake_source_binding
@@ -240,3 +251,189 @@ async def test_sealed_capture_resumes_next_fence_without_source_or_deadline_exte
         assert [call.kwargs["execution_id"] for call in claim.await_args_list] == [outcome.execution_id] * 2
         forbidden.assert_not_called()
         _assert_source_once(connector, request, cursor, connection)
+
+
+def _read_definition(definition):
+    document = json.loads(definition.canonical)
+    document["schema"]["children"][1]["fields"][2]["nullable"] = True
+    projection_slot = 0
+    for scope in (document["schema"]["root"], *document["schema"]["children"]):
+        for field in scope["fields"]:
+            projection_slot += 1
+            field["projection_slot"] = projection_slot
+    document["query"] = {
+        "root_fields": ["npi", "score", "enabled"],
+        "child": {"collection": "details", "fields": ["detail_npi", "detail_id", "amount"]},
+        "order": [{"field": "amount", "direction": "asc", "nulls": "last"}],
+    }
+    document["selection_profiles"] = [
+        {
+            "id": "default",
+            "selection": [{"field": "amount", "direction": "asc", "nulls": "last"}],
+            "context_dimensions": ["detail_id"],
+        }
+    ]
+    return CustomImportDefinition.from_mapping(document)
+
+
+async def _registered_capture(case, monkeypatch):
+    key = 'same "key" \\ café'
+    physical_rows = [
+        _shared_row("1003000126", key=key, amount=Decimal("0")) + (None, None, None),
+        _shared_row("1234567893", key=key, amount=Decimal("123456789012345678.123456789012")) + (None, None, None),
+        (1, 2, "other_source", None, None, None, None, None, None, None, "1234567893", key, None),
+        (1, 2, "other_source", None, None, None, None, None, None, None, "1003000126", key, Decimal("1.25")),
+    ]
+    physical_rows[1] = (*physical_rows[1][:6], False, *physical_rows[1][7:])
+    policy = ProcessingPolicy(_capture_policy(), 17, BuildPolicy(16, 65_536, 2000, 120, 300))
+    connector, bundle, adapter, cursor, connection = _runtime(
+        monkeypatch, physical_rows, interleaved=True, partition_rows=1, processing_policy=policy
+    )
+    bundle = connector.prepare_request(
+        _read_definition(bundle.definition),
+        bindings=bundle.bindings,
+        encoding=bundle.encoding,
+        processing_policy=policy,
+    )
+    monkeypatch.setattr(adapter, "_connect", lambda _credentials, **_options: (connection, cursor))
+    async with case.sessions() as session, session.begin():
+        registered = await register_snowflake_source_binding(
+            session,
+            dataset_key="synthetic_two_collections",
+            definition=bundle.definition,
+            binding=_binding(connector.build_statement(bundle), policy),
+        )
+    request = SnowflakeBundleCandidateRequest(
+        dataset_id=registered.dataset_id,
+        definition_revision_id=registered.definition_revision_id,
+        schema_revision_id=registered.schema_revision_id,
+        definition=bundle.definition,
+        bundle_request=bundle,
+        idempotency_key="synthetic-two-collections",
+        lease_token=b"synthetic-two-collection-owner",
+        source_binding_revision_id=registered.source_binding_revision_id,
+        source_binding_sha256=registered.source_binding_sha256,
+    )
+    return connector, request, policy, cursor, connection, key
+
+
+class _ExactReadAuthorizer:
+    def __init__(self, target):
+        self.target = target
+
+    def authorize(self, authorization, *, target):
+        if target == self.target and authorization.credential == "synthetic-reader":
+            return ExtensionReadScope("synthetic:two-collections")
+        return None
+
+
+def _assert_fields(fields, expected):
+    assert {field.field_id for field in fields} == set(expected)
+    for field in fields:
+        field_type, value = expected[field.field_id]
+        assert (field.field_type, field.state, field.value) == (field_type, "null" if value is None else "value", value)
+        assert type(field.value) is type(value)
+
+
+async def _assert_published(session, request, outcome):
+    capture = (await session.scalars(select(CustomImportCaptureBundle))).one()
+    execution = await session.get(CustomImportExecution, outcome.execution_id)
+    build = (await session.scalars(select(CustomImportBuildAttempt))).one()
+    seal = (await session.scalars(select(CustomImportGenerationSeal))).one()
+    pointer = await session.get(CustomImportCurrentGeneration, request.dataset_id)
+    assert capture.capture_state == "sealed" and capture.committed_record_count == capture.committed_part_count == 6
+    assert capture.producing_execution_id == execution.execution_id == build.execution_id == outcome.execution_id
+    assert execution.state == "completed" and build.phase == "verified"
+    assert build.capture_bundle_id == capture.capture_bundle_id and build.source_occurrence_count == 6
+    assert pointer.generation_id == seal.generation_id == build.generation_id == outcome.generation_id
+    assert (seal.root_count, seal.family_count, seal.family_child_count, seal.winner_count) == (2, 2, 4, 2)
+
+
+def _assert_family(detail, key):
+    npi = next(field.value for field in detail.root_fields if field.field_id == "npi")
+    is_first_family = npi == "1003000126"
+    assert npi in {"1003000126", "1234567893"}
+    score = Decimal("0") if is_first_family else Decimal("123456789012345678.123456789012")
+    _assert_fields(
+        detail.root_fields,
+        {"npi": ("string", npi), "score": ("decimal", score), "enabled": ("boolean", is_first_family)},
+    )
+    children_by_collection = {child.collection: child for child in detail.children}
+    assert len(detail.children) == len(children_by_collection) == 2 and set(children_by_collection) == {
+        "details",
+        "other",
+    }
+    _assert_fields(
+        children_by_collection["details"].fields,
+        {"detail_npi": ("string", npi), "detail_id": ("string", key), "amount": ("decimal", score)},
+    )
+    _assert_fields(
+        children_by_collection["other"].fields,
+        {
+            "other_npi": ("string", npi),
+            "other_id": ("string", key),
+            "other_amount": ("decimal", Decimal("1.25") if is_first_family else None),
+        },
+    )
+    child_ids = {child.child_revision_id for child in detail.children}
+    assert len(child_ids) == 2
+    return npi, child_ids
+
+
+async def _assert_reads(session, read_target, key):
+    service = CustomImportReadService(authorizer=_ExactReadAuthorizer(read_target), cursor_secret=b"r" * 32)
+    authorization = ExtensionReadAuthorization("synthetic-reader")
+    with pytest.raises(CustomImportReadAuthorizationError):
+        await service.search(
+            session, authorization=ExtensionReadAuthorization("synthetic-denied"), request=SearchRequest(read_target)
+        )
+    with pytest.raises(CustomImportReadAuthorizationError):
+        await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(replace(read_target, generation_id=read_target.generation_id + 1)),
+        )
+    page = await service.search(session, authorization=authorization, request=SearchRequest(read_target))
+    assert page.total == len(page.items) == 2 and page.next_cursor is None
+    with pytest.raises(CustomImportReadAuthorizationError):
+        await service.root_detail(
+            session,
+            authorization=authorization,
+            target=replace(read_target, generation_id=read_target.generation_id + 1),
+            winner=page.items[0].winner,
+        )
+    seen_child_ids = set()
+    seen_npis = set()
+    for search_item in page.items:
+        detail = await service.root_detail(
+            session, authorization=authorization, target=read_target, winner=search_item.winner
+        )
+        npi, child_ids = _assert_family(detail, key)
+        assert child_ids.isdisjoint(seen_child_ids)
+        seen_child_ids.update(child_ids)
+        seen_npis.add(npi)
+    assert len(seen_child_ids) == 4 and seen_npis == {"1003000126", "1234567893"}
+
+
+async def test_two_collections_capture_publish_and_read_exact_family_values(monkeypatch):
+    """One source statement retains, publishes and authorizes both typed collections."""
+    async with _source_case() as case:
+        connector, request, policy, cursor, connection, key = await _registered_capture(case, monkeypatch)
+        outcome = await runner.run_segmented_snowflake_candidate(
+            case.sessions, connector, request, processing_policy=policy
+        )
+        assert outcome.status == "activated"
+        assert (outcome.accepted_family_count, outcome.rejection_count) == (2, 0)
+        assert outcome.publication.to_generation_id == outcome.generation_id
+        assert cursor.executed == [connector.build_statement(request.bundle_request).sql]
+        assert cursor.fetchone.call_count == 8 and cursor.closed and connection.closed
+        read_target = PinnedReadTarget(
+            request.dataset_id,
+            outcome.generation_id,
+            request.definition_revision_id,
+            request.schema_revision_id,
+            "default",
+        )
+        async with case.sessions() as session:
+            await _assert_published(session, request, outcome)
+            await _assert_reads(session, read_target, key)
