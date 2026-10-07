@@ -20,9 +20,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: EndurantDevs/endurant-ci
-          ref: 9c6e18f5f9e00c5b0c4c1cc01834e797958784df
+          ref: 1b6f5a42849b56227e35a8e6b6f8a48ac5ad7624
           path: ci
           persist-credentials: false
+      - name: Install pinned uv
+        run: bash ci/scripts/install_uv
+      - name: Install uv-managed Python
+        run: bash ci/scripts/setup_python
       - name: Delete only obsolete authenticated artifacts
         env:
           GH_TOKEN: ${{ github.token }}

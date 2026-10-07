@@ -30,7 +30,7 @@ def preflight_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         [sys.executable, str(_BUILD_SCRIPT), "--output-dir", str(output_directory)],
         check=True,
         cwd=_REPOSITORY_ROOT,
-        env={**os.environ, "PIP_NO_INDEX": "1"},
+        env={**os.environ, "UV_NO_INDEX": "1"},
         capture_output=True,
         text=True,
     )
@@ -65,10 +65,13 @@ def test_installed_wheel_runs_preflight_with_or_without_native_source(
     consumer_directory = tmp_path / "consumer"
     subprocess.run(
         [
-            sys.executable,
-            "-m",
+            "uv",
+            "--no-config",
             "pip",
             "install",
+            "--python",
+            sys.executable,
+            "--no-index",
             "--no-deps",
             "--target",
             str(consumer_directory),

@@ -809,43 +809,42 @@ def _typed_scalar(field: Field, raw_scalar: object) -> TypedScalar:
         if not field.nullable:
             raise ScalarProjectionError(f"projected field {field.field_id} cannot be null")
         return TypedScalar(field_type=field.value_type, value_state="null")
-    if field.value_type == "string":
+    field_type, value = _normalized_scalar_value(field.value_type, raw_scalar, field.field_id)
+    return TypedScalar(field_type=field_type, value_state="value", **{f"{field_type}_value": value})
+
+
+def _normalized_scalar_value(field_type: str, raw_scalar: object, field_id: str) -> tuple[str, object]:
+    if field_type == "string":
         if (
             not isinstance(raw_scalar, str)
             or "\x00" in raw_scalar
-            or _utf8_size(raw_scalar, field.field_id) > MAX_SCALAR_STRING_UTF8_BYTES
+            or _utf8_size(raw_scalar, field_id) > MAX_SCALAR_STRING_UTF8_BYTES
         ):
-            raise ScalarProjectionError(f"projected string field {field.field_id} exceeds its storage shape")
-        return TypedScalar(field_type="string", value_state="value", string_value=raw_scalar)
-    if field.value_type == "integer":
+            raise ScalarProjectionError(f"projected string field {field_id} exceeds its storage shape")
+        return "string", raw_scalar
+    if field_type == "integer":
         if (
             isinstance(raw_scalar, bool)
             or not isinstance(raw_scalar, int)
             or not MIN_SCALAR_INTEGER <= raw_scalar <= MAX_SCALAR_INTEGER
         ):
-            raise ScalarProjectionError(f"projected integer field {field.field_id} is outside BIGINT storage")
-        return TypedScalar(field_type="integer", value_state="value", integer_value=raw_scalar)
-    if field.value_type == "decimal":
-        return TypedScalar(
-            field_type="decimal", value_state="value", decimal_value=_decimal(raw_scalar, field.field_id)
-        )
-    if field.value_type == "boolean":
+            raise ScalarProjectionError(f"projected integer field {field_id} is outside BIGINT storage")
+        return "integer", raw_scalar
+    if field_type == "decimal":
+        return "decimal", _decimal(raw_scalar, field_id)
+    if field_type == "boolean":
         if not isinstance(raw_scalar, bool):
-            raise ScalarProjectionError(f"projected boolean field {field.field_id} is not boolean")
-        return TypedScalar(field_type="boolean", value_state="value", boolean_value=raw_scalar)
-    if field.value_type == "date":
+            raise ScalarProjectionError(f"projected boolean field {field_id} is not boolean")
+        return "boolean", raw_scalar
+    if field_type == "date":
         if not isinstance(raw_scalar, dt.date) or isinstance(raw_scalar, dt.datetime):
-            raise ScalarProjectionError(f"projected date field {field.field_id} is not a date")
-        return TypedScalar(field_type="date", value_state="value", date_value=raw_scalar)
-    if field.value_type == "timestamp":
+            raise ScalarProjectionError(f"projected date field {field_id} is not a date")
+        return "date", raw_scalar
+    if field_type == "timestamp":
         if not isinstance(raw_scalar, dt.datetime) or raw_scalar.tzinfo is None or raw_scalar.utcoffset() is None:
-            raise ScalarProjectionError(f"projected timestamp field {field.field_id} must be timezone-aware")
-        return TypedScalar(
-            field_type="timestamp",
-            value_state="value",
-            timestamp_value=raw_scalar.astimezone(dt.UTC),
-        )
-    raise ScalarProjectionError(f"projected field {field.field_id} has an unsupported type")
+            raise ScalarProjectionError(f"projected timestamp field {field_id} must be timezone-aware")
+        return "timestamp", raw_scalar.astimezone(dt.UTC)
+    raise ScalarProjectionError(f"projected field {field_id} has an unsupported type")
 
 
 def _decimal(value: object, field_id: str) -> Decimal:
@@ -969,14 +968,18 @@ def _validate_typed_scalar(scalar: TypedScalar) -> None:
         if any(value is not None for value in values):
             raise ScalarProjectionError("null scalar rows cannot contain a typed value")
         return
-    if scalar.logical_value is None or sum(value is not None for value in values) != 1:
+    logical_value = scalar.logical_value
+    if logical_value is None or sum(value is not None for value in values) != 1:
         raise ScalarProjectionError("value scalar rows require exactly one typed value")
-    field = Field("synthetic", 1, scalar.field_type, False, 1, None)
-    _typed_scalar(field, scalar.logical_value)
+    _normalized_scalar_value(scalar.field_type, logical_value, "synthetic")
 
 
 def _root_scalar_model(row: RootScalarProjection) -> CustomImportRootScalar:
-    return CustomImportRootScalar(
+    return CustomImportRootScalar(**_root_scalar_values(row))
+
+
+def _root_scalar_values(row: RootScalarProjection) -> dict[str, object | None]:
+    return dict(
         root_revision_id=row.target.root_revision_id,
         dataset_id=row.target.dataset_id,
         schema_revision_id=row.target.schema_revision_id,
@@ -991,7 +994,11 @@ def _root_scalar_model(row: RootScalarProjection) -> CustomImportRootScalar:
 
 
 def _child_scalar_model(row: ChildScalarProjection) -> CustomImportChildScalar:
-    return CustomImportChildScalar(
+    return CustomImportChildScalar(**_child_scalar_values(row))
+
+
+def _child_scalar_values(row: ChildScalarProjection) -> dict[str, object | None]:
+    return dict(
         child_revision_id=row.target.child_revision_id,
         dataset_id=row.target.dataset_id,
         schema_revision_id=row.target.schema_revision_id,

@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_PATH = "/control/v1/custom-import/execution-evidence"
 STOP_REQUEST_PATH = "/control/v1/custom-import/execution-stop-request"
 STOP_FINALIZE_PATH = "/control/v1/custom-import/execution-stop-finalize"
-PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH)
+ADMISSION_PATH = "/control/v1/custom-import/admission-batch"
+SOURCE_PATH = "/control/v1/custom-import/source-batch"
+PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH, ADMISSION_PATH, SOURCE_PATH)
 
 
 def _unused_port():
@@ -23,12 +25,14 @@ def _unused_port():
         return listener.getsockname()[1]
 
 
-def _request(port, path):
+def _request(port, path, *, no_store=False):
     connection = HTTPConnection("127.0.0.1", port, timeout=2)
     try:
         connection.request("POST", path, headers={"Authorization": "Bearer synthetic"})
         reply = connection.getresponse()
         reply.read()
+        if no_store:
+            assert reply.getheader("Cache-Control") == "no-store"
         return reply.status, reply.getheader("X-Synthetic-Authorization")
     finally:
         connection.close()
@@ -76,12 +80,18 @@ def _wait_for_listener(process, port):
     pytest.fail("Nginx listener did not become ready")
 
 
+def _encoded_leaf(path):
+    prefix, leaf = path.rsplit("/", 1)
+    return prefix + "/%" + format(ord(leaf[0]), "02x") + leaf[1:]
+
+
 @pytest.mark.parametrize("private_enabled", (False, True))
 def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enabled):
     nginx = shutil.which("nginx")
     if nginx is None:
         pytest.skip("native Nginx is required for the routing check")
     public_port = _unused_port()
+    external_port = _unused_port()
     upstream_port = _unused_port()
     private_port = _unused_port()
     private_directory = tmp_path / "private"
@@ -97,24 +107,28 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
     else:
         assert not private_directory.exists()
     config_path = tmp_path / "nginx.conf"
-    config_path.write_text(_configuration(tmp_path, public_port, upstream_port))
+    config_path.write_text(_configuration(tmp_path, public_port, upstream_port, external_port=external_port))
     command_parts = [nginx, "-p", str(tmp_path), "-c", str(config_path)]
     subprocess.run([*command_parts, "-t"], check=True, capture_output=True, text=True)
     with subprocess.Popen([*command_parts, "-g", "daemon off;"], stderr=subprocess.PIPE, text=True) as process:
         try:
             _wait_for_listener(process, public_port)
-            for private_path in PRIVATE_PATHS:
+            _wait_for_listener(process, external_port)
+            for port, private_path in product((public_port, external_port), PRIVATE_PATHS):
                 for path in (
                     private_path,
                     private_path + "/",
                     private_path + "/nested",
                     private_path + "?probe=1",
                     private_path.replace("/control/v1/", "/control//v1/"),
-                    private_path.replace("/execution-", "/%65xecution-"),
+                    _encoded_leaf(private_path),
                     private_path.replace("/custom-import/", "/custom-import%2f"),
                     "/api/../" + private_path.removeprefix("/"),
                 ):
-                    assert _request(public_port, path) == (404, None), path
+                    assert _request(port, path, no_store=private_path in (ADMISSION_PATH, SOURCE_PATH)) == (
+                        404,
+                        None,
+                    ), path
             for path in (
                 "/api/v1/healthcheck/live",
                 "/control/v1/custom-import/another-route",

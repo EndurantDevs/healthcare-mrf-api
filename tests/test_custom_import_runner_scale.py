@@ -8,6 +8,7 @@ import hashlib
 import json
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -194,6 +195,24 @@ def test_ordered_family_hash_preserves_v1_bytes_null_missing_and_duplicates(chil
     assert new_family_hash(definition, family) == expected
 
 
+@pytest.mark.parametrize("key_type", ["string", "decimal"])
+def test_ordered_child_verification_encodes_its_typed_key_once(monkeypatch, key_type):
+    document = json.loads(_FIXTURE.read_text())
+    if key_type == "decimal":
+        document["schema"]["children"][0]["child_key"] = ["amount"]
+        document["schema"]["children"][0]["fields"][2]["nullable"] = False
+    definition = CustomImportDefinition.from_mapping(document)
+    child_values_by_field = {"rate_npi": "1234567893", "service_code": 'A"\\\nΔ', "amount": Decimal("12.500")}
+    family = _family((child_values_by_field,))
+    expected = _reference_family_hash(definition, family)
+    child_document = _child_document(definition, child_values_by_field)
+    encoder = Mock(wraps=runner_codec.child_key_document)
+    monkeypatch.setattr(runner_codec, "child_key_document", encoder)
+
+    assert new_family_hash_ordered(definition, family.root, {"rates": iter((child_document,))}) == expected
+    encoder.assert_called_once_with(definition, "rates", child_values_by_field)
+
+
 def test_eager_family_hash_preserves_large_unprojected_child_payloads():
     document = json.loads(_FIXTURE.read_text())
     document["schema"]["children"][0]["fields"].append(
@@ -220,7 +239,12 @@ def test_eager_family_hash_preserves_large_unprojected_child_payloads():
 def test_ordered_family_hash_preserves_full_tuple_ties(monkeypatch, has_hash_collision):
     definition = _definition()
     if has_hash_collision:
-        monkeypatch.setattr(runner_codec, "child_key_hash", lambda *_arguments: b"0" * 32)
+        original = runner_codec.digest_text
+        monkeypatch.setattr(
+            runner_codec,
+            "digest_text",
+            lambda domain, document: b"0" * 32 if domain == "child-key" else original(domain, document),
+        )
     child_records = tuple(
         {"rate_npi": "1234567893", "service_code": service_code, "amount": Decimal(amount)}
         for service_code, amount in (("B", "2"), ("A", "2"), ("A", "1"), ("A", "1"))
