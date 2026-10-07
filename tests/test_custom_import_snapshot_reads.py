@@ -61,6 +61,10 @@ def test_winner_search_relation_and_order_share_one_storage_binding(family_id, c
         in sql
     )
     assert f"{schema}.custom_import_winner.context_child_revision_id IS NULL" in sql or child_context
+    assert (
+        f"{schema}.custom_import_family_revision.entity_binding_id = {schema}.custom_import_winner.entity_binding_id"
+        in sql
+    )
     _assert_routing(select(func.count()).select_from(statement.subquery()), family_id)
     relation = read_core._npi_entity_relation_statement(context, normalized, terms)
     sql = _assert_routing(relation, family_id)
@@ -95,7 +99,11 @@ def test_grouped_helper_child_predicates_and_order_keep_the_pinned_family(family
     prepared = grouped_read.prepare_relation(context, query, _SCOPE)
     sql = _assert_routing(prepared.statement, family_id)
     schema = "mrf" if family_id is None else snapshot_schema(family_id)
-    assert ("AS selected_entity_value" in sql) is (period is None)
+    assert ("selected_entity_value AS MATERIALIZED" in sql) is (period is None)
+    plan = grouped_read.normalize_plan(context, query, _SCOPE)
+    detail_sql = _assert_routing(grouped_read.selected_family_statement(context, plan), family_id)
+    assert "MATERIALIZED" not in detail_sql
+    assert ("AS selected_entity_value" in detail_sql) is (period is None)
     assert (
         f"{schema}.custom_import_family_child.family_revision_id = {schema}.custom_import_winner.family_revision_id"
         in sql
