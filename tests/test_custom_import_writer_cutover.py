@@ -155,7 +155,17 @@ def test_independent_receipts_render_exact_current_and_retained_definitions(monk
     connection.execute.return_value.scalars.return_value = ("synthetic_other",)
     monkeypatch.setattr(migration.op, "get_bind", lambda: connection)
     receipts = migration._independent_reviewed_functions("synthetic_control")
-    assert receipts == migration._reviewed_functions("synthetic_other", include_obsolete=True)
+    previous = migration._reviewed_functions("synthetic_other", include_obsolete=True)
+    assert receipts[:-1] == previous
+    correction = migration._previous("20261007000000_custom_import_rejection_anti_joins")
+    body = " " + correction._body(correction._finality(), "synthetic_other", corrected=True) + " "
+    validator = next(
+        receipt
+        for receipt in previous
+        if receipt["identity"].endswith(".verify_custom_import_snapshot_structure(bigint)")
+    )
+    assert receipts[-1] == {**validator, "body_sha256": migration.hashlib.sha256(body.encode()).hexdigest()}
+    assert receipts[-1]["body_sha256"] != validator["body_sha256"]
     by_identity = {receipt["identity"]: receipt for receipt in receipts}
     assert all(f'"synthetic_other".{signature}' in by_identity for signature in migration._OBSOLETE)
     assert all(receipt["language"] in ("sql", "plpgsql") for receipt in receipts)

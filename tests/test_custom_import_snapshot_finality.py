@@ -107,6 +107,71 @@ def test_complete_structure_has_no_per_family_or_per_child_database_progress():
         assert "FOR UPDATE" not in query and "LOOP" not in query
 
 
+def _rejection_reference_query():
+    """Use the actual failure branch without the unrelated finality checks."""
+    marker = "SELECT 'rejection_missing_occurrence'"
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/20261007000000_custom_import_rejection_anti_joins.py"
+    spec = importlib.util.spec_from_file_location("rejection_probe_contract", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    query = module._source_query()
+    return marker + query.split(marker, 1)[1].split("UNION ALL", 1)[0]
+
+
+def test_rejection_reference_probe_keeps_two_scoped_equality_anti_joins():
+    query = _rejection_reference_query()
+    assert query.count("NOT EXISTS (") == 2
+    assert query.count("JOIN expected_build b ON b.build_id=o.build_id") == 2
+    assert "WHERE EXISTS(SELECT 1 FROM expected_build)" in query
+    assert "WHERE o.rejection_id=r.rejection_id" in query
+    assert "WHERE o.resolved_rejection_id=r.rejection_id" in query
+    assert " OR " not in query
+
+
+@pytest.mark.parametrize(
+    ("build_ids", "rejection_ids", "occurrences", "missing"),
+    (
+        pytest.param((7,), (1, 2), (), {1, 2}, id="no-occurrences"),
+        pytest.param((7,), (1, 2), ((7, "source", 1, None),), {2}, id="initial-only"),
+        pytest.param((7,), (1, 2), ((7, "source", None, 1),), {2}, id="resolved-only"),
+        pytest.param((7,), (1, 2), ((7, "source", 1, 2),), set(), id="both-distinct"),
+        pytest.param((7,), (1, 2), ((7, "source", 1, 1),), {2}, id="same-reference"),
+        pytest.param((7,), (1, 2), ((7, "source", 1, None), (7, "source", None, 1)), {2}, id="duplicate-reference"),
+        pytest.param((7,), (1, 2), ((7, "source", None, None),), {1, 2}, id="null-references"),
+        pytest.param((7,), (1, 2), ((8, "source", 1, None),), {1, 2}, id="foreign-initial"),
+        pytest.param((7,), (1, 2), ((8, "source", None, 1),), {1, 2}, id="foreign-resolved"),
+        pytest.param((7,), (1, 2), ((8, "source", 1, 2), (7, "source", 1, None)), {2}, id="mixed-builds"),
+        pytest.param((7,), (1, 2), ((7, "retained", 1, 2),), set(), id="retained-origin"),
+        pytest.param((), (1, 2), ((7, "source", 1, None),), set(), id="no-expected-build"),
+        pytest.param((7,), (), ((7, "source", 1, 2),), set(), id="no-rejections"),
+    ),
+)
+def test_rejection_reference_probe_preserves_complete_failure_set(build_ids, rejection_ids, occurrences, missing):
+    current = _rejection_reference_query().replace("__CANDIDATE__.", "")
+    previous = """
+        SELECT 'rejection_missing_occurrence',r.rejection_id FROM custom_import_rejection r
+        WHERE EXISTS(SELECT 1 FROM expected_build) AND NOT EXISTS (
+            SELECT 1 FROM custom_import_build_occurrence o
+            JOIN expected_build b ON b.build_id=o.build_id
+            WHERE o.rejection_id=r.rejection_id OR o.resolved_rejection_id=r.rejection_id
+        )
+    """
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript("""
+            CREATE TABLE expected_build(build_id INTEGER PRIMARY KEY);
+            CREATE TABLE custom_import_rejection(rejection_id INTEGER PRIMARY KEY);
+            CREATE TABLE custom_import_build_occurrence(
+                build_id INTEGER NOT NULL, origin TEXT NOT NULL,
+                rejection_id INTEGER, resolved_rejection_id INTEGER);
+        """)
+        connection.executemany("INSERT INTO expected_build VALUES (?)", ((value,) for value in build_ids))
+        connection.executemany("INSERT INTO custom_import_rejection VALUES (?)", ((value,) for value in rejection_ids))
+        connection.executemany("INSERT INTO custom_import_build_occurrence VALUES (?,?,?,?)", occurrences)
+        expected_failures = {("rejection_missing_occurrence", value) for value in missing}
+        assert set(connection.execute(previous)) == set(connection.execute(current)) == expected_failures
+
+
 def test_legacy_finality_fallback_is_explicit_and_never_handles_a_registered_error():
     body = _migration()._bulk()._storage()._FINALITY_RESOLVER
     assert body.index("lock_custom_import_snapshot_finality") < body.index("RETURN NULL")
