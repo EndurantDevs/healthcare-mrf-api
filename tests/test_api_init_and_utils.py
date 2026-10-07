@@ -47,6 +47,7 @@ def test_init_api_registers_group(monkeypatch):
         def __init__(self):
             self.config = {}
             self.registered = None
+            self.registered_blueprints = []
             self.registered_middleware = []
             self.listeners = {}
 
@@ -70,6 +71,7 @@ def test_init_api_registers_group(monkeypatch):
 
         def blueprint(self, group):
             self.registered = group
+            self.registered_blueprints.append(group)
 
     app = FakeApp()
     init_api(app)
@@ -84,6 +86,10 @@ def test_init_api_registers_group(monkeypatch):
     ]
     assert hasattr(app.registered, "blueprints")
     assert {bp.name for bp in app.registered.blueprints} == (EXPECTED_PUBLIC_BLUEPRINT_NAMES)
+    assert init_api.__globals__["admission_batch_blueprint"] in app.registered_blueprints
+    assert "custom_import_admission" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
+    assert init_api.__globals__["source_batch_blueprint"] in app.registered_blueprints
+    assert "custom_import_source" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
 
 
 @pytest.mark.parametrize("distance", [0.1, 1, 5])

@@ -168,6 +168,52 @@ async def test_unknown_storage_error_is_not_relabelled_as_lease_loss(monkeypatch
     flow.calls["_activate"].assert_not_awaited()
 
 
+async def test_writer_transports_is_checked_before_capture_and_forwarded_unchanged(monkeypatch):
+    flow = _install_flow(monkeypatch)
+    transport = SimpleNamespace(require_candidate_binding=Mock())
+    await runner.run_segmented_snowflake_candidate(
+        object(),
+        flow.connector,
+        flow.request,
+        processing_policy=_policy(),
+        writer_transports=transport,
+    )
+    transport.require_candidate_binding.assert_called_once_with(flow.request)
+    for stage in ("_build_request", "stage_segmented_source"):
+        assert flow.calls[stage].await_args.kwargs == {"writer_transports": transport}
+
+
+async def test_invalid_admission_launch_does_not_claim_capture_or_finish_execution(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    flow = _install_flow(monkeypatch)
+    transport = SimpleNamespace(require_candidate_binding=Mock(side_effect=AdmissionTransportError("unavailable")))
+    with pytest.raises(AdmissionTransportError):
+        await runner.run_segmented_snowflake_candidate(
+            object(),
+            flow.connector,
+            flow.request,
+            processing_policy=_policy(),
+            writer_transports=transport,
+        )
+    flow.calls["acquire_segmented_snowflake_capture"].assert_not_awaited()
+    flow.calls["_finish"].assert_not_awaited()
+
+
+async def test_uncertain_admission_response_never_finishes_or_publishes(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    flow = _install_flow(monkeypatch)
+    flow.calls["stage_segmented_source"].side_effect = AdmissionTransportError("synthetic uncertain response")
+    transport = SimpleNamespace(require_candidate_binding=Mock())
+    with pytest.raises(AdmissionTransportError):
+        await runner.run_segmented_snowflake_candidate(
+            object(), flow.connector, flow.request, processing_policy=_policy(), writer_transports=transport
+        )
+    for stage in ("_finish", "count_source_outcomes", "build_graph", "build_output", "_activate"):
+        flow.calls[stage].assert_not_awaited()
+
+
 def _transaction_mock(monkeypatch, session):
     context = Mock(side_effect=lambda *_args, **_kwargs: nullcontext(session))
     monkeypatch.setattr(runner, "_session", context)
@@ -223,6 +269,32 @@ async def test_build_request_denies_unbound_capture(monkeypatch, field, replacem
     monkeypatch.setattr(runner, "_retained_base", retained_base)
     with pytest.raises(CandidateRunnerError, match="sealed capture"):
         await build_request(object(), flow.request, captured, policy)
+    lock_page.assert_not_awaited()
+    retained_base.assert_not_awaited()
+
+
+async def test_expired_admission_stage_denies_before_initial_page_lock(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    build_request = runner._build_request
+    flow = _install_flow(monkeypatch)
+    policy = _policy()
+    captured = flow.calls["acquire_segmented_snowflake_capture"].return_value
+    bundle = _sealed_capture(flow.request, captured, policy)
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: (bundle, bundle.sealed_at)))
+    )
+    _transaction_mock(monkeypatch, session)
+    lock_page, retained_base = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(runner, "_lock_page", lock_page)
+    monkeypatch.setattr(runner, "_retained_base", retained_base)
+    admission = SimpleNamespace(bind_request=Mock(side_effect=AdmissionTransportError("expired")))
+    source = SimpleNamespace(bind_request=Mock())
+    transport = SimpleNamespace(admission=admission, source=source)
+    with pytest.raises(AdmissionTransportError):
+        await build_request(object(), flow.request, captured, policy, writer_transports=transport)
+    admission.bind_request.assert_called_once()
+    source.bind_request.assert_not_called()
     lock_page.assert_not_awaited()
     retained_base.assert_not_awaited()
 

@@ -14,11 +14,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
-from sqlalchemy import BigInteger, Integer, String, bindparam, text
+from sqlalchemy import BigInteger, Integer, String, and_, bindparam, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import DBAPIError
 
-from db.models.custom_import import CustomImportBuildAttempt
+from db.models.custom_import import CustomImportBuildAttempt, CustomImportExecution, CustomImportSourceBindingRevision
+from process.custom_import.admission_authorization import ADMISSION_PATH, PERMIT_CONTRACT, AdmissionPermit
 from process.custom_import.build_source import (
     SourceBuildRequest,
     _call,
@@ -197,18 +198,72 @@ async def _admit_locked(session, build, expected_after_id, *, physical_row_cap: 
     return AdmissionResult(**cursor_row)
 
 
-async def _retry_admission_timeout(session_factory, request, build_id, error):
+async def _verify_admission_permit(session, request, permit: AdmissionPermit) -> None:
+    """Bind the fixed admission purpose to retained rows under the page's locks."""
+
+    if type(permit) is not AdmissionPermit or (
+        permit.contract != PERMIT_CONTRACT
+        or permit.path != ADMISSION_PATH
+        or permit.method != "POST"
+        or permit.issuer != "custom-import-execution-controller"
+        or permit.audience != "custom-import-engine"
+        or request.dataset_id != permit.dataset_id
+        or request.definition_revision_id != permit.definition_revision_id
+        or request.schema_revision_id != permit.schema_revision_id
+        or request.authorization_expires_at != permit.expires_at
+    ):
+        raise AdmissionError("custom_import_admission_authority_mismatch")
+    await _prepare_statement(session)
+    matched = (
+        await session.execute(
+            select(CustomImportExecution.execution_id)
+            .join(
+                CustomImportSourceBindingRevision,
+                and_(
+                    CustomImportSourceBindingRevision.source_binding_revision_id
+                    == CustomImportExecution.source_binding_revision_id,
+                    CustomImportSourceBindingRevision.dataset_id == CustomImportExecution.dataset_id,
+                    CustomImportSourceBindingRevision.definition_revision_id
+                    == CustomImportExecution.definition_revision_id,
+                    CustomImportSourceBindingRevision.schema_revision_id == CustomImportExecution.schema_revision_id,
+                ),
+            )
+            .where(
+                CustomImportExecution.execution_id == request.execution_id,
+                CustomImportExecution.dataset_id == permit.dataset_id,
+                CustomImportExecution.definition_revision_id == permit.definition_revision_id,
+                CustomImportExecution.schema_revision_id == permit.schema_revision_id,
+                CustomImportExecution.idempotency_key == permit.idempotency_key,
+                CustomImportExecution.source_binding_revision_id == permit.source_binding_revision_id,
+                CustomImportSourceBindingRevision.binding_sha256 == bytes.fromhex(permit.source_binding_sha256),
+            )
+        )
+    ).scalar_one_or_none()
+    if matched != request.execution_id:
+        raise AdmissionError("custom_import_admission_authority_mismatch")
+    if not await _has_admission_owner(session):
+        raise AdmissionError("custom_import_admission_owner_required")
+
+
+async def _retry_admission_timeout(session_factory, request, build_id, error, *, admission_permit=None):
     """Retry one logical group only after the failed decision page fully closed."""
 
     cursor = getattr(error, "_custom_import_admission_cursor", None)
     if cursor is None or error.connection_invalidated or getattr(error, "_custom_import_retry_blocked", False):
         raise error
     async with _page_session(session_factory, request, build_id) as (session, build):
+        if admission_permit is not None:
+            await _verify_admission_permit(session, request, admission_permit)
         return await _admit_locked(session, build, cursor, physical_row_cap=build.page_row_limit)
 
 
 async def admit_source_batch(
-    session_factory: SessionFactory, request: SourceBuildRequest, build_id: int, expected_after_id: int
+    session_factory: SessionFactory,
+    request: SourceBuildRequest,
+    build_id: int,
+    expected_after_id: int,
+    *,
+    admission_permit: AdmissionPermit | None = None,
 ) -> AdmissionResult:
     """Own one physical prefix and its fresh lease check immediately before commit.
 
@@ -224,7 +279,11 @@ async def admit_source_batch(
     _integer(expected_after_id, "expected_after_id", 0, (1 << 63) - 1)
     try:
         async with _page_session(session_factory, request, build_id) as (session, build):
-            result = await _admit_locked(session, build, expected_after_id)
+            if admission_permit is not None:
+                await _verify_admission_permit(session, request, admission_permit)
+            admission_result = await _admit_locked(session, build, expected_after_id)
     except DBAPIError as error:
-        result = await _retry_admission_timeout(session_factory, request, build_id, error)
-    return result
+        admission_result = await _retry_admission_timeout(
+            session_factory, request, build_id, error, admission_permit=admission_permit
+        )
+    return admission_result

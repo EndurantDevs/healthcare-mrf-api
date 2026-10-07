@@ -12,9 +12,11 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+from sqlalchemy.dialects.postgresql import dialect
 
 import process.custom_import.build_source as staging
 from process.custom_import import bulk_page_codec as codec
+from process.custom_import import source_finalize_sql as finalizer
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_codec import pack_hash
 from process.custom_import.runner_types import CandidateRegistry, CandidateRunnerError, LeaseAuthorityLost
@@ -43,6 +45,7 @@ def _copy_stubs(monkeypatch, *, part=1, first_row=0, ordinal=0):
     )
     copied = AsyncMock()
     connection = SimpleNamespace(
+        dialect=dialect(),
         sync_connection=SimpleNamespace(
             get_execution_options=lambda: {
                 "schema_translate_map": {staging.CustomImportBuildAttempt.__table__.schema: "synthetic_candidate"}
@@ -53,6 +56,7 @@ def _copy_stubs(monkeypatch, *, part=1, first_row=0, ordinal=0):
         ),
     )
     session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: False)),
         scalars=AsyncMock(return_value=SimpleNamespace(one=lambda: cursor)),
         connection=AsyncMock(return_value=connection),
         add=Mock(),
@@ -72,6 +76,68 @@ def _copy_stubs(monkeypatch, *, part=1, first_row=0, ordinal=0):
     called = AsyncMock(side_effect=call)
     monkeypatch.setattr(staging, "_call", called)
     return session, copied, called
+
+
+@pytest.mark.parametrize("owner", [True, False, None, 1])
+@pytest.mark.parametrize("schema", ['synthetic " mapped', "synthetic_candidate"])
+async def test_source_owner_gate_uses_current_user_and_exact_mapped_signatures(monkeypatch, owner, schema):
+    session, _, _ = _copy_stubs(monkeypatch)
+    connection = session.connection.return_value
+    connection.sync_connection.get_execution_options = lambda: {
+        "schema_translate_map": {staging.CustomImportBuildAttempt.__table__.schema: schema}
+    }
+    session.execute.return_value.scalar_one = lambda: owner
+    assert await staging._is_source_writer_owner(session) is (owner is True)
+    statement, parameters = session.execute.await_args.args
+    assert "pg_catalog.pg_get_userbyid(p.proowner)=CURRENT_USER" in str(statement)
+    assert "pg_catalog.count(*)=2" in str(statement) and "pg_catalog.pg_proc" in str(statement)
+    assert "pg_catalog.bool_and" in str(statement)
+    assert "pg_catalog.to_regprocedure" in str(statement)
+    quoted = dialect().identifier_preparer.quote_schema(schema)
+    assert parameters == {
+        "authorize": (
+            f"{quoted}.source_bulk_authorize("
+            "pg_catalog.int8,pg_catalog.int2,pg_catalog.int8,pg_catalog.bytea,pg_catalog.int4,pg_catalog.int8)"
+        ),
+        "finalize": f"{quoted}.source_set_finalize(pg_catalog.uuid,pg_catalog.int4[])",
+    }
+
+
+async def test_source_owner_gate_rechecks_each_batch_and_requires_explicit_schema(monkeypatch):
+    session, _, _ = _copy_stubs(monkeypatch)
+    session.execute.side_effect = [
+        SimpleNamespace(scalar_one=lambda: True),
+        SimpleNamespace(scalar_one=lambda: False),
+    ]
+    assert await staging._is_source_writer_owner(session) is True
+    assert await staging._is_source_writer_owner(session) is False
+    connection = session.connection.return_value
+    connection.sync_connection.get_execution_options = lambda: {
+        "schema_translate_map": {staging.CustomImportBuildAttempt.__table__.schema: None}
+    }
+    with pytest.raises(CandidateRunnerError, match="explicit model schema"):
+        await staging._is_source_writer_owner(session)
+    assert session.execute.await_count == 2
+
+
+@pytest.mark.parametrize("owner", [True, False])
+async def test_source_route_uses_ordinary_sql_only_for_current_owner(monkeypatch, owner):
+    context = _bulk_context()
+    session, copied, called = _copy_stubs(monkeypatch)
+    session.execute.return_value.scalar_one = lambda: owner
+    finalized = AsyncMock(return_value=1)
+    monkeypatch.setattr(finalizer, "finalize_source_batch", finalized)
+    assert await staging._store_pages(None, context, (_prepared_page(context),)) == 1
+    copied.assert_awaited_once()
+    if owner:
+        finalized.assert_awaited_once_with(session, UUID(int=17), [])
+        assert [call.args[1] for call in called.await_args_list] == [
+            "source_bulk_authorize",
+            "resolve_custom_import_source_batch_snapshot",
+        ]
+    else:
+        finalized.assert_not_awaited()
+        assert called.await_args.args[1] == "source_set_finalize"
 
 
 @pytest.mark.parametrize("stream", [0, 1])
@@ -402,11 +468,46 @@ def _transaction_attempts(session, outcomes):
     return sessions
 
 
-@pytest.mark.parametrize("cancel_copy", [False, True])
-async def test_copy_cancel_or_fresh_precommit_loss_rolls_back_then_retries(monkeypatch, cancel_copy):
+@pytest.mark.parametrize("failure", ["owner_probe", "finalize", "count"])
+async def test_owner_route_failure_rolls_back_copy_without_legacy_fallback(monkeypatch, failure):
     context = _bulk_context()
     owned_page = staging._page_session
     session, copied, called = _copy_stubs(monkeypatch)
+    session.execute.return_value.scalar_one = lambda: True
+    finalized = AsyncMock(return_value=0 if failure == "count" else 1)
+    error = RuntimeError("synthetic source failure")
+    if failure == "owner_probe":
+        session.execute.side_effect = error
+    elif failure == "finalize":
+        finalized.side_effect = error
+    monkeypatch.setattr(finalizer, "finalize_source_batch", finalized)
+    outcomes = []
+    sessions = _transaction_attempts(session, outcomes)
+    monkeypatch.setattr(staging, "_page_session", owned_page)
+    monkeypatch.setattr(staging, "_lock_page", AsyncMock(return_value=SimpleNamespace(phase="source")))
+    monkeypatch.setattr(staging, "_flush_page", AsyncMock())
+    with pytest.raises(CandidateRunnerError if failure == "count" else RuntimeError) as caught:
+        await staging._store_pages(sessions, context, (_prepared_page(context),))
+    if failure != "count":
+        assert caught.value is error
+    assert outcomes == ["rollback"]
+    copied.assert_awaited_once()
+    assert [call.args[1] for call in called.await_args_list] == [
+        "source_bulk_authorize",
+        "resolve_custom_import_source_batch_snapshot",
+    ]
+    assert finalized.await_count == (0 if failure == "owner_probe" else 1)
+
+
+@pytest.mark.parametrize("owner", [True, False])
+@pytest.mark.parametrize("cancel_copy", [False, True])
+async def test_copy_cancel_or_fresh_precommit_loss_rolls_back_then_retries(monkeypatch, cancel_copy, owner):
+    context = _bulk_context()
+    owned_page = staging._page_session
+    session, copied, called = _copy_stubs(monkeypatch)
+    session.execute.return_value.scalar_one = lambda: owner
+    finalized = AsyncMock(return_value=1)
+    monkeypatch.setattr(finalizer, "finalize_source_batch", finalized)
     outcomes = []
     sessions = _transaction_attempts(session, outcomes)
     monkeypatch.setattr(staging, "_page_session", owned_page)
@@ -427,7 +528,9 @@ async def test_copy_cancel_or_fresh_precommit_loss_rolls_back_then_retries(monke
     assert outcomes == ["rollback"]
     assert await staging._store_pages(sessions, context, pages) == 1
     assert outcomes == ["rollback", "commit"] and verify.await_count == (1 if cancel_copy else 2)
-    assert copied.await_count == 2 and called.await_count == (5 if cancel_copy else 6)
+    assert copied.await_count == 2
+    assert called.await_count == (4 if owner else (5 if cancel_copy else 6))
+    assert finalized.await_count == ((1 if cancel_copy else 2) if owner else 0)
     assert sum(call.args[1] == "resolve_custom_import_source_batch_snapshot" for call in called.await_args_list) == 2
 
 

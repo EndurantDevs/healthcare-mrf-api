@@ -25,6 +25,7 @@ from db.models.custom_import import (
     CustomImportRootRecord,
     CustomImportRootRevision,
 )
+from process.custom_import import source_finalize_sql as finalizer
 from process.custom_import.family import _is_valid_npi
 from tests.test_custom_import_build_output_postgres import _records, _request_for
 from tests.test_custom_import_build_source_postgres import (
@@ -104,13 +105,92 @@ async def _root_page(case, records):
     return context, page
 
 
+async def test_source_owner_selection_uses_current_user_without_granting_authority():
+    async with _source_case() as case:
+        context, _ = await _root_page(case, [_root()])
+        async with staging._page_session(case.sessions, context.request, context.build_id) as (session, _):
+            assert await staging._is_source_writer_owner(session) is True
+            await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
+            try:
+                assert await staging._is_source_writer_owner(session) is False
+            finally:
+                await session.execute(text("RESET ROLE"))
+            assert await staging._is_source_writer_owner(session) is True
+
+
+def _assert_source_route_statements(statements, ordinary, owner_route):
+    """Both routes use fixed-count statements, not database work per row."""
+
+    source_calls = Counter(
+        name
+        for statement in statements
+        for name in ("source_bulk_authorize", "resolve_custom_import_source_batch_snapshot", "source_set_finalize")
+        if f".{name}(" in statement
+    )
+    expected_count_by_name = {
+        "source_bulk_authorize": 1,
+        "resolve_custom_import_source_batch_snapshot": 2 if owner_route else 1,
+    }
+    if owner_route:
+        ordinary.assert_awaited_once()
+        # Each fixed ordinary statement retains its own fenced timeout preparation.
+        assert len(statements) <= 96 + 2 * len(finalizer._load_sql())
+    else:
+        expected_count_by_name["source_set_finalize"] = 1
+        ordinary.assert_not_awaited()
+        assert len(statements) <= 96
+        for model in (
+            CustomImportPack,
+            CustomImportRootRecord,
+            CustomImportRootRevision,
+            CustomImportBuildOccurrence,
+        ):
+            assert not any(model.__tablename__ in statement for statement in statements)
+    assert source_calls == expected_count_by_name
+    return source_calls
+
+
+async def _assert_source_page_outcomes(case, context, record_count):
+    """SOURCE writes stay in the registered candidate with exact ordered counts."""
+
+    async with case.sessions() as session:
+        models = await session.run_sync(_candidate_models, context.request)
+        occurrence_model = models[CustomImportBuildOccurrence]
+        occurrences = (await session.scalars(select(occurrence_model).order_by(occurrence_model.occurrence_id))).all()
+        assert [occurrence.source_ordinal for occurrence in occurrences] == list(range(record_count))
+        assert [occurrence.part_row_ordinal for occurrence in occurrences] == list(range(record_count))
+        assert all(occurrence.rejection_id is None for occurrence in occurrences)
+        for model, expected_count in (
+            (CustomImportPack, 1),
+            (CustomImportRootRecord, record_count),
+            (CustomImportRootRevision, record_count),
+        ):
+            assert await session.scalar(select(func.count()).select_from(models[model])) == expected_count
+        assert await session.scalar(select(func.count()).select_from(CustomImportPack)) == 0
+
+
 @pytest.mark.parametrize("record_count", [1, 32])
-async def test_source_page_client_statements_are_batched(monkeypatch, record_count):
+@pytest.mark.parametrize("owner_route", [True, False])
+async def test_source_page_client_statements_are_batched(monkeypatch, record_count, owner_route):
+    """The real owner route and retained dispatcher preserve candidate outcomes."""
+
     async with _source_case() as case:
         context, page = await _root_page(case, [_root(_synthetic_npi(index)) for index in range(record_count)])
         statements = []
         copy_landing = AsyncMock(wraps=staging._copy_source_landing)
         monkeypatch.setattr(staging, "_copy_source_landing", copy_landing)
+        ordinary = AsyncMock(wraps=finalizer.finalize_source_batch)
+        monkeypatch.setattr(finalizer, "finalize_source_batch", ordinary)
+        owner_checks = []
+        original_gate = staging._is_source_writer_owner
+
+        async def checked_gate(session):
+            owned = await original_gate(session)
+            owner_checks.append(owned)
+            assert owned, "the fixture must actually own both SOURCE entry points"
+            return owner_route
+
+        monkeypatch.setattr(staging, "_is_source_writer_owner", checked_gate)
 
         def count_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
             statements.append(statement)
@@ -120,22 +200,10 @@ async def test_source_page_client_statements_are_batched(monkeypatch, record_cou
             assert await staging._store_single_page(case.sessions, context, page) == record_count
         finally:
             event.remove(case.engine.sync_engine, "before_cursor_execute", count_statement)
-        source_calls = Counter(
-            name
-            for statement in statements
-            for name in ("source_bulk_authorize", "resolve_custom_import_source_batch_snapshot", "source_set_finalize")
-            if f".{name}(" in statement
-        )
         copy_landing.assert_awaited_once()
         assert len(copy_landing.await_args.args[1]) == record_count
-        assert source_calls == {
-            "source_bulk_authorize": 1,
-            "resolve_custom_import_source_batch_snapshot": 1,
-            "source_set_finalize": 1,
-        }
-        assert len(statements) <= 96
-        for model in (CustomImportPack, CustomImportRootRecord, CustomImportRootRevision, CustomImportBuildOccurrence):
-            assert not any(model.__tablename__ in statement for statement in statements)
+        assert owner_checks == [True]
+        source_calls = _assert_source_route_statements(statements, ordinary, owner_route)
         print(
             json.dumps(
                 dict(
@@ -146,22 +214,7 @@ async def test_source_page_client_statements_are_batched(monkeypatch, record_cou
                 )
             )
         )
-        async with case.sessions() as session:
-            models = await session.run_sync(_candidate_models, context.request)
-            occurrence_model = models[CustomImportBuildOccurrence]
-            occurrences = (
-                await session.scalars(select(occurrence_model).order_by(occurrence_model.occurrence_id))
-            ).all()
-            assert [occurrence.source_ordinal for occurrence in occurrences] == list(range(record_count))
-            assert [occurrence.part_row_ordinal for occurrence in occurrences] == list(range(record_count))
-            assert all(occurrence.rejection_id is None for occurrence in occurrences)
-            for model, expected_count in (
-                (CustomImportPack, 1),
-                (CustomImportRootRecord, record_count),
-                (CustomImportRootRevision, record_count),
-            ):
-                assert await session.scalar(select(func.count()).select_from(models[model])) == expected_count
-            assert await session.scalar(select(func.count()).select_from(CustomImportPack)) == 0
+        await _assert_source_page_outcomes(case, context, record_count)
 
 
 async def test_mixed_outcomes_keep_rejection_ordinals_and_retry_prefix():
@@ -195,11 +248,15 @@ async def test_mixed_outcomes_keep_rejection_ordinals_and_retry_prefix():
         assert await staging.stage_segmented_source(case.sessions, context.request) == result
 
 
-async def test_source_row_validation_failure_rolls_back_entire_page():
+@pytest.mark.parametrize("owner_route", [True, False])
+async def test_source_row_validation_failure_rolls_back_entire_page(monkeypatch, owner_route):
+    if not owner_route:
+        monkeypatch.setattr(staging, "_is_source_writer_owner", AsyncMock(return_value=False))
     async with _source_case() as case:
         context, page = await _root_page(case, [_root(), _root(score=None), _root(_synthetic_npi(1))])
         forged = replace(page.records[-1], raw_key=(page.records[-1].raw_key[0], bytes(32)))
-        with pytest.raises(DBAPIError, match="source_bulk_row_mismatch"):
+        error_type = finalizer.SourceFinalizationError if owner_route else DBAPIError
+        with pytest.raises(error_type, match="source_bulk_row_mismatch"):
             await staging._store_single_page(
                 case.sessions, context, replace(page, records=(*page.records[:-1], forged))
             )
@@ -233,7 +290,7 @@ async def test_forged_root_digest_preserves_keys_and_prefix(collision_location):
             page = replace(page, first_row=1, first_source=1, records=(forged,))
         else:
             page = replace(page, records=(first, forged))
-        with pytest.raises(DBAPIError, match="source_bulk_row_mismatch"):
+        with pytest.raises(finalizer.SourceFinalizationError, match="source_bulk_row_mismatch"):
             await staging._store_single_page(case.sessions, context, page)
         async with case.sessions() as session:
             models = await session.run_sync(_candidate_models, context.request)
