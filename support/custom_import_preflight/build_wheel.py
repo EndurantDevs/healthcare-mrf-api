@@ -28,13 +28,15 @@ def build_wheel(output_directory: Path) -> Path:
         copy2(_PACKAGE_ROOT / "LICENSE", stage_root / "LICENSE")
         subprocess.run(
             [
+                "uv",
+                "--no-config",
+                "build",
+                "--wheel",
+                "--python",
                 sys.executable,
-                "-m",
-                "pip",
-                "wheel",
-                "--no-deps",
+                "--offline",
                 "--no-build-isolation",
-                "--wheel-dir",
+                "--out-dir",
                 str(output_directory),
                 str(stage_root),
             ],
