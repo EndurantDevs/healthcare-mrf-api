@@ -82,11 +82,20 @@ Unrelated historical files keep their existing readability baseline. Runtime
 import smoke tests and the existing contract tests run against locked application
 dependencies; they validate actual dependency APIs and source-module imports.
 
-CI also retains a bounded, error-only Pylint pass for selected security, source,
-and publication contracts using `.pylintrc`. Its pinned inference tools run in a
-separate environment with access to the verified application dependencies. A
-dependency-member canary checks that inference remains active before the pass.
-This complements Ruff and runtime tests; it is not a repository-wide Pylint gate.
+CI also checks eleven selected security, source, and publication contract modules
+with pinned ty 0.0.85 and its default diagnostics. uv manages the Python 3.14.7
+tool environment separately from the verified application dependencies, which ty
+uses to resolve real dependency APIs. A dependency-member canary checks that
+inference remains active before the pass. Ruff requires return annotations in
+these modules with ANN201, ANN202, ANN204, ANN205, and ANN206, including functions
+returning `None`; suppression comments cannot bypass this return guard.
+
+ty permits assigning a `None` result to an inferred variable, including results
+from functions annotated with `-> None`. This differs from Pylint's
+`assignment-from-no-return` warning. Return annotations and ty reject invalid
+consumption of those results, such as subscripting them or returning them from a
+function annotated to return `int`. Runtime import checks and contract tests remain
+part of CI alongside the static checks.
 
 The readability budget remains authoritative for naming, function size,
 complexity, and suppression policy.
