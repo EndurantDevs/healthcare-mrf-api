@@ -86,6 +86,7 @@ _SNAPSHOT_MIGRATION_NAMES = (
     "20261005060000_custom_import_snapshot_finality",
     "20261005070000_custom_import_materialization_storage",
     "20261005080000_custom_import_writer_cutover",
+    "20261007000000_custom_import_rejection_anti_joins",
 )
 
 
