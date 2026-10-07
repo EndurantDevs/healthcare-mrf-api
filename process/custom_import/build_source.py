@@ -90,6 +90,8 @@ class SourceBuildRequest:
     statement_timeout_ms: int
     build_deadline_at: dt.datetime
     lease_seconds: int
+    # Request-local authority, never a retained build identity or bound.
+    authorization_expires_at: dt.datetime | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "execution_id", "fence"):
@@ -117,6 +119,12 @@ class SourceBuildRequest:
             raise ValueError("build deadline must be timezone aware")
         if not isinstance(self.definition, CustomImportDefinition):
             raise ValueError("build definition is required")
+        if self.authorization_expires_at is not None and (
+            type(self.authorization_expires_at) is not dt.datetime
+            or self.authorization_expires_at.tzinfo is None
+            or self.authorization_expires_at.utcoffset() != dt.timedelta(0)
+        ):
+            raise ValueError("authorization expiry must be UTC aware")
         rebuilt = CustomImportDefinition.from_json(self.definition.canonical)
         if rebuilt != self.definition:
             raise ValueError("build definition does not match its canonical document")
@@ -201,7 +209,12 @@ async def _initial_page_window(session, request):
     if isolation != "read committed" or expires_at is None:
         raise CandidateRunnerError("build pages require a live READ COMMITTED lease")
     session.info[_WINDOW] = _PageWindow(
-        started + (min(expires_at, request.build_deadline_at) - now).total_seconds(), request.statement_timeout_ms
+        started
+        + (
+            min(expires_at, request.build_deadline_at, request.authorization_expires_at or request.build_deadline_at)
+            - now
+        ).total_seconds(),
+        request.statement_timeout_ms,
     )
     return expires_at
 
@@ -258,7 +271,15 @@ async def _renew_page_window(session, request):
     await _prepare_statement(session)
     now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
     session.info[_WINDOW] = _PageWindow(
-        started + (min(renewed.expires_at, request.build_deadline_at) - now).total_seconds(),
+        started
+        + (
+            min(
+                renewed.expires_at,
+                request.build_deadline_at,
+                request.authorization_expires_at or request.build_deadline_at,
+            )
+            - now
+        ).total_seconds(),
         request.statement_timeout_ms,
     )
     await _prepare_statement(session)
@@ -292,6 +313,8 @@ async def _page_session(
         )
         if now >= request.build_deadline_at:
             raise LeaseAuthorityLost("build deadline elapsed before page commit")
+        if request.authorization_expires_at is not None and now >= request.authorization_expires_at:
+            raise LeaseAuthorityLost("writer authorization expired before page commit")
         await _prepare_statement(session)
     except BaseException as exc:
         primary = exc
@@ -314,6 +337,34 @@ async def _call(session: AsyncSession, name: str, arguments: tuple[tuple[str, ob
     parameter_by_name = {f"p{index}": value for index, (_, value) in enumerate(arguments)}
     casts = ",".join(f"CAST(:p{index} AS {sql_type})" for index, (sql_type, _) in enumerate(arguments))
     return await session.execute(text(f"SELECT * FROM {quoted}.{name}({casts})"), parameter_by_name)
+
+
+async def _is_source_writer_owner(session: AsyncSession) -> bool:
+    """Use ordinary SOURCE SQL only as the current owners of both entry points."""
+
+    await _prepare_statement(session)
+    connection = await session.connection()
+    model_schema = CustomImportBuildAttempt.__table__.schema
+    schema_map = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
+    schema = schema_map.get(model_schema, model_schema)
+    if not schema:
+        raise CandidateRunnerError("build functions require an explicit model schema")
+    quoted = connection.dialect.identifier_preparer.quote_schema(schema)
+    result = await session.execute(
+        text(
+            "SELECT pg_catalog.count(*)=2 AND pg_catalog.bool_and(pg_catalog.pg_get_userbyid(p.proowner)=CURRENT_USER) "
+            "FROM pg_catalog.pg_proc p WHERE p.oid IN "
+            "(pg_catalog.to_regprocedure(:authorize),pg_catalog.to_regprocedure(:finalize))"
+        ),
+        {
+            "authorize": (
+                f"{quoted}.source_bulk_authorize("
+                "pg_catalog.int8,pg_catalog.int2,pg_catalog.int8,pg_catalog.bytea,pg_catalog.int4,pg_catalog.int8)"
+            ),
+            "finalize": f"{quoted}.source_set_finalize(pg_catalog.uuid,pg_catalog.int4[])",
+        },
+    )
+    return result.scalar_one() is True
 
 
 async def _begin_build(session_factory, request):
@@ -589,9 +640,14 @@ async def _store_pages(session_factory, context, pages, *, verified_parts=()):
         ).scalar_one()
         landing_rows = tuple((batch_id, ordinal, *landing[1:]) for ordinal, landing in enumerate(preview.records))
         await _copy_source_landing(session, landing_rows)
-        completed = (
-            await _call(session, "source_set_finalize", (("uuid", batch_id), ("integer[]", earlier_parts)))
-        ).scalar_one()
+        if await _is_source_writer_owner(session):
+            from process.custom_import.source_finalize_sql import finalize_source_batch
+
+            completed = await finalize_source_batch(session, batch_id, earlier_parts)
+        else:
+            completed = (
+                await _call(session, "source_set_finalize", (("uuid", batch_id), ("integer[]", earlier_parts)))
+            ).scalar_one()
         if completed != len(landing_rows):
             raise CandidateRunnerError("completed source count differs from attempted rows")
     return completed
@@ -959,7 +1015,84 @@ async def _replay_source(session_factory, request, registry, build_id, bundle_id
         batch.clear()
 
 
-async def stage_segmented_source(session_factory: SessionFactory, request: SourceBuildRequest) -> SourceBuildResult:
+async def _source_handoff_slots(session_factory, request, build_id, registry):
+    """Skip verified streams on resume; allow one interrupted global freeze."""
+
+    async with _page_session(session_factory, request, build_id) as (session, build):
+        if build.phase != "source":
+            return ()
+        await _prepare_statement(session)
+        streams = (
+            await session.scalars(
+                select(CustomImportBuildStream)
+                .where(CustomImportBuildStream.build_id == build_id)
+                .order_by(CustomImportBuildStream.stream_slot)
+                .with_for_update()
+            )
+        ).all()
+        if {stream.stream_slot for stream in streams} != set(registry.stream_slots.values()) or not streams:
+            raise CandidateRunnerError("source build streams differ from the retained definition")
+        pending_slots = tuple(stream.stream_slot for stream in streams if stream.replay_verified_at is None)
+        return pending_slots or (streams[0].stream_slot,)
+
+
+async def _stage_source_handoff(session_factory, request, build_id, registry, transport):
+    """Continue from acknowledged or independently verified durable SOURCE progress."""
+
+    from process.custom_import import source_worker as worker
+
+    slots = await _source_handoff_slots(session_factory, request, build_id, registry)
+    for slot in slots:
+        while True:
+            try:
+                progress = await worker.source_next_batch(session_factory, request, build_id, slot, transport)
+            except worker.SourceReconciliationRequired as error:
+                if error.progress is None:
+                    raise
+                progress = error.progress
+            if progress.phase != "source":
+                return
+            if progress.stream_complete:
+                break
+    # A successful final stream receipt normally freezes SOURCE. Require that
+    # durable transition before indexes/admission; never fall back to local writes.
+    async with _page_session(session_factory, request, build_id) as (_, build):
+        if build.phase == "source":
+            raise CandidateRunnerError("source handoff ended before committed global freeze")
+
+
+async def _stage_admission_handoff(session_factory, request, build_id, transport):
+    """Continue after a committed receipt, advanced cursor or observed terminal phase."""
+
+    from process.custom_import import admission_worker as worker
+
+    while True:
+        try:
+            progress = await worker.admit_next_batch(session_factory, request, build_id, transport)
+        except worker.AdmissionReconciliationRequired as error:
+            progress = error.progress
+            if progress is None or (
+                progress.phase not in worker._POST_ADMISSION_PHASES
+                and progress.after_occurrence_id <= error.pins.expected_after_occurrence_id
+            ):
+                raise
+        if progress.phase in worker._POST_ADMISSION_PHASES:
+            retained = await worker._retained_progress(session_factory, request, build_id)
+            return SourceBuildResult(
+                build_id,
+                request.execution_id,
+                retained.phase,
+                retained.source_occurrence_count,
+                retained.candidate_error_count,
+            )
+
+
+async def stage_segmented_source(
+    session_factory: SessionFactory,
+    request: SourceBuildRequest,
+    *,
+    writer_transports=None,
+) -> SourceBuildResult:
     """Replay immutable bytes, then globally admit families; never publish or finish execution.
 
     On an uncertain commit, invoke again with exactly the same request. Durable
@@ -967,11 +1100,26 @@ async def stage_segmented_source(session_factory: SessionFactory, request: Sourc
     transport status. A new fence must start its own build.
     """
 
-    from process.custom_import import admission_sql as admission
-
     if not isinstance(request, SourceBuildRequest):
         raise TypeError("source staging requires SourceBuildRequest")
+    if writer_transports is not None:
+        request = writer_transports.source.bind_request(writer_transports.admission.bind_request(request))
     build_id, registry = await _begin_build(session_factory, request)
+    if writer_transports is not None:
+        await _stage_source_handoff(session_factory, request, build_id, registry, writer_transports.source)
+    else:
+        direct_admission = await _stage_local_source(session_factory, request, build_id, registry)
+    await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
+    if writer_transports is not None:
+        return await _stage_admission_handoff(session_factory, request, build_id, writer_transports.admission)
+    return await _admit_local_pages(session_factory, request, build_id, direct_admission)
+
+
+async def _stage_local_source(session_factory, request, build_id, registry):
+    """Preserve standalone replay and select only the current connection's writer."""
+
+    from process.custom_import import admission_sql as admission
+
     async with _page_session(session_factory, request, build_id) as (session, build):
         phase, bundle_id = build.phase, build.capture_bundle_id
         await _prepare_statement(session)
@@ -991,7 +1139,14 @@ async def stage_segmented_source(session_factory: SessionFactory, request: Sourc
         direct_admission = await admission._has_admission_owner(session)
     if phase == "source":
         await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
-    await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
+    return direct_admission
+
+
+async def _admit_local_pages(session_factory, request, build_id, direct_admission):
+    """Use the current owner's writer or retained dispatcher in fenced page transactions."""
+
+    from process.custom_import import admission_sql as admission
+
     while True:
         try:
             async with _page_session(session_factory, request, build_id) as (session, build):

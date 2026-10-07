@@ -12,15 +12,26 @@ from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
+from process.custom_import import build_output as output
 from process.custom_import import execution as lifecycle
 from process.custom_import import operator as operator_evidence
+from process.custom_import import scalar_digest
 from process.custom_import import snowflake_operator_cli as operator_cli
 from process.custom_import import snowflake_segmented_runner as runner
 from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
 from process.custom_import.snowflake_capture import SnowflakeCaptureResult
+from tests.test_custom_import_build_graph import _registry
+from tests.test_custom_import_build_output import _generation
 from tests.test_custom_import_build_source import _request as _source_request
 from tests.test_custom_import_execution import _SyntheticSession
+from tests.test_custom_import_output_bulk_verification import (
+    _digests,
+    _projection_records,
+    _projection_responses,
+    _read_session,
+    _twenty_projection_family,
+)
 from tests.test_custom_import_processing_policy import _policy_document
 
 
@@ -168,6 +179,52 @@ async def test_unknown_storage_error_is_not_relabelled_as_lease_loss(monkeypatch
     flow.calls["_activate"].assert_not_awaited()
 
 
+async def test_writer_transports_is_checked_before_capture_and_forwarded_unchanged(monkeypatch):
+    flow = _install_flow(monkeypatch)
+    transport = SimpleNamespace(require_candidate_binding=Mock())
+    await runner.run_segmented_snowflake_candidate(
+        object(),
+        flow.connector,
+        flow.request,
+        processing_policy=_policy(),
+        writer_transports=transport,
+    )
+    transport.require_candidate_binding.assert_called_once_with(flow.request)
+    for stage in ("_build_request", "stage_segmented_source"):
+        assert flow.calls[stage].await_args.kwargs == {"writer_transports": transport}
+
+
+async def test_invalid_admission_launch_does_not_claim_capture_or_finish_execution(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    flow = _install_flow(monkeypatch)
+    transport = SimpleNamespace(require_candidate_binding=Mock(side_effect=AdmissionTransportError("unavailable")))
+    with pytest.raises(AdmissionTransportError):
+        await runner.run_segmented_snowflake_candidate(
+            object(),
+            flow.connector,
+            flow.request,
+            processing_policy=_policy(),
+            writer_transports=transport,
+        )
+    flow.calls["acquire_segmented_snowflake_capture"].assert_not_awaited()
+    flow.calls["_finish"].assert_not_awaited()
+
+
+async def test_uncertain_admission_response_never_finishes_or_publishes(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    flow = _install_flow(monkeypatch)
+    flow.calls["stage_segmented_source"].side_effect = AdmissionTransportError("synthetic uncertain response")
+    transport = SimpleNamespace(require_candidate_binding=Mock())
+    with pytest.raises(AdmissionTransportError):
+        await runner.run_segmented_snowflake_candidate(
+            object(), flow.connector, flow.request, processing_policy=_policy(), writer_transports=transport
+        )
+    for stage in ("_finish", "count_source_outcomes", "build_graph", "build_output", "_activate"):
+        flow.calls[stage].assert_not_awaited()
+
+
 def _transaction_mock(monkeypatch, session):
     context = Mock(side_effect=lambda *_args, **_kwargs: nullcontext(session))
     monkeypatch.setattr(runner, "_session", context)
@@ -225,6 +282,80 @@ async def test_build_request_denies_unbound_capture(monkeypatch, field, replacem
         await build_request(object(), flow.request, captured, policy)
     lock_page.assert_not_awaited()
     retained_base.assert_not_awaited()
+
+
+async def test_expired_admission_stage_denies_before_initial_page_lock(monkeypatch):
+    from process.custom_import.admission_worker import AdmissionTransportError
+
+    build_request = runner._build_request
+    flow = _install_flow(monkeypatch)
+    policy = _policy()
+    captured = flow.calls["acquire_segmented_snowflake_capture"].return_value
+    bundle = _sealed_capture(flow.request, captured, policy)
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: (bundle, bundle.sealed_at)))
+    )
+    _transaction_mock(monkeypatch, session)
+    lock_page, retained_base = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(runner, "_lock_page", lock_page)
+    monkeypatch.setattr(runner, "_retained_base", retained_base)
+    admission = SimpleNamespace(bind_request=Mock(side_effect=AdmissionTransportError("expired")))
+    source = SimpleNamespace(bind_request=Mock())
+    transport = SimpleNamespace(admission=admission, source=source)
+    with pytest.raises(AdmissionTransportError):
+        await build_request(object(), flow.request, captured, policy, writer_transports=transport)
+    admission.bind_request.assert_called_once()
+    source.bind_request.assert_not_called()
+    lock_page.assert_not_awaited()
+    retained_base.assert_not_awaited()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_writer_expiry_stays_at_boundaries(monkeypatch, expired):
+    """Keep the early permit fence without shortening unrelated build phases."""
+    build_request = runner._build_request
+    flow = _install_flow(monkeypatch)
+    policy = _policy()
+    captured = flow.calls["acquire_segmented_snowflake_capture"].return_value
+    bundle = _sealed_capture(flow.request, captured, policy)
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: (bundle, bundle.sealed_at)))
+    )
+    _transaction_mock(monkeypatch, session)
+    expires_at = bundle.sealed_at + dt.timedelta(seconds=30)
+
+    def bind_writer_expiry(request):
+        return replace(request, authorization_expires_at=expires_at)
+
+    transport = SimpleNamespace(
+        require_candidate_binding=Mock(),
+        admission=SimpleNamespace(bind_request=Mock(side_effect=bind_writer_expiry)),
+        source=SimpleNamespace(bind_request=Mock(side_effect=bind_writer_expiry)),
+    )
+    lock_page = AsyncMock(side_effect=LeaseAuthorityLost("writer expired") if expired else None)
+    retained_base = AsyncMock(side_effect=lambda session, request: request)
+    monkeypatch.setattr(runner, "_lock_page", lock_page)
+    monkeypatch.setattr(runner, "_retained_base", retained_base)
+    monkeypatch.setattr(runner, "_build_request", build_request)
+    candidate_result = await runner.run_segmented_snowflake_candidate(
+        object(), flow.connector, flow.request, processing_policy=policy, writer_transports=transport
+    )
+    assert lock_page.await_args.args[1].authorization_expires_at == expires_at
+    transport.admission.bind_request.assert_called_once()
+    transport.source.bind_request.assert_called_once()
+    stages = ("stage_segmented_source", "count_source_outcomes", "build_graph", "build_output", "_activate")
+    if expired:
+        assert candidate_result.status == "lease_lost"
+        retained_base.assert_not_awaited()
+        for stage in stages:
+            flow.calls[stage].assert_not_awaited()
+    else:
+        assert candidate_result.status == "activated"
+        retained_request = retained_base.await_args.args[1]
+        assert retained_request.authorization_expires_at is None
+        assert lock_page.await_args.args[1] == replace(retained_request, authorization_expires_at=expires_at)
+        for stage in stages:
+            assert flow.calls[stage].await_args.args[1] is retained_request
 
 
 @pytest.mark.parametrize(("generation_id", "version"), [(None, 0), (17, 3)])
@@ -391,6 +522,41 @@ async def test_post_capture_validation_finishes_current_owner(monkeypatch, stage
     lease = session.leases[captured.execution_id]
     assert lease.fence == captured.fence and lease.expires_at == session.now
     assert lease.token_sha256 == lifecycle.lease_token_sha256(flow.request.lease_token)
+    flow.calls["_activate"].assert_not_awaited()
+
+
+@pytest.mark.parametrize("adapter", ["encoder", "verifier"])
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, OverflowError])
+async def test_native_scalar_rejection_durably_fails_without_activation(monkeypatch, adapter, error_type):
+    flow, session, captured = await _claimed_validation_flow(monkeypatch, stage="build_output")
+    request, family = _twenty_projection_family(child=False)
+    projection_records = _projection_records(request, [family], child=False)
+    read_session = _read_session(monkeypatch, _projection_responses(request, projection_records, child=False))
+    native = Mock(side_effect=error_type("synthetic private scalar detail"))
+    fallback = Mock(side_effect=AssertionError("native failure must not fall back"))
+    monkeypatch.setattr(scalar_digest, "native_verifier", lambda: native if adapter == "verifier" else None)
+    monkeypatch.setattr(scalar_digest, "native_encoder", lambda: native if adapter == "encoder" else fallback)
+    digests = _digests()
+    flow.calls["build_output"].side_effect = lambda *_args: output._scalar_material(
+        read_session, request, _registry(request.definition), 7, _generation(request), digests, child=False
+    )
+
+    with pytest.raises(CandidateRunnerError, match="^segmented build failed$") as caught:
+        await _run(flow)
+
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    execution = session.executions[captured.execution_id]
+    assert execution.state == "failed" and execution.finished_at == session.now
+    assert execution.terminal_reason == "segmented_build_failed"
+    lease = session.leases[captured.execution_id]
+    assert lease.fence == captured.fence and lease.expires_at == session.now
+    assert (
+        await lifecycle.resume_execution(session, execution_id=execution.execution_id, token=b"synthetic-next") is None
+    )
+    assert read_session.transactions == read_session.closed
+    assert [digest.digest() for digest in digests] == [digest.digest() for digest in _digests()]
+    native.assert_called_once()
+    fallback.assert_not_called()
     flow.calls["_activate"].assert_not_awaited()
 
 

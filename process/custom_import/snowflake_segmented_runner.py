@@ -74,7 +74,7 @@ def _build_deadline(sealed_at, now, seconds):
     return deadline
 
 
-async def _build_request(session_factory, request, captured, policy):
+async def _build_request(session_factory, request, captured, policy, *, writer_transports=None):
     """Read one immutable capture, then retain the same-fence base and bounds."""
 
     async with _session(session_factory, transaction=True) as session:
@@ -114,7 +114,13 @@ async def _build_request(session_factory, request, captured, policy):
             build_deadline_at=deadline,
             **bounds,
         )
-        await _lock_page(session, build_request)
+        # Writer expiry bounds the initial lock, not subsequent build phases.
+        lock_request = build_request
+        if writer_transports is not None:
+            lock_request = writer_transports.source.bind_request(
+                writer_transports.admission.bind_request(build_request)
+            )
+        await _lock_page(session, lock_request)
         return await _retained_base(session, build_request)
 
 
@@ -233,12 +239,21 @@ async def _activate(session_factory, request, output):
         return None
 
 
-async def run_segmented_snowflake_candidate(session_factory, connector, request, *, processing_policy):
+async def run_segmented_snowflake_candidate(
+    session_factory,
+    connector,
+    request,
+    *,
+    processing_policy,
+    writer_transports=None,
+):
     """Carry one source claim through bounded replay, verified sealing and activation."""
 
     policy = _validated_policy(processing_policy)
     if request.source_binding_revision_id is None or request.source_binding_sha256 is None:
         raise CandidateRunnerError("segmented execution requires an immutable source binding")
+    if writer_transports is not None:
+        writer_transports.require_candidate_binding(request)
     if isinstance(request.lease_token, (bytearray, memoryview)):
         request = replace(request, lease_token=bytes(request.lease_token))
     captured = await acquire_segmented_snowflake_capture(
@@ -254,9 +269,10 @@ async def run_segmented_snowflake_candidate(session_factory, connector, request,
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
         return _result(captured.status, captured, counts)
+    handoff = {} if writer_transports is None else {"writer_transports": writer_transports}
     try:
-        build_request = await _build_request(session_factory, request, captured, policy)
-        staged_source = await stage_segmented_source(session_factory, build_request)
+        build_request = await _build_request(session_factory, request, captured, policy, **handoff)
+        staged_source = await stage_segmented_source(session_factory, build_request, **handoff)
         counts = await count_source_outcomes(session_factory, build_request, staged_source.build_id)
         generation_id = await build_graph(session_factory, build_request, staged_source.build_id)
         if generation_id is None:

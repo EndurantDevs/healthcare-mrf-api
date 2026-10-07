@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -139,6 +140,57 @@ def test_capture_materialization_projection_preserves_retained_v1_bytes(model, e
     assert new_digest.digest() == old_digest.digest()
     model.manifest_sha256 = b"x" * 32
     assert _materialization_document(model) != expected
+
+
+def test_digest_fanout_serializes_once_and_shares_framed_parts(monkeypatch):
+    document_by_field = {"z": None, "a": 'café\n"\\'}
+    serialized = b'{"a":"caf\xc3\xa9\\n\\"\\\\","z":null}'
+    expected_parts = (b"root_scalar", b"\x00", len(serialized).to_bytes(8, "big"), serialized)
+    digests = (Mock(), Mock())
+    serialize = Mock(wraps=publication.json.dumps)
+    monkeypatch.setattr(publication.json, "dumps", serialize)
+
+    publication._add_digest_record_to_all(digests, "root_scalar", document_by_field)
+
+    serialize.assert_called_once_with(
+        document_by_field, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    for digest in digests:
+        assert tuple(call.args[0] for call in digest.update.call_args_list) == expected_parts
+    assert all(
+        first.args[0] is second.args[0]
+        for first, second in zip(digests[0].update.call_args_list, digests[1].update.call_args_list, strict=True)
+    )
+
+
+def test_digest_fanout_preserves_single_record_and_domain_bytes():
+    domains = ("generation-materialization/v1", "generation-effective-output/v1")
+    digests = tuple(publication._new_digest(domain) for domain in domains)
+    body = b'{"value":"12.000000000000"}'
+    frame = b"child_scalar\x00" + len(body).to_bytes(8, "big") + body
+    publication._add_digest_record_to_all(digests, "child_scalar", {"value": "12.000000000000"})
+    for digest, domain in zip(digests, domains, strict=True):
+        expected = hashlib.sha256(b"custom-import/v1\x00" + domain.encode("ascii") + b"\x00" + frame)
+        singleton = publication._new_digest(domain)
+        publication._add_digest_record(singleton, "child_scalar", {"value": "12.000000000000"})
+        assert digest.digest() == singleton.digest() == expected.digest()
+    assert digests[0].digest() != digests[1].digest()
+
+
+@pytest.mark.parametrize(
+    ("section", "document", "error"),
+    [
+        ("scalar", {"value": float("nan")}, ValueError),
+        ("scalar", {"value": object()}, TypeError),
+        ("é", {}, UnicodeError),
+    ],
+)
+def test_digest_encoding_failure_leaves_all_states_unchanged(section, document, error):
+    digests = (Mock(), Mock())
+    with pytest.raises(error):
+        publication._add_digest_record_to_all(digests, section, document)
+    for digest in digests:
+        digest.update.assert_not_called()
 
 
 def test_publication_event_is_canonical_and_domain_separated():
