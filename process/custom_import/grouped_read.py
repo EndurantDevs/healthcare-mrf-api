@@ -177,7 +177,7 @@ def _selected_value_relation(context):
     )
 
 
-def selected_family_statement(context, plan):
+def selected_family_statement(context, plan, *, materialize_default=False):
     """Retain all configured groups at one independently resolved entity value."""
 
     winner_model = context.model(CustomImportWinner)
@@ -191,6 +191,9 @@ def selected_family_statement(context, plan):
     selected_value = literal(plan.selected_value)
     if plan.selected_value is None:
         latest = _selected_value_relation(context)
+        if materialize_default:
+            # Bound the unpaged helper join without fencing entity-scoped detail reads.
+            latest = latest.element.cte("selected_entity_value").prefix_with("MATERIALIZED")
         statement = statement.join(latest, latest.c.entity_binding_id == winner_model.entity_binding_id)
         selected_value = latest.c.selected_value
     return statement.where(
@@ -202,10 +205,10 @@ def selected_family_statement(context, plan):
     )
 
 
-def matching_family_statement(context, plan):
+def matching_family_statement(context, plan, *, materialize_default=False):
     """Apply predicates to the fixed family set, never to helper selection."""
 
-    statement = selected_family_statement(context, plan)
+    statement = selected_family_statement(context, plan, materialize_default=materialize_default)
     for predicate in (*plan.context_filters, *plan.filters):
         if predicate.field.collection is None:
             statement = statement.where(core._predicate_condition(predicate, context))
@@ -237,7 +240,9 @@ def prepare_relation(context, query, scope):
         )
         columns.append(expression.label(f"sort_{ordinal}"))
     statement = (
-        matching_family_statement(context, plan).with_only_columns(*columns, maintain_column_froms=True).distinct()
+        matching_family_statement(context, plan, materialize_default=True)
+        .with_only_columns(*columns, maintain_column_froms=True)
+        .distinct()
     )
     return core.PreparedNpiEntityRelation(statement, plan.order_terms, plan.fingerprint, core._scope_digest(scope))
 

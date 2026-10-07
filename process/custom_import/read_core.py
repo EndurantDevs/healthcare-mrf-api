@@ -1734,6 +1734,7 @@ def _winner_identity_statement(context: _ReadContext):
             family_model,
             and_(
                 family_model.family_revision_id == winner_model.family_revision_id,
+                family_model.entity_binding_id == winner_model.entity_binding_id,
                 family_model.dataset_id == winner_model.dataset_id,
                 family_model.schema_revision_id == winner_model.schema_revision_id,
                 family_model.root_record_id == generation_family_model.root_record_id,

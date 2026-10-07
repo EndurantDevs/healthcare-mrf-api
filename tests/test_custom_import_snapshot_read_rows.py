@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from db.models import custom_import as models
 from process.custom_import import grouped_read, read_core
 from process.custom_import.definition import CustomImportDefinition
-from process.custom_import.storage_layout import snapshot_models
+from process.custom_import.storage_layout import snapshot_models, snapshot_tables
 from tests import custom_import_grouped_child_support as fixture
 
 _SCOPE = read_core.ExtensionReadScope("synthetic:snapshot-read")
@@ -218,6 +218,33 @@ def test_grouped_selection_reads_each_exact_leaf_and_retains_legacy_storage(row_
         contexts[17],
         replace(filtered, context_filters=query.context_filters + (read_core.ReadFilter("period", "eq", 2024),)),
     ) == [(_NPI, Decimal("100"))]
+
+
+@pytest.mark.parametrize("family_id, expected_score", [(None, "99"), (17, "2"), (18, "7")])
+@pytest.mark.parametrize("period", [None, 2025])
+def test_grouped_winners_require_the_selected_family_entity_binding(row_store, family_id, expected_score, period):
+    session, contexts = row_store
+    context = contexts[family_id]
+    selectors = (read_core.ReadFilter("segment", "eq", "segment_a"),)
+    if period is not None:
+        selectors += (read_core.ReadFilter("period", "eq", period),)
+    query = fixture.query(
+        context_filters=selectors,
+        order_terms=(read_core.ReadOrderTerm("score", "desc", "last"),),
+    )
+    assert _rows(session, context, query) == [(_NPI, Decimal(expected_score))]
+    tables_by_model = {
+        model: model.__table__ if family_id is None else snapshot_tables(family_id)[model.__tablename__]
+        for model in (models.CustomImportEntityBinding, models.CustomImportFamilyRevision)
+    }
+    session.execute(
+        tables_by_model[models.CustomImportEntityBinding].insert().values(
+            entity_binding_id=777, dataset_id=1, adapter_id="npi", canonical_value="1000000004"
+        )
+    )
+    family_table = tables_by_model[models.CustomImportFamilyRevision]
+    session.execute(family_table.update().where(family_table.c.entity_binding_id == 501).values(entity_binding_id=777))
+    assert _rows(session, context, query) == []
 
 
 def test_child_predicates_preserve_sibling_and_period_identity(row_store):
