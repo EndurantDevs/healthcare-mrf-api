@@ -64,7 +64,6 @@ from process.custom_import.definition import (
     canonical_sha256,
     load_json_definition,
 )
-from process.custom_import.read_payload import full_family_payload
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
@@ -72,8 +71,8 @@ from process.custom_import.read_contracts import (
     MAX_FAMILY_RESPONSE_BYTES,
     MAX_FILTER_TERMS,
     MAX_FULL_FAMILY_PAGE_SIZE,
-    MAX_GROUPED_PREDICATE_TERMS,
     MAX_GROUPED_CHILD_PREDICATE_TERMS,
+    MAX_GROUPED_PREDICATE_TERMS,
     MAX_NPI_PAGE_SIZE,
     MAX_ORDER_TERMS,
     MAX_PAGE_OFFSET,
@@ -107,6 +106,7 @@ from process.custom_import.read_identity import (
     verified_definition,
     verify_published_generation,
 )
+from process.custom_import.read_payload import full_family_payload
 from process.custom_import.storage_layout import snapshot_models
 
 _VALUE_STATES = frozenset({"value", "null", "missing"})
@@ -583,11 +583,16 @@ class CustomImportReadService:
         prepared: PreparedNpiEntityRelation,
         entity_values: tuple[str, ...],
         query: NpiEntityRelationQuery = NpiEntityRelationQuery(),
-    ) -> dict[str, SearchItem | EntityFamilySet]:
-        """Batch the same eligible winners for one native provider page."""
+        full_family: bool = False,
+    ) -> dict[str, SearchItem | RootDetail | EntityFamilySet]:
+        """Batch the same eligible winners with the default query projection.
+
+        Exact detail batches opt into complete ordinary root and child
+        projections with ``full_family``; grouped reads retain their entitlement.
+        """
 
         authorization_scope = self._authorize(authorization, pinned_target)
-        if type(query) is not NpiEntityRelationQuery:
+        if type(query) is not NpiEntityRelationQuery or type(full_family) is not bool:
             raise CustomImportReadRequestError("provider relation query is invalid")
         _validate_npi_entity_relation_request(
             query.filters,
@@ -596,6 +601,8 @@ class CustomImportReadService:
             maximum_terms=_relation_predicate_limit(query),
         )
         _validate_npi_page(entity_values)
+        if full_family and len(entity_values) > MAX_FULL_FAMILY_PAGE_SIZE:
+            raise CustomImportReadRequestError("full-family provider page exceeds its bound")
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, pinned_target)
             if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
@@ -603,19 +610,18 @@ class CustomImportReadService:
 
                 return await hydrate_page(session, context, query, prepared, entity_values, authorization_scope)
             return await self._hydrate_single_family_page(
-                session, context, query, prepared, entity_values, authorization_scope
+                session, context, query, prepared, entity_values, authorization_scope, full_family=full_family
             )
 
-    async def _hydrate_single_family_page(self, session, context, query, prepared, entity_values, authorization_scope):
+    async def _hydrate_single_family_page(
+        self, session, context, query, prepared, entity_values, authorization_scope, *, full_family=False
+    ):
         """Retain the legacy single-family page selection and fingerprint."""
 
         entity_model = context.model(CustomImportEntityBinding)
 
         normalized_context_filters, normalized_filters, normalized_order = _normalized_npi_query(
-            context,
-            query.context_filters,
-            query.filters,
-            query.order_terms,
+            context, query.context_filters, query.filters, query.order_terms
         )
         if (
             type(prepared) is not PreparedNpiEntityRelation
@@ -630,23 +636,32 @@ class CustomImportReadService:
         ):
             raise CustomImportReadUnavailableError("provider page query identity is unavailable")
         statement = (
-            _filtered_npi_winner_statement(
-                context,
-                normalized_filters,
-                context_filters=normalized_context_filters,
-            )
+            _filtered_npi_winner_statement(context, normalized_filters, context_filters=normalized_context_filters)
             .add_columns(entity_model.canonical_value)
             .where(entity_model.canonical_value.in_(entity_values))
-            .distinct(entity_model.canonical_value)
-            .order_by(entity_model.canonical_value, *_winner_order_terms(context, ()))
+        )
+        if full_family and entity_values:
+            await _require_unambiguous_npi_families(session, context, statement)
+        statement = statement.distinct(entity_model.canonical_value).order_by(
+            entity_model.canonical_value, *_winner_order_terms(context, ())
         )
         selected_rows = (await session.execute(statement)).all() if entity_values else ()
         winners = tuple(
             _winner_row(selected_row[:-1], context.profile_context_slot > 0) for selected_row in selected_rows
         )
-        hydrated_items = await _hydrate_provider_page_items(
-            session, context, winners, _scope_digest(authorization_scope)
-        )
+        if full_family:
+            hydrated_items = await _hydrate_complete_family_entities(
+                session,
+                context,
+                winners,
+                tuple(selected_row[-1] for selected_row in selected_rows),
+                _scope_digest(authorization_scope),
+                is_page=True,
+            )
+        else:
+            hydrated_items = await _hydrate_provider_page_items(
+                session, context, winners, _scope_digest(authorization_scope)
+            )
         await verify_published_generation(session, context.target)
         return {
             selected_row[-1]: hydrated_item
@@ -2165,6 +2180,27 @@ async def _selected_winner_row(
     if row is None:
         raise CustomImportReadUnavailableError("selected winner is not eligible for root detail")
     return _winner_row(row, context.profile_context_slot > 0)
+
+
+async def _require_unambiguous_npi_families(session, context, statement):
+    """Apply the scalar detail family identity rule to the complete NPI page."""
+
+    entity_model = context.model(CustomImportEntityBinding)
+    family_model = context.model(CustomImportFamilyRevision)
+    winner_model = context.model(CustomImportWinner)
+    family_count = func.count(
+        func.distinct(
+            tuple_(family_model.root_record_id, winner_model.family_revision_id, winner_model.entity_binding_id)
+        )
+    )
+    ambiguity_statement = (
+        statement.with_only_columns(entity_model.canonical_value, maintain_column_froms=True)
+        .group_by(entity_model.canonical_value)
+        .having(family_count > 1)
+        .limit(1)
+    )
+    if (await session.execute(ambiguity_statement)).first() is not None:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
 
 
 async def _entity_winner_locator(

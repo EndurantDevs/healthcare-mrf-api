@@ -130,6 +130,28 @@ def test_native_text_bound_does_not_call_subclass_length(native_encoder):
         native_encoder(False, [(root_key, child_key, binding, (OversizedText("a" * 2_049), *values[1:]))])
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    ["row_type", "row_shape", "binding_type", "values_type", "child_key", "field_type", "state", "slot", "key"],
+)
+def test_native_encoder_rejects_malformed_rows(native_encoder, corruption):
+    row = scalar_digest._scalar_tuple(*_typed_records(child=False)[0], child=False)
+    key, child_key, binding, values = row
+    malformed = {
+        "row_type": list(row),
+        "row_shape": row[:-1],
+        "binding_type": (key, child_key, list(binding), values),
+        "values_type": (key, child_key, binding, list(values)),
+        "child_key": (key, "a" * 65, binding, values),
+        "field_type": (key, child_key, (*binding[:4], "x" * 17, binding[5]), values),
+        "state": (key, child_key, (*binding[:5], "x" * 9), values),
+        "slot": (key, child_key, (2**15, *binding[1:]), values),
+        "key": ("A" * 64, child_key, binding, values),
+    }[corruption]
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        native_encoder(False, [malformed])
+
+
 @pytest.mark.parametrize("child", [False, True])
 def test_native_batches_preserve_digests_across_physical_pages(monkeypatch, native_encoder, child):
     monkeypatch.setattr(scalar_digest, "native_verifier", lambda: None)
@@ -292,6 +314,164 @@ def _verification_fixture(*, child):
         rows.append(scalar_digest._verification_row(scalar, child=child))
     group = ((3, 7, int(child)), ((b"r" * 32).hex(), (b"c" * 32).hex() if child else None), tuple(expected), rows)
     return [(int(child), tuple(fields))], [group], records
+
+
+@pytest.mark.parametrize("owner", [(1,), (True, 2), (2**63, 2)])
+def test_verified_native_rejects_malformed_owner(native_verifier, owner):
+    layouts, groups, _records = _verification_fixture(child=False)
+    with pytest.raises((ValueError, OverflowError)):
+        native_verifier(False, owner, layouts, groups)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "layout_type",
+        "layout_shape",
+        "collection_type",
+        "collection_range",
+        "fields_type",
+        "field_shape",
+        "field_type",
+        "projection_type",
+        "kind_bound",
+        "nullable_type",
+        "field_range",
+        "layout_bound",
+        "field_bound",
+        "missing_root",
+        "root_collection",
+        "duplicate_projection",
+    ],
+)
+def test_verified_native_rejects_malformed_layouts(native_verifier, corruption):
+    layouts, _groups, _records = _verification_fixture(child=False)
+    layout = layouts[0]
+    fields = layout[1]
+    field = fields[0]
+    malformed = {
+        "layout_type": [list(layout)],
+        "layout_shape": [(0,)],
+        "collection_type": [(True, fields)],
+        "collection_range": [(2**15, fields)],
+        "fields_type": [(0, list(fields))],
+        "field_shape": [(0, (field[:-1],))],
+        "field_type": [(0, ((True, *field[1:]),))],
+        "projection_type": [(0, ((field[0], True, *field[2:]),))],
+        "kind_bound": [(0, ((*field[:2], "x" * 17, field[3]),))],
+        "nullable_type": [(0, ((*field[:3], 1),))],
+        "field_range": [(0, ((2**15, *field[1:]),))],
+        "layout_bound": [(0, ())] * 9,
+        "field_bound": [(0, (field,) * 21)],
+        "missing_root": [],
+        "root_collection": [(1, fields)],
+        "duplicate_projection": [(0, (field, (2, field[1], "string", False)))],
+    }[corruption]
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        native_verifier(False, (1, 2), malformed, [])
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "revision_type",
+        "revision_shape",
+        "target_type",
+        "target_identity",
+        "target_range",
+        "collection",
+        "keys_shape",
+        "key_type",
+        "key_none",
+        "key_encoding",
+        "revision_identity",
+        "expected_type",
+        "expected_count",
+        "expected_cell",
+        "state_bound",
+        "state_none",
+        "state_null",
+        "expected_value",
+        "actual_type",
+        "actual_count",
+    ],
+)
+def test_verified_native_rejects_malformed_revision_inputs(native_verifier, corruption):
+    layouts, groups, _records = _verification_fixture(child=False)
+    target, keys, expected, rows = groups[0]
+    malformed = {
+        "revision_type": list(groups[0]),
+        "revision_shape": groups[0][:-1],
+        "target_type": (list(target), keys, expected, rows),
+        "target_identity": ((True, *target[1:]), keys, expected, rows),
+        "target_range": ((*target[:2], 2**15), keys, expected, rows),
+        "collection": ((*target[:2], 1), keys, expected, rows),
+        "keys_shape": (target, keys[:1], expected, rows),
+        "key_type": (target, (1, None), expected, rows),
+        "key_none": (target, (None, None), expected, rows),
+        "key_encoding": (target, ("A" * 64, None), expected, rows),
+        "revision_identity": ((0, *target[1:]), keys, expected, rows),
+        "expected_type": (target, keys, list(expected), rows),
+        "expected_count": (target, keys, expected[:-1], rows),
+        "expected_cell": (target, keys, (expected[0][:-1], *expected[1:]), rows),
+        "state_bound": (target, keys, (("x" * 9, expected[0][1]), *expected[1:]), rows),
+        "state_none": (target, keys, ((None, expected[0][1]), *expected[1:]), rows),
+        "state_null": (target, keys, (("null", expected[0][1]), *expected[1:]), rows),
+        "expected_value": (target, keys, (("value", object()), *expected[1:]), rows),
+        "actual_type": (target, keys, expected, tuple(rows)),
+        "actual_count": (target, keys, expected, [*rows, *rows[:5]]),
+    }[corruption]
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        native_verifier(False, (1, 2), layouts, [malformed])
+
+
+@pytest.mark.parametrize("corruption", ["row", "identity", "binding", "cells", "field_type", "state", "slot"])
+def test_verified_native_rejects_malformed_actual_rows(native_verifier, corruption):
+    layouts, groups, _records = _verification_fixture(child=False)
+    target, keys, expected, rows = groups[0]
+    identity, binding, cells = rows[0]
+    malformed = {
+        "row": list(rows[0]),
+        "identity": (identity[:-1], binding, cells),
+        "binding": (identity, binding[:-1], cells),
+        "cells": (identity, binding, cells[:-1]),
+        "field_type": (identity, (*binding[:4], "x" * 17, binding[5]), cells),
+        "state": (identity, (*binding[:5], "x" * 9), cells),
+        "slot": (identity, (2**15, *binding[1:]), cells),
+    }[corruption]
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        native_verifier(False, (1, 2), layouts, [(target, keys, expected, [malformed, *rows[1:]])])
+
+
+@pytest.mark.parametrize(
+    ("row_index", "column_index", "value", "error_type", "message"),
+    [
+        (0, 0, "embedded\0text", ValueError, "scalar verification value type differs"),
+        (4, 2, Decimal("NaN"), ValueError, "scalar verification decimal exceeds its bound"),
+        (4, 2, Decimal("Infinity"), ValueError, "scalar verification decimal exceeds its bound"),
+        (4, 2, Decimal("1E-13"), ValueError, "scalar verification decimal exceeds storage"),
+        (4, 2, Decimal("1E18"), ValueError, "scalar verification decimal exceeds storage"),
+        (4, 2, Decimal("1E-40"), OverflowError, "too large to convert"),
+        (9, 5, dt.datetime(2000, 1, 1), ValueError, "scalar verification value type differs"),
+        (
+            9,
+            5,
+            dt.datetime(1, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=1))),
+            OverflowError,
+            "date value out of range",
+        ),
+    ],
+)
+def test_verified_native_rejects_noncanonical_cells(
+    native_verifier, row_index, column_index, value, error_type, message
+):
+    layouts, groups, _records = _verification_fixture(child=False)
+    target, keys, expected, rows = groups[0]
+    identity, binding, cells = rows[row_index]
+    cells = (*cells[:column_index], value, *cells[column_index + 1 :])
+    rows[row_index] = (identity, binding, cells)
+    with pytest.raises(error_type, match=message):
+        native_verifier(False, (1, 2), layouts, [(target, keys, expected, rows)])
 
 
 @pytest.mark.parametrize("child", [False, True])
