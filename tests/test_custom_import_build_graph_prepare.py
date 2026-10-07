@@ -23,6 +23,7 @@ from db.models.custom_import import (
 )
 from process.custom_import import build_graph as graph
 from process.custom_import import build_graph_prepare_page as prepare
+from process.custom_import import runner_codec, runner_graph
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.family import RootFamily
 from process.custom_import.runner_codec import (
@@ -34,7 +35,12 @@ from process.custom_import.runner_codec import (
     root_key_hash,
 )
 from process.custom_import.runner_graph import entity_value_digest
-from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
+from process.custom_import.runner_types import (
+    CancellationRequested,
+    CandidateRunnerError,
+    LeaseAuthorityLost,
+    StoredCandidateChild,
+)
 from process.custom_import.storage_layout import snapshot_models
 from tests.test_custom_import_build_graph import _registry, _request, _revision
 from tests.test_custom_import_definition import _raw_definition, _root
@@ -129,6 +135,44 @@ def child_row(request, root, values, child_id, collection="rates"):
     child.canonical_parent_key = root[2].canonical_logical_key
     child.parent_key_sha256 = root[2].logical_key_sha256
     return root[0].root_record_id, collection, child, True
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_root_identity_guards_each_encode_the_checked_key_once(monkeypatch, retained):
+    request = _request()
+    row = root_row(request, 1, retained=retained)
+    encoder = Mock(wraps=runner_codec.root_key_document)
+    for module in (prepare, runner_graph, runner_codec):
+        monkeypatch.setattr(module, "root_key_document", encoder)
+
+    family_input = prepare._root_input(request, row)
+
+    assert family_input.root is row[1] and family_input.record is row[2]
+    assert family_input.values["npi"] == "0000000001"
+    assert encoder.call_count == (2 if retained else 1)
+
+
+@pytest.mark.parametrize("corruption", [None, "parent_key_sha256", "canonical_child_key", "child_key_sha256"])
+def test_stored_child_identity_reuses_checked_key_and_preserves_errors(monkeypatch, corruption):
+    request = _request()
+    row = root_row(request, 1)
+    child_values_by_field = {"rate_npi": "0000000001", "service_code": 'A"\\\nΔ', "amount": Decimal("12.500")}
+    child = child_row(request, row, child_values_by_field, 1)[2]
+    if corruption is not None:
+        setattr(child, corruption, "[]" if corruption == "canonical_child_key" else b"x" * 32)
+    encoder = Mock(wraps=runner_codec.child_key_document)
+    for module in (runner_graph, runner_codec):
+        monkeypatch.setattr(module, "child_key_document", encoder)
+    stored_child = StoredCandidateChild("rates", child, child_values_by_field)
+
+    if corruption is None:
+        runner_graph.verify_stored_child(request, row[2], stored_child)
+    else:
+        with pytest.raises(
+            CandidateRunnerError, match="^current generation child identity does not match its payload$"
+        ):
+            runner_graph.verify_stored_child(request, row[2], stored_child)
+    encoder.assert_called_once_with(request.definition, "rates", child_values_by_field)
 
 
 def root_metadata(rows):
@@ -532,12 +576,16 @@ def test_noncanonical_root_identity_stops_before_child_reads(monkeypatch, model_
     request = _request()
     row = root_row(request, 1)
     setattr(row[model_index], field, value)
+    encoder = Mock(wraps=runner_codec.root_key_document)
+    monkeypatch.setattr(prepare, "root_key_document", encoder)
+    monkeypatch.setattr(runner_codec, "root_key_document", encoder)
     session = read_session(monkeypatch, [root_metadata([row]), [row]])
     with pytest.raises(CandidateRunnerError, match="root payload or identity is not canonical"):
         prepare.prepare_family_page(session, request, _registry(request.definition), 7, 0)
     assert session.execute.call_count == 2
     assert session.closed == session.transactions == 1
     assert row[0].family_revision_id is None
+    assert encoder.call_count == (1 if field in {"canonical_logical_key", "logical_key_sha256"} else 0)
 
 
 def test_source_preparation_requires_space_for_both_root_and_child(monkeypatch):

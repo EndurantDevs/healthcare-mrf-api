@@ -58,7 +58,7 @@ from db.models.custom_import import (
     CustomImportWinner,
 )
 from process.custom_import import materialization as material
-from process.custom_import import publication
+from process.custom_import import publication, scalar_digest
 from process.custom_import.build_graph import (
     _build_storage_models,
     _call,
@@ -78,8 +78,8 @@ from process.custom_import.build_graph import (
     _session,
     _snapshot,
     _source_digest,
-    _verify_request,
     _variable_bytes,
+    _verify_request,
 )
 from process.custom_import.build_graph_prepare_page import _source_input_with_digest
 from process.custom_import.build_source import (
@@ -947,6 +947,8 @@ def _projection_query(models, generation, *, child):
 
 
 def _expected_projections(request, registry, revision, *, child):
+    """Validate and order every projection without constructing scalar models."""
+
     if child:
         collection = next(
             name for name, slot in registry.child_collection_slots.items() if slot == revision.collection_slot
@@ -969,9 +971,7 @@ def _expected_projections(request, registry, revision, *, child):
             child_values=values_by_field,
             child_collection_slots=registry.child_collection_slots,
         )
-        expected = material.scalar_projection_models(
-            request.definition, child_scalars=projections, child_collection_slots=registry.child_collection_slots
-        )
+        material._validate_scalar_projection_rows(request.definition, (), projections, registry.child_collection_slots)
     else:
         values_by_field = payload_values(
             request.definition.root_fields, revision.canonical_payload, label="frozen root payload"
@@ -983,49 +983,107 @@ def _expected_projections(request, registry, revision, *, child):
             ),
             root_values=values_by_field,
         )
-        expected = material.scalar_projection_models(request.definition, root_scalars=projections)
-    return sorted(expected, key=lambda scalar: scalar.field_slot)
+        material._validate_scalar_projection_rows(request.definition, projections, (), {})
+    return sorted(projections, key=lambda projection: projection.field_slot)
 
 
-def _verified_projection_rows(session, request, registry, build_id, generation, *, child):
+def _verified_projection_rows(session, request, registry, build_id, generation, *, child, bounds=_ReadPage()):
     """Compare the bounded scalar stream without retaining payloads across pages."""
 
     model = CustomImportChildScalar if child else CustomImportRootScalar
+    to_values = material._child_scalar_values if child else material._root_scalar_values
     previous_id, seen, expected_count = None, 0, 0
-    with closing(
-        _output_rows(session, request, build_id, lambda models: _projection_query(models, generation, child=child))
-    ) as projection_records:
-        for scalar, revision, root_key in projection_records:
-            revision_id = revision.child_revision_id if child else revision.root_revision_id
-            if revision_id != previous_id:
-                if seen != expected_count:
+    projections = []
+
+    def query(models):
+        """Drop prepared values before reading each physical metadata/payload page."""
+        projections.clear()
+        return _projection_query(models, generation, child=child)
+
+    try:
+        with closing(_output_rows(session, request, build_id, query, bounds=bounds)) as projection_records:
+            for scalar, revision, root_key in projection_records:
+                revision_id = revision.child_revision_id if child else revision.root_revision_id
+                if revision_id != previous_id and seen != expected_count:
                     raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
-                previous_id, seen = revision_id, 0
-            # Recompute the at-most-20 hot fields within this admitted tuple;
-            # do not retain a projection page while the next page is read.
-            expected = _expected_projections(request, registry, revision, child=child)
-            expected_count = len(expected)
-            if scalar is None and not expected:
-                del expected, scalar, revision, root_key
-                continue
-            if (
-                scalar is None
-                or seen >= expected_count
-                or any(
-                    getattr(scalar, column.name) != getattr(expected[seen], column.name)
-                    for column in model.__table__.columns
-                )
-            ):
-                raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
-            seen += 1
-            del expected
-            yield scalar, revision, root_key
-            del scalar, revision, root_key
+                if revision_id != previous_id:
+                    previous_id, seen = revision_id, 0
+                    projections.clear()
+                if not projections:
+                    projections.extend(_expected_projections(request, registry, revision, child=child))
+                    expected_count = len(projections)
+                expected = to_values(projections[seen]) if seen < expected_count else None
+                if scalar is None and not expected_count:
+                    del expected, scalar, revision, root_key
+                    continue
+                if (
+                    scalar is None
+                    or seen >= expected_count
+                    or any(getattr(scalar, column.name) != expected[column.name] for column in model.__table__.columns)
+                ):
+                    raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
+                seen += 1
+                del expected
+                yield scalar, revision, root_key
+                del scalar, revision, root_key
+    finally:
+        projections.clear()
     if seen != expected_count:
         raise CandidateRunnerError("typed scalar projection differs from the frozen payload")
 
 
+def _native_scalar_material(session, request, registry, build_id, generation, digests, verifier, *, child):
+    """Keep native verification behind the existing physical read authority."""
+    layouts, contexts_by_slot = scalar_digest.verification_layouts(
+        request.definition, registry.child_collection_slots, child=child
+    )
+    projection_records = _output_rows(
+        session,
+        request,
+        build_id,
+        lambda models: _projection_query(models, generation, child=child),
+        bounds=_ReadPage(
+            reserve_bytes=scalar_digest.RESERVE_BYTES,
+            row_limit=(MAX_BATCH_ROWS - 1 - scalar_digest.VERIFY_RESERVED_ROWS) // 2,
+        ),
+    )
+    return scalar_digest.verified_material(
+        verifier,
+        scalar_digest.verification_revisions(projection_records, contexts_by_slot, child=child),
+        (request.dataset_id, request.schema_revision_id),
+        layouts,
+        digests,
+        child=child,
+        check_budget=lambda: _require_budget(session.info["custom_import_build_read_deadline"]),
+    )
+
+
 def _scalar_material(session, request, registry, build_id, generation, digests, *, child):
+    """Verify every selected projection, then encode its unchanged v1 frames."""
+    verifier = scalar_digest.native_verifier()
+    if (
+        verifier is not None
+        and MAX_BATCH_ROWS > scalar_digest.VERIFY_RESERVED_ROWS + 1
+        and MAX_BATCH_BYTES > scalar_digest.RESERVE_BYTES
+    ):
+        return _native_scalar_material(session, request, registry, build_id, generation, digests, verifier, child=child)
+    encoder = scalar_digest.native_encoder()
+    if (
+        encoder is not None
+        and MAX_BATCH_ROWS > 2 * scalar_digest.BATCH_ROWS + 1
+        and MAX_BATCH_BYTES > scalar_digest.RESERVE_BYTES
+    ):
+        bounds = _ReadPage(
+            reserve_bytes=scalar_digest.RESERVE_BYTES,
+            row_limit=(MAX_BATCH_ROWS - 1 - 2 * scalar_digest.BATCH_ROWS) // 2,
+        )
+        return scalar_digest.scalar_material(
+            encoder,
+            _verified_projection_rows(session, request, registry, build_id, generation, child=child, bounds=bounds),
+            digests,
+            child=child,
+            check_budget=lambda: _require_budget(session.info["custom_import_build_read_deadline"]),
+        )
     scalar_count = 0
     for scalar, revision, root_key in _verified_projection_rows(
         session, request, registry, build_id, generation, child=child
@@ -1036,8 +1094,7 @@ def _scalar_material(session, request, registry, build_id, generation, digests, 
         }
         if child:
             document_by_field["child_key_sha256"] = bytes(revision.child_key_sha256).hex()
-        for digest in digests:
-            publication._add_digest_record(digest, "child_scalar" if child else "root_scalar", document_by_field)
+        publication._add_digest_record_to_all(digests, "child_scalar" if child else "root_scalar", document_by_field)
         scalar_count += 1
         del scalar, revision, root_key, document_by_field
     return scalar_count

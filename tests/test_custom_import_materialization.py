@@ -169,6 +169,13 @@ def test_projection_preserves_scalar_states_and_native_columns(definition):
     assert isinstance(models[-1], CustomImportChildScalar)
     assert models[-1].value_state == "null"
     assert models[-1].decimal_value is None
+    for projection, model in zip((*root_scalars, *child_scalars), models, strict=True):
+        to_values = (
+            materialization_module._root_scalar_values
+            if isinstance(model, CustomImportRootScalar)
+            else materialization_module._child_scalar_values
+        )
+        assert to_values(projection) == {column.name: getattr(model, column.name) for column in model.__table__.columns}
 
 
 def test_projection_rejects_required_values_and_wrong_child_scope(definition):
@@ -1056,6 +1063,39 @@ def test_typed_scalar_validation_rejects_ambiguous_storage():
         materialization_module._utf8_size("\ud800", "synthetic")
     with pytest.raises(ScalarProjectionError, match="unsupported type"):
         materialization_module._typed_scalar(replace(_typed_definition().root_fields[0], value_type="unsupported"), 1)
+
+
+@pytest.mark.parametrize("null", [False, True])
+@pytest.mark.parametrize(
+    ("field_type", "value"),
+    [
+        ("string", "café 漢字"),
+        ("integer", -(2**63)),
+        ("decimal", Decimal("-0.000000000000")),
+        ("boolean", False),
+        ("date", date(1, 1, 1)),
+        ("timestamp", datetime.fromisoformat("2025-01-02T03:04:05.123456+05:30")),
+    ],
+)
+def test_typed_scalar_revalidation_does_not_reconstruct_field_or_scalar(monkeypatch, field_type, value, null):
+    scalar = TypedScalar(field_type, "null" if null else "value", **{f"{field_type}_value": None if null else value})
+    original = vars(scalar).copy()
+    logical_value = TypedScalar.logical_value.fget
+    reads = []
+
+    def read_value(row):
+        reads.append(row)
+        return logical_value(row)
+
+    def unexpected_construction(*_args, **_kwargs):
+        raise AssertionError("revalidation must not construct Field or TypedScalar")
+
+    monkeypatch.setattr(materialization_module, "Field", unexpected_construction)
+    monkeypatch.setattr(TypedScalar, "__init__", unexpected_construction)
+    monkeypatch.setattr(TypedScalar, "logical_value", property(read_value))
+    materialization_module._validate_typed_scalar(scalar)
+    assert reads == ([] if null else [scalar])
+    assert vars(scalar) == original
 
 
 def test_candidate_validation_rejects_invalid_identity_scope_and_values(definition):

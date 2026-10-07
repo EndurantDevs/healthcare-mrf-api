@@ -68,7 +68,6 @@ from process.custom_import.runner_codec import (
     record_payload,
     root_key_contract_hash,
     root_key_document,
-    root_key_hash,
 )
 from process.custom_import.runner_graph import stored_root_values
 from process.custom_import.runner_types import CandidateRunnerError
@@ -414,8 +413,8 @@ def _root_input(request, row):
         record_payload(request.definition.root_fields, values) != root.canonical_payload
         or digest_text("root-payload", root.canonical_payload) != bytes(root.payload_sha256)
         or root_key_contract_hash(request.definition) != bytes(record.key_contract_sha256)
-        or root_key_document(request.definition, values) != record.canonical_logical_key
-        or root_key_hash(request.definition, values) != bytes(record.logical_key_sha256)
+        or (canonical_root_key := root_key_document(request.definition, values)) != record.canonical_logical_key
+        or digest_text("root-key", canonical_root_key) != bytes(record.logical_key_sha256)
     ):
         raise CandidateRunnerError("build root payload or identity is not canonical")
     if binding is not None:

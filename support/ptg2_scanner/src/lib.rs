@@ -5,6 +5,7 @@ pub mod address_evidence_alias;
 pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
+pub mod custom_import_scalar;
 pub mod dedupe;
 pub mod hashing;
 pub mod hospital_mrf;
@@ -92,6 +93,7 @@ mod python_api {
     static LOCATION_CANON_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
     include!("python_hospital_price.rs");
+    include!("python_custom_import.rs");
 
     fn location_canon_pool() -> PyResult<&'static ThreadPool> {
         if let Some(pool) = LOCATION_CANON_POOL.get() {
@@ -250,6 +252,11 @@ mod python_api {
         m.add_function(wrap_pyfunction!(hospital_price_decode_payer_plan_keys, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
+        m.add_function(wrap_pyfunction!(custom_import_scalar_frames_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            custom_import_verified_scalar_frames_v1,
+            m
+        )?)?;
         Ok(())
     }
 

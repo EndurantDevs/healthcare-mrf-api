@@ -142,8 +142,10 @@ execution path and identity; it does not inherit current operator settings.
 | `build` | `page_row_limit`, `page_byte_limit`, `statement_timeout_ms`, `lease_seconds`, `build_deadline_seconds` |
 
 All limits are explicit positive integers; unknown, missing, incoherent, or
-over-ceiling values fail validation. Build pages admit at most 256 records and
-256 MiB. Declaration ceilings are not recommended sizing or throughput claims.
+over-ceiling values fail validation. Logical build pages admit at most 256 records
+and 256 MiB. Physical SOURCE and trusted admission batches may combine logical
+pages within a 100,000-record/256-MiB ceiling without changing their identity or
+validation rules. Declaration ceilings are not recommended sizing or throughput claims.
 Changing any retained limit requires a new binding revision, not a retry of an
 old request with different settings. The complete capture-policy fields and
 validation are defined in
@@ -171,6 +173,33 @@ credentials or fetching source rows. An expired deadline cannot be extended by
 retrying. Run acquisition in a supervised worker process: driver timeouts and
 cooperative cancellation alone cannot guarantee hard termination of a blocked
 driver. No policy declaration grants database or source authorization.
+
+### Optional trusted batch writer
+
+Restricted workers may use two fixed internal operations for SOURCE loading and
+family admission. The application derives bytes and configuration from the sealed
+capture; requests contain only retained execution/build/fence and cursor identities.
+SOURCE authorization, bounded COPY and ordinary set-based finalization share one
+transaction. Existing standalone operation remains available without this handoff.
+
+The launcher must authenticate and mount the complete immutable pair of
+purpose-separated permits, `admission-launch.json` and the fixed `.writer-ca.pem`
+certificate-only bundle before either `execute` or `resume`. The launch descriptor
+pins the exact CA bytes; both clients verify certificates and hostnames using only
+that bundle, without environment trust. A partial or invalid stage fails before
+source credentials or a claim; it never silently selects the local writer.
+Both permits retain their original
+scope and expiry. Workers receive no signing keys or additional database authority.
+The engine endpoints are disabled without a dedicated keyring and fixed HTTPS
+origin, and public proxy listeners deny both operations.
+
+An uncertain response permits one read of retained progress, not automatic resend
+or local fallback. Continue only from verified forward progress under the same
+authority. Source part boundaries do not define physical COPY batch size; small
+parts are combined within the row and byte ceilings after verified reader close.
+Measure capture, replay, validation, indexes and usable reads together before
+claiming a throughput gain. The previous published snapshot continues serving
+until the replacement is verified and atomically activated.
 
 ## Related child collections
 

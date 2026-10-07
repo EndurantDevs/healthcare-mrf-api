@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 METADATA_ONLY = (
     "github.event_name == 'pull_request' && github.event.action == 'edited' "
     "&& !github.event.changes.title && !github.event.changes.base"
@@ -91,32 +90,35 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     assert "container" not in job
     assert "services" not in job
     assert not job.get("continue-on-error")
-    setup = next(step for step in job["steps"] if step.get("name") == "Install Python")
-    assert setup == {
-        "name": "Install Python",
-        "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-        "with": {"python-version": "3.14.7"},
-    }
+    managed_python = next(step for step in job["steps"] if step.get("name") == "Install uv-managed Python")
+    assert set(managed_python) == {"name", "run"}
+    assert "uv --no-config venv --managed-python --python 3.14.7" in managed_python["run"]
+    assert '"$RUNNER_TEMP/uv-python.XXXXXX"' in managed_python["run"]
+    assert '"$GITHUB_PATH"' in managed_python["run"]
+    assert '"$GITHUB_ENV"' in managed_python["run"]
+    assert 'sysconfig.get_config_var("LIBDIR")' in managed_python["run"]
+    assert '"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' in managed_python["run"]
+    assert "actions/setup-python@" not in workflow_text
     bootstrap = next(step for step in job["steps"] if step.get("name") == "Install pinned uv")
-    assert bootstrap["run"] == (
-        "printf '%s\\n' 'uv==0.12.17 "
-        "--hash=sha256:9e25bb39e1674799c408345a6397ebc2c7c719d498be0ce9d935466d36ceacf5' |\n"
-        "  python -m pip install --disable-pip-version-check --no-deps "
-        "--only-binary=:all: --require-hashes -r /dev/stdin\n"
-        "test \"$(uv --version | awk '{print $2}')\" = 0.12.17\n"
+    assert set(bootstrap) == {"name", "run"}
+    assert (
+        "https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz"
+        in bootstrap["run"]
     )
+    assert "fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63" in bootstrap["run"]
+    assert "sha256sum --check --strict" in bootstrap["run"]
+    assert "uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx" in bootstrap["run"]
+    assert '"$GITHUB_PATH"' in bootstrap["run"]
+
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ci/public_hygiene.py" in commands
     assert "uv venv --python 3.14.7 --no-python-downloads .venv" in commands
     assert "uv pip install --python .venv/bin/python" in commands
     assert ".venv/bin/python -m pytest -q" in commands
-    assert "python -m pip install" not in "\n".join(
-        step.get("run", "") for step in job["steps"] if step is not bootstrap
-    )
+    assert "python -m pip install" not in "\n".join(step.get("run", "") for step in job["steps"])
     assert "test_process_" in commands or "tests/process/" in commands
     assert all(
-        token not in workflow_text
-        for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
+        token not in workflow_text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
     )
 
 
@@ -128,22 +130,24 @@ def _assert_source_validation_job(workflow) -> None:
     assert job["if"] == "${{ always() }}"
     assert job["permissions"] == {"actions": "read"}
     step = job["steps"]
-    assert step == [{
-        "name": "Require complete public validation",
-        "env": {
-            "GH_TOKEN": "${{ github.token }}",
-            "METADATA_ONLY": "${{ " + METADATA_ONLY + " }}",
-            "PR_NUMBER": "${{ github.event.pull_request.number || '' }}",
-            "SOURCE_SHA": "${{ github.event.pull_request.head.sha || github.sha }}",
-            "BASE_SHA": "${{ github.event.pull_request.base.sha || '' }}",
-            "RESULTS": "${{ toJSON(needs.*.result) }}",
-        },
-        "run": step[0]["run"],
-    }]
+    assert step == [
+        {
+            "name": "Require complete public validation",
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "METADATA_ONLY": "${{ " + METADATA_ONLY + " }}",
+                "PR_NUMBER": "${{ github.event.pull_request.number || '' }}",
+                "SOURCE_SHA": "${{ github.event.pull_request.head.sha || github.sha }}",
+                "BASE_SHA": "${{ github.event.pull_request.base.sha || '' }}",
+                "RESULTS": "${{ toJSON(needs.*.result) }}",
+            },
+            "run": step[0]["run"],
+        }
+    ]
     run = step[0]["run"]
-    assert "if [ \"$METADATA_ONLY\" != true ]; then" in run
-    assert "jq -e 'length > 0 and all(. == \"success\")' <<< \"$RESULTS\"" in run
-    assert "if ! validation_state=\"$(" in run
+    assert 'if [ "$METADATA_ONLY" != true ]; then' in run
+    assert 'jq -e \'length > 0 and all(. == "success")\' <<< "$RESULTS"' in run
+    assert 'if ! validation_state="$(' in run
     assert "actions/workflows/ci.yml/runs?event=pull_request&head_sha=$SOURCE_SHA&per_page=100" in run
     assert 'select(.name == "CI" and .display_title == "CI")' in run
     assert (
@@ -164,11 +168,16 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     workflow = yaml.safe_load(text)
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
     assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
-        "opened", "synchronize", "reopened", "edited",
+        "opened",
+        "synchronize",
+        "reopened",
+        "edited",
     }
     assert workflow.get("on", workflow.get(True))["push"]["branches"] == ["main", "dev"]
     assert workflow["permissions"] == {
-        "contents": "read", "pull-requests": "read", "actions": "read",
+        "contents": "read",
+        "pull-requests": "read",
+        "actions": "read",
     }
     assert set(workflow["jobs"]) == set(JOB_LABELS)
     revision = workflow["env"]["CI_REVISION"]
@@ -178,7 +187,8 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert workflow["run-name"] == "${{ " + METADATA_ONLY + " && 'CI metadata update' || 'CI' }}"
     assert workflow["concurrency"] == {
         "group": (
-            "${{ " + METADATA_ONLY
+            "${{ "
+            + METADATA_ONLY
             + " && format('ci-metadata-{0}', github.event.pull_request.number) || github.event_name == 'push' "
             + "&& format('ci-push-{0}', github.run_id) || format('ci-{0}', github.ref) }}"
         ),
@@ -198,7 +208,10 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         assert not job.get("continue-on-error")
         if job_id == "dev-image-publication":
             assert job["permissions"] == {
-                "contents": "read", "pull-requests": "read", "actions": "read", "packages": "write",
+                "contents": "read",
+                "pull-requests": "read",
+                "actions": "read",
+                "packages": "write",
             }
         elif job_id == "artifact-cleanup":
             assert job["permissions"] == {"contents": "read", "actions": "write"}
@@ -214,31 +227,41 @@ def test_stale_artifact_cleanup_is_main_only_and_pinned():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     revision = yaml.safe_load((path.parent / "ci.yml").read_text())["env"]["CI_REVISION"]
     assert workflow.get("on", workflow.get(True)) == {
-        "schedule": [{"cron": "47 2 * * *"}], "workflow_dispatch": None,
+        "schedule": [{"cron": "47 2 * * *"}],
+        "workflow_dispatch": None,
     }
     assert workflow["permissions"] == {
-        "contents": "read", "pull-requests": "read", "actions": "write",
+        "contents": "read",
+        "pull-requests": "read",
+        "actions": "write",
     }
     assert workflow["concurrency"] == {
-        "group": "public-artifact-cleanup", "cancel-in-progress": False,
+        "group": "public-artifact-cleanup",
+        "cancel-in-progress": False,
     }
     assert set(workflow["jobs"]) == {"stale-cleanup"}
     job = workflow["jobs"]["stale-cleanup"]
-    assert job["if"] == (
-        "github.repository == 'EndurantDevs/healthcare-mrf-api' "
-        "&& github.ref == 'refs/heads/main'"
-    )
+    assert job["if"] == ("github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/main'")
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] == 30
     assert job["steps"] == [
-        {"name": "Check out trusted artifact lifecycle",
-         "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-         "with": {"repository": "EndurantDevs/endurant-ci",
-                  "ref": revision, "path": "ci",
-                  "persist-credentials": False}},
-        {"name": "Delete only obsolete authenticated artifacts",
-         "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
-         "run": "python3 ci/scripts/artifact_cleanup.py --stale"},
+        {
+            "name": "Check out trusted artifact lifecycle",
+            "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "with": {
+                "repository": "EndurantDevs/endurant-ci",
+                "ref": revision,
+                "path": "ci",
+                "persist-credentials": False,
+            },
+        },
+        {"name": "Install pinned uv", "run": "bash ci/scripts/install_uv"},
+        {"name": "Install uv-managed Python", "run": "bash ci/scripts/setup_python"},
+        {
+            "name": "Delete only obsolete authenticated artifacts",
+            "env": {"GH_TOKEN": "${{ github.token }}", "PYTHONDONTWRITEBYTECODE": "1"},
+            "run": "python3 ci/scripts/artifact_cleanup.py --stale",
+        },
     ]
 
 
@@ -259,7 +282,8 @@ def _assert_matrix_artifact_identity(job_id, job) -> None:
     prefix = "${{ runner.temp }}/healthcare-artifacts/"
     suffix = kind + ".${{ matrix.shard }}"
     assert [line.strip() for line in upload["with"]["path"].splitlines() if line.strip()] == [
-        prefix + ".coverage." + suffix, prefix + ".coverage-provenance." + suffix + ".json",
+        prefix + ".coverage." + suffix,
+        prefix + ".coverage-provenance." + suffix + ".json",
     ]
     assert upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["include-hidden-files"] is True
@@ -294,14 +318,23 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
     jobs = workflow["jobs"]
     publisher = jobs["measurement"]
     assert set(publisher["needs"]) == set(JOB_LABELS) - {
-        "smoke", "measurement", "source-validation", "dev-image-publication", "artifact-cleanup",
+        "smoke",
+        "measurement",
+        "source-validation",
+        "dev-image-publication",
+        "artifact-cleanup",
     }
-    download = next(step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts")
+    download = next(
+        step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts"
+    )
     identities = [" ".join(selector.split()) for selector in download["with"]["artifact-ids"].split(",")]
     expected_ids = [f"${{{{ needs.python-tests.outputs.artifact_{index} }}}}" for index in range(4)]
-    expected_ids.extend([
-        "${{ needs.capacity-evidence.outputs.artifact_id }}", "${{ needs.rust-scanner.outputs.artifact_id }}",
-    ])
+    expected_ids.extend(
+        [
+            "${{ needs.capacity-evidence.outputs.artifact_id }}",
+            "${{ needs.rust-scanner.outputs.artifact_id }}",
+        ]
+    )
     expected_ids.extend(
         "${{ needs.address-canonical-db-tests.outputs." + matrix_row["output"] + " }}"
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
@@ -312,7 +345,10 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
     assert jobs["dev-image-publication"]["needs"] == [
-        "smoke", "source-validation", "container-package", "measurement",
+        "smoke",
+        "source-validation",
+        "container-package",
+        "measurement",
     ]
     assert jobs["dev-image-publication"]["env"] == {
         "CI_REVISION": workflow["env"]["CI_REVISION"],
@@ -321,5 +357,7 @@ def test_publisher_requires_every_matrix_result_and_fourteen_immutable_artifacts
         "MEASUREMENT_ARTIFACT_ID": "${{ needs.measurement.outputs.measurement_artifact_id }}",
     }
     assert jobs["artifact-cleanup"]["needs"] == [
-        "dev-image-publication", "container-package", "measurement",
+        "dev-image-publication",
+        "container-package",
+        "measurement",
     ]

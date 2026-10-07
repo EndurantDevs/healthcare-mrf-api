@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -46,6 +48,8 @@ __all__ = (
     "load_replayable_parquet_bundle",
     "open_replayable_parquet_parts",
     "open_segmented_parquet_parts",
+    "open_segmented_cursor_part",
+    "verify_segmented_stream_metadata",
     "register_capture_bundle",
     "register_replayable_parquet_bundle",
 )
@@ -1243,6 +1247,191 @@ async def _segmented_parts(verified):
             part.record_count,
             part.arrow_byte_count,
         )
+
+
+@asynccontextmanager
+async def open_segmented_cursor_part(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    stream_slot: int,
+    part_ordinal: int,
+) -> AsyncIterator[SegmentedParquetPart]:
+    """Read only the durable cursor's part; closing this reader is not stream EOF.
+
+    Complete stream metadata is checked separately after actual final-part
+    decode/close. The existing full-bundle reader and generic v1 behavior stay
+    unchanged. This borrows, and never commits, the caller's transaction.
+    """
+
+    identity = _identity(
+        dataset_id=dataset_id, definition_revision_id=definition_revision_id, schema_revision_id=schema_revision_id
+    )
+    capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
+    stream_slot = _positive_id(stream_slot, "stream_slot")
+    part_ordinal = _positive_id(part_ordinal, "part_ordinal")
+    with session.no_autoflush:
+        receipts, metadata, accounting = await _load_parquet_part_metadata(session, identity, capture_bundle_id)
+        if accounting is None or stream_slot not in receipts or not 1 <= part_ordinal <= metadata[stream_slot][0]:
+            raise CapturePayloadUnavailable("cursor replay requires an existing sealed v2 part")
+        statement = (
+            _part_statement(capture_bundle_id, accounting)
+            .where(
+                CustomImportCaptureParquetPart.stream_slot == stream_slot,
+                CustomImportCaptureParquetPart.part_ordinal == part_ordinal,
+            )
+            .limit(2)
+        )
+        part_rows = await session.stream(statement)
+    primary = None
+    try:
+        part = None
+        async for part_row in part_rows:
+            if part is not None:
+                raise CaptureBundleConflict("durable cursor has duplicate parts")
+            part = _validated_cursor_part(
+                receipts[stream_slot],
+                part_row,
+                accounting[stream_slot].policy,
+                (capture_bundle_id, stream_slot, part_ordinal),
+            )
+        if part is None:
+            raise CapturePayloadUnavailable("durable cursor payload part is missing")
+        yield part
+    except BaseException as exc:
+        primary = exc
+    await _close_cursor_result(part_rows, primary)
+
+
+def _add_segmented_metadata(accounting, receipt, ordinal, byte_count, payload_digest, metadata):
+    """Verify the seal without rereading previously decoded immutable payloads."""
+
+    from process.custom_import.capture_pending import _ACCOUNTING_FIELDS, _validated_part_manifest
+
+    policy = accounting.policy
+    _, canonical, decoded, arrow, record_count = _validated_part_manifest(
+        receipt, byte_count, payload_digest.hex(), metadata, policy
+    )
+    manifest_bytes = canonical.encode("utf-8")
+    manifest_digest = hashlib.sha256(manifest_bytes).digest()
+    if not 1 <= byte_count <= policy.part_limits.maximum_compressed_bytes:
+        raise CaptureBundleConflict("segmented capture per-part bytes exceed its policy")
+    _add_payload_part_digest(accounting.digest, ordinal, len(manifest_bytes), manifest_digest)
+    for increment in (decoded, arrow, record_count):
+        accounting.digest.update(increment.to_bytes(8, "big"))
+    for name, increment in zip(
+        _ACCOUNTING_FIELDS, (1, byte_count, decoded, arrow, record_count, len(manifest_bytes)), strict=True
+    ):
+        accounting.totals_by_field[name] += increment
+        if accounting.totals_by_field[name] > accounting.expected_by_field[name]:
+            raise CaptureBundleConflict("segmented capture part accounting exceeds its sealed receipt")
+
+
+async def _close_cursor_result(part_rows, primary=None):
+    """Drain cursor-result cleanup even if its caller is canceled again."""
+
+    task = asyncio.create_task(part_rows.close())
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if primary is None:
+                primary = exc
+            else:
+                primary._custom_import_retry_blocked = True
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+        elif primary is not exc:
+            primary._custom_import_retry_blocked = True
+            primary.add_note(f"cursor reader cleanup also failed: {type(exc).__name__}")
+            primary.__cause__ = exc
+    if primary is not None:
+        raise primary
+
+
+async def verify_segmented_stream_metadata(
+    session: AsyncSession, *, stream_slot: int, deadline: float, **identity_values
+) -> None:
+    """Verify ordered full-stream seals at SQL EOF, without fetching any payload.
+
+    This is not a substitute for actual per-part decoding. The SOURCE consumer
+    may use it only after its durable prefix and final part were decoded and
+    closed successfully. No early-close or caller EOF claim grants completion.
+    """
+
+    bundle_id = _positive_id(identity_values.pop("capture_bundle_id"), "capture_bundle_id")
+    identity = _identity(**identity_values)
+    stream_slot = _positive_id(stream_slot, "stream_slot")
+    with session.no_autoflush:
+        receipts, metadata, accounting = await _load_parquet_part_metadata(session, identity, bundle_id)
+        if accounting is None or stream_slot not in receipts:
+            raise CapturePayloadUnavailable("stream verification requires a sealed v2 capture")
+        statement = _segment_metadata_statement(bundle_id, accounting, stream_slot)
+        part_rows = await session.stream(statement)
+    count, byte_total = 0, 0
+    digest = hashlib.sha256(_PARQUET_PART_SET_DOMAIN)
+    primary = None
+    try:
+        async for part_row in part_rows:
+            if time.monotonic() >= deadline:
+                raise CaptureStoreError("segmented metadata verification deadline elapsed")
+            stored_bundle, slot, ordinal, byte_count, payload_digest = part_row[:5]
+            payload_digest = _stored_bytes(payload_digest)
+            if (
+                (stored_bundle, slot, ordinal) != (bundle_id, stream_slot, count + 1)
+                or count >= metadata[stream_slot][0]
+                or type(byte_count) is not int
+                or payload_digest is None
+                or len(payload_digest) != 32
+            ):
+                raise CaptureBundleConflict("segmented stream ordered metadata coverage has drifted")
+            _add_segmented_metadata(accounting[slot], receipts[slot], ordinal, byte_count, payload_digest, part_row[5:])
+            _add_payload_part_digest(digest, ordinal, byte_count, payload_digest)
+            count += 1
+            byte_total += byte_count
+        if (count, byte_total, digest.digest()) != (
+            metadata[stream_slot][0],
+            receipts[stream_slot].byte_count,
+            metadata[stream_slot][1],
+        ):
+            raise CaptureBundleConflict("segmented stream complete metadata coverage has drifted")
+        accounting[stream_slot].finish()
+    except BaseException as exc:
+        primary = exc
+    await _close_cursor_result(part_rows, primary)
+
+
+def _validated_cursor_part(receipt, part_row, policy, expected_identity):
+    """Validate one complete encoded part before handing it to the decoder."""
+    from process.custom_import.capture_pending import _validated_part_accounting
+
+    bundle_id, slot, ordinal, byte_count, part_payload, digest = part_row[:6]
+    part_payload, digest = _stored_bytes(part_payload), _stored_bytes(digest)
+    if (
+        (bundle_id, slot, ordinal) != expected_identity
+        or type(byte_count) is not int
+        or part_payload is None
+        or byte_count != len(part_payload)
+        or digest is None
+        or hashlib.sha256(part_payload).digest() != digest
+    ):
+        raise CaptureBundleConflict("durable cursor payload part has drifted")
+    manifest, _, _, arrow, record_count = _validated_part_accounting(receipt, part_payload, part_row[6:], policy)
+    return SegmentedParquetPart(receipt, ordinal, SealedCapture(part_payload, manifest), record_count, arrow)
+
+
+def _segment_metadata_statement(bundle_id, accounting, stream_slot):
+    """Select seals/accounting only; never prior immutable payload bytes."""
+    statement = _part_statement(bundle_id, accounting).where(CustomImportCaptureParquetPart.stream_slot == stream_slot)
+    return statement.with_only_columns(*(column for column in statement.selected_columns if column.name != "payload"))
 
 
 async def load_replayable_parquet_bundle(

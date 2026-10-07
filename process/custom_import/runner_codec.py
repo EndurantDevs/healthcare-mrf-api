@@ -271,9 +271,10 @@ def _validate_child_document(
         raise CandidateRunnerError("ordered child payload exceeds structural limits") from exc
     if record_payload(fields, child_values) != child_payload:
         raise CandidateRunnerError("ordered child payload is not canonical")
-    if child_key_document(definition, collection, child_values) != child_key:
+    canonical_child_key = child_key_document(definition, collection, child_values)
+    if canonical_child_key != child_key:
         raise CandidateRunnerError("ordered child key does not match the payload")
-    if child_key_hash(definition, collection, child_values) != key_hash:
+    if digest_text("child-key", canonical_child_key) != key_hash:
         raise CandidateRunnerError("ordered child key digest does not match the payload")
 
 

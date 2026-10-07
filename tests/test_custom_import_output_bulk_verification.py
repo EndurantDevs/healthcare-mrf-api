@@ -10,6 +10,7 @@ from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -17,8 +18,10 @@ from sqlalchemy.dialects import postgresql
 from db.models.custom_import import CustomImportGenerationFamily
 from process.custom_import import build_graph as graph
 from process.custom_import import build_output as output
-from process.custom_import import publication
+from process.custom_import import materialization as material
+from process.custom_import import publication, scalar_digest
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.runner_codec import fields_by_collection, payload_values
 from process.custom_import.runner_types import CancellationRequested, CandidateRunnerError, LeaseAuthorityLost
 from process.custom_import.storage_layout import snapshot_models
 from tests.test_custom_import_build_graph import _registry, _request
@@ -286,13 +289,48 @@ def test_missing_later_plan_is_rejected_before_child_budget(monkeypatch):
         _family_material(monkeypatch, request, [first, ((*second[:5], None), children)])
 
 
+def _projection_models(request, registry, revision, *, child):
+    if child:
+        collection = next(
+            name for name, slot in registry.child_collection_slots.items() if slot == revision.collection_slot
+        )
+        projections = material.project_child_scalars(
+            request.definition,
+            collection=collection,
+            child_target=material.ChildScalarTarget(
+                request.dataset_id,
+                request.schema_revision_id,
+                revision.root_record_id,
+                revision.collection_slot,
+                revision.child_revision_id,
+            ),
+            child_values=payload_values(
+                fields_by_collection(request.definition)[collection], revision.canonical_payload, label="test child"
+            ),
+            child_collection_slots=registry.child_collection_slots,
+        )
+        models = material.scalar_projection_models(
+            request.definition, child_scalars=projections, child_collection_slots=registry.child_collection_slots
+        )
+    else:
+        projections = material.project_root_scalars(
+            request.definition,
+            root_target=material.RootScalarTarget(
+                request.dataset_id, request.schema_revision_id, revision.root_record_id, revision.root_revision_id
+            ),
+            root_values=payload_values(request.definition.root_fields, revision.canonical_payload, label="test root"),
+        )
+        models = material.scalar_projection_models(request.definition, root_scalars=projections)
+    return sorted(models, key=lambda scalar: scalar.field_slot)
+
+
 def _projection_records(request, families, *, child):
     registry = _registry(request.definition)
     projection_records = []
     for row, children in sorted(families, key=lambda item: item[0][3].logical_key_sha256):
         revisions = [item[2] for item in children] if child else [row[2]]
         for revision in revisions:
-            projections = output._expected_projections(request, registry, revision, child=child)
+            projections = _projection_models(request, registry, revision, child=child)
             projection_records.extend((scalar, revision, row[3].logical_key_sha256) for scalar in projections or [None])
     return projection_records
 
@@ -316,8 +354,188 @@ def _projection_responses(request, records, *, child):
     return [*responses, []]
 
 
+def _twenty_projection_family(*, child):
+    raw = _raw_definition()
+    root_fields = raw["schema"]["root"]["fields"]
+    child_fields = raw["schema"]["children"][0]["fields"]
+    for field in (*root_fields, *child_fields):
+        field.pop("projection_slot", None)
+    fields = child_fields if child else root_fields
+    fields.extend(
+        {"id": f"extra_{index}", "slot": 100 - index, "type": "string", "nullable": True}
+        for index in range(20 - len(fields))
+    )
+    for index, field in enumerate(fields, 1):
+        field["projection_slot"] = index
+    if child:
+        raw["query"]["root_fields"] = []
+    else:
+        raw["query"].pop("child")
+        raw["query"]["order"] = []
+        raw["selection_profiles"][0]["selection"][0]["field"] = "npi"
+        raw["selection_profiles"][0]["context_dimensions"] = []
+    request = _request(definition=CustomImportDefinition.from_mapping(raw))
+    root_values_by_field = {"npi": "0000000001", "display_name": "Synthetic"}
+    child_values_by_field = {"rate_npi": "0000000001", "service_code": "S", "amount": Decimal("1")}
+    values = child_values_by_field if child else root_values_by_field
+    values.update({field["id"]: f"value-{field['slot']}" for field in fields if field["id"].startswith("extra_")})
+    return request, _family(request, 1, (child_values_by_field,), root_values=root_values_by_field)
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("physical_limit", [3, 9, 100_000])
+def test_twenty_projections_compare_mappings_without_expected_models(monkeypatch, child, physical_limit):
+    request, family = _twenty_projection_family(child=child)
+    records = _projection_records(request, [family], child=child)
+    assert len(records) == 20
+    monkeypatch.setattr(graph, "MAX_BATCH_ROWS", physical_limit)
+    session = _read_session(monkeypatch, _projection_responses(request, records, child=child))
+    model_name = "_child_scalar_model" if child else "_root_scalar_model"
+    to_model = Mock(wraps=getattr(material, model_name))
+    values_name = "_child_scalar_values" if child else "_root_scalar_values"
+    to_values = Mock(wraps=getattr(material, values_name))
+    validate = Mock(wraps=material._validate_scalar_projection_rows)
+    monkeypatch.setattr(material, model_name, to_model)
+    monkeypatch.setattr(material, values_name, to_values)
+    monkeypatch.setattr(material, "_validate_scalar_projection_rows", validate)
+    actual_records = list(
+        output._verified_projection_rows(
+            session, request, _registry(request.definition), 7, _generation(request), child=child
+        )
+    )
+    assert actual_records == records
+    pages = math.ceil(20 / ((physical_limit - 1) // 2))
+    to_model.assert_not_called()
+    assert to_values.call_count == 20
+    assert validate.call_count == pages
+    assert all(len(call.args[2 if child else 1]) == 20 for call in validate.call_args_list)
+    assert session.execute.call_count == 2 * pages + 1
+    assert session.binding.call_count == session.transactions == session.closed
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_scalar_verification_compares_every_model_column(monkeypatch, child):
+    request, family = _twenty_projection_family(child=child)
+    records = _projection_records(request, [family], child=child)
+    monkeypatch.setattr(output, "_output_rows", lambda *_args, **_kwargs: (record for record in records))
+    scalar = records[0][0]
+    for column in scalar.__table__.columns:
+        original = getattr(scalar, column.name)
+        setattr(scalar, column.name, object())
+        with pytest.raises(CandidateRunnerError, match="typed scalar projection differs"):
+            list(
+                output._verified_projection_rows(
+                    None, request, _registry(request.definition), 7, _generation(request), child=child
+                )
+            )
+        setattr(scalar, column.name, original)
+
+
 @pytest.mark.parametrize("child", [False, True])
 @pytest.mark.parametrize("physical_limit", [3, 100_000])
+def test_prepared_projections_are_released_before_next_read_or_revision(monkeypatch, child, physical_limit):
+    request = _request()
+    families = [
+        _family(request, index, ({"rate_npi": f"{index:010d}", "service_code": "S", "amount": Decimal("1")},))
+        for index in (1, 2)
+    ]
+    projection_records = _projection_records(request, families, child=child)
+    monkeypatch.setattr(graph, "MAX_BATCH_ROWS", physical_limit)
+    session = _read_session(monkeypatch, _projection_responses(request, projection_records, child=child))
+    prepared_refs = []
+    prepare = output._expected_projections
+    execute = session.execute.side_effect
+
+    def tracked_prepare(*args, **kwargs):
+        assert all(reference() is None for reference in prepared_refs)
+        projections = prepare(*args, **kwargs)
+        prepared_refs.extend(ref(projection) for projection in projections)
+        return projections
+
+    def checked_execute(statement):
+        assert all(reference() is None for reference in prepared_refs)
+        return execute(statement)
+
+    monkeypatch.setattr(output, "_expected_projections", tracked_prepare)
+    session.execute.side_effect = checked_execute
+    assert (
+        list(
+            output._verified_projection_rows(
+                session, request, _registry(request.definition), 7, _generation(request), child=child
+            )
+        )
+        == projection_records
+    )
+    assert prepared_refs and all(reference() is None for reference in prepared_refs)
+    assert session.transactions == session.closed
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("termination", ["close", "cancel", "deadline", "invalid"])
+def test_prepared_projections_are_released_on_early_exit(monkeypatch, child, termination):
+    request, family = _twenty_projection_family(child=child)
+    projection_records = _projection_records(request, [family], child=child)
+    monkeypatch.setattr(graph, "MAX_BATCH_ROWS", 9)
+    session = _read_session(
+        monkeypatch,
+        _projection_responses(request, projection_records, child=child),
+        cancel_at=2 if termination == "cancel" else None,
+    )
+    prepared_refs = []
+    prepare = output._expected_projections
+
+    def tracked_prepare(*args, **kwargs):
+        projections = prepare(*args, **kwargs)
+        prepared_refs.extend(ref(projection) for projection in projections)
+        return projections
+
+    monkeypatch.setattr(output, "_expected_projections", tracked_prepare)
+    projection_rows = output._verified_projection_rows(
+        session, request, _registry(request.definition), 7, _generation(request), child=child
+    )
+    assert next(projection_rows) == projection_records[0]
+    assert len(prepared_refs) == 20 and all(reference() is not None for reference in prepared_refs)
+    if termination == "close":
+        projection_rows.close()
+    else:
+        if termination == "deadline":
+            monkeypatch.setattr(graph.time, "monotonic", lambda: 21)
+        elif termination == "invalid":
+            projection_records[1][0].dataset_id += 1
+        error_by_termination = {
+            "cancel": CancellationRequested,
+            "deadline": LeaseAuthorityLost,
+            "invalid": CandidateRunnerError,
+        }
+        with pytest.raises(error_by_termination[termination]):
+            list(projection_rows)
+    assert all(reference() is None for reference in prepared_refs)
+    assert session.transactions == session.closed + int(termination == "cancel")
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_unselected_projection_binding_is_validated_before_model_construction(monkeypatch, child):
+    request, family = _twenty_projection_family(child=child)
+    revision = family[1][0][2] if child else family[0][2]
+    projector_name = "project_child_scalars" if child else "project_root_scalars"
+    projector = getattr(material, projector_name)
+
+    def invalid(*args, **kwargs):
+        projections = projector(*args, **kwargs)
+        return (*projections[:-1], replace(projections[-1], field_slot=0))
+
+    to_model = Mock()
+    monkeypatch.setattr(material, projector_name, invalid)
+    monkeypatch.setattr(material, "_child_scalar_model" if child else "_root_scalar_model", to_model)
+    with pytest.raises(ValueError, match="field_slot must be a positive integer"):
+        _projection_models(request, _registry(request.definition), revision, child=child)
+    with pytest.raises(ValueError, match="field_slot must be a positive integer"):
+        output._expected_projections(request, _registry(request.definition), revision, child=child)
+    to_model.assert_not_called()
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("physical_limit", [3, 9, 100_000])
 def test_scalars_compare_and_hash_in_global_pages(monkeypatch, child, physical_limit):
     monkeypatch.setattr(graph, "MAX_BATCH_ROWS", physical_limit)
     request = _request(page_row_limit=3)
@@ -348,8 +566,10 @@ def test_scalars_compare_and_hash_in_global_pages(monkeypatch, child, physical_l
 
 
 @pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("physical_limit", [3, 100_000])
 @pytest.mark.parametrize("change", ["all_missing", "last_missing", "extra", "changed", "owner"])
-def test_scalar_stream_rejects_missing_extra_changed_and_wrong_owner(monkeypatch, child, change):
+def test_scalar_stream_rejects_missing_extra_changed_and_wrong_owner(monkeypatch, child, physical_limit, change):
+    monkeypatch.setattr(graph, "MAX_BATCH_ROWS", physical_limit)
     request = _request(page_row_limit=1)
     families = [_family(request, 1, ({"rate_npi": "0000000001", "service_code": "S", "amount": Decimal("1")},))]
     records = _projection_records(request, families, child=child)
@@ -396,6 +616,33 @@ def test_nullable_missing_fields_and_explicit_null_keep_distinct_scalar_rows(mon
     )
 
 
+@pytest.mark.parametrize("malformed", [False, True])
+def test_empty_root_projections_still_validate_canonical_payload(monkeypatch, malformed):
+    raw = _raw_definition()
+    raw["schema"]["root"]["fields"][0].pop("projection_slot")
+    raw["schema"]["root"]["fields"][1]["nullable"] = True
+    raw["query"]["root_fields"] = ["display_name"]
+    request = _request(definition=CustomImportDefinition.from_mapping(raw))
+    family = _family(request, 1, root_values={"npi": "0000000001"})
+    records = _projection_records(request, [family], child=False)
+    assert len(records) == 1 and records[0][0] is None
+    to_model = Mock(wraps=material._root_scalar_model)
+    monkeypatch.setattr(material, "_root_scalar_model", to_model)
+    if malformed:
+        records[0][1].canonical_payload += " "
+    session = _read_session(monkeypatch, _projection_responses(request, records, child=False))
+    rows = output._verified_projection_rows(
+        session, request, _registry(request.definition), 7, _generation(request), child=False
+    )
+    if malformed:
+        with pytest.raises(CandidateRunnerError, match="malformed"):
+            list(rows)
+    else:
+        assert list(rows) == []
+    to_model.assert_not_called()
+    assert session.transactions == session.closed
+
+
 @pytest.mark.parametrize("projected", [False, True])
 def test_child_null_missing_and_no_projected_fields_remain_visible(monkeypatch, projected):
     raw = _raw_definition()
@@ -427,6 +674,75 @@ def test_child_null_missing_and_no_projected_fields_remain_visible(monkeypatch, 
     assert len(actual_records) == (3 if projected else 0)
     assert sum(projection_record[0] is None for projection_record in projection_records) == (0 if projected else 2)
     assert session.binding.call_count == session.transactions == session.closed
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_native_zero_scalar_revision_still_checks_canonical_payload(monkeypatch, malformed):
+    verifier = getattr(pytest.importorskip("ptg2_address_canon"), "custom_import_verified_scalar_frames_v1", None)
+    assert callable(verifier)
+    raw = _raw_definition()
+    raw["schema"]["root"]["fields"][0].pop("projection_slot")
+    raw["schema"]["root"]["fields"][1]["nullable"] = True
+    raw["query"]["root_fields"] = ["display_name"]
+    request = _request(definition=CustomImportDefinition.from_mapping(raw))
+    family = _family(request, 1, root_values={"npi": "0000000001"})
+    records = _projection_records(request, [family], child=False)
+    if malformed:
+        records[0][1].canonical_payload += " "
+    session = _read_session(monkeypatch, _projection_responses(request, records, child=False))
+    monkeypatch.setattr(scalar_digest, "native_verifier", lambda: verifier)
+    monkeypatch.setattr(output, "_expected_projections", Mock(side_effect=AssertionError("fallback")))
+    if malformed:
+        with pytest.raises(CandidateRunnerError, match="malformed"):
+            output._scalar_material(
+                session, request, _registry(request.definition), 7, _generation(request), _digests(), child=False
+            )
+    else:
+        assert (
+            output._scalar_material(
+                session, request, _registry(request.definition), 7, _generation(request), _digests(), child=False
+            )
+            == 0
+        )
+    assert session.transactions == session.closed
+
+
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("failure", ["cancel", "deadline", "invalid"])
+def test_native_revision_page_failures_do_not_hash_partial_groups(monkeypatch, child, failure):
+    verifier = getattr(pytest.importorskip("ptg2_address_canon"), "custom_import_verified_scalar_frames_v1", None)
+    assert callable(verifier)
+    request, family = _twenty_projection_family(child=child)
+    projection_records = _projection_records(request, [family], child=child)
+    with monkeypatch.context() as page_patch:
+        page_patch.setattr(graph, "MAX_BATCH_ROWS", 7)
+        responses = _projection_responses(request, projection_records, child=child)
+    session = _read_session(monkeypatch, responses, cancel_at=2 if failure == "cancel" else None)
+    original_decode = scalar_digest.payload_values
+
+    def decode(*args, **kwargs):
+        values_by_field = original_decode(*args, **kwargs)
+        if failure == "deadline":
+            monkeypatch.setattr(graph.time, "monotonic", lambda: 21)
+        return values_by_field
+
+    if failure == "invalid":
+        projection_records[-1][0].dataset_id += 1
+    monkeypatch.setattr(scalar_digest, "native_verifier", lambda: verifier)
+    monkeypatch.setattr(scalar_digest, "payload_values", decode)
+    monkeypatch.setattr(output, "_expected_projections", Mock(side_effect=AssertionError("fallback")))
+    digests = _digests()
+    expected_error = {
+        "cancel": CancellationRequested,
+        "deadline": LeaseAuthorityLost,
+        "invalid": CandidateRunnerError,
+    }[failure]
+    with pytest.raises(expected_error):
+        output._scalar_material(
+            session, request, _registry(request.definition), 7, _generation(request), digests, child=child
+        )
+    assert [digest.digest() for digest in digests] == [digest.digest() for digest in _digests()]
+    assert session.transactions == session.closed + int(failure == "cancel")
 
 
 @pytest.mark.parametrize("failure", ["cancel", "deadline"])

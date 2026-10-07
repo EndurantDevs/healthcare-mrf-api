@@ -726,12 +726,24 @@ class _ReplayAccounting:
 
 
 def _validated_part_accounting(receipt, part_payload, metadata, policy):
+    result = _validated_part_manifest(
+        receipt, len(part_payload), hashlib.sha256(part_payload).hexdigest(), metadata, policy
+    )
+    if not 1 <= len(part_payload) <= policy.part_limits.maximum_compressed_bytes:
+        raise CaptureBundleConflict("segmented capture per-part part_payload exceeds its policy")
+    return result
+
+
+def _validated_part_manifest(receipt, byte_count, payload_sha256_hex, metadata, policy):
+    """Apply identical manifest checks to payload and payload-free part reads."""
+
     if len(metadata) != 5:
         raise CaptureBundleConflict("segmented capture per-part metadata is incomplete")
     canonical, stored_digest, decoded, arrow, record_count = metadata
     canonical = _canonical_manifest(canonical)
-    if len(canonical.encode("utf-8")) > policy.maximum_part_manifest_bytes or not _is_stored_digest_equal(
-        stored_digest, hashlib.sha256(canonical.encode("utf-8")).digest()
+    manifest_bytes = canonical.encode("utf-8")
+    if len(manifest_bytes) > policy.maximum_part_manifest_bytes or not _is_stored_digest_equal(
+        stored_digest, hashlib.sha256(manifest_bytes).digest()
     ):
         raise CaptureBundleConflict("segmented capture per-part manifest digest has drifted")
     try:
@@ -743,13 +755,13 @@ def _validated_part_accounting(receipt, part_payload, metadata, policy):
         or manifest.source_snapshot_token != receipt.source_snapshot_token
         or manifest.format != "parquet"
         or manifest.compression != "none"
-        or manifest.compressed_bytes != len(part_payload)
-        or isinstance(manifest.compressed_bytes, bool)
-        or manifest.compressed_sha256 != hashlib.sha256(part_payload).hexdigest()
+        or type(manifest.compressed_bytes) is not int
+        or type(manifest.decoded_bytes) is not int
+        or manifest.compressed_bytes != byte_count
+        or manifest.compressed_sha256 != payload_sha256_hex
         or manifest.decoded_bytes != decoded
-        or decoded != len(part_payload)
-        or manifest.decoded_sha256 != hashlib.sha256(part_payload).hexdigest()
-        or isinstance(manifest.decoded_bytes, bool)
+        or decoded != byte_count
+        or manifest.decoded_sha256 != payload_sha256_hex
     ):
         raise CaptureBundleConflict("segmented capture per-part manifest identity has drifted")
     for name in ("stream_sha256", "compressed_sha256", "decoded_sha256", "capture_sha256"):
@@ -757,8 +769,6 @@ def _validated_part_accounting(receipt, part_payload, metadata, policy):
     _count(decoded, "decoded_byte_count", policy.part_limits.maximum_decoded_bytes)
     _count(arrow, "arrow_byte_count", policy.maximum_part_arrow_bytes)
     _count(record_count, "record_count", policy.part_limits.maximum_records)
-    if not 1 <= len(part_payload) <= policy.part_limits.maximum_compressed_bytes:
-        raise CaptureBundleConflict("segmented capture per-part part_payload exceeds its policy")
     return manifest, canonical, decoded, arrow, record_count
 
 

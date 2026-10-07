@@ -721,6 +721,12 @@ def _new_digest(domain: str) -> hashlib._Hash:
 
 
 def _add_digest_record(digest: hashlib._Hash, section: str, document: dict[str, Any]) -> None:
+    _add_digest_record_to_all((digest,), section, document)
+
+
+def _add_digest_record_to_all(digests: tuple[hashlib._Hash, ...], section: str, document: dict[str, Any]) -> None:
+    """Serialize one record once while retaining each digest's existing domain."""
+
     serialized = json.dumps(
         document,
         allow_nan=False,
@@ -728,10 +734,13 @@ def _add_digest_record(digest: hashlib._Hash, section: str, document: dict[str, 
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    digest.update(section.encode("ascii"))
-    digest.update(b"\x00")
-    digest.update(len(serialized).to_bytes(8, "big"))
-    digest.update(serialized)
+    encoded_section = section.encode("ascii")
+    encoded_length = len(serialized).to_bytes(8, "big")
+    for digest in digests:
+        digest.update(encoded_section)
+        digest.update(b"\x00")
+        digest.update(encoded_length)
+        digest.update(serialized)
 
 
 async def _capture_source_bundle_digest(

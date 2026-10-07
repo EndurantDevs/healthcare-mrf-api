@@ -1034,6 +1034,108 @@ def test_operator_rejects_sql_and_credential_path_arguments_without_reflecting_t
         assert "synthetic-private-input" not in captured.err
 
 
+@pytest.mark.parametrize("command", ["execute", "resume"])
+@pytest.mark.parametrize("has_runner_failure", [False, True])
+async def test_admission_stage_enters_before_source_and_closes_after_operator(monkeypatch, command, has_runner_failure):
+    """Carry one verified launch through either command, including runner failure."""
+
+    loaded = _configured_loaded_binding()
+    database = _resume_database(loaded) if command == "resume" else _Database()
+    if command == "resume":
+        _install_resume_preflight(monkeypatch, database, loaded)
+    else:
+        monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    events = []
+    transport = object()
+
+    @asynccontextmanager
+    async def launch():
+        events.append("entered")
+        try:
+            yield transport
+        finally:
+            events.append("closed")
+
+    def credentials(directory):
+        assert events == ["entered"]
+        events.append("credentials")
+        return _CredentialProvider(directory)
+
+    loader = Mock(return_value=launch())
+    candidate_result = CandidateRunResult(status="sealed_unpublished", execution_id=40)
+    run = AsyncMock(return_value=candidate_result)
+    if has_runner_failure:
+        run.side_effect = RuntimeError("synthetic runner failure")
+    monkeypatch.setattr(operator_cli, "load_admission_launch", loader)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", credentials)
+    monkeypatch.setattr(operator_cli, "SnowflakePythonConnectorAdapter", _Adapter)
+    monkeypatch.setattr(operator_cli, "run_segmented_snowflake_candidate", run)
+    operation = (
+        operator_cli._run_resumed_snowflake_binding
+        if command == "resume"
+        else operator_cli._run_retained_snowflake_binding
+    )
+    argument_by_name = {
+        "definition_revision_id": 32,
+        "source_binding_revision_id": 34,
+        "idempotency_key": "synthetic-resume",
+    }
+    if has_runner_failure:
+        with pytest.raises(RuntimeError, match="synthetic runner failure"):
+            await operation(**argument_by_name, database=database)
+    else:
+        assert await operation(**argument_by_name, database=database) == candidate_result
+    assert events == (["entered", "closed"] if command == "resume" else ["entered", "credentials", "closed"])
+    loader.assert_called_once_with(loaded, idempotency_key="synthetic-resume")
+    assert run.await_args.args[0] is database.session_factory
+    assert run.await_args.kwargs == {
+        "processing_policy": loaded.binding.processing_policy,
+        "writer_transports": transport,
+    }
+    assert database.connected == database.disconnected == 1
+
+
+@pytest.mark.parametrize("command", ["execute", "resume"])
+async def test_invalid_admission_stage_denies_before_source_or_runner(monkeypatch, command):
+    loaded = _configured_loaded_binding()
+    database = _resume_database(loaded) if command == "resume" else _Database()
+    if command == "resume":
+        _install_resume_preflight(monkeypatch, database, loaded)
+    else:
+        monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    loader = Mock(side_effect=ValueError("admission launch is unavailable"))
+    credentials, adapter, run = Mock(), Mock(), AsyncMock()
+    monkeypatch.setattr(operator_cli, "load_admission_launch", loader)
+    monkeypatch.setattr(operator_cli, "FixedLocalKeyPairCredentialProvider", credentials)
+    monkeypatch.setattr(operator_cli, "SnowflakePythonConnectorAdapter", adapter)
+    monkeypatch.setattr(operator_cli, "run_segmented_snowflake_candidate", run)
+    operation = (
+        operator_cli._run_resumed_snowflake_binding
+        if command == "resume"
+        else operator_cli._run_retained_snowflake_binding
+    )
+    with pytest.raises(ValueError, match="admission launch is unavailable"):
+        await operation(
+            definition_revision_id=32,
+            source_binding_revision_id=34,
+            idempotency_key="synthetic-resume",
+            database=database,
+        )
+    credentials.assert_not_called()
+    adapter.assert_not_called()
+    run.assert_not_awaited()
+    loader.assert_called_once_with(loaded, idempotency_key="synthetic-resume")
+    assert database.connected == database.disconnected == 1
+
+
+async def test_admission_stage_cannot_select_legacy_runner(monkeypatch):
+    run = AsyncMock()
+    monkeypatch.setattr(operator_cli, "run_snowflake_bundle_candidate", run)
+    with pytest.raises(ValueError, match="requires segmented processing"):
+        await operator_cli._run_configured_candidate(object(), object(), object(), None, writer_transports=object())
+    run.assert_not_awaited()
+
+
 def _registration_document():
     loaded = _loaded_binding()
     return {

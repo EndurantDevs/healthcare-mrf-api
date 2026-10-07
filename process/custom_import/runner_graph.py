@@ -46,7 +46,6 @@ from process.custom_import.publication import _capture_source_bundle_digest
 from process.custom_import.runner_codec import (
     candidate_hash,
     child_key_document,
-    child_key_hash,
     digest_text,
     family_child_payload_hashes,
     fields_by_collection,
@@ -452,7 +451,7 @@ def stored_root_values(
     )
     canonical_root_key = root_key_document(request.definition, root_values_by_field)
     if root_record.canonical_logical_key != canonical_root_key or not hmac.compare_digest(
-        bytes(root_record.logical_key_sha256), root_key_hash(request.definition, root_values_by_field)
+        bytes(root_record.logical_key_sha256), digest_text("root-key", canonical_root_key)
     ):
         raise CandidateRunnerError("current generation root identity does not match its payload")
     verify_entity_binding(request, entity_binding, root_values_by_field)
@@ -529,7 +528,7 @@ def verify_stored_child(
         or child_model.canonical_child_key != canonical_child_key
         or not hmac.compare_digest(
             bytes(child_model.child_key_sha256),
-            child_key_hash(request.definition, stored_child.collection, stored_child.values_by_field),
+            digest_text("child-key", canonical_child_key),
         )
     ):
         raise CandidateRunnerError("current generation child identity does not match its payload")

@@ -4,7 +4,9 @@ import ast
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,15 +59,18 @@ def test_runtime_copy_boundary_keeps_production_imports():
             if isinstance(node, ast.Import):
                 modules = [name.name for name in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module:
-                modules = [node.module] if (ROOT / (node.module.replace(".", "/") + ".py")).is_file() else [
-                    node.module + "." + name.name for name in node.names
-                ]
+                modules = (
+                    [node.module]
+                    if (ROOT / (node.module.replace(".", "/") + ".py")).is_file()
+                    else [node.module + "." + name.name for name in node.names]
+                )
             else:
                 continue
-            required_paths = {module.replace(".", "/") + ".py" for module in modules if module.split(".")[0] in {"scripts", "support"}}
+            required_paths = {
+                module.replace(".", "/") + ".py" for module in modules if module.split(".")[0] in {"scripts", "support"}
+            }
             assert required_paths <= copies, (path, required_paths)
     assert "support/zip/" in copies
-
 
 
 def test_documented_container_commands_are_packaged():
@@ -93,14 +98,12 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     dockerfile = (ROOT / "Dockerfile").read_text()
     lock_script = (ROOT / "scripts/python_locks.py").read_text()
     assert (
-        "python:3.14.7-slim-trixie@sha256:"
-        "cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6"
+        "python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6"
     ) in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
     assert (
-        "ghcr.io/astral-sh/uv:0.12.17@sha256:"
-        "10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc"
+        "ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc"
     ) in dockerfile
     assert "uv pip check" in dockerfile
     assert "uv pip install" in dockerfile
@@ -118,6 +121,34 @@ def test_runtime_lock_rejects_stale_inputs_and_excludes_ci_dependencies(tmp_path
     assert "pyarrow" in names
 
 
+@pytest.mark.parametrize(
+    ("capability", "selected", "accepted"),
+    [(None, None, False), (lambda: b"", None, False), (len, None, False), (len, len, True)],
+)
+def test_final_image_requires_compiled_scalar_encoder(monkeypatch, capability, selected, accepted):
+    runtime_stage = (ROOT / "Dockerfile").read_text().split("\nFROM ")[-1]
+    command = next(
+        line
+        for line in runtime_stage.splitlines()
+        if line.startswith("RUN /opt/venv/bin/python -B -c ") and "custom_import_scalar_frames_v1" in line
+    )
+    assert runtime_stage.index("USER nobody:nogroup") < runtime_stage.index(command)
+    _, python, flag, option, code = shlex.split(command)
+    assert (python, flag, option) == ("/opt/venv/bin/python", "-B", "-c")
+    native = SimpleNamespace() if capability is None else SimpleNamespace(custom_import_scalar_frames_v1=capability)
+    monkeypatch.setitem(sys.modules, "ptg2_address_canon", native)
+    monkeypatch.setitem(
+        sys.modules,
+        "process.custom_import",
+        SimpleNamespace(scalar_digest=SimpleNamespace(native_encoder=lambda: selected)),
+    )
+    if accepted:
+        exec(code)
+    else:
+        with pytest.raises(AssertionError):
+            exec(code)
+
+
 def test_native_extension_supports_python_314_and_newer():
     assert 'requires-python = ">=3.14"' in (ROOT / "support/ptg2_scanner/pyproject.toml").read_text()
     assert 'features = ["abi3-py314"]' in (ROOT / "support/ptg2_scanner/Cargo.toml").read_text()
@@ -125,7 +156,8 @@ def test_native_extension_supports_python_314_and_newer():
 
 def test_local_example_has_neutral_database_and_no_shared_operator_token():
     value_by_name = dict(
-        line.split("=", 1) for line in (ROOT / ".env.example").read_text().splitlines()
+        line.split("=", 1)
+        for line in (ROOT / ".env.example").read_text().splitlines()
         if line and not line.startswith("#")
     )
     assert value_by_name["HLTHPRT_DB_PORT"] == "5432"
@@ -145,9 +177,7 @@ def test_parallel_mrf_helper_requires_python_314_project_environment(tmp_path, m
     helper.chmod(0o755)
 
     monkeypatch.delenv("PYTHON_BIN", raising=False)
-    missing = subprocess.run(
-        [helper], cwd=checkout, capture_output=True, text=True, check=False
-    )
+    missing = subprocess.run([helper], cwd=checkout, capture_output=True, text=True, check=False)
     assert missing.returncode == 1
     assert "Python executable not found or not executable: .venv/bin/python" in missing.stderr
 
@@ -155,8 +185,6 @@ def test_parallel_mrf_helper_requires_python_314_project_environment(tmp_path, m
     old_python.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
     old_python.chmod(0o755)
     monkeypatch.setenv("PYTHON_BIN", str(old_python))
-    unsupported = subprocess.run(
-        [helper], cwd=checkout, capture_output=True, text=True, check=False
-    )
+    unsupported = subprocess.run([helper], cwd=checkout, capture_output=True, text=True, check=False)
     assert unsupported.returncode == 1
     assert f"Python 3.14 or newer is required: {old_python}" in unsupported.stderr
