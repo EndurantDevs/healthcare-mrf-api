@@ -117,6 +117,11 @@ def _assert_smoke_job(workflow, workflow_text) -> None:
     assert ".venv/bin/python -m pytest -q" in commands
     assert "python -m pip install" not in "\n".join(step.get("run", "") for step in job["steps"])
     assert "test_process_" in commands or "tests/process/" in commands
+    assert workflow["env"]["PYTEST_BOORST"] == "1"
+    assert workflow["env"]["UV_FIND_LINKS"] == (
+        "https://github.com/dnikolayev/pytest-boorst/releases/download/v0.1.0a4/wheels.html"
+    )
+    assert "pytest pytest-asyncio pytest-boorst" in commands
     assert all(
         token not in workflow_text for token in ("secrets.", "vars.", "ghcr.io", "workflow_dispatch", "self-hosted")
     )

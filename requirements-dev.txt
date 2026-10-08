@@ -6,6 +6,7 @@ pluggy>=1.6.0
 pygments>=2.21.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
+pytest-boorst==0.1.0a4
 pytest-cov
 pytest-mock
 pytest-xdist>=3.8.0

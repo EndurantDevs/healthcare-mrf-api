@@ -239,9 +239,15 @@ For a small synthetic check of CSV parsing, batching and failure handling that
 does not require running services:
 
 ```bash
-uv pip install -r requirements-dev.txt
+UV_FIND_LINKS=https://github.com/dnikolayev/pytest-boorst/releases/download/v0.1.0a4/wheels.html \
+  uv pip install -r requirements-dev.txt
 python -m pytest -q tests/test_process_geo_import_unit.py tests/test_public_runtime_packaging.py
 ```
+
+CI enables pytest-boorst with `PYTEST_BOORST=1`; set it to `0` to use stock collection.
+When regenerating `requirements-ci.lock`, provide verified release wheels through
+`UV_FIND_LINKS` and retain their published SHA256 hashes. uv 0.12.17 does not emit
+hashes from the release HTML index.
 
 To build a local container, supply the source identity:
 
