@@ -41,7 +41,8 @@ jobs:
     - name: Check public repository hygiene
       run: .venv/bin/python scripts/ci/public_hygiene.py
     - name: Install runtime and test dependencies
-      run: uv pip install --python .venv/bin/python -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio pytest-boorst
+      run: uv pip install --python .venv/bin/python -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio 'pytest-boorst>=0.1.0a5,<1.0'
+        --upgrade-package pytest-boorst
     - name: Run synthetic import and API checks
       run: .venv/bin/python -m pytest -q tests/test_process_nucc_unit.py tests/test_process_code_sets_unit.py tests/test_healthcheck.py
         tests/test_public_runtime_packaging.py tests/test_public_ci.py
@@ -191,7 +192,9 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
+      with:
+        dependencies: 'true'
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -273,7 +276,9 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
+      with:
+        dependencies: 'true'
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" capacity
 
@@ -318,7 +323,9 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
+      with:
+        dependencies: 'true'
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" api-contract
 
@@ -350,9 +357,10 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
       with:
         rust: 'true'
+        dependencies: 'true'
     - name: Install verified Rust validation tools
       run: 'tools_directory="$RUNNER_TEMP/healthcare-rust-tools"
 
@@ -449,9 +457,20 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
+      with:
+        dependencies: 'true'
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" security
+
+
+        boorst_audit_file=$(mktemp "$RUNNER_TEMP/pytest-boorst-audit.XXXXXX")
+
+        trap ''rm -f -- "$boorst_audit_file"'' EXIT
+
+        python -I -c ''from importlib.metadata import version; print("pytest-boorst==" + version("pytest-boorst"))'' > "$boorst_audit_file"
+
+        python -I -m pip_audit --disable-pip --no-deps --strict -r "$boorst_audit_file"
 
         git diff --exit-code
 
@@ -487,7 +506,9 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
+      with:
+        dependencies: 'true'
     - name: Run complete validation stage
       env:
         HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
@@ -544,9 +565,10 @@ jobs:
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
+      uses: EndurantDevs/endurant-ci/scripts/healthcare/setup@e010eddde9474f6fb06c870a2c31764d9cc9a6c4
       with:
         rust: ${{ matrix.shard == 'core-services' }}
+        dependencies: 'true'
     - name: Install PostgreSQL client
       run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
         \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
@@ -865,7 +887,6 @@ jobs:
     - dev
 env:
   PYTEST_BOORST: '1'
-  UV_FIND_LINKS: https://github.com/dnikolayev/pytest-boorst/releases/download/v0.1.0a4/wheels.html
   CI_ROOT: ${{ github.workspace }}/ci
   CI_REVISION: 3cdb6ee93545a50b482a49f36f814b4191d22d1e
   SOURCE_ROOT: ${{ github.workspace }}/source
