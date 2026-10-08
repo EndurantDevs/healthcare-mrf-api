@@ -46,6 +46,7 @@ class _TransactionConnection:
                         "telephone_number": "2125550100",
                         "address_key": "10000000-0000-0000-0000-000000000002",
                         "provider_address_total": 1,
+                        "_provider_total": 501,
                     }
                 )
             ]
@@ -180,7 +181,7 @@ async def _run_imported_page(
         import_context=context,
     )
 
-    assert session.events == ["count", "page", "taxonomy", "status", "enrichment"]
+    assert session.events == ["page", "taxonomy", "status", "enrichment"]
     return json.loads(reply.body), connection, session, context
 
 
@@ -202,11 +203,11 @@ async def test_imported_order_page_keeps_native_rows_and_uses_one_transaction(
     assert body["total"] > npi_module.MAX_PROVIDER_LIST_PHONE_CANDIDATES
     assert body["total_source"] == "computed"
     assert [provider_row["npi"] for provider_row in body["rows"]] == [1000000002]
-    assert session.proxy_databases == [npi_module.db, npi_module.db, npi_module.db]
-    assert session.proxy_inputs == [session, session, session]
+    assert session.proxy_databases == [npi_module.db, npi_module.db]
+    assert session.proxy_inputs == [session, session]
 
-    count_sql, count_parameters, count_statement = connection.calls[0]
-    page_sql, page_parameters, page_statement = connection.calls[1]
+    page_sql, page_parameters, page_statement = connection.calls[0]
+    count_sql, count_parameters, count_statement = page_sql, page_parameters, page_statement
     assert "custom_import_provider_relation AS" in count_sql
     assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
     assert page_sql.index("LEFT JOIN custom_import_provider_relation AS imported") < page_sql.index("LIMIT :limit")
@@ -236,14 +237,14 @@ async def test_imported_filter_page_uses_one_correlated_membership_predicate(
     )
 
     assert body["total"] == 501
-    count_sql = connection.calls[0][0]
-    page_sql = connection.calls[1][0]
+    page_sql = connection.calls[0][0]
+    count_sql = page_sql
     predicate = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
     assert count_sql.count(predicate) == 1
     assert page_sql.count(predicate) == 1
-    assert "LEFT JOIN custom_import_provider_relation AS imported" not in page_sql
+    assert "matching_npis AS MATERIALIZED" in page_sql
     assert set(context.compiled.values) <= set(connection.calls[0][1])
-    assert set(context.compiled.values) <= set(connection.calls[1][1])
+    assert not any("SELECT COUNT(DISTINCT" in call[0] for call in connection.calls)
 
 
 @pytest.mark.asyncio
@@ -435,9 +436,7 @@ class _PostgresConnectionProxy:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("any_array", [False, True])
 async def test_postgres_unified_zip_filter_uses_postal_fallback(any_array):
-    predicate = provider_list_sql_module._address_zip5_filter(
-        "c", "mrf.entity_address_unified", any_array=any_array
-    )
+    predicate = provider_list_sql_module._address_zip5_filter("c", "mrf.entity_address_unified", any_array=any_array)
     statement = text(
         f"""
         SELECT c.npi FROM (VALUES
@@ -674,7 +673,6 @@ async def test_postgres_generated_provider_list_count_page_and_lateral_hydration
         calls = session.info["provider_list_calls"]
 
     response_body = json.loads(response.body)
-    count_sql, count_parameters = next(call for call in calls if "SELECT COUNT(DISTINCT" in call[0])
     page_sql, page_parameters = next(call for call in calls if "page_npis AS" in call[0])
     assert response_body["total"] == 4
     assert [provider_row["npi"] for provider_row in response_body["rows"]] == [
@@ -684,7 +682,7 @@ async def test_postgres_generated_provider_list_count_page_and_lateral_hydration
         1000000001,
     ]
     assert "JOIN LATERAL" in page_sql
-    assert set(ordered_context.compiled.values) <= set(count_parameters)
+    assert not any("SELECT COUNT(DISTINCT" in sql for sql, _parameters in calls)
     assert set(ordered_context.compiled.values) <= set(page_parameters)
 
 
@@ -716,14 +714,13 @@ async def test_postgres_imported_phone_keeps_overlay_and_rows_past_candidate_lim
         calls = session.info["provider_list_calls"]
 
     response_body = json.loads(response.body)
-    count_sql, count_parameters = next(call for call in calls if "SELECT COUNT(DISTINCT" in call[0])
     page_sql, page_parameters = next(call for call in calls if "page_npis AS" in call[0])
     assert response_body["total"] == 2
     assert [provider_row["npi"] for provider_row in response_body["rows"]] == [
         1000000501,
         1000000602,
     ]
-    for sql, parameters in ((count_sql, count_parameters), (page_sql, page_parameters)):
+    for sql, parameters in ((page_sql, page_parameters),):
         assert "provider_directory_address_overlay AS overlay" in sql
         assert "LIMIT :candidate_limit" not in sql
         assert "candidate_limit" not in parameters

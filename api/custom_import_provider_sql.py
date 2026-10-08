@@ -37,6 +37,12 @@ class ProviderImportQuery:
     compiled: CompiledNpiEntityRelation
     require_match: bool
 
+    def __post_init__(self):
+        # A complete child selector narrows membership even for ordering-only requests.
+        effective = self.prepared.effective_require_match
+        if effective is not None:
+            object.__setattr__(self, "require_match", effective)
+
 
 def compile_npi_entity_relation(statement: Select) -> CompiledNpiEntityRelation:
     """Compile a read-core relation once without interpolating its values."""

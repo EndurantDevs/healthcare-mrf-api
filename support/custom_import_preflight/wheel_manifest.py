@@ -9,6 +9,7 @@ from pathlib import Path
 CANONICAL_MODULES = (
     "process/custom_import/_source_text.py",
     "process/custom_import/definition.py",
+    "process/custom_import/derived_query.py",
     "process/custom_import/family.py",
     "process/custom_import/capture_limits.py",
     "process/custom_import/segmented_capture_policy.py",

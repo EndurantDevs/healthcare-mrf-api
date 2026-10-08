@@ -320,6 +320,30 @@ def _provider_import_order_clause(
     return ", ".join(order_terms)
 
 
+def _provider_import_count_page(eligible_sql, import_context, *, native_order="ORDER BY npi"):
+    """Evaluate the exact eligible provider relation once, including empty pages."""
+
+    order = (
+        _provider_import_order_clause(import_context, "imported.npi")
+        if import_context.prepared.normalized_order_terms
+        else native_order.removeprefix("ORDER BY ")
+    )
+    sorts = "".join(
+        f", imported.sort_{ordinal}" for ordinal, _term in enumerate(import_context.prepared.normalized_order_terms)
+    )
+    membership = "WHERE imported.entity_value IS NOT NULL" if import_context.require_match else ""
+    ctes = f"""matching_npis AS MATERIALIZED (
+        SELECT eligible_npi.*, imported.entity_value{sorts}
+          FROM ({eligible_sql}) AS eligible_npi
+     LEFT JOIN custom_import_provider_relation AS imported
+            ON imported.entity_value = eligible_npi.npi::text
+        {membership}
+    ), provider_totals AS (SELECT COUNT(*) AS _provider_total FROM matching_npis)"""
+    position = f", ROW_NUMBER() OVER (ORDER BY {order}) AS _provider_page_position" if sorts else ""
+    page = f"SELECT imported.*{position} FROM matching_npis AS imported ORDER BY {order} LIMIT :limit OFFSET :start"
+    return ctes, page
+
+
 def _provider_list_statement(sql: str, import_context: ProviderImportQuery | None):
     statement = text(sql)
     if import_context is not None:

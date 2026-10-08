@@ -107,15 +107,25 @@ def test_imported_geo_builder_dedupes_before_ordering_and_uses_typed_binds(direc
     assert set(context.compiled.values) <= set(statements.page._bindparams)
 
 
-def test_imported_geo_filter_uses_one_correlated_membership_predicate():
-    statements = _statements(direction=None, require_match=True)
+@pytest.mark.parametrize("direction", (None, "asc", "desc"))
+def test_imported_geo_filter_uses_one_correlated_membership_predicate(direction):
+    statements = _statements(direction=direction, require_match=True)
     count_sql = str(statements.count)
     page_sql = str(statements.page)
     membership = "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported"
 
     assert count_sql.count(membership) == 1
     assert page_sql.count(membership) == 1
-    assert "LEFT JOIN custom_import_provider_relation AS imported" not in page_sql
+    assert "WHERE imported.entity_value = d.npi::text" in page_sql
+    assert ("LEFT JOIN custom_import_provider_relation AS imported" in page_sql) is (direction is not None)
+
+
+@pytest.mark.parametrize("direction", ("asc", "desc"))
+def test_imported_geo_optional_order_keeps_unmatched_native_providers(direction):
+    page_sql = str(_statements(direction=direction).page)
+    assert "EXISTS (SELECT 1 FROM custom_import_provider_relation AS imported" not in page_sql
+    assert "LEFT JOIN custom_import_provider_relation AS imported" in page_sql
+    assert "WHERE imported.entity_value IS NOT NULL" not in page_sql
 
 
 @pytest.mark.parametrize("direction", ("asc", "desc"))
@@ -167,11 +177,14 @@ class _RecordingGeoProxy:
         if "SELECT COUNT(*) AS total_count" in sql:
             return [SimpleNamespace(_mapping={"total_count": 3})]
         if "page_geo AS MATERIALIZED" in sql:
-            return [
+            rows = [
                 _geo_row(1000000004, _FOURTH_ADDRESS_KEY, 10.0),
                 _geo_row(1000000003, _THIRD_ADDRESS_KEY, 20.0),
                 _geo_row(1000000002, _SECOND_ADDRESS_KEY, 30.0),
             ]
+            for row in rows:
+                row._mapping.update(_geo_total=3, _geo_anchor_count=getattr(self._session, "anchor_count", 1))
+            return rows
         raise AssertionError(f"unexpected query: {sql}")
 
 
@@ -244,7 +257,7 @@ async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anch
     assert cursor_calls[0]["query_parameters"]["in_lat"] == 0.0
     assert cursor_calls[0]["query_parameters"]["in_long"] == 0.0
     assert cursor_calls[0]["limit"] == 2
-    assert ["COUNT(*) AS total_count" in sql for sql, _ in session.calls] == [True, False]
+    assert len(session.calls) == 1 and "AS _geo_total" in session.calls[0][0]
     assert response_by_key["total_count"] == 3
     assert response_by_key["next_cursor"] is None
     assert response_by_key["_custom_import_next_anchor"] == ["1000000003", _THIRD_ADDRESS_KEY]
@@ -278,8 +291,8 @@ async def test_imported_geo_handler_rejects_missing_or_nonunique_cursor_anchor(
             import_context=_context(),
             prepare_cursor=prepare_cursor,
         )
-    assert any("SELECT COUNT(*) AS anchor_count" in sql for sql, _ in session.calls)
-    assert not any("page_geo AS MATERIALIZED" in sql for sql, _ in session.calls)
+    assert len(session.calls) == 1 and "AS _geo_anchor_count" in session.calls[0][0]
+    assert "page_geo AS MATERIALIZED" in session.calls[0][0]
 
 
 @pytest.mark.asyncio
@@ -381,6 +394,8 @@ async def _read_postgres_geo_page(
     session,
     direction: str,
     cursor_anchor: tuple[str, str] | None = None,
+    *,
+    require_match: bool = False,
 ) -> dict[str, Any]:
     request, prepare_cursor = _postgres_request(
         session,
@@ -396,7 +411,7 @@ async def _read_postgres_geo_page(
                 "limit": ["2"],
             }
         ),
-        import_context=_context(direction=direction),
+        import_context=_context(direction=direction, require_match=require_match),
         prepare_cursor=prepare_cursor,
     )
     return json.loads(reply.body)
@@ -453,6 +468,11 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
             cursor_anchor=tuple(second_body["_custom_import_next_anchor"]),
             direction=direction,
         )
+        empty_body = await _read_postgres_geo_page(
+            session,
+            direction,
+            cursor_anchor=(str(_provider_identities(third_body)[-1][0]), _provider_identities(third_body)[-1][1]),
+        )
         calls = session.info["geo_calls"]
 
     assert first_body["total_count"] == 6
@@ -466,6 +486,55 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
     combined_providers = [*first_body["items"], *second_body["items"]]
     assert next(provider["type"] for provider in combined_providers if provider["npi"] == 1000000004) == "secondary"
     assert third_body["items"][1]["type"] == "primary"
-    assert any("SELECT COUNT(*) AS total_count" in sql for sql, _ in calls)
+    assert empty_body["total_count"] == 6 and empty_body["items"] == []
     assert any("page_geo AS MATERIALIZED" in sql for sql, _ in calls)
-    assert any("SELECT COUNT(*) AS anchor_count" in sql for sql, _ in calls)
+    assert len(calls) == 4 and all("AS _geo_total" in sql for sql, _ in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("direction", "expected_first", "expected_second"),
+    (
+        (
+            "asc",
+            [(1000000004, _FOURTH_ADDRESS_KEY), (1000000003, _THIRD_ADDRESS_KEY)],
+            [(1000000003, _FIFTH_ADDRESS_KEY), (1000000002, _SECOND_ADDRESS_KEY)],
+        ),
+        (
+            "desc",
+            [(1000000003, _THIRD_ADDRESS_KEY), (1000000003, _FIFTH_ADDRESS_KEY)],
+            [(1000000004, _FOURTH_ADDRESS_KEY), (1000000002, _SECOND_ADDRESS_KEY)],
+        ),
+    ),
+)
+async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pages(
+    monkeypatch, direction, expected_first, expected_second
+):
+    async with transaction_session() as session:
+        try:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        except DBAPIError:
+            pytest.skip("PostGIS is unavailable for the native geo execution proof")
+        await _seed_geo_tables(session)
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
+        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
+        monkeypatch.setattr(npi_module.db, "acquire", lambda: (_ for _ in ()).throw(AssertionError("native pool used")))
+        first_body = await _read_postgres_geo_page(session, direction, require_match=True)
+        second_body = await _read_postgres_geo_page(
+            session, direction, tuple(first_body["_custom_import_next_anchor"]), require_match=True
+        )
+        last_provider = second_body["items"][-1]
+        exhausted_body = await _read_postgres_geo_page(
+            session, direction, (str(last_provider["npi"]), last_provider["address_key"]), require_match=True
+        )
+        calls = session.info["geo_calls"]
+    assert _provider_identities(first_body) == expected_first
+    assert _provider_identities(second_body) == expected_second
+    assert first_body["has_more"] is True and second_body["has_more"] is False
+    assert exhausted_body["items"] == [] and exhausted_body["has_more"] is False
+    assert all(page["total_count"] == 4 for page in (first_body, second_body, exhausted_body))
+    providers = [*first_body["items"], *second_body["items"]]
+    assert next(provider["type"] for provider in providers if provider["npi"] == 1000000004) == "secondary"
+    assert providers[-1]["npi"] == 1000000002
+    assert len(calls) == 3 and all("AS _geo_total" in sql for sql, _ in calls)
