@@ -101,11 +101,12 @@ def _install(
     page_rows=None,
     imported_items=None,
     require_match=False,
+    effective_require_match=None,
 ):
     """Bind synthetic native results and import hydration to one session."""
 
     _install_window(monkeypatch, session)
-    expected_require_match = require_match
+    effective_membership = require_match if effective_require_match is None else effective_require_match
 
     class PreparedProviderReadService:
         def __init__(self, *, authorizer):
@@ -115,13 +116,14 @@ def _install(
             assert same_session is session
             assert self.authorizer.authorize(authorization, target=target).value == "a" * 64
             assert query.context_filters[0].value == "north" and query.filters == ()
-            assert query.require_match is expected_require_match
+            assert query.require_match is require_match
             session.events.append("prepare")
             return PreparedNpiEntityRelation(
                 select(literal("1104212877").label("entity_value"), literal(5).label("sort_0")),
                 query.order_terms or (),
                 "b" * 64,
                 "c" * 64,
+                effective_require_match,
             )
 
         async def hydrate_npi_page(self, same_session, **kwargs):
@@ -134,7 +136,7 @@ def _install(
         assert request.path == provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
         assert native_args.getlist("name_like") == ["Synthetic", "Example"]
         assert native_args.get("include_total") == "true"
-        assert import_context.require_match is require_match
+        assert import_context.require_match is effective_membership
         assert import_context.prepared.normalized_order_terms[0].direction == "desc"
         session.events.append("page")
         if page_failure is not None:
@@ -266,6 +268,15 @@ async def test_missing_required_imported_match_cannot_return_native_provider(mon
     session = _Session()
     _install(monkeypatch, session, page_rows=[{"npi": 1104212877}], require_match=True)
     reply = await provider_http.serve_custom_import_providers(_request(_body(require_match=True)), session)
+    assert reply.status == 503 and session.rolled_back
+    assert b'"rows"' not in reply.body
+
+
+@pytest.mark.asyncio
+async def test_normalized_episode_membership_rejects_missing_hydrated_family(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session, page_rows=[{"npi": 1104212877}], effective_require_match=True)
+    reply = await provider_http.serve_custom_import_providers(_request(), session)
     assert reply.status == 503 and session.rolled_back
     assert b'"rows"' not in reply.body
 

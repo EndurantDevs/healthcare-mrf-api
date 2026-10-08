@@ -59,6 +59,7 @@ from db.models.custom_import import (
 )
 from process.custom_import.definition import (
     CustomImportDefinition,
+    DerivedQueryField,
     Field,
     canonical_json,
     canonical_sha256,
@@ -77,6 +78,8 @@ from process.custom_import.read_contracts import (
     MAX_ORDER_TERMS,
     MAX_PAGE_OFFSET,
     MAX_PAGE_SIZE,
+    MAX_PROVIDER_FILTER_TERMS,
+    MAX_PROVIDER_ORDER_TERMS,
     MAX_READ_TIMEOUT_MS,
     READ_CORE_CONTRACT,
     CustomImportReadAuthorizationError,
@@ -355,6 +358,7 @@ class PreparedNpiEntityRelation:
     normalized_order_terms: tuple[ReadOrderTerm, ...]
     query_fingerprint: str
     authorization_scope_sha256: str
+    effective_require_match: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1212,6 +1216,7 @@ def _normalize_search_plan(request: SearchRequest, context: _ReadContext) -> _Se
     if type(request) is not SearchRequest or request.target != context.target:
         raise CustomImportReadRequestError("search target does not match the verified read context")
     normalized_filters = _normalized_filters(request.filters, context)
+    _verify_filter_permissions(normalized_filters, context, allow_context_selectors=True)
     declared_order_terms = tuple(
         ReadOrderTerm(field_id=term.field_id, direction=term.direction, nulls=term.nulls)
         for term in context.definition.query.order_terms
@@ -1243,6 +1248,8 @@ def _normalize_query_order_terms(
     *,
     explicit: bool,
     query_child_collection: str | None = None,
+    maximum_terms: int = MAX_ORDER_TERMS,
+    allow_derived: bool = False,
 ) -> tuple[ReadOrderTerm, ...]:
     """Normalize and validate an explicit order against the query contract."""
 
@@ -1253,7 +1260,7 @@ def _normalize_query_order_terms(
         for term in context.definition.query.order_terms
     )
     requested_order_terms = _normalized_order_terms(raw_order_terms, context)
-    if len(declared_order_terms) > MAX_ORDER_TERMS or len(requested_order_terms) > MAX_ORDER_TERMS:
+    if len(declared_order_terms) > maximum_terms or len(requested_order_terms) > maximum_terms:
         raise CustomImportReadRequestError("order term count exceeds the read-core limit")
     if explicit and context.definition.query.sortable_fields:
         sortable_field_ids = set(context.definition.query.sortable_fields)
@@ -1266,7 +1273,9 @@ def _normalize_query_order_terms(
             raise CustomImportReadRequestError("order terms are not permitted by the query contract")
     elif requested_order_terms != declared_order_terms:
         raise CustomImportReadRequestError("order terms must exactly match the bounded definition order")
-    _verify_order_context(requested_order_terms, context, query_child_collection=query_child_collection)
+    _verify_order_context(
+        requested_order_terms, context, query_child_collection=query_child_collection, allow_derived=allow_derived
+    )
     return requested_order_terms
 
 
@@ -1281,7 +1290,9 @@ def _validate_npi_entity_relation_request(
 
     if type(filters) is not tuple:
         raise CustomImportReadRequestError("filters must be a tuple")
-    if len(filters) > MAX_FILTER_TERMS:
+    metric_limit = MAX_PROVIDER_FILTER_TERMS if maximum_terms > MAX_FILTER_TERMS else MAX_FILTER_TERMS
+    order_limit = MAX_PROVIDER_ORDER_TERMS if maximum_terms > MAX_FILTER_TERMS else MAX_ORDER_TERMS
+    if len(filters) > metric_limit:
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     if context_filters is not None and (type(context_filters) is not tuple or len(context_filters) > MAX_FILTER_TERMS):
         raise CustomImportReadRequestError("context filter count exceeds the read-core limit")
@@ -1289,7 +1300,7 @@ def _validate_npi_entity_relation_request(
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     if order_terms is not None and type(order_terms) is not tuple:
         raise CustomImportReadRequestError("order_terms must be a tuple")
-    if order_terms is not None and len(order_terms) > MAX_ORDER_TERMS:
+    if order_terms is not None and len(order_terms) > order_limit:
         raise CustomImportReadRequestError("order term count exceeds the read-core limit")
 
 
@@ -1314,6 +1325,7 @@ def _normalized_npi_query(context, context_filters, filters, order_terms, requir
     normalized_filters = _normalized_filters(filters, context)
     normalized_order = () if order_terms is None else _normalize_query_order_terms(order_terms, context, explicit=True)
     if context_filters is None:
+        _verify_filter_permissions(normalized_filters, context, allow_context_selectors=True)
         _require_order_context_filters(
             normalized_order, normalized_filters, context, require_exact_context=require_exact_context
         )
@@ -1321,6 +1333,7 @@ def _normalized_npi_query(context, context_filters, filters, order_terms, requir
     normalized_context_filters = _normalized_filters(context_filters, context)
     context_dimensions = _verify_context_filters(normalized_context_filters, context)
     _verify_metric_filters(normalized_filters, context_dimensions)
+    _verify_filter_permissions(normalized_filters, context)
     _require_order_context_filters(
         normalized_order, normalized_context_filters, context, require_exact_context=require_exact_context
     )
@@ -1328,9 +1341,14 @@ def _normalized_npi_query(context, context_filters, filters, order_terms, requir
 
 
 def _normalized_filters(
-    raw_filters: tuple[ReadFilter, ...], context: _ReadContext, *, query_child_collection: str | None = None
+    raw_filters: tuple[ReadFilter, ...],
+    context: _ReadContext,
+    *,
+    query_child_collection: str | None = None,
+    maximum_terms: int = MAX_FILTER_TERMS,
+    allow_derived: bool = False,
 ) -> tuple[_NormalizedFilter, ...]:
-    if len(raw_filters) > MAX_FILTER_TERMS:
+    if len(raw_filters) > maximum_terms:
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     normalized_filters: list[_NormalizedFilter] = []
     for raw_filter in raw_filters:
@@ -1340,6 +1358,8 @@ def _normalized_filters(
         if field_id is None:
             raise CustomImportReadRequestError("filter field is not declared by the query contract")
         field = context.definition.fields_by_id.get(field_id)
+        if field is None and allow_derived:
+            field = context.definition.query.derived_by_id.get(field_id)
         if field is None:
             raise CustomImportReadUnavailableError("declared query field has no persisted binding")
         _verify_field_context(field, context, query_child_collection=query_child_collection)
@@ -1362,6 +1382,34 @@ def _normalized_filters(
             zip(descriptor_texts, normalized_filters, strict=True), key=lambda descriptor_pair: descriptor_pair[0]
         )
     )
+
+
+def _verify_filter_permissions(filters, context, *, allow_context_selectors=False):
+    """Enforce canonical metric grants while preserving exact context selectors."""
+
+    permitted_fields = context.definition.query.filterable_fields
+    if permitted_fields is None:
+        return
+    context_dimensions = ()
+    if allow_context_selectors:
+        profile = next(
+            (item for item in context.definition.selection_profiles if item.profile_id == context.target.profile_id),
+            None,
+        )
+        if profile is None:
+            raise CustomImportReadUnavailableError("selection profile is not declared by the definition")
+        context_dimensions = profile.context_dimensions
+    for predicate in filters:
+        if predicate.field.field_id in permitted_fields:
+            continue
+        if (
+            predicate.field.field_id in context_dimensions
+            and predicate.operator == "eq"
+            and predicate.value is not None
+            and (predicate.field.value_type != "integer" or type(predicate.value) is int)
+        ):
+            continue
+        raise CustomImportReadRequestError("filter field is not opted in by the query contract")
 
 
 def _verify_context_filters(filters: tuple[_NormalizedFilter, ...], context: _ReadContext) -> tuple[str, ...]:
@@ -1416,13 +1464,21 @@ def _normalized_order_terms(
 
 
 def _verify_order_context(
-    order_terms: tuple[ReadOrderTerm, ...], context: _ReadContext, *, query_child_collection: str | None = None
+    order_terms: tuple[ReadOrderTerm, ...],
+    context: _ReadContext,
+    *,
+    query_child_collection: str | None = None,
+    allow_derived: bool = False,
 ) -> None:
     permitted_ids = set(context.definition.query.root_fields) | set(context.definition.query.child_fields)
+    if allow_derived:
+        permitted_ids.update(context.definition.query.derived_by_id)
     for term in order_terms:
         if type(term) is not ReadOrderTerm or term.field_id not in permitted_ids:
             raise CustomImportReadRequestError("order field is not declared by the query contract")
         field = context.definition.fields_by_id.get(term.field_id)
+        if field is None and allow_derived:
+            field = context.definition.query.derived_by_id.get(term.field_id)
         if field is None:
             raise CustomImportReadUnavailableError("declared order field has no persisted binding")
         _verify_field_context(field, context, query_child_collection=query_child_collection)
@@ -1459,7 +1515,9 @@ def _normalized_filter_value(
     if field.value_type == "integer":
         return _normalized_integer_filter(raw_value, field.field_id)
     if field.value_type == "decimal":
-        return _normalized_decimal(raw_value, field.field_id)
+        return _normalized_decimal(
+            raw_value, field.field_id, maximum_integer_digits=19 if isinstance(field, DerivedQueryField) else 18
+        )
     if field.value_type == "boolean":
         return _normalized_boolean(raw_value, field.field_id)
     if field.value_type == "date":
@@ -1516,7 +1574,7 @@ def _normalized_integer_filter(value: object, field_id: str) -> tuple[int | Deci
     return value, format(value, "f")
 
 
-def _normalized_decimal(value: object, field_id: str) -> tuple[Decimal, str]:
+def _normalized_decimal(value: object, field_id: str, *, maximum_integer_digits: int = 18) -> tuple[Decimal, str]:
     if isinstance(value, (bool, float)):
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a decimal")
     try:
@@ -1526,7 +1584,7 @@ def _normalized_decimal(value: object, field_id: str) -> tuple[Decimal, str]:
     if (
         not decimal_value.is_finite()
         or _decimal_scale(decimal_value) > 12
-        or _decimal_integer_digits(decimal_value) > 18
+        or _decimal_integer_digits(decimal_value) > maximum_integer_digits
     ):
         raise CustomImportReadRequestError(f"filter value for {field_id} exceeds decimal storage")
     if decimal_value.is_zero():
@@ -1678,7 +1736,8 @@ def _npi_entity_relation_statement(
     for ordinal, term in enumerate(order_terms):
         field = context.definition.fields_by_id[term.field_id]
         columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
-    return statement.with_only_columns(*columns, maintain_column_froms=True)
+    statement = statement.with_only_columns(*columns, maintain_column_froms=True)
+    return statement if order_terms else statement.distinct()
 
 
 def _filtered_npi_winner_statement(

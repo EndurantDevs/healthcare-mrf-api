@@ -6,9 +6,11 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sanic import response
+from sanic.request.parameters import RequestParameters
 from sqlalchemy import func, literal, select, text
 
 from api import custom_import_detail_batch as batch_http
@@ -17,6 +19,7 @@ from api import custom_import_provider_http as provider_http
 from api import custom_import_provider_service_http as service_http
 from api import custom_import_read_http as transport
 from api.custom_import_provider_sql import compile_npi_entity_relation
+from api.endpoint import pricing
 from process.custom_import import read_core
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.read_core import (
@@ -578,35 +581,95 @@ async def test_aggregate_child_limit_is_checked_before_any_detail_hydration(monk
             )
 
 
+def _grouped_service_request(session, pinned_target, entitlement, *, is_native=False):
+    target_map = transport._target_document(_external_target(pinned_target))
+    request_map = {
+        "target": target_map,
+        "native_query": {
+            "code": "99213",
+            "code_system": "HP_PROCEDURE_CODE",
+            "year": "2024",
+            "limit": "2",
+            "min_claims": "1",
+        },
+        "context": [],
+        "filters": [],
+        "order": None,
+        "require_match": True,
+        "grouped_entity_selection": fixture.selection_document(),
+    }
+    if entitlement is not None:
+        request_map["family_entitlement"] = entitlement
+    body = transport._canonical_json_bytes(request_map)
+    path = service_http.CUSTOM_IMPORT_PROVIDER_SERVICE_PATH
+    return SimpleNamespace(
+        body=body,
+        method="POST",
+        path=path,
+        query_string="",
+        headers=http_fixture._resigned_provider_headers(body=body, path=path, target=target_map),
+        args=RequestParameters(
+            {argument_name: [argument_value] for argument_name, argument_value in request_map["native_query"].items()}
+            if is_native
+            else {}
+        ),
+        ctx=SimpleNamespace(sa_session=session),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entitlement", [None, "full_family"])
-async def test_signed_grouped_service_read_rejects_before_native_claims(monkeypatch, entitlement):
+async def test_signed_grouped_service_read_matches_native_claims_and_families(monkeypatch, entitlement):
     http_fixture._install_keyring(monkeypatch)
-
-    async def no_native_claims(*args, **kwargs):
-        pytest.fail("grouped root reads must not enter the native claims lane")
-
-    monkeypatch.setattr(service_http, "_service_page", no_native_claims)
-    async with _case() as (case, target), case.sessions() as session:
-        target_map = transport._target_document(_external_target(target))
-        request_map = {
-            "target": target_map,
-            "native_query": {"code": "99213", "code_system": "HP_PROCEDURE_CODE", "year": "2024"},
-            "context": [],
-            "filters": [],
-            "order": None,
-            "require_match": True,
-            "grouped_entity_selection": fixture.selection_document(),
-        }
-        if entitlement is not None:
-            request_map["family_entitlement"] = entitlement
-        body = transport._canonical_json_bytes(request_map)
-        path = service_http.CUSTOM_IMPORT_PROVIDER_SERVICE_PATH
-        request = http_fixture._Request(
-            body, http_fixture._resigned_provider_headers(body=body, path=path, target=target_map), path=path
+    monkeypatch.setattr(npi_fixture, "_NPI", _A)
+    monkeypatch.setattr(npi_fixture, "_ABSENT_NPI", _C)
+    async with _case() as (case, pinned_target):
+        await npi_fixture._create_pricing_claim_tables(case)
+        monkeypatch.setattr(pricing, "PRICING_SCHEMA", case.schema_name)
+        async with case.sessions() as seed_session, seed_session.begin():
+            await npi_fixture._seed_pricing_claim_rows(seed_session)
+        target_map = transport._target_document(_external_target(pinned_target))
+        documents = []
+        for imported in (False, True):
+            async with case.sessions() as session:
+                request = _grouped_service_request(session, pinned_target, entitlement, is_native=not imported)
+                reply = (
+                    await service_http.serve_custom_import_provider_service(request, session)
+                    if imported
+                    else await pricing.list_providers_by_procedure(request)
+                )
+                assert reply.status == 200, reply.body
+                documents.append(json.loads(reply.body))
+        native, composed = documents
+        assert native["pagination"]["total"] == 2 and {
+            str(provider_item["npi"]) for provider_item in native["items"]
+        } == {_A, _C}
+        assert composed["pagination"]["total"] == 1 and [
+            str(provider_item["npi"]) for provider_item in composed["items"]
+        ] == [_A]
+        provider_by_field = dict(composed["items"][0])
+        family_set = provider_by_field.pop("custom_import")
+        native_provider_by_field = next(
+            provider_item for provider_item in native["items"] if str(provider_item["npi"]) == _A
         )
-        reply = await service_http.serve_custom_import_provider_service(request, session)
-        assert reply.status == 400
+        assert provider_by_field == {**native_provider_by_field, "npi": str(native_provider_by_field["npi"])}
+        assert family_set["target"] == target_map and family_set["selection"] == {"field_id": "period", "value": 2024}
+        assert [family["group_value"] for family in family_set["families"]] == ["segment_a", "segment_b"]
+        assert family_set["projection"] == (entitlement or "query_projection")
+        assert [
+            next(field["value"] for field in family["root_fields"] if field["field_id"] == "score")
+            for family in family_set["families"]
+        ] == ["10.000000000000", "20.000000000000"]
+        if entitlement == "full_family":
+            async with case.sessions() as session:
+                scalar = await _service(pinned_target).root_detail_for_entity(
+                    session, authorization=_AUTHORIZATION, request=_detail_request(pinned_target)
+                )
+            assert family_set == transport._detail_payload(scalar, _external_target(pinned_target))
+        else:
+            assert all(
+                set(family) == {"group_value", "root_fields", "context_fields"} for family in family_set["families"]
+            )
 
 
 def _page_children():

@@ -10,17 +10,20 @@ from decimal import Decimal
 
 import pytest
 from sanic import response
-from sqlalchemy import text
+from sqlalchemy import BigInteger, Numeric, column, select, text, values
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from api import custom_import_provider_geo as geo_http
 from api import custom_import_provider_http as provider_http
 from api import custom_import_read_http as transport
 from api import provider_geo_sql, provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
-from process.custom_import import read_core
+from process.custom_import import grouped_query, grouped_read, read_core
 from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.read_core import (
     ExtensionReadAuthorization,
+    ExtensionReadScope,
     PinnedReadTarget,
     ReadFilter,
     ReadOrderTerm,
@@ -28,16 +31,59 @@ from process.custom_import.read_core import (
 )
 from process.custom_import.runner import run_candidate
 from tests import custom_import_grouped_child_support as fixture
+from tests import test_custom_import_grouped_score_query_postgres as scores
 from tests import test_custom_import_provider_http as provider_fixture
 from tests import test_custom_import_provider_hydration_postgres as native
 from tests import test_custom_import_read_core_postgres as read_fixture
 from tests import test_custom_import_read_http as http_fixture
 from tests import test_custom_import_runner_postgres as runner_fixture
-from tests.custom_import_postgres_support import _quoted_publication_schema, isolated_publication_case
+from tests.custom_import_postgres_support import (
+    _database_url,
+    _quoted_publication_schema,
+    isolated_publication_case,
+)
 
 _PANEL = ReadFilter("segment", "eq", "segment_a")
 _KEY = ReadFilter("service_code", "eq", "chosen")
 _ABSENT = "1000000038"
+
+
+@pytest.fixture
+async def values_connection():
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection:
+            yield connection
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", (False, True))
+async def test_stored_child_ambiguity_cannot_be_hidden_by_a_later_metric_filter(ambiguous, values_connection):
+    rows = [(1, 2, 3, Decimal("1"))]
+    if ambiguous:
+        rows.append((1, 2, 4, Decimal("9")))
+    children = (
+        values(
+            column("family_revision_id", BigInteger),
+            column("root_record_id", BigInteger),
+            column("child_revision_id", BigInteger),
+            column("amount", Numeric),
+        )
+        .data(rows)
+        .cte("synthetic_stored_children")
+    )
+    validated = grouped_query._validated_stored_children(children)
+    statement = select(validated.c.child_revision_id).where(
+        validated.c.validated_child_id.is_not(None),
+        validated.c.amount < 2,
+    )
+    if ambiguous:
+        with pytest.raises(DBAPIError, match="more than one row"):
+            await values_connection.execute(statement)
+    else:
+        assert (await values_connection.execute(statement)).scalar_one() == 3
 
 
 @pytest.fixture(autouse=True)
@@ -193,7 +239,7 @@ async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, dir
         prepared, rows = await native._relation(session, target, _ordered_query(direction=direction))
         assert set(tuple(row) for row in rows) == {(native._A, Decimal("2")), (native._B, Decimal("5"))}
         received, anchor = [], None
-        total = 5 if is_geo else 4
+        total = 3 if is_geo else 2
         for offset in range(total):
             count, page = await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=offset)
             assert count == total and len(page) == 1
@@ -203,31 +249,31 @@ async def test_native_exact_counts_and_stable_child_order_pagination(is_geo, dir
         expected = [native._A] * (2 if is_geo else 1) + [native._B]
         if direction == "desc":
             expected = [native._B] + [native._A] * (2 if is_geo else 1)
-        assert [npi for npi, _address in received] == expected + [native._C, _ABSENT]
+        assert [npi for npi, _address in received] == expected
         assert (await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=total))[1] == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
 @pytest.mark.parametrize("direction", ["asc", "desc"])
-async def test_present_null_precedes_absent_and_missing_child_keeps_native_rows(is_geo, direction):
+async def test_present_null_sorts_last_and_missing_child_excludes_native_rows(is_geo, direction):
     async with native._case(children=_children()) as (case, target), case.sessions() as session:
         query = _ordered_query("nullable", direction, family_entitlement="full_family")
         prepared, rows = await native._relation(session, target, query)
         assert set(tuple(row) for row in rows) == {(native._A, Decimal("2")), (native._B, None)}
         first_count, first = await _native_rows(session, prepared, is_geo=is_geo)
-        assert first_count == (5 if is_geo else 4) and first[0]["npi_code"] == native._A
+        assert first_count == (3 if is_geo else 2) and first[0]["npi_code"] == native._A
         anchor = None
         selected_npis = []
         for offset in range(first_count):
             _count, page = await _native_rows(session, prepared, is_geo=is_geo, anchor=anchor, offset=offset)
             selected_npis.append(page[0]["npi_code"])
             anchor = (page[0]["npi_code"], str(page[0]["address_key"]))
-        assert selected_npis == [native._A] * (2 if is_geo else 1) + [native._B, native._C, _ABSENT]
+        assert selected_npis == [native._A] * (2 if is_geo else 1) + [native._B]
         missing = _ordered_query("both", direction, family_entitlement="full_family")
         missing_prepared, missing_rows = await native._relation(session, target, missing)
         assert len(missing_rows) == 1 and missing_rows[0].entity_value == native._A
-        assert (await _native_rows(session, missing_prepared, is_geo=is_geo))[0] == first_count
+        assert (await _native_rows(session, missing_prepared, is_geo=is_geo))[0] == (2 if is_geo else 1)
         assert set(await native._page(session, target, missing)) == {native._A}
 
 
@@ -313,7 +359,7 @@ async def _signed_page_reply(session, prepared, *, is_geo):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_geo", [False, True])
-async def test_signed_child_pages_keep_absent_native_rows_and_complete_families(monkeypatch, is_geo):
+async def test_signed_child_pages_require_selected_episode_and_keep_complete_families(monkeypatch, is_geo):
     http_fixture._install_keyring(monkeypatch)
     module = geo_http if is_geo else provider_http
     path = geo_http.CUSTOM_IMPORT_PROVIDER_GEO_PATH if is_geo else provider_http.CUSTOM_IMPORT_PROVIDERS_PATH
@@ -336,7 +382,7 @@ async def test_signed_child_pages_keep_absent_native_rows_and_complete_families(
         reply = await endpoint(http_fixture._Request(body, headers, path=path), session)
         assert reply.status == 200, reply.body
         result_map = json.loads(reply.body)
-        assert result_map["total_count" if is_geo else "total"] == (5 if is_geo else 4)
+        assert result_map["total_count" if is_geo else "total"] == (2 if is_geo else 1)
         families = []
         for provider_row in result_map["items" if is_geo else "rows"]:
             if provider_row["npi"] == native._A:
@@ -544,3 +590,249 @@ async def test_grouped_reads_never_use_siblings_or_older_family_to_satisfy_metri
             assert accepted.total == len(accepted.items) == 2
             assert {_values(page_item.context_fields)["amount"] for page_item in accepted.items} == {Decimal("8")}
             assert {_values(page_item.root_fields)["display_name"] for page_item in accepted.items} == {"Selected"}
+
+
+@pytest.mark.asyncio
+async def test_four_scores_preserve_groups_and_complete_families(monkeypatch):
+    monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    roots = native._roots()
+    monkeypatch.setattr(native, "_roots", lambda: [dict(row, weight=2) for row in roots])
+    filters = tuple(
+        ReadFilter(field, "gt", 0) for field in ("root_cost", "root_quality", "child_cost", "child_quality")
+    )
+    order_terms = tuple(
+        ReadOrderTerm(field, "asc", "last") for field in ("root_cost", "root_quality", "child_cost", "child_quality")
+    )
+    query = fixture.query(
+        context_filters=(_KEY,),
+        filters=filters,
+        order_terms=order_terms,
+        family_entitlement="full_family",
+    )
+    async with native._case(children=_children()) as (case, target), case.sessions() as session:
+        prepared, rows = await native._relation(session, target, query)
+        assert set(row.entity_value for row in rows) == {native._A, native._B}
+        selected_provider = next(row for row in rows if row.entity_value == native._A)
+        assert tuple(selected_provider)[1:] == (Decimal("15"), 2, Decimal("90.916666666667"), Decimal("9"))
+        raw_panel = replace(query, context_filters=(_KEY, _PANEL))
+        assert [tuple(row) for row in (await native._relation(session, target, raw_panel))[1]] == [
+            tuple(row) for row in rows
+        ]
+        families = await native._page(session, target, query)
+        assert [group for group, _family in families[native._A].families] == ["segment_a", "segment_b"]
+        assert len(families[native._A].families[0][1].children) == 5
+        assert prepared.effective_require_match is True
+
+
+@pytest.mark.asyncio
+async def test_reduced_scores_preserve_panel_membership_nulls_and_mixed_raw_metrics(monkeypatch):
+    monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    roots = native._roots()
+    monkeypatch.setattr(native, "_roots", lambda: [dict(source_row, weight=2) for source_row in roots])
+    query = fixture.query(
+        context_filters=(_KEY, ReadFilter("segment", "eq", "segment_b")),
+        order_terms=(ReadOrderTerm("root_cost", "asc", "last"),),
+        require_match=False,
+    )
+    async with native._case(children=_children()) as (case, pinned_target), case.sessions() as session:
+        prepared, selected_rows = await native._relation(session, pinned_target, query)
+        assert [tuple(selected_row) for selected_row in selected_rows] == [(native._A, Decimal("15"))]
+        assert "FROM derived_score_values" in str(prepared.statement)
+        nullable = replace(
+            query,
+            context_filters=(ReadFilter("service_code", "eq", "nullable"),),
+            order_terms=(ReadOrderTerm("child_cost", "asc", "last"),),
+        )
+        selected_rows = (await native._relation(session, pinned_target, nullable))[1]
+        assert {tuple(selected_row) for selected_row in selected_rows} == {(native._A, Decimal("2")), (native._B, None)}
+        positive = replace(nullable, filters=(ReadFilter("child_cost", "gt", 0),), require_match=True)
+        assert [
+            selected_row.entity_value for selected_row in (await native._relation(session, pinned_target, positive))[1]
+        ] == [native._A]
+        mixed = replace(
+            query,
+            context_filters=(_KEY, _PANEL),
+            filters=(ReadFilter("root_cost", "gt", 0), ReadFilter("amount", "gt", 1)),
+            order_terms=(ReadOrderTerm("root_cost", "asc", "last"), ReadOrderTerm("quality", "desc", "last")),
+            require_match=True,
+        )
+        prepared, selected_rows = await native._relation(session, pinned_target, mixed)
+        assert "JOIN derived_score_values" in str(prepared.statement)
+        assert next(
+            tuple(selected_row)[1:] for selected_row in selected_rows if selected_row.entity_value == native._A
+        ) == (Decimal("15"), Decimal("9"))
+        assert set(selected_row.entity_value for selected_row in selected_rows) == {native._A, native._B}
+
+
+@pytest.mark.asyncio
+async def test_missing_group_child_preserves_root_reduction_and_same_family_membership(monkeypatch):
+    monkeypatch.setattr(native.fixture, "definition", scores._definition)
+    roots = native._roots()
+    monkeypatch.setattr(native, "_roots", lambda: [dict(source_row, weight=2) for source_row in roots])
+    child_rows = [
+        child_row
+        for child_row in _children()
+        if child_row["service_code"] != "chosen"
+        or (child_row["rate_npi"], child_row["rate_period"], child_row["rate_segment"])
+        == (native._A, 2024, "segment_a")
+    ]
+    fields = ("root_cost", "root_quality", "child_cost", "child_quality")
+    query = fixture.query(
+        context_filters=(_KEY,),
+        filters=tuple(ReadFilter(field, "gt", 0) for field in fields),
+        order_terms=tuple(ReadOrderTerm(field, "asc", "last") for field in fields),
+    )
+    async with native._case(children=child_rows) as (case, pinned_target), case.sessions() as session:
+        prepared, selected_rows = await native._relation(session, pinned_target, query)
+        assert "complete_score_child_keys AS MATERIALIZED" not in str(prepared.statement)
+        assert [tuple(selected_row) for selected_row in selected_rows] == [
+            (native._A, Decimal("15"), 2, Decimal("2"), Decimal("9"))
+        ]
+        absent_group = replace(query, context_filters=(_KEY, ReadFilter("segment", "eq", "segment_b")))
+        assert (await native._relation(session, pinned_target, absent_group))[1] == []
+        absent_key = replace(query, context_filters=(ReadFilter("service_code", "eq", "absent"),))
+        assert (await native._relation(session, pinned_target, absent_key))[1] == []
+        mixed = replace(
+            query,
+            context_filters=(_KEY, _PANEL),
+            filters=(ReadFilter("root_cost", "gt", 0), ReadFilter("amount", "gt", 1)),
+            order_terms=(ReadOrderTerm("root_cost", "asc", "last"), ReadOrderTerm("amount", "desc", "last")),
+        )
+        assert [tuple(selected_row) for selected_row in (await native._relation(session, pinned_target, mixed))[1]] == [
+            (native._A, Decimal("15"), Decimal("2"))
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", (False, True))
+async def test_root_preserving_child_guard_keeps_zero_children_and_rejects_hidden_ambiguity(
+    ambiguous, values_connection
+):
+    child_rows = [(1, 2, 3, Decimal("1")), (2, 4, None, None)]
+    if ambiguous:
+        child_rows.append((1, 2, 5, Decimal("9")))
+    children = (
+        values(
+            column("family_revision_id", BigInteger),
+            column("root_record_id", BigInteger),
+            column("child_revision_id", BigInteger),
+            column("amount", Numeric),
+        )
+        .data(child_rows)
+        .cte("synthetic_nullable_children")
+    )
+    validated = grouped_query._validated_stored_children(children, preserve_roots=True)
+    statement = select(validated.c.child_revision_id, validated.c.validated_child_id).where(
+        (validated.c.amount < 2) | validated.c.amount.is_(None)
+    )
+    if ambiguous:
+        with pytest.raises(DBAPIError, match="more than one row"):
+            await values_connection.execute(statement)
+    else:
+        assert set((await values_connection.execute(statement)).all()) == {(3, 3), (None, None)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous", (False, True))
+async def test_materialized_complete_child_identity_retains_native_ambiguity_failure(ambiguous, values_connection):
+    child_rows = ((1, 2, 3), (1, 2, 4)) if ambiguous else ((1, 2, 3),)
+    children = (
+        values(*(column(name, BigInteger) for name in ("family_revision_id", "root_record_id", "child_revision_id")))
+        .data(child_rows)
+        .cte("synthetic_children")
+    )
+    selected = select(children.c.family_revision_id, children.c.root_record_id).distinct().cte("selected_families")
+    identities, ownership, child_id = grouped_query._complete_child_identity(children, selected)
+    statement = select(child_id).select_from(selected).outerjoin(identities, ownership)
+    if ambiguous:
+        with pytest.raises(DBAPIError, match="more than one row"):
+            await values_connection.execute(statement)
+    else:
+        assert (await values_connection.execute(statement)).scalar_one() == 3
+
+
+def test_episode_alias_promotes_membership_but_root_order_retains_native_nulls():
+    child_query = fixture.query(
+        context_filters=(ReadFilter("panel_alias", "eq", "segment_a"), ReadFilter("child_alias", "eq", "chosen")),
+        order_terms=(ReadOrderTerm("cost_alias", "asc", "last"),),
+        require_match=False,
+    )
+    context, scope = fixture.context(), ExtensionReadScope("synthetic:grouped")
+    assert grouped_read.prepare_relation(context, child_query, scope).effective_require_match is True
+    root_query = replace(child_query, context_filters=(_PANEL,), order_terms=(ReadOrderTerm("score", "asc", "last"),))
+    assert grouped_read.prepare_relation(context, root_query, scope).effective_require_match is False
+
+
+def test_derived_child_metrics_require_the_complete_key_even_without_order():
+    context = replace(fixture.context(), definition=scores._definition())
+    with pytest.raises(read_core.CustomImportReadRequestError, match="complete-key"):
+        grouped_read.prepare_relation(
+            context, fixture.query(filters=(ReadFilter("child_cost", "gt", "1"),)), ExtensionReadScope("synthetic")
+        )
+
+
+def _renamed_identifiers(document, identifiers):
+    if type(document) is str:
+        return identifiers.get(document, document)
+    if type(document) is list:
+        return [_renamed_identifiers(value, identifiers) for value in document]
+    if type(document) is dict:
+        return {key: _renamed_identifiers(value, identifiers) for key, value in document.items()}
+    return document
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identifiers",
+    (
+        {
+            "weight": "state_score",
+            "amount": "value_score",
+            "quality": "state_value_score",
+            "root_quality": "entity_value",
+        },
+        {
+            name: "a" * 62 + suffix
+            for name, suffix in zip(
+                ("score", "weight", "amount", "quality", "root_cost", "child_cost"), "abcdef", strict=True
+            )
+        },
+    ),
+)
+async def test_configured_field_identifiers_cannot_collide_with_internal_sql_columns(monkeypatch, identifiers):
+    document = _renamed_identifiers(json.loads(scores._definition().canonical), identifiers)
+    definition = CustomImportDefinition.from_mapping(document)
+    monkeypatch.setattr(native.fixture, "definition", lambda: definition)
+    roots = [
+        {identifiers.get(key, key): field_value for key, field_value in dict(source_row, weight=2).items()}
+        for source_row in native._roots()
+    ]
+    child_rows = [
+        {identifiers.get(key, key): field_value for key, field_value in source_row.items()}
+        for source_row in _children()
+    ]
+    monkeypatch.setattr(native, "_roots", lambda: roots)
+    fields = tuple(
+        identifiers.get(field, field) for field in ("root_cost", "root_quality", "child_cost", "child_quality")
+    )
+    query = fixture.query(
+        context_filters=(_KEY,),
+        filters=tuple(ReadFilter(field, "gt", 0) for field in fields),
+        order_terms=tuple(ReadOrderTerm(field, "asc", "last") for field in fields),
+        family_entitlement="full_family",
+    )
+    async with native._case(children=child_rows) as (case, pinned_target), case.sessions() as session:
+        eligible_rows = (await native._relation(session, pinned_target, query))[1]
+        assert set(provider_row.entity_value for provider_row in eligible_rows) == {native._A, native._B}
+        selected_provider = next(
+            provider_row for provider_row in eligible_rows if provider_row.entity_value == native._A
+        )
+        assert tuple(selected_provider)[1:] == (Decimal("15"), 2, Decimal("90.916666666667"), Decimal("9"))
+        raw = replace(
+            query,
+            context_filters=(_KEY, _PANEL),
+            filters=(ReadFilter(identifiers.get("score", "score"), "gt", 0),),
+            order_terms=(ReadOrderTerm(identifiers.get("amount", "amount"), "asc", "last"),),
+        )
+        assert (await native._relation(session, pinned_target, raw))[1]
+        assert len((await native._page(session, pinned_target, query))[native._A].families[0][1].children) == 5

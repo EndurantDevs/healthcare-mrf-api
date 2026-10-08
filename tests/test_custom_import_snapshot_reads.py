@@ -2,6 +2,7 @@
 
 """Pinned hot-table routing, canonical control reads, and fail-closed resolution."""
 
+import re
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -104,18 +105,67 @@ def test_grouped_helper_child_predicates_and_order_keep_the_pinned_family(family
     detail_sql = _assert_routing(grouped_read.selected_family_statement(context, plan), family_id)
     assert "MATERIALIZED" not in detail_sql
     assert ("AS selected_entity_value" in detail_sql) is (period is None)
-    assert (
-        f"{schema}.custom_import_family_child.family_revision_id = {schema}.custom_import_winner.family_revision_id"
-        in sql
-    )
-    assert (
-        f"{schema}.custom_import_family_child.root_record_id = {schema}.custom_import_family_revision.root_record_id"
-        in sql
-    )
-    assert sql.count(f"FROM {schema}.custom_import_child_scalar \nWHERE") == 7
-    assert f"FROM {schema}.custom_import_child_scalar, {schema}.custom_import_family_revision" not in sql
-    assert f"FROM {schema}.custom_import_family_child JOIN {schema}.custom_import_child_revision" in sql
+    _assert_joined_child_ownership(sql, schema)
+    _assert_shared_child_projection(prepared.statement, context, schema)
     assert "LIMIT" not in sql
+
+
+def _assert_joined_child_ownership(sql, schema):
+    """Keep selected child keys, revisions, and complete identities on one family/root."""
+    member = f"{schema}.custom_import_family_child"
+    revision = f"{schema}.custom_import_child_revision"
+    assert (
+        f"{schema}.custom_import_family_revision.family_revision_id = {schema}.custom_import_winner.family_revision_id"
+        in sql
+    )
+    assert (
+        f"{schema}.custom_import_family_revision.root_record_id = {schema}.custom_import_generation_family.root_record_id"
+        in sql
+    )
+    for identity in ("child_revision_id", "dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
+        assert f"complete_score_child_keys.{identity} = {member}.{identity}" in sql
+        assert f"{revision}.{identity} = {member}.{identity}" in sql
+    for identity in ("family_revision_id", "root_record_id"):
+        assert f"matched_root_score_values.{identity} = {member}.{identity}" in sql
+        assert f"selected_score_children.{identity} = counted_score_children.{identity}" in sql
+    assert "complete_score_child_keys AS MATERIALIZED" in sql
+    assert "matched_root_score_values AS MATERIALIZED" in sql
+    assert "validated_score_children AS MATERIALIZED" in sql
+    assert (
+        "count(*) OVER (PARTITION BY selected_score_children.family_revision_id, selected_score_children.root_record_id)"
+        in sql
+    )
+    assert "validated_score_children.validated_child_id IS NOT NULL" in sql
+    assert "complete_score_child_identities" not in sql and "selected_child_counts" not in sql
+    assert "JOIN selected_score_children" not in sql
+    assert f"FROM {member} JOIN complete_score_child_keys" in sql
+    assert f"FROM {schema}.custom_import_child_scalar \nWHERE" not in sql
+    assert f"FROM {schema}.custom_import_child_scalar, {schema}.custom_import_family_revision" not in sql
+
+
+def _assert_shared_child_projection(statement, context, schema):
+    """Use one owned typed child projection for each metric and its ordering value."""
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    member = f"{schema}.custom_import_family_child"
+    for field_id in ("amount", "quality"):
+        field = context.definition.fields_by_id[field_id]
+        scalar = f"score_child_{field.field_slot}"
+        assert sql.count(f"LEFT OUTER JOIN {schema}.custom_import_child_scalar AS {scalar} ON") == 1
+        assert f"{scalar}.child_revision_id = {schema}.custom_import_child_revision.child_revision_id" in sql
+        for identity in ("dataset_id", "schema_revision_id", "root_record_id", "collection_slot"):
+            assert f"{scalar}.{identity} = {member}.{identity}" in sql
+        parameter = re.search(rf"{scalar}\.field_slot = %\((\w+)\)s", sql)
+        assert parameter and compiled.params[parameter.group(1)] == field.field_slot
+    ordered_value = statement.selected_columns["sort_0"].element
+    assert ordered_value.table.name == "validated_score_children"
+    assert f"validated_score_children.{ordered_value.name} > " in sql
+    for parameter, expected in (
+        ("dataset_id_", context.target.dataset_id),
+        ("schema_revision_id_", context.target.schema_revision_id),
+    ):
+        values = [value for name, value in compiled.params.items() if name.startswith(parameter)]
+        assert values and all(value == expected for value in values)
 
 
 @pytest.mark.asyncio

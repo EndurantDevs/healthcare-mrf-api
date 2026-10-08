@@ -42,6 +42,7 @@ def _context(
     aliases: bool = False,
     context_dimensions: tuple[str, ...] | None = None,
     sortable_fields: tuple[str, ...] | None = None,
+    filterable_fields: tuple[str, ...] | None = None,
 ):
     raw = load_json_definition((Path(__file__).with_name("fixtures") / "custom_import/v1_valid.json").read_text())
     if aliases:
@@ -55,6 +56,8 @@ def _context(
         raw["selection_profiles"][0]["context_dimensions"] = list(context_dimensions)
     if sortable_fields is not None:
         raw["query"]["sortable_fields"] = list(sortable_fields)
+    if filterable_fields is not None:
+        raw["query"].update(filterable_fields=list(filterable_fields), sortable_fields=["amount"])
     definition = CustomImportDefinition.from_mapping(raw)
     return read_core._ReadContext(_target(), definition, 1, 1, {"rates": 1}, {1: "rates"})
 
@@ -164,6 +167,98 @@ def test_provider_v2_query_normalizes_roles_before_binding_and_fingerprinting():
     assert read_core._npi_entity_relation_fingerprint(
         context.target, (), order_terms, context_filters=repeated
     ) != read_core._npi_entity_relation_fingerprint(context.target, repeated, order_terms)
+
+
+@pytest.mark.parametrize("separate_context", (False, True))
+@pytest.mark.parametrize(
+    ("filterable_fields", "field_id", "operator", "value", "permitted"),
+    (
+        (None, "metric", "gt", "5", True),
+        ((), "amount", "gt", "5", False),
+        ((), "metric", "gt", "5", False),
+        (("display_name",), "metric", "gt", "5", False),
+        (("amount",), "amount", "gt", "5", True),
+        (("amount",), "metric", "gt", "5", True),
+        (("amount",), "display_name", "eq", "Example provider", False),
+        (("display_name",), "display_name", "eq", "Example provider", True),
+    ),
+)
+def test_provider_query_enforces_canonical_filter_grants(
+    separate_context, filterable_fields, field_id, operator, value, permitted
+):
+    context = _context(aliases=True, filterable_fields=filterable_fields)
+    selectors = (ReadFilter("service", "eq", "99213"),)
+    metrics = (ReadFilter(field_id, operator, value),)
+    arguments = (
+        context,
+        selectors if separate_context else None,
+        metrics if separate_context else selectors + metrics,
+        (ReadOrderTerm("metric", "desc", "last"),),
+    )
+    if permitted:
+        normalized = read_core._normalized_npi_query(*arguments)
+        canonical_field_id = "amount" if field_id == "metric" else field_id
+        assert canonical_field_id in {predicate.field.field_id for predicate in normalized[1]}
+    else:
+        with pytest.raises(CustomImportReadRequestError, match="not opted in"):
+            read_core._normalized_npi_query(*arguments)
+
+
+@pytest.mark.parametrize("separate_context", (False, True))
+@pytest.mark.parametrize("field_id", ("service", "service_code"))
+def test_provider_query_keeps_context_selectors_when_metric_filtering_is_disabled(separate_context, field_id):
+    selectors = (ReadFilter(field_id, "eq", "99213"),)
+    normalized = read_core._normalized_npi_query(
+        _context(aliases=True, filterable_fields=()),
+        selectors if separate_context else None,
+        () if separate_context else selectors,
+        (ReadOrderTerm("metric", "desc", "last"),),
+    )
+
+    assert (normalized[0] if separate_context else normalized[1])[0].field.field_id == "service_code"
+
+
+@pytest.mark.parametrize("separate_context", (False, True))
+def test_provider_query_does_not_treat_context_state_filters_as_selectors(separate_context):
+    selectors = (ReadFilter("service", "is_null"),)
+    with pytest.raises(CustomImportReadRequestError):
+        read_core._normalized_npi_query(
+            _context(aliases=True, filterable_fields=()),
+            selectors if separate_context else None,
+            () if separate_context else selectors,
+            None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separate_context", (False, True))
+async def test_provider_query_rejects_disabled_metric_before_relation_construction(monkeypatch, separate_context):
+    @asynccontextmanager
+    async def bounded(session, *, timeout_ms):
+        yield
+
+    statement = Mock()
+    selectors = (ReadFilter("service", "eq", "99213"),)
+    metrics = (ReadFilter("metric", "gt", "5"),)
+    monkeypatch.setattr(read_core, "_bounded_read_window", bounded)
+    monkeypatch.setattr(
+        read_core, "_load_read_context", AsyncMock(return_value=_context(aliases=True, filterable_fields=()))
+    )
+    monkeypatch.setattr(read_core, "_npi_entity_relation_statement", statement)
+    service = CustomImportReadService(authorizer=_Allow())
+    with pytest.raises(CustomImportReadRequestError, match="not opted in"):
+        await service.prepare_npi_entity_relation(
+            object(),
+            authorization=ExtensionReadAuthorization("synthetic-token"),
+            target=_target(),
+            query=NpiEntityRelationQuery(
+                context_filters=selectors if separate_context else None,
+                filters=metrics if separate_context else selectors + metrics,
+                order_terms=(ReadOrderTerm("metric", "desc", "last"),),
+            ),
+        )
+
+    statement.assert_not_called()
 
 
 @pytest.mark.parametrize(

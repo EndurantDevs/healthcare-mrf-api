@@ -283,6 +283,7 @@ sys.path.insert(0, str(_TARGET_DIRECTORY))
 _MODULE_NAMES = (
     "custom_import_preflight._source_text",
     "custom_import_preflight.definition",
+    "custom_import_preflight.derived_query",
     "custom_import_preflight.family",
     "custom_import_preflight.capture_limits",
     "custom_import_preflight.segmented_capture_policy",

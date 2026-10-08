@@ -233,7 +233,7 @@ def _taxonomy_filter_parts(
 
 
 def _membership_clause(import_context: ProviderImportQuery) -> str:
-    if import_context.prepared.normalized_order_terms or not import_context.require_match:
+    if not import_context.require_match:
         return ""
     return (
         f"\n       AND EXISTS (SELECT 1 FROM {_IMPORT_RELATION} AS imported WHERE imported.entity_value = d.npi::text)"
@@ -475,8 +475,10 @@ def _page_statement(
     order_clause = _order_clause(import_context, "selected_geo")
     anchor_join = "\n      CROSS JOIN cursor_anchor" if has_anchor else ""
     keyset_clause = _keyset_clause(import_context, "selected_geo", "cursor_anchor") if has_anchor else ""
+    anchor_count = ", (SELECT COUNT(*) FROM cursor_anchor_rows) AS _geo_anchor_count" if has_anchor else ""
     return _statement(
         f"""WITH {common_ctes},
+geo_totals AS (SELECT COUNT(*) AS _geo_total{anchor_count} FROM selected_geo),
 page_geo AS MATERIALIZED (
     SELECT selected_geo.*,
            ROW_NUMBER() OVER (ORDER BY {order_clause}) AS _geo_page_position
@@ -484,8 +486,9 @@ page_geo AS MATERIALIZED (
      ORDER BY {order_clause}
      LIMIT :{_PAGE_LIMIT_PARAMETER}
 )
-SELECT page_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
-  FROM page_geo
+SELECT page_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display, geo_totals.*
+  FROM geo_totals
+  LEFT JOIN page_geo ON TRUE
   LEFT JOIN mrf.npi_taxonomy AS taxonomy ON page_geo.npi_code = taxonomy.npi
   LEFT JOIN mrf.nucc_taxonomy AS nucc
     ON nucc.code = taxonomy.healthcare_provider_taxonomy_code
