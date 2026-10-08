@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, PayloadTooLarge
@@ -42,6 +42,7 @@ _HEADER_NAMES = frozenset(name.lower() for name in _HEADERS)
 KEYRING_FILE_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_KEYRING_FILE"
 ORIGIN_ENV = "HLTHPRT_CUSTOM_IMPORT_ADMISSION_ORIGIN"
 MAX_BODY_BYTES = 512
+MAX_BATCH_RESPONSE_SECONDS = 300
 blueprint = Blueprint("custom_import_admission", url_prefix="/control/v1")
 
 
@@ -213,6 +214,39 @@ def _reply(payload, status=200):
     return response.json(payload, status=status, headers={"Cache-Control": "no-store"})
 
 
+def extend_batch_response_deadline(request, *, expires_at, trusted_now):
+    """Let verified batch work finish without changing other requests' deadlines."""
+
+    if getattr(request, "transport", None) is None:
+        return
+    protocol = request.protocol
+    if getattr(protocol, "response_timeout", None) is not None:
+        remaining = min(MAX_BATCH_RESPONSE_SECONDS, (expires_at - trusted_now).total_seconds())
+        _set_response_timeout(protocol, max(request.app.config.RESPONSE_TIMEOUT, remaining))
+
+
+def _set_response_timeout(protocol, seconds):
+    """Rearm Sanic when a shorter deadline replaces a scheduled long interval."""
+
+    previous, protocol.response_timeout = protocol.response_timeout, seconds
+    if seconds < previous:
+        if protocol._callback_check_timeouts is not None:
+            protocol._callback_check_timeouts.cancel()
+        protocol.check_timeouts()
+
+
+def register_batch_response_deadline(app):
+    """Reset the connection's timeout before each reused HTTP request."""
+
+    @app.signal("http.lifecycle.handle")
+    async def reset(request):
+        """Do not let a previous verified batch extend a keep-alive request."""
+        if getattr(request, "transport", None) is not None:
+            protocol = request.protocol
+            if getattr(protocol, "response_timeout", None) not in (None, request.app.config.RESPONSE_TIMEOUT):
+                _set_response_timeout(protocol, request.app.config.RESPONSE_TIMEOUT)
+
+
 @blueprint.listener("before_server_start")
 async def initialize_admission_authority(app, _loop):
     """Pin dedicated authority once; missing configuration keeps admission off."""
@@ -292,7 +326,21 @@ async def serve_admission_batch(
             expected_origin=expected_origin,
             keyring=keyring,
         )
+        extend_batch_response_deadline(
+            request,
+            expires_at=min(verified.permit.expires_at, trusted_now + timedelta(seconds=5)),
+            trusted_now=trusted_now,
+        )
         retained = await _retained_request(session_factory, verified)
+        extend_batch_response_deadline(
+            request,
+            expires_at=min(
+                verified.permit.expires_at,
+                retained.build_deadline_at,
+                trusted_now + timedelta(seconds=retained.lease_seconds),
+            ),
+            trusted_now=trusted_now,
+        )
         admission_result = await admission_sql.admit_source_batch(
             session_factory,
             retained,

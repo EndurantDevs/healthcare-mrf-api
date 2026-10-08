@@ -81,6 +81,9 @@ async def serve_source_batch(request, session_factory, *, keyring, expected_orig
             expected_origin=expected_origin,
             keyring=keyring,
         )
+        admission.extend_batch_response_deadline(
+            request, expires_at=verified.permit.expires_at, trusted_now=trusted_now
+        )
         committed = await _source_operation(session_factory, verified)
         return admission._reply(_receipt(verified, committed))
     except AdmissionAuthorizationError:
